@@ -1,0 +1,11 @@
+[package]
+name = "qq-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+qq-provider.workspace = true
+qq-protocol.workspace = true

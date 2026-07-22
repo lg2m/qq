@@ -1,0 +1,37 @@
+[package]
+name = "qq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[workspace]
+members = [
+  ".",
+  "crates/qq-core",
+  "crates/qq-provider",
+  "crates/qq-protocol",
+  "crates/qq-tui",
+  "xtask",
+]
+default-members = ["."]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/lg2m/qq"
+
+[workspace.dependencies]
+qq-core = { path = "crates/qq-core" }
+qq-provider = { path = "crates/qq-provider" }
+qq-protocol = { path = "crates/qq-protocol" }
+qq-tui = { path = "crates/qq-tui" }
+
+[dependencies]
+qq-core.workspace = true
+qq-provider.workspace = true
+qq-protocol.workspace = true
+qq-tui.workspace = true
