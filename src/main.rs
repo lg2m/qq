@@ -133,6 +133,7 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         "qq connected to {}. Enter a prompt, or /quit.",
         connection.address()
     );
+    let session_id = new_session_id()?;
     loop {
         let Some(prompt) = read_prompt().await? else {
             break;
@@ -143,7 +144,8 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         if prompt.is_empty() {
             continue;
         }
-        let request = overrides.ask_request(prompt)?;
+        let mut request = overrides.ask_request(prompt)?;
+        request.session_id = Some(session_id.clone());
         match client::ask(&connection, request).await {
             Ok(events) => {
                 if let Err(error) = render_client_events(events).await {
@@ -158,6 +160,21 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         server.shutdown().await?;
     }
     Ok(())
+}
+
+fn new_session_id() -> Result<String, io::Error> {
+    const RANDOM_BYTES: usize = 16;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut random = [0_u8; RANDOM_BYTES];
+    getrandom::fill(&mut random)
+        .map_err(|_| io::Error::other("secure randomness is unavailable"))?;
+    let mut id = String::with_capacity(RANDOM_BYTES * 2);
+    for byte in random {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(id)
 }
 
 async fn read_prompt() -> Result<Option<String>, io::Error> {

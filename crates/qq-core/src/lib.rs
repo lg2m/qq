@@ -53,26 +53,30 @@ impl Runtime {
 
     /// Runs one command and returns events as they become available.
     pub fn run(&self, command: RunCommand) -> RunStream {
+        self.run_messages(vec![Message::user(command.into_prompt())])
+    }
+
+    /// Runs one model turn with explicit prior conversation context.
+    pub fn run_messages(&self, messages: Vec<Message>) -> RunStream {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
         let max_output_tokens = self.max_output_tokens;
         Box::pin(stream! {
             yield RunEvent::Started;
 
-            let prompt = command.into_prompt();
-            if prompt.trim().is_empty() {
+            if messages.is_empty()
+                || messages
+                    .iter()
+                    .any(|message| message.content().trim().is_empty())
+            {
                 yield RunEvent::Failed {
                     kind: RunFailureKind::InvalidCommand,
-                    message: "prompt must not be empty".to_owned(),
+                    message: "conversation messages must not be empty".to_owned(),
                 };
                 return;
             }
 
-            let request = ModelRequest::new(
-                model,
-                vec![Message::user(prompt)],
-                max_output_tokens,
-            );
+            let request = ModelRequest::new(model, messages, max_output_tokens);
             let mut provider_events = provider.stream(request);
 
             while let Some(event) = provider_events.next().await {
@@ -205,6 +209,39 @@ mod tests {
         assert_eq!(request.model(), "gpt-test");
         assert_eq!(request.max_output_tokens(), 256);
         assert_eq!(request.messages(), [Message::user("say hello")]);
+    }
+
+    #[tokio::test]
+    async fn passes_multi_turn_context_to_the_provider() {
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        runtime
+            .run_messages(vec![
+                Message::user("hey"),
+                Message::assistant("Hello!"),
+                Message::user("what was my first message?"),
+            ])
+            .collect::<Vec<_>>()
+            .await;
+
+        let request = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            request.messages(),
+            [
+                Message::user("hey"),
+                Message::assistant("Hello!"),
+                Message::user("what was my first message?"),
+            ]
+        );
     }
 
     #[tokio::test]

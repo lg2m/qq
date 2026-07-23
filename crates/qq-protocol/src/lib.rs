@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,12 +65,14 @@ pub enum RunFailureKind {
     ProviderProtocol,
 }
 
-/// One stateless prompt submitted to a QQ server.
+/// One prompt submitted to a QQ server, optionally within a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AskRequest {
     pub prompt: String,
     pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +87,7 @@ impl AskRequest {
         Self {
             prompt: prompt.into(),
             workspace,
+            session_id: None,
             model: None,
             max_output_tokens: None,
             organization: None,

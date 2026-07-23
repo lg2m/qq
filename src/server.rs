@@ -46,6 +46,7 @@ pub(crate) const MAX_PROMPT_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_WORKSPACE_BYTES: usize = 4096;
 pub(crate) const MAX_MODEL_BYTES: usize = 512;
 pub(crate) const MAX_ORGANIZATION_BYTES: usize = 512;
+pub(crate) const SESSION_ID_HEX_BYTES: usize = 32;
 pub(crate) const MAX_EVENT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_HEALTH_BYTES: usize = 16 * 1024;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -595,6 +596,14 @@ pub(crate) fn validate_ask_request(request: &AskRequest) -> Result<(), &'static 
     }
     if request.prompt.len() > MAX_PROMPT_BYTES {
         return Err("prompt is too large");
+    }
+    if request.session_id.as_ref().is_some_and(|session_id| {
+        session_id.len() != SESSION_ID_HEX_BYTES
+            || !session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err("session ID is invalid");
     }
     let workspace = request
         .workspace
@@ -1263,6 +1272,23 @@ mod tests {
         );
         assert_eq!(requests.lock().unwrap().as_slice(), [request]);
         server.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn validates_session_identifiers() {
+        let mut request = test_request("hello");
+        request.session_id = Some("0123456789abcdef0123456789abcdef".to_owned());
+        assert_eq!(validate_ask_request(&request), Ok(()));
+
+        for invalid in [
+            "",
+            "0123456789abcdef",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            request.session_id = Some(invalid.to_owned());
+            assert_eq!(validate_ask_request(&request), Err("session ID is invalid"));
+        }
     }
 
     #[tokio::test]
