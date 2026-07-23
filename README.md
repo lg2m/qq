@@ -86,4 +86,5 @@ The interactive composer recognizes `/models`, `/new`, `/sessions` (also
 `/resume`), and `/quit` (also `/exit`). Selecting a model creates a new session
 because a session's model is immutable. The picker only lists built-in
 providers with an available credential, and the footer shows context usage,
-the selected model, working directory, and focused session cost.
+the selected model, working directory, and focused session cost. Slash command
+suggestions run immediately when selected with Enter or Tab.

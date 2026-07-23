@@ -881,23 +881,7 @@ impl App {
             .find(|command| command.name == prompt)
             .map(|command| command.action)
         {
-            self.input.clear();
-            match action {
-                SlashAction::Quit => {
-                    self.quit = true;
-                    return (true, Vec::new());
-                }
-                SlashAction::Models => return self.open_models(),
-                SlashAction::New => return self.create_session(None),
-                SlashAction::Sessions => {
-                    self.model_picker = None;
-                    self.navigator = self
-                        .focused
-                        .or_else(|| self.thread_order().first().copied());
-                    self.navigator_open = true;
-                    return (true, Vec::new());
-                }
-            }
+            return self.execute_slash_action(action);
         }
         let Some(session_id) = self.focused else {
             self.status = Some("create a session before sending a prompt".to_owned());
@@ -960,7 +944,8 @@ impl App {
     }
 
     fn handle_slash_key(&mut self, code: KeyCode) -> Option<(bool, Vec<ClientRequest>)> {
-        let command_count = self.filtered_slash_commands().len();
+        let commands = self.filtered_slash_commands();
+        let command_count = commands.len();
         if command_count == 0 {
             return None;
         }
@@ -973,16 +958,33 @@ impl App {
                 self.slash_selected = (self.slash_selected + 1).min(command_count - 1);
                 Some((true, Vec::new()))
             }
-            KeyCode::Tab => {
-                let command =
-                    self.filtered_slash_commands()[self.slash_selected.min(command_count - 1)].name;
-                let changed = self.input != command;
-                self.input.clear();
-                self.input.push_str(command);
-                self.slash_selected = 0;
-                Some((changed, Vec::new()))
+            KeyCode::Enter | KeyCode::Tab => {
+                Some(self.execute_slash_action(
+                    commands[self.slash_selected.min(command_count - 1)].action,
+                ))
             }
             _ => None,
+        }
+    }
+
+    fn execute_slash_action(&mut self, action: SlashAction) -> (bool, Vec<ClientRequest>) {
+        self.input.clear();
+        self.slash_selected = 0;
+        match action {
+            SlashAction::Quit => {
+                self.quit = true;
+                (true, Vec::new())
+            }
+            SlashAction::Models => self.open_models(),
+            SlashAction::New => self.create_session(None),
+            SlashAction::Sessions => {
+                self.model_picker = None;
+                self.navigator = self
+                    .focused
+                    .or_else(|| self.thread_order().first().copied());
+                self.navigator_open = true;
+                (true, Vec::new())
+            }
         }
     }
 
@@ -1250,8 +1252,9 @@ mod tests {
     }
 
     #[test]
-    fn slash_autocomplete_filters_selects_and_completes_commands() {
+    fn slash_autocomplete_filters_selects_and_executes_commands() {
         let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
         app.input = "/".to_owned();
 
         assert_eq!(
@@ -1271,8 +1274,11 @@ mod tests {
         assert_eq!(app.slash_selected, 0);
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.input, "/sessions");
+        assert!(app.input.is_empty());
+        assert!(app.navigator_open);
 
+        app.navigator = None;
+        app.navigator_open = false;
         app.input = "/qu".to_owned();
         app.slash_selected = 0;
         assert_eq!(
@@ -1280,8 +1286,9 @@ mod tests {
             "/quit",
             "a command prefix should hide unrelated commands"
         );
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.input, "/quit");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        assert!(app.quit);
     }
 
     #[test]
