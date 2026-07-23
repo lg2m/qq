@@ -8,11 +8,15 @@ publish = false
 
 [dependencies]
 async-stream.workspace = true
+crossbeam-channel.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 qq-provider.workspace = true
 qq-protocol.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile.workspace = true

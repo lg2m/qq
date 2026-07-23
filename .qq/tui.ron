@@ -1,0 +1,14 @@
+(
+    version: 1,
+    layout: Threadline,
+    bindings: (
+        select_threadline: ["F1"],
+        select_fold_focus: ["F2"],
+        next_layout: ["Ctrl-N"],
+        previous_layout: ["Ctrl-P"],
+        toggle_navigator: ["Ctrl-T"],
+        create_root_session: ["Alt-N"],
+        create_child_session: ["Alt-C"],
+        cancel_run: ["Ctrl-X"],
+    ),
+)

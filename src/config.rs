@@ -18,6 +18,9 @@ mod document;
 mod loader;
 mod managed;
 mod remote;
+mod tui;
+
+pub use tui::{TuiConfigSnapshot, TuiSourceReport};
 
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -283,6 +286,15 @@ impl ConfigLoader {
 
     pub fn load(&self, request: &LoadRequest) -> Result<ConfigSnapshot, ConfigError> {
         loader::load(self, request)
+    }
+
+    pub fn load_tui(&self, cwd: &Path) -> Result<TuiConfigSnapshot, ConfigError> {
+        tui::load(self, cwd)
+    }
+
+    pub(crate) fn session_database_path(&self) -> Result<PathBuf, ConfigError> {
+        loader::ensure_data_directory(self.paths.data_dir())?;
+        Ok(self.paths.data_dir().join("sessions.sqlite3"))
     }
 
     /// Grants every currently pending project source digest in one atomic state update.
@@ -1055,6 +1067,8 @@ pub enum ConfigError {
     UnknownProvider(String),
     #[error("managed policy {rule} was violated: {message}")]
     PolicyViolation { rule: &'static str, message: String },
+    #[error("TUI settings are invalid: {message}")]
+    InvalidTuiSettings { message: String },
     #[error(
         "the current binary must integrate ConfigSnapshot and resolve its SecretRef externally"
     )]

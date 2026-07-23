@@ -11,6 +11,13 @@ use qq_protocol::{RunCommand, RunEvent, RunFailureKind};
 use qq_provider::{Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent};
 use thiserror::Error;
 
+mod sessions;
+
+pub use sessions::{
+    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
+    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
+};
+
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
 
 /// Runs protocol commands against a configured model provider.

@@ -22,7 +22,7 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Request, State, rejection::BytesRejection},
+    extract::{DefaultBodyLimit, Path as AxumPath, Request, State, rejection::BytesRejection},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Response, sse::Event, sse::KeepAlive, sse::Sse},
@@ -30,11 +30,18 @@ use axum::{
 };
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use qq_core::RunStream;
-use qq_protocol::{AskRequest, PROTOCOL_VERSION, ServerInfo};
+use qq_core::{RunStream, SessionEventStream};
+use qq_protocol::{
+    AskRequest, CommandReceipt, CommandRequest, PROTOCOL_VERSION, ServerInfo, SessionCommand,
+    SnapshotRequest, SubscribeRequest, WorkspaceId, WorkspaceSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{Semaphore, oneshot},
+    task::JoinHandle,
+};
 
 const METADATA_FORMAT_VERSION: u16 = 1;
 const METADATA_FILE_NAME: &str = "server.ron";
@@ -54,14 +61,35 @@ const STARTUP_RETRIES: usize = 8;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(25);
 const TOKEN_BYTES: usize = 32;
 const TOKEN_HEX_BYTES: usize = TOKEN_BYTES * 2;
+const MAX_CONCURRENT_SESSION_REQUESTS: usize = 64;
+const MAX_CONCURRENT_SUBSCRIPTIONS: usize = 64;
 
 /// Future returned by [`AskHandler`].
 pub type AskFuture =
     Pin<Box<dyn Future<Output = Result<RunStream, AskHandlerError>> + Send + 'static>>;
 
+pub type CommandFuture =
+    Pin<Box<dyn Future<Output = Result<CommandReceipt, AskHandlerError>> + Send + 'static>>;
+pub type SnapshotFuture =
+    Pin<Box<dyn Future<Output = Result<WorkspaceSnapshot, AskHandlerError>> + Send + 'static>>;
+
 /// Root-supplied application seam for handling one request.
 pub trait AskHandler: Send + Sync + 'static {
-    fn ask(&self, request: AskRequest) -> AskFuture;
+    fn ask(&self, _request: AskRequest) -> AskFuture {
+        Box::pin(async { Err(AskHandlerError::Unavailable) })
+    }
+
+    fn command(&self, _request: CommandRequest) -> CommandFuture {
+        Box::pin(async { Err(AskHandlerError::Unavailable) })
+    }
+
+    fn snapshot(&self, _request: SnapshotRequest) -> SnapshotFuture {
+        Box::pin(async { Err(AskHandlerError::Unavailable) })
+    }
+
+    fn subscribe(&self, _request: SubscribeRequest) -> Result<SessionEventStream, AskHandlerError> {
+        Err(AskHandlerError::Unavailable)
+    }
 }
 
 impl<F, Fut> AskHandler for F
@@ -503,16 +531,28 @@ pub async fn start(
 struct AppState {
     handler: Arc<dyn AskHandler>,
     connection: ServerConnection,
+    session_requests: Arc<Semaphore>,
+    subscriptions: Arc<Semaphore>,
 }
 
 fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router {
     let state = AppState {
         handler,
         connection,
+        session_requests: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_REQUESTS)),
+        subscriptions: Arc::new(Semaphore::new(MAX_CONCURRENT_SUBSCRIPTIONS)),
     };
     Router::new()
         .route("/v1/health", get(health))
-        .route("/v1/ask", post(ask))
+        .route("/v1/workspaces/resolve", post(resolve_workspace))
+        .route("/v1/workspaces/snapshot", post(workspace_snapshot))
+        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions/prompts", post(submit_prompt))
+        .route("/v1/runs/cancel", post(cancel_run))
+        .route(
+            "/v1/workspaces/{workspace_id}/events",
+            get(workspace_events),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .method_not_allowed_fallback(method_not_allowed)
@@ -578,6 +618,9 @@ async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>)
         while let Some(event) = events.next().await {
             let encoded = serde_json::to_string(&event)
                 .expect("RunEvent serialization cannot fail");
+            if encoded.len() > MAX_EVENT_BYTES {
+                return;
+            }
             yield Ok::<Event, Infallible>(Event::default().data(encoded));
         }
     };
@@ -588,6 +631,168 @@ async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>)
                 .text("keep-alive"),
         )
         .into_response()
+}
+
+async fn resolve_workspace(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::ResolveWorkspace { .. })
+    })
+    .await
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::CreateSession { .. })
+    })
+    .await
+}
+
+async fn submit_prompt(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::SubmitPrompt { .. })
+    })
+    .await
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::CancelRun { .. })
+    })
+    .await
+}
+
+async fn session_command(
+    state: AppState,
+    body: Result<Bytes, BytesRejection>,
+    expected: impl FnOnce(&SessionCommand) -> bool,
+) -> Response {
+    let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many requests are active",
+        );
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
+    };
+    let request = match serde_json::from_slice::<CommandRequest>(&body) {
+        Ok(request) if expected(&request.command) => request,
+        Ok(_) | Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
+    };
+    match state.handler.command(request).await {
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(error) => handler_error_response(error),
+    }
+}
+
+async fn workspace_snapshot(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many requests are active",
+        );
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
+    };
+    let request = match serde_json::from_slice::<SnapshotRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
+    };
+    match state.handler.snapshot(request).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => handler_error_response(error),
+    }
+}
+
+async fn workspace_events(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let workspace_id = match workspace_id.parse::<WorkspaceId>() {
+        Ok(workspace_id) => workspace_id,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "workspace ID is invalid"),
+    };
+    let after = match headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+    {
+        Some(cursor) => cursor,
+        None => return api_error(StatusCode::BAD_REQUEST, "Last-Event-ID is required"),
+    };
+    let Ok(permit) = Arc::clone(&state.subscriptions).try_acquire_owned() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many event subscriptions are active",
+        );
+    };
+    let events = match state.handler.subscribe(SubscribeRequest {
+        workspace_id,
+        after,
+    }) {
+        Ok(events) => events,
+        Err(error) => return handler_error_response(error),
+    };
+    let output = stream! {
+        let _permit = permit;
+        let mut events = events;
+        while let Some(event) = events.next().await {
+            let event = match event {
+                Ok(event) => event,
+                Err(_) => return,
+            };
+            let encoded = serde_json::to_string(&event)
+                .expect("SessionEventEnvelope serialization cannot fail");
+            if encoded.len() > MAX_EVENT_BYTES {
+                return;
+            }
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .id(event.cursor.to_string())
+                    .event("session_event")
+                    .data(encoded),
+            );
+        }
+    };
+    Sse::new(output)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+fn handler_error_response(error: AskHandlerError) -> Response {
+    match error {
+        AskHandlerError::InvalidRequest => {
+            api_error(StatusCode::BAD_REQUEST, "request was rejected")
+        }
+        AskHandlerError::Unavailable => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "request service is unavailable",
+        ),
+        AskHandlerError::Internal => api_error(StatusCode::INTERNAL_SERVER_ERROR, "request failed"),
+    }
 }
 
 pub(crate) fn validate_ask_request(request: &AskRequest) -> Result<(), &'static str> {
@@ -1134,7 +1339,7 @@ mod tests {
         time::SystemTime,
     };
 
-    use futures_util::{StreamExt, stream as futures_stream};
+    use futures_util::stream as futures_stream;
     use qq_protocol::RunEvent;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1247,30 +1452,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_events_and_invokes_the_handler_once() {
+    async fn legacy_ask_route_is_not_exposed() {
         let directory = TestDirectory::new();
-        let expected_events = vec![
-            RunEvent::Started,
-            RunEvent::OutputTextDelta {
-                text: "hello".to_owned(),
-            },
-            RunEvent::Completed,
-        ];
-        let (handler, requests) = fake_handler(expected_events.clone());
+        let (handler, requests) = fake_handler(vec![RunEvent::Completed]);
         let server = start_test_server(directory.paths(), handler).await;
-        let request = test_request("say hello");
-
-        let results = crate::client::ask(server.connection(), request.clone())
+        let response = server
+            .connection()
+            .authorize(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .post(server.connection().endpoint("/v1/ask")),
+            )
+            .json(&test_request("say hello"))
+            .send()
             .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await;
+            .unwrap();
 
-        assert_eq!(
-            results,
-            expected_events.into_iter().map(Ok).collect::<Vec<_>>()
-        );
-        assert_eq!(requests.lock().unwrap().as_slice(), [request]);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(requests.lock().unwrap().is_empty());
         server.shutdown().await.unwrap();
     }
 
@@ -1289,28 +1490,6 @@ mod tests {
             request.session_id = Some(invalid.to_owned());
             assert_eq!(validate_ask_request(&request), Err("session ID is invalid"));
         }
-    }
-
-    #[tokio::test]
-    async fn client_reports_a_missing_terminal_event() {
-        let directory = TestDirectory::new();
-        let (handler, _) = fake_handler(vec![RunEvent::Started]);
-        let server = start_test_server(directory.paths(), handler).await;
-
-        let results = crate::client::ask(server.connection(), test_request("hello"))
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(
-            results,
-            vec![
-                Ok(RunEvent::Started),
-                Err(crate::client::ClientError::MissingTerminalEvent),
-            ]
-        );
-        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]

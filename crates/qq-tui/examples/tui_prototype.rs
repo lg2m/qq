@@ -58,6 +58,22 @@ impl Concept {
             Self::FoldFocus => "Fold / Focus",
         }
     }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Threadline => Self::Marginalia,
+            Self::Marginalia => Self::FoldFocus,
+            Self::FoldFocus => Self::Threadline,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Threadline => Self::FoldFocus,
+            Self::Marginalia => Self::Threadline,
+            Self::FoldFocus => Self::Marginalia,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,7 +191,7 @@ impl App {
             "```rust\n",
             "render(changed_rows_only);\n",
             "```\n\n",
-            "Use **F1-F3** to compare the information hierarchy, then open the ",
+            "Use **F1-F3** or `Ctrl-P`/`Ctrl-N` to compare the information hierarchy, then open the ",
             "thread navigator with `Ctrl-T`."
         );
 
@@ -387,6 +403,12 @@ impl App {
             KeyCode::F(1) => self.concept = Concept::Threadline,
             KeyCode::F(2) => self.concept = Concept::Marginalia,
             KeyCode::F(3) => self.concept = Concept::FoldFocus,
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.concept = self.concept.previous();
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.concept = self.concept.next();
+            }
             KeyCode::Tab if self.navigator.is_none() => self.thinking = self.thinking.next(),
             KeyCode::Char('t')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.navigator.is_none() =>
@@ -574,7 +596,7 @@ impl App {
         frame.push(self.composer(width));
         frame.push(truncate_line(
             Line::styled(
-                " F1-F3 concepts   Tab reasoning   Ctrl-T threads   Esc parent   Ctrl-C quit",
+                " F1-F3 / Ctrl-P,N views   Tab reasoning   Ctrl-T threads   Esc parent   Ctrl-C quit",
                 muted(),
             ),
             width,
@@ -1871,6 +1893,23 @@ mod tests {
                     .any(|row| { row.to_ascii_lowercase().contains("reasoning") })
             );
         }
+    }
+
+    #[test]
+    fn view_shortcuts_select_and_cycle_every_concept() {
+        let mut app = App::new();
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(app.concept, Concept::Marginalia);
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(app.concept, Concept::Threadline);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.concept, Concept::Marginalia);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.concept, Concept::FoldFocus);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.concept, Concept::Marginalia);
     }
 
     #[test]

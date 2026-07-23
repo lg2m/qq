@@ -633,3 +633,109 @@ fn rejects_symlink_sources() {
         Err(ConfigError::SymlinkSource { .. })
     ));
 }
+
+#[test]
+fn tui_config_layers_defaults_global_and_root_to_current_projects() {
+    let tree = TempTree::new();
+    fs::create_dir_all(tree.path("work/child/deeper")).unwrap();
+    tree.write(
+        "global/tui.ron",
+        r#"(
+            version: 1,
+            bindings: (next_layout: ["Ctrl-L"]),
+        )"#,
+    );
+    tree.write(
+        "work/.qq/tui.ron",
+        r#"(
+            version: 1,
+            layout: FoldFocus,
+            bindings: (select_threadline: ["F3"]),
+        )"#,
+    );
+    tree.write(
+        "work/child/.qq/tui.ron",
+        r#"(
+            version: 1,
+            bindings: (next_layout: ["Ctrl-K"]),
+        )"#,
+    );
+
+    let snapshot = tree
+        .loader()
+        .load_tui(&tree.path("work/child/deeper"))
+        .unwrap();
+
+    assert_eq!(
+        snapshot.settings().initial_layout(),
+        qq_tui::Layout::FoldFocus
+    );
+    assert_eq!(
+        binding_labels(snapshot.settings(), qq_tui::Action::SelectThreadline),
+        ["F3"]
+    );
+    assert_eq!(
+        binding_labels(snapshot.settings(), qq_tui::Action::NextLayout),
+        ["Ctrl-K"]
+    );
+    assert_eq!(snapshot.provenance().layout().kind(), SourceKind::Project);
+    assert!(
+        snapshot
+            .provenance()
+            .binding(qq_tui::Action::PreviousLayout)
+            .kind()
+            == SourceKind::Compiled
+    );
+    assert!(
+        snapshot
+            .provenance()
+            .binding(qq_tui::Action::NextLayout)
+            .path()
+            .unwrap()
+            .ends_with("work/child/.qq/tui.ron")
+    );
+}
+
+#[test]
+fn tui_config_rejects_invalid_and_colliding_bindings() {
+    let tree = TempTree::new();
+    tree.write(
+        "work/.qq/tui.ron",
+        r#"(version: 1, bindings: (next_layout: ["n"]))"#,
+    );
+    assert!(matches!(
+        tree.loader().load_tui(&tree.path("work")),
+        Err(ConfigError::Parse { .. })
+    ));
+
+    tree.write(
+        "work/.qq/tui.ron",
+        r#"(version: 1, bindings: (select_fold_focus: ["F1"]))"#,
+    );
+    assert!(matches!(
+        tree.loader().load_tui(&tree.path("work")),
+        Err(ConfigError::InvalidTuiSettings { .. })
+    ));
+}
+
+#[test]
+fn tui_config_allows_disabling_an_action() {
+    let tree = TempTree::new();
+    tree.write(
+        "work/.qq/tui.ron",
+        r#"(version: 1, bindings: (cancel_run: []))"#,
+    );
+
+    let snapshot = tree.loader().load_tui(&tree.path("work")).unwrap();
+
+    assert!(binding_labels(snapshot.settings(), qq_tui::Action::CancelRun).is_empty());
+}
+
+fn binding_labels(settings: &qq_tui::Settings, action: qq_tui::Action) -> Vec<String> {
+    settings
+        .bindings()
+        .iter()
+        .find(|(candidate, _)| *candidate == action)
+        .map(|(_, bindings)| bindings.iter().map(ToString::to_string).collect())
+        .unwrap_or_default()
+}

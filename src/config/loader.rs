@@ -471,7 +471,7 @@ fn apply_document(
     Ok(())
 }
 
-fn canonical_working_directory(path: &Path) -> Result<PathBuf, ConfigError> {
+pub(super) fn canonical_working_directory(path: &Path) -> Result<PathBuf, ConfigError> {
     let canonical = fs::canonicalize(path).map_err(|_| ConfigError::InvalidWorkingDirectory {
         path: path.to_owned(),
     })?;
@@ -485,7 +485,7 @@ fn canonical_working_directory(path: &Path) -> Result<PathBuf, ConfigError> {
     Ok(canonical)
 }
 
-fn project_directories(cwd: &Path) -> Vec<PathBuf> {
+pub(super) fn project_directories(cwd: &Path) -> Vec<PathBuf> {
     let root = cwd
         .ancestors()
         .find(|directory| is_vcs_root(directory))

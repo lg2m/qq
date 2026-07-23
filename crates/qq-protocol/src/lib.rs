@@ -6,7 +6,19 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+mod ids;
+mod sessions;
+
+pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, WorkspaceId};
+pub use sessions::{
+    CommandOutcome, CommandReceipt, CommandRequest, CursorError, EventCursor, MessageRole,
+    MessageSnapshot, MessageState, ModelSelection, RunFailure, RunOutcome, RunSnapshot, RunStatus,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot, SessionStatus,
+    SessionSummary, SnapshotRequest, SubscribeRequest, TextChannel, WorkspaceSnapshot,
+    WorkspaceSummary,
+};
+
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

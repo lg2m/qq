@@ -2,14 +2,12 @@
 
 use std::{
     error::Error,
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal, Read},
     process::ExitCode,
     sync::Arc,
 };
 
-use async_stream::stream;
-use futures_util::StreamExt;
-use qq_protocol::{AskRequest, RunCommand, RunEvent, RunFailureKind};
+use qq_protocol::{RunCommand, RunEvent};
 
 mod auth;
 mod cli;
@@ -72,23 +70,9 @@ impl CliOverrides {
         }
         Ok(request.with_overrides(values))
     }
-
-    fn ask_request(&self, prompt: String) -> Result<AskRequest, io::Error> {
-        let mut request = AskRequest::new(prompt, std::env::current_dir()?);
-        request.model.clone_from(&self.model);
-        request.max_output_tokens = self.max_output_tokens;
-        request.organization.clone_from(&self.organization);
-        Ok(request)
-    }
 }
 
 async fn ask(prompt: String, overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
-    if let Some(connection) = client::discover().await? {
-        let request = overrides.ask_request(prompt)?;
-        let events = client::ask(&connection, request).await?;
-        return render_client_events(events).await;
-    }
-
     let factory = runtime::RuntimeFactory::system()?;
     let load = overrides.load_request()?;
     let runtime = tokio::task::spawn_blocking(move || factory.runtime_for(&load)).await??;
@@ -96,9 +80,8 @@ async fn ask(prompt: String, overrides: &CliOverrides) -> Result<(), Box<dyn Err
 }
 
 async fn serve(bind: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {
-    let handler = Arc::new(runtime::RuntimeHandler::new(
-        runtime::RuntimeFactory::system()?,
-    ));
+    let handler =
+        Arc::new(runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?);
     let options = server::ServerOptions::for_user()?.with_bind_address(bind);
     match server::start(handler, options).await? {
         server::StartOutcome::Existing(connection) => {
@@ -114,13 +97,23 @@ async fn serve(bind: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {
 }
 
 async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::other("interactive mode requires a terminal").into());
+    }
+    let loader = config::ConfigLoader::system()?;
+    let request = overrides.load_request()?;
+    let (snapshot, tui) = tokio::task::spawn_blocking(move || {
+        let snapshot = loader.load(&request)?;
+        let tui = loader.load_tui(request.cwd())?;
+        Ok::<_, config::ConfigError>((snapshot, tui))
+    })
+    .await??;
     let mut embedded = None;
     let connection = if let Some(connection) = client::discover().await? {
         connection
     } else {
-        let handler = Arc::new(runtime::RuntimeHandler::new(
-            runtime::RuntimeFactory::system()?,
-        ));
+        let handler =
+            Arc::new(runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?);
         match server::start(handler, server::ServerOptions::for_user()?).await? {
             server::StartOutcome::Existing(connection) => connection,
             server::StartOutcome::Started(server) => {
@@ -131,87 +124,26 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    eprintln!(
-        "qq connected to {}. Enter a prompt, or /quit.",
-        connection.address()
-    );
-    let session_id = new_session_id()?;
-    loop {
-        let Some(prompt) = read_prompt().await? else {
-            break;
-        };
-        if matches!(prompt.as_str(), "/quit" | "/exit") {
-            break;
-        }
-        if prompt.is_empty() {
-            continue;
-        }
-        let mut request = overrides.ask_request(prompt)?;
-        request.session_id = Some(session_id.clone());
-        match client::ask(&connection, request).await {
-            Ok(events) => {
-                if let Err(error) = render_client_events(events).await {
-                    eprintln!("error: {error}");
-                }
-            }
-            Err(error) => eprintln!("error: {error}"),
-        }
-    }
+    let workspace = std::fs::canonicalize(std::env::current_dir()?)?;
+    let model = qq_protocol::ModelSelection {
+        model: Some(snapshot.model().as_str().to_owned()),
+        max_output_tokens: Some(snapshot.max_output_tokens()),
+        organization: snapshot.organization().map(str::to_owned),
+    };
+    let tui_client = client::TuiClient::start(connection, workspace, model.clone())?;
+    let result = qq_tui::run(
+        tui_client,
+        qq_tui::TuiOptions {
+            settings: tui.settings().clone(),
+            model,
+        },
+    )
+    .await;
 
     if let Some(server) = embedded {
         server.shutdown().await?;
     }
-    Ok(())
-}
-
-fn new_session_id() -> Result<String, io::Error> {
-    const RANDOM_BYTES: usize = 16;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut random = [0_u8; RANDOM_BYTES];
-    getrandom::fill(&mut random)
-        .map_err(|_| io::Error::other("secure randomness is unavailable"))?;
-    let mut id = String::with_capacity(RANDOM_BYTES * 2);
-    for byte in random {
-        id.push(HEX[(byte >> 4) as usize] as char);
-        id.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    Ok(id)
-}
-
-async fn read_prompt() -> Result<Option<String>, io::Error> {
-    tokio::task::spawn_blocking(|| {
-        eprint!("> ");
-        io::stderr().flush()?;
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
-        while matches!(line.as_bytes().last(), Some(b'\n' | b'\r')) {
-            line.pop();
-        }
-        Ok(Some(line))
-    })
-    .await
-    .map_err(io::Error::other)?
-}
-
-async fn render_client_events(mut events: client::RunEventStream) -> Result<(), Box<dyn Error>> {
-    let converted = stream! {
-        while let Some(event) = events.next().await {
-            match event {
-                Ok(event) => yield event,
-                Err(error) => {
-                    yield RunEvent::Failed {
-                        kind: RunFailureKind::Server,
-                        message: error.to_string(),
-                    };
-                    return;
-                }
-            }
-        }
-    };
-    render_events(converted).await
+    result.map_err(Into::into)
 }
 
 async fn render_events(
@@ -236,6 +168,10 @@ fn config_command(
     match command {
         cli::ConfigCommand::Paths => {
             println!("global:  {}", loader.paths().global_dir().display());
+            println!(
+                "global TUI: {}",
+                loader.paths().global_dir().join("tui.ron").display()
+            );
             println!("data:    {}", loader.paths().data_dir().display());
             println!("managed: {}", loader.paths().managed_dir().display());
             println!(
@@ -259,24 +195,52 @@ fn config_command(
                 }
                 Err(error) => return Err(error.into()),
             }
+            print_tui_sources(loader.load_tui(request.cwd())?.source_reports());
         }
         cli::ConfigCommand::Check => {
-            loader.load(&overrides.load_request()?)?;
+            let request = overrides.load_request()?;
+            loader.load(&request)?;
+            loader.load_tui(request.cwd())?;
             println!("configuration is valid");
         }
         cli::ConfigCommand::Show => {
-            let snapshot = loader.load(&overrides.load_request()?)?;
+            let request = overrides.load_request()?;
+            let snapshot = loader.load(&request)?;
             print_snapshot(&snapshot);
+            print_tui_snapshot(&loader.load_tui(request.cwd())?);
         }
         cli::ConfigCommand::Explain { field } => {
-            let snapshot = loader.load(&overrides.load_request()?)?;
-            let source = match field.as_str() {
-                "organization" => snapshot.provenance().organization(),
-                "model" => snapshot.provenance().model(),
-                "max_output_tokens" => snapshot.provenance().max_output_tokens(),
-                _ => field
-                    .strip_prefix("provider.")
-                    .and_then(|name| snapshot.provenance().provider(name)),
+            let request = overrides.load_request()?;
+            let source = if field == "tui.layout" {
+                Some(
+                    loader
+                        .load_tui(request.cwd())?
+                        .provenance()
+                        .layout()
+                        .clone(),
+                )
+            } else if let Some(action) = field
+                .strip_prefix("tui.bindings.")
+                .and_then(parse_tui_action)
+            {
+                Some(
+                    loader
+                        .load_tui(request.cwd())?
+                        .provenance()
+                        .binding(action)
+                        .clone(),
+                )
+            } else {
+                let snapshot = loader.load(&request)?;
+                match field.as_str() {
+                    "organization" => snapshot.provenance().organization(),
+                    "model" => snapshot.provenance().model(),
+                    "max_output_tokens" => snapshot.provenance().max_output_tokens(),
+                    _ => field
+                        .strip_prefix("provider.")
+                        .and_then(|name| snapshot.provenance().provider(name)),
+                }
+                .cloned()
             };
             let source =
                 source.ok_or_else(|| format!("unknown or unset config field {field:?}"))?;
@@ -289,6 +253,12 @@ fn config_command(
 fn print_sources(reports: &[config::SourceReport]) {
     for report in reports {
         println!("{:?}\t{}", report.status(), report.source());
+    }
+}
+
+fn print_tui_sources(reports: &[config::TuiSourceReport]) {
+    for report in reports {
+        println!("Applied\t{}", report.source());
     }
 }
 
@@ -312,6 +282,43 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
             config::ProviderConfig::Custom { .. } => "Custom",
         };
         println!("  {name}: {kind}");
+    }
+}
+
+fn print_tui_snapshot(snapshot: &config::TuiConfigSnapshot) {
+    println!("tui:");
+    println!("  layout: {:?}", snapshot.settings().initial_layout());
+    println!("  bindings:");
+    for (action, bindings) in snapshot.settings().bindings() {
+        let labels: Vec<_> = bindings.iter().map(ToString::to_string).collect();
+        println!("    {}: {}", tui_action_name(*action), labels.join(", "));
+    }
+}
+
+fn parse_tui_action(value: &str) -> Option<qq_tui::Action> {
+    match value {
+        "select_threadline" => Some(qq_tui::Action::SelectThreadline),
+        "select_fold_focus" => Some(qq_tui::Action::SelectFoldFocus),
+        "next_layout" => Some(qq_tui::Action::NextLayout),
+        "previous_layout" => Some(qq_tui::Action::PreviousLayout),
+        "toggle_navigator" => Some(qq_tui::Action::ToggleNavigator),
+        "create_root_session" => Some(qq_tui::Action::CreateRootSession),
+        "create_child_session" => Some(qq_tui::Action::CreateChildSession),
+        "cancel_run" => Some(qq_tui::Action::CancelRun),
+        _ => None,
+    }
+}
+
+fn tui_action_name(action: qq_tui::Action) -> &'static str {
+    match action {
+        qq_tui::Action::SelectThreadline => "select_threadline",
+        qq_tui::Action::SelectFoldFocus => "select_fold_focus",
+        qq_tui::Action::NextLayout => "next_layout",
+        qq_tui::Action::PreviousLayout => "previous_layout",
+        qq_tui::Action::ToggleNavigator => "toggle_navigator",
+        qq_tui::Action::CreateRootSession => "create_root_session",
+        qq_tui::Action::CreateChildSession => "create_child_session",
+        qq_tui::Action::CancelRun => "cancel_run",
     }
 }
 

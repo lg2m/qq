@@ -1,17 +1,19 @@
 //! Application configuration to model-runtime composition.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use futures_util::{StreamExt, stream};
-use qq_core::{RunStream, Runtime, RuntimeConfigError};
-use qq_protocol::{AskRequest, RunCommand, RunEvent, RunFailureKind};
+use qq_core::{
+    Runtime, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
+    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
+};
+use qq_protocol::{CommandRequest, RunFailureKind, SnapshotRequest, SubscribeRequest};
 use qq_provider::{
-    EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, Message, ProviderCompiler,
-    ProviderError, ProviderRecipe, bedrock::BedrockAuth as ProviderBedrockAuth,
+    EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderError,
+    ProviderRecipe, bedrock::BedrockAuth as ProviderBedrockAuth,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -24,7 +26,7 @@ use crate::{
         AwsAuth, BedrockAuth, ConfigError, ConfigLoader, ConfigSnapshot, Connection, LoadRequest,
         ProviderApi, ProviderAuth, ProviderConfig,
     },
-    server::{AskFuture, AskHandler, AskHandlerError},
+    server::{AskHandler, AskHandlerError, CommandFuture, SnapshotFuture},
 };
 
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -40,8 +42,6 @@ const GOOGLE_CREDENTIAL_ENDPOINT: &str = "https://generativelanguage.googleapis.
 const GOOGLE_STORED_CREDENTIAL: &str = "google/default";
 const GOOGLE_ENVIRONMENT_CREDENTIAL: &str = "GEMINI_API_KEY";
 const MAX_CACHED_RUNTIMES: usize = 16;
-const MAX_SESSIONS: usize = 16;
-const MAX_SESSION_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RuntimeFactory {
@@ -476,6 +476,51 @@ impl RuntimeFactory {
     }
 }
 
+impl RuntimeLoader for RuntimeFactory {
+    fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+        let factory = self.clone();
+        Box::pin(async move {
+            let build = tokio::task::spawn_blocking(move || {
+                let requested_workspace = PathBuf::from(&request.workspace);
+                let workspace = std::fs::canonicalize(&requested_workspace).map_err(|_| {
+                    ConfigError::InvalidWorkingDirectory {
+                        path: requested_workspace.clone(),
+                    }
+                })?;
+                if workspace != requested_workspace {
+                    return Err(ConfigError::InvalidWorkingDirectory {
+                        path: requested_workspace,
+                    }
+                    .into());
+                }
+                let mut load =
+                    LoadRequest::from_process_env(&workspace, request.model.max_output_tokens)?;
+                let mut overrides = load.overrides().clone();
+                if let Some(model) = request.model.model {
+                    overrides = overrides.with_model(model);
+                }
+                if let Some(organization) = request.model.organization {
+                    overrides = overrides.with_organization(organization);
+                }
+                load = load.with_overrides(overrides);
+                factory.runtime_for(&load)
+            })
+            .await;
+            match build {
+                Ok(Ok(runtime)) => Ok(runtime),
+                Ok(Err(error)) => Err(RuntimeLoadError {
+                    kind: error.failure_kind(),
+                    message: error.to_string(),
+                }),
+                Err(_) => Err(RuntimeLoadError {
+                    kind: RunFailureKind::Server,
+                    message: "runtime construction stopped unexpectedly".to_owned(),
+                }),
+            }
+        })
+    }
+}
+
 fn promote_cached_runtime(
     cache: &mut VecDeque<(RuntimeKey, Arc<Runtime>)>,
     key: &RuntimeKey,
@@ -530,401 +575,84 @@ impl ResolvedAuth {
 
 #[derive(Clone)]
 pub struct RuntimeHandler {
-    factory: RuntimeFactory,
-    sessions: Arc<Mutex<SessionStore>>,
+    durable: SessionRuntime,
 }
 
 impl RuntimeHandler {
-    #[must_use]
-    pub fn new(factory: RuntimeFactory) -> Self {
-        Self {
-            factory,
-            sessions: Arc::new(Mutex::new(SessionStore::default())),
-        }
+    pub async fn open(factory: RuntimeFactory) -> Result<Self, RuntimeHandlerError> {
+        let database_path = factory.inner.config.session_database_path()?;
+        let durable = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(factory.clone()),
+        )
+        .await?;
+        Ok(Self { durable })
     }
 }
 
 impl AskHandler for RuntimeHandler {
-    fn ask(&self, request: AskRequest) -> AskFuture {
-        let factory = self.factory.clone();
-        let sessions = Arc::clone(&self.sessions);
-        let AskRequest {
-            prompt,
-            workspace,
-            session_id,
-            model,
-            max_output_tokens,
-            organization,
-        } = request;
+    fn command(&self, request: CommandRequest) -> CommandFuture {
+        let runtime = self.durable.clone();
         Box::pin(async move {
-            let mut session = match session_id {
-                Some(session_id) => {
-                    sessions
-                        .lock()
-                        .map_err(|_| AskHandlerError::Internal)?
-                        .reserve(&session_id)
-                        .map_err(SessionError::handler_error)?;
-                    Some(SessionRun::new(Arc::clone(&sessions), session_id))
-                }
-                None => None,
-            };
-            let build = tokio::task::spawn_blocking(move || -> Result<_, RuntimeBuildError> {
-                let canonical_workspace = std::fs::canonicalize(&workspace).map_err(|_| {
-                    ConfigError::InvalidWorkingDirectory {
-                        path: workspace.clone(),
-                    }
-                })?;
-                let mut load =
-                    LoadRequest::from_process_env(&canonical_workspace, max_output_tokens)?;
-                let mut overrides = load.overrides().clone();
-                if let Some(model) = model {
-                    overrides = overrides.with_model(model);
-                }
-                if let Some(organization) = organization {
-                    overrides = overrides.with_organization(organization);
-                }
-                load = load.with_overrides(overrides);
-                let snapshot = factory.load(&load)?;
-                let organization = snapshot.organization().map(str::to_owned);
-                let (runtime, runtime_key) = factory.runtime_with_key_for_snapshot(&snapshot)?;
-                Ok((
-                    runtime,
-                    SessionIdentity {
-                        workspace: canonical_workspace,
-                        organization,
-                        runtime_key,
-                    },
-                ))
-            })
-            .await;
-
-            match build {
-                Ok(Ok((runtime, identity))) => {
-                    let Some(session) = session.take() else {
-                        return Ok(runtime.run(RunCommand::new(prompt)));
-                    };
-                    let context = sessions
-                        .lock()
-                        .map_err(|_| AskHandlerError::Internal)?
-                        .begin(session.id(), identity, runtime, prompt)
-                        .map_err(SessionError::handler_error)?;
-                    Ok(track_session_run(
-                        context.runtime.run_messages(context.messages),
-                        session,
-                        context.remaining_response_bytes,
-                    ))
-                }
-                Ok(Err(error)) => Ok(failed_run(error)),
-                Err(_) => Err(AskHandlerError::Internal),
-            }
-        })
-    }
-}
-
-#[derive(Default)]
-struct SessionStore {
-    sessions: HashMap<String, SessionState>,
-    clock: u64,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct SessionIdentity {
-    workspace: PathBuf,
-    organization: Option<String>,
-    runtime_key: RuntimeKey,
-}
-
-struct SessionContext {
-    runtime: Arc<Runtime>,
-    messages: Vec<Message>,
-    remaining_response_bytes: usize,
-}
-
-struct SessionState {
-    identity: Option<SessionIdentity>,
-    runtime: Option<Arc<Runtime>>,
-    messages: Vec<Message>,
-    context_bytes: usize,
-    running: bool,
-    pending_user: bool,
-    last_used: u64,
-}
-
-impl SessionStore {
-    fn reserve(&mut self, id: &str) -> Result<(), SessionError> {
-        if !self.sessions.contains_key(id) {
-            self.make_room()?;
-            self.sessions.insert(
-                id.to_owned(),
-                SessionState {
-                    identity: None,
-                    runtime: None,
-                    messages: Vec::new(),
-                    context_bytes: 0,
-                    running: false,
-                    pending_user: false,
-                    last_used: 0,
-                },
-            );
-        }
-
-        let now = self.tick();
-        let session = self.sessions.get_mut(id).ok_or(SessionError::Unavailable)?;
-        if session.running {
-            return Err(SessionError::Busy);
-        }
-        session.running = true;
-        session.last_used = now;
-        Ok(())
-    }
-
-    fn begin(
-        &mut self,
-        id: &str,
-        identity: SessionIdentity,
-        runtime: Arc<Runtime>,
-        prompt: String,
-    ) -> Result<SessionContext, SessionError> {
-        let session = self.sessions.get_mut(id).ok_or(SessionError::Unavailable)?;
-        if !session.running || session.pending_user {
-            return Err(SessionError::Unavailable);
-        }
-        if session
-            .identity
-            .as_ref()
-            .is_some_and(|existing| existing != &identity)
-        {
-            return Err(SessionError::IdentityMismatch);
-        }
-        if session.context_bytes.saturating_add(prompt.len()) > MAX_SESSION_CONTEXT_BYTES {
-            return Err(SessionError::ContextTooLarge);
-        }
-
-        session.identity.get_or_insert(identity);
-        let runtime = Arc::clone(session.runtime.get_or_insert(runtime));
-        session.context_bytes += prompt.len();
-        session.messages.push(Message::user(prompt));
-        session.pending_user = true;
-        Ok(SessionContext {
-            runtime,
-            messages: session.messages.clone(),
-            remaining_response_bytes: MAX_SESSION_CONTEXT_BYTES - session.context_bytes,
+            runtime
+                .command(request.command_id, request.command)
+                .await
+                .map_err(map_session_runtime_error)
         })
     }
 
-    fn complete(&mut self, id: &str, response: String) -> Result<(), SessionError> {
-        let now = self.tick();
-        let session = self.sessions.get_mut(id).ok_or(SessionError::Unavailable)?;
-        if !session.running || !session.pending_user {
-            return Err(SessionError::Unavailable);
-        }
-        if response.trim().is_empty() {
-            rollback_pending_turn(session);
-            session.last_used = now;
-            return Err(SessionError::EmptyResponse);
-        }
-        if session.context_bytes.saturating_add(response.len()) > MAX_SESSION_CONTEXT_BYTES {
-            rollback_pending_turn(session);
-            session.last_used = now;
-            return Err(SessionError::ContextTooLarge);
-        }
-
-        session.context_bytes += response.len();
-        session.messages.push(Message::assistant(response));
-        session.running = false;
-        session.pending_user = false;
-        session.last_used = now;
-        Ok(())
+    fn snapshot(&self, request: SnapshotRequest) -> SnapshotFuture {
+        let runtime = self.durable.clone();
+        Box::pin(async move {
+            runtime
+                .snapshot(request)
+                .await
+                .map_err(map_session_runtime_error)
+        })
     }
 
-    fn abort(&mut self, id: &str) {
-        let now = self.tick();
-        let Some(session) = self.sessions.get_mut(id) else {
-            return;
-        };
-        if session.running {
-            rollback_pending_turn(session);
-            session.last_used = now;
-        }
-        if session.messages.is_empty() {
-            self.sessions.remove(id);
-        }
-    }
-
-    fn make_room(&mut self) -> Result<(), SessionError> {
-        if self.sessions.len() < MAX_SESSIONS {
-            return Ok(());
-        }
-        let oldest = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| !session.running)
-            .min_by_key(|(_, session)| session.last_used)
-            .map(|(id, _)| id.clone())
-            .ok_or(SessionError::Capacity)?;
-        self.sessions.remove(&oldest);
-        Ok(())
-    }
-
-    fn tick(&mut self) -> u64 {
-        self.clock = self.clock.saturating_add(1);
-        self.clock
+    fn subscribe(&self, request: SubscribeRequest) -> Result<SessionEventStream, AskHandlerError> {
+        self.durable
+            .subscribe(request)
+            .map_err(map_session_runtime_error)
     }
 }
 
-fn rollback_pending_turn(session: &mut SessionState) {
-    if session.pending_user {
-        if let Some(message) = session.messages.pop() {
-            session.context_bytes = session
-                .context_bytes
-                .saturating_sub(message.content().len());
-        }
-        session.pending_user = false;
-    }
-    session.running = false;
-}
-
-struct SessionRun {
-    sessions: Arc<Mutex<SessionStore>>,
-    id: String,
-    active: bool,
-}
-
-impl SessionRun {
-    const fn new(sessions: Arc<Mutex<SessionStore>>, id: String) -> Self {
-        Self {
-            sessions,
-            id,
-            active: true,
-        }
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn complete(&mut self, response: String) -> Result<(), SessionError> {
-        if !std::mem::replace(&mut self.active, false) {
-            return Err(SessionError::Unavailable);
-        }
-        self.sessions
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .complete(&self.id, response)
-    }
-
-    fn abort(&mut self) {
-        if !std::mem::replace(&mut self.active, false) {
-            return;
-        }
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.abort(&self.id);
-        }
+fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
+    match error {
+        SessionRuntimeError::EmptyWorkspace
+        | SessionRuntimeError::InvalidWorkspace
+        | SessionRuntimeError::EmptyPrompt
+        | SessionRuntimeError::PromptTooLarge
+        | SessionRuntimeError::WorkspaceNotFound
+        | SessionRuntimeError::SessionNotFound
+        | SessionRuntimeError::ParentWorkspaceMismatch
+        | SessionRuntimeError::RunNotFound
+        | SessionRuntimeError::ContextTooLarge
+        | SessionRuntimeError::EventTooLarge
+        | SessionRuntimeError::InvalidModelSelection
+        | SessionRuntimeError::IdempotencyConflict
+        | SessionRuntimeError::CursorStoreMismatch
+        | SessionRuntimeError::CursorWorkspaceMismatch
+        | SessionRuntimeError::InvalidPageLimit => AskHandlerError::InvalidRequest,
+        SessionRuntimeError::QueueFull
+        | SessionRuntimeError::WorkspaceLimitReached
+        | SessionRuntimeError::SessionLimitReached
+        | SessionRuntimeError::CommandLimitReached
+        | SessionRuntimeError::Overloaded => AskHandlerError::Unavailable,
+        SessionRuntimeError::InvalidRunLimit
+        | SessionRuntimeError::OutputTooLarge
+        | SessionRuntimeError::Unavailable
+        | SessionRuntimeError::Persistence => AskHandlerError::Internal,
     }
 }
 
-impl Drop for SessionRun {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
-
-fn track_session_run(
-    events: RunStream,
-    mut session: SessionRun,
-    max_response_bytes: usize,
-) -> RunStream {
-    Box::pin(async_stream::stream! {
-        let mut events = events;
-        let mut response = String::new();
-        while let Some(event) = events.next().await {
-            match event {
-                RunEvent::OutputTextDelta { text } => {
-                    if response
-                        .len()
-                        .checked_add(text.len())
-                        .is_none_or(|length| length > max_response_bytes)
-                    {
-                        session.abort();
-                        yield RunEvent::Failed {
-                            kind: RunFailureKind::Server,
-                            message: SessionError::ContextTooLarge.to_string(),
-                        };
-                        return;
-                    }
-                    response.push_str(&text);
-                    yield RunEvent::OutputTextDelta { text };
-                }
-                RunEvent::RefusalDelta { text } => {
-                    if response
-                        .len()
-                        .checked_add(text.len())
-                        .is_none_or(|length| length > max_response_bytes)
-                    {
-                        session.abort();
-                        yield RunEvent::Failed {
-                            kind: RunFailureKind::Server,
-                            message: SessionError::ContextTooLarge.to_string(),
-                        };
-                        return;
-                    }
-                    response.push_str(&text);
-                    yield RunEvent::RefusalDelta { text };
-                }
-                RunEvent::Completed => {
-                    match session.complete(response) {
-                        Ok(()) => yield RunEvent::Completed,
-                        Err(error) => yield RunEvent::Failed {
-                            kind: RunFailureKind::Server,
-                            message: error.to_string(),
-                        },
-                    }
-                    return;
-                }
-                RunEvent::Failed { kind, message } => {
-                    session.abort();
-                    yield RunEvent::Failed { kind, message };
-                    return;
-                }
-                RunEvent::Started => yield RunEvent::Started,
-            }
-        }
-    })
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-enum SessionError {
-    #[error("session already has a run in progress")]
-    Busy,
-    #[error("session context is too large")]
-    ContextTooLarge,
-    #[error("session capacity is exhausted")]
-    Capacity,
-    #[error("model completed without producing a response")]
-    EmptyResponse,
-    #[error("session workspace or model configuration changed")]
-    IdentityMismatch,
-    #[error("session state is unavailable")]
-    Unavailable,
-}
-
-impl SessionError {
-    const fn handler_error(self) -> AskHandlerError {
-        match self {
-            Self::ContextTooLarge | Self::IdentityMismatch => AskHandlerError::InvalidRequest,
-            Self::Busy | Self::Capacity => AskHandlerError::Unavailable,
-            Self::EmptyResponse | Self::Unavailable => AskHandlerError::Internal,
-        }
-    }
-}
-
-fn failed_run(error: RuntimeBuildError) -> RunStream {
-    let kind = error.failure_kind();
-    let message = error.to_string();
-    Box::pin(stream::iter([
-        RunEvent::Started,
-        RunEvent::Failed { kind, message },
-    ]))
+#[derive(Debug, Error)]
+pub enum RuntimeHandlerError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Sessions(#[from] SessionRuntimeError),
 }
 
 fn provider_api_name(api: ProviderApi) -> &'static str {
@@ -1048,27 +776,17 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use super::*;
     use crate::{
         auth::{CredentialPaths, KeyringBackend, KeyringError},
         config::{ConfigPaths, RuntimeOverrides},
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use qq_provider::{ModelRequest, Provider, ProviderStream};
-
-    use super::*;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Default)]
     struct MemoryKeyring(Mutex<BTreeMap<String, Vec<u8>>>);
-
-    struct EmptyProvider;
-
-    impl Provider for EmptyProvider {
-        fn stream(&self, _request: ModelRequest) -> ProviderStream {
-            Box::pin(stream::empty())
-        }
-    }
 
     impl KeyringBackend for MemoryKeyring {
         fn get(&self, name: &str) -> Result<Vec<u8>, KeyringError> {
@@ -1514,216 +1232,5 @@ mod tests {
 
         assert_ne!(first, second);
         assert_ne!(first, different_endpoint_mode);
-    }
-
-    #[test]
-    fn sessions_replay_completed_turns_into_the_next_model_request() {
-        let mut sessions = SessionStore::default();
-        let session_id = "0123456789abcdef0123456789abcdef";
-        let identity = test_session_identity(1);
-
-        let first = begin_test_session(&mut sessions, session_id, &identity, "hey");
-        assert_eq!(first.messages, [Message::user("hey")]);
-        sessions
-            .complete(session_id, "Hello! How can I help?".to_owned())
-            .unwrap();
-
-        let second = begin_test_session(
-            &mut sessions,
-            session_id,
-            &identity,
-            "what was my first message?",
-        );
-        assert_eq!(
-            second.messages,
-            [
-                Message::user("hey"),
-                Message::assistant("Hello! How can I help?"),
-                Message::user("what was my first message?"),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn session_stream_commits_the_complete_assistant_response() {
-        let sessions = Arc::new(Mutex::new(SessionStore::default()));
-        let session_id = "0123456789abcdef0123456789abcdef";
-        let identity = test_session_identity(1);
-        let context =
-            begin_test_session(&mut sessions.lock().unwrap(), session_id, &identity, "hey");
-        let events: RunStream = Box::pin(stream::iter([
-            RunEvent::Started,
-            RunEvent::OutputTextDelta {
-                text: "Hello! ".to_owned(),
-            },
-            RunEvent::OutputTextDelta {
-                text: "How can I help?".to_owned(),
-            },
-            RunEvent::Completed,
-        ]));
-
-        let emitted = track_session_run(
-            events,
-            SessionRun::new(Arc::clone(&sessions), session_id.to_owned()),
-            context.remaining_response_bytes,
-        )
-        .collect::<Vec<_>>()
-        .await;
-        assert_eq!(emitted.last(), Some(&RunEvent::Completed));
-
-        let next = begin_test_session(
-            &mut sessions.lock().unwrap(),
-            session_id,
-            &identity,
-            "what was my first message?",
-        );
-        assert_eq!(
-            next.messages,
-            [
-                Message::user("hey"),
-                Message::assistant("Hello! How can I help?"),
-                Message::user("what was my first message?"),
-            ]
-        );
-    }
-
-    #[test]
-    fn sessions_reject_workspace_or_runtime_identity_changes() {
-        let mut sessions = SessionStore::default();
-        let session_id = "0123456789abcdef0123456789abcdef";
-        let identity = test_session_identity(1);
-
-        begin_test_session(&mut sessions, session_id, &identity, "secret");
-        sessions
-            .complete(session_id, "acknowledged".to_owned())
-            .unwrap();
-        sessions.reserve(session_id).unwrap();
-        assert!(matches!(
-            sessions.begin(
-                session_id,
-                test_session_identity(2),
-                test_runtime(),
-                "repeat it".to_owned()
-            ),
-            Err(SessionError::IdentityMismatch)
-        ));
-        sessions.abort(session_id);
-
-        let resumed = begin_test_session(&mut sessions, session_id, &identity, "continue");
-        assert_eq!(
-            resumed.messages,
-            [
-                Message::user("secret"),
-                Message::assistant("acknowledged"),
-                Message::user("continue"),
-            ]
-        );
-    }
-
-    #[test]
-    fn reserved_sessions_cannot_be_evicted_during_runtime_construction() {
-        let mut sessions = SessionStore::default();
-        let protected = "protected";
-        sessions.reserve(protected).unwrap();
-
-        for index in 1..MAX_SESSIONS {
-            let id = format!("session-{index}");
-            begin_test_session(&mut sessions, &id, &test_session_identity(1), "hello");
-            sessions.complete(&id, "response".to_owned()).unwrap();
-        }
-        sessions.reserve("replacement").unwrap();
-
-        let protected_state = sessions.sessions.get(protected).unwrap();
-        assert!(protected_state.running);
-        assert!(!protected_state.pending_user);
-    }
-
-    #[test]
-    fn sessions_pin_the_first_compiled_runtime() {
-        let mut sessions = SessionStore::default();
-        let session_id = "0123456789abcdef0123456789abcdef";
-        let identity = test_session_identity(1);
-        let first_runtime = test_runtime();
-
-        sessions.reserve(session_id).unwrap();
-        sessions
-            .begin(
-                session_id,
-                identity.clone(),
-                Arc::clone(&first_runtime),
-                "hello".to_owned(),
-            )
-            .unwrap();
-        sessions
-            .complete(session_id, "response".to_owned())
-            .unwrap();
-        sessions.reserve(session_id).unwrap();
-        let next = sessions
-            .begin(session_id, identity, test_runtime(), "continue".to_owned())
-            .unwrap();
-
-        assert!(Arc::ptr_eq(&next.runtime, &first_runtime));
-    }
-
-    #[tokio::test]
-    async fn session_stream_rejects_blank_and_oversized_responses() {
-        for (text, limit) in [("   ", 3), ("oversized", 4)] {
-            let sessions = Arc::new(Mutex::new(SessionStore::default()));
-            let session_id = "0123456789abcdef0123456789abcdef";
-            begin_test_session(
-                &mut sessions.lock().unwrap(),
-                session_id,
-                &test_session_identity(1),
-                "hello",
-            );
-            let events: RunStream = Box::pin(stream::iter([
-                RunEvent::Started,
-                RunEvent::OutputTextDelta {
-                    text: text.to_owned(),
-                },
-                RunEvent::Completed,
-            ]));
-
-            let emitted = track_session_run(
-                events,
-                SessionRun::new(Arc::clone(&sessions), session_id.to_owned()),
-                limit,
-            )
-            .collect::<Vec<_>>()
-            .await;
-            assert!(matches!(emitted.last(), Some(RunEvent::Failed { .. })));
-
-            let retry = begin_test_session(
-                &mut sessions.lock().unwrap(),
-                session_id,
-                &test_session_identity(1),
-                "retry",
-            );
-            assert_eq!(retry.messages, [Message::user("retry")]);
-        }
-    }
-
-    fn begin_test_session(
-        sessions: &mut SessionStore,
-        id: &str,
-        identity: &SessionIdentity,
-        prompt: &str,
-    ) -> SessionContext {
-        sessions.reserve(id).unwrap();
-        sessions
-            .begin(id, identity.clone(), test_runtime(), prompt.to_owned())
-            .unwrap()
-    }
-
-    fn test_runtime() -> Arc<Runtime> {
-        Arc::new(Runtime::new(EmptyProvider, "test-model", 128).unwrap())
-    }
-
-    fn test_session_identity(seed: u8) -> SessionIdentity {
-        SessionIdentity {
-            workspace: PathBuf::from(format!("/workspace-{seed}")),
-            organization: Some(format!("organization-{seed}")),
-            runtime_key: RuntimeKey([seed; 32]),
-        }
     }
 }

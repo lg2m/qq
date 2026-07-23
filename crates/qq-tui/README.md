@@ -14,6 +14,8 @@ nix develop -c cargo run -p qq-tui --example tui_prototype
 ```
 
 Use `F1`-`F3` to switch concepts and `Tab` to change reasoning visibility.
+If your terminal reserves function keys, use `Ctrl-P`/`Ctrl-N` to cycle backward
+or forward through the concepts.
 `Ctrl-T` opens the session tree; move with `Up`/`Down`, focus with `Enter`, and
 close it with `Esc`. Outside the tree, `Esc` focuses the parent session. Type a
 prompt and press `Enter` to start another synthetic stream. `Ctrl-C` exits.
