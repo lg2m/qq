@@ -1,9 +1,14 @@
 (
     version: 1,
-    model: "bedrock/us.anthropic.claude-sonnet-4-6",
+    model: "bedrock-mantle/anthropic.claude-sonnet-5",
     providers: {
         "bedrock": AmazonBedrock(
             region: "us-east-1",
+            auth: ApiKey(Stored("bedrock/default")),
+        ),
+        "bedrock-mantle": AmazonBedrockMantle(
+            region: "us-east-1",
+            api: AnthropicMessages,
             auth: ApiKey(Stored("bedrock/default")),
         ),
     },
