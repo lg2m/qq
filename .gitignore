@@ -21,3 +21,16 @@ target
 #.idea/
 
 /.direnv/
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Nix build result symlinks
+/result
+/result-*
+
+# Legacy local credentials; project .qq configuration remains trackable.
+/.qq/.config

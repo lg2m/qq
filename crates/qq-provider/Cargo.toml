@@ -5,3 +5,24 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[dependencies]
+async-stream.workspace = true
+aws-config.workspace = true
+aws-sdk-bedrockruntime.workspace = true
+aws-smithy-types.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+http-body.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[[bench]]
+name = "provider_compiler"
+harness = false

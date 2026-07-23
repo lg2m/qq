@@ -40,9 +40,11 @@ The binary has multiple process modes:
   through the same HTTP/SSE interface used by remote clients.
 - `qq serve [ARGS]` runs the server without a TUI. It is suitable for a
   persistent process on a desktop or home server.
-- Additional direct and automation-oriented CLI commands will be added later.
-  Their design must reuse the same runtime rather than create another agent
-  implementation.
+- `qq ask PROMPT` is the initial direct, automation-oriented path. It streams
+  one model response to stdout through the same core runtime that the server
+  will use.
+- Additional direct CLI commands must reuse the same runtime rather than create
+  another agent implementation.
 
 Keeping the TUI and server in one executable provides a zero-setup local path
 while still allowing several TUI or future browser clients to attach to a
@@ -120,6 +122,55 @@ The server owns session state and schedules work using bounded Tokio tasks and
 channels. Every long-running operation must support cancellation. Model calls,
 tool output, persistence, and client delivery must apply backpressure rather
 than create unbounded queues.
+
+## Provider Compilation
+
+Provider names are configuration presets, not runtime dispatch keys. The root
+package translates layered configuration into a `qq-provider` recipe, and the
+provider compiler validates that recipe before returning the single
+`Provider::stream` interface consumed by `qq-core`.
+
+```text
+provider configuration
+        |
+        v
+typed provider recipe
+        |
+        v
+ProviderCompiler -- shared HTTP pool
+        |
+        v
+configured Provider::stream
+```
+
+A recipe separates deployment identity from its wire protocol, endpoint mode,
+and authentication intent. Built-in and custom deployments compile through the
+same path. Base endpoints append protocol path segments; exact endpoints are
+never rewritten. Invalid protocol/authentication combinations fail during
+compilation rather than during a model request.
+
+Provider compilation follows these performance rules:
+
+- One `ProviderCompiler` and HTTP connection pool are shared by every model in
+  a runtime factory.
+- Provider configuration, URLs, headers, and protocol choices are validated
+  once and remain immutable while streaming.
+- Shared providers pass directly into `qq-core`; they are not boxed and then
+  wrapped again.
+- Immutable model identifiers use shared storage so each command does not
+  allocate another model string.
+- Provider identity must not cause branching in the request hot path.
+
+Protocol codecs, request-time authorization, framing, retry policy, and
+transport are internal implementation details. Add a public seam only when two
+real adapters require it. A new deployment over an existing protocol should
+normally require configuration only; a new protocol should add one codec and
+its contract fixtures without changing `qq-core`.
+
+Run `cargo bench -p qq-provider --bench provider_compiler` to measure compiled
+recipe construction independently from provider network latency. End-to-end
+startup and time-to-first-token benchmarks remain the primary performance
+signals.
 
 One run follows a simple loop:
 

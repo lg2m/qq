@@ -7,5 +7,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+async-stream.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
 qq-provider.workspace = true
 qq-protocol.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

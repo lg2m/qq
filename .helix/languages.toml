@@ -1,0 +1,6 @@
+[language-server.ron-lsp]
+command = "ron-lsp"
+
+[[language]]
+name = "ron"
+language-servers = ["ron-lsp"]

@@ -8,14 +8,12 @@ publish = false
 
 [workspace]
 members = [
-  ".",
   "crates/qq-core",
   "crates/qq-provider",
   "crates/qq-protocol",
   "crates/qq-tui",
   "xtask",
 ]
-default-members = ["."]
 resolver = "3"
 
 [workspace.package]
@@ -25,13 +23,60 @@ license = "MIT"
 repository = "https://github.com/lg2m/qq"
 
 [workspace.dependencies]
+async-stream = "0.3"
+aws-config = "1.10.0"
+aws-sdk-bedrockruntime = { version = "1.137.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-types = "1.6.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+directories = "6"
+futures-core = "0.3"
+futures-util = "0.3"
+getrandom = "0.3"
+http-body = "1"
+keyring = "4"
 qq-core = { path = "crates/qq-core" }
 qq-provider = { path = "crates/qq-provider" }
 qq-protocol = { path = "crates/qq-protocol" }
 qq-tui = { path = "crates/qq-tui" }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls", "stream", "webpki-roots"] }
+ron = "0.12"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+webbrowser = "1"
 
 [dependencies]
+async-stream.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+directories.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+keyring.workspace = true
 qq-core.workspace = true
 qq-provider.workspace = true
 qq-protocol.workspace = true
 qq-tui.workspace = true
+reqwest.workspace = true
+ron.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+webbrowser.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFPreferences", "CFPropertyList", "CFString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.56"

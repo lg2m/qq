@@ -34,6 +34,7 @@
         cargo-machete
         cargo-nextest
         cargo-outdated
+        ron-lsp
         sccache
         taplo
       ];

@@ -1,1 +1,1060 @@
-//! Application configuration loading and validation.
+//! Layered application configuration loading and validation.
+
+// The public snapshot API is staged here until the explicitly out-of-scope CLI
+// and provider construction are migrated to consume it.
+#![allow(dead_code)]
+
+use std::{
+    collections::BTreeMap,
+    env, fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+mod document;
+mod loader;
+mod managed;
+mod remote;
+
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
+pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+/// All process-dependent inputs captured before a configuration load begins.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct LoadRequest {
+    cwd: PathBuf,
+    explicit_path: Option<PathBuf>,
+    explicit_content: Option<String>,
+    overrides: RuntimeOverrides,
+}
+
+impl LoadRequest {
+    #[must_use]
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Captures all supported environment variables without silently dropping
+    /// non-Unicode values. Secret environment variables are intentionally not read.
+    pub fn from_process_env(
+        cwd: impl Into<PathBuf>,
+        max_output_tokens: Option<u32>,
+    ) -> Result<Self, ConfigError> {
+        let mut request = Self::new(cwd);
+        request.explicit_path = optional_environment("QQ_CONFIG")?.map(PathBuf::from);
+        request.explicit_content = optional_environment("QQ_CONFIG_CONTENT")?;
+        request.overrides.model = optional_environment("QQ_MODEL")?;
+        request.overrides.organization = optional_environment("QQ_ORGANIZATION")?;
+        request.overrides.max_output_tokens = max_output_tokens;
+        Ok(request)
+    }
+
+    pub fn from_current_process(max_output_tokens: Option<u32>) -> Result<Self, ConfigError> {
+        let cwd = env::current_dir().map_err(|error| ConfigError::CurrentDirectory { error })?;
+        Self::from_process_env(cwd, max_output_tokens)
+    }
+
+    #[must_use]
+    pub fn with_explicit_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.explicit_path = Some(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_explicit_content(mut self, content: impl Into<String>) -> Self {
+        self.explicit_content = Some(content.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: RuntimeOverrides) -> Self {
+        self.overrides = overrides;
+        self
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    #[must_use]
+    pub fn explicit_path(&self) -> Option<&Path> {
+        self.explicit_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn has_explicit_content(&self) -> bool {
+        self.explicit_content.is_some()
+    }
+
+    #[must_use]
+    pub const fn overrides(&self) -> &RuntimeOverrides {
+        &self.overrides
+    }
+}
+
+impl fmt::Debug for LoadRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadRequest")
+            .field("cwd", &self.cwd)
+            .field("explicit_path", &self.explicit_path)
+            .field(
+                "explicit_content",
+                &self.explicit_content.as_ref().map(|_| "<redacted>"),
+            )
+            .field("overrides", &self.overrides)
+            .finish()
+    }
+}
+
+fn optional_environment(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvironment(name)),
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeOverrides {
+    organization: Option<String>,
+    model: Option<String>,
+    max_output_tokens: Option<u32>,
+}
+
+impl RuntimeOverrides {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
+        self.organization = Some(organization.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
+
+    #[must_use]
+    pub fn organization(&self) -> Option<&str> {
+        self.organization.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
+    fn is_empty(&self) -> bool {
+        self.organization.is_none() && self.model.is_none() && self.max_output_tokens.is_none()
+    }
+}
+
+/// Injectable roots for global configuration, trust data, and managed policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigPaths {
+    global_dir: PathBuf,
+    data_dir: PathBuf,
+    managed_dir: PathBuf,
+    enforce_managed_ownership: bool,
+}
+
+impl ConfigPaths {
+    #[must_use]
+    pub fn new(
+        global_dir: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
+        managed_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            global_dir: global_dir.into(),
+            data_dir: data_dir.into(),
+            managed_dir: managed_dir.into(),
+            enforce_managed_ownership: false,
+        }
+    }
+
+    #[must_use]
+    fn with_managed_ownership_checks(mut self) -> Self {
+        self.enforce_managed_ownership = true;
+        self
+    }
+
+    pub fn system() -> Result<Self, ConfigError> {
+        loader::system_paths()
+    }
+
+    #[must_use]
+    pub fn global_dir(&self) -> &Path {
+        &self.global_dir
+    }
+
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    #[must_use]
+    pub fn managed_dir(&self) -> &Path {
+        &self.managed_dir
+    }
+
+    #[must_use]
+    pub fn trust_file(&self) -> PathBuf {
+        self.data_dir.join("trust.ron")
+    }
+
+    #[must_use]
+    pub fn trust_lock_file(&self) -> PathBuf {
+        self.data_dir.join("trust.lock")
+    }
+
+    #[must_use]
+    pub fn organizations_file(&self) -> PathBuf {
+        self.data_dir.join("organizations.ron")
+    }
+
+    #[must_use]
+    pub fn organizations_lock_file(&self) -> PathBuf {
+        self.data_dir.join("organizations.lock")
+    }
+
+    #[must_use]
+    pub fn organizations_cache_dir(&self) -> PathBuf {
+        self.data_dir.join("organizations")
+    }
+}
+
+#[derive(Clone)]
+pub struct ConfigLoader {
+    paths: ConfigPaths,
+    mdm_reader: Arc<dyn managed::MdmReader>,
+}
+
+impl fmt::Debug for ConfigLoader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigLoader")
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConfigLoader {
+    #[must_use]
+    pub fn new(paths: ConfigPaths) -> Self {
+        Self {
+            paths,
+            mdm_reader: Arc::new(managed::SystemMdmReader),
+        }
+    }
+
+    pub fn system() -> Result<Self, ConfigError> {
+        Ok(Self::new(ConfigPaths::system()?))
+    }
+
+    #[must_use]
+    pub const fn paths(&self) -> &ConfigPaths {
+        &self.paths
+    }
+
+    pub fn load(&self, request: &LoadRequest) -> Result<ConfigSnapshot, ConfigError> {
+        loader::load(self, request)
+    }
+
+    /// Grants every currently pending project source digest in one atomic state update.
+    pub fn grant_pending_trust(
+        &self,
+        request: &LoadRequest,
+    ) -> Result<Vec<PendingTrust>, ConfigError> {
+        loader::grant_pending_trust(self, request)
+    }
+
+    pub fn enroll_organization(
+        &self,
+        name: &str,
+        manifest_url: &str,
+    ) -> Result<OrganizationEnrollment, ConfigError> {
+        remote::enroll(&self.paths, name, manifest_url)
+    }
+
+    pub fn refresh_organization(&self, name: &str) -> Result<OrganizationEnrollment, ConfigError> {
+        remote::refresh(&self.paths, name)
+    }
+
+    pub fn select_organization(&self, name: &str) -> Result<(), ConfigError> {
+        remote::select(&self.paths, name)
+    }
+
+    pub fn remove_organization(&self, name: &str) -> Result<bool, ConfigError> {
+        remote::remove(&self.paths, name)
+    }
+
+    pub fn organizations(&self) -> Result<Vec<OrganizationEnrollment>, ConfigError> {
+        remote::list(&self.paths)
+    }
+
+    #[cfg(test)]
+    fn with_mdm_reader(mut self, reader: Arc<dyn managed::MdmReader>) -> Self {
+        self.mdm_reader = reader;
+        self
+    }
+}
+
+pub fn load(request: &LoadRequest) -> Result<ConfigSnapshot, ConfigError> {
+    ConfigLoader::system()?.load(request)
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretLiteral(String);
+
+impl SecretLiteral {
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretLiteral {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretRef {
+    Env(String),
+    Stored(String),
+    Value(SecretLiteral),
+}
+
+impl fmt::Debug for SecretRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Env(name) => formatter.debug_tuple("Env").field(name).finish(),
+            Self::Stored(name) => formatter.debug_tuple("Stored").field(name).finish(),
+            Self::Value(_) => formatter.write_str("Value(<redacted>)"),
+        }
+    }
+}
+
+impl SecretRef {
+    fn is_literal(&self) -> bool {
+        matches!(self, Self::Value(_))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StaticHeaderValue(String);
+
+impl StaticHeaderValue {
+    #[must_use]
+    pub fn expose_value(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for StaticHeaderValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderApi {
+    OpenAiResponses,
+    OpenAiChatCompletions,
+    AnthropicMessages,
+    GoogleGenerateContent,
+    BedrockConverse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderAuth {
+    NoAuth,
+    ApiKey(SecretRef),
+    Bearer(SecretRef),
+    Header(String, SecretRef),
+}
+
+impl ProviderAuth {
+    fn contains_literal_secret(&self) -> bool {
+        match self {
+            Self::NoAuth => false,
+            Self::ApiKey(secret) | Self::Bearer(secret) | Self::Header(_, secret) => {
+                secret.is_literal()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AwsAuth {
+    DefaultChain,
+    Profile(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BedrockAuth {
+    Aws(AwsAuth),
+    ApiKey(SecretRef),
+}
+
+impl BedrockAuth {
+    fn contains_literal_secret(&self) -> bool {
+        matches!(self, Self::ApiKey(secret) if secret.is_literal())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Connection {
+    base_url: String,
+    api: ProviderApi,
+    auth: ProviderAuth,
+    #[serde(default, deserialize_with = "document::deserialize_unique_btree_map")]
+    headers: BTreeMap<String, StaticHeaderValue>,
+}
+
+impl Connection {
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    #[must_use]
+    pub const fn api(&self) -> ProviderApi {
+        self.api
+    }
+
+    #[must_use]
+    pub const fn auth(&self) -> &ProviderAuth {
+        &self.auth
+    }
+
+    #[must_use]
+    pub const fn headers(&self) -> &BTreeMap<String, StaticHeaderValue> {
+        &self.headers
+    }
+
+    fn contains_literal_secret(&self) -> bool {
+        self.auth.contains_literal_secret() || !self.headers.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrganizationEnrollment {
+    name: String,
+    manifest_url: String,
+    selected: bool,
+}
+
+impl OrganizationEnrollment {
+    fn new(name: String, manifest_url: String, selected: bool) -> Self {
+        Self {
+            name,
+            manifest_url,
+            selected,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn manifest_url(&self) -> &str {
+        &self.manifest_url
+    }
+
+    #[must_use]
+    pub const fn selected(&self) -> bool {
+        self.selected
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputModality {
+    Text,
+    Image,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelMetadata {
+    name: Option<String>,
+    reasoning: bool,
+    input: Vec<InputModality>,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+impl ModelMetadata {
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[must_use]
+    pub const fn reasoning(&self) -> bool {
+        self.reasoning
+    }
+
+    #[must_use]
+    pub fn input(&self) -> &[InputModality] {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn context_window(&self) -> Option<u32> {
+        self.context_window
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderConfig {
+    OpenAi {
+        api_key: Option<SecretRef>,
+        models: BTreeMap<String, ModelMetadata>,
+    },
+    OpenAiCodex {
+        profile: Option<String>,
+        models: BTreeMap<String, ModelMetadata>,
+    },
+    Anthropic {
+        api_key: Option<SecretRef>,
+        models: BTreeMap<String, ModelMetadata>,
+    },
+    LiteLlm {
+        connection: Option<Connection>,
+        models: BTreeMap<String, ModelMetadata>,
+    },
+    AmazonBedrock {
+        region: Option<String>,
+        auth: BedrockAuth,
+        models: BTreeMap<String, ModelMetadata>,
+    },
+    AmazonBedrockMantle {
+        region: Option<String>,
+        api: ProviderApi,
+        auth: BedrockAuth,
+        models: BTreeMap<String, ModelMetadata>,
+    },
+    Custom {
+        connection: Option<Connection>,
+        models: BTreeMap<String, ModelMetadata>,
+    },
+}
+
+impl ProviderConfig {
+    #[must_use]
+    pub fn models(&self) -> &BTreeMap<String, ModelMetadata> {
+        match self {
+            Self::OpenAi { models, .. }
+            | Self::OpenAiCodex { models, .. }
+            | Self::Anthropic { models, .. }
+            | Self::LiteLlm { models, .. }
+            | Self::AmazonBedrock { models, .. }
+            | Self::AmazonBedrockMantle { models, .. }
+            | Self::Custom { models, .. } => models,
+        }
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> Option<&Connection> {
+        match self {
+            Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => {
+                connection.as_ref()
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
+    }
+
+    fn contains_literal_secret(&self) -> bool {
+        match self {
+            Self::OpenAi { api_key, .. } | Self::Anthropic { api_key, .. } => {
+                api_key.as_ref().is_some_and(SecretRef::is_literal)
+            }
+            Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => connection
+                .as_ref()
+                .is_some_and(Connection::contains_literal_secret),
+            Self::AmazonBedrock { auth, .. } | Self::AmazonBedrockMantle { auth, .. } => {
+                auth.contains_literal_secret()
+            }
+            Self::OpenAiCodex { .. } => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelRoute {
+    full: String,
+    provider: String,
+    model: String,
+}
+
+impl ModelRoute {
+    fn parse(value: String) -> Result<Self, ConfigError> {
+        let Some((provider, model)) = value.split_once('/') else {
+            return Err(ConfigError::InvalidModelRoute(value));
+        };
+        if provider.is_empty() || model.is_empty() {
+            return Err(ConfigError::InvalidModelRoute(value));
+        }
+        Ok(Self {
+            full: value.clone(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.full
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectivePolicy {
+    allowed_providers: Option<Vec<String>>,
+    denied_providers: Vec<String>,
+    max_output_tokens: Option<u32>,
+    require_https: bool,
+    allow_custom_providers: bool,
+    allow_literal_secrets: bool,
+}
+
+impl Default for EffectivePolicy {
+    fn default() -> Self {
+        Self {
+            allowed_providers: None,
+            denied_providers: Vec::new(),
+            max_output_tokens: None,
+            require_https: false,
+            allow_custom_providers: true,
+            allow_literal_secrets: true,
+        }
+    }
+}
+
+impl EffectivePolicy {
+    #[must_use]
+    pub fn allowed_providers(&self) -> Option<&[String]> {
+        self.allowed_providers.as_deref()
+    }
+
+    #[must_use]
+    pub fn denied_providers(&self) -> &[String] {
+        &self.denied_providers
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
+    #[must_use]
+    pub const fn require_https(&self) -> bool {
+        self.require_https
+    }
+
+    #[must_use]
+    pub const fn allow_custom_providers(&self) -> bool {
+        self.allow_custom_providers
+    }
+
+    #[must_use]
+    pub const fn allow_literal_secrets(&self) -> bool {
+        self.allow_literal_secrets
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceKind {
+    Compiled,
+    Remote,
+    Global,
+    Project,
+    Explicit,
+    Inline,
+    Runtime,
+    Managed,
+    Mdm,
+    TrustState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SourceIdentity {
+    kind: SourceKind,
+    path: Option<PathBuf>,
+    label: String,
+}
+
+impl SourceIdentity {
+    fn virtual_source(kind: SourceKind, label: impl Into<String>) -> Self {
+        Self {
+            kind,
+            path: None,
+            label: label.into(),
+        }
+    }
+
+    fn file(kind: SourceKind, path: PathBuf) -> Self {
+        let label = path.display().to_string();
+        Self {
+            kind,
+            path: Some(path),
+            label,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SourceKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+impl fmt::Display for SourceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceStatus {
+    Applied,
+    PartiallyAppliedPendingTrust,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigKey {
+    Organization,
+    Model,
+    MaxOutputTokens,
+    Providers,
+    Provider(String),
+    Policy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceReport {
+    source: SourceIdentity,
+    status: SourceStatus,
+    touched: Vec<ConfigKey>,
+}
+
+impl SourceReport {
+    fn new(source: SourceIdentity, status: SourceStatus, touched: Vec<ConfigKey>) -> Self {
+        Self {
+            source,
+            status,
+            touched,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &SourceIdentity {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> SourceStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub fn touched(&self) -> &[ConfigKey] {
+        &self.touched
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigProvenance {
+    organization: Option<SourceIdentity>,
+    model: Option<SourceIdentity>,
+    max_output_tokens: Option<SourceIdentity>,
+    providers: BTreeMap<String, SourceIdentity>,
+}
+
+impl ConfigProvenance {
+    #[must_use]
+    pub const fn organization(&self) -> Option<&SourceIdentity> {
+        self.organization.as_ref()
+    }
+
+    #[must_use]
+    pub const fn model(&self) -> Option<&SourceIdentity> {
+        self.model.as_ref()
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<&SourceIdentity> {
+        self.max_output_tokens.as_ref()
+    }
+
+    #[must_use]
+    pub fn provider(&self, name: &str) -> Option<&SourceIdentity> {
+        self.providers.get(name)
+    }
+
+    #[must_use]
+    pub const fn providers(&self) -> &BTreeMap<String, SourceIdentity> {
+        &self.providers
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTrust {
+    source: SourceIdentity,
+    digest: String,
+}
+
+impl PendingTrust {
+    fn new(source: SourceIdentity, digest: String) -> Self {
+        Self { source, digest }
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &SourceIdentity {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// A fully merged, validated configuration. All fields are read-only to callers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigSnapshot {
+    organization: Option<String>,
+    model: ModelRoute,
+    max_output_tokens: u32,
+    providers: BTreeMap<String, ProviderConfig>,
+    policy: EffectivePolicy,
+    reports: Vec<SourceReport>,
+    provenance: ConfigProvenance,
+}
+
+impl ConfigSnapshot {
+    #[must_use]
+    pub fn organization(&self) -> Option<&str> {
+        self.organization.as_deref()
+    }
+
+    #[must_use]
+    pub const fn model(&self) -> &ModelRoute {
+        &self.model
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
+
+    #[must_use]
+    pub const fn providers(&self) -> &BTreeMap<String, ProviderConfig> {
+        &self.providers
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> &EffectivePolicy {
+        &self.policy
+    }
+
+    #[must_use]
+    pub fn source_reports(&self) -> &[SourceReport] {
+        &self.reports
+    }
+
+    #[must_use]
+    pub const fn provenance(&self) -> &ConfigProvenance {
+        &self.provenance
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("the platform configuration directories are unavailable")]
+    SystemDirectoriesUnavailable,
+    #[error("failed to determine the current directory: {error}")]
+    CurrentDirectory {
+        #[source]
+        error: std::io::Error,
+    },
+    #[error("environment variable {0} is not valid Unicode")]
+    NonUnicodeEnvironment(&'static str),
+    #[error("configuration working directory is invalid: {path}")]
+    InvalidWorkingDirectory { path: PathBuf },
+    #[error("explicit configuration file does not exist: {path}")]
+    ExplicitConfigMissing { path: PathBuf },
+    #[error("symbolic links are not accepted as configuration sources: {path}")]
+    SymlinkSource { path: PathBuf },
+    #[error("configuration source is not a regular file: {path}")]
+    NotRegularFile { path: PathBuf },
+    #[error("configuration source is not a directory: {path}")]
+    NotDirectory { path: PathBuf },
+    #[error("configuration fragment name is invalid: {path}")]
+    InvalidFragmentName { path: PathBuf },
+    #[error("configuration file was discovered more than once: {path}")]
+    DuplicateSource { path: PathBuf },
+    #[error("configuration containing literal secrets is not private: {path}")]
+    InsecureSecretFile { path: PathBuf },
+    #[error("managed configuration is not administrator-owned and protected: {path}")]
+    InsecureManagedSource { path: PathBuf },
+    #[error("failed to read MDM configuration from {origin}: {message}")]
+    MdmRead { origin: String, message: String },
+    #[error("MDM configuration at {origin} must be a string")]
+    InvalidMdmValue { origin: String },
+    #[error("configuration state is not private: {path}")]
+    InsecureStatePermissions { path: PathBuf },
+    #[error("organization name is invalid; use 1-64 lowercase letters, digits, dots, or hyphens")]
+    InvalidOrganizationName,
+    #[error(
+        "organization manifest URL must be an HTTPS URL without credentials, query, or fragment"
+    )]
+    InvalidOrganizationManifestUrl,
+    #[error("organization {0:?} is not enrolled")]
+    OrganizationNotEnrolled(String),
+    #[error("organization {name:?} enrollment changed while its manifest was refreshing")]
+    OrganizationEnrollmentChanged { name: String },
+    #[error("organization {name:?} has no cached manifest; run `qq org refresh {name}`")]
+    OrganizationManifestMissing { name: String },
+    #[error("organization manifest for {name:?} must set `organization` to exactly that name")]
+    OrganizationManifestMismatch { name: String },
+    #[error("organization state uses unsupported version {version}; expected 1")]
+    UnsupportedOrganizationStateVersion { version: u32 },
+    #[error("organization state contains duplicate enrollment {name:?}")]
+    DuplicateOrganizationEnrollment { name: String },
+    #[error("failed to fetch manifest for organization {name:?}: {message}")]
+    OrganizationFetch { name: String, message: String },
+    #[error("organization {name:?} manifest server returned HTTP {status}")]
+    OrganizationHttpStatus { name: String, status: u16 },
+    #[error("configuration source exceeds the {limit}-byte limit: {origin}")]
+    SourceTooLarge {
+        origin: SourceIdentity,
+        limit: usize,
+    },
+    #[error("inline configuration exceeds the {limit}-byte limit")]
+    InlineSourceTooLarge { limit: usize },
+    #[error("failed to access {path}: {error}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        error: std::io::Error,
+    },
+    #[error("configuration source is not valid UTF-8: {origin}")]
+    InvalidUtf8 { origin: SourceIdentity },
+    #[error("failed to parse configuration source {origin}: {message}")]
+    Parse {
+        origin: SourceIdentity,
+        message: String,
+    },
+    #[error("configuration source {origin} has unsupported version {version}; expected 1")]
+    UnsupportedVersion {
+        origin: SourceIdentity,
+        version: u32,
+    },
+    #[error("policy is only allowed in managed configuration: {origin}")]
+    PolicyOutsideManaged { origin: SourceIdentity },
+    #[error("literal secret values are forbidden in {origin}")]
+    LiteralSecretForbidden { origin: SourceIdentity },
+    #[error("project configuration trust is required")]
+    TrustRequired {
+        pending: Vec<PendingTrust>,
+        reports: Vec<SourceReport>,
+    },
+    #[error("failed to serialize configuration state: {message}")]
+    StateSerialization { message: String },
+    #[error("trust state has unsupported version {version}; expected 1")]
+    UnsupportedTrustVersion { version: u32 },
+    #[error("trust state contains a duplicate record for {path} and {digest}")]
+    DuplicateTrustRecord { path: PathBuf, digest: String },
+    #[error("trust state contains an invalid SHA-256 digest: {digest}")]
+    InvalidTrustDigest { digest: String },
+    #[error("model must be configured")]
+    ModelRequired,
+    #[error("model route must use provider/model syntax: {0:?}")]
+    InvalidModelRoute(String),
+    #[error("model route selects an unknown or disabled provider: {0}")]
+    UnknownProvider(String),
+    #[error("managed policy {rule} was violated: {message}")]
+    PolicyViolation { rule: &'static str, message: String },
+    #[error(
+        "the current binary must integrate ConfigSnapshot and resolve its SecretRef externally"
+    )]
+    LegacyIntegrationRequired,
+}
+
+/// Compatibility for the current binary until provider construction consumes
+/// `ConfigSnapshot` and resolves `SecretRef` outside this module.
+pub struct AppConfig {
+    pub openai_api_key: String,
+    pub model: String,
+    pub max_output_tokens: u32,
+}
+
+impl AppConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Err(ConfigError::LegacyIntegrationRequired)
+    }
+}
+
+#[cfg(test)]
+mod tests;

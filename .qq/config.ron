@@ -1,0 +1,10 @@
+(
+    version: 1,
+    model: "bedrock/us.anthropic.claude-sonnet-4-6",
+    providers: {
+        "bedrock": AmazonBedrock(
+            region: "us-east-1",
+            auth: ApiKey(Stored("bedrock/default")),
+        ),
+    },
+)
