@@ -87,4 +87,6 @@ The interactive composer recognizes `/models`, `/new`, `/sessions` (also
 because a session's model is immutable. The picker only lists built-in
 providers with an available credential, and the footer shows context usage,
 the selected model, working directory, and focused session cost. Slash command
-suggestions run immediately when selected with Enter or Tab.
+suggestions run immediately when selected with Enter or Tab. QQ names a session
+from its first prompt; `/sessions` supports typing to search those names before
+selecting one with Enter.

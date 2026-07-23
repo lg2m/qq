@@ -14,7 +14,7 @@ use crate::{
 };
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
-const MAX_MODEL_SEARCH_BYTES: usize = 256;
+const MAX_PICKER_SEARCH_BYTES: usize = 256;
 const MAX_RECENT_EVENTS: usize = 1024;
 const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
@@ -112,6 +112,11 @@ pub(crate) struct ModelPicker {
     pub selected: usize,
 }
 
+pub(crate) struct SessionPicker {
+    pub query: String,
+    pub selected: Option<SessionId>,
+}
+
 #[derive(Debug, Default)]
 struct TranscriptViewport {
     context: Option<(Option<SessionId>, Layout)>,
@@ -136,8 +141,7 @@ pub(crate) struct App {
     pub workspace_path: String,
     pub sessions: HashMap<SessionId, SessionView>,
     pub focused: Option<SessionId>,
-    pub navigator: Option<SessionId>,
-    pub navigator_open: bool,
+    pub session_picker: Option<SessionPicker>,
     pub model_picker: Option<ModelPicker>,
     pub input: String,
     slash_selected: usize,
@@ -162,8 +166,7 @@ impl App {
             workspace_path: String::new(),
             sessions: HashMap::new(),
             focused: None,
-            navigator: None,
-            navigator_open: false,
+            session_picker: None,
             model_picker: None,
             input: String::new(),
             slash_selected: 0,
@@ -190,8 +193,7 @@ impl App {
                 self.workspace_path.clear();
                 self.sessions.clear();
                 self.focused = None;
-                self.navigator = None;
-                self.navigator_open = false;
+                self.session_picker = None;
                 self.model_picker = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
@@ -507,11 +509,15 @@ impl App {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
             }
+            Event::Paste(text) if self.session_picker.is_some() => {
+                let changed = self.push_session_search(&text);
+                (changed, Vec::new())
+            }
             Event::Paste(text) if self.model_picker.is_some() => {
                 let changed = self.push_model_search(&text);
                 (changed, Vec::new())
             }
-            Event::Paste(text) if !self.navigator_open => {
+            Event::Paste(text) => {
                 let before = self.input.len();
                 for character in text.chars() {
                     if self.input.len() + character.len_utf8() > MAX_INPUT_BYTES {
@@ -527,7 +533,7 @@ impl App {
                 }
                 (changed, Vec::new())
             }
-            Event::Mouse(mouse) if self.model_picker.is_none() && !self.navigator_open => {
+            Event::Mouse(mouse) if self.model_picker.is_none() && self.session_picker.is_none() => {
                 let changed = match mouse.kind {
                     MouseEventKind::ScrollUp => self.scroll_transcript_up(MOUSE_SCROLL_ROWS),
                     MouseEventKind::ScrollDown => self.scroll_transcript_down(MOUSE_SCROLL_ROWS),
@@ -536,7 +542,7 @@ impl App {
                 (changed, Vec::new())
             }
             Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => (true, Vec::new()),
-            Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => (false, Vec::new()),
+            Event::Key(_) | Event::Mouse(_) => (false, Vec::new()),
         }
     }
 
@@ -545,11 +551,11 @@ impl App {
             self.quit = true;
             return (true, Vec::new());
         }
+        if self.session_picker.is_some() {
+            return self.handle_session_picker_key(key);
+        }
         if self.model_picker.is_some() {
             return self.handle_model_picker_key(key);
-        }
-        if self.navigator_open {
-            return self.handle_navigator_key(key.code);
         }
         if let Some(result) = self.handle_slash_key(key.code) {
             return result;
@@ -649,15 +655,10 @@ impl App {
             Action::NextLayout => self.layout = self.layout.next(),
             Action::PreviousLayout => self.layout = self.layout.previous(),
             Action::ToggleNavigator => {
-                self.model_picker = None;
-                if self.navigator_open {
-                    self.navigator = None;
-                    self.navigator_open = false;
+                if self.session_picker.is_some() {
+                    self.session_picker = None;
                 } else {
-                    self.navigator = self
-                        .focused
-                        .or_else(|| self.thread_order().first().copied());
-                    self.navigator_open = true;
+                    return self.open_sessions();
                 }
             }
             Action::CreateRootSession => return self.create_session(None),
@@ -672,8 +673,7 @@ impl App {
             self.status = Some("no authenticated providers have selectable models".to_owned());
             return (true, Vec::new());
         }
-        self.navigator = None;
-        self.navigator_open = false;
+        self.session_picker = None;
         self.model_picker = Some(ModelPicker {
             query: String::new(),
             selected: 0,
@@ -768,7 +768,7 @@ impl App {
         };
         let before = picker.query.len();
         for character in text.chars() {
-            if picker.query.len() + character.len_utf8() > MAX_MODEL_SEARCH_BYTES {
+            if picker.query.len() + character.len_utf8() > MAX_PICKER_SEARCH_BYTES {
                 break;
             }
             if let Some(character) = terminal_safe_character(character) {
@@ -779,40 +779,122 @@ impl App {
         picker.query.len() != before
     }
 
-    fn handle_navigator_key(&mut self, code: KeyCode) -> (bool, Vec<ClientRequest>) {
-        let order = self.thread_order();
-        if order.is_empty() {
-            if code == KeyCode::Esc {
-                self.navigator_open = false;
-                return (true, Vec::new());
-            }
-            return (false, Vec::new());
-        }
-        let selected = self.navigator.unwrap_or(order[0]);
-        let position = order
-            .iter()
-            .position(|session| *session == selected)
-            .unwrap_or_default();
-        match code {
+    fn open_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
+        self.model_picker = None;
+        self.session_picker = Some(SessionPicker {
+            query: String::new(),
+            selected: self
+                .focused
+                .filter(|session_id| self.sessions.contains_key(session_id))
+                .or_else(|| self.thread_order().first().copied()),
+        });
+        (true, Vec::new())
+    }
+
+    pub(crate) fn filtered_sessions(&self) -> Vec<SessionId> {
+        let Some(picker) = &self.session_picker else {
+            return Vec::new();
+        };
+        let query = picker.query.to_ascii_lowercase();
+        self.thread_order()
+            .into_iter()
+            .filter(|session_id| {
+                query.is_empty()
+                    || self.sessions[session_id]
+                        .summary
+                        .title
+                        .to_ascii_lowercase()
+                        .contains(&query)
+            })
+            .collect()
+    }
+
+    fn handle_session_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+        let filtered = self.filtered_sessions();
+        let selected = self
+            .session_picker
+            .as_ref()
+            .and_then(|picker| picker.selected);
+        let position =
+            selected.and_then(|selected| filtered.iter().position(|session| *session == selected));
+        match key.code {
             KeyCode::Esc => {
-                self.navigator = None;
-                self.navigator_open = false;
+                self.session_picker = None;
                 (true, Vec::new())
             }
             KeyCode::Up => {
-                self.navigator = Some(order[position.saturating_sub(1)]);
+                if let Some(picker) = &mut self.session_picker {
+                    picker.selected = filtered
+                        .get(position.unwrap_or_default().saturating_sub(1))
+                        .copied();
+                }
                 (true, Vec::new())
             }
             KeyCode::Down => {
-                self.navigator = Some(order[(position + 1).min(order.len() - 1)]);
+                if let Some(picker) = &mut self.session_picker {
+                    picker.selected = filtered
+                        .get(
+                            position
+                                .map(|position| position + 1)
+                                .unwrap_or_default()
+                                .min(filtered.len().saturating_sub(1)),
+                        )
+                        .copied();
+                }
                 (true, Vec::new())
             }
             KeyCode::Enter => {
-                self.navigator = None;
-                self.navigator_open = false;
+                let Some(selected) = selected.filter(|selected| filtered.contains(selected)) else {
+                    return (false, Vec::new());
+                };
+                self.session_picker = None;
                 self.focus_session(selected)
             }
+            KeyCode::Backspace => {
+                let changed = self
+                    .session_picker
+                    .as_mut()
+                    .is_some_and(|picker| picker.query.pop().is_some());
+                self.reset_session_picker_selection();
+                (changed, Vec::new())
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let mut encoded = [0; 4];
+                (
+                    self.push_session_search(character.encode_utf8(&mut encoded)),
+                    Vec::new(),
+                )
+            }
             _ => (false, Vec::new()),
+        }
+    }
+
+    fn push_session_search(&mut self, text: &str) -> bool {
+        let Some(picker) = &mut self.session_picker else {
+            return false;
+        };
+        let before = picker.query.len();
+        for character in text.chars() {
+            if picker.query.len() + character.len_utf8() > MAX_PICKER_SEARCH_BYTES {
+                break;
+            }
+            if let Some(character) = terminal_safe_character(character) {
+                picker.query.push(character);
+            }
+        }
+        let changed = picker.query.len() != before;
+        self.reset_session_picker_selection();
+        changed
+    }
+
+    fn reset_session_picker_selection(&mut self) {
+        let selected = self.filtered_sessions().first().copied();
+        if let Some(picker) = &mut self.session_picker {
+            picker.selected = selected;
         }
     }
 
@@ -977,14 +1059,7 @@ impl App {
             }
             SlashAction::Models => self.open_models(),
             SlashAction::New => self.create_session(None),
-            SlashAction::Sessions => {
-                self.model_picker = None;
-                self.navigator = self
-                    .focused
-                    .or_else(|| self.thread_order().first().copied());
-                self.navigator_open = true;
-                (true, Vec::new())
-            }
+            SlashAction::Sessions => self.open_sessions(),
         }
     }
 
@@ -1206,10 +1281,8 @@ mod tests {
             app.input = command.to_owned();
             let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(requests.is_empty());
-            assert!(app.navigator.is_some());
-            assert!(app.navigator_open);
-            app.navigator = None;
-            app.navigator_open = false;
+            assert!(app.session_picker.is_some());
+            app.session_picker = None;
         }
 
         for command in ["/quit", "/exit"] {
@@ -1275,10 +1348,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.input.is_empty());
-        assert!(app.navigator_open);
+        assert!(app.session_picker.is_some());
 
-        app.navigator = None;
-        app.navigator_open = false;
+        app.session_picker = None;
         app.input = "/qu".to_owned();
         app.slash_selected = 0;
         assert_eq!(
@@ -1289,6 +1361,63 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.input.is_empty());
         assert!(app.quit);
+    }
+
+    #[test]
+    fn session_picker_searches_titles_and_focuses_the_match() {
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let target = id(9, SessionId::from_bytes);
+        initial.sessions[0].title = "Deploy API".to_owned();
+        initial.focused.as_mut().unwrap().summary.title = "Deploy API".to_owned();
+        initial.sessions.push(SessionSummary {
+            id: target,
+            workspace_id,
+            parent_id: None,
+            title: "Fix Login Redirect".to_owned(),
+            status: SessionStatus::Idle,
+            active_run_id: None,
+            queued_prompts: 0,
+            model: Some("openai/gpt-test".to_owned()),
+            estimated_cost_usd_nanos: Some(0),
+            updated_at_ms: 2,
+            last_outcome: None,
+        });
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(initial);
+        app.input = "/sessions".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let (changed, requests) = app.handle_terminal_event(Event::Paste("LOGIN".to_owned()));
+
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.filtered_sessions(), [target]);
+        assert_eq!(app.session_picker.as_ref().unwrap().selected, Some(target));
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Snapshot(SnapshotRequest {
+                focused_session_id: Some(session_id),
+                ..
+            }) if *session_id == target
+        ));
+        assert!(app.session_picker.is_none());
+    }
+
+    #[test]
+    fn session_picker_keeps_open_when_search_has_no_matches() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        app.open_sessions();
+        app.handle_terminal_event(Event::Paste("missing".to_owned()));
+
+        assert!(app.filtered_sessions().is_empty());
+        let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!changed);
+        assert!(requests.is_empty());
+        assert!(app.session_picker.is_some());
     }
 
     #[test]
@@ -1736,7 +1865,10 @@ mod tests {
         assert_eq!(app.transcript_scroll_offset(), 0);
 
         app.model_picker = None;
-        app.navigator_open = true;
+        app.session_picker = Some(SessionPicker {
+            query: String::new(),
+            selected: app.focused,
+        });
         assert!(!app.handle_terminal_event(wheel).0);
         assert!(!app.handle_terminal_event(page).0);
         assert_eq!(app.transcript_scroll_offset(), 0);
