@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
     CommandId, CommandOutcome, CommandRequest, MessageSnapshot, MessageState, ModelSelection,
     RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
@@ -18,6 +18,7 @@ const MAX_MODEL_SEARCH_BYTES: usize = 256;
 const MAX_RECENT_EVENTS: usize = 1024;
 const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct TuiOptions {
@@ -61,6 +62,14 @@ pub(crate) struct ModelPicker {
     pub selected: usize,
 }
 
+#[derive(Debug, Default)]
+struct TranscriptViewport {
+    context: Option<(Option<SessionId>, Layout)>,
+    body_rows: usize,
+    height: usize,
+    offset: usize,
+}
+
 #[derive(Debug, Clone)]
 enum PendingIntent {
     Create,
@@ -85,13 +94,14 @@ pub(crate) struct App {
     pub status: Option<String>,
     pub animation_tick: usize,
     pub quit: bool,
+    transcript_viewport: TranscriptViewport,
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
     pending: HashMap<CommandId, PendingIntent>,
 }
 
 impl App {
-    fn new(options: TuiOptions) -> Self {
+    pub(crate) fn new(options: TuiOptions) -> Self {
         Self {
             layout: options.settings.initial_layout(),
             settings: options.settings,
@@ -109,6 +119,7 @@ impl App {
             status: None,
             animation_tick: 0,
             quit: false,
+            transcript_viewport: TranscriptViewport::default(),
             last_sequence: 0,
             recent_events: VecDeque::new(),
             pending: HashMap::new(),
@@ -434,6 +445,14 @@ impl App {
                 }
                 (self.input.len() != before, Vec::new())
             }
+            Event::Mouse(mouse) if self.model_picker.is_none() && !self.navigator_open => {
+                let changed = match mouse.kind {
+                    MouseEventKind::ScrollUp => self.scroll_transcript_up(MOUSE_SCROLL_ROWS),
+                    MouseEventKind::ScrollDown => self.scroll_transcript_down(MOUSE_SCROLL_ROWS),
+                    _ => false,
+                };
+                (changed, Vec::new())
+            }
             Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => (true, Vec::new()),
             Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => (false, Vec::new()),
         }
@@ -464,6 +483,14 @@ impl App {
                 (false, Vec::new())
             }
             KeyCode::Enter => self.submit_prompt(),
+            KeyCode::PageUp => {
+                let changed = self.scroll_transcript_up(self.transcript_viewport.height);
+                (changed, Vec::new())
+            }
+            KeyCode::PageDown => {
+                let changed = self.scroll_transcript_down(self.transcript_viewport.height);
+                (changed, Vec::new())
+            }
             KeyCode::Backspace => (self.input.pop().is_some(), Vec::new()),
             KeyCode::Char(character)
                 if !key
@@ -475,6 +502,53 @@ impl App {
             }
             _ => (false, Vec::new()),
         }
+    }
+
+    pub(crate) fn update_transcript_viewport(&mut self, body_rows: usize, height: usize) {
+        let context = (self.focused, self.layout);
+        if self.transcript_viewport.context != Some(context) {
+            self.transcript_viewport = TranscriptViewport {
+                context: Some(context),
+                body_rows,
+                height,
+                offset: 0,
+            };
+            return;
+        }
+        if self.transcript_viewport.offset > 0 && self.transcript_viewport.height > 0 {
+            let top = self
+                .transcript_viewport
+                .body_rows
+                .saturating_sub(self.transcript_viewport.offset)
+                .saturating_sub(self.transcript_viewport.height);
+            self.transcript_viewport.offset = body_rows.saturating_sub(top.saturating_add(height));
+        }
+        self.transcript_viewport.body_rows = body_rows;
+        self.transcript_viewport.height = height;
+        self.transcript_viewport.offset = self
+            .transcript_viewport
+            .offset
+            .min(body_rows.saturating_sub(height));
+    }
+
+    pub(crate) const fn transcript_scroll_offset(&self) -> usize {
+        self.transcript_viewport.offset
+    }
+
+    fn scroll_transcript_up(&mut self, rows: usize) -> bool {
+        let before = self.transcript_viewport.offset;
+        let maximum = self
+            .transcript_viewport
+            .body_rows
+            .saturating_sub(self.transcript_viewport.height);
+        self.transcript_viewport.offset = before.saturating_add(rows).min(maximum);
+        self.transcript_viewport.offset != before
+    }
+
+    fn scroll_transcript_down(&mut self, rows: usize) -> bool {
+        let before = self.transcript_viewport.offset;
+        self.transcript_viewport.offset = before.saturating_sub(rows);
+        self.transcript_viewport.offset != before
     }
 
     fn handle_action(&mut self, action: Action) -> (bool, Vec<ClientRequest>) {
@@ -887,6 +961,7 @@ pub(crate) fn terminal_safe_character(character: char) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::MouseEvent;
     use qq_protocol::{
         EventCursor, MessageId, MessageRole, RunId, SessionStatus, StoreId, WorkspaceSummary,
     };
@@ -1231,5 +1306,139 @@ mod tests {
         let retained = app.sessions[&session_id].messages.as_ref().unwrap();
         assert_eq!(retained.len(), usize::from(SNAPSHOT_MESSAGE_LIMIT));
         assert_eq!(retained.last().unwrap().output, "newest");
+    }
+
+    #[test]
+    fn page_keys_scroll_the_transcript_by_one_visible_page() {
+        let mut app = App::new(TuiOptions::default());
+        app.update_transcript_viewport(100, 12);
+
+        let (changed, requests) = app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.transcript_scroll_offset(), 12);
+
+        let (changed, requests) = app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.transcript_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_transcript_by_three_rows() {
+        let mut app = App::new(TuiOptions::default());
+        app.update_transcript_viewport(100, 12);
+
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let (changed, requests) = app.handle_terminal_event(mouse(MouseEventKind::ScrollUp));
+
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.transcript_scroll_offset(), 3);
+
+        let (changed, requests) = app.handle_terminal_event(mouse(MouseEventKind::ScrollDown));
+
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.transcript_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn streamed_rows_do_not_move_a_scrolled_transcript() {
+        let mut app = App::new(TuiOptions::default());
+        app.update_transcript_viewport(40, 10);
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )));
+
+        app.update_transcript_viewport(45, 10);
+
+        assert_eq!(app.transcript_scroll_offset(), 15);
+    }
+
+    #[test]
+    fn session_and_layout_changes_return_the_transcript_to_the_live_tail() {
+        let mut app = App::new(TuiOptions::default());
+        app.focused = Some(SessionId::from_bytes([1; 16]));
+        app.update_transcript_viewport(100, 10);
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )));
+
+        app.focused = Some(SessionId::from_bytes([2; 16]));
+        app.update_transcript_viewport(100, 10);
+
+        assert_eq!(app.transcript_scroll_offset(), 0);
+
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )));
+        app.layout = app.layout.next();
+        app.update_transcript_viewport(100, 10);
+
+        assert_eq!(app.transcript_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scrolling_clamps_at_the_oldest_row_and_the_live_tail() {
+        let mut app = App::new(TuiOptions::default());
+        app.update_transcript_viewport(25, 10);
+        let page_up = Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        let page_down = Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert!(app.handle_terminal_event(page_up.clone()).0);
+        assert!(app.handle_terminal_event(page_up.clone()).0);
+        assert_eq!(app.transcript_scroll_offset(), 15);
+        assert!(!app.handle_terminal_event(page_up).0);
+
+        assert!(app.handle_terminal_event(page_down.clone()).0);
+        assert!(app.handle_terminal_event(page_down.clone()).0);
+        assert_eq!(app.transcript_scroll_offset(), 0);
+        assert!(!app.handle_terminal_event(page_down).0);
+    }
+
+    #[test]
+    fn transcript_scroll_controls_are_ignored_by_overlays() {
+        let mut app = App::new(TuiOptions::default());
+        app.update_transcript_viewport(100, 10);
+        app.model_picker = Some(ModelPicker {
+            query: String::new(),
+            selected: 0,
+        });
+        let wheel = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        let page = Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+
+        assert!(!app.handle_terminal_event(wheel.clone()).0);
+        assert!(!app.handle_terminal_event(page.clone()).0);
+        assert_eq!(app.transcript_scroll_offset(), 0);
+
+        app.model_picker = None;
+        app.navigator_open = true;
+        assert!(!app.handle_terminal_event(wheel).0);
+        assert!(!app.handle_terminal_event(page).0);
+        assert_eq!(app.transcript_scroll_offset(), 0);
     }
 }
