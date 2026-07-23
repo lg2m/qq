@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, Role,
+    ProviderStream, ProviderUsage, Role,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
     request_auth::RequestAuthorizer,
@@ -218,6 +218,7 @@ impl Provider for AnthropicMessages {
             let mut decoder = SseDecoder::new(limits.event);
             let mut output_bytes = 0_usize;
             let mut wire_bytes = 0_usize;
+            let mut usage = None;
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
@@ -233,12 +234,36 @@ impl Provider for AnthropicMessages {
                             add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
                             yield ProviderEvent::OutputTextDelta { text };
                         }
-                        DecodedEvent::Refusal(text) => {
-                            add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
-                            yield ProviderEvent::RefusalDelta { text };
+                        DecodedEvent::MessageStart(start) => {
+                            if let Some(start) = start
+                                && usage.replace(start).is_some()
+                            {
+                                Err(ProviderError::Protocol(
+                                    "Anthropic-compatible stream reported starting usage more than once".to_owned(),
+                                ))?;
+                            }
+                        }
+                        DecodedEvent::MessageDelta { refusal, output_tokens } => {
+                            if let Some(text) = refusal {
+                                add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                                yield ProviderEvent::RefusalDelta { text };
+                            }
+                            if let Some(output_tokens) = output_tokens {
+                                let current = usage.as_mut().ok_or_else(|| {
+                                    ProviderError::Protocol(
+                                        "Anthropic-compatible stream reported output usage before starting usage".to_owned(),
+                                    )
+                                })?;
+                                if output_tokens < current.output_tokens {
+                                    Err(ProviderError::Protocol(
+                                        "Anthropic-compatible cumulative output usage decreased".to_owned(),
+                                    ))?;
+                                }
+                                current.output_tokens = output_tokens;
+                            }
                         }
                         DecodedEvent::Completed => {
-                            yield ProviderEvent::Completed;
+                            yield ProviderEvent::Completed { usage };
                             return;
                         }
                         DecodedEvent::Ignored => {}
@@ -613,13 +638,16 @@ enum StreamingEvent {
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { delta: ContentDelta },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: MessageDelta },
+    MessageDelta {
+        delta: MessageDelta,
+        usage: Option<MessageDeltaUsage>,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "error")]
     Error { error: WireApiError },
     #[serde(rename = "message_start")]
-    MessageStart,
+    MessageStart { message: StartedMessage },
     #[serde(rename = "content_block_start")]
     ContentBlockStart,
     #[serde(rename = "content_block_stop")]
@@ -648,6 +676,26 @@ struct MessageDelta {
 }
 
 #[derive(Deserialize)]
+struct MessageDeltaUsage {
+    output_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct StartedMessage {
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+#[derive(Deserialize)]
 struct StopDetails {
     #[serde(rename = "type")]
     detail_type: Option<String>,
@@ -671,7 +719,11 @@ struct WireApiError {
 #[derive(Debug, PartialEq, Eq)]
 enum DecodedEvent {
     OutputText(String),
-    Refusal(String),
+    MessageStart(Option<ProviderUsage>),
+    MessageDelta {
+        refusal: Option<String>,
+        output_tokens: Option<u64>,
+    },
     Completed,
     Ignored,
 }
@@ -711,12 +763,24 @@ fn decode_event(event: SseEvent, redactions: &[String]) -> Result<DecodedEvent, 
         StreamingEvent::ContentBlockDelta {
             delta: ContentDelta::Thinking | ContentDelta::Other,
         }
-        | StreamingEvent::MessageStart
         | StreamingEvent::ContentBlockStart
         | StreamingEvent::ContentBlockStop
         | StreamingEvent::Ping
         | StreamingEvent::Other => Ok(DecodedEvent::Ignored),
-        StreamingEvent::MessageDelta { delta } => decode_message_delta(delta, redactions),
+        StreamingEvent::MessageStart { message } => {
+            Ok(DecodedEvent::MessageStart(message.usage.map(|usage| {
+                ProviderUsage {
+                    input_tokens: usage.input_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_write_input_tokens: usage.cache_creation_input_tokens,
+                    output_tokens: usage.output_tokens,
+                }
+            })))
+        }
+        StreamingEvent::MessageDelta { delta, usage } => Ok(DecodedEvent::MessageDelta {
+            refusal: decode_message_delta(delta, redactions)?,
+            output_tokens: usage.map(|usage| usage.output_tokens),
+        }),
         StreamingEvent::MessageStop => Ok(DecodedEvent::Completed),
         StreamingEvent::Error { error } => Err(wire_api_error(error, redactions)),
     }
@@ -725,7 +789,7 @@ fn decode_event(event: SseEvent, redactions: &[String]) -> Result<DecodedEvent, 
 fn decode_message_delta(
     delta: MessageDelta,
     redactions: &[String],
-) -> Result<DecodedEvent, ProviderError> {
+) -> Result<Option<String>, ProviderError> {
     let details_are_refusal = delta
         .stop_details
         .as_ref()
@@ -740,11 +804,11 @@ fn decode_message_delta(
                 || "Anthropic declined the request".to_owned(),
                 |explanation| sanitize_message(&explanation, redactions),
             );
-        return Ok(DecodedEvent::Refusal(explanation));
+        return Ok(Some(explanation));
     }
 
     match delta.stop_reason.as_deref() {
-        None | Some("end_turn" | "stop_sequence") => Ok(DecodedEvent::Ignored),
+        None | Some("end_turn" | "stop_sequence") => Ok(None),
         Some("max_tokens" | "model_context_window_exceeded") => {
             Err(ProviderError::ResponseIncomplete(
                 "Anthropic response reached a configured model limit".to_owned(),
@@ -1108,6 +1172,47 @@ mod tests {
     }
 
     #[test]
+    fn decodes_cumulative_usage_and_rejects_overflow() {
+        let start = decode_data(
+            "message_start",
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creation_input_tokens":3,"cache_read_input_tokens":4,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+        let delta = decode_event(
+            SseEvent {
+                name: Some("message_delta".to_owned()),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#.to_owned(),
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            start,
+            DecodedEvent::MessageStart(Some(ProviderUsage {
+                input_tokens: 12,
+                cache_read_input_tokens: 4,
+                cache_write_input_tokens: 3,
+                output_tokens: 1,
+            }))
+        );
+        assert_eq!(
+            delta,
+            DecodedEvent::MessageDelta {
+                refusal: None,
+                output_tokens: Some(9),
+            }
+        );
+
+        let error = decode_data(
+            "message_start",
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":18446744073709551616,"output_tokens":1}}}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::Protocol(_)));
+    }
+
+    #[test]
     fn handles_text_refusal_errors_and_opaque_events() {
         let text = decode_data(
             "content_block_delta",
@@ -1143,7 +1248,10 @@ mod tests {
         assert!(matches!(text, DecodedEvent::OutputText(text) if text == "hello"));
         assert!(matches!(
             refusal,
-            DecodedEvent::Refusal(text) if text == "request declined"
+            DecodedEvent::MessageDelta {
+                refusal: Some(text),
+                output_tokens: None,
+            } if text == "request declined"
         ));
         assert_eq!(thinking, DecodedEvent::Ignored);
         assert_eq!(redacted, DecodedEvent::Ignored);
@@ -1189,7 +1297,7 @@ mod tests {
             b"\xef".to_vec(),
             b"\xbb".to_vec(),
             b"\xbf: heartbeat\r".to_vec(),
-            b"\nevent: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{}}\r\n\r"
+            b"\nevent: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":4,\"output_tokens\":1}}}\r\n\r"
                 .to_vec(),
             b"\nevent: ping\ndata: {\"type\":\"ping\"}\n\n".to_vec(),
             b"event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"h\xc3"
@@ -1199,7 +1307,7 @@ mod tests {
                 .to_vec(),
             b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n"
                 .to_vec(),
-            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n"
                 .to_vec(),
             b"event: message_stop\ndata: {\"type\":\"message_".to_vec(),
             b"stop\"}\r\r".to_vec(),
@@ -1232,7 +1340,17 @@ mod tests {
             &events[1],
             Ok(ProviderEvent::OutputTextDelta { text }) if text == "lo"
         ));
-        assert!(matches!(&events[2], Ok(ProviderEvent::Completed)));
+        assert_eq!(
+            events[2].as_ref().unwrap(),
+            &ProviderEvent::Completed {
+                usage: Some(ProviderUsage {
+                    input_tokens: 12,
+                    cache_read_input_tokens: 4,
+                    cache_write_input_tokens: 3,
+                    output_tokens: 9,
+                }),
+            }
+        );
 
         let request = String::from_utf8(server.join().unwrap()).unwrap();
         let (head, body) = request.split_once("\r\n\r\n").unwrap();

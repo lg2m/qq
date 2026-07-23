@@ -381,7 +381,7 @@ mod tests {
             &events[..],
             [
                 Ok(ProviderEvent::OutputTextDelta { text }),
-                Ok(ProviderEvent::Completed)
+                Ok(ProviderEvent::Completed { usage: None })
             ] if text == "fast"
         ));
         let request = server.join().unwrap();

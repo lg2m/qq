@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, Role,
+    ProviderStream, ProviderUsage, Role,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
     request_auth::RequestAuthorizer,
@@ -158,6 +158,7 @@ impl Provider for OpenAiChatCompletions {
             let mut decoder = SseDecoder::new(limits.event);
             let mut output_bytes = 0_usize;
             let mut wire_bytes = 0_usize;
+            let mut usage = None;
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
@@ -170,11 +171,19 @@ impl Provider for OpenAiChatCompletions {
                         continue;
                     }
                     if data == "[DONE]" {
-                        yield ProviderEvent::Completed;
+                        yield ProviderEvent::Completed { usage };
                         return;
                     }
 
-                    for delta in decode_event(data, redactions.as_ref())? {
+                    let decoded = decode_event(data, redactions.as_ref())?;
+                    if let Some(chunk_usage) = decoded.usage
+                        && usage.replace(chunk_usage).is_some()
+                    {
+                        Err(ProviderError::Protocol(
+                            "OpenAI-compatible stream reported usage more than once".to_owned(),
+                        ))?;
+                    }
+                    for delta in decoded.deltas {
                         match delta {
                             DecodedDelta::OutputText(text) => {
                                 add_output_bytes(
@@ -456,6 +465,7 @@ struct ChatCompletionsRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     stream: bool,
+    stream_options: ChatStreamOptions,
     max_tokens: u32,
 }
 
@@ -465,9 +475,17 @@ impl<'a> From<&'a ModelRequest> for ChatCompletionsRequest<'a> {
             model: request.model(),
             messages: request.messages().iter().map(ChatMessage::from).collect(),
             stream: true,
+            stream_options: ChatStreamOptions {
+                include_usage: true,
+            },
             max_tokens: request.max_output_tokens(),
         }
     }
+}
+
+#[derive(Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -499,7 +517,21 @@ enum ChatRole {
 struct ChatCompletionChunk {
     #[serde(default)]
     choices: Vec<ChatChoice>,
+    usage: Option<ChatUsage>,
     error: Option<WireApiError>,
+}
+
+#[derive(Deserialize)]
+struct ChatUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    prompt_tokens_details: Option<ChatPromptTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct ChatPromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -536,7 +568,13 @@ enum DecodedDelta {
     TerminalError(ProviderError),
 }
 
-fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedDelta>, ProviderError> {
+#[derive(Debug)]
+struct DecodedChunk {
+    deltas: Vec<DecodedDelta>,
+    usage: Option<ProviderUsage>,
+}
+
+fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedChunk, ProviderError> {
     let chunk: ChatCompletionChunk = serde_json::from_str(data).map_err(|error| {
         ProviderError::Protocol(sanitize_message(
             &format!("could not decode OpenAI-compatible event: {error}"),
@@ -548,6 +586,7 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedDelta>, 
         return Err(wire_api_error(error, redactions));
     }
 
+    let usage = chunk.usage.map(provider_usage).transpose()?;
     let mut deltas = Vec::new();
     for choice in chunk.choices {
         if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
@@ -575,7 +614,24 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedDelta>, 
             deltas.push(DecodedDelta::TerminalError(error));
         }
     }
-    Ok(deltas)
+    Ok(DecodedChunk { deltas, usage })
+}
+
+fn provider_usage(usage: ChatUsage) -> Result<ProviderUsage, ProviderError> {
+    let cached = usage
+        .prompt_tokens_details
+        .map_or(0, |details| details.cached_tokens);
+    let input_tokens = usage.prompt_tokens.checked_sub(cached).ok_or_else(|| {
+        ProviderError::Protocol(
+            "OpenAI-compatible cached input tokens exceeded prompt tokens".to_owned(),
+        )
+    })?;
+    Ok(ProviderUsage {
+        input_tokens,
+        cache_read_input_tokens: cached,
+        cache_write_input_tokens: 0,
+        output_tokens: usage.completion_tokens,
+    })
 }
 
 fn wire_api_error(error: WireApiError, redactions: &[String]) -> ProviderError {
@@ -881,6 +937,7 @@ mod tests {
             &[],
         )
         .unwrap()
+        .deltas
         .pop()
         .expect("length must produce a terminal outcome");
         let tool_calls = decode_event(
@@ -888,6 +945,7 @@ mod tests {
             &[],
         )
         .unwrap()
+        .deltas
         .pop()
         .expect("tool calls must produce a terminal outcome");
 
@@ -899,6 +957,32 @@ mod tests {
             tool_calls,
             DecodedDelta::TerminalError(ProviderError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn decodes_usage_and_rejects_cached_prompt_underflow() {
+        let usage = decode_event(
+            r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":6}}}"#,
+            &[],
+        )
+        .unwrap()
+        .usage;
+        assert_eq!(
+            usage,
+            Some(ProviderUsage {
+                input_tokens: 14,
+                cache_read_input_tokens: 6,
+                cache_write_input_tokens: 0,
+                output_tokens: 7,
+            })
+        );
+
+        let error = decode_event(
+            r#"{"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":3}}}"#,
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::Protocol(_)));
     }
 
     #[test]
@@ -925,6 +1009,7 @@ mod tests {
             b"\xa9l\"}}]}\r\n\r".to_vec(),
             b"\ndata: {\"choices\":[{\"delta\":{\"refusal\":\"cannot\"}}]}\n\n".to_vec(),
             b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\r\r".to_vec(),
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":6}}}\n\n".to_vec(),
             b"data: [DO".to_vec(),
             b"NE]\r\n\r\n".to_vec(),
         ];
@@ -956,7 +1041,17 @@ mod tests {
             &events[1],
             Ok(ProviderEvent::RefusalDelta { text }) if text == "cannot"
         ));
-        assert!(matches!(&events[2], Ok(ProviderEvent::Completed)));
+        assert_eq!(
+            events[2].as_ref().unwrap(),
+            &ProviderEvent::Completed {
+                usage: Some(ProviderUsage {
+                    input_tokens: 14,
+                    cache_read_input_tokens: 6,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 7,
+                }),
+            }
+        );
 
         let request = String::from_utf8(server.join().unwrap()).unwrap();
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
@@ -984,6 +1079,7 @@ mod tests {
                     {"role": "assistant", "content": "pong"}
                 ],
                 "stream": true,
+                "stream_options": {"include_usage": true},
                 "max_tokens": 321
             })
         );

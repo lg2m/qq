@@ -34,7 +34,7 @@ use aws_sdk_bedrockruntime::{
     operation::converse_stream::ConverseStreamError,
     types::{
         ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
-        InferenceConfiguration, Message as BedrockMessage, StopReason,
+        InferenceConfiguration, Message as BedrockMessage, StopReason, TokenUsage,
         error::ConverseStreamOutputError,
     },
 };
@@ -46,8 +46,9 @@ use http_body::Body;
 use tokio::sync::{OnceCell, Semaphore};
 
 use crate::{
-    ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent, ProviderStream, Role,
-    limits::StreamLimits, request_auth::AwsCredentialLease, sanitize::sanitize_message,
+    ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent, ProviderStream,
+    ProviderUsage, Role, limits::StreamLimits, request_auth::AwsCredentialLease,
+    sanitize::sanitize_message,
 };
 
 const EVENT_FRAME_OVERHEAD_BYTES: usize = 64;
@@ -164,6 +165,7 @@ impl Provider for Bedrock {
                 })?;
             let mut receiver = response.stream;
             let mut output_bytes = 0_usize;
+            let mut message_stopped = false;
 
             while let Some(event) = receiver
                 .recv()
@@ -180,6 +182,11 @@ impl Provider for Bedrock {
 
                 match decode_stream_event(event)? {
                     DecodedEvent::OutputText(text) => {
+                        if message_stopped {
+                            Err(ProviderError::Protocol(
+                                "Amazon Bedrock returned output after messageStop".to_owned(),
+                            ))?;
+                        }
                         if text.is_empty() {
                             continue;
                         }
@@ -187,22 +194,42 @@ impl Provider for Bedrock {
                         yield ProviderEvent::OutputTextDelta { text };
                     }
                     DecodedEvent::Refusal(text) => {
+                        if message_stopped {
+                            Err(ProviderError::Protocol(
+                                "Amazon Bedrock returned more than one messageStop".to_owned(),
+                            ))?;
+                        }
                         add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
                         yield ProviderEvent::RefusalDelta { text };
-                        yield ProviderEvent::Completed;
-                        return;
+                        message_stopped = true;
                     }
-                    DecodedEvent::Completed => {
-                        yield ProviderEvent::Completed;
+                    DecodedEvent::MessageStopped => {
+                        if message_stopped {
+                            Err(ProviderError::Protocol(
+                                "Amazon Bedrock returned more than one messageStop".to_owned(),
+                            ))?;
+                        }
+                        message_stopped = true;
+                    }
+                    DecodedEvent::Usage(usage) => {
+                        if !message_stopped {
+                            Err(ProviderError::Protocol(
+                                "Amazon Bedrock returned metadata before messageStop".to_owned(),
+                            ))?;
+                        }
+                        yield ProviderEvent::Completed { usage: Some(usage) };
                         return;
                     }
                     DecodedEvent::Ignored => {}
                 }
             }
 
-            Err(ProviderError::Protocol(
-                "Amazon Bedrock stream ended before messageStop".to_owned(),
-            ))?;
+            let message = if message_stopped {
+                "Amazon Bedrock stream ended before metadata"
+            } else {
+                "Amazon Bedrock stream ended before messageStop"
+            };
+            Err(ProviderError::Protocol(message.to_owned()))?;
         })
     }
 }
@@ -510,7 +537,8 @@ impl TryFrom<&ModelRequest> for ConverseRequest {
 enum DecodedEvent {
     OutputText(String),
     Refusal(String),
-    Completed,
+    MessageStopped,
+    Usage(ProviderUsage),
     Ignored,
 }
 
@@ -551,9 +579,15 @@ fn decode_stream_event(event: ConverseStreamOutput) -> Result<DecodedEvent, Prov
             )),
         },
         ConverseStreamOutput::MessageStop(event) => decode_stop_reason(event.stop_reason()),
-        ConverseStreamOutput::ContentBlockStop(_)
-        | ConverseStreamOutput::MessageStart(_)
-        | ConverseStreamOutput::Metadata(_) => Ok(DecodedEvent::Ignored),
+        ConverseStreamOutput::Metadata(event) => {
+            let usage = event.usage.ok_or_else(|| {
+                ProviderError::Protocol("Amazon Bedrock metadata omitted token usage".to_owned())
+            })?;
+            Ok(DecodedEvent::Usage(provider_usage(&usage)?))
+        }
+        ConverseStreamOutput::ContentBlockStop(_) | ConverseStreamOutput::MessageStart(_) => {
+            Ok(DecodedEvent::Ignored)
+        }
         event if event.is_unknown() => Err(ProviderError::Protocol(
             "Amazon Bedrock returned an unknown stream event".to_owned(),
         )),
@@ -565,7 +599,7 @@ fn decode_stream_event(event: ConverseStreamOutput) -> Result<DecodedEvent, Prov
 
 fn decode_stop_reason(reason: &StopReason) -> Result<DecodedEvent, ProviderError> {
     match reason {
-        StopReason::EndTurn | StopReason::StopSequence => Ok(DecodedEvent::Completed),
+        StopReason::EndTurn | StopReason::StopSequence => Ok(DecodedEvent::MessageStopped),
         StopReason::ContentFiltered => Ok(DecodedEvent::Refusal(
             "Amazon Bedrock filtered the response".to_owned(),
         )),
@@ -591,6 +625,33 @@ fn decode_stop_reason(reason: &StopReason) -> Result<DecodedEvent, ProviderError
             "Amazon Bedrock returned an unsupported stop reason".to_owned(),
         )),
     }
+}
+
+fn provider_usage(usage: &TokenUsage) -> Result<ProviderUsage, ProviderError> {
+    let input_tokens = u64::try_from(usage.input_tokens()).map_err(|_| {
+        ProviderError::Protocol("Amazon Bedrock returned negative input token usage".to_owned())
+    })?;
+    let output_tokens = u64::try_from(usage.output_tokens()).map_err(|_| {
+        ProviderError::Protocol("Amazon Bedrock returned negative output token usage".to_owned())
+    })?;
+    let cache_read_input_tokens = u64::try_from(usage.cache_read_input_tokens().unwrap_or(0))
+        .map_err(|_| {
+            ProviderError::Protocol(
+                "Amazon Bedrock returned negative cache-read token usage".to_owned(),
+            )
+        })?;
+    let cache_write_input_tokens = u64::try_from(usage.cache_write_input_tokens().unwrap_or(0))
+        .map_err(|_| {
+            ProviderError::Protocol(
+                "Amazon Bedrock returned negative cache-write token usage".to_owned(),
+            )
+        })?;
+    Ok(ProviderUsage {
+        input_tokens,
+        cache_read_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+    })
 }
 
 fn unsupported_output(kind: &str) -> ProviderError {
@@ -836,7 +897,9 @@ mod tests {
     #[allow(deprecated)]
     use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use aws_credential_types::provider::ProvideCredentials;
-    use aws_sdk_bedrockruntime::types::{ContentBlockDeltaEvent, MessageStopEvent};
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockDeltaEvent, ConverseStreamMetadataEvent, MessageStopEvent,
+    };
 
     use super::*;
     use crate::Message;
@@ -1144,12 +1207,47 @@ mod tests {
         );
         assert_eq!(
             decode_stream_event(stop(StopReason::EndTurn)).unwrap(),
-            DecodedEvent::Completed
+            DecodedEvent::MessageStopped
         );
         assert_eq!(
             decode_stream_event(stop(StopReason::StopSequence)).unwrap(),
-            DecodedEvent::Completed
+            DecodedEvent::MessageStopped
         );
+    }
+
+    #[test]
+    fn decodes_metadata_usage_and_rejects_negative_counts() {
+        let usage = TokenUsage::builder()
+            .input_tokens(12)
+            .cache_read_input_tokens(4)
+            .cache_write_input_tokens(3)
+            .output_tokens(9)
+            .total_tokens(28)
+            .build()
+            .unwrap();
+        let metadata = ConverseStreamOutput::Metadata(
+            ConverseStreamMetadataEvent::builder().usage(usage).build(),
+        );
+        assert_eq!(
+            decode_stream_event(metadata).unwrap(),
+            DecodedEvent::Usage(ProviderUsage {
+                input_tokens: 12,
+                cache_read_input_tokens: 4,
+                cache_write_input_tokens: 3,
+                output_tokens: 9,
+            })
+        );
+
+        let invalid = TokenUsage::builder()
+            .input_tokens(-1)
+            .output_tokens(1)
+            .total_tokens(0)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            provider_usage(&invalid),
+            Err(ProviderError::Protocol(_))
+        ));
     }
 
     #[test]

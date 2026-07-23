@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, Role,
+    ProviderStream, ProviderUsage, Role,
     http::{build_client, validate_endpoint},
     limits::StreamLimits,
     sanitize::sanitize_message,
@@ -173,6 +173,7 @@ impl Provider for GoogleGenerateContent {
             let mut decoder = SseDecoder::new(limits.event);
             let mut output_bytes = 0_usize;
             let mut wire_bytes = 0_usize;
+            let mut usage = None;
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
@@ -186,8 +187,15 @@ impl Provider for GoogleGenerateContent {
                                 add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
                                 yield ProviderEvent::OutputTextDelta { text };
                             }
+                            DecodedEvent::Usage(event_usage) => {
+                                if usage.replace(event_usage).is_some() {
+                                    Err(ProviderError::Protocol(
+                                        "Google GenerateContent stream reported usage more than once".to_owned(),
+                                    ))?;
+                                }
+                            }
                             DecodedEvent::Completed => {
-                                yield ProviderEvent::Completed;
+                                yield ProviderEvent::Completed { usage };
                                 return;
                             }
                         }
@@ -511,6 +519,18 @@ struct GenerateContentResponse {
     candidates: Vec<Candidate>,
     prompt_feedback: Option<PromptFeedback>,
     error: Option<WireApiError>,
+    usage_metadata: Option<UsageMetadata>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageMetadata {
+    prompt_token_count: u64,
+    candidates_token_count: u64,
+    #[serde(default)]
+    cached_content_token_count: u64,
+    #[serde(default)]
+    thoughts_token_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -565,6 +585,7 @@ struct WireApiError {
 #[derive(Debug, PartialEq, Eq)]
 enum DecodedEvent {
     OutputText(String),
+    Usage(ProviderUsage),
     Completed,
 }
 
@@ -591,8 +612,10 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, 
         });
     }
 
+    let usage = response.usage_metadata.map(provider_usage).transpose()?;
+
     let Some(candidate) = response.candidates.into_iter().next() else {
-        return Ok(Vec::new());
+        return Ok(usage.map_or_else(Vec::new, |usage| vec![DecodedEvent::Usage(usage)]));
     };
     if candidate.index.is_some_and(|index| index != 0) {
         return Err(ProviderError::Protocol(
@@ -600,7 +623,7 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, 
         ));
     }
 
-    let mut events = Vec::new();
+    let mut events = usage.map_or_else(Vec::new, |usage| vec![DecodedEvent::Usage(usage)]);
     if let Some(content) = candidate.content {
         for part in content.parts {
             if part.function_call.is_some()
@@ -670,6 +693,27 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, 
         }
     }
     Ok(events)
+}
+
+fn provider_usage(usage: UsageMetadata) -> Result<ProviderUsage, ProviderError> {
+    let input_tokens = usage
+        .prompt_token_count
+        .checked_sub(usage.cached_content_token_count)
+        .ok_or_else(|| {
+            ProviderError::Protocol("Google cached input tokens exceeded prompt tokens".to_owned())
+        })?;
+    let output_tokens = usage
+        .candidates_token_count
+        .checked_add(usage.thoughts_token_count)
+        .ok_or_else(|| {
+            ProviderError::Protocol("Google output token usage overflowed".to_owned())
+        })?;
+    Ok(ProviderUsage {
+        input_tokens,
+        cache_read_input_tokens: usage.cached_content_token_count,
+        cache_write_input_tokens: 0,
+        output_tokens,
+    })
 }
 
 fn wire_api_error(error: WireApiError, redactions: &[String]) -> ProviderError {
@@ -798,7 +842,7 @@ mod tests {
     async fn streams_text_and_builds_the_google_wire_request() {
         let body = concat!(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]},\"index\":0}]}\n\n",
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\",\"index\":0}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":20,\"cachedContentTokenCount\":6,\"candidatesTokenCount\":7,\"thoughtsTokenCount\":3}}\n\n",
         );
         let (base_url, server) = serve_once(200, "text/event-stream", body);
         let provider = GoogleGenerateContent::with_client(
@@ -824,7 +868,14 @@ mod tests {
             [
                 Ok(ProviderEvent::OutputTextDelta { text: first }),
                 Ok(ProviderEvent::OutputTextDelta { text: second }),
-                Ok(ProviderEvent::Completed),
+                Ok(ProviderEvent::Completed {
+                    usage: Some(ProviderUsage {
+                        input_tokens: 14,
+                        cache_read_input_tokens: 6,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 10,
+                    }),
+                }),
             ] if first == "Hel" && second == "lo"
         ));
         let request = server.join().unwrap();
@@ -891,6 +942,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(tool, ProviderError::Protocol(_)));
+    }
+
+    #[test]
+    fn usage_subtracts_cached_prompt_and_includes_thoughts() {
+        let events = decode_event(
+            r#"{"candidates":[{"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":20,"cachedContentTokenCount":6,"candidatesTokenCount":7,"thoughtsTokenCount":3}}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            [
+                DecodedEvent::Usage(ProviderUsage {
+                    input_tokens: 14,
+                    cache_read_input_tokens: 6,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 10,
+                }),
+                DecodedEvent::Completed,
+            ]
+        );
+
+        for data in [
+            r#"{"usageMetadata":{"promptTokenCount":2,"cachedContentTokenCount":3,"candidatesTokenCount":1}}"#,
+            r#"{"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":18446744073709551615,"thoughtsTokenCount":1}}"#,
+        ] {
+            assert!(matches!(
+                decode_event(data, &[]),
+                Err(ProviderError::Protocol(_))
+            ));
+        }
     }
 
     #[test]

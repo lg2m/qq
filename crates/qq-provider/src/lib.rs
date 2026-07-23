@@ -130,7 +130,18 @@ pub enum Role {
 pub enum ProviderEvent {
     OutputTextDelta { text: String },
     RefusalDelta { text: String },
-    Completed,
+    Completed { usage: Option<ProviderUsage> },
+}
+
+/// Provider-neutral token counts for one completed model response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderUsage {
+    /// Input tokens that were neither read from nor written to a cache.
+    pub input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    /// All generated tokens, including hidden reasoning tokens when reported.
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, Error)]
