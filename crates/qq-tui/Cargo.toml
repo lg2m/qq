@@ -8,3 +8,15 @@ publish = false
 
 [dependencies]
 qq-protocol.workspace = true
+
+[dev-dependencies]
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util.workspace = true
+pulldown-cmark = "0.13"
+tokio = { workspace = true, features = ["io-std"] }
+unicode-width = "0.2"
+
+[[example]]
+name = "tui_prototype"
+path = "examples/tui_prototype.rs"
+test = true
