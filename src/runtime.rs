@@ -1141,6 +1141,13 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn runtime_factory_can_be_dropped_in_async_context() {
+        let fixture = RuntimeFixture::new();
+
+        drop(fixture.factory());
+    }
+
     #[test]
     fn catalog_hides_builtin_models_until_the_provider_is_authenticated() {
         let fixture = RuntimeFixture::new();

@@ -30,7 +30,7 @@ const MAX_TOKEN_BYTES: usize = 256 * 1024;
 const REFRESH_SKEW: u64 = 5 * 60;
 const DEFAULT_TOKEN_LIFETIME: u64 = 60 * 60;
 const STORED_CREDENTIAL_VERSION: u32 = 1;
-const MAX_DEVICE_LIFETIME: u64 = 15 * 60;
+const MAX_DEVICE_LIFETIME: u64 = 60 * 60;
 const MAX_POLL_INTERVAL: u64 = 30;
 
 #[derive(Clone, Copy, Debug, Error)]
@@ -71,6 +71,46 @@ pub(super) struct DeviceAuthorization {
     interval: u64,
 }
 
+#[derive(Deserialize)]
+struct DeviceResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    expires_in: u64,
+    interval: Option<u64>,
+}
+
+impl TryFrom<DeviceResponse> for DeviceAuthorization {
+    type Error = XaiAuthError;
+
+    fn try_from(response: DeviceResponse) -> Result<Self, Self::Error> {
+        if response.device_code.is_empty()
+            || response.user_code.is_empty()
+            || response.expires_in == 0
+            || response.expires_in > MAX_DEVICE_LIFETIME
+            || response
+                .interval
+                .is_some_and(|interval| interval > MAX_POLL_INTERVAL)
+            || !is_https_url(&response.verification_uri)
+            || response
+                .verification_uri_complete
+                .as_deref()
+                .is_some_and(|url| !is_https_url(url))
+        {
+            return Err(XaiAuthError::DeviceResponseInvalid);
+        }
+        Ok(Self {
+            device_code: response.device_code,
+            user_code: response.user_code,
+            verification_uri: response.verification_uri,
+            verification_uri_complete: response.verification_uri_complete,
+            expires_in: response.expires_in,
+            interval: response.interval.unwrap_or(5).max(1),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct TokenSet {
     pub(super) access_token: String,
@@ -96,46 +136,14 @@ pub(super) struct SystemXaiTokenClient;
 
 impl XaiTokenClient for SystemXaiTokenClient {
     fn start_device(&self) -> Result<DeviceAuthorization, XaiAuthError> {
-        #[derive(Deserialize)]
-        struct ResponseBody {
-            device_code: String,
-            user_code: String,
-            verification_uri: String,
-            verification_uri_complete: Option<String>,
-            expires_in: u64,
-            interval: Option<u64>,
-        }
-
         let response = oauth_client()?
             .post(DEVICE_ENDPOINT)
             .header("referer", "qq")
             .form(&[("client_id", CLIENT_ID), ("scope", SCOPE)])
             .send()
             .map_err(|_| XaiAuthError::DeviceRequestFailed)?;
-        let body: ResponseBody = decode_success(response, XaiAuthError::DeviceResponseInvalid)?;
-        if body.device_code.is_empty()
-            || body.user_code.is_empty()
-            || body.expires_in == 0
-            || body.expires_in > MAX_DEVICE_LIFETIME
-            || body
-                .interval
-                .is_some_and(|interval| interval > MAX_POLL_INTERVAL)
-            || !is_https_url(&body.verification_uri)
-            || body
-                .verification_uri_complete
-                .as_deref()
-                .is_some_and(|url| !is_https_url(url))
-        {
-            return Err(XaiAuthError::DeviceResponseInvalid);
-        }
-        Ok(DeviceAuthorization {
-            device_code: body.device_code,
-            user_code: body.user_code,
-            verification_uri: body.verification_uri,
-            verification_uri_complete: body.verification_uri_complete,
-            expires_in: body.expires_in,
-            interval: body.interval.unwrap_or(5).max(1),
-        })
+        let body: DeviceResponse = decode_success(response, XaiAuthError::DeviceResponseInvalid)?;
+        body.try_into()
     }
 
     fn poll_device(&self, device_code: &str) -> Result<DevicePoll, XaiAuthError> {
@@ -541,4 +549,27 @@ fn unix_time() -> Result<u64, XaiAuthError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| XaiAuthError::ClockUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_xai_device_lifetime_is_accepted() {
+        let response: DeviceResponse = serde_json::from_value(serde_json::json!({
+            "device_code": "device-code",
+            "user_code": "USER-CODE",
+            "verification_uri": "https://accounts.x.ai/activate",
+            "verification_uri_complete": "https://accounts.x.ai/activate?user_code=USER-CODE",
+            "expires_in": 1800,
+            "interval": 5
+        }))
+        .unwrap();
+
+        let authorization = DeviceAuthorization::try_from(response).unwrap();
+
+        assert_eq!(authorization.expires_in, 1800);
+        assert_eq!(authorization.interval, 5);
+    }
 }

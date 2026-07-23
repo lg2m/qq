@@ -34,8 +34,6 @@ pub(crate) struct DiscoveredModel {
 }
 
 pub(crate) struct ModelDiscovery {
-    client: reqwest::blocking::Client,
-    direct_client: reqwest::blocking::Client,
     cache: Mutex<VecDeque<CacheEntry>>,
     fetch_gate: Mutex<()>,
     cache_key: [u8; 32],
@@ -61,27 +59,15 @@ enum DiscoveryAuth {
 
 #[derive(Debug, Error)]
 pub(crate) enum ModelDiscoveryError {
-    #[error("the model-discovery HTTP client could not be initialized")]
-    Http(#[from] reqwest::Error),
     #[error("model-discovery cache key generation failed")]
     Random,
 }
 
 impl ModelDiscovery {
     pub(crate) fn new() -> Result<Self, ModelDiscoveryError> {
-        let client = || {
-            reqwest::blocking::Client::builder()
-                .use_rustls_tls()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(1))
-                .timeout(Duration::from_secs(2))
-                .user_agent(concat!("qq/", env!("CARGO_PKG_VERSION")))
-        };
         let mut cache_key = [0_u8; 32];
         getrandom::fill(&mut cache_key).map_err(|_| ModelDiscoveryError::Random)?;
         Ok(Self {
-            client: client().build()?,
-            direct_client: client().no_proxy().build()?,
             cache: Mutex::new(VecDeque::new()),
             fetch_gate: Mutex::new(()),
             cache_key,
@@ -156,11 +142,9 @@ impl ModelDiscovery {
             }
             _ => {}
         }
-        let client = if direct {
-            &self.direct_client
-        } else {
-            &self.client
-        };
+        // Blocking clients own an internal runtime, so keep their lifetime
+        // inside the blocking discovery call rather than RuntimeFactory.
+        let client = discovery_client(direct)?;
         let mut request = apply_static_headers(client.get(endpoint), access);
         if kind == ProviderKind::Anthropic || access.api() == ProviderApi::AnthropicMessages {
             request = request.header("anthropic-version", "2023-06-01");
@@ -181,6 +165,19 @@ impl ModelDiscovery {
         let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         parse_models(&body, kind, access.api())
     }
+}
+
+fn discovery_client(direct: bool) -> Option<reqwest::blocking::Client> {
+    let mut client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .user_agent(concat!("qq/", env!("CARGO_PKG_VERSION")));
+    if direct {
+        client = client.no_proxy();
+    }
+    client.build().ok()
 }
 
 fn cache_key(
