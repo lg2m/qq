@@ -1,6 +1,8 @@
 //! Request-time HTTP authorization.
 
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
 };
@@ -17,6 +19,112 @@ use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::{ProviderError, ProviderErrorKind};
+
+pub type RequestCredentialFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RequestCredential, RequestCredentialError>> + Send + 'a>>;
+
+pub trait RequestCredentialProvider: Send + Sync {
+    fn credential(&self) -> RequestCredentialFuture<'_>;
+}
+
+#[derive(Clone)]
+pub struct SharedRequestCredentialProvider(Arc<dyn RequestCredentialProvider>);
+
+impl SharedRequestCredentialProvider {
+    pub fn new(provider: impl RequestCredentialProvider + 'static) -> Self {
+        Self(Arc::new(provider))
+    }
+}
+
+impl std::fmt::Debug for SharedRequestCredentialProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedRequestCredentialProvider([REDACTED])")
+    }
+}
+
+impl PartialEq for SharedRequestCredentialProvider {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedRequestCredentialProvider {}
+
+#[derive(Clone)]
+pub struct RequestCredential {
+    kind: RequestCredentialKind,
+}
+
+#[derive(Clone)]
+enum RequestCredentialKind {
+    Bearer(String),
+    Codex {
+        access_token: String,
+        account_id: String,
+        is_fedramp: bool,
+    },
+}
+
+impl RequestCredential {
+    pub fn bearer(token: impl Into<String>) -> Result<Self, RequestCredentialError> {
+        let token = token.into();
+        validate_credential_value(&token)?;
+        Ok(Self {
+            kind: RequestCredentialKind::Bearer(token),
+        })
+    }
+
+    pub fn codex(
+        access_token: impl Into<String>,
+        account_id: impl Into<String>,
+        is_fedramp: bool,
+    ) -> Result<Self, RequestCredentialError> {
+        let access_token = access_token.into();
+        let account_id = account_id.into();
+        validate_credential_value(&access_token)?;
+        validate_credential_value(&account_id)?;
+        Ok(Self {
+            kind: RequestCredentialKind::Codex {
+                access_token,
+                account_id,
+                is_fedramp,
+            },
+        })
+    }
+}
+
+impl std::fmt::Debug for RequestCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RequestCredential([REDACTED])")
+    }
+}
+
+fn validate_credential_value(value: &str) -> Result<(), RequestCredentialError> {
+    if value.is_empty() || HeaderValue::from_str(value).is_err() {
+        return Err(RequestCredentialError::Invalid);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RequestCredentialError {
+    #[error("request credentials are missing")]
+    Missing,
+    #[error("request credentials are invalid")]
+    Invalid,
+    #[error("credential refresh was rejected")]
+    RefreshRejected,
+    #[error("credential refresh is temporarily unavailable")]
+    RefreshUnavailable,
+    #[error("credential storage is unavailable")]
+    StorageUnavailable,
+    #[error("credential loading timed out")]
+    TimedOut,
+    #[error("credential loading capacity is exhausted")]
+    CapacityUnavailable,
+    #[error("credential loading worker stopped unexpectedly")]
+    WorkerFailed,
+}
 
 const MANTLE_SIGNING_NAME: &str = "bedrock-mantle";
 const CREDENTIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,6 +149,7 @@ static CREDENTIAL_LOAD_PERMITS: LazyLock<Arc<Semaphore>> =
 #[derive(Clone, Default)]
 pub(crate) struct RequestAuthorizer {
     sigv4: Option<Arc<SigV4Authorizer>>,
+    credentials: Option<SharedRequestCredentialProvider>,
 }
 
 impl RequestAuthorizer {
@@ -50,6 +159,14 @@ impl RequestAuthorizer {
     ) -> Self {
         Self {
             sigv4: Some(Arc::new(SigV4Authorizer::new(region, credentials))),
+            credentials: None,
+        }
+    }
+
+    pub(crate) fn request_credentials(credentials: SharedRequestCredentialProvider) -> Self {
+        Self {
+            sigv4: None,
+            credentials: Some(credentials),
         }
     }
 
@@ -66,18 +183,99 @@ impl RequestAuthorizer {
         authorizer.clock = clock;
         Self {
             sigv4: Some(Arc::new(authorizer)),
+            credentials: None,
         }
     }
 
     pub(crate) async fn authorize(
         &self,
         request: &mut reqwest::Request,
-    ) -> Result<(), ProviderError> {
-        match &self.sigv4 {
-            Some(authorizer) => authorizer.sign(request).await,
-            None => Ok(()),
+    ) -> Result<Vec<String>, ProviderError> {
+        if let Some(authorizer) = &self.sigv4 {
+            authorizer.sign(request).await?;
+        }
+        let Some(provider) = &self.credentials else {
+            return Ok(Vec::new());
+        };
+        let credential = provider
+            .0
+            .credential()
+            .await
+            .map_err(request_credential_error)?;
+        apply_request_credential(request, credential)
+    }
+}
+
+fn request_credential_error(error: RequestCredentialError) -> ProviderError {
+    let kind = match error {
+        RequestCredentialError::Missing
+        | RequestCredentialError::Invalid
+        | RequestCredentialError::RefreshRejected => ProviderErrorKind::Authentication,
+        RequestCredentialError::RefreshUnavailable
+        | RequestCredentialError::StorageUnavailable
+        | RequestCredentialError::TimedOut
+        | RequestCredentialError::CapacityUnavailable
+        | RequestCredentialError::WorkerFailed => ProviderErrorKind::Unavailable,
+    };
+    ProviderError::ResponseFailed {
+        kind,
+        message: error.to_string(),
+    }
+}
+
+fn apply_request_credential(
+    request: &mut reqwest::Request,
+    credential: RequestCredential,
+) -> Result<Vec<String>, ProviderError> {
+    let mut redactions = Vec::new();
+    match credential.kind {
+        RequestCredentialKind::Bearer(token) => {
+            insert_sensitive_header(request, AUTHORIZATION, &format!("Bearer {token}"))?;
+            redactions.push(token);
+        }
+        RequestCredentialKind::Codex {
+            access_token,
+            account_id,
+            is_fedramp,
+        } => {
+            insert_sensitive_header(request, AUTHORIZATION, &format!("Bearer {access_token}"))?;
+            insert_sensitive_header(
+                request,
+                HeaderName::from_static("chatgpt-account-id"),
+                &account_id,
+            )?;
+            request.headers_mut().insert(
+                HeaderName::from_static("originator"),
+                HeaderValue::from_static("qq"),
+            );
+            if is_fedramp {
+                request.headers_mut().insert(
+                    HeaderName::from_static("x-openai-fedramp"),
+                    HeaderValue::from_static("true"),
+                );
+            } else {
+                request
+                    .headers_mut()
+                    .remove(HeaderName::from_static("x-openai-fedramp"));
+            }
+            redactions.push(access_token);
+            redactions.push(account_id);
         }
     }
+    Ok(redactions)
+}
+
+fn insert_sensitive_header(
+    request: &mut reqwest::Request,
+    name: HeaderName,
+    value: &str,
+) -> Result<(), ProviderError> {
+    let mut value = HeaderValue::from_str(value).map_err(|_| {
+        ProviderError::Configuration("request credential produced an invalid header".to_owned())
+    })?;
+    value.set_sensitive(true);
+    request.headers_mut().insert(name, value);
+    Ok(())
 }
 
 struct CachedCredentials {
@@ -520,6 +718,38 @@ mod tests {
     use tokio::sync::{Notify, Semaphore};
 
     use super::*;
+
+    struct RotatingRequestCredentials {
+        calls: AtomicUsize,
+    }
+
+    impl RequestCredentialProvider for RotatingRequestCredentials {
+        fn credential(&self) -> RequestCredentialFuture<'_> {
+            let token = format!("token-{}", self.calls.fetch_add(1, Ordering::Relaxed));
+            Box::pin(async move { RequestCredential::bearer(token) })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_credentials_are_resolved_for_every_request() {
+        let authorizer = RequestAuthorizer::request_credentials(
+            SharedRequestCredentialProvider::new(RotatingRequestCredentials {
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        let client = reqwest::Client::new();
+        let mut first = client.get("https://example.test").build().unwrap();
+        let mut second = client.get("https://example.test").build().unwrap();
+
+        let first_redactions = authorizer.authorize(&mut first).await.unwrap();
+        let second_redactions = authorizer.authorize(&mut second).await.unwrap();
+
+        assert_eq!(first.headers()[AUTHORIZATION], "Bearer token-0");
+        assert_eq!(second.headers()[AUTHORIZATION], "Bearer token-1");
+        assert_eq!(first_redactions, ["token-0"]);
+        assert_eq!(second_redactions, ["token-1"]);
+        assert!(first.headers()[AUTHORIZATION].is_sensitive());
+    }
 
     #[tokio::test]
     async fn sigv4_signs_the_buffered_body_and_caches_credentials() {

@@ -15,6 +15,10 @@ use thiserror::Error;
 
 use super::{AuthError, CredentialBackend, CredentialStore, Secret, validate_credential_name};
 use crate::config::SecretRef;
+use qq_provider::{
+    RequestCredential, RequestCredentialError, RequestCredentialFuture, RequestCredentialProvider,
+    SharedRequestCredentialProvider,
+};
 
 pub(super) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const CREDENTIAL_ENDPOINT: &str = "https://chatgpt.com";
@@ -718,6 +722,16 @@ impl CodexCredential {
 }
 
 impl CredentialStore {
+    pub(crate) fn codex_request_credentials(
+        &self,
+        profile: &str,
+    ) -> SharedRequestCredentialProvider {
+        SharedRequestCredentialProvider::new(CodexRequestCredentials {
+            store: self.clone(),
+            profile: profile.to_owned(),
+        })
+    }
+
     pub(crate) fn resolve_codex(&self, profile: &str) -> Result<CodexCredential, AuthError> {
         let name = credential_name(profile)?;
         let now = unix_time()?;
@@ -759,15 +773,11 @@ impl CredentialStore {
             .into());
         }
 
-        let metadata = self
-            .status(&name)?
-            .ok_or_else(|| AuthError::StoredCredentialNotRegistered { name: name.clone() })?;
-        self.set_with_metadata_normalized(
+        self.replace_with_metadata_normalized(
             &name,
             &credential.encode()?,
-            metadata.backend == CredentialBackend::File,
-            Some("openai-codex".to_owned()),
-            Some(CREDENTIAL_ENDPOINT.to_owned()),
+            "openai-codex".to_owned(),
+            CREDENTIAL_ENDPOINT.to_owned(),
         )?;
         Ok(credential.runtime_credential())
     }
@@ -778,6 +788,52 @@ impl CredentialStore {
             Some(CREDENTIAL_ENDPOINT),
         )?;
         StoredCodexCredential::parse(secret.expose_secret_bytes()).map_err(Into::into)
+    }
+}
+
+struct CodexRequestCredentials {
+    store: CredentialStore,
+    profile: String,
+}
+
+impl RequestCredentialProvider for CodexRequestCredentials {
+    fn credential(&self) -> RequestCredentialFuture<'_> {
+        let store = self.store.clone();
+        let profile = self.profile.clone();
+        Box::pin(async move {
+            let credential = store
+                .load_request_credential(move |store| store.resolve_codex(&profile))
+                .await?
+                .map_err(map_request_credential_error)?;
+            RequestCredential::codex(
+                credential
+                    .access_token()
+                    .expose_secret_str()
+                    .map_err(|_| RequestCredentialError::Invalid)?,
+                credential.account_id(),
+                credential.is_fedramp(),
+            )
+        })
+    }
+}
+
+fn map_request_credential_error(error: AuthError) -> RequestCredentialError {
+    match error {
+        AuthError::Codex(
+            CodexAuthError::TokenRequestRejected { .. }
+            | CodexAuthError::AuthorizationDenied { .. },
+        ) => RequestCredentialError::RefreshRejected,
+        AuthError::Codex(
+            CodexAuthError::TokenRequestFailed { .. }
+            | CodexAuthError::TokenResponseInvalid { .. }
+            | CodexAuthError::CallbackTimedOut,
+        ) => RequestCredentialError::RefreshUnavailable,
+        AuthError::StoredCredentialNotRegistered { .. }
+        | AuthError::StoredCredentialMissing { .. } => RequestCredentialError::Missing,
+        AuthError::Codex(CodexAuthError::StoredCredentialInvalid)
+        | AuthError::Codex(CodexAuthError::UnsupportedStoredCredentialVersion { .. })
+        | AuthError::SecretNotUnicode => RequestCredentialError::Invalid,
+        _ => RequestCredentialError::StorageUnavailable,
     }
 }
 

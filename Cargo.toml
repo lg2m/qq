@@ -40,6 +40,7 @@ directories = "6"
 futures-core = "0.3"
 futures-util = "0.3"
 getrandom = "0.3"
+hmac = "0.12"
 http-body = "1"
 keyring = "4"
 qq-core = { path = "crates/qq-core" }
@@ -67,6 +68,7 @@ directories.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
 keyring.workspace = true
 qq-core.workspace = true
 qq-provider.workspace = true

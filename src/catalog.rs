@@ -1,0 +1,626 @@
+//! Authenticated, best-effort model discovery.
+
+use std::{
+    collections::VecDeque,
+    io::Read,
+    net::IpAddr,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+use hmac::{Hmac, Mac};
+use reqwest::{Url, blocking::RequestBuilder, header::AUTHORIZATION};
+use sha2::Sha256;
+use thiserror::Error;
+
+use crate::{
+    auth::{CredentialStore, Secret, resolve_provider_credential},
+    config::{
+        EndpointMode, HttpAccess, HttpCredential, ProviderApi, ProviderAuth, ProviderConfig,
+        ProviderKind,
+    },
+};
+
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DISCOVERED_MODELS: usize = 4_096;
+const MAX_CACHE_ENTRIES: usize = 32;
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoveredModel {
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
+}
+
+pub(crate) struct ModelDiscovery {
+    client: reqwest::blocking::Client,
+    direct_client: reqwest::blocking::Client,
+    cache: Mutex<VecDeque<CacheEntry>>,
+    fetch_gate: Mutex<()>,
+    cache_key: [u8; 32],
+}
+
+struct CacheEntry {
+    key: [u8; 32],
+    expires_at: Instant,
+    models: Option<Vec<DiscoveredModel>>,
+}
+
+enum DiscoveryAuth {
+    NoAuth,
+    ApiKey(Secret),
+    Bearer(Secret),
+    Header(String, Secret),
+    Codex {
+        access_token: Secret,
+        account_id: String,
+        is_fedramp: bool,
+    },
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ModelDiscoveryError {
+    #[error("the model-discovery HTTP client could not be initialized")]
+    Http(#[from] reqwest::Error),
+    #[error("model-discovery cache key generation failed")]
+    Random,
+}
+
+impl ModelDiscovery {
+    pub(crate) fn new() -> Result<Self, ModelDiscoveryError> {
+        let client = || {
+            reqwest::blocking::Client::builder()
+                .use_rustls_tls()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(1))
+                .timeout(Duration::from_secs(2))
+                .user_agent(concat!("qq/", env!("CARGO_PKG_VERSION")))
+        };
+        let mut cache_key = [0_u8; 32];
+        getrandom::fill(&mut cache_key).map_err(|_| ModelDiscoveryError::Random)?;
+        Ok(Self {
+            client: client().build()?,
+            direct_client: client().no_proxy().build()?,
+            cache: Mutex::new(VecDeque::new()),
+            fetch_gate: Mutex::new(()),
+            cache_key,
+        })
+    }
+
+    pub(crate) fn discover(
+        &self,
+        provider_id: &str,
+        provider: &ProviderConfig,
+        credentials: &CredentialStore,
+    ) -> Option<Vec<DiscoveredModel>> {
+        let access = match provider.access()? {
+            crate::config::ProviderAccess::Http(access) => access,
+            crate::config::ProviderAccess::AmazonBedrock { .. }
+            | crate::config::ProviderAccess::AmazonBedrockMantle { .. } => return None,
+        };
+        let _fetch = self.fetch_gate.lock().ok()?;
+        let auth = resolve_auth(access, credentials)?;
+        let Some(key) = cache_key(&self.cache_key, provider_id, provider.kind(), access, &auth)
+        else {
+            return self.fetch(provider.kind(), access, &auth);
+        };
+        let now = Instant::now();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|entry| entry.expires_at > now);
+            if let Some(position) = cache.iter().position(|entry| entry.key == key) {
+                let entry = cache.remove(position)?;
+                let models = entry.models.clone();
+                cache.push_back(entry);
+                return models;
+            }
+        }
+
+        let models = self.fetch(provider.kind(), access, &auth);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.push_back(CacheEntry {
+                key,
+                expires_at: now
+                    + if models.is_some() {
+                        CACHE_TTL
+                    } else {
+                        FAILURE_CACHE_TTL
+                    },
+                models: models.clone(),
+            });
+            while cache.len() > MAX_CACHE_ENTRIES {
+                cache.pop_front();
+            }
+        }
+        models
+    }
+
+    fn fetch(
+        &self,
+        kind: ProviderKind,
+        access: &HttpAccess,
+        auth: &DiscoveryAuth,
+    ) -> Option<Vec<DiscoveredModel>> {
+        let (mut endpoint, direct) = models_endpoint(access)?;
+        match (kind, access.api()) {
+            (ProviderKind::Anthropic, _) | (_, ProviderApi::AnthropicMessages) => {
+                endpoint.query_pairs_mut().append_pair("limit", "1000");
+            }
+            (ProviderKind::Google, _) | (_, ProviderApi::GoogleGenerateContent) => {
+                endpoint.query_pairs_mut().append_pair("pageSize", "1000");
+            }
+            (ProviderKind::OpenAiCodex, _) => {
+                endpoint
+                    .query_pairs_mut()
+                    .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+            }
+            _ => {}
+        }
+        let client = if direct {
+            &self.direct_client
+        } else {
+            &self.client
+        };
+        let mut request = apply_static_headers(client.get(endpoint), access);
+        if kind == ProviderKind::Anthropic || access.api() == ProviderApi::AnthropicMessages {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+        let request = apply_auth(request, kind, access.api(), auth)?;
+        let response = request.send().ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        response
+            .take((MAX_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return None;
+        }
+        let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        parse_models(&body, kind, access.api())
+    }
+}
+
+fn cache_key(
+    key: &[u8; 32],
+    provider_id: &str,
+    kind: ProviderKind,
+    access: &HttpAccess,
+    auth: &DiscoveryAuth,
+) -> Option<[u8; 32]> {
+    let mut digest = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    update_digest(&mut digest, provider_id.as_bytes());
+    digest.update(&[kind as u8, access.api() as u8, access.endpoint_mode() as u8]);
+    update_digest(&mut digest, access.endpoint().as_bytes());
+    for (name, value) in access.headers() {
+        update_digest(&mut digest, name.as_bytes());
+        update_digest(&mut digest, value.expose_value().as_bytes());
+    }
+    update_auth_digest(&mut digest, kind, access.api(), auth);
+    Some(digest.finalize().into_bytes().into())
+}
+
+fn update_auth_digest(
+    digest: &mut Hmac<Sha256>,
+    kind: ProviderKind,
+    api: ProviderApi,
+    auth: &DiscoveryAuth,
+) {
+    match auth {
+        DiscoveryAuth::NoAuth => update_digest(digest, b"no-auth"),
+        DiscoveryAuth::ApiKey(secret) => {
+            let name = api_key_header(kind, api);
+            update_digest(digest, name.as_bytes());
+            if name == "authorization" {
+                update_digest(digest, b"Bearer ");
+            }
+            update_digest(digest, secret.expose_secret_bytes());
+        }
+        DiscoveryAuth::Bearer(secret) => {
+            update_digest(digest, b"authorization");
+            update_digest(digest, b"Bearer ");
+            update_digest(digest, secret.expose_secret_bytes());
+        }
+        DiscoveryAuth::Header(name, secret) => {
+            update_digest(digest, name.to_ascii_lowercase().as_bytes());
+            update_digest(digest, secret.expose_secret_bytes());
+        }
+        DiscoveryAuth::Codex {
+            access_token,
+            account_id,
+            is_fedramp,
+        } => {
+            update_digest(digest, b"authorization");
+            update_digest(digest, b"Bearer ");
+            update_digest(digest, access_token.expose_secret_bytes());
+            update_digest(digest, b"chatgpt-account-id");
+            update_digest(digest, account_id.as_bytes());
+            update_digest(digest, b"originator:qq");
+            update_digest(digest, &[u8::from(*is_fedramp)]);
+        }
+    }
+}
+
+fn update_digest(digest: &mut Hmac<Sha256>, value: &[u8]) {
+    digest.update(&(value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+fn models_endpoint(access: &HttpAccess) -> Option<(Url, bool)> {
+    let mut endpoint = validate_endpoint(access.endpoint())?;
+    let direct = endpoint.scheme() == "http";
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    {
+        let mut segments = endpoint.path_segments_mut().ok()?;
+        segments.pop_if_empty();
+        if access.endpoint_mode() == EndpointMode::Exact {
+            segments.pop();
+        }
+        segments.push("models");
+    }
+    Some((endpoint, direct))
+}
+
+fn validate_endpoint(endpoint: &str) -> Option<Url> {
+    let url = Url::parse(endpoint).ok()?;
+    if url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return None;
+    }
+    match url.scheme() {
+        "https" => Some(url),
+        "http" if is_loopback_host(&url) => Some(url),
+        _ => None,
+    }
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+fn apply_static_headers(mut request: RequestBuilder, access: &HttpAccess) -> RequestBuilder {
+    for (name, value) in access.headers() {
+        request = request.header(name, value.expose_value());
+    }
+    request
+}
+
+fn resolve_auth(access: &HttpAccess, credentials: &CredentialStore) -> Option<DiscoveryAuth> {
+    match access.auth() {
+        HttpCredential::Configured(ProviderAuth::NoAuth) => Some(DiscoveryAuth::NoAuth),
+        HttpCredential::Configured(ProviderAuth::ApiKey(reference)) => Some(DiscoveryAuth::ApiKey(
+            credentials
+                .resolve_with_endpoint(reference, Some(access.endpoint()))
+                .ok()?,
+        )),
+        HttpCredential::Configured(ProviderAuth::Bearer(reference)) => Some(DiscoveryAuth::Bearer(
+            credentials
+                .resolve_with_endpoint(reference, Some(access.endpoint()))
+                .ok()?,
+        )),
+        HttpCredential::Configured(ProviderAuth::Header(name, reference)) => {
+            Some(DiscoveryAuth::Header(
+                name.clone(),
+                credentials
+                    .resolve_with_endpoint(reference, Some(access.endpoint()))
+                    .ok()?,
+            ))
+        }
+        HttpCredential::ApiKey {
+            explicit,
+            stored_name,
+            environment_variable,
+            audience,
+        } => Some(DiscoveryAuth::ApiKey(
+            resolve_provider_credential(
+                credentials,
+                explicit.as_ref(),
+                stored_name,
+                environment_variable,
+                Some(audience),
+            )
+            .ok()?,
+        )),
+        HttpCredential::OpenAiCodex { profile } => {
+            let credential = credentials
+                .resolve_codex(profile.as_deref().unwrap_or("default"))
+                .ok()?;
+            Some(DiscoveryAuth::Codex {
+                access_token: credential.access_token().clone(),
+                account_id: credential.account_id().to_owned(),
+                is_fedramp: credential.is_fedramp(),
+            })
+        }
+        HttpCredential::XAi { api_key, profile } => Some(DiscoveryAuth::Bearer(
+            credentials
+                .resolve_xai(profile.as_deref().unwrap_or("default"), api_key.as_ref())
+                .ok()?,
+        )),
+    }
+}
+
+fn apply_auth(
+    request: RequestBuilder,
+    kind: ProviderKind,
+    api: ProviderApi,
+    auth: &DiscoveryAuth,
+) -> Option<RequestBuilder> {
+    match auth {
+        DiscoveryAuth::NoAuth => Some(request),
+        DiscoveryAuth::ApiKey(secret) => apply_api_key(request, kind, api, secret),
+        DiscoveryAuth::Bearer(secret) => bearer(request, secret),
+        DiscoveryAuth::Header(name, secret) => {
+            Some(request.header(name, secret.expose_secret_str().ok()?))
+        }
+        DiscoveryAuth::Codex {
+            access_token,
+            account_id,
+            is_fedramp,
+        } => {
+            let request = bearer(request, access_token)?
+                .header("chatgpt-account-id", account_id)
+                .header("originator", "qq");
+            Some(if *is_fedramp {
+                request.header("x-openai-fedramp", "true")
+            } else {
+                request
+            })
+        }
+    }
+}
+
+fn apply_api_key(
+    request: RequestBuilder,
+    kind: ProviderKind,
+    api: ProviderApi,
+    secret: &Secret,
+) -> Option<RequestBuilder> {
+    let value = secret.expose_secret_str().ok()?;
+    match api_key_header(kind, api) {
+        "authorization" => bearer(request, secret),
+        name => Some(request.header(name, value)),
+    }
+}
+
+fn api_key_header(kind: ProviderKind, api: ProviderApi) -> &'static str {
+    match (kind, api) {
+        (ProviderKind::Anthropic, _) | (_, ProviderApi::AnthropicMessages) => "x-api-key",
+        (ProviderKind::Google, _) | (_, ProviderApi::GoogleGenerateContent) => "x-goog-api-key",
+        _ => "authorization",
+    }
+}
+
+fn bearer(request: RequestBuilder, secret: &Secret) -> Option<RequestBuilder> {
+    Some(request.header(
+        AUTHORIZATION,
+        format!("Bearer {}", secret.expose_secret_str().ok()?),
+    ))
+}
+
+fn parse_models(
+    body: &serde_json::Value,
+    kind: ProviderKind,
+    api: ProviderApi,
+) -> Option<Vec<DiscoveredModel>> {
+    let entries = if kind == ProviderKind::Google
+        || api == ProviderApi::GoogleGenerateContent
+        || kind == ProviderKind::OpenAiCodex
+    {
+        body.get("models")?.as_array()?
+    } else {
+        body.get("data")?.as_array()?
+    };
+    let mut models = Vec::with_capacity(entries.len().min(MAX_DISCOVERED_MODELS));
+    for entry in entries.iter().take(MAX_DISCOVERED_MODELS) {
+        if api == ProviderApi::GoogleGenerateContent
+            && entry
+                .get("supportedGenerationMethods")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|methods| {
+                    !methods
+                        .iter()
+                        .any(|method| method.as_str() == Some("generateContent"))
+                })
+        {
+            continue;
+        }
+        let Some(id) = entry
+            .get("id")
+            .or_else(|| entry.get("slug"))
+            .or_else(|| entry.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(|id| id.strip_prefix("models/").unwrap_or(id))
+            .filter(|id| valid_model_id(id))
+        else {
+            continue;
+        };
+        let name = entry
+            .get("display_name")
+            .or_else(|| entry.get("displayName"))
+            .or_else(|| entry.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| {
+                !name.is_empty() && name.len() <= 512 && !name.chars().any(char::is_control)
+            })
+            .map(str::to_owned);
+        models.push(DiscoveredModel {
+            id: id.to_owned(),
+            name,
+        });
+    }
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    Some(models)
+}
+
+fn valid_model_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        sync::atomic::{AtomicU64, Ordering},
+        thread,
+    };
+
+    use super::*;
+    use crate::{
+        auth::CredentialPaths,
+        config::{ProviderAccess, SecretRef},
+    };
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn discovers_authenticated_models_from_validated_loopback_endpoints() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..length]).unwrap();
+            assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token\r\n")
+            );
+            let body = r#"{"data":[{"id":"live-model","display_name":"Live model"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let reference: SecretRef = ron::from_str(r#"Value("test-token")"#).unwrap();
+        let provider = ProviderConfig::new(
+            ProviderKind::Custom,
+            Some(ProviderAccess::Http(HttpAccess::new(
+                format!("http://{address}/v1/responses"),
+                EndpointMode::Exact,
+                ProviderApi::OpenAiResponses,
+                HttpCredential::Configured(ProviderAuth::Bearer(reference)),
+                BTreeMap::new(),
+            ))),
+            crate::config::UsageType::Unknown,
+            BTreeMap::new(),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "qq-catalog-test-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let credentials = CredentialStore::with_paths(CredentialPaths::new(path));
+        let discovery = ModelDiscovery::new().unwrap();
+
+        let first = discovery
+            .discover("custom", &provider, &credentials)
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            first,
+            [DiscoveredModel {
+                id: "live-model".to_owned(),
+                name: Some("Live model".to_owned())
+            }]
+        );
+    }
+
+    #[test]
+    fn cache_identity_separates_effective_credentials() {
+        let provider = |reference| {
+            HttpAccess::new(
+                "https://example.test/v1/responses",
+                EndpointMode::Exact,
+                ProviderApi::OpenAiResponses,
+                HttpCredential::Configured(ProviderAuth::Bearer(reference)),
+                BTreeMap::new(),
+            )
+        };
+        let first: SecretRef = ron::from_str(r#"Value("tenant-a")"#).unwrap();
+        let second: SecretRef = ron::from_str(r#"Value("tenant-b")"#).unwrap();
+        let credentials = CredentialStore::with_paths(CredentialPaths::new(
+            std::env::temp_dir().join("qq-catalog-cache-key-test"),
+        ));
+        let key = [7_u8; 32];
+        let first = provider(first);
+        let second = provider(second);
+        let first_auth = resolve_auth(&first, &credentials).unwrap();
+        let second_auth = resolve_auth(&second, &credentials).unwrap();
+
+        assert_ne!(
+            cache_key(&key, "custom", ProviderKind::Custom, &first, &first_auth),
+            cache_key(&key, "custom", ProviderKind::Custom, &second, &second_auth)
+        );
+        let shared = Secret::from_secret_bytes("shared");
+        assert_ne!(
+            cache_key(
+                &key,
+                "custom",
+                ProviderKind::Anthropic,
+                &first,
+                &DiscoveryAuth::ApiKey(shared.clone())
+            ),
+            cache_key(
+                &key,
+                "custom",
+                ProviderKind::Anthropic,
+                &first,
+                &DiscoveryAuth::Bearer(shared)
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_non_loopback_http_discovery_endpoints() {
+        let access = HttpAccess::new(
+            "http://192.0.2.1/v1/responses",
+            EndpointMode::Exact,
+            ProviderApi::OpenAiResponses,
+            HttpCredential::Configured(ProviderAuth::NoAuth),
+            BTreeMap::new(),
+        );
+
+        assert!(models_endpoint(&access).is_none());
+    }
+
+    #[test]
+    fn discards_terminal_controls_in_discovered_names() {
+        let models = parse_models(
+            &serde_json::json!({
+                "data": [{"id": "safe-id", "display_name": "unsafe\u{1b}[2J"}]
+            }),
+            ProviderKind::Custom,
+            ProviderApi::OpenAiResponses,
+        )
+        .unwrap();
+
+        assert_eq!(models[0].id, "safe-id");
+        assert_eq!(models[0].name, None);
+    }
+}

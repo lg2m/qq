@@ -1,7 +1,7 @@
 //! Application configuration to model-runtime composition.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -23,30 +23,19 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    auth::{
-        AuthError, CODEX_RESPONSES_ENDPOINT, CredentialStore, Secret, resolve_provider_credential,
-    },
+    auth::{AuthError, CredentialStore, Secret, resolve_provider_credential},
+    catalog::{DiscoveredModel, ModelDiscovery},
     config::{
-        AwsAuth, BedrockAuth, ConfigError, ConfigLoader, ConfigSnapshot, Connection, LoadRequest,
-        ProviderApi, ProviderAuth, ProviderConfig,
+        AwsAuth, BedrockAuth, ConfigError, ConfigLoader, ConfigSnapshot, EndpointMode, HttpAccess,
+        HttpCredential, LoadRequest, ProviderAccess, ProviderApi, ProviderAuth, ProviderConfig,
     },
+    providers,
     server::{AskHandler, AskHandlerError, CommandFuture, ModelsFuture, SnapshotFuture},
 };
 
-const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/responses";
-const OPENAI_CREDENTIAL_ENDPOINT: &str = "https://api.openai.com";
-const OPENAI_STORED_CREDENTIAL: &str = "openai/default";
-const OPENAI_ENVIRONMENT_CREDENTIAL: &str = "OPENAI_API_KEY";
-const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_CREDENTIAL_ENDPOINT: &str = "https://api.anthropic.com";
-const ANTHROPIC_STORED_CREDENTIAL: &str = "anthropic/default";
-const ANTHROPIC_ENVIRONMENT_CREDENTIAL: &str = "ANTHROPIC_API_KEY";
-const GOOGLE_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
-const GOOGLE_CREDENTIAL_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
-const GOOGLE_STORED_CREDENTIAL: &str = "google/default";
-const GOOGLE_ENVIRONMENT_CREDENTIAL: &str = "GEMINI_API_KEY";
 const MAX_CACHED_RUNTIMES: usize = 16;
 const MAX_MODEL_OPTIONS: usize = 4_096;
+const MAX_DISCOVERY_PROVIDERS: usize = 4;
 
 #[derive(Clone)]
 pub struct RuntimeFactory {
@@ -57,6 +46,7 @@ struct RuntimeFactoryInner {
     config: ConfigLoader,
     credentials: CredentialStore,
     providers: ProviderCompiler,
+    discovery: ModelDiscovery,
     cache: Mutex<VecDeque<(RuntimeKey, Arc<Runtime>)>>,
 }
 
@@ -74,6 +64,7 @@ impl RuntimeFactory {
                 config,
                 credentials,
                 providers: ProviderCompiler::new()?,
+                discovery: ModelDiscovery::new()?,
                 cache: Mutex::new(VecDeque::new()),
             }),
         })
@@ -83,7 +74,16 @@ impl RuntimeFactory {
         self.inner.config.load(request).map_err(Into::into)
     }
 
-    pub fn model_options(&self, snapshot: &ConfigSnapshot) -> Vec<ModelDescriptor> {
+    #[cfg(test)]
+    fn model_options(&self, snapshot: &ConfigSnapshot) -> Vec<ModelDescriptor> {
+        self.model_options_with_discovery(snapshot, &BTreeMap::new())
+    }
+
+    fn model_options_with_discovery(
+        &self,
+        snapshot: &ConfigSnapshot,
+        discovered: &BTreeMap<String, Vec<DiscoveredModel>>,
+    ) -> Vec<ModelDescriptor> {
         let allowed = snapshot.policy().allowed_providers();
         let denied = snapshot.policy().denied_providers();
         let mut options = Vec::new();
@@ -116,6 +116,26 @@ impl RuntimeFactory {
                     },
                 });
             }
+            if let Some(discovered) = discovered.get(provider_id) {
+                for model in discovered {
+                    if provider.models().contains_key(&model.id) {
+                        continue;
+                    }
+                    if options.len() >= MAX_MODEL_OPTIONS {
+                        break 'providers;
+                    }
+                    options.push(ModelDescriptor {
+                        provider: provider_id.clone(),
+                        model: model.id.clone(),
+                        name: model.name.clone(),
+                        selection: qq_protocol::ModelSelection {
+                            model: Some(format!("{provider_id}/{}", model.id)),
+                            max_output_tokens: Some(snapshot.max_output_tokens()),
+                            organization: snapshot.organization().map(str::to_owned),
+                        },
+                    });
+                }
+            }
         }
         if options.len() < MAX_MODEL_OPTIONS
             && !options
@@ -147,6 +167,33 @@ impl RuntimeFactory {
         options
     }
 
+    fn discovered_model_options(&self, snapshot: &ConfigSnapshot) -> Vec<ModelDescriptor> {
+        let allowed = snapshot.policy().allowed_providers();
+        let denied = snapshot.policy().denied_providers();
+        let mut discovered = BTreeMap::new();
+        let mut attempted = 0;
+        for (provider_id, provider) in snapshot.providers() {
+            if allowed.is_some_and(|allowed| !allowed.iter().any(|id| id == provider_id))
+                || denied.iter().any(|id| id == provider_id)
+                || !self.provider_authenticated(provider_id, provider)
+            {
+                continue;
+            }
+            if attempted >= MAX_DISCOVERY_PROVIDERS {
+                break;
+            }
+            attempted += 1;
+            if let Some(models) =
+                self.inner
+                    .discovery
+                    .discover(provider_id, provider, &self.inner.credentials)
+            {
+                discovered.insert(provider_id.clone(), models);
+            }
+        }
+        self.model_options_with_discovery(snapshot, &discovered)
+    }
+
     pub fn models_for(
         &self,
         request: &ModelCatalogRequest,
@@ -165,7 +212,7 @@ impl RuntimeFactory {
         }
         let load = LoadRequest::from_process_env(&workspace, None)?;
         match self.load(&load) {
-            Ok(snapshot) => return Ok(self.model_options(&snapshot)),
+            Ok(snapshot) => return Ok(self.discovered_model_options(&snapshot)),
             Err(RuntimeBuildError::Config(ConfigError::ModelRequired)) => {}
             Err(error) => return Err(error),
         }
@@ -180,48 +227,63 @@ impl RuntimeFactory {
         }
         load = load.with_overrides(overrides);
         let snapshot = self.load(&load)?;
-        Ok(self.model_options(&snapshot))
+        Ok(self.discovered_model_options(&snapshot))
     }
 
     fn provider_authenticated(&self, _provider_id: &str, provider: &ProviderConfig) -> bool {
-        match provider {
-            ProviderConfig::OpenAi { api_key, .. } => resolve_provider_credential(
-                &self.inner.credentials,
-                api_key.as_ref(),
-                OPENAI_STORED_CREDENTIAL,
-                OPENAI_ENVIRONMENT_CREDENTIAL,
-                Some(OPENAI_CREDENTIAL_ENDPOINT),
-            )
-            .is_ok(),
-            ProviderConfig::Anthropic { api_key, .. } => resolve_provider_credential(
-                &self.inner.credentials,
-                api_key.as_ref(),
-                ANTHROPIC_STORED_CREDENTIAL,
-                ANTHROPIC_ENVIRONMENT_CREDENTIAL,
-                Some(ANTHROPIC_CREDENTIAL_ENDPOINT),
-            )
-            .is_ok(),
-            ProviderConfig::Google { api_key, .. } => resolve_provider_credential(
-                &self.inner.credentials,
-                api_key.as_ref(),
-                GOOGLE_STORED_CREDENTIAL,
-                GOOGLE_ENVIRONMENT_CREDENTIAL,
-                Some(GOOGLE_CREDENTIAL_ENDPOINT),
-            )
-            .is_ok(),
-            ProviderConfig::OpenAiCodex { profile, .. } => self
-                .inner
-                .credentials
-                .resolve_with_endpoint(
-                    &crate::config::SecretRef::Stored(format!(
-                        "openai-codex/{}",
-                        profile.as_deref().unwrap_or("default")
-                    )),
-                    Some("https://chatgpt.com"),
+        match provider.access() {
+            Some(ProviderAccess::Http(access)) => match access.auth() {
+                HttpCredential::Configured(auth) => match auth {
+                    ProviderAuth::NoAuth => true,
+                    ProviderAuth::ApiKey(reference)
+                    | ProviderAuth::Bearer(reference)
+                    | ProviderAuth::Header(_, reference) => self
+                        .inner
+                        .credentials
+                        .resolve_with_endpoint(reference, Some(access.endpoint()))
+                        .is_ok(),
+                },
+                HttpCredential::ApiKey {
+                    explicit,
+                    stored_name,
+                    environment_variable,
+                    audience,
+                } => resolve_provider_credential(
+                    &self.inner.credentials,
+                    explicit.as_ref(),
+                    stored_name,
+                    environment_variable,
+                    Some(audience),
                 )
                 .is_ok(),
-            ProviderConfig::AmazonBedrock { auth, .. }
-            | ProviderConfig::AmazonBedrockMantle { auth, .. } => match auth {
+                HttpCredential::OpenAiCodex { profile } => self
+                    .inner
+                    .credentials
+                    .resolve_with_endpoint(
+                        &crate::config::SecretRef::Stored(format!(
+                            "openai-codex/{}",
+                            profile.as_deref().unwrap_or("default")
+                        )),
+                        Some("https://chatgpt.com"),
+                    )
+                    .is_ok(),
+                HttpCredential::XAi { api_key, profile } => {
+                    let profile = profile.as_deref().unwrap_or("default");
+                    let stored = format!("xai/{profile}");
+                    resolve_provider_credential(
+                        &self.inner.credentials,
+                        api_key.as_ref(),
+                        &stored,
+                        "XAI_API_KEY",
+                        Some(providers::XAI_CREDENTIAL_ENDPOINT),
+                    )
+                    .is_ok()
+                }
+            },
+            Some(
+                ProviderAccess::AmazonBedrock { auth, .. }
+                | ProviderAccess::AmazonBedrockMantle { auth, .. },
+            ) => match auth {
                 BedrockAuth::ApiKey(reference) => self.inner.credentials.resolve(reference).is_ok(),
                 BedrockAuth::Aws(AwsAuth::Profile(profile)) => aws_profile_configured(profile),
                 BedrockAuth::Aws(AwsAuth::DefaultChain) => {
@@ -236,8 +298,7 @@ impl RuntimeFactory {
                         || std::env::var_os("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some()
                 }
             },
-            ProviderConfig::LiteLlm { connection, .. }
-            | ProviderConfig::Custom { connection, .. } => connection.is_some(),
+            None => false,
         }
     }
 
@@ -263,7 +324,8 @@ impl RuntimeFactory {
             .providers()
             .get(provider_id)
             .ok_or_else(|| RuntimeBuildError::UnknownProvider(provider_id.to_owned()))?;
-        let (recipe, provider_key) = self.prepare_provider(provider_id, provider_config)?;
+        let (recipe, provider_key) =
+            self.prepare_provider(provider_id, snapshot.model().model(), provider_config)?;
         let key = RuntimeKey::new(
             provider_id,
             snapshot.model().model(),
@@ -306,170 +368,117 @@ impl RuntimeFactory {
     fn prepare_provider(
         &self,
         provider_id: &str,
+        model_id: &str,
         config: &ProviderConfig,
     ) -> Result<(ProviderRecipe, Vec<u8>), RuntimeBuildError> {
-        match config {
-            ProviderConfig::OpenAi { api_key, .. } => {
-                let secret = resolve_provider_credential(
-                    &self.inner.credentials,
-                    api_key.as_ref(),
-                    OPENAI_STORED_CREDENTIAL,
-                    OPENAI_ENVIRONMENT_CREDENTIAL,
-                    Some(OPENAI_CREDENTIAL_ENDPOINT),
-                )?;
-                let auth = ResolvedAuth::ApiKey(secret);
-                let key = provider_key(
-                    provider_id,
-                    OPENAI_ENDPOINT,
-                    "exact",
-                    "openai_responses",
-                    &auth,
-                    std::iter::empty::<(&str, &str)>(),
-                );
-                let recipe = ProviderRecipe::http(HttpProviderRecipe::new(
-                    EndpointSpec::exact(OPENAI_ENDPOINT, false),
-                    HttpProtocol::OpenAiResponses,
-                    auth.into_http()?,
-                ));
-                Ok((recipe, key))
+        let access = config
+            .access()
+            .ok_or_else(|| RuntimeBuildError::IncompleteProvider(provider_id.to_owned()))?;
+        match access {
+            ProviderAccess::Http(access) => {
+                let api = config
+                    .models()
+                    .get(model_id)
+                    .and_then(|metadata| metadata.api())
+                    .unwrap_or(access.api());
+                self.prepare_http_provider(provider_id, access, api)
             }
-            ProviderConfig::LiteLlm { connection, .. }
-            | ProviderConfig::Custom { connection, .. } => {
-                let connection = connection
-                    .as_ref()
-                    .ok_or_else(|| RuntimeBuildError::IncompleteProvider(provider_id.to_owned()))?;
-                self.prepare_http_provider(provider_id, connection)
-            }
-            ProviderConfig::OpenAiCodex { profile, .. } => {
-                let credential = self
-                    .inner
-                    .credentials
-                    .resolve_codex(profile.as_deref().unwrap_or("default"))?;
-                let key_auth = ResolvedAuth::Bearer(credential.access_token().clone());
-                let mut key_headers = vec![("chatgpt-account-id", credential.account_id())];
-                if credential.is_fedramp() {
-                    key_headers.push(("x-openai-fedramp", "true"));
-                }
-                let key = provider_key(
-                    provider_id,
-                    CODEX_RESPONSES_ENDPOINT,
-                    "exact",
-                    "openai_codex_responses",
-                    &key_auth,
-                    key_headers,
-                );
-                let recipe = ProviderRecipe::http(HttpProviderRecipe::new(
-                    EndpointSpec::exact(CODEX_RESPONSES_ENDPOINT, false),
-                    HttpProtocol::OpenAiResponses,
-                    HttpAuth::Codex {
-                        access_token: credential.access_token().expose_secret_str()?.to_owned(),
-                        account_id: credential.account_id().to_owned(),
-                        is_fedramp: credential.is_fedramp(),
-                    },
-                ));
-                Ok((recipe, key))
-            }
-            ProviderConfig::Anthropic { api_key, .. } => {
-                let secret = resolve_provider_credential(
-                    &self.inner.credentials,
-                    api_key.as_ref(),
-                    ANTHROPIC_STORED_CREDENTIAL,
-                    ANTHROPIC_ENVIRONMENT_CREDENTIAL,
-                    Some(ANTHROPIC_CREDENTIAL_ENDPOINT),
-                )?;
-                let auth = ResolvedAuth::ApiKey(secret);
-                let key = provider_key(
-                    provider_id,
-                    ANTHROPIC_ENDPOINT,
-                    "exact",
-                    "anthropic_messages",
-                    &auth,
-                    std::iter::empty::<(&str, &str)>(),
-                );
-                let recipe = ProviderRecipe::http(HttpProviderRecipe::new(
-                    EndpointSpec::exact(ANTHROPIC_ENDPOINT, false),
-                    HttpProtocol::AnthropicMessages,
-                    auth.into_http()?,
-                ));
-                Ok((recipe, key))
-            }
-            ProviderConfig::Google { api_key, .. } => {
-                let secret = resolve_provider_credential(
-                    &self.inner.credentials,
-                    api_key.as_ref(),
-                    GOOGLE_STORED_CREDENTIAL,
-                    GOOGLE_ENVIRONMENT_CREDENTIAL,
-                    Some(GOOGLE_CREDENTIAL_ENDPOINT),
-                )?;
-                let auth = ResolvedAuth::ApiKey(secret);
-                let key = provider_key(
-                    provider_id,
-                    GOOGLE_ENDPOINT,
-                    "base",
-                    "google_generate_content",
-                    &auth,
-                    std::iter::empty::<(&str, &str)>(),
-                );
-                let recipe = ProviderRecipe::http(HttpProviderRecipe::new(
-                    EndpointSpec::base(GOOGLE_ENDPOINT, false),
-                    HttpProtocol::GoogleGenerateContent,
-                    auth.into_http()?,
-                ));
-                Ok((recipe, key))
-            }
-            ProviderConfig::AmazonBedrock { region, auth, .. } => {
+            ProviderAccess::AmazonBedrock { region, auth } => {
                 self.prepare_bedrock_provider(provider_id, region.as_deref(), auth)
             }
-            ProviderConfig::AmazonBedrockMantle {
-                region, api, auth, ..
-            } => self.prepare_bedrock_mantle_provider(provider_id, region.as_deref(), *api, auth),
+            ProviderAccess::AmazonBedrockMantle { region, api, auth } => {
+                self.prepare_bedrock_mantle_provider(provider_id, region.as_deref(), *api, auth)
+            }
         }
     }
 
     fn prepare_http_provider(
         &self,
         provider_id: &str,
-        connection: &Connection,
+        access: &HttpAccess,
+        api: ProviderApi,
     ) -> Result<(ProviderRecipe, Vec<u8>), RuntimeBuildError> {
-        let auth = self.resolve_http_auth(connection.auth(), connection.base_url())?;
-        let headers = connection
+        let prepared_auth = match access.auth() {
+            HttpCredential::Configured(auth) => {
+                PreparedHttpAuth::Static(self.resolve_http_auth(auth, access.endpoint())?)
+            }
+            HttpCredential::ApiKey {
+                explicit,
+                stored_name,
+                environment_variable,
+                audience,
+            } => PreparedHttpAuth::Static(ResolvedAuth::ApiKey(resolve_provider_credential(
+                &self.inner.credentials,
+                explicit.as_ref(),
+                stored_name,
+                environment_variable,
+                Some(audience),
+            )?)),
+            HttpCredential::OpenAiCodex { profile } => {
+                let profile = profile.as_deref().unwrap_or("default");
+                PreparedHttpAuth::RequestTime {
+                    auth: HttpAuth::RequestTime(
+                        self.inner.credentials.codex_request_credentials(profile),
+                    ),
+                    key_auth: ResolvedAuth::NoAuth,
+                    identity: vec![("credential-profile".to_owned(), profile.to_owned())],
+                }
+            }
+            HttpCredential::XAi { api_key, profile } => {
+                let profile = profile.as_deref().unwrap_or("default");
+                let key_auth = match api_key.as_ref() {
+                    Some(reference) => {
+                        ResolvedAuth::Bearer(self.inner.credentials.resolve_with_endpoint(
+                            reference,
+                            Some(providers::XAI_CREDENTIAL_ENDPOINT),
+                        )?)
+                    }
+                    None => ResolvedAuth::NoAuth,
+                };
+                PreparedHttpAuth::RequestTime {
+                    auth: HttpAuth::RequestTime(
+                        self.inner
+                            .credentials
+                            .xai_request_credentials(profile, api_key.clone()),
+                    ),
+                    key_auth,
+                    identity: vec![("credential-profile".to_owned(), profile.to_owned())],
+                }
+            }
+        };
+        let headers = access
             .headers()
             .iter()
             .map(|(name, value)| (name.clone(), value.expose_value().to_owned()))
             .collect::<Vec<_>>();
+        let endpoint_mode = match access.endpoint_mode() {
+            EndpointMode::Base => "base",
+            EndpointMode::Exact => "exact",
+        };
+        let mut key_headers = headers.clone();
+        key_headers.extend(prepared_auth.identity().iter().cloned());
         let key = provider_key(
             provider_id,
-            connection.base_url(),
-            "base",
-            provider_api_name(connection.api()),
-            &auth,
-            headers
+            access.endpoint(),
+            endpoint_mode,
+            provider_api_name(api),
+            prepared_auth.key_auth(),
+            key_headers
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
-        let protocol = match connection.api() {
-            ProviderApi::OpenAiResponses => HttpProtocol::OpenAiResponses,
-            ProviderApi::OpenAiChatCompletions => HttpProtocol::OpenAiChatCompletions,
-            ProviderApi::AnthropicMessages => HttpProtocol::AnthropicMessages,
-            ProviderApi::GoogleGenerateContent => HttpProtocol::GoogleGenerateContent,
-            api => {
-                return Err(RuntimeBuildError::UnsupportedApi {
-                    provider: provider_id.to_owned(),
-                    api,
-                });
-            }
-        };
-        let allow_http = connection
-            .base_url()
+        let protocol = http_protocol(provider_id, api)?;
+        let allow_http = access
+            .endpoint()
             .split_once("://")
             .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"));
+        let endpoint = match access.endpoint_mode() {
+            EndpointMode::Base => EndpointSpec::base(access.endpoint(), allow_http),
+            EndpointMode::Exact => EndpointSpec::exact(access.endpoint(), allow_http),
+        };
         let recipe = ProviderRecipe::http(
-            HttpProviderRecipe::new(
-                EndpointSpec::base(connection.base_url(), allow_http),
-                protocol,
-                auth.into_http()?,
-            )
-            .with_headers(headers),
+            HttpProviderRecipe::new(endpoint, protocol, prepared_auth.into_http()?)
+                .with_headers(headers),
         );
         Ok((recipe, key))
     }
@@ -736,6 +745,38 @@ enum ResolvedAuth {
     Header(String, Secret),
 }
 
+enum PreparedHttpAuth {
+    Static(ResolvedAuth),
+    RequestTime {
+        auth: HttpAuth,
+        key_auth: ResolvedAuth,
+        identity: Vec<(String, String)>,
+    },
+}
+
+impl PreparedHttpAuth {
+    fn key_auth(&self) -> &ResolvedAuth {
+        match self {
+            Self::Static(auth) => auth,
+            Self::RequestTime { key_auth, .. } => key_auth,
+        }
+    }
+
+    fn identity(&self) -> &[(String, String)] {
+        match self {
+            Self::Static(_) => &[],
+            Self::RequestTime { identity, .. } => identity,
+        }
+    }
+
+    fn into_http(self) -> Result<HttpAuth, AuthError> {
+        match self {
+            Self::Static(auth) => auth.into_http(),
+            Self::RequestTime { auth, .. } => Ok(auth),
+        }
+    }
+}
+
 impl ResolvedAuth {
     fn into_http(self) -> Result<HttpAuth, AuthError> {
         match self {
@@ -877,6 +918,19 @@ fn provider_api_name(api: ProviderApi) -> &'static str {
     }
 }
 
+fn http_protocol(provider: &str, api: ProviderApi) -> Result<HttpProtocol, RuntimeBuildError> {
+    match api {
+        ProviderApi::OpenAiResponses => Ok(HttpProtocol::OpenAiResponses),
+        ProviderApi::OpenAiChatCompletions => Ok(HttpProtocol::OpenAiChatCompletions),
+        ProviderApi::AnthropicMessages => Ok(HttpProtocol::AnthropicMessages),
+        ProviderApi::GoogleGenerateContent => Ok(HttpProtocol::GoogleGenerateContent),
+        api => Err(RuntimeBuildError::UnsupportedApi {
+            provider: provider.to_owned(),
+            api,
+        }),
+    }
+}
+
 fn provider_key<'a>(
     provider: &str,
     endpoint: &str,
@@ -941,6 +995,8 @@ pub enum RuntimeBuildError {
     UnsupportedApi { provider: String, api: ProviderApi },
     #[error("runtime cache is unavailable")]
     CacheUnavailable,
+    #[error(transparent)]
+    CatalogClientUnavailable(#[from] crate::catalog::ModelDiscoveryError),
 }
 
 impl RuntimeBuildError {
@@ -970,7 +1026,7 @@ impl RuntimeBuildError {
             | Self::UnknownProvider(_)
             | Self::IncompleteProvider(_)
             | Self::UnsupportedApi { .. } => RunFailureKind::ProviderConfiguration,
-            Self::CacheUnavailable => RunFailureKind::Server,
+            Self::CacheUnavailable | Self::CatalogClientUnavailable(_) => RunFailureKind::Server,
         }
     }
 }
@@ -1115,6 +1171,52 @@ mod tests {
     }
 
     #[test]
+    fn catalog_merges_live_ids_without_overriding_configured_metadata() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let snapshot = factory
+            .load(&fixture.request(
+                r#"(
+                    version: 1,
+                    model: "custom/configured",
+                    providers: {
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: OpenAiResponses,
+                                auth: NoAuth,
+                            ),
+                            models: {"configured": (name: "Configured name")},
+                        ),
+                    },
+                )"#,
+            ))
+            .unwrap();
+        let discovered = BTreeMap::from([(
+            "custom".to_owned(),
+            vec![
+                DiscoveredModel {
+                    id: "configured".to_owned(),
+                    name: Some("Vendor name".to_owned()),
+                },
+                DiscoveredModel {
+                    id: "live".to_owned(),
+                    name: Some("Live name".to_owned()),
+                },
+            ],
+        )]);
+
+        let options = factory.model_options_with_discovery(&snapshot, &discovered);
+
+        assert!(options.iter().any(|option| {
+            option.model == "configured" && option.name.as_deref() == Some("Configured name")
+        }));
+        assert!(options
+            .iter()
+            .any(|option| option.model == "live" && option.name.as_deref() == Some("Live name")));
+    }
+
+    #[test]
     fn constructs_every_wired_http_api_and_builtin_key_provider() {
         let fixture = RuntimeFixture::new();
         let factory = fixture.factory();
@@ -1173,6 +1275,25 @@ mod tests {
             )"#,
         );
         factory.runtime_for(&google).unwrap();
+    }
+
+    #[test]
+    fn constructs_xai_runtimes_for_model_selected_responses_and_chat_protocols() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+
+        for model in ["grok-4.5", "grok-4.3"] {
+            let request = fixture.request(format!(
+                r#"(
+                    version: 1,
+                    model: "xai/{model}",
+                    providers: {{
+                        "xai": XAi(api_key: Value("xai-test-secret")),
+                    }},
+                )"#
+            ));
+            factory.runtime_for(&request).unwrap();
+        }
     }
 
     #[test]

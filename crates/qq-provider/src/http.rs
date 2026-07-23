@@ -1,12 +1,14 @@
 use std::{net::IpAddr, time::Duration};
 
-use reqwest::Url;
+use futures_util::StreamExt;
+use reqwest::{Url, header::CONTENT_TYPE};
 
-use crate::ProviderError;
+use crate::{ProviderError, sanitize::sanitize_message};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const ERROR_BODY_BYTES_LIMIT: usize = 16 * 1_024;
 
 pub(crate) fn build_client() -> Result<reqwest::Client, ProviderError> {
     client_builder()
@@ -29,6 +31,46 @@ fn client_builder() -> reqwest::ClientBuilder {
         .read_timeout(READ_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("qq/", env!("CARGO_PKG_VERSION")))
+}
+
+pub(crate) fn transport_error(error: reqwest::Error, redactions: &[String]) -> ProviderError {
+    ProviderError::Transport(sanitize_message(
+        &error.without_url().to_string(),
+        redactions,
+    ))
+}
+
+pub(crate) fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+}
+
+pub(crate) async fn read_error_body(response: reqwest::Response) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+
+    while let Some(chunk) = chunks.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = ERROR_BODY_BYTES_LIMIT.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body.len() == ERROR_BODY_BYTES_LIMIT {
+            break;
+        }
+    }
+
+    body
 }
 
 pub(crate) fn validate_endpoint(endpoint: &str, allow_http: bool) -> Result<Url, ProviderError> {
@@ -90,4 +132,46 @@ fn is_loopback_host(url: &Url) -> bool {
     address
         .parse::<IpAddr>()
         .is_ok_and(|address| address.is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn error_body_is_bounded_to_sixteen_kibibytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = stream.read(&mut request).unwrap();
+            let body = vec![b'x'; ERROR_BODY_BYTES_LIMIT + 1_024];
+            write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let response = build_direct_client()
+            .unwrap()
+            .get(format!("http://{address}/error"))
+            .send()
+            .await
+            .unwrap();
+
+        let body = read_error_body(response).await;
+
+        assert_eq!(body.len(), ERROR_BODY_BYTES_LIMIT);
+        assert!(body.iter().all(|byte| *byte == b'x'));
+        server.join().unwrap();
+    }
 }

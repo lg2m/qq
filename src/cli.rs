@@ -123,6 +123,9 @@ pub struct LoginArgs {
     /// Credential profile name.
     #[arg(long, default_value = "default")]
     pub profile: String,
+    /// Authenticate xAI with OAuth instead of prompting for an API key.
+    #[arg(long)]
+    pub oauth: bool,
     /// Allow an explicit user-only plaintext file if the OS keyring is unavailable.
     #[arg(long)]
     pub allow_file: bool,
@@ -188,16 +191,24 @@ mod tests {
             }) if field == "model"
         ));
         assert!(matches!(
-            Cli::try_parse_from(["qq", "auth", "login", "openai", "--allow-file"])
+            Cli::try_parse_from([
+                "qq",
+                "auth",
+                "login",
+                "xai",
+                "--oauth",
+                "--allow-file"
+            ])
                 .unwrap()
                 .command,
             Some(Command::Auth {
                 command: AuthCommand::Login(LoginArgs {
                     provider,
+                    oauth: true,
                     allow_file: true,
                     ..
                 })
-            }) if provider == "openai"
+            }) if provider == "xai"
         ));
         assert!(matches!(
             Cli::try_parse_from([

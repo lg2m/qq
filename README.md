@@ -17,6 +17,14 @@ cargo run -- auth login openai-codex
 QQ_MODEL=openai-codex/MODEL cargo run -- ask "Reply with pong"
 ```
 
+To use xAI, set `XAI_API_KEY` or sign in with OAuth. OAuth credentials are
+refreshed and stored under the selected profile:
+
+```sh
+QQ_MODEL=xai/grok-4.3 cargo run -- ask "Reply with pong"
+cargo run -- auth login xai --oauth
+```
+
 ## Amazon Bedrock Mantle
 
 Mantle reuses the OpenAI Responses, OpenAI Chat Completions, and Anthropic
