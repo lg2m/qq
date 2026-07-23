@@ -71,6 +71,27 @@ pub struct TuiClient {
     updates: mpsc::Receiver<ClientUpdate>,
 }
 
+struct StreamConnectionState {
+    next_attempt: ConnectionState,
+}
+
+impl StreamConnectionState {
+    const fn new() -> Self {
+        Self {
+            next_attempt: ConnectionState::Connecting,
+        }
+    }
+
+    const fn attempt(&self) -> ConnectionState {
+        self.next_attempt
+    }
+
+    fn connected(&mut self) -> ConnectionState {
+        self.next_attempt = ConnectionState::Replaying;
+        ConnectionState::Live
+    }
+}
+
 impl TuiClient {
     pub fn start(
         connection: Connection,
@@ -140,9 +161,10 @@ async fn run_tui_client(
 
     let request_permits = Arc::new(Semaphore::new(TUI_CONCURRENT_REQUESTS));
     let mut reconnect_delay = Duration::from_millis(50);
+    let mut connection_state = StreamConnectionState::new();
     loop {
         if updates
-            .send(ClientUpdate::Connection(ConnectionState::Replaying))
+            .send(ClientUpdate::Connection(connection_state.attempt()))
             .await
             .is_err()
         {
@@ -180,7 +202,7 @@ async fn run_tui_client(
             }
         };
         if updates
-            .send(ClientUpdate::Connection(ConnectionState::Live))
+            .send(ClientUpdate::Connection(connection_state.connected()))
             .await
             .is_err()
         {
@@ -1031,6 +1053,20 @@ mod tests {
             events.push(event.event);
         }
         Ok(events)
+    }
+
+    #[test]
+    fn stream_connection_state_distinguishes_initial_and_reconnect_attempts() {
+        let mut state = StreamConnectionState::new();
+
+        assert_eq!(
+            [state.attempt(), state.connected(), state.attempt()],
+            [
+                ConnectionState::Connecting,
+                ConnectionState::Live,
+                ConnectionState::Replaying,
+            ]
+        );
     }
 
     #[test]

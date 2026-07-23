@@ -1886,15 +1886,14 @@ fn complete_run(
     let (run_status, message_state) = outcome_states(&outcome);
     let outcome_json =
         serde_json::to_string(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
-    let usage_json = accounting
+    let usage = accounting.as_ref().and_then(|accounting| accounting.usage);
+    let usage_json = usage
         .as_ref()
-        .and_then(|accounting| accounting.usage.as_ref())
         .map(serde_json::to_string)
         .transpose()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let cost = accounting.as_ref().and_then(|accounting| {
-        accounting
-            .usage
+        usage
             .and_then(|usage| {
                 accounting
                     .pricing
@@ -1973,6 +1972,7 @@ fn complete_run(
             session: summary,
             run_id: claimed.run_id,
             outcome,
+            usage,
         },
     )?;
     transaction
@@ -2035,6 +2035,7 @@ fn finish_queued_run(
             session: summary,
             run_id,
             outcome,
+            usage: None,
         },
     )
 }
@@ -2153,6 +2154,7 @@ fn complete_run_in_transaction(
             session: summary,
             run_id: claimed.run_id,
             outcome,
+            usage: None,
         },
     )
 }
@@ -3102,6 +3104,18 @@ mod tests {
                 .windows(2)
                 .all(|events| { events[1].cursor.sequence == events[0].cursor.sequence + 1 })
         );
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                usage: Some(TokenUsage {
+                    input_tokens: 10,
+                    cache_read_input_tokens: 2,
+                    cache_write_input_tokens: 1,
+                    output_tokens: 5,
+                }),
+                ..
+            }
+        ));
         let snapshot = runtime
             .snapshot(SnapshotRequest {
                 workspace_id,

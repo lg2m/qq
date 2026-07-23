@@ -123,6 +123,8 @@ pub struct ModelDescriptor {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     pub selection: ModelSelection,
 }
 
@@ -382,6 +384,8 @@ pub enum SessionEvent {
         session: SessionSummary,
         run_id: RunId,
         outcome: RunOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
     },
 }
 
@@ -442,5 +446,37 @@ mod tests {
             envelope
         );
         assert_eq!(envelope.cursor.to_string().parse(), Ok(envelope.cursor));
+    }
+
+    #[test]
+    fn run_finished_without_usage_retains_its_previous_wire_shape() {
+        let workspace_id = id::<WorkspaceId>(2);
+        let session_id = id::<SessionId>(3);
+        let event = SessionEvent::RunFinished {
+            session: SessionSummary {
+                id: session_id,
+                workspace_id,
+                parent_id: None,
+                title: "Session".to_owned(),
+                status: SessionStatus::Idle,
+                active_run_id: None,
+                queued_prompts: 0,
+                model: Some("test/model".to_owned()),
+                estimated_cost_usd_nanos: None,
+                updated_at_ms: 11,
+                last_outcome: Some(RunOutcome::Completed),
+            },
+            run_id: id(4),
+            outcome: RunOutcome::Completed,
+            usage: None,
+        };
+
+        let encoded = serde_json::to_value(&event).unwrap();
+
+        assert!(encoded.get("usage").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            event
+        );
     }
 }

@@ -1456,6 +1456,7 @@ mod tests {
                     provider: "openai".to_owned(),
                     model: "gpt-test".to_owned(),
                     name: Some("GPT Test".to_owned()),
+                    context_window: Some(128_000),
                     selection: request.selection,
                 }])
             })
@@ -1489,6 +1490,7 @@ mod tests {
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].selection, selection);
+        assert_eq!(models[0].context_window, Some(128_000));
         server.shutdown().await.unwrap();
     }
 

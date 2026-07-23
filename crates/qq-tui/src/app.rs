@@ -4,7 +4,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Mou
 use qq_protocol::{
     CommandId, CommandOutcome, CommandRequest, MessageSnapshot, MessageState, ModelSelection,
     RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
-    SessionSummary, SnapshotRequest, WorkspaceId, WorkspaceSnapshot,
+    SessionSummary, SnapshotRequest, TokenUsage, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -20,6 +20,53 @@ const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
 const MOUSE_SCROLL_ROWS: usize = 3;
 
+pub(crate) struct SlashCommand {
+    pub name: &'static str,
+    pub description: &'static str,
+    action: SlashAction,
+}
+
+#[derive(Clone, Copy)]
+enum SlashAction {
+    Models,
+    New,
+    Sessions,
+    Quit,
+}
+
+const SLASH_COMMANDS: [SlashCommand; 6] = [
+    SlashCommand {
+        name: "/models",
+        description: "choose a model",
+        action: SlashAction::Models,
+    },
+    SlashCommand {
+        name: "/sessions",
+        description: "open sessions",
+        action: SlashAction::Sessions,
+    },
+    SlashCommand {
+        name: "/resume",
+        description: "open sessions",
+        action: SlashAction::Sessions,
+    },
+    SlashCommand {
+        name: "/new",
+        description: "create a session",
+        action: SlashAction::New,
+    },
+    SlashCommand {
+        name: "/quit",
+        description: "exit QQ",
+        action: SlashAction::Quit,
+    },
+    SlashCommand {
+        name: "/exit",
+        description: "exit QQ",
+        action: SlashAction::Quit,
+    },
+];
+
 #[derive(Debug, Clone, Default)]
 pub struct TuiOptions {
     pub settings: Settings,
@@ -32,6 +79,7 @@ pub struct ModelOption {
     pub provider: String,
     pub model: String,
     pub name: Option<String>,
+    pub context_window: Option<u32>,
     pub selection: ModelSelection,
 }
 
@@ -54,6 +102,8 @@ pub enum TuiError {
 pub(crate) struct SessionView {
     pub summary: SessionSummary,
     pub messages: Option<Vec<MessageSnapshot>>,
+    pub latest_input_tokens: Option<u64>,
+    pub context_window: Option<u32>,
     loaded_through: u64,
 }
 
@@ -90,6 +140,7 @@ pub(crate) struct App {
     pub navigator_open: bool,
     pub model_picker: Option<ModelPicker>,
     pub input: String,
+    slash_selected: usize,
     pub connection: ConnectionState,
     pub status: Option<String>,
     pub animation_tick: usize,
@@ -115,6 +166,7 @@ impl App {
             navigator_open: false,
             model_picker: None,
             input: String::new(),
+            slash_selected: 0,
             connection: ConnectionState::Connecting,
             status: None,
             animation_tick: 0,
@@ -206,12 +258,18 @@ impl App {
         }
         if initial || snapshot_sequence >= self.last_sequence {
             for summary in snapshot.sessions {
+                let context_window = model_context_window(&self.models, summary.model.as_deref());
                 self.sessions
                     .entry(summary.id)
-                    .and_modify(|session| session.summary = summary.clone())
+                    .and_modify(|session| {
+                        session.summary = summary.clone();
+                        session.context_window = context_window;
+                    })
                     .or_insert(SessionView {
                         summary,
                         messages: None,
+                        latest_input_tokens: None,
+                        context_window,
                         loaded_through: snapshot_sequence,
                     });
             }
@@ -247,11 +305,19 @@ impl App {
         }
         let mut messages = snapshot.messages;
         retain_recent_messages(&mut messages);
+        let latest_input_tokens = snapshot
+            .runs
+            .iter()
+            .rev()
+            .find_map(|run| run.usage.map(total_input_tokens));
+        let context_window = model_context_window(&self.models, snapshot.summary.model.as_deref());
         self.sessions.insert(
             snapshot.summary.id,
             SessionView {
                 summary: snapshot.summary,
                 messages: Some(messages),
+                latest_input_tokens,
+                context_window,
                 loaded_through,
             },
         );
@@ -345,8 +411,14 @@ impl App {
                 session,
                 run_id,
                 outcome,
+                usage,
             } => {
                 self.upsert_summary(session.clone());
+                if let Some(usage) = usage
+                    && let Some(session) = self.sessions.get_mut(&envelope.session_id)
+                {
+                    session.latest_input_tokens = Some(total_input_tokens(*usage));
+                }
                 if let Some(messages) = self
                     .sessions
                     .get_mut(&envelope.session_id)
@@ -377,12 +449,18 @@ impl App {
     }
 
     fn upsert_summary(&mut self, summary: SessionSummary) {
+        let context_window = model_context_window(&self.models, summary.model.as_deref());
         self.sessions
             .entry(summary.id)
-            .and_modify(|session| session.summary = summary.clone())
+            .and_modify(|session| {
+                session.summary = summary.clone();
+                session.context_window = context_window;
+            })
             .or_insert(SessionView {
                 summary,
                 messages: None,
+                latest_input_tokens: None,
+                context_window,
                 loaded_through: 0,
             });
     }
@@ -443,7 +521,11 @@ impl App {
                         self.input.push(character);
                     }
                 }
-                (self.input.len() != before, Vec::new())
+                let changed = self.input.len() != before;
+                if changed {
+                    self.slash_selected = 0;
+                }
+                (changed, Vec::new())
             }
             Event::Mouse(mouse) if self.model_picker.is_none() && !self.navigator_open => {
                 let changed = match mouse.kind {
@@ -469,6 +551,9 @@ impl App {
         if self.navigator_open {
             return self.handle_navigator_key(key.code);
         }
+        if let Some(result) = self.handle_slash_key(key.code) {
+            return result;
+        }
         if let Some(action) = self.settings.action_for(key) {
             return self.handle_action(action);
         }
@@ -491,7 +576,13 @@ impl App {
                 let changed = self.scroll_transcript_down(self.transcript_viewport.height);
                 (changed, Vec::new())
             }
-            KeyCode::Backspace => (self.input.pop().is_some(), Vec::new()),
+            KeyCode::Backspace => {
+                let changed = self.input.pop().is_some();
+                if changed {
+                    self.slash_selected = 0;
+                }
+                (changed, Vec::new())
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -785,26 +876,28 @@ impl App {
         if prompt.is_empty() {
             return (false, Vec::new());
         }
-        match prompt.as_str() {
-            "/quit" | "/exit" => {
-                self.input.clear();
-                self.quit = true;
-                return (true, Vec::new());
+        if let Some(action) = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == prompt)
+            .map(|command| command.action)
+        {
+            self.input.clear();
+            match action {
+                SlashAction::Quit => {
+                    self.quit = true;
+                    return (true, Vec::new());
+                }
+                SlashAction::Models => return self.open_models(),
+                SlashAction::New => return self.create_session(None),
+                SlashAction::Sessions => {
+                    self.model_picker = None;
+                    self.navigator = self
+                        .focused
+                        .or_else(|| self.thread_order().first().copied());
+                    self.navigator_open = true;
+                    return (true, Vec::new());
+                }
             }
-            "/models" => {
-                self.input.clear();
-                return self.open_models();
-            }
-            "/sessions" => {
-                self.input.clear();
-                self.model_picker = None;
-                self.navigator = self
-                    .focused
-                    .or_else(|| self.thread_order().first().copied());
-                self.navigator_open = true;
-                return (true, Vec::new());
-            }
-            _ => {}
         }
         let Some(session_id) = self.focused else {
             self.status = Some("create a session before sending a prompt".to_owned());
@@ -862,7 +955,49 @@ impl App {
             return false;
         }
         self.input.push(character);
+        self.slash_selected = 0;
         true
+    }
+
+    fn handle_slash_key(&mut self, code: KeyCode) -> Option<(bool, Vec<ClientRequest>)> {
+        let command_count = self.filtered_slash_commands().len();
+        if command_count == 0 {
+            return None;
+        }
+        match code {
+            KeyCode::Up => {
+                self.slash_selected = self.slash_selected.saturating_sub(1);
+                Some((true, Vec::new()))
+            }
+            KeyCode::Down => {
+                self.slash_selected = (self.slash_selected + 1).min(command_count - 1);
+                Some((true, Vec::new()))
+            }
+            KeyCode::Tab => {
+                let command =
+                    self.filtered_slash_commands()[self.slash_selected.min(command_count - 1)].name;
+                let changed = self.input != command;
+                self.input.clear();
+                self.input.push_str(command);
+                self.slash_selected = 0;
+                Some((changed, Vec::new()))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn filtered_slash_commands(&self) -> Vec<&'static SlashCommand> {
+        if !self.input.starts_with('/') || self.input.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.name.starts_with(&self.input))
+            .collect()
+    }
+
+    pub(crate) fn slash_selected(&self) -> usize {
+        self.slash_selected
     }
 
     pub fn advance_animation(&mut self) -> bool {
@@ -890,6 +1025,11 @@ impl App {
                     None
                 }
             })
+    }
+
+    pub(crate) fn focused_context_usage(&self) -> Option<(u64, u32)> {
+        let session = self.focused.and_then(|id| self.sessions.get(&id))?;
+        Some((session.latest_input_tokens?, session.context_window?))
     }
 
     pub fn thread_order(&self) -> Vec<SessionId> {
@@ -946,6 +1086,20 @@ fn retain_recent_messages(messages: &mut Vec<MessageSnapshot>) {
     }
 }
 
+const fn total_input_tokens(usage: TokenUsage) -> u64 {
+    usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.cache_write_input_tokens)
+}
+
+fn model_context_window(models: &[ModelOption], model: Option<&str>) -> Option<u32> {
+    models
+        .iter()
+        .find(|option| option.selection.model.as_deref() == model)?
+        .context_window
+}
+
 pub(crate) fn terminal_safe_character(character: char) -> Option<char> {
     if character.is_control() {
         return character.is_whitespace().then_some(' ');
@@ -963,7 +1117,8 @@ pub(crate) fn terminal_safe_character(character: char) -> Option<char> {
 mod tests {
     use crossterm::event::MouseEvent;
     use qq_protocol::{
-        EventCursor, MessageId, MessageRole, RunId, SessionStatus, StoreId, WorkspaceSummary,
+        EventCursor, MessageId, MessageRole, RunId, RunSnapshot, RunStatus, SessionStatus, StoreId,
+        TokenUsage, WorkspaceSummary,
     };
 
     use super::*;
@@ -1041,21 +1196,158 @@ mod tests {
     }
 
     #[test]
-    fn slash_commands_quit_and_open_overlays_without_submitting_prompts() {
+    fn slash_command_aliases_quit_and_open_sessions_without_submitting_prompts() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
 
-        app.input = "/sessions".to_owned();
-        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(requests.is_empty());
-        assert!(app.navigator.is_some());
+        for command in ["/sessions", "/resume"] {
+            app.input = command.to_owned();
+            let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(requests.is_empty());
+            assert!(app.navigator.is_some());
+            assert!(app.navigator_open);
+            app.navigator = None;
+            app.navigator_open = false;
+        }
 
-        app.navigator = None;
-        app.navigator_open = false;
-        app.input = "/quit".to_owned();
+        for command in ["/quit", "/exit"] {
+            let mut app = App::new(TuiOptions::default());
+            app.input = command.to_owned();
+            let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(requests.is_empty());
+            assert!(app.quit);
+        }
+    }
+
+    #[test]
+    fn new_slash_command_creates_a_root_session_with_the_selected_model() {
+        let model = ModelSelection {
+            model: Some("openai/gpt-test".to_owned()),
+            max_output_tokens: Some(4_096),
+            organization: None,
+        };
+        let mut app = App::new(TuiOptions {
+            settings: Settings::default(),
+            model: model.clone(),
+            models: Vec::new(),
+        });
+        app.apply_snapshot(snapshot());
+        app.input = "/new".to_owned();
+
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(requests.is_empty());
-        assert!(app.quit);
+
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Command(CommandRequest {
+                command: SessionCommand::CreateSession {
+                    parent_id: None,
+                    model: selected,
+                    ..
+                },
+                ..
+            }) if selected == &model
+        ));
+    }
+
+    #[test]
+    fn slash_autocomplete_filters_selects_and_completes_commands() {
+        let mut app = App::new(TuiOptions::default());
+        app.input = "/".to_owned();
+
+        assert_eq!(
+            app.filtered_slash_commands()
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/models", "/sessions", "/resume", "/new", "/quit", "/exit"]
+        );
+        for _ in 0..10 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.slash_selected, 5);
+        for _ in 0..10 {
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        assert_eq!(app.slash_selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "/sessions");
+
+        app.input = "/qu".to_owned();
+        app.slash_selected = 0;
+        assert_eq!(
+            app.filtered_slash_commands()[0].name,
+            "/quit",
+            "a command prefix should hide unrelated commands"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "/quit");
+    }
+
+    #[test]
+    fn context_usage_uses_latest_reported_input_and_model_limit() {
+        let selection = ModelSelection {
+            model: Some("openai/gpt-test".to_owned()),
+            max_output_tokens: Some(4_096),
+            organization: None,
+        };
+        let mut app = App::new(TuiOptions {
+            settings: Settings::default(),
+            model: selection.clone(),
+            models: vec![ModelOption {
+                provider: "openai".to_owned(),
+                model: "gpt-test".to_owned(),
+                name: Some("GPT Test".to_owned()),
+                context_window: Some(128_000),
+                selection,
+            }],
+        });
+        let mut initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        initial.focused.as_mut().unwrap().runs.push(RunSnapshot {
+            id: id(7, RunId::from_bytes),
+            session_id,
+            status: RunStatus::Completed,
+            outcome: Some(RunOutcome::Completed),
+            usage: Some(TokenUsage {
+                input_tokens: 10_000,
+                cache_read_input_tokens: 2_000,
+                cache_write_input_tokens: 500,
+                output_tokens: 1_000,
+            }),
+            estimated_cost_usd_nanos: Some(1),
+        });
+        let summary = initial.focused.as_ref().unwrap().summary.clone();
+        let workspace_id = initial.workspace.id;
+        let store_id = initial.cursor.store_id;
+        app.apply_snapshot(initial);
+
+        assert_eq!(app.focused_context_usage(), Some((12_500, 128_000)));
+
+        app.apply_live_event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 2,
+            },
+            session_id,
+            run_id: Some(id(8, RunId::from_bytes)),
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::RunFinished {
+                session: summary,
+                run_id: id(8, RunId::from_bytes),
+                outcome: RunOutcome::Completed,
+                usage: Some(TokenUsage {
+                    input_tokens: 20_000,
+                    cache_read_input_tokens: 3_000,
+                    cache_write_input_tokens: 1_000,
+                    output_tokens: 2_000,
+                }),
+            },
+        });
+
+        assert_eq!(app.focused_context_usage(), Some((24_000, 128_000)));
     }
 
     #[test]
@@ -1072,6 +1364,7 @@ mod tests {
                 provider: "anthropic".to_owned(),
                 model: "claude-sonnet-5".to_owned(),
                 name: Some("Claude Sonnet 5".to_owned()),
+                context_window: Some(200_000),
                 selection: selection.clone(),
             }],
         });
