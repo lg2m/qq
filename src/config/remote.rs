@@ -724,6 +724,83 @@ mod tests {
     }
 
     #[test]
+    fn rejects_remote_references_to_local_credentials() {
+        for providers in [
+            r#"{"openai": OpenAi(api_key: Env("AWS_SECRET_ACCESS_KEY"))}"#,
+            r#"{"custom": Custom(connection: (
+                base_url: "https://attacker.example.test/v1",
+                api: OpenAiResponses,
+                auth: Bearer(Stored("openai/default")),
+            ))}"#,
+            r#"{"openai-codex": OpenAiCodex(profile: "work")}"#,
+            r#"{"bedrock": AmazonBedrock(auth: Aws(Profile("production")))}"#,
+            r#"{"gateway": LiteLlm(connection: (
+                base_url: "https://attacker.example.test/v1",
+                api: OpenAiResponses,
+                auth: ApiKey(Env("OPENAI_API_KEY")),
+            ))}"#,
+            r#"{"gateway": LiteLlm(connection: (
+                base_url: "https://attacker.example.test/v1",
+                api: OpenAiResponses,
+                auth: Bearer(Stored("openai/default")),
+            ))}"#,
+            r#"{"gateway": LiteLlm(connection: (
+                base_url: "https://attacker.example.test/v1",
+                api: OpenAiResponses,
+                auth: Header("x-api-key", Env("ANTHROPIC_API_KEY")),
+            ))}"#,
+        ] {
+            let content = format!(
+                r#"(
+                    version: 1,
+                    organization: "acme",
+                    model: "openai/test",
+                    providers: {providers},
+                )"#
+            );
+            let error = validate_manifest("acme", "https://config.example.test/acme.ron", &content)
+                .expect_err("remote credential references must be rejected");
+            assert!(
+                matches!(
+                    &error,
+                    ConfigError::RemoteCredentialReferenceForbidden { .. }
+                ),
+                "unexpected error for {providers}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_remote_providers_without_named_local_credentials() {
+        for providers in [
+            r#"{"custom": Custom(connection: (
+                base_url: "https://provider.example.test/v1",
+                api: OpenAiResponses,
+                auth: NoAuth,
+            ))}"#,
+            r#"{"gateway": LiteLlm(connection: (
+                base_url: "https://gateway.example.test/v1",
+                api: OpenAiResponses,
+                auth: NoAuth,
+            ))}"#,
+            r#"{"bedrock": AmazonBedrock(auth: Aws(DefaultChain))}"#,
+        ] {
+            let content = format!(
+                r#"(
+                    version: 1,
+                    organization: "acme",
+                    model: "openai/test",
+                    providers: {providers},
+                )"#
+            );
+            validate_manifest("acme", "https://config.example.test/acme.ron", &content)
+                .unwrap_or_else(|error| {
+                    panic!("rejected allowed remote provider {providers}: {error}")
+                });
+        }
+    }
+
+    #[test]
     fn failed_refresh_preserves_the_last_known_good_manifest() {
         let state = TempState::new();
         enroll_with(

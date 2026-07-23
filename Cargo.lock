@@ -2335,7 +2335,11 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-bedrockruntime",
+ "aws-sigv4",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
  "aws-smithy-types",
  "bytes",
  "futures-core",

@@ -260,6 +260,12 @@ enum ProviderEntryPatch {
         #[serde(default, skip_serializing_if = "Field::is_missing")]
         models: Field<UniqueMap<String, ModelEntryPatch>>,
     },
+    Google {
+        #[serde(default, skip_serializing_if = "Field::is_missing")]
+        api_key: Field<SecretRef>,
+        #[serde(default, skip_serializing_if = "Field::is_missing")]
+        models: Field<UniqueMap<String, ModelEntryPatch>>,
+    },
     LiteLlm {
         #[serde(default, skip_serializing_if = "Field::is_missing")]
         connection: Field<Connection>,
@@ -296,7 +302,9 @@ enum ProviderEntryPatch {
 impl ProviderEntryPatch {
     pub(super) fn contains_literal_secret(&self) -> bool {
         match self {
-            Self::OpenAi { api_key, .. } | Self::Anthropic { api_key, .. } => {
+            Self::OpenAi { api_key, .. }
+            | Self::Anthropic { api_key, .. }
+            | Self::Google { api_key, .. } => {
                 matches!(api_key, Field::Set(SecretRef::Value(_)))
             }
             Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => {
@@ -306,6 +314,25 @@ impl ProviderEntryPatch {
                 matches!(auth, Field::Set(value) if value.contains_literal_secret())
             }
             Self::OpenAiCodex { .. } | Self::Remove => false,
+        }
+    }
+
+    fn references_local_credential(&self) -> bool {
+        match self {
+            Self::OpenAi { api_key, .. }
+            | Self::Anthropic { api_key, .. }
+            | Self::Google { api_key, .. } => matches!(api_key, Field::Set(_)),
+            Self::OpenAiCodex { profile, .. } => matches!(profile, StringField::Set(_)),
+            Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => {
+                matches!(
+                    connection,
+                    Field::Set(value) if value.references_local_credential()
+                )
+            }
+            Self::AmazonBedrock { auth, .. } | Self::AmazonBedrockMantle { auth, .. } => {
+                matches!(auth, Field::Set(value) if value.references_local_credential())
+            }
+            Self::Remove => false,
         }
     }
 }
@@ -370,6 +397,11 @@ impl Document {
             )
         {
             return Err(ConfigError::LiteralSecretForbidden {
+                origin: origin.clone(),
+            });
+        }
+        if origin.kind() == SourceKind::Remote && self.references_local_credential() {
+            return Err(ConfigError::RemoteCredentialReferenceForbidden {
                 origin: origin.clone(),
             });
         }
@@ -453,6 +485,16 @@ impl Document {
         }
     }
 
+    fn references_local_credential(&self) -> bool {
+        match &self.providers {
+            Field::Set(providers) => providers
+                .0
+                .values()
+                .any(ProviderEntryPatch::references_local_credential),
+            Field::Missing | Field::Clear => false,
+        }
+    }
+
     pub(super) fn apply_organization(&self, organization: &mut Option<String>) -> bool {
         apply_optional_string(&self.organization, organization)
     }
@@ -523,6 +565,13 @@ impl MergeState {
                     region: None,
                     api: ProviderApi::OpenAiResponses,
                     auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
+                    models: BTreeMap::new(),
+                },
+            ),
+            (
+                "google".to_owned(),
+                ProviderConfig::Google {
+                    api_key: None,
                     models: BTreeMap::new(),
                 },
             ),
@@ -711,6 +760,28 @@ impl MergeState {
                     };
                 }
                 if let ProviderConfig::Anthropic {
+                    api_key: current,
+                    models: current_models,
+                } = provider
+                {
+                    apply_optional(api_key, current);
+                    apply_models(models, current_models);
+                }
+            }
+            ProviderEntryPatch::Google { api_key, models } => {
+                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
+                    ProviderConfig::Google {
+                        api_key: None,
+                        models: BTreeMap::new(),
+                    }
+                });
+                if !matches!(provider, ProviderConfig::Google { .. }) {
+                    *provider = ProviderConfig::Google {
+                        api_key: None,
+                        models: BTreeMap::new(),
+                    };
+                }
+                if let ProviderConfig::Google {
                     api_key: current,
                     models: current_models,
                 } = provider
@@ -996,10 +1067,12 @@ fn enforce_policy(
             format!("configured value {max_output_tokens} exceeds {limit}"),
         ));
     }
-    if !policy.allow_custom_providers && providers.values().any(ProviderConfig::is_custom) {
+    if !policy.allow_custom_providers
+        && providers.values().any(ProviderConfig::uses_custom_endpoint)
+    {
         return Err(policy_violation(
             "allow_custom_providers",
-            "a custom provider is configured".to_owned(),
+            "a custom or LiteLLM provider is configured".to_owned(),
         ));
     }
     if !policy.allow_literal_secrets

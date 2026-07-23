@@ -6,7 +6,9 @@ use crate::{
     Provider, ProviderError,
     anthropic::{AnthropicAuth, AnthropicMessages},
     bedrock::{Bedrock, BedrockAuth},
+    google::{GoogleAuth, GoogleEndpoint, GoogleGenerateContent},
     http::{build_client, build_direct_client, validate_endpoint},
+    mantle::Mantle,
     openai::{OpenAi, ResponsesAuth},
     openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
 };
@@ -34,10 +36,21 @@ impl ProviderCompiler {
             ProviderRecipe::AmazonBedrock { region, auth } => {
                 Ok(Arc::new(Bedrock::new(auth, region)?))
             }
+            ProviderRecipe::AmazonBedrockMantle {
+                region,
+                protocol,
+                auth,
+            } => Ok(Arc::new(Mantle::new(
+                self.direct_http.clone(),
+                region,
+                protocol,
+                auth,
+            )?)),
         }
     }
 
     fn compile_http(&self, recipe: HttpProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
+        let endpoint_kind = recipe.endpoint.kind;
         let endpoint = recipe.endpoint.resolve(recipe.protocol)?;
         let client = if endpoint.scheme() == "http" {
             self.direct_http.clone()
@@ -73,6 +86,20 @@ impl ProviderCompiler {
                     recipe.headers,
                 )?))
             }
+            HttpProtocol::GoogleGenerateContent => {
+                let auth = google_auth(recipe.auth)?;
+                let endpoint_kind = match endpoint_kind {
+                    EndpointKind::Base => GoogleEndpoint::Base,
+                    EndpointKind::Exact => GoogleEndpoint::Exact,
+                };
+                Ok(Arc::new(GoogleGenerateContent::with_client(
+                    client,
+                    endpoint,
+                    endpoint_kind,
+                    auth,
+                    recipe.headers,
+                )?))
+            }
         }
     }
 }
@@ -82,6 +109,11 @@ pub enum ProviderRecipe {
     Http(HttpProviderRecipe),
     AmazonBedrock {
         region: Option<String>,
+        auth: BedrockAuth,
+    },
+    AmazonBedrockMantle {
+        region: Option<String>,
+        protocol: HttpProtocol,
         auth: BedrockAuth,
     },
 }
@@ -95,6 +127,19 @@ impl ProviderRecipe {
     #[must_use]
     pub fn amazon_bedrock(region: Option<String>, auth: BedrockAuth) -> Self {
         Self::AmazonBedrock { region, auth }
+    }
+
+    #[must_use]
+    pub fn amazon_bedrock_mantle(
+        region: Option<String>,
+        protocol: HttpProtocol,
+        auth: BedrockAuth,
+    ) -> Self {
+        Self::AmazonBedrockMantle {
+            region,
+            protocol,
+            auth,
+        }
     }
 }
 
@@ -185,6 +230,7 @@ pub enum HttpProtocol {
     OpenAiResponses,
     OpenAiChatCompletions,
     AnthropicMessages,
+    GoogleGenerateContent,
 }
 
 impl HttpProtocol {
@@ -193,6 +239,7 @@ impl HttpProtocol {
             Self::OpenAiResponses => &["responses"],
             Self::OpenAiChatCompletions => &["chat", "completions"],
             Self::AnthropicMessages => &["messages"],
+            Self::GoogleGenerateContent => &[],
         }
     }
 }
@@ -273,6 +320,18 @@ fn anthropic_auth(auth: HttpAuth) -> Result<AnthropicAuth, ProviderError> {
         HttpAuth::ApiKey(secret) => Ok(AnthropicAuth::XApiKey(secret)),
         HttpAuth::Bearer(secret) => Ok(AnthropicAuth::Bearer(secret)),
         HttpAuth::Header(name, secret) => Ok(AnthropicAuth::Header(name, secret)),
+        HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
+            "Codex authentication requires the OpenAI Responses protocol".to_owned(),
+        )),
+    }
+}
+
+fn google_auth(auth: HttpAuth) -> Result<GoogleAuth, ProviderError> {
+    match auth {
+        HttpAuth::NoAuth => Ok(GoogleAuth::NoAuth),
+        HttpAuth::ApiKey(secret) => Ok(GoogleAuth::XGoogApiKey(secret)),
+        HttpAuth::Bearer(secret) => Ok(GoogleAuth::Bearer(secret)),
+        HttpAuth::Header(name, secret) => Ok(GoogleAuth::Header(name, secret)),
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),

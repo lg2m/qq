@@ -303,6 +303,7 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
             config::ProviderConfig::OpenAi { .. } => "OpenAi",
             config::ProviderConfig::OpenAiCodex { .. } => "OpenAiCodex",
             config::ProviderConfig::Anthropic { .. } => "Anthropic",
+            config::ProviderConfig::Google { .. } => "Google",
             config::ProviderConfig::LiteLlm { .. } => "LiteLlm",
             config::ProviderConfig::AmazonBedrock { .. } => "AmazonBedrock",
             config::ProviderConfig::AmazonBedrockMantle { .. } => "AmazonBedrockMantle",

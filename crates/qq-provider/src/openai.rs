@@ -12,6 +12,7 @@ use crate::{
     ProviderStream, Role,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
+    request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
 };
 
@@ -66,6 +67,7 @@ pub struct OpenAi {
     headers: HeaderMap,
     redactions: Arc<[String]>,
     request_kind: ResponsesRequestKind,
+    authorizer: RequestAuthorizer,
 }
 
 impl OpenAi {
@@ -104,6 +106,22 @@ impl OpenAi {
         auth: ResponsesAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, ProviderError> {
+        Self::with_client_and_authorizer(
+            client,
+            endpoint,
+            auth,
+            static_headers,
+            RequestAuthorizer::default(),
+        )
+    }
+
+    pub(crate) fn with_client_and_authorizer(
+        client: reqwest::Client,
+        endpoint: reqwest::Url,
+        auth: ResponsesAuth,
+        static_headers: impl IntoIterator<Item = (String, String)>,
+        authorizer: RequestAuthorizer,
+    ) -> Result<Self, ProviderError> {
         let request_kind = if matches!(&auth, ResponsesAuth::Codex { .. }) {
             ResponsesRequestKind::Codex
         } else {
@@ -117,6 +135,7 @@ impl OpenAi {
             headers,
             redactions: Arc::from(redactions),
             request_kind,
+            authorizer,
         })
     }
 }
@@ -128,15 +147,20 @@ impl Provider for OpenAi {
         let headers = self.headers.clone();
         let redactions = Arc::clone(&self.redactions);
         let request_kind = self.request_kind;
+        let authorizer = self.authorizer.clone();
         Box::pin(try_stream! {
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = ResponsesRequest::new(&request, request_kind);
-            let response = client
+            let mut wire_request = client
                 .post(endpoint)
                 .headers(headers)
                 .header(ACCEPT, "text/event-stream")
                 .json(&body)
-                .send()
+                .build()
+                .map_err(|error| transport_error(error, redactions.as_ref()))?;
+            authorizer.authorize(&mut wire_request).await?;
+            let response = client
+                .execute(wire_request)
                 .await
                 .map_err(|error| transport_error(error, redactions.as_ref()))?;
 

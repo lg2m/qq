@@ -547,6 +547,42 @@ fn require_https_and_custom_provider_policy_are_enforced() {
 }
 
 #[test]
+fn custom_provider_policy_classifies_litellm_as_a_custom_endpoint() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(
+            version: 1,
+            providers: {
+                "gateway": LiteLlm(connection: (
+                    base_url: "https://gateway.example.test/v1",
+                    api: OpenAiChatCompletions,
+                    auth: NoAuth,
+                )),
+            },
+        )"#,
+    );
+    tree.write(
+        "managed/managed.ron",
+        r#"(version: 1, policy: (allow_custom_providers: false))"#,
+    );
+    tree.write(
+        "managed/managed.d/99-cannot-relax.ron",
+        r#"(version: 1, policy: (allow_custom_providers: true))"#,
+    );
+    let request = LoadRequest::new(tree.path("work"))
+        .with_overrides(RuntimeOverrides::new().with_model("gateway/model"));
+
+    assert!(matches!(
+        tree.loader().load(&request),
+        Err(ConfigError::PolicyViolation {
+            rule: "allow_custom_providers",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn malformed_unknown_and_wrong_version_documents_are_rejected() {
     let tree = TempTree::new();
     for content in [

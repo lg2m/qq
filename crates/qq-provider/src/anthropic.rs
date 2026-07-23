@@ -13,6 +13,7 @@ use crate::{
     ProviderStream, Role,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
+    request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
 };
 
@@ -58,6 +59,7 @@ pub struct AnthropicMessages {
     endpoint: reqwest::Url,
     headers: HeaderMap,
     redactions: Arc<[String]>,
+    authorizer: RequestAuthorizer,
 }
 
 impl AnthropicMessages {
@@ -129,6 +131,41 @@ impl AnthropicMessages {
         static_headers: impl IntoIterator<Item = (String, String)>,
         anthropic_version: &str,
     ) -> Result<Self, ProviderError> {
+        Self::with_client_authorizer_and_version(
+            client,
+            endpoint,
+            auth,
+            static_headers,
+            RequestAuthorizer::default(),
+            anthropic_version,
+        )
+    }
+
+    pub(crate) fn with_client_and_authorizer(
+        client: reqwest::Client,
+        endpoint: reqwest::Url,
+        auth: AnthropicAuth,
+        static_headers: impl IntoIterator<Item = (String, String)>,
+        authorizer: RequestAuthorizer,
+    ) -> Result<Self, ProviderError> {
+        Self::with_client_authorizer_and_version(
+            client,
+            endpoint,
+            auth,
+            static_headers,
+            authorizer,
+            DEFAULT_ANTHROPIC_VERSION,
+        )
+    }
+
+    fn with_client_authorizer_and_version(
+        client: reqwest::Client,
+        endpoint: reqwest::Url,
+        auth: AnthropicAuth,
+        static_headers: impl IntoIterator<Item = (String, String)>,
+        authorizer: RequestAuthorizer,
+        anthropic_version: &str,
+    ) -> Result<Self, ProviderError> {
         let (headers, redactions) = build_headers(auth, static_headers, anthropic_version)?;
 
         Ok(Self {
@@ -136,6 +173,7 @@ impl AnthropicMessages {
             endpoint,
             headers,
             redactions: Arc::from(redactions),
+            authorizer,
         })
     }
 }
@@ -146,16 +184,21 @@ impl Provider for AnthropicMessages {
         let endpoint = self.endpoint.clone();
         let headers = self.headers.clone();
         let redactions = Arc::clone(&self.redactions);
+        let authorizer = self.authorizer.clone();
 
         Box::pin(try_stream! {
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = MessagesRequest::from(&request);
-            let response = client
+            let mut wire_request = client
                 .post(endpoint)
                 .headers(headers)
                 .header(ACCEPT, "text/event-stream")
                 .json(&body)
-                .send()
+                .build()
+                .map_err(|error| transport_error(error, redactions.as_ref()))?;
+            authorizer.authorize(&mut wire_request).await?;
+            let response = client
+                .execute(wire_request)
                 .await
                 .map_err(|error| transport_error(error, redactions.as_ref()))?;
 

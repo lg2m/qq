@@ -10,10 +10,13 @@ use thiserror::Error;
 pub mod anthropic;
 pub mod bedrock;
 pub mod compiler;
+pub mod google;
 mod http;
 mod limits;
+mod mantle;
 pub mod openai;
 pub mod openai_chat;
+mod request_auth;
 mod sanitize;
 
 pub use compiler::{

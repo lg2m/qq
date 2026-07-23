@@ -411,6 +411,10 @@ impl ProviderAuth {
             }
         }
     }
+
+    const fn references_local_credential(&self) -> bool {
+        !matches!(self, Self::NoAuth)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +432,10 @@ pub enum BedrockAuth {
 impl BedrockAuth {
     fn contains_literal_secret(&self) -> bool {
         matches!(self, Self::ApiKey(secret) if secret.is_literal())
+    }
+
+    const fn references_local_credential(&self) -> bool {
+        matches!(self, Self::Aws(AwsAuth::Profile(_)) | Self::ApiKey(_))
     }
 }
 
@@ -464,6 +472,10 @@ impl Connection {
 
     fn contains_literal_secret(&self) -> bool {
         self.auth.contains_literal_secret() || !self.headers.is_empty()
+    }
+
+    const fn references_local_credential(&self) -> bool {
+        self.auth.references_local_credential()
     }
 }
 
@@ -555,6 +567,10 @@ pub enum ProviderConfig {
         api_key: Option<SecretRef>,
         models: BTreeMap<String, ModelMetadata>,
     },
+    Google {
+        api_key: Option<SecretRef>,
+        models: BTreeMap<String, ModelMetadata>,
+    },
     LiteLlm {
         connection: Option<Connection>,
         models: BTreeMap<String, ModelMetadata>,
@@ -583,6 +599,7 @@ impl ProviderConfig {
             Self::OpenAi { models, .. }
             | Self::OpenAiCodex { models, .. }
             | Self::Anthropic { models, .. }
+            | Self::Google { models, .. }
             | Self::LiteLlm { models, .. }
             | Self::AmazonBedrock { models, .. }
             | Self::AmazonBedrockMantle { models, .. }
@@ -601,15 +618,15 @@ impl ProviderConfig {
     }
 
     #[must_use]
-    pub const fn is_custom(&self) -> bool {
-        matches!(self, Self::Custom { .. })
+    pub const fn uses_custom_endpoint(&self) -> bool {
+        matches!(self, Self::LiteLlm { .. } | Self::Custom { .. })
     }
 
     fn contains_literal_secret(&self) -> bool {
         match self {
-            Self::OpenAi { api_key, .. } | Self::Anthropic { api_key, .. } => {
-                api_key.as_ref().is_some_and(SecretRef::is_literal)
-            }
+            Self::OpenAi { api_key, .. }
+            | Self::Anthropic { api_key, .. }
+            | Self::Google { api_key, .. } => api_key.as_ref().is_some_and(SecretRef::is_literal),
             Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => connection
                 .as_ref()
                 .is_some_and(Connection::contains_literal_secret),
@@ -1015,6 +1032,8 @@ pub enum ConfigError {
     PolicyOutsideManaged { origin: SourceIdentity },
     #[error("literal secret values are forbidden in {origin}")]
     LiteralSecretForbidden { origin: SourceIdentity },
+    #[error("remote configuration cannot select local credential references: {origin}")]
+    RemoteCredentialReferenceForbidden { origin: SourceIdentity },
     #[error("project configuration trust is required")]
     TrustRequired {
         pending: Vec<PendingTrust>,

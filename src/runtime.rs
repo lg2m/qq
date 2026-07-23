@@ -35,6 +35,10 @@ const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_CREDENTIAL_ENDPOINT: &str = "https://api.anthropic.com";
 const ANTHROPIC_STORED_CREDENTIAL: &str = "anthropic/default";
 const ANTHROPIC_ENVIRONMENT_CREDENTIAL: &str = "ANTHROPIC_API_KEY";
+const GOOGLE_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
+const GOOGLE_CREDENTIAL_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
+const GOOGLE_STORED_CREDENTIAL: &str = "google/default";
+const GOOGLE_ENVIRONMENT_CREDENTIAL: &str = "GEMINI_API_KEY";
 const MAX_CACHED_RUNTIMES: usize = 16;
 const MAX_SESSIONS: usize = 16;
 const MAX_SESSION_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
@@ -226,15 +230,36 @@ impl RuntimeFactory {
                 ));
                 Ok((recipe, key))
             }
+            ProviderConfig::Google { api_key, .. } => {
+                let secret = resolve_provider_credential(
+                    &self.inner.credentials,
+                    api_key.as_ref(),
+                    GOOGLE_STORED_CREDENTIAL,
+                    GOOGLE_ENVIRONMENT_CREDENTIAL,
+                    Some(GOOGLE_CREDENTIAL_ENDPOINT),
+                )?;
+                let auth = ResolvedAuth::ApiKey(secret);
+                let key = provider_key(
+                    provider_id,
+                    GOOGLE_ENDPOINT,
+                    "base",
+                    "google_generate_content",
+                    &auth,
+                    std::iter::empty::<(&str, &str)>(),
+                );
+                let recipe = ProviderRecipe::http(HttpProviderRecipe::new(
+                    EndpointSpec::base(GOOGLE_ENDPOINT, false),
+                    HttpProtocol::GoogleGenerateContent,
+                    auth.into_http()?,
+                ));
+                Ok((recipe, key))
+            }
             ProviderConfig::AmazonBedrock { region, auth, .. } => {
                 self.prepare_bedrock_provider(provider_id, region.as_deref(), auth)
             }
-            ProviderConfig::AmazonBedrockMantle { .. } => {
-                Err(RuntimeBuildError::UnsupportedProvider {
-                    provider: provider_id.to_owned(),
-                    detail: "Amazon Bedrock Mantle is not wired yet",
-                })
-            }
+            ProviderConfig::AmazonBedrockMantle {
+                region, api, auth, ..
+            } => self.prepare_bedrock_mantle_provider(provider_id, region.as_deref(), *api, auth),
         }
     }
 
@@ -263,6 +288,7 @@ impl RuntimeFactory {
             ProviderApi::OpenAiResponses => HttpProtocol::OpenAiResponses,
             ProviderApi::OpenAiChatCompletions => HttpProtocol::OpenAiChatCompletions,
             ProviderApi::AnthropicMessages => HttpProtocol::AnthropicMessages,
+            ProviderApi::GoogleGenerateContent => HttpProtocol::GoogleGenerateContent,
             api => {
                 return Err(RuntimeBuildError::UnsupportedApi {
                     provider: provider_id.to_owned(),
@@ -341,6 +367,79 @@ impl RuntimeFactory {
 
         Ok((
             ProviderRecipe::amazon_bedrock(region.map(str::to_owned), auth),
+            key,
+        ))
+    }
+
+    fn prepare_bedrock_mantle_provider(
+        &self,
+        provider_id: &str,
+        region: Option<&str>,
+        api: ProviderApi,
+        auth: &BedrockAuth,
+    ) -> Result<(ProviderRecipe, Vec<u8>), RuntimeBuildError> {
+        let protocol = match api {
+            ProviderApi::OpenAiResponses => HttpProtocol::OpenAiResponses,
+            ProviderApi::OpenAiChatCompletions => HttpProtocol::OpenAiChatCompletions,
+            ProviderApi::AnthropicMessages => HttpProtocol::AnthropicMessages,
+            api => {
+                return Err(RuntimeBuildError::UnsupportedApi {
+                    provider: provider_id.to_owned(),
+                    api,
+                });
+            }
+        };
+        let credential_endpoint =
+            region.map(|region| format!("https://bedrock-mantle.{region}.api.aws"));
+        let key_endpoint = credential_endpoint
+            .as_deref()
+            .unwrap_or("aws-region-provider-chain");
+        let api_name = provider_api_name(api);
+
+        let (auth, key) = match auth {
+            BedrockAuth::Aws(AwsAuth::DefaultChain) => {
+                let key = provider_key(
+                    provider_id,
+                    key_endpoint,
+                    "aws",
+                    api_name,
+                    &ResolvedAuth::NoAuth,
+                    [("aws-auth", "default-chain")],
+                );
+                (ProviderBedrockAuth::DefaultChain, key)
+            }
+            BedrockAuth::Aws(AwsAuth::Profile(profile)) => {
+                let key = provider_key(
+                    provider_id,
+                    key_endpoint,
+                    "aws",
+                    api_name,
+                    &ResolvedAuth::NoAuth,
+                    [("aws-auth", "profile"), ("aws-profile", profile)],
+                );
+                (ProviderBedrockAuth::Profile(profile.clone()), key)
+            }
+            BedrockAuth::ApiKey(reference) => {
+                let secret = self
+                    .inner
+                    .credentials
+                    .resolve_with_endpoint(reference, credential_endpoint.as_deref())?;
+                let api_key = secret.expose_secret_str()?.to_owned();
+                let key_auth = ResolvedAuth::ApiKey(secret);
+                let key = provider_key(
+                    provider_id,
+                    key_endpoint,
+                    "aws",
+                    api_name,
+                    &key_auth,
+                    std::iter::empty::<(&str, &str)>(),
+                );
+                (ProviderBedrockAuth::ApiKey(api_key), key)
+            }
+        };
+
+        Ok((
+            ProviderRecipe::amazon_bedrock_mantle(region.map(str::to_owned), protocol, auth),
             key,
         ))
     }
@@ -898,11 +997,6 @@ pub enum RuntimeBuildError {
     UnknownProvider(String),
     #[error("provider {0:?} is missing its connection configuration")]
     IncompleteProvider(String),
-    #[error("provider {provider:?} is not available: {detail}")]
-    UnsupportedProvider {
-        provider: String,
-        detail: &'static str,
-    },
     #[error("provider {provider:?} uses an API that is not available yet: {api:?}")]
     UnsupportedApi { provider: String, api: ProviderApi },
     #[error("runtime cache is unavailable")]
@@ -935,7 +1029,6 @@ impl RuntimeBuildError {
             Self::Runtime(_)
             | Self::UnknownProvider(_)
             | Self::IncompleteProvider(_)
-            | Self::UnsupportedProvider { .. }
             | Self::UnsupportedApi { .. } => RunFailureKind::ProviderConfiguration,
             Self::CacheUnavailable => RunFailureKind::Server,
         }
@@ -1062,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn constructs_every_wired_http_api_and_builtin_anthropic() {
+    fn constructs_every_wired_http_api_and_builtin_key_provider() {
         let fixture = RuntimeFixture::new();
         let factory = fixture.factory();
 
@@ -1070,6 +1163,7 @@ mod tests {
             "OpenAiResponses",
             "OpenAiChatCompletions",
             "AnthropicMessages",
+            "GoogleGenerateContent",
         ] {
             let request = fixture.request(format!(
                 r#"(
@@ -1105,6 +1199,20 @@ mod tests {
             )"#,
         );
         factory.runtime_for(&anthropic).unwrap();
+
+        let google = fixture.request(
+            r#"(
+                version: 1,
+                model: "google/gemini-test",
+                providers: {
+                    "google": Google(
+                        api_key: Value("google-test-secret"),
+                        models: {"gemini-test": (name: "Gemini test")},
+                    ),
+                },
+            )"#,
+        );
+        factory.runtime_for(&google).unwrap();
     }
 
     #[test]
@@ -1215,6 +1323,132 @@ mod tests {
                 .runtime_for(&request)
                 .unwrap_or_else(|error| panic!("failed to construct {provider}: {error}"));
         }
+    }
+
+    #[test]
+    fn constructs_amazon_bedrock_mantle_runtimes_for_supported_apis_and_auth_modes() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+
+        for api in [
+            "OpenAiResponses",
+            "OpenAiChatCompletions",
+            "AnthropicMessages",
+        ] {
+            for (auth_name, auth) in [
+                ("default", "Aws(DefaultChain)"),
+                ("profile", r#"Aws(Profile("work"))"#),
+                ("api-key", r#"ApiKey(Value("mantle-test-secret"))"#),
+            ] {
+                let provider = format!("mantle-{api}-{auth_name}");
+                let request = fixture.request(format!(
+                    r#"(
+                        version: 1,
+                        model: "{provider}/test-model",
+                        providers: {{
+                            "{provider}": AmazonBedrockMantle(
+                                region: "us-east-1",
+                                api: {api},
+                                auth: {auth},
+                                models: {{"test-model": (name: "Test model")}},
+                            ),
+                        }},
+                    )"#
+                ));
+
+                factory.runtime_for(&request).unwrap_or_else(|error| {
+                    panic!("failed to construct Mantle {api}/{auth_name}: {error}")
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_amazon_bedrock_mantle_apis_before_network_access() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+
+        for (api, expected) in [
+            ("GoogleGenerateContent", ProviderApi::GoogleGenerateContent),
+            ("BedrockConverse", ProviderApi::BedrockConverse),
+        ] {
+            let request = fixture.request(format!(
+                r#"(
+                    version: 1,
+                    model: "mantle/test-model",
+                    providers: {{
+                        "mantle": AmazonBedrockMantle(
+                            region: "us-east-1",
+                            api: {api},
+                            auth: Aws(DefaultChain),
+                            models: {{"test-model": (name: "Test model")}},
+                        ),
+                    }},
+                )"#
+            ));
+
+            let error = factory
+                .runtime_for(&request)
+                .err()
+                .expect("unsupported Mantle API must fail");
+            assert!(matches!(
+                error,
+                RuntimeBuildError::UnsupportedApi { api: actual, .. }
+                    if actual == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn mantle_runtime_cache_identity_includes_region_api_and_aws_profile() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let document = |region: &str, api: &str, auth: &str| {
+            fixture.request(format!(
+                r#"(
+                    version: 1,
+                    model: "mantle/test-model",
+                    providers: {{
+                        "mantle": AmazonBedrockMantle(
+                            region: "{region}",
+                            api: {api},
+                            auth: {auth},
+                            models: {{"test-model": (name: "Test model")}},
+                        ),
+                    }},
+                )"#
+            ))
+        };
+
+        let base = document("us-east-1", "OpenAiResponses", "Aws(DefaultChain)");
+        let first = factory.runtime_for(&base).unwrap();
+        let reused = factory.runtime_for(&base).unwrap();
+        let different_region = factory
+            .runtime_for(&document(
+                "us-west-2",
+                "OpenAiResponses",
+                "Aws(DefaultChain)",
+            ))
+            .unwrap();
+        let different_api = factory
+            .runtime_for(&document(
+                "us-east-1",
+                "AnthropicMessages",
+                "Aws(DefaultChain)",
+            ))
+            .unwrap();
+        let different_profile = factory
+            .runtime_for(&document(
+                "us-east-1",
+                "OpenAiResponses",
+                r#"Aws(Profile("work"))"#,
+            ))
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(!Arc::ptr_eq(&first, &different_region));
+        assert!(!Arc::ptr_eq(&first, &different_api));
+        assert!(!Arc::ptr_eq(&first, &different_profile));
     }
 
     #[test]

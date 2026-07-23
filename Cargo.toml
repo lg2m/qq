@@ -24,8 +24,12 @@ repository = "https://github.com/lg2m/qq"
 
 [workspace.dependencies]
 async-stream = "0.3"
-aws-config = "1.10.0"
+aws-config = { version = "1.10.0", default-features = false, features = ["default-https-client", "rt-tokio", "sso"] }
+aws-credential-types = "1.3.0"
 aws-sdk-bedrockruntime = { version = "1.137.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sigv4 = "1.5.1"
+aws-smithy-http-client = { version = "1.2.0", default-features = false, features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = "1.13.0"
 aws-smithy-types = "1.6.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22"
