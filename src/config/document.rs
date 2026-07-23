@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AwsAuth, BedrockAuth, ConfigError, ConfigKey, ConfigProvenance, ConfigSnapshot, Connection,
-    DEFAULT_MAX_OUTPUT_TOKENS, EffectivePolicy, InputModality, ModelMetadata, ModelRoute,
-    ProviderApi, ProviderConfig, RuntimeOverrides, SecretRef, SourceIdentity, SourceKind,
-    SourceReport,
+    DEFAULT_MAX_OUTPUT_TOKENS, EffectivePolicy, HttpAccess, HttpCredential, InputModality,
+    ModelMetadata, ModelRoute, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind,
+    RuntimeOverrides, SecretRef, SourceIdentity, SourceKind, SourceReport,
 };
 
 pub(super) fn deserialize_unique_btree_map<'de, D, K, V>(
@@ -268,6 +268,14 @@ enum ProviderEntryPatch {
         #[serde(default, skip_serializing_if = "Field::is_missing")]
         models: Field<UniqueMap<String, ModelEntryPatch>>,
     },
+    XAi {
+        #[serde(default, skip_serializing_if = "Field::is_missing")]
+        api_key: Field<SecretRef>,
+        #[serde(default, skip_serializing_if = "StringField::is_missing")]
+        profile: StringField,
+        #[serde(default, skip_serializing_if = "Field::is_missing")]
+        models: Field<UniqueMap<String, ModelEntryPatch>>,
+    },
     LiteLlm {
         #[serde(default, skip_serializing_if = "Field::is_missing")]
         connection: Field<Connection>,
@@ -306,7 +314,8 @@ impl ProviderEntryPatch {
         match self {
             Self::OpenAi { api_key, .. }
             | Self::Anthropic { api_key, .. }
-            | Self::Google { api_key, .. } => {
+            | Self::Google { api_key, .. }
+            | Self::XAi { api_key, .. } => {
                 matches!(api_key, Field::Set(SecretRef::Value(_)))
             }
             Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => {
@@ -324,6 +333,9 @@ impl ProviderEntryPatch {
             Self::OpenAi { api_key, .. }
             | Self::Anthropic { api_key, .. }
             | Self::Google { api_key, .. } => matches!(api_key, Field::Set(_)),
+            Self::XAi {
+                api_key, profile, ..
+            } => matches!(api_key, Field::Set(_)) || matches!(profile, StringField::Set(_)),
             Self::OpenAiCodex { profile, .. } => matches!(profile, StringField::Set(_)),
             Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => {
                 matches!(
@@ -548,48 +560,31 @@ impl MergeState {
         let providers = BTreeMap::from([
             (
                 "anthropic".to_owned(),
-                ProviderConfig::Anthropic {
-                    api_key: None,
-                    models: crate::models::builtin_models("anthropic"),
-                },
+                crate::providers::builtin(ProviderKind::Anthropic),
             ),
             (
                 "bedrock".to_owned(),
-                ProviderConfig::AmazonBedrock {
-                    region: None,
-                    auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                    models: crate::models::builtin_models("bedrock"),
-                },
+                crate::providers::builtin(ProviderKind::AmazonBedrock),
             ),
             (
                 "bedrock-mantle".to_owned(),
-                ProviderConfig::AmazonBedrockMantle {
-                    region: None,
-                    api: ProviderApi::OpenAiResponses,
-                    auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                    models: crate::models::builtin_models("bedrock-mantle"),
-                },
+                crate::providers::builtin(ProviderKind::AmazonBedrockMantle),
             ),
             (
                 "google".to_owned(),
-                ProviderConfig::Google {
-                    api_key: None,
-                    models: crate::models::builtin_models("google"),
-                },
+                crate::providers::builtin(ProviderKind::Google),
             ),
             (
                 "openai".to_owned(),
-                ProviderConfig::OpenAi {
-                    api_key: None,
-                    models: crate::models::builtin_models("openai"),
-                },
+                crate::providers::builtin(ProviderKind::OpenAi),
             ),
             (
                 "openai-codex".to_owned(),
-                ProviderConfig::OpenAiCodex {
-                    profile: None,
-                    models: crate::models::builtin_models("openai-codex"),
-                },
+                crate::providers::builtin(ProviderKind::OpenAiCodex),
+            ),
+            (
+                "xai".to_owned(),
+                crate::providers::builtin(ProviderKind::XAi),
             ),
         ]);
         let provenance = ConfigProvenance {
@@ -705,145 +700,75 @@ impl MergeState {
                 self.providers.remove(name);
             }
             ProviderEntryPatch::OpenAi { api_key, models } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::OpenAi {
-                        api_key: None,
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::OpenAi { .. }) {
-                    *provider = ProviderConfig::OpenAi {
-                        api_key: None,
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::OpenAi {
-                    api_key: current,
-                    models: current_models,
-                } = provider
-                {
-                    apply_optional(api_key, current);
-                    apply_models(models, current_models);
-                }
+                let provider = self.provider_for_patch(name, ProviderKind::OpenAi);
+                let current = api_key_slot(provider, ProviderKind::OpenAi);
+                apply_optional(api_key, current);
+                apply_models(models, provider.models_mut());
             }
             ProviderEntryPatch::OpenAiCodex { profile, models } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::OpenAiCodex {
-                        profile: None,
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::OpenAiCodex { .. }) {
-                    *provider = ProviderConfig::OpenAiCodex {
-                        profile: None,
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::OpenAiCodex {
-                    profile: current,
-                    models: current_models,
-                } = provider
-                {
-                    apply_optional_string(profile, current);
-                    apply_models(models, current_models);
-                }
+                let provider = self.provider_for_patch(name, ProviderKind::OpenAiCodex);
+                let Some(ProviderAccess::Http(access)) = provider.access_mut().as_mut() else {
+                    unreachable!("OpenAI Codex preset is HTTP")
+                };
+                let HttpCredential::OpenAiCodex { profile: current } = &mut access.auth else {
+                    unreachable!("OpenAI Codex preset uses Codex credentials")
+                };
+                apply_optional_string(profile, current);
+                apply_models(models, provider.models_mut());
             }
             ProviderEntryPatch::Anthropic { api_key, models } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::Anthropic {
-                        api_key: None,
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::Anthropic { .. }) {
-                    *provider = ProviderConfig::Anthropic {
-                        api_key: None,
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::Anthropic {
-                    api_key: current,
-                    models: current_models,
-                } = provider
-                {
-                    apply_optional(api_key, current);
-                    apply_models(models, current_models);
-                }
+                let provider = self.provider_for_patch(name, ProviderKind::Anthropic);
+                let current = api_key_slot(provider, ProviderKind::Anthropic);
+                apply_optional(api_key, current);
+                apply_models(models, provider.models_mut());
             }
             ProviderEntryPatch::Google { api_key, models } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::Google {
-                        api_key: None,
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::Google { .. }) {
-                    *provider = ProviderConfig::Google {
-                        api_key: None,
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::Google {
-                    api_key: current,
-                    models: current_models,
-                } = provider
-                {
-                    apply_optional(api_key, current);
-                    apply_models(models, current_models);
-                }
+                let provider = self.provider_for_patch(name, ProviderKind::Google);
+                let current = api_key_slot(provider, ProviderKind::Google);
+                apply_optional(api_key, current);
+                apply_models(models, provider.models_mut());
+            }
+            ProviderEntryPatch::XAi {
+                api_key,
+                profile,
+                models,
+            } => {
+                let provider = self.provider_for_patch(name, ProviderKind::XAi);
+                let Some(ProviderAccess::Http(access)) = provider.access_mut().as_mut() else {
+                    unreachable!("xAI preset is HTTP")
+                };
+                let HttpCredential::XAi {
+                    api_key: current_key,
+                    profile: current_profile,
+                } = &mut access.auth
+                else {
+                    unreachable!("xAI preset uses xAI credentials")
+                };
+                apply_optional(api_key, current_key);
+                apply_optional_string(profile, current_profile);
+                apply_models(models, provider.models_mut());
             }
             ProviderEntryPatch::LiteLlm { connection, models } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::LiteLlm {
-                        connection: None,
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::LiteLlm { .. }) {
-                    *provider = ProviderConfig::LiteLlm {
-                        connection: None,
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::LiteLlm {
-                    connection: current,
-                    models: current_models,
-                } = provider
-                {
-                    // Connection is deliberately atomic rather than field-merged.
-                    apply_optional(connection, current);
-                    apply_models(models, current_models);
-                }
+                let provider = self.provider_for_patch(name, ProviderKind::LiteLlm);
+                apply_connection(connection, provider);
+                apply_models(models, provider.models_mut());
             }
             ProviderEntryPatch::AmazonBedrock {
                 region,
                 auth,
                 models,
             } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::AmazonBedrock {
-                        region: None,
-                        auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::AmazonBedrock { .. }) {
-                    *provider = ProviderConfig::AmazonBedrock {
-                        region: None,
-                        auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::AmazonBedrock {
+                let provider = self.provider_for_patch(name, ProviderKind::AmazonBedrock);
+                let Some(ProviderAccess::AmazonBedrock {
                     region: current_region,
                     auth: current_auth,
-                    models: current_models,
-                } = provider
-                {
-                    apply_optional_string(region, current_region);
-                    apply_default(auth, current_auth, BedrockAuth::Aws(AwsAuth::DefaultChain));
-                    apply_models(models, current_models);
-                }
+                }) = provider.access_mut().as_mut()
+                else {
+                    unreachable!("Bedrock preset uses Bedrock access")
+                };
+                apply_optional_string(region, current_region);
+                apply_default(auth, current_auth, BedrockAuth::Aws(AwsAuth::DefaultChain));
+                apply_models(models, provider.models_mut());
             }
             ProviderEntryPatch::AmazonBedrockMantle {
                 region,
@@ -851,59 +776,40 @@ impl MergeState {
                 auth,
                 models,
             } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::AmazonBedrockMantle {
-                        region: None,
-                        api: ProviderApi::OpenAiResponses,
-                        auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::AmazonBedrockMantle { .. }) {
-                    *provider = ProviderConfig::AmazonBedrockMantle {
-                        region: None,
-                        api: ProviderApi::OpenAiResponses,
-                        auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::AmazonBedrockMantle {
+                let provider = self.provider_for_patch(name, ProviderKind::AmazonBedrockMantle);
+                let Some(ProviderAccess::AmazonBedrockMantle {
                     region: current_region,
                     api: current_api,
                     auth: current_auth,
-                    models: current_models,
-                } = provider
-                {
-                    apply_optional_string(region, current_region);
-                    apply_default(api, current_api, ProviderApi::OpenAiResponses);
-                    apply_default(auth, current_auth, BedrockAuth::Aws(AwsAuth::DefaultChain));
-                    apply_models(models, current_models);
-                }
+                }) = provider.access_mut().as_mut()
+                else {
+                    unreachable!("Mantle preset uses Mantle access")
+                };
+                apply_optional_string(region, current_region);
+                apply_default(api, current_api, ProviderApi::OpenAiResponses);
+                apply_default(auth, current_auth, BedrockAuth::Aws(AwsAuth::DefaultChain));
+                apply_models(models, provider.models_mut());
             }
             ProviderEntryPatch::Custom { connection, models } => {
-                let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
-                    ProviderConfig::Custom {
-                        connection: None,
-                        models: BTreeMap::new(),
-                    }
-                });
-                if !matches!(provider, ProviderConfig::Custom { .. }) {
-                    *provider = ProviderConfig::Custom {
-                        connection: None,
-                        models: BTreeMap::new(),
-                    };
-                }
-                if let ProviderConfig::Custom {
-                    connection: current,
-                    models: current_models,
-                } = provider
-                {
-                    // Connection is deliberately atomic rather than field-merged.
-                    apply_optional(connection, current);
-                    apply_models(models, current_models);
-                }
+                let provider = self.provider_for_patch(name, ProviderKind::Custom);
+                apply_connection(connection, provider);
+                apply_models(models, provider.models_mut());
             }
         }
+    }
+
+    fn provider_for_patch(&mut self, name: &str, kind: ProviderKind) -> &mut ProviderConfig {
+        let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
+            let mut provider = crate::providers::builtin(kind);
+            provider.models_mut().clear();
+            provider
+        });
+        if provider.kind() != kind {
+            let mut replacement = crate::providers::builtin(kind);
+            replacement.models_mut().clear();
+            *provider = replacement;
+        }
+        provider
     }
 
     fn compose_policy(&mut self, patch: &PolicyPatch) {
@@ -1007,6 +913,26 @@ fn apply_default<T: Clone>(field: &Field<T>, current: &mut T, default: T) -> boo
     }
 }
 
+fn api_key_slot(provider: &mut ProviderConfig, kind: ProviderKind) -> &mut Option<SecretRef> {
+    let Some(ProviderAccess::Http(access)) = provider.access_mut().as_mut() else {
+        unreachable!("{kind:?} preset is HTTP")
+    };
+    let HttpCredential::ApiKey { explicit, .. } = &mut access.auth else {
+        unreachable!("{kind:?} preset uses API-key credentials")
+    };
+    explicit
+}
+
+fn apply_connection(field: &Field<Connection>, provider: &mut ProviderConfig) {
+    match field {
+        Field::Missing => {}
+        Field::Clear => *provider.access_mut() = None,
+        Field::Set(connection) => {
+            *provider.access_mut() = Some(ProviderAccess::Http(HttpAccess::configured(connection)));
+        }
+    }
+}
+
 fn apply_models(
     patch: &Field<UniqueMap<String, ModelEntryPatch>>,
     models: &mut BTreeMap<String, ModelMetadata>,
@@ -1090,8 +1016,9 @@ fn enforce_policy(
     }
     if policy.require_https {
         for (name, provider) in providers {
-            if let Some(connection) = provider.connection()
-                && !has_https_scheme(connection.base_url())
+            if provider.uses_custom_endpoint()
+                && let Some(ProviderAccess::Http(access)) = provider.access()
+                && !has_https_scheme(access.endpoint())
             {
                 return Err(policy_violation(
                     "require_https",

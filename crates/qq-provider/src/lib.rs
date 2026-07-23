@@ -18,9 +18,14 @@ pub mod openai;
 pub mod openai_chat;
 mod request_auth;
 mod sanitize;
+mod sse;
 
 pub use compiler::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderRecipe,
+};
+pub use request_auth::{
+    RequestCredential, RequestCredentialError, RequestCredentialFuture, RequestCredentialProvider,
+    SharedRequestCredentialProvider,
 };
 
 /// A stream of semantic model events from a configured provider.

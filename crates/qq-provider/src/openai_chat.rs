@@ -4,21 +4,24 @@ use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
-    http::{build_client, build_direct_client, validate_endpoint},
+    http::{
+        build_client, build_direct_client, is_event_stream, read_error_body, transport_error,
+        validate_endpoint,
+    },
     limits::StreamLimits,
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
+    sse::{SseDecoder, Utf8ErrorMessage},
 };
 
 const CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const ERROR_BODY_BYTES_LIMIT: usize = 16 * 1_024;
 
 /// Authentication applied by an OpenAI-compatible Chat Completions client.
 #[derive(Clone, PartialEq, Eq)]
@@ -127,6 +130,7 @@ impl Provider for OpenAiChatCompletions {
         let authorizer = self.authorizer.clone();
 
         Box::pin(try_stream! {
+            let mut redactions = redactions.as_ref().to_vec();
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = ChatCompletionsRequest::from(&request);
             let mut wire_request = client
@@ -136,7 +140,7 @@ impl Provider for OpenAiChatCompletions {
                 .json(&body)
                 .build()
                 .map_err(|error| transport_error(error, redactions.as_ref()))?;
-            authorizer.authorize(&mut wire_request).await?;
+            redactions.extend(authorizer.authorize(&mut wire_request).await?);
             let response = client
                 .execute(wire_request)
                 .await
@@ -155,7 +159,7 @@ impl Provider for OpenAiChatCompletions {
             }
 
             let mut chunks = response.bytes_stream();
-            let mut decoder = SseDecoder::new(limits.event);
+            let mut decoder = sse_decoder(limits.event);
             let mut output_bytes = 0_usize;
             let mut wire_bytes = 0_usize;
             let mut usage = None;
@@ -169,8 +173,8 @@ impl Provider for OpenAiChatCompletions {
                     .map_err(|error| transport_error(error, redactions.as_ref()))?;
                 add_wire_bytes(&mut wire_bytes, chunk.len(), limits.wire)?;
 
-                for data in decoder.push(&chunk)? {
-                    let data = data.trim();
+                for event in decoder.push(&chunk)? {
+                    let data = event.data.trim();
                     if data.is_empty() {
                         continue;
                     }
@@ -360,143 +364,13 @@ fn is_request_controlled_header(name: &HeaderName) -> bool {
     )
 }
 
-fn is_event_stream(response: &reqwest::Response) -> bool {
-    response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.split(';').next().is_some_and(|media_type| {
-                media_type.trim().eq_ignore_ascii_case("text/event-stream")
-            })
-        })
-}
-
-struct SseDecoder {
-    bom_prefix: Vec<u8>,
-    bom_checked: bool,
-    line: Vec<u8>,
-    data: Vec<u8>,
-    event_bytes: usize,
-    max_event_bytes: usize,
-    skip_line_feed: bool,
-}
-
-impl SseDecoder {
-    const fn new(max_event_bytes: usize) -> Self {
-        Self {
-            bom_prefix: Vec::new(),
-            bom_checked: false,
-            line: Vec::new(),
-            data: Vec::new(),
-            event_bytes: 0,
-            max_event_bytes,
-            skip_line_feed: false,
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ProviderError> {
-        let mut events = Vec::new();
-
-        for &byte in bytes {
-            if !self.bom_checked {
-                self.bom_prefix.push(byte);
-                if b"\xef\xbb\xbf".starts_with(&self.bom_prefix) {
-                    if self.bom_prefix.len() == 3 {
-                        self.bom_prefix.clear();
-                        self.bom_checked = true;
-                    }
-                    continue;
-                }
-
-                self.bom_checked = true;
-                for prefix_byte in std::mem::take(&mut self.bom_prefix) {
-                    self.push_byte(prefix_byte, &mut events)?;
-                }
-                continue;
-            }
-
-            self.push_byte(byte, &mut events)?;
-        }
-
-        Ok(events)
-    }
-
-    fn push_byte(&mut self, byte: u8, events: &mut Vec<String>) -> Result<(), ProviderError> {
-        if self.skip_line_feed {
-            self.skip_line_feed = false;
-            if byte == b'\n' {
-                return Ok(());
-            }
-        }
-
-        match byte {
-            b'\r' => {
-                if let Some(data) = self.finish_line()? {
-                    events.push(data);
-                }
-                self.skip_line_feed = true;
-            }
-            b'\n' => {
-                if let Some(data) = self.finish_line()? {
-                    events.push(data);
-                }
-            }
-            _ => {
-                self.event_bytes = self.event_bytes.checked_add(1).ok_or_else(|| {
-                    ProviderError::Protocol(
-                        "OpenAI-compatible SSE event size overflowed".to_owned(),
-                    )
-                })?;
-                if self.event_bytes > self.max_event_bytes {
-                    return Err(ProviderError::Protocol(
-                        "OpenAI-compatible SSE event exceeded the configured size limit".to_owned(),
-                    ));
-                }
-                self.line.push(byte);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn finish_line(&mut self) -> Result<Option<String>, ProviderError> {
-        if self.line.is_empty() {
-            self.event_bytes = 0;
-            if self.data.is_empty() {
-                return Ok(None);
-            }
-
-            self.data.pop();
-            let data = String::from_utf8(std::mem::take(&mut self.data)).map_err(|error| {
-                ProviderError::Protocol(format!(
-                    "OpenAI-compatible SSE event was not UTF-8: {error}"
-                ))
-            })?;
-            return Ok(Some(data));
-        }
-
-        let line = std::mem::take(&mut self.line);
-        if line.starts_with(b":") {
-            return Ok(None);
-        }
-
-        let (field, value) = line.iter().position(|byte| *byte == b':').map_or_else(
-            || (line.as_slice(), &[][..]),
-            |colon| {
-                let value = line[colon + 1..]
-                    .strip_prefix(b" ")
-                    .unwrap_or(&line[colon + 1..]);
-                (&line[..colon], value)
-            },
-        );
-        if field == b"data" {
-            self.data.extend_from_slice(value);
-            self.data.push(b'\n');
-        }
-
-        Ok(None)
-    }
+fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
+    SseDecoder::data_only(
+        max_event_bytes,
+        "OpenAI-compatible SSE event size overflowed",
+        "OpenAI-compatible SSE event exceeded the configured size limit",
+        Utf8ErrorMessage::WithSource("OpenAI-compatible SSE event was not UTF-8"),
+    )
 }
 
 #[derive(Serialize)]
@@ -936,13 +810,6 @@ fn add_wire_bytes(
     Ok(())
 }
 
-fn transport_error(error: reqwest::Error, redactions: &[String]) -> ProviderError {
-    ProviderError::Transport(sanitize_message(
-        &error.without_url().to_string(),
-        redactions,
-    ))
-}
-
 async fn api_error(response: reqwest::Response, redactions: &[String]) -> ProviderError {
     let status = response.status();
     let fallback = status
@@ -961,27 +828,6 @@ async fn api_error(response: reqwest::Response, redactions: &[String]) -> Provid
         status: status.as_u16(),
         message,
     }
-}
-
-async fn read_error_body(response: reqwest::Response) -> Vec<u8> {
-    let mut body = Vec::new();
-    let mut chunks = response.bytes_stream();
-
-    while let Some(chunk) = chunks.next().await {
-        let Ok(chunk) = chunk else {
-            break;
-        };
-        let remaining = ERROR_BODY_BYTES_LIMIT.saturating_sub(body.len());
-        if remaining == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if body.len() == ERROR_BODY_BYTES_LIMIT {
-            break;
-        }
-    }
-
-    body
 }
 
 #[cfg(test)]
@@ -1093,7 +939,7 @@ mod tests {
             "data: {\"content\":\"hello\"}}]}\n\r",
             "data: [DONE]\r\r",
         );
-        let mut decoder = SseDecoder::new(1_024);
+        let mut decoder = sse_decoder(1_024);
         let mut events = Vec::new();
 
         for byte in source.as_bytes() {
@@ -1101,7 +947,10 @@ mod tests {
         }
 
         assert_eq!(
-            events,
+            events
+                .into_iter()
+                .map(|event| event.data)
+                .collect::<Vec<_>>(),
             [
                 "{\"choices\":[{\"delta\":\n{\"content\":\"hello\"}}]}",
                 "[DONE]",
@@ -1199,7 +1048,7 @@ mod tests {
 
     #[test]
     fn enforces_event_output_and_wire_limits() {
-        let event_error = SseDecoder::new(8)
+        let event_error = sse_decoder(8)
             .push(b"data: this event keeps going")
             .unwrap_err();
         let output_error = add_output_bytes(&mut 3, 2, 4).unwrap_err();

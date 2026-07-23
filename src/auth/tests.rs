@@ -125,6 +125,29 @@ impl codex::CodexTokenClient for FakeCodexTokenClient {
     }
 }
 
+struct FakeXaiTokenClient {
+    refreshes: Mutex<Vec<String>>,
+    refreshed: xai::TokenSet,
+}
+
+impl xai::XaiTokenClient for FakeXaiTokenClient {
+    fn start_device(&self) -> Result<xai::DeviceAuthorization, xai::XaiAuthError> {
+        Err(xai::XaiAuthError::DeviceRequestFailed)
+    }
+
+    fn poll_device(&self, _device_code: &str) -> Result<xai::DevicePoll, xai::XaiAuthError> {
+        Err(xai::XaiAuthError::DeviceRequestFailed)
+    }
+
+    fn refresh(&self, refresh_token: &str) -> Result<xai::TokenSet, xai::XaiAuthError> {
+        self.refreshes
+            .lock()
+            .unwrap()
+            .push(refresh_token.to_owned());
+        Ok(self.refreshed.clone())
+    }
+}
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
@@ -618,6 +641,52 @@ fn codex_resolution_refreshes_an_expired_access_token_once() {
         client.refreshes.lock().unwrap().as_slice(),
         ["original-refresh-token"]
     );
+}
+
+#[test]
+fn xai_resolution_refreshes_once_and_persists_the_rotated_token() {
+    let (mut store, keyring, _directory) = test_store();
+    let client = Arc::new(FakeXaiTokenClient {
+        refreshes: Mutex::new(Vec::new()),
+        refreshed: xai::TokenSet {
+            access_token: "refreshed-access-token".to_owned(),
+            refresh_token: Some("rotated-refresh-token".to_owned()),
+            expires_in: Some(3_600),
+        },
+    });
+    store.xai_client = client.clone();
+    store
+        .set_with_metadata(
+            "xai/work",
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "access_token": "expired-access-token",
+                "refresh_token": "original-refresh-token",
+                "expires_at": 1
+            }))
+            .unwrap(),
+            false,
+            Some("xai-oauth"),
+            Some("https://api.x.ai"),
+        )
+        .unwrap();
+
+    let first = store.resolve_xai_oauth("work").unwrap();
+    let second = store.resolve_xai_oauth("work").unwrap();
+
+    assert_eq!(first.expose_secret_str().unwrap(), "refreshed-access-token");
+    assert_eq!(
+        second.expose_secret_str().unwrap(),
+        "refreshed-access-token"
+    );
+    assert_eq!(
+        client.refreshes.lock().unwrap().as_slice(),
+        ["original-refresh-token"]
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&keyring.value("xai/work").unwrap()).unwrap();
+    assert_eq!(persisted["refresh_token"], "rotated-refresh-token");
+    assert_eq!(persisted["access_token"], "refreshed-access-token");
 }
 
 #[cfg(unix)]

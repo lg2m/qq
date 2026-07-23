@@ -406,6 +406,12 @@ pub enum ProviderApi {
     BedrockConverse,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointMode {
+    Base,
+    Exact,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderAuth {
     NoAuth,
@@ -531,6 +537,8 @@ pub enum InputModality {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelMetadata {
+    canonical_id: Option<String>,
+    api: Option<ProviderApi>,
     name: Option<String>,
     reasoning: bool,
     input: Vec<InputModality>,
@@ -540,6 +548,16 @@ pub struct ModelMetadata {
 }
 
 impl ModelMetadata {
+    #[must_use]
+    pub fn canonical_id(&self) -> Option<&str> {
+        self.canonical_id.as_deref()
+    }
+
+    #[must_use]
+    pub const fn api(&self) -> Option<ProviderApi> {
+        self.api
+    }
+
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
@@ -571,6 +589,8 @@ impl ModelMetadata {
     }
 
     pub(crate) fn builtin(
+        canonical_id: &str,
+        api: Option<ProviderApi>,
         name: &str,
         reasoning: bool,
         context_window: u32,
@@ -578,6 +598,8 @@ impl ModelMetadata {
         pricing: Option<qq_protocol::ModelPricing>,
     ) -> Self {
         Self {
+            canonical_id: Some(canonical_id.to_owned()),
+            api,
             name: Some(name.to_owned()),
             reasoning,
             input: vec![InputModality::Text],
@@ -588,87 +610,211 @@ impl ModelMetadata {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderKind {
+    OpenAi,
+    OpenAiCodex,
+    Anthropic,
+    Google,
+    XAi,
+    LiteLlm,
+    AmazonBedrock,
+    AmazonBedrockMantle,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageType {
+    Metered,
+    Subscription,
+    Unknown,
+    CredentialDependent,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProviderConfig {
-    OpenAi {
-        api_key: Option<SecretRef>,
-        models: BTreeMap<String, ModelMetadata>,
+pub enum HttpCredential {
+    Configured(ProviderAuth),
+    ApiKey {
+        explicit: Option<SecretRef>,
+        stored_name: &'static str,
+        environment_variable: &'static str,
+        audience: &'static str,
     },
     OpenAiCodex {
         profile: Option<String>,
-        models: BTreeMap<String, ModelMetadata>,
     },
-    Anthropic {
+    XAi {
         api_key: Option<SecretRef>,
-        models: BTreeMap<String, ModelMetadata>,
+        profile: Option<String>,
     },
-    Google {
-        api_key: Option<SecretRef>,
-        models: BTreeMap<String, ModelMetadata>,
-    },
-    LiteLlm {
-        connection: Option<Connection>,
-        models: BTreeMap<String, ModelMetadata>,
-    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpAccess {
+    endpoint: String,
+    endpoint_mode: EndpointMode,
+    api: ProviderApi,
+    auth: HttpCredential,
+    headers: BTreeMap<String, StaticHeaderValue>,
+}
+
+impl HttpAccess {
+    pub(crate) fn new(
+        endpoint: impl Into<String>,
+        endpoint_mode: EndpointMode,
+        api: ProviderApi,
+        auth: HttpCredential,
+        headers: BTreeMap<String, StaticHeaderValue>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            endpoint_mode,
+            api,
+            auth,
+            headers,
+        }
+    }
+
+    pub(crate) fn configured(connection: &Connection) -> Self {
+        Self::new(
+            connection.base_url.clone(),
+            EndpointMode::Base,
+            connection.api,
+            HttpCredential::Configured(connection.auth.clone()),
+            connection.headers.clone(),
+        )
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    #[must_use]
+    pub const fn endpoint_mode(&self) -> EndpointMode {
+        self.endpoint_mode
+    }
+
+    #[must_use]
+    pub const fn api(&self) -> ProviderApi {
+        self.api
+    }
+
+    #[must_use]
+    pub const fn auth(&self) -> &HttpCredential {
+        &self.auth
+    }
+
+    #[must_use]
+    pub const fn headers(&self) -> &BTreeMap<String, StaticHeaderValue> {
+        &self.headers
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderAccess {
+    Http(HttpAccess),
     AmazonBedrock {
         region: Option<String>,
         auth: BedrockAuth,
-        models: BTreeMap<String, ModelMetadata>,
     },
     AmazonBedrockMantle {
         region: Option<String>,
         api: ProviderApi,
         auth: BedrockAuth,
-        models: BTreeMap<String, ModelMetadata>,
-    },
-    Custom {
-        connection: Option<Connection>,
-        models: BTreeMap<String, ModelMetadata>,
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderConfig {
+    kind: ProviderKind,
+    access: Option<ProviderAccess>,
+    usage: UsageType,
+    models: BTreeMap<String, ModelMetadata>,
+}
+
 impl ProviderConfig {
+    pub(crate) fn new(
+        kind: ProviderKind,
+        access: Option<ProviderAccess>,
+        usage: UsageType,
+        models: BTreeMap<String, ModelMetadata>,
+    ) -> Self {
+        Self {
+            kind,
+            access,
+            usage,
+            models,
+        }
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        kind: ProviderKind,
+        access: Option<ProviderAccess>,
+        usage: UsageType,
+    ) {
+        self.kind = kind;
+        self.access = access;
+        self.usage = usage;
+        self.models.clear();
+    }
+
+    pub(crate) fn models_mut(&mut self) -> &mut BTreeMap<String, ModelMetadata> {
+        &mut self.models
+    }
+
+    pub(crate) fn access_mut(&mut self) -> &mut Option<ProviderAccess> {
+        &mut self.access
+    }
+
     #[must_use]
     pub fn models(&self) -> &BTreeMap<String, ModelMetadata> {
-        match self {
-            Self::OpenAi { models, .. }
-            | Self::OpenAiCodex { models, .. }
-            | Self::Anthropic { models, .. }
-            | Self::Google { models, .. }
-            | Self::LiteLlm { models, .. }
-            | Self::AmazonBedrock { models, .. }
-            | Self::AmazonBedrockMantle { models, .. }
-            | Self::Custom { models, .. } => models,
-        }
+        &self.models
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn access(&self) -> Option<&ProviderAccess> {
+        self.access.as_ref()
+    }
+
+    #[must_use]
+    pub const fn usage(&self) -> UsageType {
+        self.usage
     }
 
     #[must_use]
     pub const fn connection(&self) -> Option<&Connection> {
-        match self {
-            Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => {
-                connection.as_ref()
-            }
-            _ => None,
-        }
+        None
     }
 
     #[must_use]
     pub const fn uses_custom_endpoint(&self) -> bool {
-        matches!(self, Self::LiteLlm { .. } | Self::Custom { .. })
+        matches!(self.kind, ProviderKind::LiteLlm | ProviderKind::Custom)
     }
 
     fn contains_literal_secret(&self) -> bool {
-        match self {
-            Self::OpenAi { api_key, .. }
-            | Self::Anthropic { api_key, .. }
-            | Self::Google { api_key, .. } => api_key.as_ref().is_some_and(SecretRef::is_literal),
-            Self::LiteLlm { connection, .. } | Self::Custom { connection, .. } => connection
-                .as_ref()
-                .is_some_and(Connection::contains_literal_secret),
-            Self::AmazonBedrock { auth, .. } | Self::AmazonBedrockMantle { auth, .. } => {
-                auth.contains_literal_secret()
+        match self.access.as_ref() {
+            Some(ProviderAccess::Http(access)) => {
+                (match &access.auth {
+                    HttpCredential::Configured(auth) => auth.contains_literal_secret(),
+                    HttpCredential::ApiKey { explicit, .. }
+                    | HttpCredential::XAi {
+                        api_key: explicit, ..
+                    } => explicit.as_ref().is_some_and(SecretRef::is_literal),
+                    HttpCredential::OpenAiCodex { .. } => false,
+                }) || !access.headers.is_empty()
             }
-            Self::OpenAiCodex { .. } => false,
+            Some(
+                ProviderAccess::AmazonBedrock { auth, .. }
+                | ProviderAccess::AmazonBedrockMantle { auth, .. },
+            ) => auth.contains_literal_secret(),
+            None => false,
         }
     }
 }

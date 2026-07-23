@@ -3,7 +3,7 @@
 use std::{fmt, sync::Arc};
 
 use crate::{
-    Provider, ProviderError,
+    Provider, ProviderError, SharedRequestCredentialProvider,
     anthropic::{AnthropicAuth, AnthropicMessages},
     bedrock::{Bedrock, BedrockAuth},
     google::{GoogleAuth, GoogleEndpoint, GoogleGenerateContent},
@@ -11,6 +11,7 @@ use crate::{
     mantle::Mantle,
     openai::{OpenAi, ResponsesAuth},
     openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
+    request_auth::RequestAuthorizer,
 };
 
 /// Compiles provider recipes while sharing expensive transport state.
@@ -60,30 +61,33 @@ impl ProviderCompiler {
 
         match recipe.protocol {
             HttpProtocol::OpenAiResponses => {
-                let auth = responses_auth(recipe.auth)?;
-                Ok(Arc::new(OpenAi::with_client(
+                let (auth, authorizer) = responses_auth(recipe.auth)?;
+                Ok(Arc::new(OpenAi::with_client_and_authorizer(
                     client,
                     endpoint,
                     auth,
                     recipe.headers,
+                    authorizer,
                 )?))
             }
             HttpProtocol::OpenAiChatCompletions => {
-                let auth = chat_completions_auth(recipe.auth)?;
-                Ok(Arc::new(OpenAiChatCompletions::with_client(
+                let (auth, authorizer) = chat_completions_auth(recipe.auth)?;
+                Ok(Arc::new(OpenAiChatCompletions::with_client_and_authorizer(
                     client,
                     endpoint,
                     auth,
                     recipe.headers,
+                    authorizer,
                 )?))
             }
             HttpProtocol::AnthropicMessages => {
-                let auth = anthropic_auth(recipe.auth)?;
-                Ok(Arc::new(AnthropicMessages::with_client(
+                let (auth, authorizer) = anthropic_auth(recipe.auth)?;
+                Ok(Arc::new(AnthropicMessages::with_client_and_authorizer(
                     client,
                     endpoint,
                     auth,
                     recipe.headers,
+                    authorizer,
                 )?))
             }
             HttpProtocol::GoogleGenerateContent => {
@@ -256,6 +260,7 @@ pub enum HttpAuth {
         account_id: String,
         is_fedramp: bool,
     },
+    RequestTime(SharedRequestCredentialProvider),
 }
 
 impl fmt::Debug for HttpAuth {
@@ -280,48 +285,82 @@ impl fmt::Debug for HttpAuth {
                 .field("access_token", &"<redacted>")
                 .field("account_id", &"<redacted>")
                 .finish_non_exhaustive(),
+            Self::RequestTime(_) => formatter.write_str("RequestTime([REDACTED])"),
         }
     }
 }
 
-fn responses_auth(auth: HttpAuth) -> Result<ResponsesAuth, ProviderError> {
+fn responses_auth(auth: HttpAuth) -> Result<(ResponsesAuth, RequestAuthorizer), ProviderError> {
     match auth {
-        HttpAuth::NoAuth => Ok(ResponsesAuth::NoAuth),
-        HttpAuth::ApiKey(secret) | HttpAuth::Bearer(secret) => Ok(ResponsesAuth::Bearer(secret)),
-        HttpAuth::Header(name, secret) => Ok(ResponsesAuth::Header(name, secret)),
+        HttpAuth::NoAuth => Ok((ResponsesAuth::NoAuth, RequestAuthorizer::default())),
+        HttpAuth::ApiKey(secret) | HttpAuth::Bearer(secret) => {
+            Ok((ResponsesAuth::Bearer(secret), RequestAuthorizer::default()))
+        }
+        HttpAuth::Header(name, secret) => Ok((
+            ResponsesAuth::Header(name, secret),
+            RequestAuthorizer::default(),
+        )),
         HttpAuth::Codex {
             access_token,
             account_id,
             is_fedramp,
-        } => Ok(ResponsesAuth::Codex {
-            access_token,
-            account_id,
-            is_fedramp,
-        }),
-    }
-}
-
-fn chat_completions_auth(auth: HttpAuth) -> Result<ChatCompletionsAuth, ProviderError> {
-    match auth {
-        HttpAuth::NoAuth => Ok(ChatCompletionsAuth::NoAuth),
-        HttpAuth::ApiKey(secret) | HttpAuth::Bearer(secret) => {
-            Ok(ChatCompletionsAuth::Bearer(secret))
-        }
-        HttpAuth::Header(name, secret) => Ok(ChatCompletionsAuth::Header(name, secret)),
-        HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
-            "Codex authentication requires the OpenAI Responses protocol".to_owned(),
+        } => Ok((
+            ResponsesAuth::Codex {
+                access_token,
+                account_id,
+                is_fedramp,
+            },
+            RequestAuthorizer::default(),
+        )),
+        HttpAuth::RequestTime(credentials) => Ok((
+            ResponsesAuth::NoAuth,
+            RequestAuthorizer::request_credentials(credentials),
         )),
     }
 }
 
-fn anthropic_auth(auth: HttpAuth) -> Result<AnthropicAuth, ProviderError> {
+fn chat_completions_auth(
+    auth: HttpAuth,
+) -> Result<(ChatCompletionsAuth, RequestAuthorizer), ProviderError> {
     match auth {
-        HttpAuth::NoAuth => Ok(AnthropicAuth::NoAuth),
-        HttpAuth::ApiKey(secret) => Ok(AnthropicAuth::XApiKey(secret)),
-        HttpAuth::Bearer(secret) => Ok(AnthropicAuth::Bearer(secret)),
-        HttpAuth::Header(name, secret) => Ok(AnthropicAuth::Header(name, secret)),
+        HttpAuth::NoAuth => Ok((ChatCompletionsAuth::NoAuth, RequestAuthorizer::default())),
+        HttpAuth::ApiKey(secret) | HttpAuth::Bearer(secret) => Ok((
+            ChatCompletionsAuth::Bearer(secret),
+            RequestAuthorizer::default(),
+        )),
+        HttpAuth::Header(name, secret) => Ok((
+            ChatCompletionsAuth::Header(name, secret),
+            RequestAuthorizer::default(),
+        )),
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
+        )),
+        HttpAuth::RequestTime(credentials) => Ok((
+            ChatCompletionsAuth::NoAuth,
+            RequestAuthorizer::request_credentials(credentials),
+        )),
+    }
+}
+
+fn anthropic_auth(auth: HttpAuth) -> Result<(AnthropicAuth, RequestAuthorizer), ProviderError> {
+    match auth {
+        HttpAuth::NoAuth => Ok((AnthropicAuth::NoAuth, RequestAuthorizer::default())),
+        HttpAuth::ApiKey(secret) => {
+            Ok((AnthropicAuth::XApiKey(secret), RequestAuthorizer::default()))
+        }
+        HttpAuth::Bearer(secret) => {
+            Ok((AnthropicAuth::Bearer(secret), RequestAuthorizer::default()))
+        }
+        HttpAuth::Header(name, secret) => Ok((
+            AnthropicAuth::Header(name, secret),
+            RequestAuthorizer::default(),
+        )),
+        HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
+            "Codex authentication requires the OpenAI Responses protocol".to_owned(),
+        )),
+        HttpAuth::RequestTime(credentials) => Ok((
+            AnthropicAuth::NoAuth,
+            RequestAuthorizer::request_credentials(credentials),
         )),
     }
 }
@@ -334,6 +373,9 @@ fn google_auth(auth: HttpAuth) -> Result<GoogleAuth, ProviderError> {
         HttpAuth::Header(name, secret) => Ok(GoogleAuth::Header(name, secret)),
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
+        )),
+        HttpAuth::RequestTime(_) => Err(ProviderError::Configuration(
+            "request-time credentials are not supported by Google GenerateContent".to_owned(),
         )),
     }
 }

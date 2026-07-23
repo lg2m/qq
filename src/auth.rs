@@ -14,7 +14,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use directories::ProjectDirs;
@@ -24,8 +24,10 @@ use thiserror::Error;
 use crate::config::SecretRef;
 
 mod codex;
+mod xai;
 
 pub(crate) use codex::{CodexLogin, RESPONSES_ENDPOINT as CODEX_RESPONSES_ENDPOINT};
+pub(crate) use xai::XaiLogin;
 
 pub const KEYRING_SERVICE: &str = "dev.qq";
 pub const MAX_CREDENTIAL_NAME_LEN: usize = 128;
@@ -38,6 +40,10 @@ const INDEX_FILE_NAME: &str = "credentials.ron";
 const FALLBACK_FILE_NAME: &str = "auth.ron";
 const LOCK_FILE_NAME: &str = "auth.lock";
 const CODEX_LOCK_FILE_NAME: &str = "openai-codex.lock";
+const XAI_LOCK_FILE_NAME: &str = "xai.lock";
+const REQUEST_CREDENTIAL_CONCURRENCY: usize = 4;
+const REQUEST_CREDENTIAL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_CREDENTIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(65);
 
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -105,6 +111,7 @@ pub struct CredentialPaths {
     fallback_file: PathBuf,
     lock_file: PathBuf,
     codex_lock_file: PathBuf,
+    xai_lock_file: PathBuf,
 }
 
 impl CredentialPaths {
@@ -116,6 +123,7 @@ impl CredentialPaths {
             fallback_file: data_dir.join(FALLBACK_FILE_NAME),
             lock_file: data_dir.join(LOCK_FILE_NAME),
             codex_lock_file: data_dir.join(CODEX_LOCK_FILE_NAME),
+            xai_lock_file: data_dir.join(XAI_LOCK_FILE_NAME),
             data_dir,
         }
     }
@@ -144,12 +152,20 @@ impl CredentialPaths {
     pub fn codex_lock_file(&self) -> &Path {
         &self.codex_lock_file
     }
+
+    #[must_use]
+    pub fn xai_lock_file(&self) -> &Path {
+        &self.xai_lock_file
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error(transparent)]
     Codex(#[from] codex::CodexAuthError),
+
+    #[error(transparent)]
+    XAi(#[from] xai::XaiAuthError),
 
     #[error("the operating system did not provide an application data directory")]
     SystemDirectoriesUnavailable,
@@ -255,6 +271,9 @@ pub struct CredentialStore {
     keyring: Arc<dyn KeyringBackend>,
     codex_client: Arc<dyn codex::CodexTokenClient>,
     codex_refresh: Arc<Mutex<()>>,
+    xai_client: Arc<dyn xai::XaiTokenClient>,
+    xai_refresh: Arc<Mutex<()>>,
+    request_credential_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl CredentialStore {
@@ -324,6 +343,7 @@ impl CredentialStore {
         let endpoint = endpoint.map(normalize_endpoint).transpose()?;
         let secret = secret.as_ref();
         let _codex_lock = self.lock_codex_operation(name)?;
+        let _xai_lock = self.lock_xai_operation(name)?;
         self.set_with_metadata_normalized(name, secret, allow_file_fallback, kind, endpoint)
     }
 
@@ -458,6 +478,7 @@ impl CredentialStore {
     pub fn remove(&self, name: &str) -> Result<bool, AuthError> {
         validate_credential_name(name)?;
         let _codex_lock = self.lock_codex_operation(name)?;
+        let _xai_lock = self.lock_xai_operation(name)?;
         let _lock = self.lock_state()?;
         let mut index = self.load_index()?;
         let Some(record) = index.find(name).cloned() else {
@@ -500,7 +521,100 @@ impl CredentialStore {
             keyring,
             codex_client: Arc::new(codex::SystemCodexTokenClient),
             codex_refresh: Arc::new(Mutex::new(())),
+            xai_client: Arc::new(xai::SystemXaiTokenClient),
+            xai_refresh: Arc::new(Mutex::new(())),
+            request_credential_permits: Arc::new(tokio::sync::Semaphore::new(
+                REQUEST_CREDENTIAL_CONCURRENCY,
+            )),
         }
+    }
+
+    async fn load_request_credential<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<Result<T, AuthError>, qq_provider::RequestCredentialError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CredentialStore) -> Result<T, AuthError> + Send + 'static,
+    {
+        let permit = tokio::time::timeout(
+            REQUEST_CREDENTIAL_CAPACITY_TIMEOUT,
+            Arc::clone(&self.request_credential_permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| qq_provider::RequestCredentialError::CapacityUnavailable)?
+        .map_err(|_| qq_provider::RequestCredentialError::WorkerFailed)?;
+        let store = self.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation(store)
+        });
+        tokio::time::timeout(REQUEST_CREDENTIAL_LOAD_TIMEOUT, worker)
+            .await
+            .map_err(|_| qq_provider::RequestCredentialError::TimedOut)?
+            .map_err(|_| qq_provider::RequestCredentialError::WorkerFailed)
+    }
+
+    fn replace_with_metadata_normalized(
+        &self,
+        name: &str,
+        secret: &[u8],
+        kind: String,
+        endpoint: String,
+    ) -> Result<CredentialBackend, AuthError> {
+        let _lock = self.lock_state()?;
+        let mut index = self.load_index()?;
+        let record =
+            index
+                .find(name)
+                .cloned()
+                .ok_or_else(|| AuthError::StoredCredentialNotRegistered {
+                    name: name.to_owned(),
+                })?;
+        if record.kind.as_deref() != Some(&kind) || record.endpoint.as_deref() != Some(&endpoint) {
+            return Err(AuthError::StoredCredentialMissing {
+                name: name.to_owned(),
+                backend: record.backend,
+            });
+        }
+
+        match record.backend {
+            CredentialBackend::Keyring => {
+                self.keyring
+                    .set(name, secret)
+                    .map_err(|error| match error {
+                        KeyringError::Unavailable => AuthError::KeyringUnavailable {
+                            operation: "refresh",
+                            name: name.to_owned(),
+                        },
+                        KeyringError::Missing | KeyringError::Failure => {
+                            AuthError::KeyringFailure {
+                                operation: "refresh",
+                                name: name.to_owned(),
+                            }
+                        }
+                    })?
+            }
+            CredentialBackend::File => {
+                let mut fallback = self.load_fallback()?;
+                if !fallback.contains(name) {
+                    return Err(AuthError::StoredCredentialMissing {
+                        name: name.to_owned(),
+                        backend: CredentialBackend::File,
+                    });
+                }
+                fallback.upsert(name, secret);
+                self.save_fallback(&fallback)?;
+            }
+        }
+        index.upsert(CredentialRecord {
+            name: name.to_owned(),
+            backend: record.backend,
+            kind: Some(kind),
+            endpoint: Some(endpoint),
+        });
+        self.save_index(&index)?;
+        Ok(record.backend)
     }
 
     fn resolve_registered(
@@ -633,6 +747,28 @@ impl CredentialStore {
             source,
         })?;
         verify_open_regular_file(self.paths.codex_lock_file(), &file, true)?;
+        Ok(Some(CodexStateLock {
+            _process: process,
+            _file: file,
+        }))
+    }
+
+    fn lock_xai_operation(&self, name: &str) -> Result<Option<CodexStateLock<'_>>, AuthError> {
+        if !name.starts_with("xai/") {
+            return Ok(None);
+        }
+        let process = self
+            .xai_refresh
+            .lock()
+            .map_err(|_| xai::XaiAuthError::RefreshLockUnavailable)?;
+        ensure_data_directory(self.paths.data_dir())?;
+        let file = open_lock_file(self.paths.xai_lock_file())?;
+        file.lock().map_err(|source| AuthError::Io {
+            operation: "lock",
+            path: self.paths.xai_lock_file().to_owned(),
+            source,
+        })?;
+        verify_open_regular_file(self.paths.xai_lock_file(), &file, true)?;
         Ok(Some(CodexStateLock {
             _process: process,
             _file: file,

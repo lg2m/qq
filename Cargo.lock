@@ -2347,6 +2347,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "getrandom 0.3.4",
+ "hmac 0.12.1",
  "keyring",
  "objc2-core-foundation",
  "qq-core",

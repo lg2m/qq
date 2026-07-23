@@ -10,11 +10,13 @@ use std::{
 use qq_protocol::{RunCommand, RunEvent};
 
 mod auth;
+mod catalog;
 mod cli;
 mod client;
 mod config;
 mod models;
 mod output;
+mod providers;
 mod runtime;
 mod server;
 
@@ -291,15 +293,16 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
     println!("max_output_tokens: {}", snapshot.max_output_tokens());
     println!("providers:");
     for (name, provider) in snapshot.providers() {
-        let kind = match provider {
-            config::ProviderConfig::OpenAi { .. } => "OpenAi",
-            config::ProviderConfig::OpenAiCodex { .. } => "OpenAiCodex",
-            config::ProviderConfig::Anthropic { .. } => "Anthropic",
-            config::ProviderConfig::Google { .. } => "Google",
-            config::ProviderConfig::LiteLlm { .. } => "LiteLlm",
-            config::ProviderConfig::AmazonBedrock { .. } => "AmazonBedrock",
-            config::ProviderConfig::AmazonBedrockMantle { .. } => "AmazonBedrockMantle",
-            config::ProviderConfig::Custom { .. } => "Custom",
+        let kind = match provider.kind() {
+            config::ProviderKind::OpenAi => "OpenAi",
+            config::ProviderKind::OpenAiCodex => "OpenAiCodex",
+            config::ProviderKind::Anthropic => "Anthropic",
+            config::ProviderKind::Google => "Google",
+            config::ProviderKind::XAi => "XAi",
+            config::ProviderKind::LiteLlm => "LiteLlm",
+            config::ProviderKind::AmazonBedrock => "AmazonBedrock",
+            config::ProviderKind::AmazonBedrockMantle => "AmazonBedrockMantle",
+            config::ProviderKind::Custom => "Custom",
         };
         println!("  {name}: {kind}");
     }
@@ -360,7 +363,13 @@ fn auth_command(command: cli::AuthCommand) -> Result<(), Box<dyn Error>> {
     match command {
         cli::AuthCommand::Login(arguments) => {
             let name = format!("{}/{}", arguments.provider, arguments.profile);
-            let backend = if arguments.provider == "openai-codex" {
+            let backend = if arguments.oauth && arguments.provider != "xai" {
+                return Err(format!(
+                    "OAuth login is not supported for provider {:?}",
+                    arguments.provider
+                )
+                .into());
+            } else if arguments.provider == "openai-codex" {
                 auth::validate_credential_name(&name)?;
                 let login = auth::CodexLogin::start()?;
                 eprintln!(
@@ -368,6 +377,18 @@ fn auth_command(command: cli::AuthCommand) -> Result<(), Box<dyn Error>> {
                     login.authorization_url()
                 );
                 if webbrowser::open(login.authorization_url()).is_err() {
+                    eprintln!("The browser could not be opened automatically.");
+                }
+                login.complete(&store, &arguments.profile, arguments.allow_file)?
+            } else if arguments.provider == "xai" && arguments.oauth {
+                auth::validate_credential_name(&name)?;
+                let login = auth::XaiLogin::start(&store)?;
+                eprintln!(
+                    "Open this URL to sign in with xAI:\n{}\n\nEnter code: {}",
+                    login.verification_url(),
+                    login.user_code()
+                );
+                if webbrowser::open(login.verification_url()).is_err() {
                     eprintln!("The browser could not be opened automatically.");
                 }
                 login.complete(&store, &arguments.profile, arguments.allow_file)?
@@ -497,6 +518,8 @@ fn built_in_endpoint(provider: &str) -> Option<&'static str> {
         "openai" => Some("https://api.openai.com"),
         "openai-codex" => Some("https://chatgpt.com"),
         "anthropic" => Some("https://api.anthropic.com"),
+        "google" => Some("https://generativelanguage.googleapis.com"),
+        "xai" => Some("https://api.x.ai"),
         _ => None,
     }
 }
