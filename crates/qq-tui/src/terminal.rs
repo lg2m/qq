@@ -2,7 +2,10 @@ use std::io::{self, stdout};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste, EventStream},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        EventStream,
+    },
     execute,
     style::{Attribute, Print, ResetColor, SetAttribute},
     terminal::{self, Clear, ClearType, EndSynchronizedUpdate},
@@ -73,7 +76,7 @@ where
                 dirty |= app.advance_animation();
             }
             _ = frame_tick.tick(), if dirty => {
-                let bytes = renderer.draw(&app)?;
+                let bytes = renderer.draw(&mut app)?;
                 output.write_all(&bytes).await?;
                 output.flush().await?;
                 dirty = false;
@@ -103,13 +106,9 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self;
-        execute!(
-            stdout(),
-            EnableBracketedPaste,
-            Hide,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        )?;
+        let mut output = stdout();
+        enable_input_modes(&mut output)?;
+        execute!(output, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
         Ok(guard)
     }
 }
@@ -123,14 +122,25 @@ impl Drop for TerminalGuard {
             output,
             SetAttribute(Attribute::Reset),
             ResetColor,
-            EndSynchronizedUpdate,
-            DisableBracketedPaste,
+            EndSynchronizedUpdate
+        );
+        let _ = disable_input_modes(&mut output);
+        let _ = execute!(
+            output,
             MoveTo(0, height.saturating_sub(1)),
             Clear(ClearType::CurrentLine),
             Show,
             Print("\r\n")
         );
     }
+}
+
+fn enable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
+    execute!(output, EnableBracketedPaste, EnableMouseCapture)
+}
+
+fn disable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
+    execute!(output, DisableMouseCapture, DisableBracketedPaste)
 }
 
 #[cfg(unix)]
@@ -149,4 +159,25 @@ async fn shutdown_signal() -> io::Result<()> {
 #[cfg(not(unix))]
 async fn shutdown_signal() -> io::Result<()> {
     tokio::signal::ctrl_c().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_input_modes_enable_and_restore_mouse_reporting() {
+        let mut entered = Vec::new();
+        let mut restored = Vec::new();
+
+        enable_input_modes(&mut entered).unwrap();
+        disable_input_modes(&mut restored).unwrap();
+
+        let entered = String::from_utf8(entered).unwrap();
+        let restored = String::from_utf8(restored).unwrap();
+        assert!(entered.contains("\x1b[?1000h"));
+        assert!(entered.contains("\x1b[?2004h"));
+        assert!(restored.contains("\x1b[?1000l"));
+        assert!(restored.contains("\x1b[?2004l"));
+    }
 }

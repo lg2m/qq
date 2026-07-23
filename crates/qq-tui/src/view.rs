@@ -140,7 +140,7 @@ struct CachedMarkdown {
 }
 
 impl FrameRenderer {
-    pub fn draw(&mut self, app: &App) -> io::Result<Vec<u8>> {
+    pub fn draw(&mut self, app: &mut App) -> io::Result<Vec<u8>> {
         let actual_size = terminal::size()?;
         let width = actual_size.0.clamp(1, MAX_RENDER_WIDTH);
         let height = actual_size.1.clamp(1, MAX_RENDER_HEIGHT);
@@ -177,7 +177,7 @@ impl FrameRenderer {
         Ok(output)
     }
 
-    fn frame(&mut self, app: &App, width: usize, height: usize) -> Vec<Line> {
+    fn frame(&mut self, app: &mut App, width: usize, height: usize) -> Vec<Line> {
         self.prune_markdown(app);
         if width < 32 || height < 9 {
             return fit_height(
@@ -205,8 +205,15 @@ impl FrameRenderer {
         };
         if app.model_picker.is_some() {
             lines.extend(body);
-        } else {
+        } else if app.navigator_open {
             lines.extend(tail_viewport(body, body_height));
+        } else {
+            app.update_transcript_viewport(body.len(), body_height);
+            lines.extend(transcript_viewport(
+                body,
+                body_height,
+                app.transcript_scroll_offset(),
+            ));
         }
         lines.push(Line::styled("-".repeat(width), muted()));
         lines.push(composer(app, width));
@@ -944,6 +951,15 @@ fn tail_viewport(mut lines: Vec<Line>, height: usize) -> Vec<Line> {
     fit_height(lines, height)
 }
 
+fn transcript_viewport(mut lines: Vec<Line>, height: usize, offset: usize) -> Vec<Line> {
+    let offset = offset.min(lines.len().saturating_sub(height));
+    let end = lines.len().saturating_sub(offset);
+    let start = end.saturating_sub(height);
+    lines.drain(end..);
+    lines.drain(..start);
+    fit_height(lines, height)
+}
+
 fn fit_height(mut lines: Vec<Line>, height: usize) -> Vec<Line> {
     lines.resize(height, Line::default());
     lines.truncate(height);
@@ -1017,9 +1033,14 @@ fn write_line(output: &mut impl Write, line: &Line) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use qq_protocol::{RunId, SessionId};
+    use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
+    use qq_protocol::{
+        EventCursor, RunId, SessionId, SessionSnapshot, SessionStatus, SessionSummary, StoreId,
+        WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    };
 
     use super::*;
+    use crate::{ClientUpdate, TuiOptions};
 
     fn completed_message(byte: u8, output: String) -> MessageSnapshot {
         MessageSnapshot {
@@ -1032,6 +1053,56 @@ mod tests {
             refusal: String::new(),
             created_at_ms: 1,
         }
+    }
+
+    fn app_with_messages(count: u8) -> App {
+        let workspace_id = WorkspaceId::from_bytes([3; 16]);
+        let session_id = SessionId::from_bytes([1; 16]);
+        let summary = SessionSummary {
+            id: session_id,
+            workspace_id,
+            parent_id: None,
+            title: "Session".to_owned(),
+            status: SessionStatus::Idle,
+            active_run_id: None,
+            queued_prompts: 0,
+            model: Some("openai/gpt-test".to_owned()),
+            estimated_cost_usd_nanos: Some(0),
+            updated_at_ms: 1,
+            last_outcome: None,
+        };
+        let mut app = App::new(TuiOptions::default());
+        app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
+            cursor: EventCursor {
+                store_id: StoreId::from_bytes([4; 16]),
+                workspace_id,
+                sequence: 1,
+            },
+            workspace: WorkspaceSummary {
+                id: workspace_id,
+                path: "/workspace".to_owned(),
+            },
+            sessions: vec![summary.clone()],
+            focused: Some(SessionSnapshot {
+                summary,
+                messages: (0..count)
+                    .map(|row| completed_message(row + 1, format!("row {row}")))
+                    .collect(),
+                runs: Vec::new(),
+                has_older_messages: false,
+            }),
+            has_older_sessions: false,
+        }));
+        app
+    }
+
+    fn frame_text(frame: &[Line]) -> String {
+        frame
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1113,5 +1184,45 @@ mod tests {
 
         assert!(content.len() <= MAX_MARKDOWN_BYTES);
         assert!(content.ends_with("END"));
+    }
+
+    #[test]
+    fn transcript_viewport_renders_rows_above_the_tail_and_clamps_at_the_top() {
+        let lines = (0..8)
+            .map(|row| Line::styled(row.to_string(), normal()))
+            .collect::<Vec<_>>();
+
+        let scrolled = transcript_viewport(lines.clone(), 3, 2);
+        let top = transcript_viewport(lines, 3, usize::MAX);
+        let text = |rows: &[Line]| {
+            rows.iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(text(&scrolled), ["3", "4", "5"]);
+        assert_eq!(text(&top), ["0", "1", "2"]);
+    }
+
+    #[test]
+    fn page_up_replaces_the_rendered_live_tail_with_older_transcript_rows() {
+        let mut app = app_with_messages(10);
+        let mut renderer = FrameRenderer::default();
+        let tail = renderer.frame(&mut app, 80, 12);
+
+        app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )));
+        let scrolled = renderer.frame(&mut app, 80, 12);
+
+        assert!(frame_text(&tail).contains("row 9"));
+        assert!(!frame_text(&scrolled).contains("row 9"));
+        assert!(frame_text(&scrolled).contains("row 6"));
     }
 }
