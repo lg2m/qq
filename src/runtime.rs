@@ -7,8 +7,9 @@ use std::{
 };
 
 use qq_core::{
-    Runtime, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
-    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
+    LoadedRuntime, Runtime, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture,
+    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
+    SessionRuntimeOptions,
 };
 use qq_protocol::{CommandRequest, RunFailureKind, SnapshotRequest, SubscribeRequest};
 use qq_provider::{
@@ -76,6 +77,106 @@ impl RuntimeFactory {
 
     pub fn load(&self, request: &LoadRequest) -> Result<ConfigSnapshot, RuntimeBuildError> {
         self.inner.config.load(request).map_err(Into::into)
+    }
+
+    pub fn model_options(&self, snapshot: &ConfigSnapshot) -> Vec<qq_tui::ModelOption> {
+        let allowed = snapshot.policy().allowed_providers();
+        let denied = snapshot.policy().denied_providers();
+        let mut options = Vec::new();
+        for (provider_id, provider) in snapshot.providers() {
+            if allowed.is_some_and(|allowed| !allowed.iter().any(|id| id == provider_id))
+                || denied.iter().any(|id| id == provider_id)
+                || !self.provider_authenticated(provider_id, provider)
+            {
+                continue;
+            }
+            for (model_id, metadata) in provider.models() {
+                options.push(qq_tui::ModelOption {
+                    provider: provider_id.clone(),
+                    model: model_id.clone(),
+                    name: metadata.name().map(str::to_owned),
+                    selection: qq_protocol::ModelSelection {
+                        model: Some(format!("{provider_id}/{model_id}")),
+                        max_output_tokens: Some(
+                            metadata
+                                .max_output_tokens()
+                                .map_or(snapshot.max_output_tokens(), |limit| {
+                                    limit.min(snapshot.max_output_tokens())
+                                }),
+                        ),
+                        organization: snapshot.organization().map(str::to_owned),
+                    },
+                });
+            }
+        }
+        options.sort_by(|left, right| {
+            (&left.provider, &left.name, &left.model).cmp(&(
+                &right.provider,
+                &right.name,
+                &right.model,
+            ))
+        });
+        options
+    }
+
+    fn provider_authenticated(&self, provider_id: &str, provider: &ProviderConfig) -> bool {
+        match provider {
+            ProviderConfig::OpenAi { api_key, .. } => resolve_provider_credential(
+                &self.inner.credentials,
+                api_key.as_ref(),
+                OPENAI_STORED_CREDENTIAL,
+                OPENAI_ENVIRONMENT_CREDENTIAL,
+                Some(OPENAI_CREDENTIAL_ENDPOINT),
+            )
+            .is_ok(),
+            ProviderConfig::Anthropic { api_key, .. } => resolve_provider_credential(
+                &self.inner.credentials,
+                api_key.as_ref(),
+                ANTHROPIC_STORED_CREDENTIAL,
+                ANTHROPIC_ENVIRONMENT_CREDENTIAL,
+                Some(ANTHROPIC_CREDENTIAL_ENDPOINT),
+            )
+            .is_ok(),
+            ProviderConfig::Google { api_key, .. } => resolve_provider_credential(
+                &self.inner.credentials,
+                api_key.as_ref(),
+                GOOGLE_STORED_CREDENTIAL,
+                GOOGLE_ENVIRONMENT_CREDENTIAL,
+                Some(GOOGLE_CREDENTIAL_ENDPOINT),
+            )
+            .is_ok(),
+            ProviderConfig::OpenAiCodex { profile, .. } => self
+                .inner
+                .credentials
+                .resolve_with_endpoint(
+                    &crate::config::SecretRef::Stored(format!(
+                        "openai-codex/{}",
+                        profile.as_deref().unwrap_or("default")
+                    )),
+                    Some("https://chatgpt.com"),
+                )
+                .is_ok(),
+            ProviderConfig::AmazonBedrock { auth, .. }
+            | ProviderConfig::AmazonBedrockMantle { auth, .. } => match auth {
+                BedrockAuth::ApiKey(reference) => self.inner.credentials.resolve(reference).is_ok(),
+                BedrockAuth::Aws(AwsAuth::Profile(profile)) => self
+                    .inner
+                    .credentials
+                    .resolve(&crate::config::SecretRef::Stored(format!(
+                        "{provider_id}/{profile}"
+                    )))
+                    .is_ok(),
+                BedrockAuth::Aws(AwsAuth::DefaultChain) => self
+                    .inner
+                    .credentials
+                    .resolve(&crate::config::SecretRef::Stored(format!(
+                        "{provider_id}/default"
+                    )))
+                    .is_ok(),
+            },
+            ProviderConfig::LiteLlm { connection, .. }
+            | ProviderConfig::Custom { connection, .. } => connection.is_some(),
+        }
     }
 
     pub fn runtime_for(&self, request: &LoadRequest) -> Result<Arc<Runtime>, RuntimeBuildError> {
@@ -503,7 +604,15 @@ impl RuntimeLoader for RuntimeFactory {
                     overrides = overrides.with_organization(organization);
                 }
                 load = load.with_overrides(overrides);
-                factory.runtime_for(&load)
+                let snapshot = factory.load(&load)?;
+                let pricing = snapshot
+                    .providers()
+                    .get(snapshot.model().provider())
+                    .and_then(|provider| provider.models().get(snapshot.model().model()))
+                    .and_then(|metadata| metadata.pricing())
+                    .cloned();
+                let runtime = factory.runtime_for_snapshot(&snapshot)?;
+                Ok::<_, RuntimeBuildError>(LoadedRuntime { runtime, pricing })
             })
             .await;
             match build {
@@ -870,6 +979,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn catalog_hides_builtin_models_until_the_provider_is_authenticated() {
+        let fixture = RuntimeFixture::new();
+        let credentials = CredentialStore::with_backend(
+            CredentialPaths::new(fixture.path("data")),
+            Arc::new(MemoryKeyring::default()),
+        );
+        let factory = fixture.factory_with_credentials(credentials.clone());
+        let snapshot = factory
+            .load(&fixture.request(r#"(version: 1, model: "openai/gpt-5.6")"#))
+            .unwrap();
+
+        assert!(factory.model_options(&snapshot).is_empty());
+
+        credentials
+            .set("openai/default", "test-secret", false)
+            .unwrap();
+        let options = factory.model_options(&snapshot);
+        assert!(!options.is_empty());
+        assert!(options.iter().all(|option| option.provider == "openai"));
+        assert!(options.iter().any(|option| option.model == "gpt-5.6"));
     }
 
     #[test]

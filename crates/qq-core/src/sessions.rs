@@ -14,10 +14,10 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use qq_protocol::{
     CommandId, CommandOutcome, CommandReceipt, EventCursor, MessageId, MessageRole,
-    MessageSnapshot, MessageState, ModelSelection, RunFailure, RunFailureKind, RunId, RunOutcome,
-    RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, StoreId, SubscribeRequest,
-    TextChannel, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    MessageSnapshot, MessageState, ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId,
+    RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope,
+    SessionId, SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, StoreId,
+    SubscribeRequest, TextChannel, TokenUsage, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::Message;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -45,7 +45,13 @@ const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(8);
 const MAX_PERSISTED_EVENT_BYTES: usize = 1024 * 1024;
 
 pub type RuntimeLoadFuture =
-    Pin<Box<dyn Future<Output = Result<Arc<Runtime>, RuntimeLoadError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<LoadedRuntime, RuntimeLoadError>> + Send + 'static>>;
+
+#[derive(Clone)]
+pub struct LoadedRuntime {
+    pub runtime: Arc<Runtime>,
+    pub pricing: Option<ModelPricing>,
+}
 
 pub trait RuntimeLoader: Send + Sync + 'static {
     fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture;
@@ -334,7 +340,7 @@ async fn execute_run(
         workspace: claimed.workspace.clone(),
         model: claimed.model.clone(),
     });
-    let runtime = tokio::select! {
+    let loaded = tokio::select! {
         result = &mut load => match result {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -387,7 +393,8 @@ async fn execute_run(
             }),
         })
         .collect();
-    let mut events = runtime.run_messages(messages);
+    let mut events = loaded.runtime.run_messages(messages);
+    let mut usage = None;
     let mut pending_text = String::new();
     let mut pending_channel = None;
     let mut flush_at = None;
@@ -457,6 +464,9 @@ async fn execute_run(
                 return;
             }
             RunInput::Event(Some(RunEvent::Started)) => {}
+            RunInput::Event(Some(RunEvent::Usage { usage: reported })) => {
+                usage = Some(reported);
+            }
             RunInput::Event(Some(
                 event @ (RunEvent::OutputTextDelta { .. } | RunEvent::RefusalDelta { .. }),
             )) => {
@@ -528,7 +538,16 @@ async fn execute_run(
                     .await;
                     return;
                 }
-                finish_run(&inner, &claimed, RunOutcome::Completed).await;
+                finish_run_accounted(
+                    &inner,
+                    &claimed,
+                    RunOutcome::Completed,
+                    usage.map(|usage| RunAccounting {
+                        usage,
+                        pricing: loaded.pricing.clone(),
+                    }),
+                )
+                .await;
                 return;
             }
             RunInput::Event(Some(RunEvent::Failed { kind, message })) => {
@@ -629,7 +648,16 @@ async fn persist_text(
 }
 
 async fn finish_run(inner: &SessionRuntimeInner, claimed: &ClaimedRun, outcome: RunOutcome) {
-    match inner.store.finish_run(claimed, outcome).await {
+    finish_run_accounted(inner, claimed, outcome, None).await;
+}
+
+async fn finish_run_accounted(
+    inner: &SessionRuntimeInner,
+    claimed: &ClaimedRun,
+    outcome: RunOutcome,
+    accounting: Option<RunAccounting>,
+) {
+    match inner.store.finish_run(claimed, outcome, accounting).await {
         Ok(event) => inner.notify(event.cursor),
         Err(_) => {
             inner.failed.send_replace(true);
@@ -638,6 +666,12 @@ async fn finish_run(inner: &SessionRuntimeInner, claimed: &ClaimedRun, outcome: 
     if let Ok(mut cancellations) = inner.cancellations.lock() {
         cancellations.remove(&claimed.run_id);
     }
+}
+
+#[derive(Clone)]
+struct RunAccounting {
+    usage: TokenUsage,
+    pricing: Option<ModelPricing>,
 }
 
 fn internal_failure(message: &str) -> RunOutcome {
@@ -897,11 +931,12 @@ impl Store {
         &self,
         claimed: &ClaimedRun,
         outcome: RunOutcome,
+        accounting: Option<RunAccounting>,
     ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
-            complete_run(connection, store_id, &claimed, outcome)
+            complete_run(connection, store_id, &claimed, outcome, accounting)
         })
         .await
     }
@@ -982,6 +1017,8 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  model TEXT,
                  max_output_tokens INTEGER,
                  organization TEXT,
+                 estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                 cost_known INTEGER NOT NULL DEFAULT 1,
                  created_at_ms INTEGER NOT NULL,
                  updated_at_ms INTEGER NOT NULL
              );
@@ -993,7 +1030,9 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  assistant_message_id TEXT NOT NULL,
                   status TEXT NOT NULL,
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
-                  outcome_json TEXT,
+                   outcome_json TEXT,
+                   usage_json TEXT,
+                   estimated_cost_usd_nanos INTEGER,
                  created_at_ms INTEGER NOT NULL,
                  started_at_ms INTEGER,
                  finished_at_ms INTEGER
@@ -1063,12 +1102,30 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
         None => {
             connection
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '1')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '2')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("1") => {}
+        Some("1") => {
+            for statement in [
+                "ALTER TABLE sessions ADD COLUMN estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE sessions ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE runs ADD COLUMN usage_json TEXT",
+                "ALTER TABLE runs ADD COLUMN estimated_cost_usd_nanos INTEGER",
+            ] {
+                connection
+                    .execute(statement, [])
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+            }
+            connection
+                .execute(
+                    "UPDATE metadata SET value = '2' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("2") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -1787,6 +1844,7 @@ fn complete_run(
     store_id: StoreId,
     claimed: &ClaimedRun,
     outcome: RunOutcome,
+    accounting: Option<RunAccounting>,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let transaction = connection
         .transaction()
@@ -1796,12 +1854,31 @@ fn complete_run(
     let (run_status, message_state) = outcome_states(&outcome);
     let outcome_json =
         serde_json::to_string(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
+    let usage_json = accounting
+        .as_ref()
+        .map(|accounting| serde_json::to_string(&accounting.usage))
+        .transpose()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let cost = accounting.as_ref().and_then(|accounting| {
+        accounting
+            .pricing
+            .as_ref()
+            .and_then(|pricing| run_cost(accounting.usage, pricing))
+    });
     transaction
         .execute(
             "UPDATE runs
-             SET status = ?2, outcome_json = ?3, finished_at_ms = ?4
+             SET status = ?2, outcome_json = ?3, finished_at_ms = ?4,
+                 usage_json = ?5, estimated_cost_usd_nanos = ?6
              WHERE id = ?1 AND outcome_json IS NULL",
-            params![claimed.run_id.to_string(), run_status, outcome_json, now],
+            params![
+                claimed.run_id.to_string(),
+                run_status,
+                outcome_json,
+                now,
+                usage_json,
+                cost
+            ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     transaction
@@ -1814,13 +1891,20 @@ fn complete_run(
         .execute(
             "UPDATE sessions
              SET active_run_id = NULL,
-                 status = CASE WHEN queued_prompts > 0 THEN 'queued' ELSE 'idle' END,
-                 updated_at_ms = ?2
+                  status = CASE WHEN queued_prompts > 0 THEN 'queued' ELSE 'idle' END,
+                  estimated_cost_usd_nanos = estimated_cost_usd_nanos + COALESCE(?4, 0),
+                  cost_known = CASE
+                      WHEN ?5 = 1 AND ?4 IS NULL THEN 0
+                      ELSE cost_known
+                  END,
+                  updated_at_ms = ?2
              WHERE id = ?1 AND active_run_id = ?3",
             params![
                 claimed.session_id.to_string(),
                 now,
                 claimed.run_id.to_string(),
+                cost,
+                matches!(outcome, RunOutcome::Completed),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2258,7 +2342,9 @@ fn load_session_summary(
     connection
         .query_row(
             "SELECT s.workspace_id, s.parent_id, s.title, s.status, s.active_run_id,
-                     s.queued_prompts, s.updated_at_ms,
+                     s.queued_prompts, s.model,
+                     CASE WHEN s.cost_known = 1 THEN s.estimated_cost_usd_nanos END,
+                     s.updated_at_ms,
                      (SELECT outcome_json FROM runs
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
                       ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1)
@@ -2272,8 +2358,10 @@ fn load_session_summary(
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, u16>(5)?,
-                    row.get::<_, u64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<u64>>(7)?,
+                    row.get::<_, u64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )
@@ -2281,7 +2369,18 @@ fn load_session_summary(
         .map_err(|_| SessionRuntimeError::Persistence)?
         .ok_or(SessionRuntimeError::SessionNotFound)
         .and_then(
-            |(workspace, parent, title, status, active, queued, updated, last_outcome)| {
+            |(
+                workspace,
+                parent,
+                title,
+                status,
+                active,
+                queued,
+                model,
+                cost,
+                updated,
+                last_outcome,
+            )| {
                 Ok(SessionSummary {
                     id: session_id,
                     workspace_id: parse_id(&workspace)?,
@@ -2290,6 +2389,8 @@ fn load_session_summary(
                     status: parse_session_status(&status)?,
                     active_run_id: active.as_deref().map(parse_id).transpose()?,
                     queued_prompts: queued,
+                    model,
+                    estimated_cost_usd_nanos: cost,
                     updated_at_ms: updated,
                     last_outcome: last_outcome
                         .as_deref()
@@ -2340,18 +2441,21 @@ fn load_message(
 fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, SessionRuntimeError> {
     connection
         .query_row(
-            "SELECT session_id, status, outcome_json FROM runs WHERE id = ?1",
+            "SELECT session_id, status, outcome_json, usage_json, estimated_cost_usd_nanos
+             FROM runs WHERE id = ?1",
             [run_id.to_string()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<u64>>(4)?,
                 ))
             },
         )
         .map_err(|_| SessionRuntimeError::Persistence)
-        .and_then(|(session, status, outcome)| {
+        .and_then(|(session, status, outcome, usage, cost)| {
             Ok(RunSnapshot {
                 id: run_id,
                 session_id: parse_id(&session)?,
@@ -2361,8 +2465,40 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     .map(serde_json::from_str)
                     .transpose()
                     .map_err(|_| SessionRuntimeError::Persistence)?,
+                usage: usage
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| SessionRuntimeError::Persistence)?,
+                estimated_cost_usd_nanos: cost,
             })
         })
+}
+
+fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
+    let cache_read_rate = if usage.cache_read_input_tokens == 0 {
+        0
+    } else {
+        pricing.cache_read_usd_nanos_per_token?
+    };
+    let cache_write_rate = if usage.cache_write_input_tokens == 0 {
+        0
+    } else {
+        pricing.cache_write_usd_nanos_per_token?
+    };
+    let total = u128::from(usage.input_tokens)
+        .checked_mul(u128::from(pricing.input_usd_nanos_per_token))?
+        .checked_add(
+            u128::from(usage.output_tokens)
+                .checked_mul(u128::from(pricing.output_usd_nanos_per_token))?,
+        )?
+        .checked_add(
+            u128::from(usage.cache_read_input_tokens).checked_mul(u128::from(cache_read_rate))?,
+        )?
+        .checked_add(
+            u128::from(usage.cache_write_input_tokens).checked_mul(u128::from(cache_write_rate))?,
+        )?;
+    u64::try_from(total).ok()
 }
 
 fn ensure_workspace(
@@ -2504,7 +2640,16 @@ mod tests {
         fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             Box::pin(async {
                 Runtime::new(ScriptedProvider, "test-model", 256)
-                    .map(Arc::new)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: Some(ModelPricing {
+                            input_usd_nanos_per_token: 1_000,
+                            output_usd_nanos_per_token: 2_000,
+                            cache_read_usd_nanos_per_token: Some(100),
+                            cache_write_usd_nanos_per_token: Some(300),
+                            provenance: "test".to_owned(),
+                        }),
+                    })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -2527,7 +2672,14 @@ mod tests {
                 Ok(qq_provider::ProviderEvent::OutputTextDelta {
                     text: "o".to_owned(),
                 }),
-                Ok(qq_provider::ProviderEvent::Completed),
+                Ok(qq_provider::ProviderEvent::Completed {
+                    usage: Some(qq_provider::ProviderUsage {
+                        input_tokens: 10,
+                        cache_read_input_tokens: 2,
+                        cache_write_input_tokens: 1,
+                        output_tokens: 5,
+                    }),
+                }),
             ]))
         }
     }
@@ -2538,7 +2690,10 @@ mod tests {
         fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             Box::pin(async {
                 Runtime::new(ChunkingProvider, "test-model", 256)
-                    .map(Arc::new)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -2558,7 +2713,7 @@ mod tests {
                 Ok(qq_provider::ProviderEvent::OutputTextDelta {
                     text: "é".repeat(MAX_TEXT_CHUNK_BYTES / 2 + 8),
                 }),
-                Ok(qq_provider::ProviderEvent::Completed),
+                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
             ]))
         }
     }
@@ -2572,7 +2727,10 @@ mod tests {
             let requests = Arc::clone(&self.requests);
             Box::pin(async move {
                 Runtime::new(DelayedProvider { requests }, "test-model", 256)
-                    .map(Arc::new)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -2593,7 +2751,7 @@ mod tests {
                 yield Ok(qq_provider::ProviderEvent::OutputTextDelta {
                     text: "answer".to_owned(),
                 });
-                yield Ok(qq_provider::ProviderEvent::Completed);
+                yield Ok(qq_provider::ProviderEvent::Completed { usage: None });
             })
         }
     }
@@ -2639,7 +2797,11 @@ mod tests {
                 SessionCommand::CreateSession {
                     workspace_id,
                     parent_id,
-                    model: ModelSelection::default(),
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
                 },
             )
             .await
@@ -2793,6 +2955,18 @@ mod tests {
         assert_eq!(focused.messages.len(), 2);
         assert_eq!(focused.messages[1].output, "hello");
         assert_eq!(focused.summary.status, SessionStatus::Idle);
+        assert_eq!(focused.summary.model.as_deref(), Some("test/model"));
+        assert_eq!(focused.summary.estimated_cost_usd_nanos, Some(20_500));
+        assert_eq!(
+            focused.runs[0].usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                cache_read_input_tokens: 2,
+                cache_write_input_tokens: 1,
+                output_tokens: 5,
+            })
+        );
+        assert_eq!(focused.runs[0].estimated_cost_usd_nanos, Some(20_500));
         assert!(snapshot.cursor.sequence > initial.sequence);
     }
 
@@ -3060,7 +3234,7 @@ mod tests {
 
         assert!(store.cancellation_requested(run_id).await.unwrap());
         store
-            .finish_run(&claimed, RunOutcome::Completed)
+            .finish_run(&claimed, RunOutcome::Completed, None)
             .await
             .unwrap();
         let run = store

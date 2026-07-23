@@ -193,7 +193,9 @@ impl FrameRenderer {
 
         let mut lines = vec![header(app, width), context(app, width)];
         let body_height = height.saturating_sub(5);
-        let body = if app.navigator.is_some() {
+        let body = if app.model_picker.is_some() {
+            model_picker(app, width, body_height)
+        } else if app.navigator.is_some() {
             navigator(app, width)
         } else {
             match app.layout {
@@ -201,7 +203,11 @@ impl FrameRenderer {
                 Layout::FoldFocus => self.fold_focus(app, width),
             }
         };
-        lines.extend(tail_viewport(body, body_height));
+        if app.model_picker.is_some() {
+            lines.extend(body);
+        } else {
+            lines.extend(tail_viewport(body, body_height));
+        }
         lines.push(Line::styled("-".repeat(width), muted()));
         lines.push(composer(app, width));
         lines.push(help(app, width));
@@ -209,7 +215,7 @@ impl FrameRenderer {
     }
 
     fn prune_markdown(&mut self, app: &App) {
-        let visible = if app.navigator.is_none() {
+        let visible = if app.navigator.is_none() && app.model_picker.is_none() {
             app.focused
                 .and_then(|session_id| app.sessions.get(&session_id))
                 .and_then(|session| session.messages.as_ref())
@@ -514,6 +520,69 @@ fn navigator(app: &App, width: usize) -> Vec<Line> {
     lines
 }
 
+fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let picker = app.model_picker.as_ref().expect("model picker is open");
+    let filtered = app.filtered_models();
+    let mut lines = vec![section(
+        "MODELS",
+        "type to search, Up/Down select, Enter creates session, Esc closes",
+    )];
+    lines.push(Line::styled(
+        format!(
+            "  search: {}",
+            if picker.query.is_empty() {
+                "all models"
+            } else {
+                &picker.query
+            }
+        ),
+        if picker.query.is_empty() {
+            muted()
+        } else {
+            accent()
+        },
+    ));
+    lines.push(Line::default());
+    if filtered.is_empty() {
+        lines.push(Line::styled("  No matching models.", muted().italic()));
+        return fit_height(lines, height);
+    }
+
+    let mut selected_row = 0;
+    let mut provider = None;
+    for (position, index) in filtered.iter().enumerate() {
+        let option = &app.models[*index];
+        if provider != Some(option.provider.as_str()) {
+            provider = Some(&option.provider);
+            lines.push(Line::styled(
+                format!("  {}", option.provider.to_ascii_uppercase()),
+                accent().bold(),
+            ));
+        }
+        let selected = position == picker.selected.min(filtered.len() - 1);
+        if selected {
+            selected_row = lines.len();
+        }
+        let mut line = Line::styled(if selected { "  > " } else { "    " }, muted());
+        line.push(
+            option.name.as_deref().unwrap_or(&option.model),
+            if selected { normal().bold() } else { normal() },
+        );
+        if option.name.as_deref() != Some(option.model.as_str()) {
+            line.push(format!("  {}", option.model), muted());
+        }
+        lines.push(truncate_line(line, width));
+    }
+
+    if lines.len() <= height {
+        return fit_height(lines, height);
+    }
+    let start = selected_row
+        .saturating_sub(height / 2)
+        .min(lines.len().saturating_sub(height));
+    lines.into_iter().skip(start).take(height).collect()
+}
+
 fn child_sessions(app: &App, parent: SessionId) -> Vec<SessionId> {
     let mut children = app
         .sessions
@@ -587,10 +656,19 @@ fn help(app: &App, width: usize) -> Line {
         ),
         muted(),
     );
-    let model = format!(
-        "model: {} ",
-        app.model.model.as_deref().unwrap_or("default")
-    );
+    let focused = app
+        .focused
+        .and_then(|id| app.sessions.get(&id))
+        .map(|session| &session.summary);
+    let selected_model = focused
+        .and_then(|session| session.model.as_deref())
+        .or(app.model.model.as_deref())
+        .unwrap_or("default");
+    let model = match focused.and_then(|session| session.estimated_cost_usd_nanos) {
+        Some(cost) => format!("model: {selected_model}  cost: {} ", format_cost(cost)),
+        None if focused.is_some() => format!("model: {selected_model}  cost: unavailable "),
+        None => format!("model: {selected_model} "),
+    };
     let model_width = Line::styled(&model, muted()).width();
     if model_width >= width {
         return truncate_line(Line::styled(model, accent()), width);
@@ -599,6 +677,16 @@ fn help(app: &App, width: usize) -> Line {
     left.push(" ".repeat(width - model_width - left.width()), muted());
     left.push(model, accent());
     left
+}
+
+fn format_cost(usd_nanos: u64) -> String {
+    let whole = usd_nanos / 1_000_000_000;
+    let micros = (usd_nanos % 1_000_000_000) / 1_000;
+    let mut fractional = format!("{micros:06}");
+    while fractional.len() > 2 && fractional.ends_with('0') {
+        fractional.pop();
+    }
+    format!("${whole}.{fractional}")
 }
 
 fn section(title: &str, subtitle: &str) -> Line {

@@ -12,13 +12,13 @@ mod sessions;
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, WorkspaceId};
 pub use sessions::{
     CommandOutcome, CommandReceipt, CommandRequest, CursorError, EventCursor, MessageRole,
-    MessageSnapshot, MessageState, ModelSelection, RunFailure, RunOutcome, RunSnapshot, RunStatus,
-    SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot, SessionStatus,
-    SessionSummary, SnapshotRequest, SubscribeRequest, TextChannel, WorkspaceSnapshot,
-    WorkspaceSummary,
+    MessageSnapshot, MessageState, ModelPricing, ModelSelection, RunFailure, RunOutcome,
+    RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot,
+    SessionStatus, SessionSummary, SnapshotRequest, SubscribeRequest, TextChannel, TokenUsage,
+    WorkspaceSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +50,9 @@ pub enum RunEvent {
     },
     RefusalDelta {
         text: String,
+    },
+    Usage {
+        usage: TokenUsage,
     },
     Completed,
     Failed {

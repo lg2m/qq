@@ -81,3 +81,8 @@ from the repository root to the current directory.
 
 An omitted action inherits the previous layer. An empty list disables that
 action. Invalid chords and collisions are rejected before the TUI starts.
+
+The interactive composer recognizes `/models`, `/sessions`, `/quit`, and
+`/exit`. Selecting a model creates a new session because a session's model is
+immutable. The picker only lists built-in providers with an available
+credential, and the footer shows the focused session's estimated token cost.

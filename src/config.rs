@@ -536,6 +536,7 @@ pub struct ModelMetadata {
     input: Vec<InputModality>,
     context_window: Option<u32>,
     max_output_tokens: Option<u32>,
+    pricing: Option<qq_protocol::ModelPricing>,
 }
 
 impl ModelMetadata {
@@ -562,6 +563,28 @@ impl ModelMetadata {
     #[must_use]
     pub const fn max_output_tokens(&self) -> Option<u32> {
         self.max_output_tokens
+    }
+
+    #[must_use]
+    pub const fn pricing(&self) -> Option<&qq_protocol::ModelPricing> {
+        self.pricing.as_ref()
+    }
+
+    pub(crate) fn builtin(
+        name: &str,
+        reasoning: bool,
+        context_window: u32,
+        max_output_tokens: u32,
+        pricing: Option<qq_protocol::ModelPricing>,
+    ) -> Self {
+        Self {
+            name: Some(name.to_owned()),
+            reasoning,
+            input: vec![InputModality::Text],
+            context_window: Some(context_window),
+            max_output_tokens: Some(max_output_tokens),
+            pricing,
+        }
     }
 }
 

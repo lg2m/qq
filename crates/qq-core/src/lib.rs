@@ -7,15 +7,15 @@ use std::{pin::Pin, sync::Arc};
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
-use qq_protocol::{RunCommand, RunEvent, RunFailureKind};
+use qq_protocol::{RunCommand, RunEvent, RunFailureKind, TokenUsage};
 use qq_provider::{Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent};
 use thiserror::Error;
 
 mod sessions;
 
 pub use sessions::{
-    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
-    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
+    LoadedRuntime, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader,
+    SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
 };
 
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
@@ -94,7 +94,17 @@ impl Runtime {
                     Ok(ProviderEvent::RefusalDelta { text }) => {
                         yield RunEvent::RefusalDelta { text };
                     }
-                    Ok(ProviderEvent::Completed) => {
+                    Ok(ProviderEvent::Completed { usage }) => {
+                        if let Some(usage) = usage {
+                            yield RunEvent::Usage {
+                                usage: TokenUsage {
+                                    input_tokens: usage.input_tokens,
+                                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                                    cache_write_input_tokens: usage.cache_write_input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                },
+                            };
+                        }
                         yield RunEvent::Completed;
                         return;
                     }
@@ -172,7 +182,14 @@ mod tests {
                 Ok(ProviderEvent::RefusalDelta {
                     text: " cannot continue".to_owned(),
                 }),
-                Ok(ProviderEvent::Completed),
+                Ok(ProviderEvent::Completed {
+                    usage: Some(qq_provider::ProviderUsage {
+                        input_tokens: 12,
+                        cache_read_input_tokens: 3,
+                        cache_write_input_tokens: 2,
+                        output_tokens: 5,
+                    }),
+                }),
             ]))
         }
     }
@@ -207,6 +224,14 @@ mod tests {
                 },
                 RunEvent::RefusalDelta {
                     text: " cannot continue".to_owned()
+                },
+                RunEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 12,
+                        cache_read_input_tokens: 3,
+                        cache_write_input_tokens: 2,
+                        output_tokens: 5,
+                    }
                 },
                 RunEvent::Completed,
             ]

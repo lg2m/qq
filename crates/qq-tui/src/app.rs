@@ -14,6 +14,7 @@ use crate::{
 };
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
+const MAX_MODEL_SEARCH_BYTES: usize = 256;
 const MAX_RECENT_EVENTS: usize = 1024;
 const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
@@ -22,6 +23,15 @@ const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
 pub struct TuiOptions {
     pub settings: Settings,
     pub model: ModelSelection,
+    pub models: Vec<ModelOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub provider: String,
+    pub model: String,
+    pub name: Option<String>,
+    pub selection: ModelSelection,
 }
 
 pub async fn run<P>(client: P, options: TuiOptions) -> Result<(), TuiError>
@@ -46,6 +56,11 @@ pub(crate) struct SessionView {
     loaded_through: u64,
 }
 
+pub(crate) struct ModelPicker {
+    pub query: String,
+    pub selected: usize,
+}
+
 #[derive(Debug, Clone)]
 enum PendingIntent {
     Create,
@@ -57,11 +72,13 @@ pub(crate) struct App {
     pub settings: Settings,
     pub layout: Layout,
     pub model: ModelSelection,
+    pub models: Vec<ModelOption>,
     pub workspace_id: Option<WorkspaceId>,
     pub workspace_path: String,
     pub sessions: HashMap<SessionId, SessionView>,
     pub focused: Option<SessionId>,
     pub navigator: Option<SessionId>,
+    pub model_picker: Option<ModelPicker>,
     pub input: String,
     pub connection: ConnectionState,
     pub status: Option<String>,
@@ -78,11 +95,13 @@ impl App {
             layout: options.settings.initial_layout(),
             settings: options.settings,
             model: options.model,
+            models: options.models,
             workspace_id: None,
             workspace_path: String::new(),
             sessions: HashMap::new(),
             focused: None,
             navigator: None,
+            model_picker: None,
             input: String::new(),
             connection: ConnectionState::Connecting,
             status: None,
@@ -107,6 +126,7 @@ impl App {
                 self.sessions.clear();
                 self.focused = None;
                 self.navigator = None;
+                self.model_picker = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
                 self.status = Some("session state reset after reconnecting".to_owned());
@@ -395,6 +415,10 @@ impl App {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
             }
+            Event::Paste(text) if self.model_picker.is_some() => {
+                let changed = self.push_model_search(&text);
+                (changed, Vec::new())
+            }
             Event::Paste(text) if self.navigator.is_none() => {
                 let before = self.input.len();
                 for character in text.chars() {
@@ -417,11 +441,14 @@ impl App {
             self.quit = true;
             return (true, Vec::new());
         }
-        if let Some(action) = self.settings.action_for(key) {
-            return self.handle_action(action);
+        if self.model_picker.is_some() {
+            return self.handle_model_picker_key(key);
         }
         if self.navigator.is_some() {
             return self.handle_navigator_key(key.code);
+        }
+        if let Some(action) = self.settings.action_for(key) {
+            return self.handle_action(action);
         }
         match key.code {
             KeyCode::Esc => {
@@ -454,6 +481,7 @@ impl App {
             Action::NextLayout => self.layout = self.layout.next(),
             Action::PreviousLayout => self.layout = self.layout.previous(),
             Action::ToggleNavigator => {
+                self.model_picker = None;
                 self.navigator = if self.navigator.is_some() {
                     None
                 } else {
@@ -466,6 +494,117 @@ impl App {
             Action::CancelRun => return self.cancel_run(),
         }
         (true, Vec::new())
+    }
+
+    fn open_models(&mut self) -> (bool, Vec<ClientRequest>) {
+        if self.models.is_empty() {
+            self.status = Some("no authenticated providers have selectable models".to_owned());
+            return (true, Vec::new());
+        }
+        self.navigator = None;
+        self.model_picker = Some(ModelPicker {
+            query: String::new(),
+            selected: 0,
+        });
+        (true, Vec::new())
+    }
+
+    pub(crate) fn filtered_models(&self) -> Vec<usize> {
+        let Some(picker) = &self.model_picker else {
+            return Vec::new();
+        };
+        let query = picker.query.to_ascii_lowercase();
+        self.models
+            .iter()
+            .enumerate()
+            .filter(|(_, option)| {
+                query.is_empty()
+                    || option.provider.to_ascii_lowercase().contains(&query)
+                    || option.model.to_ascii_lowercase().contains(&query)
+                    || option
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+        let filtered = self.filtered_models();
+        match key.code {
+            KeyCode::Esc => {
+                self.model_picker = None;
+                (true, Vec::new())
+            }
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                (true, Vec::new())
+            }
+            KeyCode::Down => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.selected = (picker.selected + 1).min(filtered.len().saturating_sub(1));
+                }
+                (true, Vec::new())
+            }
+            KeyCode::Enter => {
+                let selected = self
+                    .model_picker
+                    .as_ref()
+                    .and_then(|picker| filtered.get(picker.selected))
+                    .and_then(|index| self.models.get(*index))
+                    .map(|option| option.selection.clone());
+                let Some(model) = selected else {
+                    return (false, Vec::new());
+                };
+                let result = self.create_session_with_model(None, model);
+                if !result.1.is_empty() {
+                    self.model_picker = None;
+                }
+                result
+            }
+            KeyCode::Backspace => {
+                let changed = self
+                    .model_picker
+                    .as_mut()
+                    .is_some_and(|picker| picker.query.pop().is_some());
+                if let Some(picker) = &mut self.model_picker {
+                    picker.selected = 0;
+                }
+                (changed, Vec::new())
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let mut encoded = [0; 4];
+                (
+                    self.push_model_search(character.encode_utf8(&mut encoded)),
+                    Vec::new(),
+                )
+            }
+            _ => (false, Vec::new()),
+        }
+    }
+
+    fn push_model_search(&mut self, text: &str) -> bool {
+        let Some(picker) = &mut self.model_picker else {
+            return false;
+        };
+        let before = picker.query.len();
+        for character in text.chars() {
+            if picker.query.len() + character.len_utf8() > MAX_MODEL_SEARCH_BYTES {
+                break;
+            }
+            if let Some(character) = terminal_safe_character(character) {
+                picker.query.push(character);
+            }
+        }
+        picker.selected = 0;
+        picker.query.len() != before
     }
 
     fn handle_navigator_key(&mut self, code: KeyCode) -> (bool, Vec<ClientRequest>) {
@@ -517,6 +656,14 @@ impl App {
     }
 
     fn create_session(&mut self, parent_id: Option<SessionId>) -> (bool, Vec<ClientRequest>) {
+        self.create_session_with_model(parent_id, self.model.clone())
+    }
+
+    fn create_session_with_model(
+        &mut self,
+        parent_id: Option<SessionId>,
+        model: ModelSelection,
+    ) -> (bool, Vec<ClientRequest>) {
         let Some(workspace_id) = self.workspace_id else {
             self.status = Some("workspace is still connecting".to_owned());
             return (true, Vec::new());
@@ -533,21 +680,41 @@ impl App {
                 command: SessionCommand::CreateSession {
                     workspace_id,
                     parent_id,
-                    model: self.model.clone(),
+                    model,
                 },
             })],
         )
     }
 
     fn submit_prompt(&mut self) -> (bool, Vec<ClientRequest>) {
-        let Some(session_id) = self.focused else {
-            self.status = Some("create a session before sending a prompt".to_owned());
-            return (true, Vec::new());
-        };
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
             return (false, Vec::new());
         }
+        match prompt.as_str() {
+            "/quit" | "/exit" => {
+                self.input.clear();
+                self.quit = true;
+                return (true, Vec::new());
+            }
+            "/models" => {
+                self.input.clear();
+                return self.open_models();
+            }
+            "/sessions" => {
+                self.input.clear();
+                self.model_picker = None;
+                self.navigator = self
+                    .focused
+                    .or_else(|| self.thread_order().first().copied());
+                return (true, Vec::new());
+            }
+            _ => {}
+        }
+        let Some(session_id) = self.focused else {
+            self.status = Some("create a session before sending a prompt".to_owned());
+            return (true, Vec::new());
+        };
         let Ok(command_id) = CommandId::generate() else {
             self.status = Some("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
@@ -730,6 +897,8 @@ mod tests {
                 status: SessionStatus::Idle,
                 active_run_id: None,
                 queued_prompts: 0,
+                model: Some("openai/gpt-test".to_owned()),
+                estimated_cost_usd_nanos: Some(0),
                 updated_at_ms: 1,
                 last_outcome: None,
             }],
@@ -742,6 +911,8 @@ mod tests {
                     status: SessionStatus::Idle,
                     active_run_id: None,
                     queued_prompts: 0,
+                    model: Some("openai/gpt-test".to_owned()),
+                    estimated_cost_usd_nanos: Some(0),
                     updated_at_ms: 1,
                     last_outcome: None,
                 },
@@ -771,6 +942,64 @@ mod tests {
 
         assert_eq!(app.input, "hello");
         assert_eq!(app.status.as_deref(), Some("offline"));
+    }
+
+    #[test]
+    fn slash_commands_quit_and_open_overlays_without_submitting_prompts() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+
+        app.input = "/sessions".to_owned();
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(requests.is_empty());
+        assert!(app.navigator.is_some());
+
+        app.navigator = None;
+        app.input = "/quit".to_owned();
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(requests.is_empty());
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn model_picker_filters_and_creates_an_immutable_model_session() {
+        let selection = ModelSelection {
+            model: Some("anthropic/claude-sonnet-5".to_owned()),
+            max_output_tokens: Some(8_192),
+            organization: None,
+        };
+        let mut app = App::new(TuiOptions {
+            settings: Settings::default(),
+            model: ModelSelection::default(),
+            models: vec![ModelOption {
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet-5".to_owned(),
+                name: Some("Claude Sonnet 5".to_owned()),
+                selection: selection.clone(),
+            }],
+        });
+        app.apply_snapshot(snapshot());
+        app.input = "/models".to_owned();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(requests.is_empty());
+        assert!(app.model_picker.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.filtered_models(), vec![0]);
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let ClientRequest::Command(request) = &requests[0] else {
+            panic!("expected create-session command")
+        };
+        assert!(matches!(
+            &request.command,
+            SessionCommand::CreateSession {
+                parent_id: None,
+                model,
+                ..
+            } if model == &selection
+        ));
+        assert!(app.model_picker.is_none());
     }
 
     #[test]
@@ -914,6 +1143,8 @@ mod tests {
             status: SessionStatus::Idle,
             active_run_id: None,
             queued_prompts: 0,
+            model: Some("openai/gpt-test".to_owned()),
+            estimated_cost_usd_nanos: Some(0),
             updated_at_ms: 2,
             last_outcome: None,
         });

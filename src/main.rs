@@ -13,6 +13,7 @@ mod auth;
 mod cli;
 mod client;
 mod config;
+mod models;
 mod output;
 mod runtime;
 mod server;
@@ -100,20 +101,21 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other("interactive mode requires a terminal").into());
     }
-    let loader = config::ConfigLoader::system()?;
+    let factory = runtime::RuntimeFactory::system()?;
     let request = overrides.load_request()?;
+    let config_factory = factory.clone();
     let (snapshot, tui) = tokio::task::spawn_blocking(move || {
-        let snapshot = loader.load(&request)?;
-        let tui = loader.load_tui(request.cwd())?;
-        Ok::<_, config::ConfigError>((snapshot, tui))
+        let snapshot = config_factory.load(&request)?;
+        let tui = config::ConfigLoader::system()?.load_tui(request.cwd())?;
+        Ok::<_, runtime::RuntimeBuildError>((snapshot, tui))
     })
     .await??;
+    let models = factory.model_options(&snapshot);
     let mut embedded = None;
     let connection = if let Some(connection) = client::discover().await? {
         connection
     } else {
-        let handler =
-            Arc::new(runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?);
+        let handler = Arc::new(runtime::RuntimeHandler::open(factory).await?);
         match server::start(handler, server::ServerOptions::for_user()?).await? {
             server::StartOutcome::Existing(connection) => connection,
             server::StartOutcome::Started(server) => {
@@ -136,6 +138,7 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         qq_tui::TuiOptions {
             settings: tui.settings().clone(),
             model,
+            models,
         },
     )
     .await;
