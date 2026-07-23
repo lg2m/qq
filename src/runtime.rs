@@ -7,10 +7,14 @@ use std::{
 };
 
 use qq_core::{
-    Runtime, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
-    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
+    LoadedRuntime, Runtime, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture,
+    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
+    SessionRuntimeOptions,
 };
-use qq_protocol::{CommandRequest, RunFailureKind, SnapshotRequest, SubscribeRequest};
+use qq_protocol::{
+    CommandRequest, ModelCatalogRequest, ModelDescriptor, RunFailureKind, SnapshotRequest,
+    SubscribeRequest,
+};
 use qq_provider::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderError,
     ProviderRecipe, bedrock::BedrockAuth as ProviderBedrockAuth,
@@ -26,7 +30,7 @@ use crate::{
         AwsAuth, BedrockAuth, ConfigError, ConfigLoader, ConfigSnapshot, Connection, LoadRequest,
         ProviderApi, ProviderAuth, ProviderConfig,
     },
-    server::{AskHandler, AskHandlerError, CommandFuture, SnapshotFuture},
+    server::{AskHandler, AskHandlerError, CommandFuture, ModelsFuture, SnapshotFuture},
 };
 
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -42,6 +46,7 @@ const GOOGLE_CREDENTIAL_ENDPOINT: &str = "https://generativelanguage.googleapis.
 const GOOGLE_STORED_CREDENTIAL: &str = "google/default";
 const GOOGLE_ENVIRONMENT_CREDENTIAL: &str = "GEMINI_API_KEY";
 const MAX_CACHED_RUNTIMES: usize = 16;
+const MAX_MODEL_OPTIONS: usize = 4_096;
 
 #[derive(Clone)]
 pub struct RuntimeFactory {
@@ -76,6 +81,161 @@ impl RuntimeFactory {
 
     pub fn load(&self, request: &LoadRequest) -> Result<ConfigSnapshot, RuntimeBuildError> {
         self.inner.config.load(request).map_err(Into::into)
+    }
+
+    pub fn model_options(&self, snapshot: &ConfigSnapshot) -> Vec<ModelDescriptor> {
+        let allowed = snapshot.policy().allowed_providers();
+        let denied = snapshot.policy().denied_providers();
+        let mut options = Vec::new();
+        'providers: for (provider_id, provider) in snapshot.providers() {
+            if allowed.is_some_and(|allowed| !allowed.iter().any(|id| id == provider_id))
+                || denied.iter().any(|id| id == provider_id)
+                || !self.provider_authenticated(provider_id, provider)
+            {
+                continue;
+            }
+            for (model_id, metadata) in provider.models() {
+                if options.len() >= MAX_MODEL_OPTIONS {
+                    break 'providers;
+                }
+                options.push(ModelDescriptor {
+                    provider: provider_id.clone(),
+                    model: model_id.clone(),
+                    name: metadata.name().map(str::to_owned),
+                    selection: qq_protocol::ModelSelection {
+                        model: Some(format!("{provider_id}/{model_id}")),
+                        max_output_tokens: Some(
+                            metadata
+                                .max_output_tokens()
+                                .map_or(snapshot.max_output_tokens(), |limit| {
+                                    limit.min(snapshot.max_output_tokens())
+                                }),
+                        ),
+                        organization: snapshot.organization().map(str::to_owned),
+                    },
+                });
+            }
+        }
+        if options.len() < MAX_MODEL_OPTIONS
+            && !options
+                .iter()
+                .any(|option| option.selection.model.as_deref() == Some(snapshot.model().as_str()))
+            && let Some(provider) = snapshot.providers().get(snapshot.model().provider())
+            && self.provider_authenticated(snapshot.model().provider(), provider)
+        {
+            options.push(ModelDescriptor {
+                provider: snapshot.model().provider().to_owned(),
+                model: snapshot.model().model().to_owned(),
+                name: None,
+                selection: qq_protocol::ModelSelection {
+                    model: Some(snapshot.model().as_str().to_owned()),
+                    max_output_tokens: Some(snapshot.max_output_tokens()),
+                    organization: snapshot.organization().map(str::to_owned),
+                },
+            });
+        }
+        options.sort_by(|left, right| {
+            (&left.provider, &left.name, &left.model).cmp(&(
+                &right.provider,
+                &right.name,
+                &right.model,
+            ))
+        });
+        options
+    }
+
+    pub fn models_for(
+        &self,
+        request: &ModelCatalogRequest,
+    ) -> Result<Vec<ModelDescriptor>, RuntimeBuildError> {
+        let requested_workspace = PathBuf::from(&request.workspace);
+        let workspace = std::fs::canonicalize(&requested_workspace).map_err(|_| {
+            ConfigError::InvalidWorkingDirectory {
+                path: requested_workspace.clone(),
+            }
+        })?;
+        if workspace != requested_workspace {
+            return Err(ConfigError::InvalidWorkingDirectory {
+                path: requested_workspace,
+            }
+            .into());
+        }
+        let load = LoadRequest::from_process_env(&workspace, None)?;
+        match self.load(&load) {
+            Ok(snapshot) => return Ok(self.model_options(&snapshot)),
+            Err(RuntimeBuildError::Config(ConfigError::ModelRequired)) => {}
+            Err(error) => return Err(error),
+        }
+        let mut load =
+            LoadRequest::from_process_env(&workspace, request.selection.max_output_tokens)?;
+        let mut overrides = load.overrides().clone();
+        if let Some(model) = &request.selection.model {
+            overrides = overrides.with_model(model.clone());
+        }
+        if let Some(organization) = &request.selection.organization {
+            overrides = overrides.with_organization(organization.clone());
+        }
+        load = load.with_overrides(overrides);
+        let snapshot = self.load(&load)?;
+        Ok(self.model_options(&snapshot))
+    }
+
+    fn provider_authenticated(&self, _provider_id: &str, provider: &ProviderConfig) -> bool {
+        match provider {
+            ProviderConfig::OpenAi { api_key, .. } => resolve_provider_credential(
+                &self.inner.credentials,
+                api_key.as_ref(),
+                OPENAI_STORED_CREDENTIAL,
+                OPENAI_ENVIRONMENT_CREDENTIAL,
+                Some(OPENAI_CREDENTIAL_ENDPOINT),
+            )
+            .is_ok(),
+            ProviderConfig::Anthropic { api_key, .. } => resolve_provider_credential(
+                &self.inner.credentials,
+                api_key.as_ref(),
+                ANTHROPIC_STORED_CREDENTIAL,
+                ANTHROPIC_ENVIRONMENT_CREDENTIAL,
+                Some(ANTHROPIC_CREDENTIAL_ENDPOINT),
+            )
+            .is_ok(),
+            ProviderConfig::Google { api_key, .. } => resolve_provider_credential(
+                &self.inner.credentials,
+                api_key.as_ref(),
+                GOOGLE_STORED_CREDENTIAL,
+                GOOGLE_ENVIRONMENT_CREDENTIAL,
+                Some(GOOGLE_CREDENTIAL_ENDPOINT),
+            )
+            .is_ok(),
+            ProviderConfig::OpenAiCodex { profile, .. } => self
+                .inner
+                .credentials
+                .resolve_with_endpoint(
+                    &crate::config::SecretRef::Stored(format!(
+                        "openai-codex/{}",
+                        profile.as_deref().unwrap_or("default")
+                    )),
+                    Some("https://chatgpt.com"),
+                )
+                .is_ok(),
+            ProviderConfig::AmazonBedrock { auth, .. }
+            | ProviderConfig::AmazonBedrockMantle { auth, .. } => match auth {
+                BedrockAuth::ApiKey(reference) => self.inner.credentials.resolve(reference).is_ok(),
+                BedrockAuth::Aws(AwsAuth::Profile(profile)) => aws_profile_configured(profile),
+                BedrockAuth::Aws(AwsAuth::DefaultChain) => {
+                    (std::env::var_os("AWS_ACCESS_KEY_ID").is_some()
+                        && std::env::var_os("AWS_SECRET_ACCESS_KEY").is_some())
+                        || std::env::var_os("AWS_PROFILE")
+                            .and_then(|profile| profile.into_string().ok())
+                            .is_some_and(|profile| aws_profile_configured(&profile))
+                        || (std::env::var_os("AWS_WEB_IDENTITY_TOKEN_FILE").is_some()
+                            && std::env::var_os("AWS_ROLE_ARN").is_some())
+                        || std::env::var_os("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_some()
+                        || std::env::var_os("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some()
+                }
+            },
+            ProviderConfig::LiteLlm { connection, .. }
+            | ProviderConfig::Custom { connection, .. } => connection.is_some(),
+        }
     }
 
     pub fn runtime_for(&self, request: &LoadRequest) -> Result<Arc<Runtime>, RuntimeBuildError> {
@@ -476,6 +636,31 @@ impl RuntimeFactory {
     }
 }
 
+fn aws_profile_configured(profile: &str) -> bool {
+    if profile.is_empty() {
+        return false;
+    }
+    let home = directories::BaseDirs::new().map(|directories| directories.home_dir().to_owned());
+    let files = [
+        std::env::var_os("AWS_CONFIG_FILE")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".aws/config"))),
+        std::env::var_os("AWS_SHARED_CREDENTIALS_FILE")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|home| home.join(".aws/credentials"))),
+    ];
+    let config_header = format!("[profile {profile}]");
+    let credentials_header = format!("[{profile}]");
+    files.into_iter().flatten().any(|path| {
+        std::fs::read_to_string(path).is_ok_and(|content| {
+            content.lines().any(|line| {
+                let line = line.trim();
+                line == config_header || line == credentials_header
+            })
+        })
+    })
+}
+
 impl RuntimeLoader for RuntimeFactory {
     fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
         let factory = self.clone();
@@ -503,7 +688,15 @@ impl RuntimeLoader for RuntimeFactory {
                     overrides = overrides.with_organization(organization);
                 }
                 load = load.with_overrides(overrides);
-                factory.runtime_for(&load)
+                let snapshot = factory.load(&load)?;
+                let pricing = snapshot
+                    .providers()
+                    .get(snapshot.model().provider())
+                    .and_then(|provider| provider.models().get(snapshot.model().model()))
+                    .and_then(|metadata| metadata.pricing())
+                    .cloned();
+                let runtime = factory.runtime_for_snapshot(&snapshot)?;
+                Ok::<_, RuntimeBuildError>(LoadedRuntime { runtime, pricing })
             })
             .await;
             match build {
@@ -576,6 +769,7 @@ impl ResolvedAuth {
 #[derive(Clone)]
 pub struct RuntimeHandler {
     durable: SessionRuntime,
+    factory: RuntimeFactory,
 }
 
 impl RuntimeHandler {
@@ -586,7 +780,7 @@ impl RuntimeHandler {
             Arc::new(factory.clone()),
         )
         .await?;
-        Ok(Self { durable })
+        Ok(Self { durable, factory })
     }
 }
 
@@ -608,6 +802,21 @@ impl AskHandler for RuntimeHandler {
                 .snapshot(request)
                 .await
                 .map_err(map_session_runtime_error)
+        })
+    }
+
+    fn models(&self, request: ModelCatalogRequest) -> ModelsFuture {
+        let factory = self.factory.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || factory.models_for(&request))
+                .await
+                .map_err(|_| AskHandlerError::Internal)?
+                .map_err(|error| match error.failure_kind() {
+                    RunFailureKind::Configuration | RunFailureKind::Policy => {
+                        AskHandlerError::InvalidRequest
+                    }
+                    _ => AskHandlerError::Internal,
+                })
         })
     }
 
@@ -870,6 +1079,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn catalog_hides_builtin_models_until_the_provider_is_authenticated() {
+        let fixture = RuntimeFixture::new();
+        let credentials = CredentialStore::with_backend(
+            CredentialPaths::new(fixture.path("data")),
+            Arc::new(MemoryKeyring::default()),
+        );
+        let factory = fixture.factory_with_credentials(credentials.clone());
+        let snapshot = factory
+            .load(&fixture.request(r#"(version: 1, model: "openai/gpt-5.6")"#))
+            .unwrap();
+
+        assert!(factory.model_options(&snapshot).is_empty());
+
+        credentials
+            .set("openai/default", "test-secret", false)
+            .unwrap();
+        let options = factory.model_options(&snapshot);
+        assert!(!options.is_empty());
+        assert!(options.iter().all(|option| option.provider == "openai"));
+        assert!(options.iter().any(|option| option.model == "gpt-5.6"));
     }
 
     #[test]

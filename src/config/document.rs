@@ -237,6 +237,8 @@ struct ModelPatch {
     context_window: Field<u32>,
     #[serde(skip_serializing_if = "Field::is_missing")]
     max_output_tokens: Field<u32>,
+    #[serde(skip_serializing_if = "Field::is_missing")]
+    pricing: Field<qq_protocol::ModelPricing>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,7 +550,7 @@ impl MergeState {
                 "anthropic".to_owned(),
                 ProviderConfig::Anthropic {
                     api_key: None,
-                    models: BTreeMap::new(),
+                    models: crate::models::builtin_models("anthropic"),
                 },
             ),
             (
@@ -556,7 +558,7 @@ impl MergeState {
                 ProviderConfig::AmazonBedrock {
                     region: None,
                     auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                    models: BTreeMap::new(),
+                    models: crate::models::builtin_models("bedrock"),
                 },
             ),
             (
@@ -565,28 +567,28 @@ impl MergeState {
                     region: None,
                     api: ProviderApi::OpenAiResponses,
                     auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
-                    models: BTreeMap::new(),
+                    models: crate::models::builtin_models("bedrock-mantle"),
                 },
             ),
             (
                 "google".to_owned(),
                 ProviderConfig::Google {
                     api_key: None,
-                    models: BTreeMap::new(),
+                    models: crate::models::builtin_models("google"),
                 },
             ),
             (
                 "openai".to_owned(),
                 ProviderConfig::OpenAi {
                     api_key: None,
-                    models: BTreeMap::new(),
+                    models: crate::models::builtin_models("openai"),
                 },
             ),
             (
                 "openai-codex".to_owned(),
                 ProviderConfig::OpenAiCodex {
                     profile: None,
-                    models: BTreeMap::new(),
+                    models: crate::models::builtin_models("openai-codex"),
                 },
             ),
         ]);
@@ -1033,6 +1035,7 @@ fn apply_model_patch(model: &mut ModelMetadata, patch: &ModelPatch) {
     apply_default(&patch.input, &mut model.input, Vec::new());
     apply_optional(&patch.context_window, &mut model.context_window);
     apply_optional(&patch.max_output_tokens, &mut model.max_output_tokens);
+    apply_optional(&patch.pricing, &mut model.pricing);
 }
 
 fn enforce_policy(

@@ -74,6 +74,58 @@ pub struct ModelSelection {
     pub organization: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricing {
+    pub input_usd_nanos_per_token: u64,
+    pub output_usd_nanos_per_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tier: Option<ModelPricingTier>,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricingTier {
+    pub above_input_tokens: u64,
+    pub input_usd_nanos_per_token: u64,
+    pub output_usd_nanos_per_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_usd_nanos_per_token: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalogRequest {
+    pub workspace: String,
+    pub selection: ModelSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDescriptor {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub selection: ModelSelection,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
@@ -212,6 +264,10 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_run_id: Option<RunId>,
     pub queued_prompts: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd_nanos: Option<u64>,
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<RunOutcome>,
@@ -225,6 +281,10 @@ pub struct RunSnapshot {
     pub status: RunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<RunOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd_nanos: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

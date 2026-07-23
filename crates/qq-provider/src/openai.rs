@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, Role,
+    ProviderStream, ProviderUsage, Role,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
     request_auth::RequestAuthorizer,
@@ -218,8 +218,8 @@ impl Provider for OpenAi {
                             add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
                             yield ProviderEvent::RefusalDelta { text };
                         }
-                        DecodedEvent::Completed => {
-                            yield ProviderEvent::Completed;
+                        DecodedEvent::Completed(usage) => {
+                            yield ProviderEvent::Completed { usage };
                             return;
                         }
                         DecodedEvent::Ignored => {}
@@ -572,7 +572,7 @@ enum StreamingEvent {
     #[serde(rename = "response.refusal.delta")]
     RefusalDelta { delta: String },
     #[serde(rename = "response.completed")]
-    Completed,
+    Completed { response: Option<CompletedResponse> },
     #[serde(rename = "response.failed")]
     Failed { response: FailedResponse },
     #[serde(rename = "response.incomplete")]
@@ -602,6 +602,24 @@ struct IncompleteDetails {
 }
 
 #[derive(Deserialize)]
+struct CompletedResponse {
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    input_tokens_details: Option<ResponsesInputTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesInputTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Deserialize)]
 struct ApiErrorEnvelope {
     error: ApiError,
 }
@@ -612,11 +630,11 @@ struct ApiError {
     message: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum DecodedEvent {
     OutputTextDelta(String),
     RefusalDelta(String),
-    Completed,
+    Completed(Option<ProviderUsage>),
     Ignored,
 }
 
@@ -631,7 +649,13 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedEvent, Provi
     match event {
         StreamingEvent::OutputTextDelta { delta } => Ok(DecodedEvent::OutputTextDelta(delta)),
         StreamingEvent::RefusalDelta { delta } => Ok(DecodedEvent::RefusalDelta(delta)),
-        StreamingEvent::Completed => Ok(DecodedEvent::Completed),
+        StreamingEvent::Completed { response } => {
+            let usage = response
+                .and_then(|response| response.usage)
+                .map(provider_usage)
+                .transpose()?;
+            Ok(DecodedEvent::Completed(usage))
+        }
         StreamingEvent::Failed { response } => Err(response.error.map_or_else(
             || ProviderError::ResponseFailed {
                 kind: ProviderErrorKind::Response,
@@ -657,6 +681,21 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedEvent, Provi
         }),
         StreamingEvent::Other => Ok(DecodedEvent::Ignored),
     }
+}
+
+fn provider_usage(usage: ResponsesUsage) -> Result<ProviderUsage, ProviderError> {
+    let cached = usage
+        .input_tokens_details
+        .map_or(0, |details| details.cached_tokens);
+    let input_tokens = usage.input_tokens.checked_sub(cached).ok_or_else(|| {
+        ProviderError::Protocol("OpenAI cached input tokens exceeded total input tokens".to_owned())
+    })?;
+    Ok(ProviderUsage {
+        input_tokens,
+        cache_read_input_tokens: cached,
+        cache_write_input_tokens: 0,
+        output_tokens: usage.output_tokens,
+    })
 }
 
 fn openai_error_kind(code: Option<&str>) -> ProviderErrorKind {
@@ -881,11 +920,34 @@ mod tests {
             &[],
         )
         .unwrap();
-        let completed = decode_event(r#"{"type":"response.completed"}"#, &[]).unwrap();
+        let completed = decode_event(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":17,"input_tokens_details":{"cached_tokens":5},"output_tokens":9}}}"#,
+            &[],
+        )
+        .unwrap();
 
         assert!(matches!(delta, DecodedEvent::OutputTextDelta(text) if text == "hello"));
         assert!(matches!(refusal, DecodedEvent::RefusalDelta(text) if text == "cannot help"));
-        assert!(matches!(completed, DecodedEvent::Completed));
+        assert_eq!(
+            completed,
+            DecodedEvent::Completed(Some(ProviderUsage {
+                input_tokens: 12,
+                cache_read_input_tokens: 5,
+                cache_write_input_tokens: 0,
+                output_tokens: 9,
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_responses_usage() {
+        let error = decode_event(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":2,"input_tokens_details":{"cached_tokens":3},"output_tokens":1}}}"#,
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Protocol(_)));
     }
 
     #[test]
@@ -965,7 +1027,7 @@ mod tests {
     async fn sends_a_responses_request_and_streams_events() {
         let body = concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
-            "data: {\"type\":\"response.completed\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens\":9}}}\n\n",
         );
         let path = "/custom/responses?api-version=42";
         let (endpoint, server) = serve_once(path, "200 OK", "text/event-stream", body);
@@ -989,7 +1051,17 @@ mod tests {
             &events[0],
             Ok(ProviderEvent::OutputTextDelta { text }) if text == "hello"
         ));
-        assert!(matches!(&events[1], Ok(ProviderEvent::Completed)));
+        assert_eq!(
+            events[1].as_ref().unwrap(),
+            &ProviderEvent::Completed {
+                usage: Some(ProviderUsage {
+                    input_tokens: 12,
+                    cache_read_input_tokens: 5,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 9,
+                }),
+            }
+        );
 
         let request = server.join().unwrap();
         let (head, request_body) = request.split_once("\r\n\r\n").unwrap();
@@ -1041,7 +1113,10 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
 
-        assert!(matches!(&events[0], Ok(ProviderEvent::Completed)));
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::Completed { usage: None })
+        ));
         let request = server.join().unwrap();
         let (head, request_body) = request.split_once("\r\n\r\n").unwrap();
         assert_eq!(

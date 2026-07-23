@@ -8,6 +8,6 @@ mod settings;
 mod terminal;
 mod view;
 
-pub use app::{TuiError, TuiOptions, run};
+pub use app::{ModelOption, TuiError, TuiOptions, run};
 pub use client::{ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState};
 pub use settings::{Action, KeyChord, Layout, Settings, SettingsBuilder, SettingsError};

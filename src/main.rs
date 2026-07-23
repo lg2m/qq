@@ -13,6 +13,7 @@ mod auth;
 mod cli;
 mod client;
 mod config;
+mod models;
 mod output;
 mod runtime;
 mod server;
@@ -100,20 +101,20 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other("interactive mode requires a terminal").into());
     }
-    let loader = config::ConfigLoader::system()?;
+    let factory = runtime::RuntimeFactory::system()?;
     let request = overrides.load_request()?;
+    let config_factory = factory.clone();
     let (snapshot, tui) = tokio::task::spawn_blocking(move || {
-        let snapshot = loader.load(&request)?;
-        let tui = loader.load_tui(request.cwd())?;
-        Ok::<_, config::ConfigError>((snapshot, tui))
+        let snapshot = config_factory.load(&request)?;
+        let tui = config::ConfigLoader::system()?.load_tui(request.cwd())?;
+        Ok::<_, runtime::RuntimeBuildError>((snapshot, tui))
     })
     .await??;
     let mut embedded = None;
     let connection = if let Some(connection) = client::discover().await? {
         connection
     } else {
-        let handler =
-            Arc::new(runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?);
+        let handler = Arc::new(runtime::RuntimeHandler::open(factory).await?);
         match server::start(handler, server::ServerOptions::for_user()?).await? {
             server::StartOutcome::Existing(connection) => connection,
             server::StartOutcome::Started(server) => {
@@ -125,17 +126,36 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     };
 
     let workspace = std::fs::canonicalize(std::env::current_dir()?)?;
-    let model = qq_protocol::ModelSelection {
+    let configured_model = qq_protocol::ModelSelection {
         model: Some(snapshot.model().as_str().to_owned()),
         max_output_tokens: Some(snapshot.max_output_tokens()),
         organization: snapshot.organization().map(str::to_owned),
     };
+    let models = client::SessionClient::new(connection.clone())?
+        .models(qq_protocol::ModelCatalogRequest {
+            workspace: workspace.to_string_lossy().into_owned(),
+            selection: configured_model.clone(),
+        })
+        .await?
+        .into_iter()
+        .map(|model| qq_tui::ModelOption {
+            provider: model.provider,
+            model: model.model,
+            name: model.name,
+            selection: model.selection,
+        })
+        .collect::<Vec<_>>();
+    let model = models
+        .iter()
+        .any(|option| option.selection.model == configured_model.model)
+        .then_some(configured_model);
     let tui_client = client::TuiClient::start(connection, workspace, model.clone())?;
     let result = qq_tui::run(
         tui_client,
         qq_tui::TuiOptions {
             settings: tui.settings().clone(),
-            model,
+            model: model.unwrap_or_default(),
+            models,
         },
     )
     .await;

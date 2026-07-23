@@ -30,6 +30,7 @@ pub async fn render(
                     ends_with_newline = text.ends_with('\n');
                 }
             }
+            RunEvent::Usage { .. } => {}
             RunEvent::Completed => {
                 if !wrote_text || !ends_with_newline {
                     writer.write_all(b"\n")?;

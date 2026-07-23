@@ -295,7 +295,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Message, ModelRequest, http::build_direct_client};
+    use crate::{Message, ModelRequest, ProviderEvent, ProviderUsage, http::build_direct_client};
 
     #[test]
     fn uses_canonical_regional_endpoints_for_each_protocol() {
@@ -441,6 +441,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegates_usage_capture_to_each_protocol_codec() {
+        let cases = [
+            (
+                HttpProtocol::OpenAiResponses,
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens\":9}}}\n\n",
+                ProviderUsage {
+                    input_tokens: 12,
+                    cache_read_input_tokens: 5,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 9,
+                },
+            ),
+            (
+                HttpProtocol::OpenAiChatCompletions,
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":9,",
+                    "\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+                ProviderUsage {
+                    input_tokens: 12,
+                    cache_read_input_tokens: 5,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 9,
+                },
+            ),
+            (
+                HttpProtocol::AnthropicMessages,
+                concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{",
+                    "\"input_tokens\":12,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ),
+                ProviderUsage {
+                    input_tokens: 12,
+                    cache_read_input_tokens: 5,
+                    cache_write_input_tokens: 3,
+                    output_tokens: 9,
+                },
+            ),
+        ];
+
+        for (protocol, body, expected) in cases {
+            let (endpoint, server) = serve_ok(body);
+            let provider = build_provider(
+                build_direct_client().unwrap(),
+                endpoint,
+                protocol,
+                Some("mantle-test-secret".to_owned()),
+                RequestAuthorizer::default(),
+            )
+            .unwrap();
+            let events = provider
+                .stream(ModelRequest::new(
+                    "test-model",
+                    vec![Message::user("hello")],
+                    64,
+                ))
+                .collect::<Vec<_>>()
+                .await;
+            server.join().unwrap();
+
+            assert!(matches!(
+                &events[..],
+                [Ok(ProviderEvent::Completed { usage: Some(usage) })] if *usage == expected
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn codec_applies_sigv4_after_serializing_the_request() {
         let calls = Arc::new(AtomicUsize::new(0));
         let credentials = CountingCredentials {
@@ -522,6 +593,28 @@ mod tests {
                     b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
                 )
                 .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (endpoint, server)
+    }
+
+    fn serve_ok(body: &str) -> (reqwest::Url, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            reqwest::Url::parse(&format!("http://{}/invoke", listener.local_addr().unwrap()))
+                .unwrap();
+        let body = body.to_owned();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
             String::from_utf8(request).unwrap()
         });
         (endpoint, server)
