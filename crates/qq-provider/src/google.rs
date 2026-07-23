@@ -6,11 +6,11 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
-    Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role,
+    ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
+    ProviderStream, ProviderUsage, Role, ToolSpec,
     http::{build_client, validate_endpoint},
     limits::StreamLimits,
     sanitize::sanitize_message,
@@ -148,7 +148,7 @@ impl Provider for GoogleGenerateContent {
                 )
             })?;
             let limits = StreamLimits::new(request.max_output_tokens());
-            let body = GenerateContentRequest::new(&request, max_output_tokens);
+            let body = GenerateContentRequest::new(&request, max_output_tokens)?;
             let response = client
                 .post(endpoint)
                 .headers(headers)
@@ -174,6 +174,9 @@ impl Provider for GoogleGenerateContent {
             let mut output_bytes = 0_usize;
             let mut wire_bytes = 0_usize;
             let mut usage = None;
+            // Gemini assigns no tool-call ids; a per-stream ordinal keeps the
+            // synthesized ids deterministic.
+            let mut tool_call_ordinal = 0_u64;
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
@@ -181,7 +184,7 @@ impl Provider for GoogleGenerateContent {
                 add_wire_bytes(&mut wire_bytes, chunk.len(), limits.wire)?;
 
                 for data in decoder.push(&chunk)? {
-                    for event in decode_event(&data, redactions.as_ref())? {
+                    for event in decode_event(&data, &mut tool_call_ordinal, redactions.as_ref())? {
                         match event {
                             DecodedEvent::OutputText(text) => {
                                 add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
@@ -193,6 +196,18 @@ impl Provider for GoogleGenerateContent {
                                         "Google GenerateContent stream reported usage more than once".to_owned(),
                                     ))?;
                                 }
+                            }
+                            DecodedEvent::ToolCall { id, name, arguments } => {
+                                add_output_bytes(&mut output_bytes, arguments.len(), limits.output)?;
+                                yield ProviderEvent::ToolCallStarted {
+                                    id: id.clone(),
+                                    name,
+                                };
+                                yield ProviderEvent::ToolCallArgumentsDelta {
+                                    id: id.clone(),
+                                    json: arguments,
+                                };
+                                yield ProviderEvent::ToolCallCompleted { id };
                             }
                             DecodedEvent::Completed => {
                                 yield ProviderEvent::Completed { usage };
@@ -462,36 +477,96 @@ impl SseDecoder {
 #[serde(rename_all = "camelCase")]
 struct GenerateContentRequest<'a> {
     contents: Vec<GoogleContent<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<GoogleTool<'a>>,
     generation_config: GenerationConfig,
 }
 
 impl<'a> GenerateContentRequest<'a> {
-    fn new(request: &'a ModelRequest, max_output_tokens: i32) -> Self {
-        Self {
-            contents: request.messages().iter().map(GoogleContent::from).collect(),
-            generation_config: GenerationConfig { max_output_tokens },
+    /// Builds the wire request, resolving each tool result back to the name of
+    /// the call it answers. Gemini identifies function responses by name, so a
+    /// result whose `call_id` matches no earlier tool call cannot be sent.
+    fn new(request: &'a ModelRequest, max_output_tokens: i32) -> Result<Self, ProviderError> {
+        let messages = request.messages();
+        let mut contents = Vec::with_capacity(messages.len());
+        for (index, message) in messages.iter().enumerate() {
+            let mut parts = Vec::with_capacity(message.content().len());
+            for block in message.content() {
+                parts.push(match block {
+                    ContentBlock::Text { text } => GooglePart::Text { text },
+                    ContentBlock::ToolCall {
+                        name, arguments, ..
+                    } => GooglePart::FunctionCall {
+                        function_call: FunctionCallPart {
+                            name,
+                            args: arguments,
+                        },
+                    },
+                    ContentBlock::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } => {
+                        let name = messages[..index]
+                            .iter()
+                            .flat_map(Message::content)
+                            .find_map(|earlier| match earlier {
+                                ContentBlock::ToolCall { id, name, .. } if id == call_id => {
+                                    Some(name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                ProviderError::Configuration(format!(
+                                    "Google tool result `{call_id}` does not match any earlier tool call"
+                                ))
+                            })?;
+                        GooglePart::FunctionResponse {
+                            function_response: FunctionResponsePart {
+                                name,
+                                response: if *is_error {
+                                    FunctionResponseBody::Error { error: content }
+                                } else {
+                                    FunctionResponseBody::Output { output: content }
+                                },
+                            },
+                        }
+                    }
+                });
+            }
+            contents.push(GoogleContent {
+                role: match message.role() {
+                    Role::User => GoogleRole::User,
+                    Role::Assistant => GoogleRole::Model,
+                },
+                parts,
+            });
         }
+
+        let tools = if request.tools().is_empty() {
+            Vec::new()
+        } else {
+            vec![GoogleTool {
+                function_declarations: request
+                    .tools()
+                    .iter()
+                    .map(FunctionDeclaration::from)
+                    .collect(),
+            }]
+        };
+
+        Ok(Self {
+            contents,
+            tools,
+            generation_config: GenerationConfig { max_output_tokens },
+        })
     }
 }
 
 #[derive(Serialize)]
 struct GoogleContent<'a> {
     role: GoogleRole,
-    parts: [TextPart<'a>; 1],
-}
-
-impl<'a> From<&'a Message> for GoogleContent<'a> {
-    fn from(message: &'a Message) -> Self {
-        Self {
-            role: match message.role() {
-                Role::User => GoogleRole::User,
-                Role::Assistant => GoogleRole::Model,
-            },
-            parts: [TextPart {
-                text: message.content(),
-            }],
-        }
-    }
+    parts: Vec<GooglePart<'a>>,
 }
 
 #[derive(Serialize)]
@@ -502,8 +577,61 @@ enum GoogleRole {
 }
 
 #[derive(Serialize)]
-struct TextPart<'a> {
-    text: &'a str,
+#[serde(untagged)]
+enum GooglePart<'a> {
+    Text {
+        text: &'a str,
+    },
+    FunctionCall {
+        #[serde(rename = "functionCall")]
+        function_call: FunctionCallPart<'a>,
+    },
+    FunctionResponse {
+        #[serde(rename = "functionResponse")]
+        function_response: FunctionResponsePart<'a>,
+    },
+}
+
+#[derive(Serialize)]
+struct FunctionCallPart<'a> {
+    name: &'a str,
+    args: &'a Value,
+}
+
+#[derive(Serialize)]
+struct FunctionResponsePart<'a> {
+    name: &'a str,
+    response: FunctionResponseBody<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum FunctionResponseBody<'a> {
+    Output { output: &'a str },
+    Error { error: &'a str },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleTool<'a> {
+    function_declarations: Vec<FunctionDeclaration<'a>>,
+}
+
+#[derive(Serialize)]
+struct FunctionDeclaration<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+}
+
+impl<'a> From<&'a ToolSpec> for FunctionDeclaration<'a> {
+    fn from(tool: &'a ToolSpec) -> Self {
+        Self {
+            name: tool.name(),
+            description: tool.description(),
+            parameters: tool.input_schema(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -554,7 +682,7 @@ struct ResponsePart {
     text: Option<String>,
     #[serde(default)]
     thought: bool,
-    function_call: Option<Value>,
+    function_call: Option<WireFunctionCall>,
     executable_code: Option<Value>,
     code_execution_result: Option<Value>,
     inline_data: Option<Value>,
@@ -562,6 +690,12 @@ struct ResponsePart {
     thought_signature: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct WireFunctionCall {
+    name: String,
+    args: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -586,10 +720,19 @@ struct WireApiError {
 enum DecodedEvent {
     OutputText(String),
     Usage(ProviderUsage),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     Completed,
 }
 
-fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, ProviderError> {
+fn decode_event(
+    data: &str,
+    tool_call_ordinal: &mut u64,
+    redactions: &[String],
+) -> Result<Vec<DecodedEvent>, ProviderError> {
     let response: GenerateContentResponse = serde_json::from_str(data).map_err(|error| {
         ProviderError::Protocol(sanitize_message(
             &format!("could not decode Google GenerateContent event: {error}"),
@@ -626,8 +769,7 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, 
     let mut events = usage.map_or_else(Vec::new, |usage| vec![DecodedEvent::Usage(usage)]);
     if let Some(content) = candidate.content {
         for part in content.parts {
-            if part.function_call.is_some()
-                || part.executable_code.is_some()
+            if part.executable_code.is_some()
                 || part.code_execution_result.is_some()
                 || part.inline_data.is_some()
                 || part.file_data.is_some()
@@ -637,6 +779,31 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, 
                     "Google GenerateContent response contained unsupported non-text content"
                         .to_owned(),
                 ));
+            }
+            if let Some(call) = part.function_call {
+                if part.text.is_some() {
+                    return Err(ProviderError::Protocol(
+                        "Google GenerateContent response mixed text and a function call in one part"
+                            .to_owned(),
+                    ));
+                }
+                let arguments = call.args.unwrap_or_else(|| Value::Object(Map::new()));
+                let arguments = serde_json::to_string(&arguments).map_err(|error| {
+                    ProviderError::Protocol(sanitize_message(
+                        &format!("could not serialize Google function-call arguments: {error}"),
+                        redactions,
+                    ))
+                })?;
+                // Gemini assigns no call ids; synthesize a deterministic one
+                // from the per-stream ordinal and the function name.
+                let id = format!("call_{tool_call_ordinal}_{name}", name = call.name);
+                *tool_call_ordinal += 1;
+                events.push(DecodedEvent::ToolCall {
+                    id,
+                    name: call.name,
+                    arguments,
+                });
+                continue;
             }
             if part.thought {
                 continue;
@@ -655,7 +822,7 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, 
 
     if let Some(reason) = candidate.finish_reason {
         match reason.as_str() {
-            "STOP" => events.push(DecodedEvent::Completed),
+            "STOP" | "TOOL_CALL" | "TOOL_CALLS" => events.push(DecodedEvent::Completed),
             "MAX_TOKENS" => {
                 return Err(ProviderError::ResponseIncomplete(
                     "Google response reached its output token limit".to_owned(),
@@ -667,7 +834,7 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedEvent>, 
             | "MISSING_THOUGHT_SIGNATURE"
             | "MALFORMED_RESPONSE" => {
                 return Err(ProviderError::Protocol(format!(
-                    "Google response ended with unsupported tool or protocol reason {reason}"
+                    "Google response ended with tool or protocol failure reason {reason}"
                 )));
             }
             "FINISH_REASON_UNSPECIFIED" => {
@@ -902,6 +1069,187 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sends_tool_declarations_and_tool_history_parts() {
+        let body = "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"index\":0}]}\n\n";
+        let (endpoint, server) = serve_once(200, "text/event-stream", body);
+        let provider = GoogleGenerateContent::with_client(
+            crate::http::build_direct_client().unwrap(),
+            validate_endpoint(&endpoint, true).unwrap(),
+            GoogleEndpoint::Base,
+            GoogleAuth::NoAuth,
+            [],
+        )
+        .unwrap();
+        let request = ModelRequest::new(
+            "gemini-test",
+            vec![
+                Message::user("read the config"),
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Text {
+                            text: "Reading it now.".to_owned(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "call_0_read_file".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: serde_json::json!({"path": "config.ron"}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "call_1_list_dir".to_owned(),
+                            name: "list_dir".to_owned(),
+                            arguments: serde_json::json!({"path": "."}),
+                        },
+                    ],
+                ),
+                Message::tool_results(vec![
+                    ContentBlock::ToolResult {
+                        call_id: "call_0_read_file".to_owned(),
+                        content: "(config)".to_owned(),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        call_id: "call_1_list_dir".to_owned(),
+                        content: "denied".to_owned(),
+                        is_error: true,
+                    },
+                ]),
+            ],
+            128,
+        )
+        .with_tools(vec![ToolSpec::new(
+            "read_file",
+            "Reads one file",
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )]);
+        let events = provider.stream(request).collect::<Vec<_>>().await;
+
+        assert!(matches!(
+            &events[..],
+            [Ok(ProviderEvent::Completed { usage: None })]
+        ));
+        let request = server.join().unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            serde_json::json!({
+                "contents": [
+                    {"role": "user", "parts": [{"text": "read the config"}]},
+                    {"role": "model", "parts": [
+                        {"text": "Reading it now."},
+                        {"functionCall": {"name": "read_file", "args": {"path": "config.ron"}}},
+                        {"functionCall": {"name": "list_dir", "args": {"path": "."}}},
+                    ]},
+                    {"role": "user", "parts": [
+                        {"functionResponse": {
+                            "name": "read_file",
+                            "response": {"output": "(config)"},
+                        }},
+                        {"functionResponse": {
+                            "name": "list_dir",
+                            "response": {"error": "denied"},
+                        }},
+                    ]},
+                ],
+                "tools": [{"functionDeclarations": [{
+                    "name": "read_file",
+                    "description": "Reads one file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }]}],
+                "generationConfig": {"maxOutputTokens": 128},
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_tool_calls_with_deterministic_synthetic_ids_to_completion() {
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Checking.\"}]},\"index\":0}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[",
+            "{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"a.rs\"}}},",
+            "{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"b.rs\"}}}",
+            "]},\"finishReason\":\"STOP\",\"index\":0}]}\n\n",
+        );
+        let (endpoint, server) = serve_once(200, "text/event-stream", body);
+        let provider = GoogleGenerateContent::with_client(
+            crate::http::build_direct_client().unwrap(),
+            validate_endpoint(&endpoint, true).unwrap(),
+            GoogleEndpoint::Exact,
+            GoogleAuth::NoAuth,
+            [],
+        )
+        .unwrap();
+        let events = provider
+            .stream(ModelRequest::new(
+                "gemini-test",
+                vec![Message::user("hi")],
+                64,
+            ))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        server.join().unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::OutputTextDelta {
+                    text: "Checking.".to_owned(),
+                },
+                ProviderEvent::ToolCallStarted {
+                    id: "call_0_read_file".to_owned(),
+                    name: "read_file".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "call_0_read_file".to_owned(),
+                    json: "{\"path\":\"a.rs\"}".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    id: "call_0_read_file".to_owned(),
+                },
+                ProviderEvent::ToolCallStarted {
+                    id: "call_1_read_file".to_owned(),
+                    name: "read_file".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "call_1_read_file".to_owned(),
+                    json: "{\"path\":\"b.rs\"}".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    id: "call_1_read_file".to_owned(),
+                },
+                ProviderEvent::Completed { usage: None },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_tool_result_without_a_matching_call() {
+        let provider = GoogleGenerateContent::with_client(
+            crate::http::build_direct_client().unwrap(),
+            validate_endpoint("https://example.test/custom", false).unwrap(),
+            GoogleEndpoint::Exact,
+            GoogleAuth::NoAuth,
+            [],
+        )
+        .unwrap();
+        let request = ModelRequest::new(
+            "gemini-test",
+            vec![Message::tool_results(vec![ContentBlock::ToolResult {
+                call_id: "call_9_missing".to_owned(),
+                content: "(orphaned)".to_owned(),
+                is_error: false,
+            }])],
+            64,
+        );
+
+        let error = provider.stream(request).next().await.unwrap().unwrap_err();
+        assert!(matches!(error, ProviderError::Configuration(_)));
+    }
+
     #[test]
     fn decoder_handles_fragmented_utf8_multiline_data_and_crlf() {
         let mut decoder = SseDecoder::new(4_096);
@@ -921,13 +1269,18 @@ mod tests {
     fn maps_terminal_and_blocked_responses_without_silent_success() {
         let max_tokens = decode_event(
             r#"{"candidates":[{"finishReason":"MAX_TOKENS","index":0}]}"#,
+            &mut 0,
             &[],
         )
         .unwrap_err();
         assert!(matches!(max_tokens, ProviderError::ResponseIncomplete(_)));
 
-        let blocked =
-            decode_event(r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#, &[]).unwrap_err();
+        let blocked = decode_event(
+            r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#,
+            &mut 0,
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(
             blocked,
             ProviderError::ResponseFailed {
@@ -938,6 +1291,7 @@ mod tests {
 
         let tool = decode_event(
             r#"{"candidates":[{"finishReason":"UNEXPECTED_TOOL_CALL","index":0}]}"#,
+            &mut 0,
             &[],
         )
         .unwrap_err();
@@ -948,6 +1302,7 @@ mod tests {
     fn usage_subtracts_cached_prompt_and_includes_thoughts() {
         let events = decode_event(
             r#"{"candidates":[{"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":20,"cachedContentTokenCount":6,"candidatesTokenCount":7,"thoughtsTokenCount":3}}"#,
+            &mut 0,
             &[],
         )
         .unwrap();
@@ -969,7 +1324,7 @@ mod tests {
             r#"{"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":18446744073709551615,"thoughtsTokenCount":1}}"#,
         ] {
             assert!(matches!(
-                decode_event(data, &[]),
+                decode_event(data, &mut 0, &[]),
                 Err(ProviderError::Protocol(_))
             ));
         }
@@ -982,6 +1337,7 @@ mod tests {
             &format!(
                 r#"{{"error":{{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota for {secret}"}}}}"#
             ),
+            &mut 0,
             &[secret.to_owned()],
         )
         .unwrap_err();
@@ -995,9 +1351,9 @@ mod tests {
     fn rejects_unknown_and_mixed_non_text_parts() {
         for response in [
             r#"{"candidates":[{"content":{"parts":[{"functionResponse":{}}]},"finishReason":"STOP","index":0}]}"#,
-            r#"{"candidates":[{"content":{"parts":[{"text":"unsafe","functionCall":{}}]},"finishReason":"STOP","index":0}]}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"unsafe","functionCall":{"name":"noop"}}]},"finishReason":"STOP","index":0}]}"#,
         ] {
-            let error = decode_event(response, &[]).unwrap_err();
+            let error = decode_event(response, &mut 0, &[]).unwrap_err();
             assert!(matches!(error, ProviderError::Protocol(_)));
         }
     }

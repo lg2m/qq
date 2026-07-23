@@ -71,11 +71,7 @@ impl Runtime {
         Box::pin(stream! {
             yield RunEvent::Started;
 
-            if messages.is_empty()
-                || messages
-                    .iter()
-                    .any(|message| message.content().trim().is_empty())
-            {
+            if messages.is_empty() || messages.iter().any(|message| !message.has_content()) {
                 yield RunEvent::Failed {
                     kind: RunFailureKind::InvalidCommand,
                     message: "conversation messages must not be empty".to_owned(),
@@ -93,6 +89,20 @@ impl Runtime {
                     }
                     Ok(ProviderEvent::RefusalDelta { text }) => {
                         yield RunEvent::RefusalDelta { text };
+                    }
+                    Ok(
+                        ProviderEvent::ToolCallStarted { .. }
+                        | ProviderEvent::ToolCallArgumentsDelta { .. }
+                        | ProviderEvent::ToolCallCompleted { .. },
+                    ) => {
+                        // No tools are declared yet; a streamed tool call is a
+                        // provider contract violation until the tool loop lands.
+                        yield RunEvent::Failed {
+                            kind: RunFailureKind::ProviderProtocol,
+                            message: "provider streamed a tool call without declared tools"
+                                .to_owned(),
+                        };
+                        return;
                     }
                     Ok(ProviderEvent::Completed { usage }) => {
                         if let Some(usage) = usage {
@@ -274,6 +284,39 @@ mod tests {
                 Message::user("what was my first message?"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn fails_when_a_provider_streams_a_tool_call_without_declared_tools() {
+        struct ToolCallingProvider;
+
+        impl Provider for ToolCallingProvider {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: "call_1".to_owned(),
+                        name: "read_file".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+
+        let runtime = Runtime::new(ToolCallingProvider, "gpt-test", 256).unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events[0], RunEvent::Started);
+        assert!(matches!(
+            &events[1],
+            RunEvent::Failed {
+                kind: RunFailureKind::ProviderProtocol,
+                ..
+            }
+        ));
+        assert_eq!(events.len(), 2);
     }
 
     #[tokio::test]
