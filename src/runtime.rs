@@ -128,6 +128,7 @@ impl RuntimeFactory {
                         provider: provider_id.clone(),
                         model: model.id.clone(),
                         name: model.name.clone(),
+                        context_window: None,
                         selection: qq_protocol::ModelSelection {
                             model: Some(format!("{provider_id}/{}", model.id)),
                             max_output_tokens: Some(snapshot.max_output_tokens()),
