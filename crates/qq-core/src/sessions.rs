@@ -1479,7 +1479,7 @@ fn execute_command(
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             let next_queued = queued + 1;
-            let next_title = if title == "New session" {
+            let next_title = if ordinal == 1 {
                 prompt_title(&prompt)
             } else {
                 title
@@ -2663,12 +2663,51 @@ fn parse_message_state(value: &str) -> Result<MessageState, SessionRuntimeError>
 }
 
 fn prompt_title(prompt: &str) -> String {
-    let first_line = prompt.lines().next().unwrap_or(prompt).trim();
-    let mut title = first_line.chars().take(48).collect::<String>();
-    if first_line.chars().count() > 48 {
+    let mut title = String::new();
+    let mut characters = 0;
+    let mut pending_space = false;
+    let mut truncated = false;
+    for character in prompt.chars() {
+        if character.is_whitespace() {
+            pending_space = !title.is_empty();
+            continue;
+        }
+        if character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        {
+            continue;
+        }
+        if pending_space {
+            if characters + 1 >= 48 {
+                truncated = true;
+                break;
+            }
+            title.push(' ');
+            characters += 1;
+            pending_space = false;
+        }
+        if characters == 48 {
+            truncated = true;
+            break;
+        }
+        title.push(character);
+        characters += 1;
+    }
+    if truncated {
         title.push_str("...");
     }
-    title
+    if title.is_empty() {
+        "New session".to_owned()
+    } else {
+        title
+    }
 }
 
 fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
@@ -2929,6 +2968,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prompt_titles_are_compact_and_bounded() {
+        assert_eq!(
+            prompt_title("  Fix the login\n\tredirect  "),
+            "Fix the login redirect"
+        );
+        assert_eq!(
+            prompt_title(&"x".repeat(49)),
+            format!("{}...", "x".repeat(48))
+        );
+        assert_eq!(prompt_title("\0\u{1b}\u{202e}\u{2066}"), "New session");
+    }
+
     async fn resolve_workspace(
         runtime: &SessionRuntime,
         path: &std::path::Path,
@@ -3020,6 +3072,40 @@ mod tests {
 
         assert_eq!(snapshot.sessions.len(), 2);
         assert_eq!(snapshot.focused.unwrap().summary.parent_id, Some(root_id));
+    }
+
+    #[tokio::test]
+    async fn only_the_first_prompt_names_a_session() {
+        let (directory, runtime) = test_runtime().await;
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+
+        for prompt in ["New session", "Do not replace the first title"] {
+            runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::SubmitPrompt {
+                        session_id,
+                        prompt: prompt.to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.focused.unwrap().summary.title, "New session");
     }
 
     #[tokio::test]

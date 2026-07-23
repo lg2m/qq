@@ -205,23 +205,21 @@ impl FrameRenderer {
         let body_height = height.saturating_sub(5);
         let body = if app.model_picker.is_some() {
             model_picker(app, width, body_height)
-        } else if app.navigator_open {
-            navigator(app, width)
+        } else if app.session_picker.is_some() {
+            session_picker(app, width, body_height)
         } else {
             match app.layout {
                 Layout::Threadline => self.threadline(app, width),
                 Layout::FoldFocus => self.fold_focus(app, width),
             }
         };
-        let mut body = if app.model_picker.is_some() {
+        let mut body = if app.model_picker.is_some() || app.session_picker.is_some() {
             body
-        } else if app.navigator_open {
-            tail_viewport(body, body_height)
         } else {
             app.update_transcript_viewport(body.len(), body_height);
             transcript_viewport(body, body_height, app.transcript_scroll_offset())
         };
-        if app.model_picker.is_none() && !app.navigator_open {
+        if app.model_picker.is_none() && app.session_picker.is_none() {
             overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
         }
         lines.extend(body);
@@ -232,7 +230,7 @@ impl FrameRenderer {
     }
 
     fn prune_markdown(&mut self, app: &App) {
-        let visible = if !app.navigator_open && app.model_picker.is_none() {
+        let visible = if app.session_picker.is_none() && app.model_picker.is_none() {
             app.focused
                 .and_then(|session_id| app.sessions.get(&session_id))
                 .and_then(|session| session.messages.as_ref())
@@ -501,29 +499,63 @@ fn context(app: &App, width: usize) -> Line {
     truncate_line(line, width)
 }
 
-fn navigator(app: &App, width: usize) -> Vec<Line> {
+fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let picker = app.session_picker.as_ref().expect("session picker is open");
+    let filtered = app.filtered_sessions();
     let mut lines = vec![section(
         "SESSIONS",
-        "Up/Down select, Enter focus, Esc close",
+        "type to search, Up/Down select, Enter focuses, Esc closes",
     )];
+    lines.push(Line::styled(
+        format!(
+            "  search: {}",
+            if picker.query.is_empty() {
+                "all sessions"
+            } else {
+                &picker.query
+            }
+        ),
+        if picker.query.is_empty() {
+            muted()
+        } else {
+            accent()
+        },
+    ));
     lines.push(Line::default());
-    for session_id in app.thread_order() {
+    if filtered.is_empty() {
+        lines.push(Line::styled(
+            if app.sessions.is_empty() {
+                "  Alt-N creates a root session."
+            } else {
+                "  No matching sessions."
+            },
+            muted().italic(),
+        ));
+        return fit_height(lines, height);
+    }
+
+    let mut results = Vec::with_capacity(filtered.len());
+    let mut selected_row = 0;
+    for session_id in filtered {
         let depth = app.depth(session_id);
+        let selected = picker.selected == Some(session_id);
+        if selected {
+            selected_row = results.len();
+        }
         let prefix = format!(
             "  {}{} ",
             "  ".repeat(depth),
-            if app.navigator == Some(session_id) {
-                ">"
-            } else {
-                " "
-            }
+            if selected { ">" } else { " " }
         );
-        lines.push(session_line(app, session_id, width, &prefix));
+        results.push(session_line(app, session_id, width, &prefix));
     }
-    if app.sessions.is_empty() {
-        lines.push(Line::styled("  Alt-N creates a root session.", muted()));
-    }
-    lines
+
+    lines.extend(selection_viewport(
+        results,
+        height.saturating_sub(lines.len()),
+        selected_row,
+    ));
+    fit_height(lines, height)
 }
 
 fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
@@ -554,20 +586,21 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
         return fit_height(lines, height);
     }
 
+    let mut results = Vec::new();
     let mut selected_row = 0;
     let mut provider = None;
     for (position, index) in filtered.iter().enumerate() {
         let option = &app.models[*index];
         if provider != Some(option.provider.as_str()) {
             provider = Some(&option.provider);
-            lines.push(Line::styled(
+            results.push(Line::styled(
                 format!("  {}", option.provider.to_ascii_uppercase()),
                 accent().bold(),
             ));
         }
         let selected = position == picker.selected.min(filtered.len() - 1);
         if selected {
-            selected_row = lines.len();
+            selected_row = results.len();
         }
         let mut line = Line::styled(if selected { "  > " } else { "    " }, muted());
         line.push(
@@ -577,16 +610,15 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
         if option.name.as_deref() != Some(option.model.as_str()) {
             line.push(format!("  {}", option.model), muted());
         }
-        lines.push(truncate_line(line, width));
+        results.push(truncate_line(line, width));
     }
 
-    if lines.len() <= height {
-        return fit_height(lines, height);
-    }
-    let start = selected_row
-        .saturating_sub(height / 2)
-        .min(lines.len().saturating_sub(height));
-    lines.into_iter().skip(start).take(height).collect()
+    lines.extend(selection_viewport(
+        results,
+        height.saturating_sub(lines.len()),
+        selected_row,
+    ));
+    fit_height(lines, height)
 }
 
 fn child_sessions(app: &App, parent: SessionId) -> Vec<SessionId> {
@@ -997,11 +1029,11 @@ fn truncate_line(line: Line, width: usize) -> Line {
     output
 }
 
-fn tail_viewport(mut lines: Vec<Line>, height: usize) -> Vec<Line> {
-    if lines.len() > height {
-        lines.drain(..lines.len() - height);
-    }
-    fit_height(lines, height)
+fn selection_viewport(lines: Vec<Line>, height: usize, selected_row: usize) -> Vec<Line> {
+    let start = selected_row
+        .saturating_sub(height / 2)
+        .min(lines.len().saturating_sub(height));
+    lines.into_iter().skip(start).take(height).collect()
 }
 
 fn transcript_viewport(mut lines: Vec<Line>, height: usize, offset: usize) -> Vec<Line> {
@@ -1088,8 +1120,9 @@ fn write_line(output: &mut impl Write, line: &Line) -> io::Result<()> {
 mod tests {
     use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
     use qq_protocol::{
-        EventCursor, ModelSelection, RunId, SessionId, SessionSnapshot, SessionStatus,
-        SessionSummary, StoreId, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+        EventCursor, ModelSelection, RunId, SessionEvent, SessionEventEnvelope, SessionId,
+        SessionSnapshot, SessionStatus, SessionSummary, StoreId, WorkspaceId, WorkspaceSnapshot,
+        WorkspaceSummary,
     };
 
     use super::*;
@@ -1316,6 +1349,71 @@ mod tests {
         assert!(text.contains("/quit"));
         assert!(!text.contains("/models"));
         assert!(!text.contains("/sessions"));
+    }
+
+    #[test]
+    fn session_picker_pins_search_and_keeps_the_selection_visible() {
+        let mut app = app_with_messages(0);
+        let workspace_id = app.workspace_id.unwrap();
+        let store_id = StoreId::from_bytes([4; 16]);
+        let mut selected = None;
+        for byte in 2..20 {
+            let session_id = SessionId::from_bytes([byte; 16]);
+            if byte == 10 {
+                selected = Some(session_id);
+            }
+            let summary = SessionSummary {
+                id: session_id,
+                workspace_id,
+                parent_id: None,
+                title: format!("Session {byte}"),
+                status: SessionStatus::Idle,
+                active_run_id: None,
+                queued_prompts: 0,
+                model: Some("openai/gpt-test".to_owned()),
+                estimated_cost_usd_nanos: Some(0),
+                updated_at_ms: u64::from(byte),
+                last_outcome: None,
+            };
+            app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id,
+                    workspace_id,
+                    sequence: u64::from(byte),
+                },
+                session_id,
+                run_id: None,
+                caused_by: None,
+                occurred_at_ms: u64::from(byte),
+                event: SessionEvent::SessionCreated { session: summary },
+            }));
+        }
+        app.session_picker = Some(crate::app::SessionPicker {
+            query: String::new(),
+            selected,
+        });
+
+        let frame = FrameRenderer::default().frame(&mut app, 80, 12);
+        let text = frame_text(&frame);
+
+        assert!(text.contains("SESSIONS"));
+        assert!(text.contains("search: all sessions"));
+        assert!(text.contains("Session 10"));
+    }
+
+    #[test]
+    fn session_picker_renders_an_empty_search_result() {
+        let mut app = app_with_messages(0);
+        app.session_picker = Some(crate::app::SessionPicker {
+            query: "missing".to_owned(),
+            selected: None,
+        });
+
+        let frame = FrameRenderer::default().frame(&mut app, 80, 12);
+        let text = frame_text(&frame);
+
+        assert!(text.contains("search: missing"));
+        assert!(text.contains("No matching sessions."));
     }
 
     #[test]
