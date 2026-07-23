@@ -42,7 +42,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Some(cli::Command::Ask { prompt }) => ask(prompt, &overrides).await?,
         Some(cli::Command::Serve { bind }) => serve(bind).await?,
         Some(cli::Command::Config { command }) => config_command(command, &overrides)?,
-        Some(cli::Command::Auth { command }) => auth_command(command)?,
+        Some(cli::Command::Auth { command }) => {
+            run_blocking_command(move || auth_command(command)).await?
+        }
         Some(cli::Command::Org { command }) => organization_command(command)?,
         Some(cli::Command::Trust) => trust_command(&overrides)?,
         None => interactive(&overrides).await?,
@@ -469,5 +471,29 @@ fn built_in_endpoint(provider: &str) -> Option<&'static str> {
         "openai-codex" => Some("https://chatgpt.com"),
         "anthropic" => Some("https://api.anthropic.com"),
         _ => None,
+    }
+}
+
+async fn run_blocking_command(
+    command: impl FnOnce() -> Result<(), Box<dyn Error>> + Send + 'static,
+) -> Result<(), Box<dyn Error>> {
+    let result =
+        tokio::task::spawn_blocking(move || command().map_err(|error| error.to_string())).await?;
+    result.map_err(|error| io::Error::other(error).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocking_command_can_drop_its_http_runtime() {
+        run_blocking_command(|| {
+            let client = reqwest::blocking::Client::builder().build()?;
+            drop(client);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
