@@ -460,7 +460,16 @@ async fn execute_run(
                 } else {
                     RunOutcome::Interrupted
                 };
-                finish_run(&inner, &claimed, outcome).await;
+                finish_run_accounted(
+                    &inner,
+                    &claimed,
+                    outcome,
+                    Some(RunAccounting {
+                        usage,
+                        pricing: loaded.pricing.clone(),
+                    }),
+                )
+                .await;
                 return;
             }
             RunInput::Event(Some(RunEvent::Started)) => {}
@@ -542,7 +551,7 @@ async fn execute_run(
                     &inner,
                     &claimed,
                     RunOutcome::Completed,
-                    usage.map(|usage| RunAccounting {
+                    Some(RunAccounting {
                         usage,
                         pricing: loaded.pricing.clone(),
                     }),
@@ -563,7 +572,7 @@ async fn execute_run(
                     .await;
                     return;
                 }
-                finish_run(
+                finish_run_accounted(
                     &inner,
                     &claimed,
                     RunOutcome::Failed {
@@ -572,6 +581,10 @@ async fn execute_run(
                             message: truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES),
                         },
                     },
+                    Some(RunAccounting {
+                        usage,
+                        pricing: loaded.pricing.clone(),
+                    }),
                 )
                 .await;
                 return;
@@ -589,10 +602,14 @@ async fn execute_run(
                     .await;
                     return;
                 }
-                finish_run(
+                finish_run_accounted(
                     &inner,
                     &claimed,
                     internal_failure("model stream ended without a terminal event"),
+                    Some(RunAccounting {
+                        usage,
+                        pricing: loaded.pricing.clone(),
+                    }),
                 )
                 .await;
                 return;
@@ -670,7 +687,7 @@ async fn finish_run_accounted(
 
 #[derive(Clone)]
 struct RunAccounting {
-    usage: TokenUsage,
+    usage: Option<TokenUsage>,
     pricing: Option<ModelPricing>,
 }
 
@@ -977,7 +994,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(SessionRuntimeError::Persistence),
     }
-    let connection = Connection::open_with_flags(
+    let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
@@ -1070,26 +1087,6 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  ON messages(session_id, ordinal);",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let has_cancel_requested = {
-        let mut statement = connection
-            .prepare("PRAGMA table_info(runs)")
-            .map_err(|_| SessionRuntimeError::Persistence)?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|_| SessionRuntimeError::Persistence)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| SessionRuntimeError::Persistence)?
-            .iter()
-            .any(|column| column == "cancel_requested")
-    };
-    if !has_cancel_requested {
-        connection
-            .execute(
-                "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|_| SessionRuntimeError::Persistence)?;
-    }
     let schema_version = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'schema_version'",
@@ -1108,21 +1105,38 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
         Some("1") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            if !has_column(&transaction, "runs", "cancel_requested")? {
+                transaction
+                    .execute(
+                        "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+            }
             for statement in [
                 "ALTER TABLE sessions ADD COLUMN estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE sessions ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1",
                 "ALTER TABLE runs ADD COLUMN usage_json TEXT",
                 "ALTER TABLE runs ADD COLUMN estimated_cost_usd_nanos INTEGER",
             ] {
-                connection
+                transaction
                     .execute(statement, [])
                     .map_err(|_| SessionRuntimeError::Persistence)?;
             }
-            connection
+            transaction
+                .execute("UPDATE sessions SET cost_known = 0", [])
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
                 .execute(
                     "UPDATE metadata SET value = '2' WHERE key = 'schema_version'",
                     [],
                 )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
         Some("2") => {}
@@ -1152,6 +1166,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
         }
     };
     Ok((connection, store_id))
+}
+
+fn has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, SessionRuntimeError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(columns.iter().any(|candidate| candidate == column))
 }
 
 #[derive(Clone)]
@@ -1270,10 +1300,12 @@ fn execute_command(
             parent_id,
             model,
         } => {
-            if model
-                .model
-                .as_ref()
-                .is_some_and(|value| value.len() > MAX_MODEL_SELECTION_BYTES)
+            if !model.model.as_ref().is_some_and(|value| {
+                value.len() <= MAX_MODEL_SELECTION_BYTES
+                    && value
+                        .split_once('/')
+                        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+            }) || model.max_output_tokens == Some(0)
                 || model
                     .organization
                     .as_ref()
@@ -1856,15 +1888,36 @@ fn complete_run(
         serde_json::to_string(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
     let usage_json = accounting
         .as_ref()
-        .map(|accounting| serde_json::to_string(&accounting.usage))
+        .and_then(|accounting| accounting.usage.as_ref())
+        .map(serde_json::to_string)
         .transpose()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let cost = accounting.as_ref().and_then(|accounting| {
         accounting
-            .pricing
-            .as_ref()
-            .and_then(|pricing| run_cost(accounting.usage, pricing))
+            .usage
+            .and_then(|usage| {
+                accounting
+                    .pricing
+                    .as_ref()
+                    .and_then(|pricing| run_cost(usage, pricing))
+            })
+            .and_then(|cost| i64::try_from(cost).ok())
     });
+    let (current_cost, current_cost_known) = transaction
+        .query_row(
+            "SELECT estimated_cost_usd_nanos, cost_known FROM sessions WHERE id = ?1",
+            [claimed.session_id.to_string()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let (next_cost, next_cost_known) = if accounting.is_some() {
+        match cost.and_then(|cost| current_cost.checked_add(cost)) {
+            Some(cost) if current_cost_known => (cost, true),
+            _ => (current_cost, false),
+        }
+    } else {
+        (current_cost, current_cost_known)
+    };
     transaction
         .execute(
             "UPDATE runs
@@ -1892,19 +1945,16 @@ fn complete_run(
             "UPDATE sessions
              SET active_run_id = NULL,
                   status = CASE WHEN queued_prompts > 0 THEN 'queued' ELSE 'idle' END,
-                  estimated_cost_usd_nanos = estimated_cost_usd_nanos + COALESCE(?4, 0),
-                  cost_known = CASE
-                      WHEN ?5 = 1 AND ?4 IS NULL THEN 0
-                      ELSE cost_known
-                  END,
+                  estimated_cost_usd_nanos = ?4,
+                  cost_known = ?5,
                   updated_at_ms = ?2
              WHERE id = ?1 AND active_run_id = ?3",
             params![
                 claimed.session_id.to_string(),
                 now,
                 claimed.run_id.to_string(),
-                cost,
-                matches!(outcome, RunOutcome::Completed),
+                next_cost,
+                next_cost_known,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2476,22 +2526,39 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
 }
 
 fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
+    let total_input = usage
+        .input_tokens
+        .checked_add(usage.cache_read_input_tokens)?
+        .checked_add(usage.cache_write_input_tokens)?;
+    let tier = pricing
+        .context_tier
+        .as_ref()
+        .filter(|tier| total_input > tier.above_input_tokens);
+    let input_rate = tier.map_or(pricing.input_usd_nanos_per_token, |tier| {
+        tier.input_usd_nanos_per_token
+    });
+    let output_rate = tier.map_or(pricing.output_usd_nanos_per_token, |tier| {
+        tier.output_usd_nanos_per_token
+    });
+    let cache_read_price = tier
+        .and_then(|tier| tier.cache_read_usd_nanos_per_token)
+        .or(pricing.cache_read_usd_nanos_per_token);
+    let cache_write_price = tier
+        .and_then(|tier| tier.cache_write_usd_nanos_per_token)
+        .or(pricing.cache_write_usd_nanos_per_token);
     let cache_read_rate = if usage.cache_read_input_tokens == 0 {
         0
     } else {
-        pricing.cache_read_usd_nanos_per_token?
+        cache_read_price?
     };
     let cache_write_rate = if usage.cache_write_input_tokens == 0 {
         0
     } else {
-        pricing.cache_write_usd_nanos_per_token?
+        cache_write_price?
     };
     let total = u128::from(usage.input_tokens)
-        .checked_mul(u128::from(pricing.input_usd_nanos_per_token))?
-        .checked_add(
-            u128::from(usage.output_tokens)
-                .checked_mul(u128::from(pricing.output_usd_nanos_per_token))?,
-        )?
+        .checked_mul(u128::from(input_rate))?
+        .checked_add(u128::from(usage.output_tokens).checked_mul(u128::from(output_rate))?)?
         .checked_add(
             u128::from(usage.cache_read_input_tokens).checked_mul(u128::from(cache_read_rate))?,
         )?
@@ -2647,6 +2714,7 @@ mod tests {
                             output_usd_nanos_per_token: 2_000,
                             cache_read_usd_nanos_per_token: Some(100),
                             cache_write_usd_nanos_per_token: Some(300),
+                            context_tier: None,
                             provenance: "test".to_owned(),
                         }),
                     })
@@ -2765,6 +2833,98 @@ mod tests {
         .await
         .unwrap();
         (directory, runtime)
+    }
+
+    #[test]
+    fn version_one_migration_is_atomic_and_marks_historical_cost_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata VALUES ('schema_version', '1');
+                 CREATE TABLE workspaces (
+                     id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                     next_sequence INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO workspaces VALUES ('workspace', '/workspace', 0);
+                 CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY,
+                     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                     parent_id TEXT REFERENCES sessions(id),
+                     title TEXT NOT NULL, status TEXT NOT NULL, active_run_id TEXT,
+                     queued_prompts INTEGER NOT NULL DEFAULT 0, model TEXT,
+                     max_output_tokens INTEGER, organization TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO sessions VALUES (
+                     'old', 'workspace', NULL, 'Old', 'idle', NULL, 0,
+                     'openai/gpt-test', 100, NULL, 1, 1
+                 );
+                 CREATE TABLE runs (
+                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                     command_id TEXT NOT NULL UNIQUE, user_message_id TEXT NOT NULL,
+                     assistant_message_id TEXT NOT NULL, status TEXT NOT NULL,
+                     cancel_requested INTEGER NOT NULL DEFAULT 0, outcome_json TEXT,
+                     created_at_ms INTEGER NOT NULL, started_at_ms INTEGER,
+                     finished_at_ms INTEGER
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "2"
+        );
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT cost_known FROM sessions WHERE id = 'old'",
+                    [],
+                    |row| { row.get::<_, bool>(0) }
+                )
+                .unwrap()
+        );
+        assert!(has_column(&connection, "runs", "usage_json").unwrap());
+    }
+
+    #[test]
+    fn cost_uses_the_context_tier_and_cache_rates() {
+        let pricing = ModelPricing {
+            input_usd_nanos_per_token: 1,
+            output_usd_nanos_per_token: 2,
+            cache_read_usd_nanos_per_token: Some(1),
+            cache_write_usd_nanos_per_token: Some(2),
+            context_tier: Some(qq_protocol::ModelPricingTier {
+                above_input_tokens: 10,
+                input_usd_nanos_per_token: 10,
+                output_usd_nanos_per_token: 20,
+                cache_read_usd_nanos_per_token: Some(3),
+                cache_write_usd_nanos_per_token: Some(4),
+            }),
+            provenance: "test".to_owned(),
+        };
+        assert_eq!(
+            run_cost(
+                TokenUsage {
+                    input_tokens: 8,
+                    cache_read_input_tokens: 2,
+                    cache_write_input_tokens: 1,
+                    output_tokens: 3,
+                },
+                &pricing,
+            ),
+            Some(8 * 10 + 2 * 3 + 4 + 3 * 20)
+        );
     }
 
     async fn resolve_workspace(
@@ -3201,7 +3361,11 @@ mod tests {
                 SessionCommand::CreateSession {
                     workspace_id,
                     parent_id: None,
-                    model: ModelSelection::default(),
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
                 },
             )
             .await

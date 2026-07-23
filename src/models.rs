@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use qq_protocol::ModelPricing;
+use qq_protocol::{ModelPricing, ModelPricingTier};
 
 use crate::config::ModelMetadata;
 
@@ -92,7 +92,7 @@ pub(crate) fn builtin_models(provider: &str) -> BTreeMap<String, ModelMetadata> 
                 true,
                 1_050_000,
                 128_000,
-                Some((5_000, 30_000, 500, 0)),
+                Some((5_000, 30_000, 500, 6_250)),
             ),
             (
                 "gpt-5.6-sol",
@@ -100,7 +100,7 @@ pub(crate) fn builtin_models(provider: &str) -> BTreeMap<String, ModelMetadata> 
                 true,
                 1_050_000,
                 128_000,
-                Some((5_000, 30_000, 500, 0)),
+                Some((5_000, 30_000, 500, 6_250)),
             ),
             (
                 "gpt-5.6-luna",
@@ -108,7 +108,7 @@ pub(crate) fn builtin_models(provider: &str) -> BTreeMap<String, ModelMetadata> 
                 true,
                 1_050_000,
                 128_000,
-                Some((1_000, 6_000, 100, 0)),
+                Some((1_000, 6_000, 100, 1_250)),
             ),
             (
                 "gpt-5.4",
@@ -409,6 +409,7 @@ pub(crate) fn builtin_models(provider: &str) -> BTreeMap<String, ModelMetadata> 
                 output_usd_nanos_per_token: output,
                 cache_read_usd_nanos_per_token: Some(cache_read),
                 cache_write_usd_nanos_per_token: (cache_write != 0).then_some(cache_write),
+                context_tier: context_tier(provider, id),
                 provenance: PROVENANCE.to_owned(),
             });
             (
@@ -417,4 +418,24 @@ pub(crate) fn builtin_models(provider: &str) -> BTreeMap<String, ModelMetadata> 
             )
         })
         .collect()
+}
+
+fn context_tier(provider: &str, model: &str) -> Option<ModelPricingTier> {
+    let (above, input, output, cache_read, cache_write) = match (provider, model) {
+        ("openai", "gpt-5.6" | "gpt-5.6-sol") => {
+            (272_000, 10_000, 45_000, Some(1_000), Some(12_500))
+        }
+        ("openai", "gpt-5.6-luna") => (272_000, 2_000, 9_000, Some(200), Some(2_500)),
+        ("openai", "gpt-5.4") => (272_000, 5_000, 22_500, Some(500), None),
+        ("google", "gemini-2.5-pro") => (200_000, 2_500, 15_000, Some(250), None),
+        ("google", "gemini-3.1-pro-preview") => (200_000, 4_000, 18_000, Some(400), None),
+        _ => return None,
+    };
+    Some(ModelPricingTier {
+        above_input_tokens: above,
+        input_usd_nanos_per_token: input,
+        output_usd_nanos_per_token: output,
+        cache_read_usd_nanos_per_token: cache_read,
+        cache_write_usd_nanos_per_token: cache_write,
+    })
 }

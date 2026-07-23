@@ -92,7 +92,38 @@ pub struct ModelPricing {
     pub cache_read_usd_nanos_per_token: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tier: Option<ModelPricingTier>,
     pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricingTier {
+    pub above_input_tokens: u64,
+    pub input_usd_nanos_per_token: u64,
+    pub output_usd_nanos_per_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_usd_nanos_per_token: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalogRequest {
+    pub workspace: String,
+    pub selection: ModelSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDescriptor {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub selection: ModelSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

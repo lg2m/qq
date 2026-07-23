@@ -78,6 +78,7 @@ pub(crate) struct App {
     pub sessions: HashMap<SessionId, SessionView>,
     pub focused: Option<SessionId>,
     pub navigator: Option<SessionId>,
+    pub navigator_open: bool,
     pub model_picker: Option<ModelPicker>,
     pub input: String,
     pub connection: ConnectionState,
@@ -101,6 +102,7 @@ impl App {
             sessions: HashMap::new(),
             focused: None,
             navigator: None,
+            navigator_open: false,
             model_picker: None,
             input: String::new(),
             connection: ConnectionState::Connecting,
@@ -126,6 +128,7 @@ impl App {
                 self.sessions.clear();
                 self.focused = None;
                 self.navigator = None;
+                self.navigator_open = false;
                 self.model_picker = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
@@ -419,7 +422,7 @@ impl App {
                 let changed = self.push_model_search(&text);
                 (changed, Vec::new())
             }
-            Event::Paste(text) if self.navigator.is_none() => {
+            Event::Paste(text) if !self.navigator_open => {
                 let before = self.input.len();
                 for character in text.chars() {
                     if self.input.len() + character.len_utf8() > MAX_INPUT_BYTES {
@@ -444,7 +447,7 @@ impl App {
         if self.model_picker.is_some() {
             return self.handle_model_picker_key(key);
         }
-        if self.navigator.is_some() {
+        if self.navigator_open {
             return self.handle_navigator_key(key.code);
         }
         if let Some(action) = self.settings.action_for(key) {
@@ -482,12 +485,15 @@ impl App {
             Action::PreviousLayout => self.layout = self.layout.previous(),
             Action::ToggleNavigator => {
                 self.model_picker = None;
-                self.navigator = if self.navigator.is_some() {
-                    None
+                if self.navigator_open {
+                    self.navigator = None;
+                    self.navigator_open = false;
                 } else {
-                    self.focused
-                        .or_else(|| self.thread_order().first().copied())
-                };
+                    self.navigator = self
+                        .focused
+                        .or_else(|| self.thread_order().first().copied());
+                    self.navigator_open = true;
+                }
             }
             Action::CreateRootSession => return self.create_session(None),
             Action::CreateChildSession => return self.create_session(self.focused),
@@ -502,6 +508,7 @@ impl App {
             return (true, Vec::new());
         }
         self.navigator = None;
+        self.navigator_open = false;
         self.model_picker = Some(ModelPicker {
             query: String::new(),
             selected: 0,
@@ -610,8 +617,11 @@ impl App {
     fn handle_navigator_key(&mut self, code: KeyCode) -> (bool, Vec<ClientRequest>) {
         let order = self.thread_order();
         if order.is_empty() {
-            self.navigator = None;
-            return (true, Vec::new());
+            if code == KeyCode::Esc {
+                self.navigator_open = false;
+                return (true, Vec::new());
+            }
+            return (false, Vec::new());
         }
         let selected = self.navigator.unwrap_or(order[0]);
         let position = order
@@ -621,6 +631,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.navigator = None;
+                self.navigator_open = false;
                 (true, Vec::new())
             }
             KeyCode::Up => {
@@ -633,6 +644,7 @@ impl App {
             }
             KeyCode::Enter => {
                 self.navigator = None;
+                self.navigator_open = false;
                 self.focus_session(selected)
             }
             _ => (false, Vec::new()),
@@ -664,6 +676,14 @@ impl App {
         parent_id: Option<SessionId>,
         model: ModelSelection,
     ) -> (bool, Vec<ClientRequest>) {
+        if !model.model.as_ref().is_some_and(|route| {
+            route
+                .split_once('/')
+                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        }) {
+            self.status = Some("choose a model with /models before creating a session".to_owned());
+            return (true, Vec::new());
+        }
         let Some(workspace_id) = self.workspace_id else {
             self.status = Some("workspace is still connecting".to_owned());
             return (true, Vec::new());
@@ -707,6 +727,7 @@ impl App {
                 self.navigator = self
                     .focused
                     .or_else(|| self.thread_order().first().copied());
+                self.navigator_open = true;
                 return (true, Vec::new());
             }
             _ => {}
@@ -955,6 +976,7 @@ mod tests {
         assert!(app.navigator.is_some());
 
         app.navigator = None;
+        app.navigator_open = false;
         app.input = "/quit".to_owned();
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(requests.is_empty());
@@ -1000,6 +1022,21 @@ mod tests {
             } if model == &selection
         ));
         assert!(app.model_picker.is_none());
+    }
+
+    #[test]
+    fn session_shortcuts_require_a_selected_model() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        app.model = ModelSelection::default();
+
+        let (_, requests) = app.handle_action(Action::CreateRootSession);
+
+        assert!(requests.is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("choose a model with /models before creating a session")
+        );
     }
 
     #[test]

@@ -17,9 +17,9 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use qq_protocol::{
-    AskRequest, CommandId, CommandReceipt, CommandRequest, EventCursor, ModelSelection,
-    PROTOCOL_VERSION, RunEvent, SessionCommand, SessionEventEnvelope, SnapshotRequest, WorkspaceId,
-    WorkspaceSnapshot,
+    AskRequest, CommandId, CommandReceipt, CommandRequest, EventCursor, ModelCatalogRequest,
+    ModelDescriptor, ModelSelection, PROTOCOL_VERSION, RunEvent, SessionCommand,
+    SessionEventEnvelope, SnapshotRequest, WorkspaceId, WorkspaceSnapshot,
 };
 use qq_tui::{
     ClientFailure as TuiClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState,
@@ -46,6 +46,7 @@ const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_SSE_WIRE_EVENT_BYTES: usize = MAX_EVENT_BYTES + 16 * 1024;
 const MAX_SSE_LINE_BYTES: usize = MAX_SSE_WIRE_EVENT_BYTES;
 const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const TUI_REQUEST_CAPACITY: usize = 64;
 const TUI_UPDATE_CAPACITY: usize = 256;
 const TUI_CONCURRENT_REQUESTS: usize = 8;
@@ -74,7 +75,7 @@ impl TuiClient {
     pub fn start(
         connection: Connection,
         workspace: PathBuf,
-        model: ModelSelection,
+        model: Option<ModelSelection>,
     ) -> Result<Self, ClientError> {
         let client = SessionClient::new(connection)?;
         let (request_tx, request_rx) = mpsc::channel(TUI_REQUEST_CAPACITY);
@@ -109,7 +110,7 @@ impl ClientPort for TuiClient {
 async fn run_tui_client(
     mut client: SessionClient,
     workspace: PathBuf,
-    model: ModelSelection,
+    model: Option<ModelSelection>,
     mut requests: mpsc::Receiver<ClientRequest>,
     updates: mpsc::Sender<ClientUpdate>,
 ) {
@@ -120,13 +121,14 @@ async fn run_tui_client(
     {
         return;
     }
-    let (mut workspace_id, snapshot) = match bootstrap_tui(&client, &workspace, &model).await {
-        Ok(bootstrap) => bootstrap,
-        Err(error) => {
-            send_bootstrap_failure(&updates, error).await;
-            return;
-        }
-    };
+    let (mut workspace_id, snapshot) =
+        match bootstrap_tui(&client, &workspace, model.as_ref()).await {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                send_bootstrap_failure(&updates, error).await;
+                return;
+            }
+        };
     let mut cursor = snapshot.cursor;
     if updates
         .send(ClientUpdate::Snapshot(snapshot))
@@ -150,7 +152,7 @@ async fn run_tui_client(
             Ok(events) => events,
             Err(error) => {
                 if let Some((recovered_client, recovered_workspace, snapshot)) =
-                    recover_tui_client(&client, &workspace, &model, &error).await
+                    recover_tui_client(&client, &workspace, model.as_ref(), &error).await
                 {
                     client = recovered_client;
                     workspace_id = recovered_workspace;
@@ -238,7 +240,7 @@ async fn run_tui_client(
         }
         if let Some(error) = reset_error {
             if let Some((recovered_client, recovered_workspace, snapshot)) =
-                recover_tui_client(&client, &workspace, &model, &error).await
+                recover_tui_client(&client, &workspace, model.as_ref(), &error).await
             {
                 client = recovered_client;
                 workspace_id = recovered_workspace;
@@ -269,7 +271,7 @@ async fn run_tui_client(
 async fn bootstrap_tui(
     client: &SessionClient,
     workspace: &Path,
-    model: &ModelSelection,
+    model: Option<&ModelSelection>,
 ) -> Result<(WorkspaceId, WorkspaceSnapshot), ClientError> {
     let (workspace_id, _) = client.resolve_workspace(workspace).await?;
     let snapshot = client
@@ -282,7 +284,7 @@ async fn bootstrap_tui(
         .await?;
     let focused = if let Some(session) = snapshot.sessions.first() {
         session.id
-    } else {
+    } else if let Some(model) = model {
         let receipt = client
             .command(
                 CommandId::generate().map_err(|_| ClientError::Unavailable)?,
@@ -297,6 +299,8 @@ async fn bootstrap_tui(
             return Err(ClientError::MalformedEvent);
         };
         session_id
+    } else {
+        return Ok((workspace_id, snapshot));
     };
     let snapshot = client
         .snapshot(SnapshotRequest {
@@ -312,7 +316,7 @@ async fn bootstrap_tui(
 async fn recover_tui_client(
     current: &SessionClient,
     workspace: &Path,
-    model: &ModelSelection,
+    model: Option<&ModelSelection>,
     error: &ClientError,
 ) -> Option<(SessionClient, WorkspaceId, WorkspaceSnapshot)> {
     if matches!(
@@ -460,6 +464,14 @@ impl SessionClient {
         request: SnapshotRequest,
     ) -> Result<WorkspaceSnapshot, ClientError> {
         self.post_json("/v1/workspaces/snapshot", &request, MAX_SNAPSHOT_BYTES)
+            .await
+    }
+
+    pub async fn models(
+        &self,
+        request: ModelCatalogRequest,
+    ) -> Result<Vec<ModelDescriptor>, ClientError> {
+        self.post_json("/v1/models", &request, MAX_MODEL_CATALOG_BYTES)
             .await
     }
 

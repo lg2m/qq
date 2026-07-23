@@ -195,7 +195,7 @@ impl FrameRenderer {
         let body_height = height.saturating_sub(5);
         let body = if app.model_picker.is_some() {
             model_picker(app, width, body_height)
-        } else if app.navigator.is_some() {
+        } else if app.navigator_open {
             navigator(app, width)
         } else {
             match app.layout {
@@ -215,7 +215,7 @@ impl FrameRenderer {
     }
 
     fn prune_markdown(&mut self, app: &App) {
-        let visible = if app.navigator.is_none() && app.model_picker.is_none() {
+        let visible = if !app.navigator_open && app.model_picker.is_none() {
             app.focused
                 .and_then(|session_id| app.sessions.get(&session_id))
                 .and_then(|session| session.messages.as_ref())

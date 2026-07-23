@@ -110,7 +110,6 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         Ok::<_, runtime::RuntimeBuildError>((snapshot, tui))
     })
     .await??;
-    let models = factory.model_options(&snapshot);
     let mut embedded = None;
     let connection = if let Some(connection) = client::discover().await? {
         connection
@@ -127,17 +126,35 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     };
 
     let workspace = std::fs::canonicalize(std::env::current_dir()?)?;
-    let model = qq_protocol::ModelSelection {
+    let configured_model = qq_protocol::ModelSelection {
         model: Some(snapshot.model().as_str().to_owned()),
         max_output_tokens: Some(snapshot.max_output_tokens()),
         organization: snapshot.organization().map(str::to_owned),
     };
+    let models = client::SessionClient::new(connection.clone())?
+        .models(qq_protocol::ModelCatalogRequest {
+            workspace: workspace.to_string_lossy().into_owned(),
+            selection: configured_model.clone(),
+        })
+        .await?
+        .into_iter()
+        .map(|model| qq_tui::ModelOption {
+            provider: model.provider,
+            model: model.model,
+            name: model.name,
+            selection: model.selection,
+        })
+        .collect::<Vec<_>>();
+    let model = models
+        .iter()
+        .any(|option| option.selection.model == configured_model.model)
+        .then_some(configured_model);
     let tui_client = client::TuiClient::start(connection, workspace, model.clone())?;
     let result = qq_tui::run(
         tui_client,
         qq_tui::TuiOptions {
             settings: tui.settings().clone(),
-            model,
+            model: model.unwrap_or_default(),
             models,
         },
     )

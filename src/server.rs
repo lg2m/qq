@@ -32,8 +32,9 @@ use directories::ProjectDirs;
 use futures_util::StreamExt;
 use qq_core::{RunStream, SessionEventStream};
 use qq_protocol::{
-    AskRequest, CommandReceipt, CommandRequest, PROTOCOL_VERSION, ServerInfo, SessionCommand,
-    SnapshotRequest, SubscribeRequest, WorkspaceId, WorkspaceSnapshot,
+    AskRequest, CommandReceipt, CommandRequest, ModelCatalogRequest, ModelDescriptor,
+    PROTOCOL_VERSION, ServerInfo, SessionCommand, SnapshotRequest, SubscribeRequest, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -56,6 +57,7 @@ pub(crate) const MAX_ORGANIZATION_BYTES: usize = 512;
 pub(crate) const SESSION_ID_HEX_BYTES: usize = 32;
 pub(crate) const MAX_EVENT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_HEALTH_BYTES: usize = 16 * 1024;
+const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_RETRIES: usize = 8;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -72,6 +74,8 @@ pub type CommandFuture =
     Pin<Box<dyn Future<Output = Result<CommandReceipt, AskHandlerError>> + Send + 'static>>;
 pub type SnapshotFuture =
     Pin<Box<dyn Future<Output = Result<WorkspaceSnapshot, AskHandlerError>> + Send + 'static>>;
+pub type ModelsFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<ModelDescriptor>, AskHandlerError>> + Send + 'static>>;
 
 /// Root-supplied application seam for handling one request.
 pub trait AskHandler: Send + Sync + 'static {
@@ -84,6 +88,10 @@ pub trait AskHandler: Send + Sync + 'static {
     }
 
     fn snapshot(&self, _request: SnapshotRequest) -> SnapshotFuture {
+        Box::pin(async { Err(AskHandlerError::Unavailable) })
+    }
+
+    fn models(&self, _request: ModelCatalogRequest) -> ModelsFuture {
         Box::pin(async { Err(AskHandlerError::Unavailable) })
     }
 
@@ -546,6 +554,7 @@ fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router 
         .route("/v1/health", get(health))
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/workspaces/snapshot", post(workspace_snapshot))
+        .route("/v1/models", post(models))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/prompts", post(submit_prompt))
         .route("/v1/runs/cancel", post(cancel_run))
@@ -718,6 +727,48 @@ async fn workspace_snapshot(
     };
     match state.handler.snapshot(request).await {
         Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => handler_error_response(error),
+    }
+}
+
+async fn models(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Response {
+    let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many requests are active",
+        );
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
+    };
+    let request = match serde_json::from_slice::<ModelCatalogRequest>(&body) {
+        Ok(request)
+            if !request.workspace.is_empty()
+                && request.workspace.len() <= MAX_WORKSPACE_BYTES
+                && request
+                    .selection
+                    .model
+                    .as_ref()
+                    .is_none_or(|model| model.len() <= MAX_MODEL_BYTES)
+                && request
+                    .selection
+                    .organization
+                    .as_ref()
+                    .is_none_or(|organization| organization.len() <= MAX_ORGANIZATION_BYTES) =>
+        {
+            request
+        }
+        Ok(_) | Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
+    };
+    match state.handler.models(request).await {
+        Ok(models)
+            if serde_json::to_vec(&models)
+                .is_ok_and(|encoded| encoded.len() <= MAX_MODEL_CATALOG_BYTES) =>
+        {
+            Json(models).into_response()
+        }
+        Ok(_) => handler_error_response(AskHandlerError::Internal),
         Err(error) => handler_error_response(error),
     }
 }
@@ -1396,11 +1447,49 @@ mod tests {
         AskRequest::new(prompt, PathBuf::from("/test/workspace"))
     }
 
+    struct CatalogHandler;
+
+    impl AskHandler for CatalogHandler {
+        fn models(&self, request: ModelCatalogRequest) -> ModelsFuture {
+            Box::pin(async move {
+                Ok(vec![ModelDescriptor {
+                    provider: "openai".to_owned(),
+                    model: "gpt-test".to_owned(),
+                    name: Some("GPT Test".to_owned()),
+                    selection: request.selection,
+                }])
+            })
+        }
+    }
+
     async fn start_test_server(paths: ServerPaths, handler: Arc<dyn AskHandler>) -> ServerHandle {
         match start(handler, ServerOptions::new(paths)).await.unwrap() {
             StartOutcome::Started(handle) => handle,
             StartOutcome::Existing(_) => panic!("test unexpectedly found an existing server"),
         }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_is_authenticated_and_round_trips() {
+        let directory = TestDirectory::new();
+        let server = start_test_server(directory.paths(), Arc::new(CatalogHandler)).await;
+        let client = crate::client::SessionClient::new(server.connection().clone()).unwrap();
+        let selection = qq_protocol::ModelSelection {
+            model: Some("openai/gpt-test".to_owned()),
+            max_output_tokens: Some(100),
+            organization: None,
+        };
+        let models = client
+            .models(ModelCatalogRequest {
+                workspace: "/test/workspace".to_owned(),
+                selection: selection.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].selection, selection);
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]
