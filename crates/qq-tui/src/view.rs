@@ -17,13 +17,15 @@ use qq_protocol::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::{Action, Layout, app::App, app::terminal_safe_character};
+use crate::{Layout, app::App, app::terminal_safe_character};
 
 const MAX_RENDER_WIDTH: u16 = 320;
 const MAX_RENDER_HEIGHT: u16 = 160;
 const MAX_MARKDOWN_BYTES: usize = 32 * 1024;
 const MAX_VISIBLE_MESSAGES: usize = 64;
 const MAX_CACHED_MARKDOWN_ROWS: usize = MAX_RENDER_HEIGHT as usize;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Style {
@@ -119,6 +121,14 @@ fn accent() -> Style {
     Style::color(Color::Cyan)
 }
 
+fn brand() -> Style {
+    Style::color(Color::Rgb {
+        r: 255,
+        g: 159,
+        b: 67,
+    })
+}
+
 fn warning() -> Style {
     Style::color(Color::Yellow)
 }
@@ -182,7 +192,7 @@ impl FrameRenderer {
         if width < 32 || height < 9 {
             return fit_height(
                 vec![
-                    Line::styled(" qq", accent().bold()),
+                    Line::styled(" qq", brand().bold()),
                     Line::default(),
                     Line::styled("Terminal is too small.", warning()),
                     Line::styled("Resize to at least 32 x 9. Ctrl-C exits.", muted()),
@@ -203,21 +213,21 @@ impl FrameRenderer {
                 Layout::FoldFocus => self.fold_focus(app, width),
             }
         };
-        if app.model_picker.is_some() {
-            lines.extend(body);
+        let mut body = if app.model_picker.is_some() {
+            body
         } else if app.navigator_open {
-            lines.extend(tail_viewport(body, body_height));
+            tail_viewport(body, body_height)
         } else {
             app.update_transcript_viewport(body.len(), body_height);
-            lines.extend(transcript_viewport(
-                body,
-                body_height,
-                app.transcript_scroll_offset(),
-            ));
+            transcript_viewport(body, body_height, app.transcript_scroll_offset())
+        };
+        if app.model_picker.is_none() && !app.navigator_open {
+            overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
         }
-        lines.push(Line::styled("-".repeat(width), muted()));
+        lines.extend(body);
         lines.push(composer(app, width));
-        lines.push(help(app, width));
+        lines.push(footer_context(app, width));
+        lines.push(footer_workspace(app, width));
         fit_height(lines, height)
     }
 
@@ -253,14 +263,14 @@ impl FrameRenderer {
             "conversation with child work in one chronology",
         )];
         lines.push(Line::default());
-        lines.extend(self.transcript(app, width, true));
+        lines.extend(self.transcript(app, width));
         if let Some(focused) = app.focused {
             let children = child_sessions(app, focused);
             if !children.is_empty() {
                 lines.push(Line::default());
                 lines.push(Line::styled("  +-- related sessions", muted().bold()));
                 for child in children {
-                    lines.push(session_line(app, child, width, "  |  "));
+                    lines.push(session_line(app, child, width, "     "));
                 }
             }
         }
@@ -297,7 +307,7 @@ impl FrameRenderer {
             lines.push(Line::default());
         }
         for message in messages.iter().skip(messages.len().saturating_sub(2)) {
-            lines.extend(self.render_message(message, content_width, false));
+            lines.extend(self.render_message(message, content_width));
             lines.push(Line::default());
         }
         for prompt in app.pending_prompts(session_id) {
@@ -314,7 +324,7 @@ impl FrameRenderer {
         lines
     }
 
-    fn transcript(&mut self, app: &App, width: usize, rail: bool) -> Vec<Line> {
+    fn transcript(&mut self, app: &App, width: usize) -> Vec<Line> {
         let Some(session_id) = app.focused else {
             return vec![Line::styled("  Alt-N creates the first session.", muted())];
         };
@@ -340,18 +350,18 @@ impl FrameRenderer {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            lines.extend(self.render_message(message, width, rail));
+            lines.extend(self.render_message(message, width));
         }
         for prompt in app.pending_prompts(session_id) {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            let mut line = Line::styled(if rail { "  :  " } else { "  " }, muted());
+            let mut line = Line::styled("  ", muted());
             line.push("YOU  pending", warning().bold());
             lines.push(line);
             lines.extend(indent_lines(
-                bounded_markdown_lines(prompt, width.saturating_sub(5)),
-                if rail { "  :  " } else { "   " },
+                bounded_markdown_lines(prompt, width.saturating_sub(3)),
+                "   ",
                 width,
             ));
         }
@@ -364,8 +374,8 @@ impl FrameRenderer {
         lines
     }
 
-    fn render_message(&mut self, message: &MessageSnapshot, width: usize, rail: bool) -> Vec<Line> {
-        let prefix = if rail { "  |  " } else { "   " };
+    fn render_message(&mut self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
+        let prefix = "   ";
         let role = match message.role {
             MessageRole::User => "YOU",
             MessageRole::Assistant => "QQ",
@@ -446,30 +456,19 @@ fn message_content(message: &MessageSnapshot) -> Cow<'_, str> {
 }
 
 fn header(app: &App, width: usize) -> Line {
-    let mut line = Line::styled(" qq ", accent().bold());
-    for (layout, action, name) in [
-        (Layout::Threadline, Action::SelectThreadline, "Threadline"),
-        (Layout::FoldFocus, Action::SelectFoldFocus, "Fold / Focus"),
-    ] {
-        let key = app
-            .settings
-            .binding_label(action)
-            .unwrap_or_else(|| "-".to_owned());
-        let style = if app.layout == layout {
-            normal().bold()
-        } else {
-            muted()
-        };
-        line.push(format!(" {key} {name} "), style);
-    }
+    let mut left = Line::styled(" qq", brand().bold());
+    left.push(format!("  {VERSION} {GIT_COMMIT}"), muted());
+    let mut right = Line::styled("local", normal());
     let connection = match app.connection {
-        crate::ConnectionState::Connecting => "connecting",
-        crate::ConnectionState::Replaying => "replaying",
-        crate::ConnectionState::Live => "live",
-        crate::ConnectionState::Offline => "offline",
+        crate::ConnectionState::Connecting => Some("connecting"),
+        crate::ConnectionState::Replaying => Some("reconnecting"),
+        crate::ConnectionState::Live => None,
+        crate::ConnectionState::Offline => Some("offline"),
     };
-    line.push(format!("  {connection}"), muted());
-    truncate_line(line, width)
+    if let Some(connection) = connection {
+        right.push(format!("  {connection}"), warning());
+    }
+    align_sides(left, right, width)
 }
 
 fn context(app: &App, width: usize) -> Line {
@@ -648,21 +647,14 @@ fn composer(app: &App, width: usize) -> Line {
     truncate_line(line, width)
 }
 
-fn help(app: &App, width: usize) -> Line {
-    let label = |action| {
-        app.settings
-            .binding_label(action)
-            .unwrap_or_else(|| "-".to_owned())
+fn footer_context(app: &App, width: usize) -> Line {
+    let context = match app.focused_context_usage() {
+        Some((tokens, limit)) if limit > 0 => {
+            let tenths = u128::from(tokens) * 1_000 / u128::from(limit);
+            format!(" context: {}.{}%", tenths / 10, tenths % 10)
+        }
+        Some(_) | None => " context: unavailable".to_owned(),
     };
-    let mut left = Line::styled(
-        format!(
-            " {} sessions  {} root  {} child",
-            label(Action::ToggleNavigator),
-            label(Action::CreateRootSession),
-            label(Action::CreateChildSession),
-        ),
-        muted(),
-    );
     let focused = app
         .focused
         .and_then(|id| app.sessions.get(&id))
@@ -671,18 +663,79 @@ fn help(app: &App, width: usize) -> Line {
         .and_then(|session| session.model.as_deref())
         .or(app.model.model.as_deref())
         .unwrap_or("default");
-    let model = match focused.and_then(|session| session.estimated_cost_usd_nanos) {
-        Some(cost) => format!("model: {selected_model}  cost: {} ", format_cost(cost)),
-        None if focused.is_some() => format!("model: {selected_model}  cost: unavailable "),
-        None => format!("model: {selected_model} "),
+    align_sides(
+        Line::styled(context, muted()),
+        Line::styled(format!("model: {selected_model} "), accent()),
+        width,
+    )
+}
+
+fn footer_workspace(app: &App, width: usize) -> Line {
+    let workspace = if app.workspace_path.is_empty() {
+        "cwd: connecting".to_owned()
+    } else {
+        format!("cwd: {}", app.workspace_path)
     };
-    let model_width = Line::styled(&model, muted()).width();
-    if model_width >= width {
-        return truncate_line(Line::styled(model, accent()), width);
+    let cost = app
+        .focused
+        .and_then(|id| app.sessions.get(&id))
+        .and_then(|session| session.summary.estimated_cost_usd_nanos)
+        .map_or_else(
+            || "cost: unavailable ".to_owned(),
+            |cost| format!("cost: {} ", format_cost(cost)),
+        );
+    align_sides(
+        Line::styled(format!(" {workspace}"), muted()),
+        Line::styled(cost, accent()),
+        width,
+    )
+}
+
+fn slash_autocomplete(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let commands = app.filtered_slash_commands();
+    let selected = app.slash_selected().min(commands.len().saturating_sub(1));
+    let visible = height.min(commands.len());
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(commands.len().saturating_sub(visible));
+    commands
+        .into_iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, command)| {
+            let mut line = Line::styled(if index == selected { " > " } else { "   " }, accent());
+            line.push(
+                command.name,
+                if index == selected {
+                    normal().bold()
+                } else {
+                    normal()
+                },
+            );
+            line.push(format!("  {}", command.description), muted());
+            truncate_line(line, width)
+        })
+        .collect()
+}
+
+fn overlay_slash_autocomplete(body: &mut [Line], autocomplete: Vec<Line>) {
+    let start = body.len().saturating_sub(autocomplete.len());
+    for (target, line) in body[start..].iter_mut().zip(autocomplete) {
+        *target = line;
     }
-    left = truncate_line(left, width - model_width);
-    left.push(" ".repeat(width - model_width - left.width()), muted());
-    left.push(model, accent());
+}
+
+fn align_sides(mut left: Line, right: Line, width: usize) -> Line {
+    let right_width = right.width();
+    if right_width >= width {
+        return truncate_line(right, width);
+    }
+    left = truncate_line(left, width - right_width);
+    left.push(" ".repeat(width - right_width - left.width()), muted());
+    for span in right.spans {
+        left.push(span.text, span.style);
+    }
     left
 }
 
@@ -1035,12 +1088,12 @@ fn write_line(output: &mut impl Write, line: &Line) -> io::Result<()> {
 mod tests {
     use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
     use qq_protocol::{
-        EventCursor, RunId, SessionId, SessionSnapshot, SessionStatus, SessionSummary, StoreId,
-        WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+        EventCursor, ModelSelection, RunId, SessionId, SessionSnapshot, SessionStatus,
+        SessionSummary, StoreId, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
     };
 
     use super::*;
-    use crate::{ClientUpdate, TuiOptions};
+    use crate::{ClientUpdate, ModelOption, TuiOptions};
 
     fn completed_message(byte: u8, output: String) -> MessageSnapshot {
         MessageSnapshot {
@@ -1105,6 +1158,13 @@ mod tests {
             .join("\n")
     }
 
+    fn frame_rows(frame: &[Line]) -> Vec<String> {
+        frame
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect()
+    }
+
     #[test]
     fn markdown_rows_remain_within_the_render_width() {
         let lines = markdown_lines("**Streaming** text remains narrow and readable.", 9);
@@ -1146,13 +1206,13 @@ mod tests {
     fn completed_markdown_cache_is_bounded_and_keeps_one_width() {
         let mut renderer = FrameRenderer::default();
         let message = completed_message(1, "hello".to_owned());
-        renderer.render_message(&message, 40, true);
-        renderer.render_message(&message, 80, true);
+        renderer.render_message(&message, 40);
+        renderer.render_message(&message, 80);
         assert_eq!(renderer.markdown.len(), 1);
-        assert_eq!(renderer.markdown[&message.id].width, 75);
+        assert_eq!(renderer.markdown[&message.id].width, 77);
 
         for byte in 2..=u8::try_from(MAX_VISIBLE_MESSAGES + 8).unwrap() {
-            renderer.render_message(&completed_message(byte, byte.to_string()), 80, true);
+            renderer.render_message(&completed_message(byte, byte.to_string()), 80);
         }
         assert!(renderer.markdown.len() <= MAX_VISIBLE_MESSAGES);
     }
@@ -1162,7 +1222,7 @@ mod tests {
         let mut renderer = FrameRenderer::default();
         let output = format!("START-MARKER{}END-MARKER", "x".repeat(MAX_MARKDOWN_BYTES));
         let message = completed_message(1, output);
-        renderer.render_message(&message, 80, true);
+        renderer.render_message(&message, 80);
 
         let cached = &renderer.markdown[&message.id].lines;
         let text = cached
@@ -1184,6 +1244,78 @@ mod tests {
 
         assert!(content.len() <= MAX_MARKDOWN_BYTES);
         assert!(content.ends_with("END"));
+    }
+
+    #[test]
+    fn refreshed_chrome_shows_identity_status_and_session_metrics() {
+        let mut app = app_with_messages(1);
+        app.connection = crate::ConnectionState::Live;
+        app.models.push(ModelOption {
+            provider: "openai".to_owned(),
+            model: "gpt-test".to_owned(),
+            name: Some("GPT Test".to_owned()),
+            context_window: Some(128_000),
+            selection: ModelSelection {
+                model: Some("openai/gpt-test".to_owned()),
+                max_output_tokens: Some(4_096),
+                organization: None,
+            },
+        });
+        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        session.latest_input_tokens = Some(64_000);
+        session.context_window = Some(128_000);
+        let frame = FrameRenderer::default().frame(&mut app, 80, 12);
+        let rows = frame_rows(&frame);
+
+        assert!(rows[0].contains(&format!("qq  {VERSION} {GIT_COMMIT}")));
+        assert!(rows[0].ends_with("local"));
+        assert!(!rows[0].contains("Threadline"));
+        assert!(rows[9].contains("> Ask QQ..."));
+        assert!(rows[10].contains("context: 50.0%"));
+        assert!(rows[10].ends_with("model: openai/gpt-test "));
+        assert!(rows[11].contains("cwd: /workspace"));
+        assert!(rows[11].ends_with("cost: $0.00 "));
+        assert_eq!(frame[0].spans[0].style, brand().bold());
+    }
+
+    #[test]
+    fn header_only_qualifies_local_when_the_connection_has_a_problem() {
+        let mut app = app_with_messages(0);
+        for (connection, expected) in [
+            (crate::ConnectionState::Connecting, "local  connecting"),
+            (crate::ConnectionState::Replaying, "local  reconnecting"),
+            (crate::ConnectionState::Offline, "local  offline"),
+        ] {
+            app.connection = connection;
+            assert!(frame_rows(&[header(&app, 80)])[0].ends_with(expected));
+        }
+    }
+
+    #[test]
+    fn threadline_has_no_vertical_message_rails() {
+        let mut app = app_with_messages(2);
+        let frame = FrameRenderer::default().frame(&mut app, 80, 14);
+
+        assert!(frame_rows(&frame).iter().all(|row| !row.contains("  |  ")));
+    }
+
+    #[test]
+    fn slash_autocomplete_is_filtered_above_the_composer() {
+        let mut app = app_with_messages(1);
+        app.input = "/".to_owned();
+        let frame = FrameRenderer::default().frame(&mut app, 80, 16);
+        let text = frame_text(&frame);
+        for command in ["/models", "/sessions", "/resume", "/new", "/quit", "/exit"] {
+            assert!(text.contains(command));
+        }
+
+        app.input = "/qu".to_owned();
+        let frame = FrameRenderer::default().frame(&mut app, 80, 14);
+        let text = frame_text(&frame);
+
+        assert!(text.contains("/quit"));
+        assert!(!text.contains("/models"));
+        assert!(!text.contains("/sessions"));
     }
 
     #[test]

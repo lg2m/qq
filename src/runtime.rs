@@ -102,6 +102,7 @@ impl RuntimeFactory {
                     provider: provider_id.clone(),
                     model: model_id.clone(),
                     name: metadata.name().map(str::to_owned),
+                    context_window: metadata.context_window(),
                     selection: qq_protocol::ModelSelection {
                         model: Some(format!("{provider_id}/{model_id}")),
                         max_output_tokens: Some(
@@ -123,10 +124,12 @@ impl RuntimeFactory {
             && let Some(provider) = snapshot.providers().get(snapshot.model().provider())
             && self.provider_authenticated(snapshot.model().provider(), provider)
         {
+            let metadata = provider.models().get(snapshot.model().model());
             options.push(ModelDescriptor {
                 provider: snapshot.model().provider().to_owned(),
                 model: snapshot.model().model().to_owned(),
                 name: None,
+                context_window: metadata.and_then(|metadata| metadata.context_window()),
                 selection: qq_protocol::ModelSelection {
                     model: Some(snapshot.model().as_str().to_owned()),
                     max_output_tokens: Some(snapshot.max_output_tokens()),
@@ -1102,6 +1105,13 @@ mod tests {
         assert!(!options.is_empty());
         assert!(options.iter().all(|option| option.provider == "openai"));
         assert!(options.iter().any(|option| option.model == "gpt-5.6"));
+        assert!(
+            options
+                .iter()
+                .find(|option| option.model == "gpt-5.6")
+                .and_then(|option| option.context_window)
+                .is_some()
+        );
     }
 
     #[test]

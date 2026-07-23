@@ -142,6 +142,7 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
             provider: model.provider,
             model: model.model,
             name: model.name,
+            context_window: model.context_window,
             selection: model.selection,
         })
         .collect::<Vec<_>>();
