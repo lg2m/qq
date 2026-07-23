@@ -51,10 +51,11 @@ where
 }
 
 /// A provider-neutral model generation request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
     model: Arc<str>,
     messages: Vec<Message>,
+    tools: Vec<ToolSpec>,
     max_output_tokens: u32,
 }
 
@@ -64,8 +65,16 @@ impl ModelRequest {
         Self {
             model: model.into(),
             messages,
+            tools: Vec::new(),
             max_output_tokens,
         }
+    }
+
+    /// Declares the tools the model may call during this request.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
+        self.tools = tools;
+        self
     }
 
     #[must_use]
@@ -79,32 +88,95 @@ impl ModelRequest {
     }
 
     #[must_use]
+    pub fn tools(&self) -> &[ToolSpec] {
+        &self.tools
+    }
+
+    #[must_use]
     pub const fn max_output_tokens(&self) -> u32 {
         self.max_output_tokens
     }
 }
 
-/// A text message in model context.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    role: Role,
-    content: String,
+/// A tool the model may call, described provider-neutrally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
 }
 
-impl Message {
+impl ToolSpec {
     #[must_use]
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
         Self {
-            role: Role::User,
-            content: content.into(),
+            name: name.into(),
+            description: description.into(),
+            input_schema,
         }
     }
 
     #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    #[must_use]
+    pub const fn input_schema(&self) -> &serde_json::Value {
+        &self.input_schema
+    }
+}
+
+/// A message in model context, holding ordered content blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    role: Role,
+    content: Vec<ContentBlock>,
+}
+
+impl Message {
+    #[must_use]
+    pub fn new(role: Role, content: Vec<ContentBlock>) -> Self {
+        Self { role, content }
+    }
+
+    /// A user message with one text block.
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: content.into(),
+            }],
+        }
+    }
+
+    /// An assistant message with one text block.
+    #[must_use]
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: content.into(),
+            content: vec![ContentBlock::Text {
+                text: content.into(),
+            }],
+        }
+    }
+
+    /// A user-role message carrying tool results back to the model.
+    #[must_use]
+    pub fn tool_results(results: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content: results,
         }
     }
 
@@ -114,9 +186,38 @@ impl Message {
     }
 
     #[must_use]
-    pub fn content(&self) -> &str {
+    pub fn content(&self) -> &[ContentBlock] {
         &self.content
     }
+
+    /// Whether any block carries usable content.
+    #[must_use]
+    pub fn has_content(&self) -> bool {
+        self.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. } => true,
+        })
+    }
+}
+
+/// One ordered unit of message content.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    /// A model-requested tool invocation, valid in assistant messages.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    /// The result of one tool invocation, valid in user messages.
+    ToolResult {
+        call_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +231,9 @@ pub enum Role {
 pub enum ProviderEvent {
     OutputTextDelta { text: String },
     RefusalDelta { text: String },
+    ToolCallStarted { id: String, name: String },
+    ToolCallArgumentsDelta { id: String, json: String },
+    ToolCallCompleted { id: String },
     Completed,
 }
 

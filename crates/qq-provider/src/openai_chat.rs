@@ -1,6 +1,6 @@
 //! OpenAI-compatible Chat Completions API adapter.
 
-use std::{fmt, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, Role,
+    ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
+    ProviderStream, Role, ToolSpec,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
     request_auth::RequestAuthorizer,
@@ -158,6 +158,10 @@ impl Provider for OpenAiChatCompletions {
             let mut decoder = SseDecoder::new(limits.event);
             let mut output_bytes = 0_usize;
             let mut wire_bytes = 0_usize;
+            // Maps streamed tool-call array indexes to call ids so argument
+            // fragments and the finish reason can be attributed after the
+            // first fragment. Ordered so completion drains in index order.
+            let mut tool_calls: BTreeMap<u64, String> = BTreeMap::new();
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
@@ -191,6 +195,41 @@ impl Provider for OpenAiChatCompletions {
                                     limits.output,
                                 )?;
                                 yield ProviderEvent::RefusalDelta { text };
+                            }
+                            DecodedDelta::ToolCallStarted { index, id, name } => {
+                                if tool_calls.insert(index, id.clone()).is_some() {
+                                    Err(ProviderError::Protocol(
+                                        "OpenAI-compatible stream reused a tool-call index"
+                                            .to_owned(),
+                                    ))?;
+                                }
+                                yield ProviderEvent::ToolCallStarted { id, name };
+                            }
+                            DecodedDelta::ToolCallArguments { index, json } => {
+                                match tool_calls.get(&index) {
+                                    Some(id) => {
+                                        add_output_bytes(
+                                            &mut output_bytes,
+                                            json.len(),
+                                            limits.output,
+                                        )?;
+                                        yield ProviderEvent::ToolCallArgumentsDelta {
+                                            id: id.clone(),
+                                            json,
+                                        };
+                                    }
+                                    None => {
+                                        Err(ProviderError::Protocol(
+                                            "OpenAI-compatible stream sent arguments for an unknown tool call"
+                                                .to_owned(),
+                                        ))?;
+                                    }
+                                }
+                            }
+                            DecodedDelta::ToolCallsFinished => {
+                                for (_, id) in std::mem::take(&mut tool_calls) {
+                                    yield ProviderEvent::ToolCallCompleted { id };
+                                }
                             }
                             DecodedDelta::TerminalError(error) => Err(error)?,
                         }
@@ -455,37 +494,148 @@ impl SseDecoder {
 struct ChatCompletionsRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ChatTool<'a>>,
     stream: bool,
     max_tokens: u32,
 }
 
 impl<'a> From<&'a ModelRequest> for ChatCompletionsRequest<'a> {
     fn from(request: &'a ModelRequest) -> Self {
+        let mut messages = Vec::with_capacity(request.messages().len());
+        for message in request.messages() {
+            append_chat_messages(message, &mut messages);
+        }
         Self {
             model: request.model(),
-            messages: request.messages().iter().map(ChatMessage::from).collect(),
+            messages,
+            tools: request.tools().iter().map(ChatTool::from).collect(),
             stream: true,
             max_tokens: request.max_output_tokens(),
         }
     }
 }
 
+/// Appends the wire messages for one provider-neutral message.
+///
+/// Chat Completions has no multi-result message, so each `ToolResult` block
+/// becomes its own `tool`-role message; `is_error` has no wire field because
+/// the runtime frames errors inside the result content. Any remaining text and
+/// tool calls follow as one message so a lone text block keeps its legacy
+/// plain-string shape.
+fn append_chat_messages<'a>(message: &'a Message, messages: &mut Vec<ChatMessage<'a>>) {
+    let role = match message.role() {
+        Role::User => ChatRole::User,
+        Role::Assistant => ChatRole::Assistant,
+    };
+    if let [ContentBlock::Text { text }] = message.content() {
+        messages.push(ChatMessage {
+            role,
+            content: Some(Cow::Borrowed(text.as_str())),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        return;
+    }
+
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut wrote_results = false;
+    for block in message.content() {
+        match block {
+            ContentBlock::Text { text: fragment } => text.push_str(fragment),
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => tool_calls.push(ChatToolCall::Function {
+                id,
+                function: ChatFunctionCall {
+                    name,
+                    arguments: arguments.to_string(),
+                },
+            }),
+            ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error: _,
+            } => {
+                wrote_results = true;
+                messages.push(ChatMessage {
+                    role: ChatRole::Tool,
+                    content: Some(Cow::Borrowed(content.as_str())),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                });
+            }
+        }
+    }
+
+    if !text.is_empty() || !tool_calls.is_empty() || !wrote_results {
+        let content = if text.is_empty() && !tool_calls.is_empty() {
+            None
+        } else {
+            Some(Cow::Owned(text))
+        };
+        messages.push(ChatMessage {
+            role,
+            content,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+        });
+    }
+}
+
 #[derive(Serialize)]
 struct ChatMessage<'a> {
     role: ChatRole,
-    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
 }
 
-impl<'a> From<&'a Message> for ChatMessage<'a> {
-    fn from(message: &'a Message) -> Self {
-        Self {
-            role: match message.role() {
-                Role::User => ChatRole::User,
-                Role::Assistant => ChatRole::Assistant,
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatToolCall<'a> {
+    Function {
+        id: &'a str,
+        function: ChatFunctionCall<'a>,
+    },
+}
+
+#[derive(Serialize)]
+struct ChatFunctionCall<'a> {
+    name: &'a str,
+    /// Chat Completions carries tool arguments as a JSON-encoded string.
+    arguments: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatTool<'a> {
+    Function { function: ChatFunction<'a> },
+}
+
+impl<'a> From<&'a ToolSpec> for ChatTool<'a> {
+    fn from(tool: &'a ToolSpec) -> Self {
+        Self::Function {
+            function: ChatFunction {
+                name: tool.name(),
+                description: tool.description(),
+                parameters: tool.input_schema(),
             },
-            content: message.content(),
         }
     }
+}
+
+#[derive(Serialize)]
+struct ChatFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
 }
 
 #[derive(Serialize)]
@@ -493,6 +643,7 @@ impl<'a> From<&'a Message> for ChatMessage<'a> {
 enum ChatRole {
     User,
     Assistant,
+    Tool,
 }
 
 #[derive(Deserialize)]
@@ -513,6 +664,22 @@ struct ChatChoice {
 struct ChatDelta {
     content: Option<String>,
     refusal: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatToolCallDelta>,
+}
+
+#[derive(Deserialize)]
+struct ChatToolCallDelta {
+    index: u64,
+    id: Option<String>,
+    #[serde(default)]
+    function: ChatFunctionDelta,
+}
+
+#[derive(Default, Deserialize)]
+struct ChatFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -533,6 +700,16 @@ struct WireApiError {
 enum DecodedDelta {
     OutputText(String),
     Refusal(String),
+    ToolCallStarted {
+        index: u64,
+        id: String,
+        name: String,
+    },
+    ToolCallArguments {
+        index: u64,
+        json: String,
+    },
+    ToolCallsFinished,
     TerminalError(ProviderError),
 }
 
@@ -556,17 +733,43 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<Vec<DecodedDelta>, 
         if let Some(text) = choice.delta.refusal.filter(|text| !text.is_empty()) {
             deltas.push(DecodedDelta::Refusal(text));
         }
+        for tool_call in choice.delta.tool_calls {
+            // The first fragment of a call carries `id` and `function.name`;
+            // later fragments carry only `function.arguments`.
+            if let Some(id) = tool_call.id {
+                let Some(name) = tool_call.function.name else {
+                    return Err(ProviderError::Protocol(
+                        "OpenAI-compatible stream started a tool call without a name".to_owned(),
+                    ));
+                };
+                deltas.push(DecodedDelta::ToolCallStarted {
+                    index: tool_call.index,
+                    id,
+                    name,
+                });
+            }
+            if let Some(json) = tool_call.function.arguments.filter(|json| !json.is_empty()) {
+                deltas.push(DecodedDelta::ToolCallArguments {
+                    index: tool_call.index,
+                    json,
+                });
+            }
+        }
         if let Some(reason) = choice.finish_reason {
             let error = match reason.as_str() {
                 "stop" => continue,
+                "tool_calls" => {
+                    deltas.push(DecodedDelta::ToolCallsFinished);
+                    continue;
+                }
                 "length" => ProviderError::ResponseIncomplete(
                     "OpenAI-compatible response reached its output token limit".to_owned(),
                 ),
                 "content_filter" => ProviderError::ResponseIncomplete(
                     "OpenAI-compatible response was stopped by a content filter".to_owned(),
                 ),
-                "tool_calls" | "function_call" => ProviderError::Protocol(
-                    "OpenAI-compatible response requested unsupported tool execution".to_owned(),
+                "function_call" => ProviderError::Protocol(
+                    "OpenAI-compatible response requested legacy function execution".to_owned(),
                 ),
                 _ => ProviderError::Protocol(
                     "OpenAI-compatible response used an unsupported finish reason".to_owned(),
@@ -883,22 +1086,30 @@ mod tests {
         .unwrap()
         .pop()
         .expect("length must produce a terminal outcome");
+        let function_call = decode_event(
+            r#"{"choices":[{"delta":{},"finish_reason":"function_call"}]}"#,
+            &[],
+        )
+        .unwrap()
+        .pop()
+        .expect("function call must produce a terminal outcome");
         let tool_calls = decode_event(
             r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
             &[],
         )
         .unwrap()
         .pop()
-        .expect("tool calls must produce a terminal outcome");
+        .expect("tool calls must finish the open calls");
 
         assert!(matches!(
             length,
             DecodedDelta::TerminalError(ProviderError::ResponseIncomplete(_))
         ));
         assert!(matches!(
-            tool_calls,
+            function_call,
             DecodedDelta::TerminalError(ProviderError::Protocol(_))
         ));
+        assert!(matches!(tool_calls, DecodedDelta::ToolCallsFinished));
     }
 
     #[test]
@@ -987,6 +1198,168 @@ mod tests {
                 "max_tokens": 321
             })
         );
+    }
+
+    #[tokio::test]
+    async fn sends_tool_declarations_and_tool_history_messages() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (endpoint, server) = serve_once(
+            "/v1/chat/completions",
+            "200 OK",
+            "text/event-stream",
+            vec![body.as_bytes().to_vec()],
+        );
+        let provider =
+            OpenAiChatCompletions::with_endpoint(&endpoint, ChatCompletionsAuth::NoAuth, [], true)
+                .unwrap();
+        let request = ModelRequest::new(
+            "chat-test",
+            vec![
+                Message::user("read the config"),
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Text {
+                            text: "Reading it now.".to_owned(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "call_1".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: json!({"path": "config.ron"}),
+                        },
+                    ],
+                ),
+                Message::tool_results(vec![
+                    ContentBlock::ToolResult {
+                        call_id: "call_1".to_owned(),
+                        content: "(config)".to_owned(),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        call_id: "call_2".to_owned(),
+                        content: "not found".to_owned(),
+                        is_error: true,
+                    },
+                ]),
+            ],
+            128,
+        )
+        .with_tools(vec![ToolSpec::new(
+            "read_file",
+            "Reads one file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )]);
+        let events = provider.stream(request).collect::<Vec<_>>().await;
+
+        assert!(matches!(&events[0], Ok(ProviderEvent::Completed)));
+
+        let request = String::from_utf8(server.join().unwrap()).unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({
+                "model": "chat-test",
+                "messages": [
+                    {"role": "user", "content": "read the config"},
+                    {"role": "assistant", "content": "Reading it now.",
+                     "tool_calls": [
+                        {"id": "call_1", "type": "function",
+                         "function": {"name": "read_file",
+                                      "arguments": "{\"path\":\"config.ron\"}"}}
+                     ]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "(config)"},
+                    {"role": "tool", "tool_call_id": "call_2", "content": "not found"}
+                ],
+                "tools": [
+                    {"type": "function",
+                     "function": {"name": "read_file", "description": "Reads one file",
+                                  "parameters": {"type": "object",
+                                                 "properties": {"path": {"type": "string"}}}}}
+                ],
+                "stream": true,
+                "max_tokens": 128
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_tool_calls_with_attributed_arguments_to_completion() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Checking.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (endpoint, server) = serve_once(
+            "/v1/chat/completions",
+            "200 OK",
+            "text/event-stream",
+            vec![body.as_bytes().to_vec()],
+        );
+        let provider =
+            OpenAiChatCompletions::with_endpoint(&endpoint, ChatCompletionsAuth::NoAuth, [], true)
+                .unwrap();
+        let events = provider
+            .stream(test_request())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::OutputTextDelta {
+                    text: "Checking.".to_owned(),
+                },
+                ProviderEvent::ToolCallStarted {
+                    id: "call_1".to_owned(),
+                    name: "read_file".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "call_1".to_owned(),
+                    json: "{\"path\":".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "call_1".to_owned(),
+                    json: "\"a.rs\"}".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    id: "call_1".to_owned(),
+                },
+                ProviderEvent::Completed,
+            ]
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_arguments_for_an_unknown_call() {
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":4,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n";
+        let (endpoint, server) = serve_once(
+            "/v1/chat/completions",
+            "200 OK",
+            "text/event-stream",
+            vec![body.as_bytes().to_vec()],
+        );
+        let provider =
+            OpenAiChatCompletions::with_endpoint(&endpoint, ChatCompletionsAuth::NoAuth, [], true)
+                .unwrap();
+        let error = provider
+            .stream(test_request())
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Protocol(_)));
+        server.join().unwrap();
     }
 
     #[tokio::test]

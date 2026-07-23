@@ -1,15 +1,16 @@
 //! OpenAI Responses API adapter.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
-    Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, Role,
+    ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
+    ProviderStream, Role, ToolSpec,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
     request_auth::RequestAuthorizer,
@@ -192,6 +193,10 @@ impl Provider for OpenAi {
             let mut decoder = SseDecoder::new(limits.event);
             let mut output_bytes = 0;
             let mut wire_bytes = 0_usize;
+            // Maps streamed function-call item ids to call ids so argument
+            // deltas and item completions can be attributed after the added
+            // event; the call id is what round-trips into function_call_output.
+            let mut tool_calls: HashMap<String, String> = HashMap::new();
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
                     .map_err(|error| transport_error(error, redactions.as_ref()))?;
@@ -217,6 +222,37 @@ impl Provider for OpenAi {
                         DecodedEvent::RefusalDelta(text) => {
                             add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
                             yield ProviderEvent::RefusalDelta { text };
+                        }
+                        DecodedEvent::ToolCallStarted { item_id, call_id, name } => {
+                            if tool_calls.insert(item_id, call_id.clone()).is_some() {
+                                Err(ProviderError::Protocol(
+                                    "OpenAI-compatible stream reused a function-call item id"
+                                        .to_owned(),
+                                ))?;
+                            }
+                            yield ProviderEvent::ToolCallStarted { id: call_id, name };
+                        }
+                        DecodedEvent::ToolCallArguments { item_id, json } => {
+                            match tool_calls.get(&item_id) {
+                                Some(call_id) => {
+                                    add_output_bytes(&mut output_bytes, json.len(), limits.output)?;
+                                    yield ProviderEvent::ToolCallArgumentsDelta {
+                                        id: call_id.clone(),
+                                        json,
+                                    };
+                                }
+                                None => {
+                                    Err(ProviderError::Protocol(
+                                        "OpenAI-compatible stream sent arguments for an unknown function call"
+                                            .to_owned(),
+                                    ))?;
+                                }
+                            }
+                        }
+                        DecodedEvent::ToolCallDone { item_id } => {
+                            if let Some(call_id) = tool_calls.remove(&item_id) {
+                                yield ProviderEvent::ToolCallCompleted { id: call_id };
+                            }
                         }
                         DecodedEvent::Completed => {
                             yield ProviderEvent::Completed;
@@ -519,7 +555,9 @@ impl SseDecoder {
 #[derive(Serialize)]
 struct ResponsesRequest<'a> {
     model: &'a str,
-    input: Vec<InputMessage<'a>>,
+    input: Vec<InputItem<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ResponsesTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
     stream: bool,
@@ -528,9 +566,46 @@ struct ResponsesRequest<'a> {
 
 impl<'a> ResponsesRequest<'a> {
     fn new(request: &'a ModelRequest, kind: ResponsesRequestKind) -> Self {
+        // Each content block becomes its own Responses input item; a text
+        // block keeps the plain message shape so tool-less requests stay
+        // wire-identical.
+        let mut input = Vec::new();
+        for message in request.messages() {
+            let role = match message.role() {
+                Role::User => InputRole::User,
+                Role::Assistant => InputRole::Assistant,
+            };
+            for block in message.content() {
+                input.push(match block {
+                    ContentBlock::Text { text } => InputItem::Message {
+                        role,
+                        content: text,
+                    },
+                    ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => InputItem::Function(FunctionItem::FunctionCall {
+                        call_id: id,
+                        name,
+                        arguments: arguments.to_string(),
+                    }),
+                    ContentBlock::ToolResult {
+                        call_id,
+                        content,
+                        is_error: _,
+                    } => InputItem::Function(FunctionItem::FunctionCallOutput {
+                        call_id,
+                        output: content,
+                    }),
+                });
+            }
+        }
+
         Self {
             model: request.model(),
-            input: request.messages().iter().map(InputMessage::from).collect(),
+            input,
+            tools: request.tools().iter().map(ResponsesTool::from).collect(),
             max_output_tokens: matches!(kind, ResponsesRequestKind::Standard)
                 .then(|| request.max_output_tokens()),
             stream: true,
@@ -540,24 +615,47 @@ impl<'a> ResponsesRequest<'a> {
 }
 
 #[derive(Serialize)]
-struct InputMessage<'a> {
-    role: InputRole,
-    content: &'a str,
+#[serde(untagged)]
+enum InputItem<'a> {
+    Message { role: InputRole, content: &'a str },
+    Function(FunctionItem<'a>),
 }
 
-impl<'a> From<&'a Message> for InputMessage<'a> {
-    fn from(message: &'a Message) -> Self {
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum FunctionItem<'a> {
+    FunctionCall {
+        call_id: &'a str,
+        name: &'a str,
+        arguments: String,
+    },
+    FunctionCallOutput {
+        call_id: &'a str,
+        output: &'a str,
+    },
+}
+
+#[derive(Serialize)]
+struct ResponsesTool<'a> {
+    #[serde(rename = "type")]
+    tool_type: &'static str,
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+}
+
+impl<'a> From<&'a ToolSpec> for ResponsesTool<'a> {
+    fn from(tool: &'a ToolSpec) -> Self {
         Self {
-            role: match message.role() {
-                Role::User => InputRole::User,
-                Role::Assistant => InputRole::Assistant,
-            },
-            content: message.content(),
+            tool_type: "function",
+            name: tool.name(),
+            description: tool.description(),
+            parameters: tool.input_schema(),
         }
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum InputRole {
     User,
@@ -571,6 +669,12 @@ enum StreamingEvent {
     OutputTextDelta { delta: String },
     #[serde(rename = "response.refusal.delta")]
     RefusalDelta { delta: String },
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded { item: OutputItem },
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta { item_id: String, delta: String },
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone { item: OutputItem },
     #[serde(rename = "response.completed")]
     Completed,
     #[serde(rename = "response.failed")]
@@ -581,6 +685,19 @@ enum StreamingEvent {
     Error {
         code: Option<String>,
         message: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum OutputItem {
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        id: String,
+        call_id: String,
+        name: String,
     },
     #[serde(other)]
     Other,
@@ -616,6 +733,18 @@ struct ApiError {
 enum DecodedEvent {
     OutputTextDelta(String),
     RefusalDelta(String),
+    ToolCallStarted {
+        item_id: String,
+        call_id: String,
+        name: String,
+    },
+    ToolCallArguments {
+        item_id: String,
+        json: String,
+    },
+    ToolCallDone {
+        item_id: String,
+    },
     Completed,
     Ignored,
 }
@@ -631,6 +760,28 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedEvent, Provi
     match event {
         StreamingEvent::OutputTextDelta { delta } => Ok(DecodedEvent::OutputTextDelta(delta)),
         StreamingEvent::RefusalDelta { delta } => Ok(DecodedEvent::RefusalDelta(delta)),
+        StreamingEvent::OutputItemAdded {
+            item: OutputItem::FunctionCall { id, call_id, name },
+        } => Ok(DecodedEvent::ToolCallStarted {
+            item_id: id,
+            call_id,
+            name,
+        }),
+        StreamingEvent::FunctionCallArgumentsDelta { item_id, delta } => {
+            Ok(DecodedEvent::ToolCallArguments {
+                item_id,
+                json: delta,
+            })
+        }
+        StreamingEvent::OutputItemDone {
+            item: OutputItem::FunctionCall { id, .. },
+        } => Ok(DecodedEvent::ToolCallDone { item_id: id }),
+        StreamingEvent::OutputItemAdded {
+            item: OutputItem::Other,
+        }
+        | StreamingEvent::OutputItemDone {
+            item: OutputItem::Other,
+        } => Ok(DecodedEvent::Ignored),
         StreamingEvent::Completed => Ok(DecodedEvent::Completed),
         StreamingEvent::Failed { response } => Err(response.error.map_or_else(
             || ProviderError::ResponseFailed {
@@ -746,6 +897,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::Message;
 
     #[test]
     fn default_constructor_uses_openai_endpoint_and_redacts_auth_debug() {
@@ -863,6 +1015,69 @@ mod tests {
                     {"role": "assistant", "content": "hi"}
                 ],
                 "max_output_tokens": 512,
+                "stream": true,
+                "store": false
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_tool_declarations_and_tool_history_items() {
+        let body = "data: {\"type\":\"response.completed\"}\n\n";
+        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "text/event-stream", body);
+        let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
+        let request = ModelRequest::new(
+            "gpt-test",
+            vec![
+                Message::user("read the config"),
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Text {
+                            text: "Reading it now.".to_owned(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "call_1".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: json!({"path": "config.ron"}),
+                        },
+                    ],
+                ),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    call_id: "call_1".to_owned(),
+                    content: "(config)".to_owned(),
+                    is_error: false,
+                }]),
+            ],
+            128,
+        )
+        .with_tools(vec![ToolSpec::new(
+            "read_file",
+            "Reads one file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )]);
+        let events = provider.stream(request).collect::<Vec<_>>().await;
+
+        assert!(matches!(&events[0], Ok(ProviderEvent::Completed)));
+
+        let request = server.join().unwrap();
+        let request_body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(request_body).unwrap(),
+            json!({
+                "model": "gpt-test",
+                "input": [
+                    {"role": "user", "content": "read the config"},
+                    {"role": "assistant", "content": "Reading it now."},
+                    {"type": "function_call", "call_id": "call_1", "name": "read_file",
+                     "arguments": "{\"path\":\"config.ron\"}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": "(config)"}
+                ],
+                "tools": [
+                    {"type": "function", "name": "read_file", "description": "Reads one file",
+                     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+                ],
+                "max_output_tokens": 128,
                 "stream": true,
                 "store": false
             })
@@ -1063,6 +1278,92 @@ mod tests {
                 .unwrap()
                 .contains_key("max_output_tokens")
         );
+    }
+
+    #[tokio::test]
+    async fn streams_tool_calls_with_attributed_arguments_to_completion() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+            "\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Checking.\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+            "\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,",
+            "\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",",
+            "\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",",
+            "\"delta\":\"{\\\"path\\\":\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",",
+            "\"delta\":\"\\\"a.rs\\\"}\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",",
+            "\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,",
+            "\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",",
+            "\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        );
+        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "text/event-stream", body);
+        let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
+        let events = provider
+            .stream(ModelRequest::new(
+                "gpt-test",
+                vec![Message::user("ping")],
+                128,
+            ))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::OutputTextDelta {
+                    text: "Checking.".to_owned(),
+                },
+                ProviderEvent::ToolCallStarted {
+                    id: "call_1".to_owned(),
+                    name: "read_file".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "call_1".to_owned(),
+                    json: "{\"path\":".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "call_1".to_owned(),
+                    json: "\"a.rs\"}".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    id: "call_1".to_owned(),
+                },
+                ProviderEvent::Completed,
+            ]
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_arguments_for_an_unknown_call() {
+        let body = concat!(
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_9\",",
+            "\"delta\":\"{}\"}\n\n",
+        );
+        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "text/event-stream", body);
+        let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
+        let error = provider
+            .stream(ModelRequest::new(
+                "gpt-test",
+                vec![Message::user("ping")],
+                128,
+            ))
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Protocol(_)));
+        server.join().unwrap();
     }
 
     #[tokio::test]

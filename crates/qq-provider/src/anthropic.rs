@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, Role,
+    ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
+    ProviderStream, Role, ToolSpec,
     http::{build_client, build_direct_client, validate_endpoint},
     limits::StreamLimits,
     request_auth::RequestAuthorizer,
@@ -218,6 +218,9 @@ impl Provider for AnthropicMessages {
             let mut decoder = SseDecoder::new(limits.event);
             let mut output_bytes = 0_usize;
             let mut wire_bytes = 0_usize;
+            // Maps streamed content-block indexes to tool-call ids so argument
+            // deltas and block stops can be attributed after the start event.
+            let mut tool_calls: HashMap<u64, String> = HashMap::new();
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
@@ -236,6 +239,37 @@ impl Provider for AnthropicMessages {
                         DecodedEvent::Refusal(text) => {
                             add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
                             yield ProviderEvent::RefusalDelta { text };
+                        }
+                        DecodedEvent::ToolCallStarted { index, id, name } => {
+                            if tool_calls.insert(index, id.clone()).is_some() {
+                                Err(ProviderError::Protocol(
+                                    "Anthropic-compatible stream reused a tool content-block index"
+                                        .to_owned(),
+                                ))?;
+                            }
+                            yield ProviderEvent::ToolCallStarted { id, name };
+                        }
+                        DecodedEvent::ToolCallArguments { index, json } => {
+                            match tool_calls.get(&index) {
+                                Some(id) => {
+                                    add_output_bytes(&mut output_bytes, json.len(), limits.output)?;
+                                    yield ProviderEvent::ToolCallArgumentsDelta {
+                                        id: id.clone(),
+                                        json,
+                                    };
+                                }
+                                None => {
+                                    Err(ProviderError::Protocol(
+                                        "Anthropic-compatible stream sent arguments for an unknown tool call"
+                                            .to_owned(),
+                                    ))?;
+                                }
+                            }
+                        }
+                        DecodedEvent::BlockStopped { index } => {
+                            if let Some(id) = tool_calls.remove(&index) {
+                                yield ProviderEvent::ToolCallCompleted { id };
+                            }
                         }
                         DecodedEvent::Completed => {
                             yield ProviderEvent::Completed;
@@ -557,6 +591,8 @@ impl SseDecoder {
 struct MessagesRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<AnthropicTool<'a>>,
     max_tokens: u32,
     stream: bool,
 }
@@ -570,6 +606,7 @@ impl<'a> From<&'a ModelRequest> for MessagesRequest<'a> {
                 .iter()
                 .map(AnthropicMessage::from)
                 .collect(),
+            tools: request.tools().iter().map(AnthropicTool::from).collect(),
             max_tokens: request.max_output_tokens(),
             stream: true,
         }
@@ -577,19 +614,93 @@ impl<'a> From<&'a ModelRequest> for MessagesRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct AnthropicTool<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a Value,
+}
+
+impl<'a> From<&'a ToolSpec> for AnthropicTool<'a> {
+    fn from(tool: &'a ToolSpec) -> Self {
+        Self {
+            name: tool.name(),
+            description: tool.description(),
+            input_schema: tool.input_schema(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct AnthropicMessage<'a> {
     role: AnthropicRole,
-    content: &'a str,
+    content: AnthropicContent<'a>,
 }
 
 impl<'a> From<&'a Message> for AnthropicMessage<'a> {
     fn from(message: &'a Message) -> Self {
+        // A single text block serializes as a plain string so tool-less
+        // requests keep their existing wire shape.
+        let content = match message.content() {
+            [ContentBlock::Text { text }] => AnthropicContent::Text(text),
+            blocks => AnthropicContent::Blocks(blocks.iter().map(AnthropicBlock::from).collect()),
+        };
         Self {
             role: match message.role() {
                 Role::User => AnthropicRole::User,
                 Role::Assistant => AnthropicRole::Assistant,
             },
-            content: message.content(),
+            content,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AnthropicContent<'a> {
+    Text(&'a str),
+    Blocks(Vec<AnthropicBlock<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicBlock<'a> {
+    Text {
+        text: &'a str,
+    },
+    ToolUse {
+        id: &'a str,
+        name: &'a str,
+        input: &'a Value,
+    },
+    ToolResult {
+        tool_use_id: &'a str,
+        content: &'a str,
+        is_error: bool,
+    },
+}
+
+impl<'a> From<&'a ContentBlock> for AnthropicBlock<'a> {
+    fn from(block: &'a ContentBlock) -> Self {
+        match block {
+            ContentBlock::Text { text } => Self::Text { text },
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Self::ToolUse {
+                id,
+                name,
+                input: arguments,
+            },
+            ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => Self::ToolResult {
+                tool_use_id: call_id,
+                content,
+                is_error: *is_error,
+            },
         }
     }
 }
@@ -611,7 +722,7 @@ struct EventEnvelope {
 #[serde(tag = "type")]
 enum StreamingEvent {
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { delta: ContentDelta },
+    ContentBlockDelta { index: u64, delta: ContentDelta },
     #[serde(rename = "message_delta")]
     MessageDelta { delta: MessageDelta },
     #[serde(rename = "message_stop")]
@@ -621,11 +732,23 @@ enum StreamingEvent {
     #[serde(rename = "message_start")]
     MessageStart,
     #[serde(rename = "content_block_start")]
-    ContentBlockStart,
+    ContentBlockStart {
+        index: u64,
+        content_block: StartedBlock,
+    },
     #[serde(rename = "content_block_stop")]
-    ContentBlockStop,
+    ContentBlockStop { index: u64 },
     #[serde(rename = "ping")]
     Ping,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum StartedBlock {
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
     #[serde(other)]
     Other,
 }
@@ -635,6 +758,8 @@ enum StreamingEvent {
 enum ContentDelta {
     #[serde(rename = "text_delta")]
     Text { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: String },
     #[serde(rename = "thinking_delta")]
     Thinking,
     #[serde(other)]
@@ -672,6 +797,18 @@ struct WireApiError {
 enum DecodedEvent {
     OutputText(String),
     Refusal(String),
+    ToolCallStarted {
+        index: u64,
+        id: String,
+        name: String,
+    },
+    ToolCallArguments {
+        index: u64,
+        json: String,
+    },
+    BlockStopped {
+        index: u64,
+    },
     Completed,
     Ignored,
 }
@@ -707,13 +844,29 @@ fn decode_event(event: SseEvent, redactions: &[String]) -> Result<DecodedEvent, 
     match event {
         StreamingEvent::ContentBlockDelta {
             delta: ContentDelta::Text { text },
+            ..
         } => Ok(DecodedEvent::OutputText(text)),
         StreamingEvent::ContentBlockDelta {
+            index,
+            delta: ContentDelta::InputJson { partial_json },
+        } => Ok(DecodedEvent::ToolCallArguments {
+            index,
+            json: partial_json,
+        }),
+        StreamingEvent::ContentBlockStart {
+            index,
+            content_block: StartedBlock::ToolUse { id, name },
+        } => Ok(DecodedEvent::ToolCallStarted { index, id, name }),
+        StreamingEvent::ContentBlockStop { index } => Ok(DecodedEvent::BlockStopped { index }),
+        StreamingEvent::ContentBlockDelta {
             delta: ContentDelta::Thinking | ContentDelta::Other,
+            ..
         }
         | StreamingEvent::MessageStart
-        | StreamingEvent::ContentBlockStart
-        | StreamingEvent::ContentBlockStop
+        | StreamingEvent::ContentBlockStart {
+            content_block: StartedBlock::Other,
+            ..
+        }
         | StreamingEvent::Ping
         | StreamingEvent::Other => Ok(DecodedEvent::Ignored),
         StreamingEvent::MessageDelta { delta } => decode_message_delta(delta, redactions),
@@ -744,15 +897,12 @@ fn decode_message_delta(
     }
 
     match delta.stop_reason.as_deref() {
-        None | Some("end_turn" | "stop_sequence") => Ok(DecodedEvent::Ignored),
+        None | Some("end_turn" | "stop_sequence" | "tool_use") => Ok(DecodedEvent::Ignored),
         Some("max_tokens" | "model_context_window_exceeded") => {
             Err(ProviderError::ResponseIncomplete(
                 "Anthropic response reached a configured model limit".to_owned(),
             ))
         }
-        Some("tool_use") => Err(ProviderError::Protocol(
-            "Anthropic response requested unsupported tool execution".to_owned(),
-        )),
         Some("pause_turn") => Err(ProviderError::ResponseIncomplete(
             "Anthropic paused the response before completion".to_owned(),
         )),
@@ -1158,14 +1308,56 @@ mod tests {
             r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
         )
         .unwrap_err();
+        let unknown = decode_data(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"mystery"}}"#,
+        )
+        .unwrap_err();
         let tool_use = decode_data(
             "message_delta",
             r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
         )
-        .unwrap_err();
+        .unwrap();
 
         assert!(matches!(max_tokens, ProviderError::ResponseIncomplete(_)));
-        assert!(matches!(tool_use, ProviderError::Protocol(_)));
+        assert!(matches!(unknown, ProviderError::Protocol(_)));
+        assert_eq!(tool_use, DecodedEvent::Ignored);
+    }
+
+    #[test]
+    fn decodes_tool_call_stream_events() {
+        let started = decode_data(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+        )
+        .unwrap();
+        let arguments = decode_data(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+        )
+        .unwrap();
+        let stopped = decode_data(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":1}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            started,
+            DecodedEvent::ToolCallStarted {
+                index: 1,
+                id: "toolu_1".to_owned(),
+                name: "read_file".to_owned(),
+            }
+        );
+        assert_eq!(
+            arguments,
+            DecodedEvent::ToolCallArguments {
+                index: 1,
+                json: "{\"path\":".to_owned(),
+            }
+        );
+        assert_eq!(stopped, DecodedEvent::BlockStopped { index: 1 });
     }
 
     #[test]
@@ -1268,6 +1460,172 @@ mod tests {
             })
         );
         assert!(!body.contains("system"));
+    }
+
+    #[tokio::test]
+    async fn sends_tool_declarations_and_tool_history_blocks() {
+        let body = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (endpoint, server) = serve_once(
+            "/v1/messages",
+            "200 OK",
+            "text/event-stream",
+            vec![body.as_bytes().to_vec()],
+        );
+        let provider =
+            AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
+        let request = ModelRequest::new(
+            "claude-test",
+            vec![
+                Message::user("read the config"),
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Text {
+                            text: "Reading it now.".to_owned(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "toolu_1".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: json!({"path": "config.ron"}),
+                        },
+                    ],
+                ),
+                Message::tool_results(vec![ContentBlock::ToolResult {
+                    call_id: "toolu_1".to_owned(),
+                    content: "(config)".to_owned(),
+                    is_error: false,
+                }]),
+            ],
+            128,
+        )
+        .with_tools(vec![ToolSpec::new(
+            "read_file",
+            "Reads one file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )]);
+        let events = provider.stream(request).collect::<Vec<_>>().await;
+
+        assert!(matches!(&events[0], Ok(ProviderEvent::Completed)));
+
+        let request = String::from_utf8(server.join().unwrap()).unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({
+                "model": "claude-test",
+                "messages": [
+                    {"role": "user", "content": "read the config"},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "Reading it now."},
+                        {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                         "input": {"path": "config.ron"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1",
+                         "content": "(config)", "is_error": false}
+                    ]}
+                ],
+                "tools": [
+                    {"name": "read_file", "description": "Reads one file",
+                     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+                ],
+                "max_tokens": 128,
+                "stream": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_tool_calls_with_attributed_arguments_to_completion() {
+        let body = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Checking.\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a.rs\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (endpoint, server) = serve_once(
+            "/v1/messages",
+            "200 OK",
+            "text/event-stream",
+            vec![body.as_bytes().to_vec()],
+        );
+        let provider =
+            AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
+        let events = provider
+            .stream(test_request())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::OutputTextDelta {
+                    text: "Checking.".to_owned(),
+                },
+                ProviderEvent::ToolCallStarted {
+                    id: "toolu_1".to_owned(),
+                    name: "read_file".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "toolu_1".to_owned(),
+                    json: "{\"path\":".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    id: "toolu_1".to_owned(),
+                    json: "\"a.rs\"}".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    id: "toolu_1".to_owned(),
+                },
+                ProviderEvent::Completed,
+            ]
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_tool_arguments_for_an_unknown_call() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+        );
+        let (endpoint, server) = serve_once(
+            "/v1/messages",
+            "200 OK",
+            "text/event-stream",
+            vec![body.as_bytes().to_vec()],
+        );
+        let provider =
+            AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
+        let error = provider
+            .stream(test_request())
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Protocol(_)));
+        server.join().unwrap();
     }
 
     #[tokio::test]

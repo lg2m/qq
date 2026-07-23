@@ -1,6 +1,7 @@
 //! Amazon Bedrock `ConverseStream` adapter.
 
 use std::{
+    collections::{HashMap, hash_map::Entry},
     error::Error,
     fmt::{self, Write as _},
     pin::Pin,
@@ -33,21 +34,25 @@ use aws_sdk_bedrockruntime::{
     error::{BoxError, DisplayErrorContext, SdkError},
     operation::converse_stream::ConverseStreamError,
     types::{
-        ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
-        InferenceConfiguration, Message as BedrockMessage, StopReason,
+        ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart,
+        ConversationRole, ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage,
+        StopReason, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+        ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
         error::ConverseStreamOutputError,
     },
 };
 use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls};
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
-use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::{Document, Number, body::SdkBody};
 use bytes::Bytes;
 use http_body::Body;
+use serde_json::Value;
 use tokio::sync::{OnceCell, Semaphore};
 
 use crate::{
-    ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent, ProviderStream, Role,
-    limits::StreamLimits, request_auth::AwsCredentialLease, sanitize::sanitize_message,
+    ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
+    ProviderStream, Role, limits::StreamLimits, request_auth::AwsCredentialLease,
+    sanitize::sanitize_message,
 };
 
 const EVENT_FRAME_OVERHEAD_BYTES: usize = 64;
@@ -150,6 +155,7 @@ impl Provider for Bedrock {
                 .converse_stream()
                 .model_id(request.model_id)
                 .set_messages(Some(request.messages))
+                .set_tool_config(request.tool_config)
                 .inference_config(request.inference_config)
                 .customize()
                 .interceptor(body_limit)
@@ -164,6 +170,9 @@ impl Provider for Bedrock {
                 })?;
             let mut receiver = response.stream;
             let mut output_bytes = 0_usize;
+            // Maps streamed content-block indexes to tool-call ids so argument
+            // deltas and block stops can be attributed after the start event.
+            let mut tool_calls = ToolCallTracker::default();
 
             while let Some(event) = receiver
                 .recv()
@@ -191,6 +200,20 @@ impl Provider for Bedrock {
                         yield ProviderEvent::RefusalDelta { text };
                         yield ProviderEvent::Completed;
                         return;
+                    }
+                    DecodedEvent::ToolCallStarted { index, id, name } => {
+                        tool_calls.start(index, id.clone())?;
+                        yield ProviderEvent::ToolCallStarted { id, name };
+                    }
+                    DecodedEvent::ToolCallArguments { index, json } => {
+                        let id = tool_calls.arguments(index)?.to_owned();
+                        add_output_bytes(&mut output_bytes, json.len(), limits.output)?;
+                        yield ProviderEvent::ToolCallArgumentsDelta { id, json };
+                    }
+                    DecodedEvent::BlockStopped { index } => {
+                        if let Some(id) = tool_calls.stop(index) {
+                            yield ProviderEvent::ToolCallCompleted { id };
+                        }
                     }
                     DecodedEvent::Completed => {
                         yield ProviderEvent::Completed;
@@ -465,6 +488,7 @@ fn service_config(shared_config: &SdkConfig, api_key: Option<String>) -> Config 
 struct ConverseRequest {
     model_id: String,
     messages: Vec<BedrockMessage>,
+    tool_config: Option<ToolConfiguration>,
     inference_config: InferenceConfiguration,
 }
 
@@ -481,24 +505,50 @@ impl TryFrom<&ModelRequest> for ConverseRequest {
             .messages()
             .iter()
             .map(|message| {
-                BedrockMessage::builder()
-                    .role(match message.role() {
-                        Role::User => ConversationRole::User,
-                        Role::Assistant => ConversationRole::Assistant,
-                    })
-                    .content(ContentBlock::Text(message.content().to_owned()))
+                let mut builder = BedrockMessage::builder().role(match message.role() {
+                    Role::User => ConversationRole::User,
+                    Role::Assistant => ConversationRole::Assistant,
+                });
+                for block in message.content() {
+                    builder = builder.content(bedrock_content_block(block)?);
+                }
+                builder.build().map_err(|_| {
+                    ProviderError::Configuration(
+                        "could not construct an Amazon Bedrock message".to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let tool_config = if request.tools().is_empty() {
+            None
+        } else {
+            let mut builder = ToolConfiguration::builder();
+            for tool in request.tools() {
+                let specification = ToolSpecification::builder()
+                    .name(tool.name())
+                    .description(tool.description())
+                    .input_schema(ToolInputSchema::Json(document_from_value(
+                        tool.input_schema(),
+                    )))
                     .build()
                     .map_err(|_| {
                         ProviderError::Configuration(
-                            "could not construct an Amazon Bedrock message".to_owned(),
+                            "could not construct an Amazon Bedrock tool specification".to_owned(),
                         )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                    })?;
+                builder = builder.tools(Tool::ToolSpec(specification));
+            }
+            Some(builder.build().map_err(|_| {
+                ProviderError::Configuration(
+                    "could not construct an Amazon Bedrock tool configuration".to_owned(),
+                )
+            })?)
+        };
 
         Ok(Self {
             model_id: request.model().to_owned(),
             messages,
+            tool_config,
             inference_config: InferenceConfiguration::builder()
                 .max_tokens(max_tokens)
                 .build(),
@@ -506,54 +556,179 @@ impl TryFrom<&ModelRequest> for ConverseRequest {
     }
 }
 
+fn bedrock_content_block(block: &ContentBlock) -> Result<BedrockContentBlock, ProviderError> {
+    match block {
+        ContentBlock::Text { text } => Ok(BedrockContentBlock::Text(text.clone())),
+        ContentBlock::ToolCall {
+            id,
+            name,
+            arguments,
+        } => ToolUseBlock::builder()
+            .tool_use_id(id)
+            .name(name)
+            .input(document_from_value(arguments))
+            .build()
+            .map(BedrockContentBlock::ToolUse)
+            .map_err(|_| {
+                ProviderError::Configuration(
+                    "could not construct an Amazon Bedrock tool use block".to_owned(),
+                )
+            }),
+        ContentBlock::ToolResult {
+            call_id,
+            content,
+            is_error,
+        } => {
+            let mut builder = ToolResultBlock::builder()
+                .tool_use_id(call_id)
+                .content(ToolResultContentBlock::Text(content.clone()));
+            if *is_error {
+                builder = builder.status(ToolResultStatus::Error);
+            }
+            builder
+                .build()
+                .map(BedrockContentBlock::ToolResult)
+                .map_err(|_| {
+                    ProviderError::Configuration(
+                        "could not construct an Amazon Bedrock tool result block".to_owned(),
+                    )
+                })
+        }
+    }
+}
+
+fn document_from_value(value: &Value) -> Document {
+    match value {
+        Value::Null => Document::Null,
+        Value::Bool(value) => Document::Bool(*value),
+        Value::Number(number) => Document::Number(match (number.as_u64(), number.as_i64()) {
+            (Some(value), _) => Number::PosInt(value),
+            (None, Some(value)) => Number::NegInt(value),
+            // Without serde_json's arbitrary_precision feature, a number that
+            // fits neither integer range is always representable as f64.
+            (None, None) => Number::Float(number.as_f64().unwrap_or(0.0)),
+        }),
+        Value::String(value) => Document::String(value.clone()),
+        Value::Array(values) => Document::Array(values.iter().map(document_from_value).collect()),
+        Value::Object(entries) => Document::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), document_from_value(value)))
+                .collect(),
+        ),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum DecodedEvent {
     OutputText(String),
     Refusal(String),
+    ToolCallStarted {
+        index: i32,
+        id: String,
+        name: String,
+    },
+    ToolCallArguments {
+        index: i32,
+        json: String,
+    },
+    BlockStopped {
+        index: i32,
+    },
     Completed,
     Ignored,
 }
 
+/// Attributes streamed tool-call events to ids by content-block index.
+#[derive(Debug, Default)]
+struct ToolCallTracker {
+    calls: HashMap<i32, String>,
+}
+
+impl ToolCallTracker {
+    fn start(&mut self, index: i32, id: String) -> Result<(), ProviderError> {
+        match self.calls.entry(index) {
+            Entry::Occupied(_) => Err(ProviderError::Protocol(
+                "Amazon Bedrock stream reused a tool content-block index".to_owned(),
+            )),
+            Entry::Vacant(entry) => {
+                entry.insert(id);
+                Ok(())
+            }
+        }
+    }
+
+    fn arguments(&self, index: i32) -> Result<&str, ProviderError> {
+        self.calls.get(&index).map(String::as_str).ok_or_else(|| {
+            ProviderError::Protocol(
+                "Amazon Bedrock stream sent arguments for an unknown tool call".to_owned(),
+            )
+        })
+    }
+
+    fn stop(&mut self, index: i32) -> Option<String> {
+        self.calls.remove(&index)
+    }
+}
+
 fn decode_stream_event(event: ConverseStreamOutput) -> Result<DecodedEvent, ProviderError> {
     match event {
-        ConverseStreamOutput::ContentBlockDelta(event) => match event.delta {
-            Some(ContentBlockDelta::Text(text)) => Ok(DecodedEvent::OutputText(text)),
-            Some(ContentBlockDelta::Citation(_) | ContentBlockDelta::ReasoningContent(_)) => {
-                Ok(DecodedEvent::Ignored)
+        ConverseStreamOutput::ContentBlockDelta(event) => {
+            let index = event.content_block_index;
+            match event.delta {
+                Some(ContentBlockDelta::Text(text)) => Ok(DecodedEvent::OutputText(text)),
+                Some(ContentBlockDelta::ToolUse(delta)) => Ok(DecodedEvent::ToolCallArguments {
+                    index,
+                    json: delta.input,
+                }),
+                Some(ContentBlockDelta::Citation(_) | ContentBlockDelta::ReasoningContent(_)) => {
+                    Ok(DecodedEvent::Ignored)
+                }
+                Some(ContentBlockDelta::ToolResult(_)) => {
+                    Err(unsupported_output("tool result output"))
+                }
+                Some(ContentBlockDelta::Image(_)) => Err(unsupported_output("image output")),
+                Some(delta) if delta.is_unknown() => Err(ProviderError::Protocol(
+                    "Amazon Bedrock returned an unknown content block delta".to_owned(),
+                )),
+                None => Err(ProviderError::Protocol(
+                    "Amazon Bedrock content block delta was missing its payload".to_owned(),
+                )),
+                Some(_) => Err(ProviderError::Protocol(
+                    "Amazon Bedrock returned an unsupported content block delta".to_owned(),
+                )),
             }
-            Some(ContentBlockDelta::ToolUse(_) | ContentBlockDelta::ToolResult(_)) => {
-                Err(unsupported_output("tool use"))
+        }
+        ConverseStreamOutput::ContentBlockStart(event) => {
+            let index = event.content_block_index;
+            match event.start {
+                Some(ContentBlockStart::ToolUse(start)) => Ok(DecodedEvent::ToolCallStarted {
+                    index,
+                    id: start.tool_use_id,
+                    name: start.name,
+                }),
+                Some(ContentBlockStart::ToolResult(_)) => {
+                    Err(unsupported_output("tool result output"))
+                }
+                Some(ContentBlockStart::Image(_)) => Err(unsupported_output("image output")),
+                Some(start) if start.is_unknown() => Err(ProviderError::Protocol(
+                    "Amazon Bedrock returned an unknown content block start".to_owned(),
+                )),
+                None => Err(ProviderError::Protocol(
+                    "Amazon Bedrock content block start was missing its payload".to_owned(),
+                )),
+                Some(_) => Err(ProviderError::Protocol(
+                    "Amazon Bedrock returned an unsupported content block start".to_owned(),
+                )),
             }
-            Some(ContentBlockDelta::Image(_)) => Err(unsupported_output("image output")),
-            Some(delta) if delta.is_unknown() => Err(ProviderError::Protocol(
-                "Amazon Bedrock returned an unknown content block delta".to_owned(),
-            )),
-            None => Err(ProviderError::Protocol(
-                "Amazon Bedrock content block delta was missing its payload".to_owned(),
-            )),
-            Some(_) => Err(ProviderError::Protocol(
-                "Amazon Bedrock returned an unsupported content block delta".to_owned(),
-            )),
-        },
-        ConverseStreamOutput::ContentBlockStart(event) => match event.start {
-            Some(ContentBlockStart::ToolUse(_) | ContentBlockStart::ToolResult(_)) => {
-                Err(unsupported_output("tool use"))
-            }
-            Some(ContentBlockStart::Image(_)) => Err(unsupported_output("image output")),
-            Some(start) if start.is_unknown() => Err(ProviderError::Protocol(
-                "Amazon Bedrock returned an unknown content block start".to_owned(),
-            )),
-            None => Err(ProviderError::Protocol(
-                "Amazon Bedrock content block start was missing its payload".to_owned(),
-            )),
-            Some(_) => Err(ProviderError::Protocol(
-                "Amazon Bedrock returned an unsupported content block start".to_owned(),
-            )),
-        },
+        }
         ConverseStreamOutput::MessageStop(event) => decode_stop_reason(event.stop_reason()),
-        ConverseStreamOutput::ContentBlockStop(_)
-        | ConverseStreamOutput::MessageStart(_)
-        | ConverseStreamOutput::Metadata(_) => Ok(DecodedEvent::Ignored),
+        ConverseStreamOutput::ContentBlockStop(event) => Ok(DecodedEvent::BlockStopped {
+            index: event.content_block_index,
+        }),
+        ConverseStreamOutput::MessageStart(_) | ConverseStreamOutput::Metadata(_) => {
+            Ok(DecodedEvent::Ignored)
+        }
         event if event.is_unknown() => Err(ProviderError::Protocol(
             "Amazon Bedrock returned an unknown stream event".to_owned(),
         )),
@@ -565,7 +740,9 @@ fn decode_stream_event(event: ConverseStreamOutput) -> Result<DecodedEvent, Prov
 
 fn decode_stop_reason(reason: &StopReason) -> Result<DecodedEvent, ProviderError> {
     match reason {
-        StopReason::EndTurn | StopReason::StopSequence => Ok(DecodedEvent::Completed),
+        StopReason::EndTurn | StopReason::StopSequence | StopReason::ToolUse => {
+            Ok(DecodedEvent::Completed)
+        }
         StopReason::ContentFiltered => Ok(DecodedEvent::Refusal(
             "Amazon Bedrock filtered the response".to_owned(),
         )),
@@ -578,7 +755,6 @@ fn decode_stop_reason(reason: &StopReason) -> Result<DecodedEvent, ProviderError
         StopReason::ModelContextWindowExceeded => Err(ProviderError::ResponseIncomplete(
             "Amazon Bedrock exceeded the model context window".to_owned(),
         )),
-        StopReason::ToolUse => Err(unsupported_output("tool use")),
         StopReason::MalformedModelOutput => Err(ProviderError::ResponseFailed {
             kind: ProviderErrorKind::Response,
             message: "Amazon Bedrock reported malformed model output".to_owned(),
@@ -836,10 +1012,14 @@ mod tests {
     #[allow(deprecated)]
     use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use aws_credential_types::provider::ProvideCredentials;
-    use aws_sdk_bedrockruntime::types::{ContentBlockDeltaEvent, MessageStopEvent};
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, MessageStopEvent,
+        ToolUseBlockDelta, ToolUseBlockStart,
+    };
+    use serde_json::json;
 
     use super::*;
-    use crate::Message;
+    use crate::{Message, ToolSpec};
 
     #[test]
     fn constructor_is_network_free_and_debug_redacts_api_keys() {
@@ -1109,6 +1289,116 @@ mod tests {
         assert_eq!(mapped.messages[0].content()[0].as_text().unwrap(), "hello");
         assert_eq!(mapped.messages[1].content()[0].as_text().unwrap(), "hi");
         assert_eq!(mapped.inference_config.max_tokens(), Some(512));
+        assert!(mapped.tool_config.is_none());
+    }
+
+    #[test]
+    fn maps_tool_declarations_and_tool_history_blocks() {
+        let request = ModelRequest::new(
+            "anthropic.claude-test",
+            vec![
+                Message::user("read the config"),
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Text {
+                            text: "Reading it now.".to_owned(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "toolu_1".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: json!({"path": "config.ron"}),
+                        },
+                    ],
+                ),
+                Message::tool_results(vec![
+                    ContentBlock::ToolResult {
+                        call_id: "toolu_1".to_owned(),
+                        content: "(config)".to_owned(),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        call_id: "toolu_2".to_owned(),
+                        content: "denied".to_owned(),
+                        is_error: true,
+                    },
+                ]),
+            ],
+            128,
+        )
+        .with_tools(vec![ToolSpec::new(
+            "read_file",
+            "Reads one file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )]);
+        let mapped = ConverseRequest::try_from(&request).unwrap();
+
+        let assistant = mapped.messages[1].content();
+        assert_eq!(assistant[0].as_text().unwrap(), "Reading it now.");
+        let tool_use = assistant[1].as_tool_use().unwrap();
+        assert_eq!(tool_use.tool_use_id(), "toolu_1");
+        assert_eq!(tool_use.name(), "read_file");
+        assert_eq!(
+            tool_use.input(),
+            &Document::Object(HashMap::from([(
+                "path".to_owned(),
+                Document::String("config.ron".to_owned()),
+            )]))
+        );
+
+        assert_eq!(mapped.messages[2].role(), &ConversationRole::User);
+        let results = mapped.messages[2].content();
+        let success = results[0].as_tool_result().unwrap();
+        assert_eq!(success.tool_use_id(), "toolu_1");
+        assert_eq!(success.content()[0].as_text().unwrap(), "(config)");
+        assert_eq!(success.status(), None);
+        let failure = results[1].as_tool_result().unwrap();
+        assert_eq!(failure.tool_use_id(), "toolu_2");
+        assert_eq!(failure.content()[0].as_text().unwrap(), "denied");
+        assert_eq!(failure.status(), Some(&ToolResultStatus::Error));
+
+        let tools = mapped.tool_config.unwrap();
+        let specification = tools.tools()[0].as_tool_spec().unwrap();
+        assert_eq!(specification.name(), "read_file");
+        assert_eq!(specification.description(), Some("Reads one file"));
+        assert_eq!(
+            specification.input_schema().unwrap().as_json().unwrap(),
+            &document_from_value(
+                &json!({"type": "object", "properties": {"path": {"type": "string"}}})
+            )
+        );
+    }
+
+    #[test]
+    fn converts_json_values_to_smithy_documents() {
+        let value = json!({
+            "text": "path",
+            "count": 3,
+            "offset": -7,
+            "ratio": 0.5,
+            "flag": true,
+            "missing": null,
+            "items": [1, "two"],
+        });
+
+        assert_eq!(
+            document_from_value(&value),
+            Document::Object(HashMap::from([
+                ("text".to_owned(), Document::String("path".to_owned())),
+                ("count".to_owned(), Document::Number(Number::PosInt(3))),
+                ("offset".to_owned(), Document::Number(Number::NegInt(-7))),
+                ("ratio".to_owned(), Document::Number(Number::Float(0.5))),
+                ("flag".to_owned(), Document::Bool(true)),
+                ("missing".to_owned(), Document::Null),
+                (
+                    "items".to_owned(),
+                    Document::Array(vec![
+                        Document::Number(Number::PosInt(1)),
+                        Document::String("two".to_owned()),
+                    ]),
+                ),
+            ]))
+        );
     }
 
     #[test]
@@ -1171,10 +1461,88 @@ mod tests {
             ));
         }
 
-        let tool_error = decode_stop_reason(&StopReason::ToolUse).unwrap_err();
+        assert_eq!(
+            decode_stop_reason(&StopReason::ToolUse).unwrap(),
+            DecodedEvent::Completed
+        );
         let unknown_error = decode_stop_reason(&StopReason::from("future_reason")).unwrap_err();
-        assert!(matches!(tool_error, ProviderError::ResponseFailed { .. }));
         assert!(matches!(unknown_error, ProviderError::Protocol(_)));
+    }
+
+    #[test]
+    fn decodes_tool_call_stream_events() {
+        let started = ConverseStreamOutput::ContentBlockStart(
+            ContentBlockStartEvent::builder()
+                .content_block_index(1)
+                .start(ContentBlockStart::ToolUse(
+                    ToolUseBlockStart::builder()
+                        .tool_use_id("toolu_1")
+                        .name("read_file")
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        );
+        let arguments = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .content_block_index(1)
+                .delta(ContentBlockDelta::ToolUse(
+                    ToolUseBlockDelta::builder()
+                        .input("{\"path\":")
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        );
+        let stopped = ConverseStreamOutput::ContentBlockStop(
+            ContentBlockStopEvent::builder()
+                .content_block_index(1)
+                .build()
+                .unwrap(),
+        );
+        let stop = ConverseStreamOutput::MessageStop(
+            MessageStopEvent::builder()
+                .stop_reason(StopReason::ToolUse)
+                .build()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            decode_stream_event(started).unwrap(),
+            DecodedEvent::ToolCallStarted {
+                index: 1,
+                id: "toolu_1".to_owned(),
+                name: "read_file".to_owned(),
+            }
+        );
+        assert_eq!(
+            decode_stream_event(arguments).unwrap(),
+            DecodedEvent::ToolCallArguments {
+                index: 1,
+                json: "{\"path\":".to_owned(),
+            }
+        );
+        assert_eq!(
+            decode_stream_event(stopped).unwrap(),
+            DecodedEvent::BlockStopped { index: 1 }
+        );
+        assert_eq!(decode_stream_event(stop).unwrap(), DecodedEvent::Completed);
+    }
+
+    #[test]
+    fn attributes_tool_calls_by_index_and_rejects_unknown_or_reused_indexes() {
+        let mut tracker = ToolCallTracker::default();
+        tracker.start(1, "toolu_1".to_owned()).unwrap();
+
+        assert_eq!(tracker.arguments(1).unwrap(), "toolu_1");
+        let unknown = tracker.arguments(4).unwrap_err();
+        assert!(matches!(unknown, ProviderError::Protocol(_)));
+        let reused = tracker.start(1, "toolu_2".to_owned()).unwrap_err();
+        assert!(matches!(reused, ProviderError::Protocol(_)));
+        assert_eq!(tracker.stop(1), Some("toolu_1".to_owned()));
+        assert_eq!(tracker.stop(1), None);
     }
 
     #[test]
