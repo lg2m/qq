@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -15,12 +16,13 @@ use std::{
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
-use qq_protocol::{RunCommand, RunEvent, RunFailureKind, TokenUsage, ToolCallId};
+use qq_protocol::{ApprovalMode, RunCommand, RunEvent, RunFailureKind, TokenUsage, ToolCallId};
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
 };
 use thiserror::Error;
 
+mod approval;
 mod sessions;
 mod tools;
 
@@ -63,6 +65,10 @@ enum RuntimeEvent {
     ToolCallStarted {
         id: ToolCallId,
     },
+    ToolCallDenied {
+        id: ToolCallId,
+        message: String,
+    },
     ToolCallFinished {
         id: ToolCallId,
         result: String,
@@ -94,6 +100,48 @@ struct CancelOnDrop(Arc<AtomicBool>);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+/// The runtime's answer for one requested tool call after policy and, when
+/// required, an approval round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    Execute,
+    Deny { message: String },
+}
+
+pub(crate) type ToolGateFuture = Pin<Box<dyn Future<Output = GateDecision> + Send + 'static>>;
+
+/// Resolves approval policy for tool calls before they execute. The session
+/// runtime installs a gate that persists approval state and waits for clients;
+/// gate-less runs fall back to a static policy that cannot prompt.
+pub(crate) trait ToolGate: Send + Sync {
+    fn resolve(&self, call: &RuntimeToolCall) -> ToolGateFuture;
+}
+
+struct StaticPolicyGate {
+    mode: ApprovalMode,
+}
+
+impl ToolGate for StaticPolicyGate {
+    fn resolve(&self, call: &RuntimeToolCall) -> ToolGateFuture {
+        let class = approval::classify(&call.name, &call.arguments);
+        let decision = match approval::evaluate(
+            self.mode,
+            &call.name,
+            &class,
+            &approval::SessionGrants::default(),
+        ) {
+            approval::PolicyDecision::Execute => GateDecision::Execute,
+            approval::PolicyDecision::Deny => GateDecision::Deny {
+                message: approval::POLICY_DENIED_RESULT.to_owned(),
+            },
+            approval::PolicyDecision::RequireApproval => GateDecision::Deny {
+                message: approval::UNATTENDED_DENIED_RESULT.to_owned(),
+            },
+        };
+        Box::pin(std::future::ready(decision))
     }
 }
 
@@ -177,6 +225,7 @@ impl Runtime {
                     }
                     RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
                     | RuntimeEvent::ToolCallStarted { .. }
+                    | RuntimeEvent::ToolCallDenied { .. }
                     | RuntimeEvent::ToolCallFinished { .. } => {}
                     RuntimeEvent::Completed => {
                         yield RunEvent::Completed;
@@ -206,6 +255,7 @@ impl Runtime {
                     }
                     RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
                     | RuntimeEvent::ToolCallStarted { .. }
+                    | RuntimeEvent::ToolCallDenied { .. }
                     | RuntimeEvent::ToolCallFinished { .. } => {}
                     RuntimeEvent::Completed => {
                         yield RunEvent::Completed;
@@ -234,9 +284,26 @@ impl Runtime {
 
     fn run_messages_in_workspace_with_cancellation(
         &self,
+        messages: Vec<Message>,
+        workspace: PathBuf,
+        cancelled: Arc<AtomicBool>,
+    ) -> RuntimeStream {
+        self.run_loop(
+            messages,
+            workspace,
+            cancelled,
+            Arc::new(StaticPolicyGate {
+                mode: ApprovalMode::Ask,
+            }),
+        )
+    }
+
+    pub(crate) fn run_loop(
+        &self,
         mut messages: Vec<Message>,
         workspace: PathBuf,
         cancelled: Arc<AtomicBool>,
+        gate: Arc<dyn ToolGate>,
     ) -> RuntimeStream {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
@@ -508,11 +575,38 @@ impl Runtime {
                 }
                 messages.push(assistant);
 
-                for call in &calls {
+                // Policy resolves sequentially in request order, after the
+                // turn and its `requested` call rows are persisted, so
+                // approval prompts arrive one at a time. Calls with malformed
+                // arguments never reach the gate: there is nothing executable
+                // to approve, so they short-circuit to their tool error below.
+                let mut results = vec![None; calls.len()];
+                for (index, call) in calls.iter().enumerate() {
+                    if call.argument_error.is_some() {
+                        continue;
+                    }
+                    match gate.resolve(call).await {
+                        GateDecision::Execute => {}
+                        GateDecision::Deny { message } => {
+                            results[index] = Some(tools::ToolExecutionResult {
+                                content: message.clone(),
+                                is_error: true,
+                            });
+                            yield RuntimeEvent::ToolCallDenied { id: call.id, message };
+                        }
+                    }
+                }
+                let approved = calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| results[*index].is_none())
+                    .map(|(_, call)| call.clone())
+                    .collect::<Vec<_>>();
+                for call in &approved {
                     yield RuntimeEvent::ToolCallStarted { id: call.id };
                 }
 
-                let executions = calls.iter().cloned().map(|call| {
+                let executions = approved.into_iter().map(|call| {
                     let workspace = workspace.clone();
                     let cancelled = Arc::clone(&cancelled);
                     async move {
@@ -535,7 +629,6 @@ impl Runtime {
                     }
                 });
                 let mut executions = futures_stream::iter(executions).buffer_unordered(MAX_PARALLEL_READS);
-                let mut results = vec![None; calls.len()];
                 while let Some((call, result)) = executions.next().await {
                     results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                     yield RuntimeEvent::ToolCallFinished {
@@ -1045,6 +1138,163 @@ mod tests {
             ] if message.contains("could not open the workspace directory")
                 && message.len() > "could not open the workspace directory: ".len()
         ));
+    }
+
+    #[tokio::test]
+    async fn gate_less_runs_deny_mutating_tools_and_return_the_error_to_the_model() {
+        struct MutatingProvider {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for MutatingProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests.len();
+                requests.push(request);
+                drop(requests);
+                if turn == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "call_0".to_owned(),
+                            name: "__test_mutate".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "call_0".to_owned(),
+                            json: "{}".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "call_0".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            MutatingProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("mutate")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallDenied { message, .. }
+                if message == approval::UNATTENDED_DENIED_RESULT
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ToolCallStarted { .. }))
+        );
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        let requests = requests.lock().unwrap();
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult {
+                content,
+                is_error: true,
+                ..
+            }] if content == approval::UNATTENDED_DENIED_RESULT
+        ));
+    }
+
+    #[tokio::test]
+    async fn calls_with_malformed_arguments_short_circuit_without_consulting_the_gate() {
+        struct RecordingGate {
+            consulted: Arc<AtomicBool>,
+        }
+
+        impl ToolGate for RecordingGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                self.consulted.store(true, Ordering::Release);
+                Box::pin(std::future::ready(GateDecision::Deny {
+                    message: "the gate must not see unexecutable calls".to_owned(),
+                }))
+            }
+        }
+
+        struct MalformedMutatingProvider {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for MalformedMutatingProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests.len();
+                requests.push(request);
+                drop(requests);
+                if turn == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "bad".to_owned(),
+                            name: "__test_mutate".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "bad".to_owned(),
+                            json: r#"{"broken": "#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "bad".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let consulted = Arc::new(AtomicBool::new(false));
+        let runtime = Runtime::new(
+            MalformedMutatingProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        // Even though the tool is mutating and the gate would deny it, a call
+        // with malformed arguments has nothing executable to approve: it must
+        // return its argument error without an approval round trip.
+        let events = runtime
+            .run_loop(
+                vec![Message::user("mutate")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(RecordingGate {
+                    consulted: Arc::clone(&consulted),
+                }),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(!consulted.load(Ordering::Acquire));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ToolCallDenied { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { is_error: true, result, .. }
+                if result.contains("not valid JSON")
+        )));
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
     }
 
     #[tokio::test]
