@@ -402,6 +402,17 @@ fn read_file(
         if line_number >= arguments.offset {
             let text = match std::str::from_utf8(&line) {
                 Ok(text) => text,
+                // `error_len() == None` means the data ends inside a multibyte
+                // character: the scan cap (or the file itself) cut it short.
+                // Return the valid prefix as a truncated read, not an error.
+                Err(error) if error.error_len().is_none() => {
+                    output.push_str(
+                        std::str::from_utf8(&line[..error.valid_up_to()])
+                            .expect("the UTF-8 validator reported a valid prefix"),
+                    );
+                    output.push_str(TRUNCATION_MARKER);
+                    return ToolExecutionResult::success(output);
+                }
                 Err(_) => return ToolExecutionResult::error("file is not valid UTF-8"),
             };
             output.push_str(text);
@@ -411,7 +422,13 @@ fn read_file(
         }
     }
     if reader.limit() == 0 {
-        output.push_str(TRUNCATION_MARKER);
+        // The scan cap was consumed exactly; only mark truncation when the file
+        // actually continues past it. A probe failure is treated as truncation
+        // because end-of-file cannot be confirmed.
+        let mut probe = [0_u8; 1];
+        if !matches!(reader.get_mut().read(&mut probe), Ok(0)) {
+            output.push_str(TRUNCATION_MARKER);
+        }
     }
     ToolExecutionResult::success(output)
 }
@@ -507,7 +524,10 @@ fn search(
         if cancelled.load(Ordering::Acquire) {
             return ToolExecutionResult::error("tool execution was cancelled");
         }
-        if matches.len() >= MAX_SEARCH_RESULTS
+        // `bounded` also stops the walk: once the result buffer is full no
+        // further match can be reported, so scanning more files is wasted work.
+        if bounded
+            || matches.len() >= MAX_SEARCH_RESULTS
             || files >= MAX_SEARCH_FILES
             || scanned_bytes >= MAX_SEARCH_BYTES
             || visited_entries >= MAX_SEARCH_ENTRIES
@@ -699,12 +719,37 @@ fn contained_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, Str
     Ok(canonical)
 }
 
+/// The size of `byte` once serde_json escapes it inside a JSON string.
+const fn escaped_byte_len(byte: u8) -> usize {
+    match byte {
+        b'"' | b'\\' | 0x08 | 0x09 | 0x0A | 0x0C | 0x0D => 2,
+        byte if byte < 0x20 => 6,
+        _ => 1,
+    }
+}
+
+fn escaped_len(content: &str) -> usize {
+    content.bytes().map(escaped_byte_len).sum()
+}
+
+/// Bounds a tool result by its JSON-escaped size, not its raw size. Results are
+/// embedded in persisted event envelopes with a hard byte cap; control-heavy
+/// content (for example ANSI logs) escapes up to 6:1, so budgeting the raw size
+/// could make persistence fail on legitimate workspace file content.
 fn truncate_result(mut content: String) -> String {
-    if content.len() <= MAX_TOOL_RESULT_BYTES {
+    if escaped_len(&content) <= MAX_TOOL_RESULT_BYTES {
         return content;
     }
-    let marker_bytes = TRUNCATION_MARKER.len();
-    let mut end = MAX_TOOL_RESULT_BYTES.saturating_sub(marker_bytes);
+    let available = MAX_TOOL_RESULT_BYTES.saturating_sub(escaped_len(TRUNCATION_MARKER));
+    let mut escaped = 0_usize;
+    let mut end = 0_usize;
+    for (index, byte) in content.bytes().enumerate() {
+        escaped += escaped_byte_len(byte);
+        if escaped > available {
+            break;
+        }
+        end = index + 1;
+    }
     while !content.is_char_boundary(end) {
         end -= 1;
     }
@@ -759,6 +804,77 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.len() <= MAX_TOOL_RESULT_BYTES);
         assert!(result.content.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn control_dense_results_are_bounded_by_their_json_escaped_size() {
+        let directory = tempfile::tempdir().unwrap();
+        // Raw size stays under the result cap, but every ESC escapes 6:1 so the
+        // escaped size would far exceed the persisted-event budget.
+        fs::write(
+            directory.path().join("ansi.log"),
+            "\u{1b}".repeat(MAX_TOOL_RESULT_BYTES - 16 * 1024),
+        )
+        .unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        let result = execute_blocking(
+            &workspace,
+            "read_file",
+            r#"{"path":"ansi.log"}"#,
+            &AtomicBool::new(false),
+        );
+
+        assert!(!result.is_error);
+        assert!(result.content.ends_with(TRUNCATION_MARKER));
+        assert!(escaped_len(&result.content) <= MAX_TOOL_RESULT_BYTES);
+        assert!(serde_json::to_string(&result.content).unwrap().len() <= MAX_TOOL_RESULT_BYTES + 2);
+    }
+
+    #[test]
+    fn read_file_accepts_a_multibyte_char_split_by_the_scan_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let cap = usize::try_from(MAX_READ_SCAN_BYTES).unwrap();
+        let mut content = Vec::with_capacity(cap + 2);
+        content.resize(cap - 4, b'x');
+        content.push(b'\n');
+        content.extend_from_slice("ab\u{e9}".as_bytes());
+        assert_eq!(content.len(), cap + 1);
+        fs::write(directory.path().join("split.txt"), &content).unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        let result = execute_blocking(
+            &workspace,
+            "read_file",
+            r#"{"path":"split.txt","offset":2,"limit":1}"#,
+            &AtomicBool::new(false),
+        );
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert_eq!(result.content, format!("ab{TRUNCATION_MARKER}"));
+    }
+
+    #[test]
+    fn read_file_does_not_mark_an_exactly_cap_sized_file_truncated() {
+        let directory = tempfile::tempdir().unwrap();
+        let cap = usize::try_from(MAX_READ_SCAN_BYTES).unwrap();
+        let mut content = Vec::with_capacity(cap);
+        content.resize(cap - 2, b'x');
+        content.push(b'\n');
+        content.push(b'y');
+        assert_eq!(content.len(), cap);
+        fs::write(directory.path().join("exact.txt"), &content).unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        let result = execute_blocking(
+            &workspace,
+            "read_file",
+            r#"{"path":"exact.txt","offset":2,"limit":1}"#,
+            &AtomicBool::new(false),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "y");
     }
 
     #[test]

@@ -378,11 +378,11 @@ async fn execute_run(
 
     match inner.store.start_assistant(&claimed).await {
         Ok(event) => inner.notify(event.cursor),
-        Err(_) => {
+        Err(error) => {
             finish_run(
                 &inner,
                 &claimed,
-                internal_failure("failed to persist the assistant message"),
+                persistence_failure("failed to persist the assistant message", &error),
             )
             .await;
             return;
@@ -429,14 +429,14 @@ async fn execute_run(
         };
         match input {
             RunInput::Flush => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -445,14 +445,14 @@ async fn execute_run(
             }
             stopped @ (RunInput::Cancelled | RunInput::Interrupted) => {
                 tool_cancellation.store(true, Ordering::Release);
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -470,59 +470,56 @@ async fn execute_run(
                 turn_ordinal,
                 message,
                 usage,
+                calls,
             })) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
                 }
                 flush_at = None;
                 accounting.record_turn(usage);
-                if message.has_content()
-                    && inner
+                if message.has_content() || !calls.is_empty() {
+                    match inner
                         .store
-                        .persist_model_turn(&claimed, turn_ordinal, message)
+                        .persist_model_turn(&claimed, turn_ordinal, message, calls)
                         .await
-                        .is_err()
-                {
-                    finish_run(
-                        &inner,
-                        &claimed,
-                        internal_failure("failed to persist the completed model turn"),
-                    )
-                    .await;
-                    return;
-                }
-            }
-            RunInput::Event(Some(RuntimeEvent::ToolCallRequested { call })) => {
-                match inner.store.request_tool_call(&claimed, call).await {
-                    Ok(event) => inner.notify(event.cursor),
-                    Err(_) => {
-                        finish_run(
-                            &inner,
-                            &claimed,
-                            internal_failure("failed to persist the requested tool call"),
-                        )
-                        .await;
-                        return;
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                inner.notify(event.cursor);
+                            }
+                        }
+                        Err(error) => {
+                            finish_run(
+                                &inner,
+                                &claimed,
+                                persistence_failure(
+                                    "failed to persist the completed model turn",
+                                    &error,
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
                     }
                 }
             }
             RunInput::Event(Some(RuntimeEvent::ToolCallStarted { id })) => {
                 match inner.store.start_tool_call(&claimed, id).await {
                     Ok(event) => inner.notify(event.cursor),
-                    Err(_) => {
+                    Err(error) => {
                         finish_run(
                             &inner,
                             &claimed,
-                            internal_failure("failed to persist the started tool call"),
+                            persistence_failure("failed to persist the started tool call", &error),
                         )
                         .await;
                         return;
@@ -540,11 +537,11 @@ async fn execute_run(
                     .await
                 {
                     Ok(event) => inner.notify(event.cursor),
-                    Err(_) => {
+                    Err(error) => {
                         finish_run(
                             &inner,
                             &claimed,
-                            internal_failure("failed to persist the tool result"),
+                            persistence_failure("failed to persist the tool result", &error),
                         )
                         .await;
                         return;
@@ -563,11 +560,11 @@ async fn execute_run(
                     continue;
                 }
                 if !persisted_first_text {
-                    if persist_text(&inner, &claimed, channel, text).await.is_err() {
+                    if let Err(error) = persist_text(&inner, &claimed, channel, text).await {
                         finish_run(
                             &inner,
                             &claimed,
-                            internal_failure("failed to persist model output"),
+                            persistence_failure("failed to persist model output", &error),
                         )
                         .await;
                         return;
@@ -576,14 +573,18 @@ async fn execute_run(
                     continue;
                 }
                 if pending_channel.is_some_and(|pending| pending != channel)
-                    && flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
-                        .is_err()
+                    && let Err(error) = flush_pending_text(
+                        &inner,
+                        &claimed,
+                        &mut pending_channel,
+                        &mut pending_text,
+                    )
+                    .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -594,14 +595,18 @@ async fn execute_run(
                 }
                 pending_text.push_str(&text);
                 if pending_text.len() >= OUTPUT_BATCH_BYTES {
-                    if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
-                        .is_err()
+                    if let Err(error) = flush_pending_text(
+                        &inner,
+                        &claimed,
+                        &mut pending_channel,
+                        &mut pending_text,
+                    )
+                    .await
                     {
                         finish_run(
                             &inner,
                             &claimed,
-                            internal_failure("failed to persist model output"),
+                            persistence_failure("failed to persist model output", &error),
                         )
                         .await;
                         return;
@@ -610,14 +615,14 @@ async fn execute_run(
                 }
             }
             RunInput::Event(Some(RuntimeEvent::Completed)) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -632,14 +637,14 @@ async fn execute_run(
                 return;
             }
             RunInput::Event(Some(RuntimeEvent::Failed { kind, message })) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -659,14 +664,14 @@ async fn execute_run(
                 return;
             }
             RunInput::Event(None) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -820,6 +825,32 @@ fn internal_failure(message: &str) -> RunOutcome {
         failure: RunFailure {
             kind: RunFailureKind::Server,
             message: message.to_owned(),
+        },
+    }
+}
+
+/// Maps a store error during a run into a run outcome. The deliberate session
+/// context budget surfaces as a user-meaningful policy failure; every other
+/// error is an internal failure that carries the store error rather than
+/// discarding it, since qq-core has no logging facility to record it.
+fn persistence_failure(action: &str, error: &SessionRuntimeError) -> RunOutcome {
+    match error {
+        SessionRuntimeError::OutputTooLarge | SessionRuntimeError::ContextTooLarge => {
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Policy,
+                    message: format!(
+                        "session context reached its {} MiB limit; start a new session to continue",
+                        MAX_CONTEXT_BYTES / (1024 * 1024)
+                    ),
+                },
+            }
+        }
+        error => RunOutcome::Failed {
+            failure: RunFailure {
+                kind: RunFailureKind::Server,
+                message: format!("{action}: {error}"),
+            },
         },
     }
 }
@@ -1068,28 +1099,28 @@ impl Store {
         .await
     }
 
+    /// Persists a completed model turn together with every tool call it
+    /// requested in one transaction. A crash must never commit the turn's
+    /// ToolCall blocks without their tool_calls rows: such orphans would replay
+    /// as `tool_use` without `tool_result` and poison every later request.
     async fn persist_model_turn(
         &self,
         claimed: &ClaimedRun,
         turn_ordinal: u16,
         message: Message,
-    ) -> Result<(), SessionRuntimeError> {
-        let claimed = claimed.clone();
-        self.call(Priority::Output, move |connection| {
-            persist_model_turn(connection, &claimed, turn_ordinal, &message)
-        })
-        .await
-    }
-
-    async fn request_tool_call(
-        &self,
-        claimed: &ClaimedRun,
-        call: RuntimeToolCall,
-    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        calls: Vec<RuntimeToolCall>,
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
-            request_tool_call(connection, store_id, &claimed, &call)
+            persist_model_turn(
+                connection,
+                store_id,
+                &claimed,
+                turn_ordinal,
+                &message,
+                &calls,
+            )
         })
         .await
     }
@@ -2085,10 +2116,12 @@ fn append_text(
 
 fn persist_model_turn(
     connection: &mut Connection,
+    store_id: StoreId,
     claimed: &ClaimedRun,
     turn_ordinal: u16,
     message: &Message,
-) -> Result<(), SessionRuntimeError> {
+    calls: &[RuntimeToolCall],
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
     if message.role() != Role::Assistant {
         return Err(SessionRuntimeError::Persistence);
     }
@@ -2099,62 +2132,59 @@ fn persist_model_turn(
         .collect::<Vec<_>>();
     let content_json =
         serde_json::to_string(&content).map_err(|_| SessionRuntimeError::Persistence)?;
-    connection
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let argument_bytes = calls.iter().fold(0_usize, |total, call| {
+        total.saturating_add(call.arguments.len())
+    });
+    ensure_context_capacity(&transaction, claimed.session_id, argument_bytes)?;
+    transaction
         .execute(
             "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
              VALUES (?1, ?2, ?3)",
             params![claimed.run_id.to_string(), turn_ordinal, content_json],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(())
-}
-
-fn request_tool_call(
-    connection: &mut Connection,
-    store_id: StoreId,
-    claimed: &ClaimedRun,
-    call: &RuntimeToolCall,
-) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    ensure_context_capacity(&transaction, claimed.session_id, call.arguments.len())?;
     let now = now_ms();
-    transaction
-        .execute(
-            "INSERT INTO tool_calls(
-                 id, run_id, turn_ordinal, call_ordinal, provider_call_id, name,
-                 arguments_json, state, requested_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)",
-            params![
-                call.id.to_string(),
-                claimed.run_id.to_string(),
-                call.turn_ordinal,
-                call.call_ordinal,
-                call.provider_call_id,
-                call.name,
-                call.arguments,
-                now,
-            ],
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let tool_call = load_tool_call(&transaction, call.id)?;
-    let event = append_event(
-        &transaction,
-        EventContext {
-            store_id,
-            workspace_id: claimed.workspace_id,
-            session_id: claimed.session_id,
-            run_id: Some(claimed.run_id),
-            caused_by: Some(claimed.command_id),
-            occurred_at_ms: now,
-        },
-        SessionEvent::ToolCallRequested { tool_call },
-    )?;
+    let mut events = Vec::with_capacity(calls.len());
+    for call in calls {
+        transaction
+            .execute(
+                "INSERT INTO tool_calls(
+                     id, run_id, turn_ordinal, call_ordinal, provider_call_id, name,
+                     arguments_json, state, requested_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)",
+                params![
+                    call.id.to_string(),
+                    claimed.run_id.to_string(),
+                    call.turn_ordinal,
+                    call.call_ordinal,
+                    call.provider_call_id,
+                    call.name,
+                    call.arguments,
+                    now,
+                ],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let tool_call = load_tool_call(&transaction, call.id)?;
+        events.push(append_event(
+            &transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by: Some(claimed.command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::ToolCallRequested { tool_call },
+        )?);
+    }
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(event)
+    Ok(events)
 }
 
 fn start_tool_call(
@@ -3098,12 +3128,12 @@ fn load_model_context(
                     continue;
                 }
                 for (turn_ordinal, content_json) in turns {
-                    let content = serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
-                        .map_err(|_| SessionRuntimeError::Persistence)?
-                        .into_iter()
-                        .map(ContentBlock::from)
-                        .collect();
-                    context.push(Message::new(Role::Assistant, content));
+                    let content: Vec<ContentBlock> =
+                        serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
+                            .map_err(|_| SessionRuntimeError::Persistence)?
+                            .into_iter()
+                            .map(ContentBlock::from)
+                            .collect();
 
                     let mut statement = transaction
                         .prepare(
@@ -3112,18 +3142,41 @@ fn load_model_context(
                              ORDER BY call_ordinal",
                         )
                         .map_err(|_| SessionRuntimeError::Persistence)?;
-                    let results = statement
+                    let mut recorded = statement
                         .query_map(params![snapshot.run_id.to_string(), turn_ordinal], |row| {
-                            Ok(ContentBlock::ToolResult {
-                                call_id: row.get(0)?,
-                                content: row.get(1)?,
-                                is_error: row.get(2)?,
-                            })
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                (row.get::<_, String>(1)?, row.get::<_, bool>(2)?),
+                            ))
                         })
                         .map_err(|_| SessionRuntimeError::Persistence)?
-                        .collect::<Result<Vec<_>, _>>()
+                        .collect::<Result<HashMap<String, (String, bool)>, _>>()
                         .map_err(|_| SessionRuntimeError::Persistence)?;
                     drop(statement);
+                    // Emit exactly one result per ToolCall block, in block order.
+                    // A block without a recorded result (a crash between the
+                    // turn commit and its tool_calls rows in an older store)
+                    // gets an explicit interrupted result so replayed context
+                    // stays provider-valid instead of poisoning the session.
+                    let results = content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolCall { id, .. } => Some(match recorded.remove(id) {
+                                Some((content, is_error)) => ContentBlock::ToolResult {
+                                    call_id: id.clone(),
+                                    content,
+                                    is_error,
+                                },
+                                None => ContentBlock::ToolResult {
+                                    call_id: id.clone(),
+                                    content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                                    is_error: true,
+                                },
+                            }),
+                            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
+                        })
+                        .collect::<Vec<_>>();
+                    context.push(Message::new(Role::Assistant, content));
                     if !results.is_empty() {
                         context.push(Message::tool_results(results));
                     }
@@ -4161,6 +4214,7 @@ mod tests {
             provider_call_id: "provider-call".to_owned(),
             name: "read_file".to_owned(),
             arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            argument_error: None,
         };
         store
             .persist_model_turn(
@@ -4174,10 +4228,10 @@ mod tests {
                         arguments: serde_json::from_str(&call.arguments).unwrap(),
                     }],
                 ),
+                vec![call],
             )
             .await
             .unwrap();
-        store.request_tool_call(&claimed, call).await.unwrap();
         let started = store.start_tool_call(&claimed, tool_call_id).await.unwrap();
         drop(store);
 
@@ -4246,6 +4300,214 @@ mod tests {
                 content,
                 is_error: true,
             }] if call_id == "provider-call" && content == INTERRUPTED_TOOL_RESULT
+        ));
+    }
+
+    #[tokio::test]
+    async fn orphaned_tool_call_blocks_replay_with_synthesized_interrupted_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "read".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        // Simulate the pre-fix crash window: the model turn committed with a
+        // ToolCall block, but no tool_calls rows were ever written.
+        store
+            .persist_model_turn(
+                &claimed,
+                1,
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolCall {
+                        id: "orphan-call".to_owned(),
+                        name: "read_file".to_owned(),
+                        arguments: serde_json::json!({"path": "note.txt"}),
+                    }],
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.receipt.committed_through,
+            })
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0].messages();
+        assert!(matches!(
+            messages[1].content(),
+            [ContentBlock::ToolCall { id, .. }] if id == "orphan-call"
+        ));
+        assert!(matches!(
+            messages[2].content(),
+            [ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error: true,
+            }] if call_id == "orphan-call" && content == INTERRUPTED_TOOL_RESULT
+        ));
+        // Provider validity: every ToolCall block must be answered by a
+        // ToolResult with the same call ID in a later message.
+        for (index, message) in messages.iter().enumerate() {
+            for block in message.content() {
+                if let ContentBlock::ToolCall { id, .. } = block {
+                    assert!(messages[index + 1..].iter().any(|candidate| {
+                        candidate.content().iter().any(|result| {
+                            matches!(
+                                result,
+                                ContentBlock::ToolResult { call_id, .. } if call_id == id
+                            )
+                        })
+                    }));
+                }
+            }
+        }
+    }
+
+    struct ContextBudgetLoader;
+
+    impl RuntimeLoader for ContextBudgetLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            Box::pin(async {
+                Runtime::new(ContextBudgetProvider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct ContextBudgetProvider;
+
+    impl Provider for ContextBudgetProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "x".repeat(MAX_CONTEXT_BYTES + 1),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn exceeding_the_context_budget_fails_the_run_with_a_policy_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(ContextBudgetLoader),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "fill the context".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let observed = collect_through_finished(&mut events).await;
+        let finished = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            finished,
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Policy,
+                    ref message,
+                }
+            } if message.contains("4 MiB limit")
         ));
     }
 

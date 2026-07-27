@@ -54,9 +54,11 @@ enum RuntimeEvent {
         turn_ordinal: u16,
         message: Message,
         usage: Option<TokenUsage>,
-    },
-    ToolCallRequested {
-        call: RuntimeToolCall,
+        /// Tool calls requested by this turn, in request order. Carried on the
+        /// same event as the completed turn so the store can persist the turn
+        /// and its calls in one transaction; a crash must never leave a
+        /// persisted ToolCall block without its tool_calls rows.
+        calls: Vec<RuntimeToolCall>,
     },
     ToolCallStarted {
         id: ToolCallId,
@@ -81,6 +83,10 @@ struct RuntimeToolCall {
     provider_call_id: String,
     name: String,
     arguments: String,
+    /// Set when the provider streamed arguments that were not valid JSON. The
+    /// call is never executed; this message is returned to the model as a
+    /// retryable tool error instead of failing the run.
+    argument_error: Option<String>,
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -97,6 +103,7 @@ struct PendingToolCall {
     name: String,
     arguments: String,
     parsed_arguments: Option<serde_json::Value>,
+    argument_error: Option<String>,
     completed: bool,
 }
 
@@ -169,7 +176,6 @@ impl Runtime {
                         yield RunEvent::Usage { usage };
                     }
                     RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
-                    | RuntimeEvent::ToolCallRequested { .. }
                     | RuntimeEvent::ToolCallStarted { .. }
                     | RuntimeEvent::ToolCallFinished { .. } => {}
                     RuntimeEvent::Completed => {
@@ -199,7 +205,6 @@ impl Runtime {
                         yield RunEvent::Usage { usage };
                     }
                     RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
-                    | RuntimeEvent::ToolCallRequested { .. }
                     | RuntimeEvent::ToolCallStarted { .. }
                     | RuntimeEvent::ToolCallFinished { .. } => {}
                     RuntimeEvent::Completed => {
@@ -250,10 +255,10 @@ impl Runtime {
 
             let workspace = match tools::open_workspace(workspace, Arc::clone(&cancelled)).await {
                 Ok(workspace) => workspace,
-                Err(_) => {
+                Err(error) => {
                     yield RuntimeEvent::Failed {
                         kind: RunFailureKind::InvalidCommand,
-                        message: "workspace must identify an existing directory".to_owned(),
+                        message: format!("could not open the workspace directory: {error}"),
                     };
                     return;
                 }
@@ -340,6 +345,7 @@ impl Runtime {
                                 name,
                                 arguments: String::new(),
                                 parsed_arguments: None,
+                                argument_error: None,
                                 completed: false,
                             });
                             total_tool_calls += 1;
@@ -391,14 +397,15 @@ impl Runtime {
                             } else {
                                 &call.arguments
                             };
+                            // Malformed argument JSON is the model's mistake, not a
+                            // run failure: return a retryable tool error instead.
                             let parsed = match serde_json::from_str(arguments) {
                                 Ok(arguments) => arguments,
                                 Err(error) => {
-                                    yield RuntimeEvent::Failed {
-                                        kind: RunFailureKind::ProviderProtocol,
-                                        message: format!("tool call {id:?} contained invalid JSON arguments: {error}"),
-                                    };
-                                    return;
+                                    call.argument_error = Some(format!(
+                                        "tool call arguments were not valid JSON: {error}"
+                                    ));
+                                    serde_json::Value::Object(serde_json::Map::new())
                                 }
                             };
                             call.arguments = serde_json::to_string(&parsed)
@@ -458,31 +465,17 @@ impl Runtime {
                     })
                     .collect::<Vec<_>>();
                 let assistant = Message::new(Role::Assistant, assistant_content);
-                yield RuntimeEvent::AssistantTurnCompleted {
-                    turn_ordinal,
-                    message: assistant.clone(),
-                    usage: terminal_usage,
-                };
-
-                if pending_calls.is_empty() {
-                    yield RuntimeEvent::Completed;
-                    return;
-                }
-                messages.push(assistant);
-
                 let mut calls = Vec::with_capacity(pending_calls.len());
+                let mut id_generation_failed = None;
                 for (index, pending) in pending_calls.into_iter().enumerate() {
                     let id = match ToolCallId::generate() {
                         Ok(id) => id,
                         Err(error) => {
-                            yield RuntimeEvent::Failed {
-                                kind: RunFailureKind::Server,
-                                message: error.to_string(),
-                            };
-                            return;
+                            id_generation_failed = Some(error.to_string());
+                            break;
                         }
                     };
-                    let call = RuntimeToolCall {
+                    calls.push(RuntimeToolCall {
                         id,
                         turn_ordinal,
                         call_ordinal: u16::try_from(index + 1)
@@ -490,10 +483,31 @@ impl Runtime {
                         provider_call_id: pending.provider_call_id,
                         name: pending.name,
                         arguments: pending.arguments,
-                    };
-                    yield RuntimeEvent::ToolCallRequested { call: call.clone() };
-                    calls.push(call);
+                        argument_error: pending.argument_error,
+                    });
                 }
+                if let Some(message) = id_generation_failed {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::Server,
+                        message,
+                    };
+                    return;
+                }
+                // The completed turn and its requested calls travel on one event
+                // so the store can persist them atomically.
+                yield RuntimeEvent::AssistantTurnCompleted {
+                    turn_ordinal,
+                    message: assistant.clone(),
+                    usage: terminal_usage,
+                    calls: calls.clone(),
+                };
+
+                if calls.is_empty() {
+                    yield RuntimeEvent::Completed;
+                    return;
+                }
+                messages.push(assistant);
+
                 for call in &calls {
                     yield RuntimeEvent::ToolCallStarted { id: call.id };
                 }
@@ -502,13 +516,21 @@ impl Runtime {
                     let workspace = workspace.clone();
                     let cancelled = Arc::clone(&cancelled);
                     async move {
-                        let result = tools::execute(
-                            workspace,
-                            call.name.clone(),
-                            call.arguments.clone(),
-                            cancelled,
-                        )
-                        .await;
+                        let result = match call.argument_error.clone() {
+                            Some(error) => tools::ToolExecutionResult {
+                                content: error,
+                                is_error: true,
+                            },
+                            None => {
+                                tools::execute(
+                                    workspace,
+                                    call.name.clone(),
+                                    call.arguments.clone(),
+                                    cancelled,
+                                )
+                                .await
+                            }
+                        };
                         (call, result)
                     }
                 });
@@ -781,8 +803,11 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, RuntimeEvent::ToolCallRequested { .. }))
-                .count(),
+                .filter_map(|event| match event {
+                    RuntimeEvent::AssistantTurnCompleted { calls, .. } => Some(calls.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
             2
         );
         let requests = requests.lock().unwrap();
@@ -873,9 +898,11 @@ mod tests {
             .await;
         let requested = events
             .iter()
-            .filter_map(|event| match event {
-                RuntimeEvent::ToolCallRequested { call } => Some(call.id),
-                _ => None,
+            .flat_map(|event| match event {
+                RuntimeEvent::AssistantTurnCompleted { calls, .. } => {
+                    calls.iter().map(|call| call.id).collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
             })
             .collect::<Vec<_>>();
         let finished = events
@@ -913,6 +940,111 @@ mod tests {
         let result = execution.await.unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_argument_json_yields_a_tool_error_and_continues_the_run() {
+        struct MalformedArgumentsProvider {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for MalformedArgumentsProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests.len();
+                requests.push(request);
+                drop(requests);
+                if turn == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "bad".to_owned(),
+                            name: "read_file".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "bad".to_owned(),
+                            json: r#"{"path": "#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "bad".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "done".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            MalformedArgumentsProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("inspect")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { is_error: true, result, .. }
+                if result.contains("not valid JSON")
+        )));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error: true,
+            }] if call_id == "bad" && content.contains("not valid JSON")
+        ));
+    }
+
+    #[tokio::test]
+    async fn reports_the_underlying_workspace_open_error() {
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::new(Mutex::new(None)),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(
+                RunCommand::new("hello"),
+                PathBuf::from("/qq-test-missing-workspace"),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RunEvent::Started,
+                RunEvent::Failed {
+                    kind: RunFailureKind::InvalidCommand,
+                    message,
+                }
+            ] if message.contains("could not open the workspace directory")
+                && message.len() > "could not open the workspace directory: ".len()
+        ));
     }
 
     #[tokio::test]
