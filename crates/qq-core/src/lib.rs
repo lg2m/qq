@@ -2,16 +2,27 @@
 
 #![forbid(unsafe_code)]
 
-use std::{pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_stream::stream;
 use futures_core::Stream;
-use futures_util::StreamExt;
-use qq_protocol::{RunCommand, RunEvent, RunFailureKind, TokenUsage};
-use qq_provider::{Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent};
+use futures_util::{StreamExt, stream as futures_stream};
+use qq_protocol::{RunCommand, RunEvent, RunFailureKind, TokenUsage, ToolCallId};
+use qq_provider::{
+    ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
+};
 use thiserror::Error;
 
 mod sessions;
+mod tools;
 
 pub use sessions::{
     LoadedRuntime, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader,
@@ -19,6 +30,80 @@ pub use sessions::{
 };
 
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
+type RuntimeStream = Pin<Box<dyn Stream<Item = RuntimeEvent> + Send + 'static>>;
+
+const MAX_MODEL_TURNS: u16 = 32;
+const MAX_TOOL_CALLS_PER_TURN: usize = 16;
+const MAX_TOOL_CALLS_PER_RUN: usize = 64;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_TOOL_CALL_ID_BYTES: usize = 1_024;
+const MAX_TOOL_NAME_BYTES: usize = 128;
+const MAX_RUN_MODEL_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PARALLEL_READS: usize = 4;
+
+#[derive(Debug, Clone, PartialEq)]
+enum RuntimeEvent {
+    Started,
+    OutputTextDelta {
+        text: String,
+    },
+    RefusalDelta {
+        text: String,
+    },
+    AssistantTurnCompleted {
+        turn_ordinal: u16,
+        message: Message,
+        usage: Option<TokenUsage>,
+    },
+    ToolCallRequested {
+        call: RuntimeToolCall,
+    },
+    ToolCallStarted {
+        id: ToolCallId,
+    },
+    ToolCallFinished {
+        id: ToolCallId,
+        result: String,
+        is_error: bool,
+    },
+    Completed,
+    Failed {
+        kind: RunFailureKind,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeToolCall {
+    id: ToolCallId,
+    turn_ordinal: u16,
+    call_ordinal: u16,
+    provider_call_id: String,
+    name: String,
+    arguments: String,
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct PendingToolCall {
+    provider_call_id: String,
+    name: String,
+    arguments: String,
+    parsed_arguments: Option<serde_json::Value>,
+    completed: bool,
+}
+
+enum TurnBlock {
+    Text(String),
+    ToolCall(usize),
+}
 
 /// Runs protocol commands against a configured model provider.
 #[derive(Clone)]
@@ -60,79 +145,419 @@ impl Runtime {
 
     /// Runs one command and returns events as they become available.
     pub fn run(&self, command: RunCommand) -> RunStream {
-        self.run_messages(vec![Message::user(command.into_prompt())])
+        self.run_in_workspace(
+            command,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
     }
 
-    /// Runs one model turn with explicit prior conversation context.
+    /// Runs one command with read-only tools scoped to `workspace`.
+    pub fn run_in_workspace(&self, command: RunCommand, workspace: PathBuf) -> RunStream {
+        let mut events =
+            self.run_messages_in_workspace(vec![Message::user(command.into_prompt())], workspace);
+        Box::pin(stream! {
+            while let Some(event) = events.next().await {
+                match event {
+                    RuntimeEvent::Started => yield RunEvent::Started,
+                    RuntimeEvent::OutputTextDelta { text } => {
+                        yield RunEvent::OutputTextDelta { text };
+                    }
+                    RuntimeEvent::RefusalDelta { text } => {
+                        yield RunEvent::RefusalDelta { text };
+                    }
+                    RuntimeEvent::AssistantTurnCompleted { usage: Some(usage), .. } => {
+                        yield RunEvent::Usage { usage };
+                    }
+                    RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
+                    | RuntimeEvent::ToolCallRequested { .. }
+                    | RuntimeEvent::ToolCallStarted { .. }
+                    | RuntimeEvent::ToolCallFinished { .. } => {}
+                    RuntimeEvent::Completed => {
+                        yield RunEvent::Completed;
+                        return;
+                    }
+                    RuntimeEvent::Failed { kind, message } => {
+                        yield RunEvent::Failed { kind, message };
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Runs a multi-turn model/tool loop with explicit prior conversation context.
     pub fn run_messages(&self, messages: Vec<Message>) -> RunStream {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut events = self.run_messages_in_workspace(messages, workspace);
+        Box::pin(stream! {
+            while let Some(event) = events.next().await {
+                match event {
+                    RuntimeEvent::Started => yield RunEvent::Started,
+                    RuntimeEvent::OutputTextDelta { text } => yield RunEvent::OutputTextDelta { text },
+                    RuntimeEvent::RefusalDelta { text } => yield RunEvent::RefusalDelta { text },
+                    RuntimeEvent::AssistantTurnCompleted { usage: Some(usage), .. } => {
+                        yield RunEvent::Usage { usage };
+                    }
+                    RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
+                    | RuntimeEvent::ToolCallRequested { .. }
+                    | RuntimeEvent::ToolCallStarted { .. }
+                    | RuntimeEvent::ToolCallFinished { .. } => {}
+                    RuntimeEvent::Completed => {
+                        yield RunEvent::Completed;
+                        return;
+                    }
+                    RuntimeEvent::Failed { kind, message } => {
+                        yield RunEvent::Failed { kind, message };
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    fn run_messages_in_workspace(
+        &self,
+        messages: Vec<Message>,
+        workspace: PathBuf,
+    ) -> RuntimeStream {
+        self.run_messages_in_workspace_with_cancellation(
+            messages,
+            workspace,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn run_messages_in_workspace_with_cancellation(
+        &self,
+        mut messages: Vec<Message>,
+        workspace: PathBuf,
+        cancelled: Arc<AtomicBool>,
+    ) -> RuntimeStream {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
         let max_output_tokens = self.max_output_tokens;
         Box::pin(stream! {
-            yield RunEvent::Started;
+            let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
+            yield RuntimeEvent::Started;
 
             if messages.is_empty() || messages.iter().any(|message| !message.has_content()) {
-                yield RunEvent::Failed {
+                yield RuntimeEvent::Failed {
                     kind: RunFailureKind::InvalidCommand,
                     message: "conversation messages must not be empty".to_owned(),
                 };
                 return;
             }
 
-            let request = ModelRequest::new(model, messages, max_output_tokens);
-            let mut provider_events = provider.stream(request);
+            let workspace = match tools::open_workspace(workspace, Arc::clone(&cancelled)).await {
+                Ok(workspace) => workspace,
+                Err(_) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::InvalidCommand,
+                        message: "workspace must identify an existing directory".to_owned(),
+                    };
+                    return;
+                }
+            };
 
-            while let Some(event) = provider_events.next().await {
-                match event {
-                    Ok(ProviderEvent::OutputTextDelta { text }) => {
-                        yield RunEvent::OutputTextDelta { text };
-                    }
-                    Ok(ProviderEvent::RefusalDelta { text }) => {
-                        yield RunEvent::RefusalDelta { text };
-                    }
-                    Ok(
-                        ProviderEvent::ToolCallStarted { .. }
-                        | ProviderEvent::ToolCallArgumentsDelta { .. }
-                        | ProviderEvent::ToolCallCompleted { .. },
-                    ) => {
-                        // No tools are declared yet; a streamed tool call is a
-                        // provider contract violation until the tool loop lands.
-                        yield RunEvent::Failed {
-                            kind: RunFailureKind::ProviderProtocol,
-                            message: "provider streamed a tool call without declared tools"
-                                .to_owned(),
-                        };
-                        return;
-                    }
-                    Ok(ProviderEvent::Completed { usage }) => {
-                        if let Some(usage) = usage {
-                            yield RunEvent::Usage {
-                                usage: TokenUsage {
-                                    input_tokens: usage.input_tokens,
-                                    cache_read_input_tokens: usage.cache_read_input_tokens,
-                                    cache_write_input_tokens: usage.cache_write_input_tokens,
-                                    output_tokens: usage.output_tokens,
-                                },
-                            };
+            let mut total_tool_calls = 0_usize;
+            let mut model_text_bytes = 0_usize;
+            for turn_ordinal in 1..=MAX_MODEL_TURNS {
+                let request = ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens)
+                    .with_tools(tools::specs());
+                let mut provider_events = provider.stream(request);
+                let mut pending_calls = Vec::<PendingToolCall>::new();
+                let mut calls_by_provider_id = HashMap::<String, usize>::new();
+                let mut blocks = Vec::<TurnBlock>::new();
+                let mut terminal_usage = None;
+                let mut completed = false;
+
+                while let Some(event) = provider_events.next().await {
+                    match event {
+                        Ok(ProviderEvent::OutputTextDelta { text }) => {
+                            if model_text_bytes.saturating_add(text.len()) > MAX_RUN_MODEL_TEXT_BYTES {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::Policy,
+                                    message: "model text exceeded the 16 MiB per-run limit".to_owned(),
+                                };
+                                return;
+                            }
+                            model_text_bytes += text.len();
+                            append_turn_text(&mut blocks, &text);
+                            yield RuntimeEvent::OutputTextDelta { text };
                         }
-                        yield RunEvent::Completed;
-                        return;
-                    }
-                    Err(error) => {
-                        yield RunEvent::Failed {
-                            kind: run_failure_kind(error.kind()),
-                            message: error.to_string(),
-                        };
-                        return;
+                        Ok(ProviderEvent::RefusalDelta { text }) => {
+                            if model_text_bytes.saturating_add(text.len()) > MAX_RUN_MODEL_TEXT_BYTES {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::Policy,
+                                    message: "model text exceeded the 16 MiB per-run limit".to_owned(),
+                                };
+                                return;
+                            }
+                            model_text_bytes += text.len();
+                            append_turn_text(&mut blocks, &text);
+                            yield RuntimeEvent::RefusalDelta { text };
+                        }
+                        Ok(ProviderEvent::ToolCallStarted { id, name }) => {
+                            if id.is_empty() || id.len() > MAX_TOOL_CALL_ID_BYTES {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: "provider tool call ID is empty or exceeds 1 KiB".to_owned(),
+                                };
+                                return;
+                            }
+                            if name.is_empty() || name.len() > MAX_TOOL_NAME_BYTES {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: "provider tool name is empty or exceeds 128 bytes".to_owned(),
+                                };
+                                return;
+                            }
+                            if pending_calls.len() >= MAX_TOOL_CALLS_PER_TURN {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!("model requested more than {MAX_TOOL_CALLS_PER_TURN} tools in one turn"),
+                                };
+                                return;
+                            }
+                            if total_tool_calls >= MAX_TOOL_CALLS_PER_RUN {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::Policy,
+                                    message: format!("tool loop exceeded {MAX_TOOL_CALLS_PER_RUN} calls in one run"),
+                                };
+                                return;
+                            }
+                            if calls_by_provider_id.contains_key(&id) {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!("provider reused tool call ID {id:?} in one turn"),
+                                };
+                                return;
+                            }
+                            let index = pending_calls.len();
+                            calls_by_provider_id.insert(id.clone(), index);
+                            pending_calls.push(PendingToolCall {
+                                provider_call_id: id,
+                                name,
+                                arguments: String::new(),
+                                parsed_arguments: None,
+                                completed: false,
+                            });
+                            total_tool_calls += 1;
+                            blocks.push(TurnBlock::ToolCall(index));
+                        }
+                        Ok(ProviderEvent::ToolCallArgumentsDelta { id, json }) => {
+                            let Some(index) = calls_by_provider_id.get(&id).copied() else {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!("provider streamed arguments for unknown tool call {id:?}"),
+                                };
+                                return;
+                            };
+                            let call = &mut pending_calls[index];
+                            if call.completed {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!("provider streamed arguments after completing tool call {id:?}"),
+                                };
+                                return;
+                            }
+                            if call.arguments.len().saturating_add(json.len()) > MAX_TOOL_ARGUMENT_BYTES {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!("tool call {id:?} arguments exceed the 64 KiB limit"),
+                                };
+                                return;
+                            }
+                            call.arguments.push_str(&json);
+                        }
+                        Ok(ProviderEvent::ToolCallCompleted { id }) => {
+                            let Some(index) = calls_by_provider_id.get(&id).copied() else {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!("provider completed unknown tool call {id:?}"),
+                                };
+                                return;
+                            };
+                            let call = &mut pending_calls[index];
+                            if call.completed {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!("provider completed tool call {id:?} twice"),
+                                };
+                                return;
+                            }
+                            let arguments = if call.arguments.trim().is_empty() {
+                                "{}"
+                            } else {
+                                &call.arguments
+                            };
+                            let parsed = match serde_json::from_str(arguments) {
+                                Ok(arguments) => arguments,
+                                Err(error) => {
+                                    yield RuntimeEvent::Failed {
+                                        kind: RunFailureKind::ProviderProtocol,
+                                        message: format!("tool call {id:?} contained invalid JSON arguments: {error}"),
+                                    };
+                                    return;
+                                }
+                            };
+                            call.arguments = serde_json::to_string(&parsed)
+                                .expect("a parsed JSON value must serialize");
+                            call.parsed_arguments = Some(parsed);
+                            call.completed = true;
+                        }
+                        Ok(ProviderEvent::Completed { usage }) => {
+                            if let Some(call) = pending_calls.iter().find(|call| !call.completed) {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: format!(
+                                        "provider completed the turn before tool call {:?}",
+                                        call.provider_call_id
+                                    ),
+                                };
+                                return;
+                            }
+                            terminal_usage = usage.map(provider_usage);
+                            completed = true;
+                            break;
+                        }
+                        Err(error) => {
+                            yield RuntimeEvent::Failed {
+                                kind: run_failure_kind(error.kind()),
+                                message: error.to_string(),
+                            };
+                            return;
+                        }
                     }
                 }
+
+                if !completed {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::ProviderProtocol,
+                        message: "provider stream ended without a terminal event".to_owned(),
+                    };
+                    return;
+                }
+
+                let assistant_content = blocks
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        TurnBlock::Text(text) if text.is_empty() => None,
+                        TurnBlock::Text(text) => Some(ContentBlock::Text { text }),
+                        TurnBlock::ToolCall(index) => {
+                            let call = &pending_calls[index];
+                            Some(ContentBlock::ToolCall {
+                                id: call.provider_call_id.clone(),
+                                name: call.name.clone(),
+                                arguments: call
+                                    .parsed_arguments
+                                    .clone()
+                                    .expect("completed calls have parsed arguments"),
+                            })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let assistant = Message::new(Role::Assistant, assistant_content);
+                yield RuntimeEvent::AssistantTurnCompleted {
+                    turn_ordinal,
+                    message: assistant.clone(),
+                    usage: terminal_usage,
+                };
+
+                if pending_calls.is_empty() {
+                    yield RuntimeEvent::Completed;
+                    return;
+                }
+                messages.push(assistant);
+
+                let mut calls = Vec::with_capacity(pending_calls.len());
+                for (index, pending) in pending_calls.into_iter().enumerate() {
+                    let id = match ToolCallId::generate() {
+                        Ok(id) => id,
+                        Err(error) => {
+                            yield RuntimeEvent::Failed {
+                                kind: RunFailureKind::Server,
+                                message: error.to_string(),
+                            };
+                            return;
+                        }
+                    };
+                    let call = RuntimeToolCall {
+                        id,
+                        turn_ordinal,
+                        call_ordinal: u16::try_from(index + 1)
+                            .expect("the per-turn tool bound fits u16"),
+                        provider_call_id: pending.provider_call_id,
+                        name: pending.name,
+                        arguments: pending.arguments,
+                    };
+                    yield RuntimeEvent::ToolCallRequested { call: call.clone() };
+                    calls.push(call);
+                }
+                for call in &calls {
+                    yield RuntimeEvent::ToolCallStarted { id: call.id };
+                }
+
+                let executions = calls.iter().cloned().map(|call| {
+                    let workspace = workspace.clone();
+                    let cancelled = Arc::clone(&cancelled);
+                    async move {
+                        let result = tools::execute(
+                            workspace,
+                            call.name.clone(),
+                            call.arguments.clone(),
+                            cancelled,
+                        )
+                        .await;
+                        (call, result)
+                    }
+                });
+                let mut executions = futures_stream::iter(executions).buffer_unordered(MAX_PARALLEL_READS);
+                let mut results = vec![None; calls.len()];
+                while let Some((call, result)) = executions.next().await {
+                    results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
+                    yield RuntimeEvent::ToolCallFinished {
+                        id: call.id,
+                        result: result.content,
+                        is_error: result.is_error,
+                    };
+                }
+                let result_blocks = calls
+                    .iter()
+                    .zip(results.into_iter())
+                    .map(|(call, result)| {
+                        let result = result.expect("every bounded tool execution completed");
+                        ContentBlock::ToolResult {
+                            call_id: call.provider_call_id.clone(),
+                            content: result.content,
+                            is_error: result.is_error,
+                        }
+                    })
+                    .collect();
+                messages.push(Message::tool_results(result_blocks));
             }
 
-            yield RunEvent::Failed {
-                kind: RunFailureKind::ProviderProtocol,
-                message: "provider stream ended without a terminal event".to_owned(),
+            yield RuntimeEvent::Failed {
+                kind: RunFailureKind::Policy,
+                message: format!("tool loop exceeded {MAX_MODEL_TURNS} model turns"),
             };
         })
+    }
+}
+
+fn append_turn_text(blocks: &mut Vec<TurnBlock>, text: &str) {
+    match blocks.last_mut() {
+        Some(TurnBlock::Text(existing)) => existing.push_str(text),
+        Some(TurnBlock::ToolCall(_)) | None => blocks.push(TurnBlock::Text(text.to_owned())),
+    }
+}
+
+const fn provider_usage(usage: qq_provider::ProviderUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage.input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
+        output_tokens: usage.output_tokens,
     }
 }
 
@@ -287,7 +712,211 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fails_when_a_provider_streams_a_tool_call_without_declared_tools() {
+    async fn executes_read_tools_and_returns_results_in_request_order() {
+        struct ToolLoopProvider {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for ToolLoopProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests.len();
+                requests.push(request);
+                drop(requests);
+                if turn == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "read".to_owned(),
+                            name: "read_file".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "read".to_owned(),
+                            json: r#"{"path":"note.txt"}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "read".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "list".to_owned(),
+                            name: "list_dir".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "list".to_owned(),
+                            json: r#"{"path":"."}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "list".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "done".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "contents\n").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            ToolLoopProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("inspect")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::ToolCallRequested { .. }))
+                .count(),
+            2
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tools().len(), 3);
+        let result_message = &requests[1].messages()[2];
+        assert!(matches!(
+            result_message.content(),
+            [
+                ContentBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    call_id: second_id,
+                    content: second_content,
+                    is_error: false,
+                }
+            ] if call_id == "read"
+                && content == "contents\n"
+                && second_id == "list"
+                && second_content == "note.txt\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_tools_overlap_and_cancellation_stops_in_flight_work() {
+        struct ConcurrentProvider {
+            turn: Mutex<usize>,
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for ConcurrentProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                self.requests.lock().unwrap().push(request);
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                if current == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "slow".to_owned(),
+                            name: "__test_delay".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "slow".to_owned(),
+                            json: r#"{"delay_ms":50,"result":"slow","synchronize":true}"#
+                                .to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "slow".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "fast".to_owned(),
+                            name: "__test_delay".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "fast".to_owned(),
+                            json: r#"{"delay_ms":1,"result":"fast","synchronize":true}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "fast".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]))
+                }
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(
+            ConcurrentProvider {
+                turn: Mutex::new(0),
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("inspect")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+        let requested = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ToolCallRequested { call } => Some(call.id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let finished = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ToolCallFinished { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished, [requested[1], requested[0]]);
+        assert!(matches!(
+            requests.lock().unwrap()[1].messages()[2].content(),
+            [
+                ContentBlock::ToolResult { content, .. },
+                ContentBlock::ToolResult {
+                    content: second_content,
+                    ..
+                }
+            ] if content == "slow" && second_content == "fast"
+        ));
+
+        let workspace = tools::Workspace::open(directory.path()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let started = tools::test_executions_started();
+        let execution = tokio::spawn(tools::execute(
+            workspace,
+            "__test_delay".to_owned(),
+            r#"{"delay_ms":500,"result":"late"}"#.to_owned(),
+            Arc::clone(&cancelled),
+        ));
+        while tools::test_executions_started() == started {
+            tokio::task::yield_now().await;
+        }
+        cancelled.store(true, Ordering::Release);
+        let result = execution.await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn fails_when_provider_completes_with_an_unfinished_tool_call() {
         struct ToolCallingProvider;
 
         impl Provider for ToolCallingProvider {
@@ -317,6 +946,197 @@ mod tests {
             }
         ));
         assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_provider_tool_metadata() {
+        struct OversizedMetadataProvider;
+
+        impl Provider for OversizedMetadataProvider {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                Box::pin(stream::iter([Ok(ProviderEvent::ToolCallStarted {
+                    id: "x".repeat(MAX_TOOL_CALL_ID_BYTES + 1),
+                    name: "read_file".to_owned(),
+                })]))
+            }
+        }
+
+        let runtime = Runtime::new(OversizedMetadataProvider, "gpt-test", 256).unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RunEvent::Started,
+                RunEvent::Failed {
+                    kind: RunFailureKind::ProviderProtocol,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounds_model_text_across_the_entire_tool_loop() {
+        struct OversizedTextProvider;
+
+        impl Provider for OversizedTextProvider {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                Box::pin(stream::iter([Ok(ProviderEvent::OutputTextDelta {
+                    text: "x".repeat(MAX_RUN_MODEL_TEXT_BYTES + 1),
+                })]))
+            }
+        }
+
+        let runtime = Runtime::new(OversizedTextProvider, "gpt-test", 256).unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RunEvent::Started,
+                RunEvent::Failed {
+                    kind: RunFailureKind::Policy,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn enforces_per_turn_and_per_run_tool_call_limits() {
+        struct TooManyInOneTurn;
+
+        impl Provider for TooManyInOneTurn {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                let events = (0..=MAX_TOOL_CALLS_PER_TURN)
+                    .map(|index| {
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: format!("call-{index}"),
+                            name: "read_file".to_owned(),
+                        })
+                    })
+                    .collect::<Vec<Result<_, ProviderError>>>();
+                Box::pin(stream::iter(events))
+            }
+        }
+
+        let runtime = Runtime::new(TooManyInOneTurn, "gpt-test", 256).unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderProtocol,
+                ..
+            })
+        ));
+
+        struct TooManyAcrossTurns {
+            turn: Mutex<usize>,
+        }
+
+        impl Provider for TooManyAcrossTurns {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                let count = if current < MAX_TOOL_CALLS_PER_RUN / MAX_TOOL_CALLS_PER_TURN {
+                    MAX_TOOL_CALLS_PER_TURN
+                } else {
+                    1
+                };
+                let mut events = Vec::with_capacity(count * 3 + 1);
+                for index in 0..count {
+                    let id = format!("call-{current}-{index}");
+                    events.push(Ok(ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "unknown".to_owned(),
+                    }));
+                    events.push(Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: "{}".to_owned(),
+                    }));
+                    events.push(Ok(ProviderEvent::ToolCallCompleted { id }));
+                }
+                events.push(Ok(ProviderEvent::Completed { usage: None }));
+                Box::pin(stream::iter(events))
+            }
+        }
+
+        let runtime = Runtime::new(
+            TooManyAcrossTurns {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::Policy,
+                ..
+            })
+        ));
+
+        struct EndlessToolTurns {
+            turn: Mutex<usize>,
+        }
+
+        impl Provider for EndlessToolTurns {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                let mut turn = self.turn.lock().unwrap();
+                let id = format!("call-{}", *turn);
+                *turn += 1;
+                drop(turn);
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "unknown".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: "{}".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted { id }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+
+        let runtime = Runtime::new(
+            EndlessToolTurns {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::Policy,
+                message,
+            }) if message.contains("model turns")
+        ));
     }
 
     #[tokio::test]

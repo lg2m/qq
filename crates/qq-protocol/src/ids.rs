@@ -77,6 +77,7 @@ identifier!(WorkspaceId);
 identifier!(SessionId);
 identifier!(RunId);
 identifier!(MessageId);
+identifier!(ToolCallId);
 identifier!(CommandId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

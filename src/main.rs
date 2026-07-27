@@ -78,8 +78,9 @@ impl CliOverrides {
 async fn ask(prompt: String, overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     let factory = runtime::RuntimeFactory::system()?;
     let load = overrides.load_request()?;
+    let workspace = std::env::current_dir()?;
     let runtime = tokio::task::spawn_blocking(move || factory.runtime_for(&load)).await??;
-    render_events(runtime.run(RunCommand::new(prompt))).await
+    render_events(runtime.run_in_workspace(RunCommand::new(prompt), workspace)).await
 }
 
 async fn serve(bind: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {

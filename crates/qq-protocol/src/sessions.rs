@@ -2,7 +2,9 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CommandId, MessageId, RunFailureKind, RunId, SessionId, StoreId, WorkspaceId};
+use crate::{
+    CommandId, MessageId, RunFailureKind, RunId, SessionId, StoreId, ToolCallId, WorkspaceId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventCursor {
@@ -242,6 +244,18 @@ pub enum MessageState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ToolCallState {
+    Requested,
+    AwaitingApproval,
+    Running,
+    Completed,
+    Failed,
+    Denied,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TextChannel {
     Output,
     Refusal,
@@ -304,10 +318,31 @@ pub struct MessageSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ToolCallSnapshot {
+    pub id: ToolCallId,
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub turn_ordinal: u16,
+    pub call_ordinal: u16,
+    pub provider_call_id: String,
+    pub name: String,
+    pub arguments: String,
+    pub state: ToolCallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
     pub summary: SessionSummary,
     pub messages: Vec<MessageSnapshot>,
     pub runs: Vec<RunSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallSnapshot>,
+    #[serde(default)]
+    pub has_older_tool_calls: bool,
     pub has_older_messages: bool,
 }
 
@@ -376,6 +411,15 @@ pub enum SessionEvent {
         channel: TextChannel,
         text: String,
     },
+    ToolCallRequested {
+        tool_call: ToolCallSnapshot,
+    },
+    ToolCallStarted {
+        tool_call: ToolCallSnapshot,
+    },
+    ToolCallFinished {
+        tool_call: ToolCallSnapshot,
+    },
     CancellationRequested {
         session: SessionSummary,
         run_id: RunId,
@@ -414,7 +458,15 @@ mod tests {
         )+};
     }
 
-    from_id_bytes!(StoreId, WorkspaceId, SessionId, RunId, MessageId, CommandId);
+    from_id_bytes!(
+        StoreId,
+        WorkspaceId,
+        SessionId,
+        RunId,
+        MessageId,
+        ToolCallId,
+        CommandId
+    );
 
     #[test]
     fn session_events_have_a_stable_tagged_wire_shape() {
@@ -446,6 +498,34 @@ mod tests {
             envelope
         );
         assert_eq!(envelope.cursor.to_string().parse(), Ok(envelope.cursor));
+    }
+
+    #[test]
+    fn tool_call_events_have_a_stable_tagged_wire_shape() {
+        let event = SessionEvent::ToolCallFinished {
+            tool_call: ToolCallSnapshot {
+                id: id(7),
+                session_id: id(3),
+                run_id: id(4),
+                turn_ordinal: 1,
+                call_ordinal: 2,
+                provider_call_id: "call_2".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"README.md"}"#.to_owned(),
+                state: ToolCallState::Completed,
+                result: Some("QQ".to_owned()),
+                is_error: false,
+            },
+        };
+
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "tool_call_finished");
+        assert_eq!(encoded["tool_call"]["state"], "completed");
+        assert_eq!(encoded["tool_call"]["name"], "read_file");
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            event
+        );
     }
 
     #[test]

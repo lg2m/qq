@@ -4,7 +4,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Mou
 use qq_protocol::{
     CommandId, CommandOutcome, CommandRequest, MessageSnapshot, MessageState, ModelDescriptor,
     ModelSelection, RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionSummary, SnapshotRequest, TokenUsage, WorkspaceId, WorkspaceSnapshot,
+    SessionSnapshot, SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -18,6 +19,7 @@ const MAX_PICKER_SEARCH_BYTES: usize = 256;
 const MAX_RECENT_EVENTS: usize = 1024;
 const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
+const MAX_RECENT_TOOL_CALLS: usize = 64;
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub(crate) struct SlashCommand {
@@ -114,6 +116,7 @@ pub enum TuiError {
 pub(crate) struct SessionView {
     pub summary: SessionSummary,
     pub messages: Option<Vec<MessageSnapshot>>,
+    pub tool_calls: Option<Vec<ToolCallSnapshot>>,
     pub latest_input_tokens: Option<u64>,
     pub context_window: Option<u32>,
     loaded_through: u64,
@@ -332,6 +335,7 @@ impl App {
                     .or_insert(SessionView {
                         summary,
                         messages: None,
+                        tool_calls: None,
                         latest_input_tokens: None,
                         context_window,
                         loaded_through: snapshot_sequence,
@@ -366,9 +370,12 @@ impl App {
     fn install_session_snapshot(&mut self, snapshot: SessionSnapshot, loaded_through: u64) {
         for session in self.sessions.values_mut() {
             session.messages = None;
+            session.tool_calls = None;
         }
         let mut messages = snapshot.messages;
         retain_recent_messages(&mut messages);
+        let mut tool_calls = snapshot.tool_calls;
+        retain_recent_tool_calls(&mut tool_calls);
         let latest_input_tokens = snapshot
             .runs
             .iter()
@@ -380,6 +387,7 @@ impl App {
             SessionView {
                 summary: snapshot.summary,
                 messages: Some(messages),
+                tool_calls: Some(tool_calls),
                 latest_input_tokens,
                 context_window,
                 loaded_through,
@@ -471,6 +479,11 @@ impl App {
                     }
                 }
             }
+            SessionEvent::ToolCallRequested { tool_call }
+            | SessionEvent::ToolCallStarted { tool_call }
+            | SessionEvent::ToolCallFinished { tool_call } => {
+                self.upsert_tool_call(tool_call.clone());
+            }
             SessionEvent::RunFinished {
                 session,
                 run_id,
@@ -523,6 +536,7 @@ impl App {
             .or_insert(SessionView {
                 summary,
                 messages: None,
+                tool_calls: None,
                 latest_input_tokens: None,
                 context_window,
                 loaded_through: 0,
@@ -554,6 +568,25 @@ impl App {
             .as_mut()?
             .iter_mut()
             .find(|message| message.id == message_id)
+    }
+
+    fn upsert_tool_call(&mut self, tool_call: ToolCallSnapshot) {
+        let Some(tool_calls) = self
+            .sessions
+            .get_mut(&tool_call.session_id)
+            .and_then(|session| session.tool_calls.as_mut())
+        else {
+            return;
+        };
+        if let Some(existing) = tool_calls
+            .iter_mut()
+            .find(|existing| existing.id == tool_call.id)
+        {
+            *existing = tool_call;
+        } else {
+            tool_calls.push(tool_call);
+            retain_recent_tool_calls(tool_calls);
+        }
     }
 
     fn reject_pending(&mut self, command_id: CommandId, error: ClientFailure) {
@@ -1225,6 +1258,13 @@ fn retain_recent_messages(messages: &mut Vec<MessageSnapshot>) {
     }
 }
 
+fn retain_recent_tool_calls(tool_calls: &mut Vec<ToolCallSnapshot>) {
+    let excess = tool_calls.len().saturating_sub(MAX_RECENT_TOOL_CALLS);
+    if excess > 0 {
+        tool_calls.drain(..excess);
+    }
+}
+
 const fn total_input_tokens(usage: TokenUsage) -> u64 {
     usage
         .input_tokens
@@ -1257,7 +1297,7 @@ mod tests {
     use crossterm::event::MouseEvent;
     use qq_protocol::{
         EventCursor, MessageId, MessageRole, RunId, RunSnapshot, RunStatus, SessionStatus, StoreId,
-        TokenUsage, WorkspaceSummary,
+        TokenUsage, ToolCallId, ToolCallState, WorkspaceSummary,
     };
 
     use super::*;
@@ -1308,6 +1348,8 @@ mod tests {
                 },
                 messages: Vec::new(),
                 runs: Vec::new(),
+                tool_calls: Vec::new(),
+                has_older_tool_calls: false,
                 has_older_messages: false,
             }),
             has_older_sessions: false,
@@ -1762,10 +1804,42 @@ mod tests {
                 text: "hello".to_owned(),
             },
         ));
+        let tool_call_id = id(6, ToolCallId::from_bytes);
+        let mut tool_call = ToolCallSnapshot {
+            id: tool_call_id,
+            session_id,
+            run_id,
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call-1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            state: ToolCallState::Requested,
+            result: None,
+            is_error: false,
+        };
+        app.apply_live_event(event(
+            4,
+            SessionEvent::ToolCallRequested {
+                tool_call: tool_call.clone(),
+            },
+        ));
+        tool_call.state = ToolCallState::Completed;
+        tool_call.result = Some("contents".to_owned());
+        app.apply_live_event(event(
+            5,
+            SessionEvent::ToolCallFinished {
+                tool_call: tool_call.clone(),
+            },
+        ));
 
         assert_eq!(
             app.sessions[&session_id].messages.as_ref().unwrap()[0].output,
             "hello"
+        );
+        assert_eq!(
+            app.sessions[&session_id].tool_calls.as_deref(),
+            Some([tool_call].as_slice())
         );
     }
 
