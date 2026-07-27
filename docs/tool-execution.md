@@ -1,6 +1,7 @@
 # QQ Tool Execution And Security Design
 
-Status: initial direction
+Status: steps 1–2 of the sequencing are implemented (step 2 landing);
+steps 3a onward are direction.
 
 ## Purpose
 
@@ -16,8 +17,7 @@ locks, avoidable round trips, and interactive ceremony.
 
 ## The Tool Loop
 
-Today a run is a single model turn that streams text. With tools, a run
-becomes a loop owned by `qq-core`:
+A run is a loop owned by `qq-core`:
 
 1. Assemble session context and request a model turn.
 2. Stream text and tool-call requests as they arrive.
@@ -31,6 +31,31 @@ The loop lives in `qq-core` next to `execute_run`, reusing the existing
 cancellation watch, run permits, and persist-before-publish ordering. The TUI,
 server, and direct CLI paths share it; no mode gets a parallel agent
 implementation.
+
+### Loop Bounds
+
+"Repeat until no tool calls" needs a ceiling — a model that keeps calling
+tools must not burn tokens forever. The loop is bounded three ways: tool
+calls per turn (16), tool calls per run (64), and model turns per run
+(default 32, becoming per-session configuration). The defaults are high
+enough that legitimate multi-step work never notices them.
+
+Hitting a ceiling ends the run with an explicit run outcome — not a silent
+stop, and not a generic failure — so clients can render "turn limit
+reached" and the user can continue with a follow-up prompt. The session
+stays usable; the next run starts with a fresh budget.
+
+### Agent Instructions
+
+Tool declarations tell the model what it may call; they do not tell it
+that it is an agent. `ModelRequest` grows a system-prompt field, and
+`qq-core` owns a base agent prompt assembled per run: what the workspace
+is, which tools are available, and the working conventions — read a file
+before editing it, prefer `search` over guessing paths, cite paths
+relative to the workspace root. The prompt is versioned in code, not
+user-editable configuration for now, so behavior changes ship as reviewed
+diffs rather than config drift. Each provider maps the field to its native
+system/instructions slot; no codec invents its own preamble.
 
 ### Message And Content Model
 
@@ -80,6 +105,23 @@ Tool results can be large. Persist the full result up to a bounded size
 deltas through the existing batching path so persistence latency stays off
 the token hot path.
 
+### Context Budget
+
+Bounding each result is not enough; the accumulated context needs its own
+bound. Every persist — message text, tool-call arguments, tool results —
+runs a capacity check in the same transaction: the summed bytes of the
+session's persisted messages, arguments, and results must stay under a
+fixed per-session cap (4 MiB), and a persist that would exceed it fails
+the run. That is the current policy: a backstop against unbounded growth,
+not window management.
+
+The direction for when accumulated tool results threaten the model
+window: truncate oldest tool-result content first, keeping the call and
+an explicit truncation marker in place, before touching conversation
+text. Tool output is re-derivable — the agent can re-read anything it
+still needs — while conversation text is not, so results are the cheapest
+context to shed.
+
 ## Built-In Tools
 
 The first tool set is small, executed in-process, and dispatched statically —
@@ -103,11 +145,26 @@ mutating or externally visible tool and goes through policy.
 
 ### Containment
 
-The workspace root is canonicalized once at session creation. Every tool path
-is resolved against it and its canonical parent must remain inside the root;
-symlinks that escape the root are rejected. Paths outside the workspace are
-not an error class the agent can approve its way through by default — wider
-access is an explicit per-session grant, off by default.
+Containment is a capability, not a path check. The workspace root is
+canonicalized once and opened as a `cap-std` directory handle — the anchor
+via `open_ambient_dir`, each component below it opened without following
+symlinks. That handle is the only filesystem authority tools hold, and
+every tool path resolves through it, so escape prevention is enforced by
+the kernel at resolution time rather than by comparing strings before
+opening. This is strictly stronger than canonicalize-and-prefix-check:
+there is no TOCTOU window between a check and an open, and a symlink
+inside the workspace that points outside it fails when the capability
+resolves it, not after a race.
+
+Tool paths must be relative to the workspace root; absolute paths are
+rejected outright rather than re-rooted, so the model learns the real
+addressing scheme instead of being silently corrected. Each path is then
+canonicalized inside the capability: `..` traversal that escapes the root
+fails there, and a resolved path that still carries a parent component is
+rejected as a belt-and-suspenders check. `search` never follows symlinks
+at all. Paths outside the workspace remain not an error class the agent
+can approve its way through by default — wider access is an explicit
+per-session grant, off by default.
 
 ### Edit Semantics
 
@@ -235,11 +292,20 @@ shell, the server, tool, and arguments for MCP.
 
 ## Sequencing
 
-1. Content-block message model and provider tool-call events, with codec
-   contract fixtures. No behavior change for tool-less runs.
-2. Tool loop in `qq-core` with read-only tools; parallel read execution.
-3. `edit_file`/`write_file` with containment, staleness CAS, and atomic
-   apply; approval protocol and session modes.
+1. Content-block message model, `ToolSpec`, and provider tool-call
+   events, with contract fixtures across all five codecs. No behavior
+   change for tool-less runs. Done.
+2. Tool loop in `qq-core` with read-only tools, capability containment,
+   parallel read execution, and tool-call persistence with replay
+   events. Done (landing).
+3. Split so the approval flow exists before anything it must guard:
+   - 3a — approval protocol: session approval modes,
+     `ToolApprovalRequested`/`ToolApprovalResolved` events, the
+     idempotent `RespondToolApproval` command, the TUI approval prompt,
+     and headless bounded-wait failure. Lands first so the flow is
+     testable end-to-end while a wrong decision can cost nothing.
+   - 3b — `edit_file`/`write_file` with read-before-write tracking,
+     content-hash CAS, and atomic rename.
 4. `shell` with bounds, streaming output, and the command allowlist.
 5. MCP client, configuration, and namespaced tool integration.
 
