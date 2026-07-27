@@ -434,6 +434,7 @@ async fn load_tui_models(
                 workspace_id,
                 parent_id: None,
                 model: selection,
+                approval_mode: qq_protocol::ApprovalMode::default(),
             },
         )
         .await
@@ -481,6 +482,7 @@ async fn bootstrap_tui(
                     workspace_id,
                     parent_id: None,
                     model: model.clone(),
+                    approval_mode: qq_protocol::ApprovalMode::default(),
                 },
             )
             .await?;
@@ -636,6 +638,8 @@ impl SessionClient {
             SessionCommand::CreateSession { .. } => "/v1/sessions",
             SessionCommand::SubmitPrompt { .. } => "/v1/sessions/prompts",
             SessionCommand::CancelRun { .. } => "/v1/runs/cancel",
+            SessionCommand::RespondToolApproval { .. } => "/v1/tools/approvals",
+            SessionCommand::SetApprovalMode { .. } => "/v1/sessions/approval-mode",
         };
         self.post_json(
             path,

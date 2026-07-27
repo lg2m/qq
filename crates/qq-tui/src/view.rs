@@ -204,23 +204,28 @@ impl FrameRenderer {
 
         let mut lines = vec![header(app, width), context(app, width)];
         let body_height = height.saturating_sub(5);
+        let overlay = app.model_picker.is_some()
+            || app.session_picker.is_some()
+            || app.pending_approval().is_some();
         let body = if app.model_picker.is_some() {
             model_picker(app, width, body_height)
         } else if app.session_picker.is_some() {
             session_picker(app, width, body_height)
+        } else if app.pending_approval().is_some() {
+            approval_prompt(app, width, body_height)
         } else {
             match app.layout {
                 Layout::Threadline => self.threadline(app, width),
                 Layout::FoldFocus => self.fold_focus(app, width),
             }
         };
-        let mut body = if app.model_picker.is_some() || app.session_picker.is_some() {
+        let mut body = if overlay {
             body
         } else {
             app.update_transcript_viewport(body.len(), body_height);
             transcript_viewport(body, body_height, app.transcript_scroll_offset())
         };
-        if app.model_picker.is_none() && app.session_picker.is_none() {
+        if !overlay {
             overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
         }
         lines.extend(body);
@@ -231,7 +236,10 @@ impl FrameRenderer {
     }
 
     fn prune_markdown(&mut self, app: &App) {
-        let visible = if app.session_picker.is_none() && app.model_picker.is_none() {
+        let visible = if app.session_picker.is_none()
+            && app.model_picker.is_none()
+            && app.pending_approval().is_none()
+        {
             app.focused
                 .and_then(|session_id| app.sessions.get(&session_id))
                 .and_then(|session| session.messages.as_ref())
@@ -675,6 +683,58 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
         selected_row,
     ));
     fit_height(lines, height)
+}
+
+fn approval_prompt(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let tool_call = app.pending_approval().expect("an approval is pending");
+    let mut lines = vec![section(
+        "TOOL APPROVAL",
+        "y approves once, a approves for this session, n or Esc denies",
+    )];
+    lines.push(Line::default());
+    let mut name = Line::styled("  tool: ", muted());
+    name.push(tool_call.name.clone(), warning().bold());
+    lines.push(truncate_line(name, width));
+    if let Some(command) = shell_command_preview(tool_call) {
+        let mut line = Line::styled("  command: ", muted());
+        line.push(command, normal().bold());
+        lines.push(truncate_line(line, width));
+    }
+    lines.push(Line::styled("  arguments:", muted()));
+    let arguments = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| tool_call.arguments.clone());
+    let available = height.saturating_sub(lines.len() + 2).max(1);
+    for (shown, text) in arguments.lines().enumerate() {
+        if shown == available {
+            lines.push(Line::styled("    ...", muted().italic()));
+            break;
+        }
+        lines.push(truncate_line(
+            Line::styled(format!("    {text}"), normal()),
+            width,
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "  [y] approve once   [a] approve for session   [n]/[Esc] deny",
+        accent().bold(),
+    ));
+    fit_height(lines, height)
+}
+
+/// Shell approvals surface the exact command so the user can decide in place.
+fn shell_command_preview(tool_call: &ToolCallSnapshot) -> Option<String> {
+    if tool_call.name != "shell" {
+        return None;
+    }
+    let arguments = serde_json::from_str::<serde_json::Value>(&tool_call.arguments).ok()?;
+    let command = arguments.get("command")?.as_str()?;
+    let cwd = arguments.get("cwd").and_then(|value| value.as_str());
+    Some(match cwd {
+        Some(cwd) => format!("{command}  (in {cwd})"),
+        None => command.to_owned(),
+    })
 }
 
 fn child_sessions(app: &App, parent: SessionId) -> Vec<SessionId> {

@@ -875,6 +875,9 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
         | SessionRuntimeError::SessionNotFound
         | SessionRuntimeError::ParentWorkspaceMismatch
         | SessionRuntimeError::RunNotFound
+        | SessionRuntimeError::ToolCallNotFound
+        | SessionRuntimeError::ApprovalNotPending
+        | SessionRuntimeError::InvalidApprovalGrant
         | SessionRuntimeError::ContextTooLarge
         | SessionRuntimeError::EventTooLarge
         | SessionRuntimeError::InvalidModelSelection
