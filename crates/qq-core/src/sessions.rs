@@ -3,7 +3,10 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,14 +20,16 @@ use qq_protocol::{
     MessageSnapshot, MessageState, ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId,
     RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope,
     SessionId, SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, StoreId,
-    SubscribeRequest, TextChannel, TokenUsage, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    SubscribeRequest, TextChannel, TokenUsage, ToolCallId, ToolCallSnapshot, ToolCallState,
+    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
-use qq_provider::Message;
+use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
-use crate::{RunEvent, Runtime};
+use crate::{Runtime, RuntimeEvent, RuntimeToolCall};
 
 const CONTROL_QUEUE_CAPACITY: usize = 256;
 const OUTPUT_QUEUE_CAPACITY: usize = 1024;
@@ -34,6 +39,7 @@ const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_REPLAY_EVENTS: u16 = 128;
 const MAX_SNAPSHOT_SESSIONS: u16 = 512;
 const MAX_SNAPSHOT_MESSAGES: u16 = 256;
+const MAX_SNAPSHOT_TOOL_CALLS: usize = 4_096;
 const MAX_TEXT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_WORKSPACES: u32 = 1024;
@@ -43,6 +49,8 @@ const MAX_MODEL_SELECTION_BYTES: usize = 512;
 const OUTPUT_BATCH_BYTES: usize = 8 * 1024;
 const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(8);
 const MAX_PERSISTED_EVENT_BYTES: usize = 1024 * 1024;
+const INTERRUPTED_TOOL_RESULT: &str =
+    "Tool execution was interrupted before a durable result was recorded.";
 
 pub type RuntimeLoadFuture =
     Pin<Box<dyn Future<Output = Result<LoadedRuntime, RuntimeLoadError>> + Send + 'static>>;
@@ -370,31 +378,24 @@ async fn execute_run(
 
     match inner.store.start_assistant(&claimed).await {
         Ok(event) => inner.notify(event.cursor),
-        Err(_) => {
+        Err(error) => {
             finish_run(
                 &inner,
                 &claimed,
-                internal_failure("failed to persist the assistant message"),
+                persistence_failure("failed to persist the assistant message", &error),
             )
             .await;
             return;
         }
     }
 
-    let messages = claimed
-        .messages
-        .iter()
-        .map(|message| match message.role {
-            MessageRole::User => Message::user(message.output.clone()),
-            MessageRole::Assistant => Message::assistant(if message.output.is_empty() {
-                message.refusal.clone()
-            } else {
-                message.output.clone()
-            }),
-        })
-        .collect();
-    let mut events = loaded.runtime.run_messages(messages);
-    let mut usage = None;
+    let tool_cancellation = Arc::new(AtomicBool::new(false));
+    let mut events = loaded.runtime.run_messages_in_workspace_with_cancellation(
+        claimed.messages.clone(),
+        PathBuf::from(&claimed.workspace),
+        Arc::clone(&tool_cancellation),
+    );
+    let mut accounting = RunAccountingAccumulator::new(loaded.pricing.clone());
     let mut pending_text = String::new();
     let mut pending_channel = None;
     let mut flush_at = None;
@@ -428,14 +429,14 @@ async fn execute_run(
         };
         match input {
             RunInput::Flush => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -443,14 +444,15 @@ async fn execute_run(
                 flush_at = None;
             }
             stopped @ (RunInput::Cancelled | RunInput::Interrupted) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                tool_cancellation.store(true, Ordering::Release);
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -460,39 +462,109 @@ async fn execute_run(
                 } else {
                     RunOutcome::Interrupted
                 };
-                finish_run_accounted(
-                    &inner,
-                    &claimed,
-                    outcome,
-                    Some(RunAccounting {
-                        usage,
-                        pricing: loaded.pricing.clone(),
-                    }),
-                )
-                .await;
+                finish_run_accounted(&inner, &claimed, outcome, Some(accounting.snapshot())).await;
                 return;
             }
-            RunInput::Event(Some(RunEvent::Started)) => {}
-            RunInput::Event(Some(RunEvent::Usage { usage: reported })) => {
-                usage = Some(reported);
+            RunInput::Event(Some(RuntimeEvent::Started)) => {}
+            RunInput::Event(Some(RuntimeEvent::AssistantTurnCompleted {
+                turn_ordinal,
+                message,
+                usage,
+                calls,
+            })) => {
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist model output", &error),
+                    )
+                    .await;
+                    return;
+                }
+                flush_at = None;
+                accounting.record_turn(usage);
+                if message.has_content() || !calls.is_empty() {
+                    match inner
+                        .store
+                        .persist_model_turn(&claimed, turn_ordinal, message, calls)
+                        .await
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                inner.notify(event.cursor);
+                            }
+                        }
+                        Err(error) => {
+                            finish_run(
+                                &inner,
+                                &claimed,
+                                persistence_failure(
+                                    "failed to persist the completed model turn",
+                                    &error,
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+            }
+            RunInput::Event(Some(RuntimeEvent::ToolCallStarted { id })) => {
+                match inner.store.start_tool_call(&claimed, id).await {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist the started tool call", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            RunInput::Event(Some(RuntimeEvent::ToolCallFinished {
+                id,
+                result,
+                is_error,
+            })) => {
+                match inner
+                    .store
+                    .finish_tool_call(&claimed, id, result, is_error)
+                    .await
+                {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist the tool result", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
             }
             RunInput::Event(Some(
-                event @ (RunEvent::OutputTextDelta { .. } | RunEvent::RefusalDelta { .. }),
+                event @ (RuntimeEvent::OutputTextDelta { .. } | RuntimeEvent::RefusalDelta { .. }),
             )) => {
                 let (channel, text) = match event {
-                    RunEvent::OutputTextDelta { text } => (TextChannel::Output, text),
-                    RunEvent::RefusalDelta { text } => (TextChannel::Refusal, text),
+                    RuntimeEvent::OutputTextDelta { text } => (TextChannel::Output, text),
+                    RuntimeEvent::RefusalDelta { text } => (TextChannel::Refusal, text),
                     _ => unreachable!("matched text event"),
                 };
                 if text.is_empty() {
                     continue;
                 }
                 if !persisted_first_text {
-                    if persist_text(&inner, &claimed, channel, text).await.is_err() {
+                    if let Err(error) = persist_text(&inner, &claimed, channel, text).await {
                         finish_run(
                             &inner,
                             &claimed,
-                            internal_failure("failed to persist model output"),
+                            persistence_failure("failed to persist model output", &error),
                         )
                         .await;
                         return;
@@ -501,14 +573,18 @@ async fn execute_run(
                     continue;
                 }
                 if pending_channel.is_some_and(|pending| pending != channel)
-                    && flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
-                        .is_err()
+                    && let Err(error) = flush_pending_text(
+                        &inner,
+                        &claimed,
+                        &mut pending_channel,
+                        &mut pending_text,
+                    )
+                    .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -519,14 +595,18 @@ async fn execute_run(
                 }
                 pending_text.push_str(&text);
                 if pending_text.len() >= OUTPUT_BATCH_BYTES {
-                    if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
-                        .is_err()
+                    if let Err(error) = flush_pending_text(
+                        &inner,
+                        &claimed,
+                        &mut pending_channel,
+                        &mut pending_text,
+                    )
+                    .await
                     {
                         finish_run(
                             &inner,
                             &claimed,
-                            internal_failure("failed to persist model output"),
+                            persistence_failure("failed to persist model output", &error),
                         )
                         .await;
                         return;
@@ -534,15 +614,15 @@ async fn execute_run(
                     flush_at = None;
                 }
             }
-            RunInput::Event(Some(RunEvent::Completed)) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+            RunInput::Event(Some(RuntimeEvent::Completed)) => {
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -551,23 +631,20 @@ async fn execute_run(
                     &inner,
                     &claimed,
                     RunOutcome::Completed,
-                    Some(RunAccounting {
-                        usage,
-                        pricing: loaded.pricing.clone(),
-                    }),
+                    Some(accounting.snapshot()),
                 )
                 .await;
                 return;
             }
-            RunInput::Event(Some(RunEvent::Failed { kind, message })) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+            RunInput::Event(Some(RuntimeEvent::Failed { kind, message })) => {
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -581,23 +658,20 @@ async fn execute_run(
                             message: truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES),
                         },
                     },
-                    Some(RunAccounting {
-                        usage,
-                        pricing: loaded.pricing.clone(),
-                    }),
+                    Some(accounting.snapshot()),
                 )
                 .await;
                 return;
             }
             RunInput::Event(None) => {
-                if flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                    .await
-                    .is_err()
+                if let Err(error) =
+                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
+                        .await
                 {
                     finish_run(
                         &inner,
                         &claimed,
-                        internal_failure("failed to persist model output"),
+                        persistence_failure("failed to persist model output", &error),
                     )
                     .await;
                     return;
@@ -606,10 +680,7 @@ async fn execute_run(
                     &inner,
                     &claimed,
                     internal_failure("model stream ended without a terminal event"),
-                    Some(RunAccounting {
-                        usage,
-                        pricing: loaded.pricing.clone(),
-                    }),
+                    Some(accounting.snapshot()),
                 )
                 .await;
                 return;
@@ -619,7 +690,7 @@ async fn execute_run(
 }
 
 enum RunInput {
-    Event(Option<RunEvent>),
+    Event(Option<RuntimeEvent>),
     Flush,
     Cancelled,
     Interrupted,
@@ -688,7 +759,65 @@ async fn finish_run_accounted(
 #[derive(Clone)]
 struct RunAccounting {
     usage: Option<TokenUsage>,
+    estimated_cost_usd_nanos: Option<u64>,
+}
+
+struct RunAccountingAccumulator {
+    usage: Option<TokenUsage>,
+    estimated_cost_usd_nanos: Option<u64>,
     pricing: Option<ModelPricing>,
+    saw_turn: bool,
+}
+
+impl RunAccountingAccumulator {
+    fn new(pricing: Option<ModelPricing>) -> Self {
+        Self {
+            usage: Some(TokenUsage::default()),
+            estimated_cost_usd_nanos: pricing.as_ref().map(|_| 0),
+            pricing,
+            saw_turn: false,
+        }
+    }
+
+    fn record_turn(&mut self, usage: Option<TokenUsage>) {
+        self.saw_turn = true;
+        let Some(usage) = usage else {
+            self.usage = None;
+            self.estimated_cost_usd_nanos = None;
+            return;
+        };
+        self.usage = self.usage.and_then(|total| add_usage(total, usage));
+        if self.usage.is_none() {
+            self.estimated_cost_usd_nanos = None;
+            return;
+        }
+        self.estimated_cost_usd_nanos = self.estimated_cost_usd_nanos.and_then(|total| {
+            run_cost(usage, self.pricing.as_ref()?).and_then(|cost| total.checked_add(cost))
+        });
+    }
+
+    fn snapshot(&self) -> RunAccounting {
+        RunAccounting {
+            usage: self.saw_turn.then_some(self.usage).flatten(),
+            estimated_cost_usd_nanos: self
+                .saw_turn
+                .then_some(self.estimated_cost_usd_nanos)
+                .flatten(),
+        }
+    }
+}
+
+fn add_usage(left: TokenUsage, right: TokenUsage) -> Option<TokenUsage> {
+    Some(TokenUsage {
+        input_tokens: left.input_tokens.checked_add(right.input_tokens)?,
+        cache_read_input_tokens: left
+            .cache_read_input_tokens
+            .checked_add(right.cache_read_input_tokens)?,
+        cache_write_input_tokens: left
+            .cache_write_input_tokens
+            .checked_add(right.cache_write_input_tokens)?,
+        output_tokens: left.output_tokens.checked_add(right.output_tokens)?,
+    })
 }
 
 fn internal_failure(message: &str) -> RunOutcome {
@@ -696,6 +825,32 @@ fn internal_failure(message: &str) -> RunOutcome {
         failure: RunFailure {
             kind: RunFailureKind::Server,
             message: message.to_owned(),
+        },
+    }
+}
+
+/// Maps a store error during a run into a run outcome. The deliberate session
+/// context budget surfaces as a user-meaningful policy failure; every other
+/// error is an internal failure that carries the store error rather than
+/// discarding it, since qq-core has no logging facility to record it.
+fn persistence_failure(action: &str, error: &SessionRuntimeError) -> RunOutcome {
+    match error {
+        SessionRuntimeError::OutputTooLarge | SessionRuntimeError::ContextTooLarge => {
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Policy,
+                    message: format!(
+                        "session context reached its {} MiB limit; start a new session to continue",
+                        MAX_CONTEXT_BYTES / (1024 * 1024)
+                    ),
+                },
+            }
+        }
+        error => RunOutcome::Failed {
+            failure: RunFailure {
+                kind: RunFailureKind::Server,
+                message: format!("{action}: {error}"),
+            },
         },
     }
 }
@@ -944,6 +1099,67 @@ impl Store {
         .await
     }
 
+    /// Persists a completed model turn together with every tool call it
+    /// requested in one transaction. A crash must never commit the turn's
+    /// ToolCall blocks without their tool_calls rows: such orphans would replay
+    /// as `tool_use` without `tool_result` and poison every later request.
+    async fn persist_model_turn(
+        &self,
+        claimed: &ClaimedRun,
+        turn_ordinal: u16,
+        message: Message,
+        calls: Vec<RuntimeToolCall>,
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            persist_model_turn(
+                connection,
+                store_id,
+                &claimed,
+                turn_ordinal,
+                &message,
+                &calls,
+            )
+        })
+        .await
+    }
+
+    async fn start_tool_call(
+        &self,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            start_tool_call(connection, store_id, &claimed, tool_call_id)
+        })
+        .await
+    }
+
+    async fn finish_tool_call(
+        &self,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+        result: String,
+        is_error: bool,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            finish_tool_call(
+                connection,
+                store_id,
+                &claimed,
+                tool_call_id,
+                result,
+                is_error,
+            )
+        })
+        .await
+    }
+
     async fn finish_run(
         &self,
         claimed: &ClaimedRun,
@@ -1097,11 +1313,18 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
         .map_err(|_| SessionRuntimeError::Persistence)?;
     match schema_version.as_deref() {
         None => {
-            connection
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            create_tool_tables(&transaction)?;
+            transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '2')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '3')",
                     [],
                 )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
         Some("1") => {
@@ -1129,9 +1352,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             transaction
                 .execute("UPDATE sessions SET cost_known = 0", [])
                 .map_err(|_| SessionRuntimeError::Persistence)?;
+            create_tool_tables(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '2' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '3' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1139,7 +1363,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("2") => {}
+        Some("2") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            create_tool_tables(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '3' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("3") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -1168,6 +1407,38 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
     Ok((connection, store_id))
 }
 
+fn create_tool_tables(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE model_turns (
+                 run_id TEXT NOT NULL REFERENCES runs(id),
+                 turn_ordinal INTEGER NOT NULL,
+                 assistant_content_json TEXT NOT NULL,
+                 PRIMARY KEY(run_id, turn_ordinal)
+             );
+             CREATE TABLE tool_calls (
+                 id TEXT PRIMARY KEY,
+                 run_id TEXT NOT NULL REFERENCES runs(id),
+                 turn_ordinal INTEGER NOT NULL,
+                 call_ordinal INTEGER NOT NULL,
+                 provider_call_id TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 arguments_json TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 result TEXT,
+                 is_error INTEGER NOT NULL DEFAULT 0,
+                 requested_at_ms INTEGER NOT NULL,
+                 started_at_ms INTEGER,
+                 finished_at_ms INTEGER,
+                 UNIQUE(run_id, turn_ordinal, provider_call_id),
+                 UNIQUE(run_id, turn_ordinal, call_ordinal)
+             );
+             CREATE INDEX tool_calls_run_ordinal
+                 ON tool_calls(run_id, turn_ordinal, call_ordinal);",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)
+}
+
 fn has_column(
     connection: &Connection,
     table: &str,
@@ -1193,7 +1464,7 @@ struct ClaimedRun {
     command_id: CommandId,
     assistant_message_id: MessageId,
     model: ModelSelection,
-    messages: Vec<MessageSnapshot>,
+    messages: Vec<Message>,
     started: SessionEventEnvelope,
 }
 
@@ -1406,10 +1677,16 @@ fn execute_command(
             }
             let context_bytes: u64 = transaction
                 .query_row(
-                    "SELECT COALESCE(SUM(
-                         length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
-                     ), 0)
-                     FROM messages WHERE session_id = ?1",
+                    "SELECT
+                         (SELECT COALESCE(SUM(
+                             length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
+                         ), 0) FROM messages WHERE session_id = ?1)
+                         +
+                         (SELECT COALESCE(SUM(
+                             length(CAST(t.arguments_json AS BLOB))
+                             + length(CAST(COALESCE(t.result, '') AS BLOB))
+                         ), 0) FROM tool_calls t JOIN runs r ON r.id = t.run_id
+                            WHERE r.session_id = ?1)",
                     [session_id.to_string()],
                     |row| row.get(0),
                 )
@@ -1712,25 +1989,7 @@ fn claim_next_run(
             |row| row.get(0),
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let mut statement = transaction
-        .prepare(
-            "SELECT id FROM messages
-             WHERE session_id = ?1 AND ordinal <= ?2 AND state = 'complete'
-             ORDER BY ordinal",
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let message_ids = statement
-        .query_map(params![session_id.to_string(), user_ordinal], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|_| SessionRuntimeError::Persistence)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    drop(statement);
-    let mut messages = Vec::with_capacity(message_ids.len());
-    for id in message_ids {
-        messages.push(load_message(&transaction, parse_id(&id)?)?);
-    }
+    let messages = load_model_context(&transaction, session_id, user_ordinal)?;
     let summary = load_session_summary(&transaction, session_id)?;
     let started = append_event(
         &transaction,
@@ -1819,23 +2078,7 @@ fn append_text(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let persisted_bytes: u64 = transaction
-        .query_row(
-            "SELECT COALESCE(SUM(
-                 length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
-             ), 0)
-             FROM messages WHERE session_id = ?1",
-            [claimed.session_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    if usize::try_from(persisted_bytes)
-        .unwrap_or(usize::MAX)
-        .saturating_add(text.len())
-        > MAX_CONTEXT_BYTES
-    {
-        return Err(SessionRuntimeError::OutputTooLarge);
-    }
+    ensure_context_capacity(&transaction, claimed.session_id, text.len())?;
     let column = match channel {
         TextChannel::Output => "output",
         TextChannel::Refusal => "refusal",
@@ -1871,6 +2114,200 @@ fn append_text(
     Ok(event)
 }
 
+fn persist_model_turn(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    turn_ordinal: u16,
+    message: &Message,
+    calls: &[RuntimeToolCall],
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    if message.role() != Role::Assistant {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let content = message
+        .content()
+        .iter()
+        .map(PersistedContentBlock::from)
+        .collect::<Vec<_>>();
+    let content_json =
+        serde_json::to_string(&content).map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let argument_bytes = calls.iter().fold(0_usize, |total, call| {
+        total.saturating_add(call.arguments.len())
+    });
+    ensure_context_capacity(&transaction, claimed.session_id, argument_bytes)?;
+    transaction
+        .execute(
+            "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
+             VALUES (?1, ?2, ?3)",
+            params![claimed.run_id.to_string(), turn_ordinal, content_json],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let mut events = Vec::with_capacity(calls.len());
+    for call in calls {
+        transaction
+            .execute(
+                "INSERT INTO tool_calls(
+                     id, run_id, turn_ordinal, call_ordinal, provider_call_id, name,
+                     arguments_json, state, requested_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)",
+                params![
+                    call.id.to_string(),
+                    claimed.run_id.to_string(),
+                    call.turn_ordinal,
+                    call.call_ordinal,
+                    call.provider_call_id,
+                    call.name,
+                    call.arguments,
+                    now,
+                ],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let tool_call = load_tool_call(&transaction, call.id)?;
+        events.push(append_event(
+            &transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by: Some(claimed.command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::ToolCallRequested { tool_call },
+        )?);
+    }
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(events)
+}
+
+fn start_tool_call(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    tool_call_id: ToolCallId,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let updated = transaction
+        .execute(
+            "UPDATE tool_calls SET state = 'running', started_at_ms = ?2
+             WHERE id = ?1 AND run_id = ?3 AND state = 'requested'",
+            params![tool_call_id.to_string(), now, claimed.run_id.to_string()],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if updated != 1 {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let tool_call = load_tool_call(&transaction, tool_call_id)?;
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::ToolCallStarted { tool_call },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+fn finish_tool_call(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    tool_call_id: ToolCallId,
+    result: String,
+    is_error: bool,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    ensure_context_capacity(&transaction, claimed.session_id, result.len())?;
+    let now = now_ms();
+    let state = if is_error { "failed" } else { "completed" };
+    let updated = transaction
+        .execute(
+            "UPDATE tool_calls
+             SET state = ?2, result = ?3, is_error = ?4, finished_at_ms = ?5
+             WHERE id = ?1 AND run_id = ?6 AND state = 'running'",
+            params![
+                tool_call_id.to_string(),
+                state,
+                result,
+                is_error,
+                now,
+                claimed.run_id.to_string(),
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if updated != 1 {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let tool_call = load_tool_call(&transaction, tool_call_id)?;
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::ToolCallFinished { tool_call },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+fn ensure_context_capacity(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    additional: usize,
+) -> Result<(), SessionRuntimeError> {
+    let persisted_bytes: u64 = transaction
+        .query_row(
+            "SELECT
+                 (SELECT COALESCE(SUM(
+                     length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
+                 ), 0) FROM messages WHERE session_id = ?1)
+                 +
+                 (SELECT COALESCE(SUM(
+                     length(CAST(t.arguments_json AS BLOB))
+                     + length(CAST(COALESCE(t.result, '') AS BLOB))
+                 ), 0) FROM tool_calls t JOIN runs r ON r.id = t.run_id
+                    WHERE r.session_id = ?1)",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if usize::try_from(persisted_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_add(additional)
+        > MAX_CONTEXT_BYTES
+    {
+        return Err(SessionRuntimeError::OutputTooLarge);
+    }
+    Ok(())
+}
+
 fn complete_run(
     connection: &mut Connection,
     store_id: StoreId,
@@ -1883,6 +2320,13 @@ fn complete_run(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let now = now_ms();
     let outcome = cancellation_wins(&transaction, claimed.run_id, outcome)?;
+    interrupt_active_tool_calls(
+        &transaction,
+        store_id,
+        claimed,
+        Some(claimed.command_id),
+        now,
+    )?;
     let (run_status, message_state) = outcome_states(&outcome);
     let outcome_json =
         serde_json::to_string(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1892,16 +2336,10 @@ fn complete_run(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let cost = accounting.as_ref().and_then(|accounting| {
-        usage
-            .and_then(|usage| {
-                accounting
-                    .pricing
-                    .as_ref()
-                    .and_then(|pricing| run_cost(usage, pricing))
-            })
-            .and_then(|cost| i64::try_from(cost).ok())
-    });
+    let cost = accounting
+        .as_ref()
+        .and_then(|accounting| accounting.estimated_cost_usd_nanos)
+        .and_then(|cost| i64::try_from(cost).ok());
     let (current_cost, current_cost_known) = transaction
         .query_row(
             "SELECT estimated_cost_usd_nanos, cost_known FROM sessions WHERE id = ?1",
@@ -2114,6 +2552,7 @@ fn complete_run_in_transaction(
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let now = now_ms();
     let outcome = cancellation_wins(transaction, claimed.run_id, outcome)?;
+    interrupt_active_tool_calls(transaction, store_id, claimed, None, now)?;
     let (run_status, message_state) = outcome_states(&outcome);
     let outcome_json =
         serde_json::to_string(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2157,6 +2596,53 @@ fn complete_run_in_transaction(
             usage: None,
         },
     )
+}
+
+fn interrupt_active_tool_calls(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    caused_by: Option<CommandId>,
+    now: u64,
+) -> Result<(), SessionRuntimeError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT id FROM tool_calls
+             WHERE run_id = ?1 AND state IN ('requested', 'running')
+             ORDER BY turn_ordinal, call_ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let ids = statement
+        .query_map([claimed.run_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+    for id in ids {
+        let id = parse_id::<ToolCallId>(&id)?;
+        transaction
+            .execute(
+                "UPDATE tool_calls
+                 SET state = 'interrupted', result = ?2, is_error = 1, finished_at_ms = ?3
+                 WHERE id = ?1 AND state IN ('requested', 'running')",
+                params![id.to_string(), INTERRUPTED_TOOL_RESULT, now],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let tool_call = load_tool_call(transaction, id)?;
+        append_event(
+            transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by,
+                occurred_at_ms: now,
+            },
+            SessionEvent::ToolCallFinished { tool_call },
+        )?;
+    }
+    Ok(())
 }
 
 fn cancellation_wins(
@@ -2306,10 +2792,39 @@ fn load_session_snapshot(
     for id in run_ids {
         runs.push(load_run(transaction, parse_id(&id)?)?);
     }
+    let mut statement = transaction
+        .prepare(
+            "SELECT t.id FROM tool_calls t JOIN runs r ON r.id = t.run_id
+             WHERE r.session_id = ?1
+             ORDER BY r.created_at_ms DESC, t.turn_ordinal DESC, t.call_ordinal DESC
+             LIMIT ?2",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut tool_call_ids = statement
+        .query_map(
+            params![
+                session_id.to_string(),
+                u64::try_from(MAX_SNAPSHOT_TOOL_CALLS + 1).expect("snapshot bound fits u64")
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+    let has_older_tool_calls = tool_call_ids.len() > MAX_SNAPSHOT_TOOL_CALLS;
+    tool_call_ids.truncate(MAX_SNAPSHOT_TOOL_CALLS);
+    tool_call_ids.reverse();
+    let mut tool_calls = Vec::with_capacity(tool_call_ids.len());
+    for id in tool_call_ids {
+        tool_calls.push(load_tool_call(transaction, parse_id(&id)?)?);
+    }
     Ok(SessionSnapshot {
         summary,
         messages,
         runs,
+        tool_calls,
+        has_older_tool_calls,
         has_older_messages,
     })
 }
@@ -2490,6 +3005,233 @@ fn load_message(
         })
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersistedContentBlock {
+    Text {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    ToolResult {
+        call_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+impl From<&ContentBlock> for PersistedContentBlock {
+    fn from(block: &ContentBlock) -> Self {
+        match block {
+            ContentBlock::Text { text } => Self::Text { text: text.clone() },
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Self::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
+            ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => Self::ToolResult {
+                call_id: call_id.clone(),
+                content: content.clone(),
+                is_error: *is_error,
+            },
+        }
+    }
+}
+
+impl From<PersistedContentBlock> for ContentBlock {
+    fn from(block: PersistedContentBlock) -> Self {
+        match block {
+            PersistedContentBlock::Text { text } => Self::Text { text },
+            PersistedContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Self::ToolCall {
+                id,
+                name,
+                arguments,
+            },
+            PersistedContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => Self::ToolResult {
+                call_id,
+                content,
+                is_error,
+            },
+        }
+    }
+}
+
+fn load_model_context(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    through_ordinal: u64,
+) -> Result<Vec<Message>, SessionRuntimeError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT id FROM messages
+             WHERE session_id = ?1 AND ordinal <= ?2 AND state IN ('complete', 'interrupted')
+             ORDER BY ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let message_ids = statement
+        .query_map(params![session_id.to_string(), through_ordinal], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+
+    let mut context = Vec::new();
+    for id in message_ids {
+        let snapshot = load_message(transaction, parse_id(&id)?)?;
+        match snapshot.role {
+            MessageRole::User => context.push(Message::user(snapshot.output)),
+            MessageRole::Assistant => {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT turn_ordinal, assistant_content_json FROM model_turns
+                         WHERE run_id = ?1 ORDER BY turn_ordinal",
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let turns = statement
+                    .query_map([snapshot.run_id.to_string()], |row| {
+                        Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|_| SessionRuntimeError::Persistence)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                drop(statement);
+                if turns.is_empty() {
+                    let content = if snapshot.output.is_empty() {
+                        snapshot.refusal
+                    } else {
+                        snapshot.output
+                    };
+                    if !content.trim().is_empty() {
+                        context.push(Message::assistant(content));
+                    }
+                    continue;
+                }
+                for (turn_ordinal, content_json) in turns {
+                    let content: Vec<ContentBlock> =
+                        serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
+                            .map_err(|_| SessionRuntimeError::Persistence)?
+                            .into_iter()
+                            .map(ContentBlock::from)
+                            .collect();
+
+                    let mut statement = transaction
+                        .prepare(
+                            "SELECT provider_call_id, result, is_error FROM tool_calls
+                             WHERE run_id = ?1 AND turn_ordinal = ?2 AND result IS NOT NULL
+                             ORDER BY call_ordinal",
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    let mut recorded = statement
+                        .query_map(params![snapshot.run_id.to_string(), turn_ordinal], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                (row.get::<_, String>(1)?, row.get::<_, bool>(2)?),
+                            ))
+                        })
+                        .map_err(|_| SessionRuntimeError::Persistence)?
+                        .collect::<Result<HashMap<String, (String, bool)>, _>>()
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    drop(statement);
+                    // Emit exactly one result per ToolCall block, in block order.
+                    // A block without a recorded result (a crash between the
+                    // turn commit and its tool_calls rows in an older store)
+                    // gets an explicit interrupted result so replayed context
+                    // stays provider-valid instead of poisoning the session.
+                    let results = content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolCall { id, .. } => Some(match recorded.remove(id) {
+                                Some((content, is_error)) => ContentBlock::ToolResult {
+                                    call_id: id.clone(),
+                                    content,
+                                    is_error,
+                                },
+                                None => ContentBlock::ToolResult {
+                                    call_id: id.clone(),
+                                    content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                                    is_error: true,
+                                },
+                            }),
+                            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
+                        })
+                        .collect::<Vec<_>>();
+                    context.push(Message::new(Role::Assistant, content));
+                    if !results.is_empty() {
+                        context.push(Message::tool_results(results));
+                    }
+                }
+            }
+        }
+    }
+    Ok(context)
+}
+
+fn load_tool_call(
+    connection: &Connection,
+    tool_call_id: ToolCallId,
+) -> Result<ToolCallSnapshot, SessionRuntimeError> {
+    connection
+        .query_row(
+            "SELECT r.session_id, t.run_id, t.turn_ordinal, t.call_ordinal,
+                    t.provider_call_id, t.name, t.arguments_json, t.state, t.result, t.is_error
+             FROM tool_calls t JOIN runs r ON r.id = t.run_id WHERE t.id = ?1",
+            [tool_call_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u16>(2)?,
+                    row.get::<_, u16>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, bool>(9)?,
+                ))
+            },
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)
+        .and_then(
+            |(session, run, turn, call, provider_id, name, arguments, state, result, is_error)| {
+                Ok(ToolCallSnapshot {
+                    id: tool_call_id,
+                    session_id: parse_id(&session)?,
+                    run_id: parse_id(&run)?,
+                    turn_ordinal: turn,
+                    call_ordinal: call,
+                    provider_call_id: provider_id,
+                    name,
+                    arguments,
+                    state: parse_tool_call_state(&state)?,
+                    result,
+                    is_error,
+                })
+            },
+        )
+}
+
 fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, SessionRuntimeError> {
     connection
         .query_row(
@@ -2658,6 +3400,19 @@ fn parse_message_state(value: &str) -> Result<MessageState, SessionRuntimeError>
         "cancelled" => Ok(MessageState::Cancelled),
         "failed" => Ok(MessageState::Failed),
         "interrupted" => Ok(MessageState::Interrupted),
+        _ => Err(SessionRuntimeError::Persistence),
+    }
+}
+
+fn parse_tool_call_state(value: &str) -> Result<ToolCallState, SessionRuntimeError> {
+    match value {
+        "requested" => Ok(ToolCallState::Requested),
+        "awaiting_approval" => Ok(ToolCallState::AwaitingApproval),
+        "running" => Ok(ToolCallState::Running),
+        "completed" => Ok(ToolCallState::Completed),
+        "failed" => Ok(ToolCallState::Failed),
+        "denied" => Ok(ToolCallState::Denied),
+        "interrupted" => Ok(ToolCallState::Interrupted),
         _ => Err(SessionRuntimeError::Persistence),
     }
 }
@@ -2852,6 +3607,77 @@ mod tests {
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
     }
 
+    struct ToolLoopLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl RuntimeLoader for ToolLoopLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                Runtime::new(ToolLoopProvider { requests }, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct ToolLoopProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for ToolLoopProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            drop(requests);
+            if turn == 0 {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: "call_0".to_owned(),
+                        name: "read_file".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: "call_0".to_owned(),
+                        json: r#"{"path":"note.txt"}"#.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: "call_0".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed {
+                        usage: Some(qq_provider::ProviderUsage {
+                            input_tokens: 4,
+                            cache_read_input_tokens: 0,
+                            cache_write_input_tokens: 0,
+                            output_tokens: 2,
+                        }),
+                    }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed {
+                        usage: Some(qq_provider::ProviderUsage {
+                            input_tokens: 6,
+                            cache_read_input_tokens: 0,
+                            cache_write_input_tokens: 0,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ]))
+            }
+        }
+    }
+
     impl Provider for DelayedProvider {
         fn stream(&self, request: ModelRequest) -> ProviderStream {
             self.requests.lock().unwrap().push(request);
@@ -2924,7 +3750,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "2"
+            "3"
         );
         assert!(
             !connection
@@ -2936,6 +3762,8 @@ mod tests {
                 .unwrap()
         );
         assert!(has_column(&connection, "runs", "usage_json").unwrap());
+        assert!(has_column(&connection, "tool_calls", "provider_call_id").unwrap());
+        assert!(has_column(&connection, "model_turns", "assistant_content_json").unwrap());
     }
 
     #[test]
@@ -3228,6 +4056,459 @@ mod tests {
         );
         assert_eq!(focused.runs[0].estimated_cost_usd_nanos, Some(20_500));
         assert!(snapshot.cursor.sequence > initial.sequence);
+    }
+
+    #[tokio::test]
+    async fn persists_tool_transitions_and_reconstructs_follow_up_context() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "tool result\n").unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(ToolLoopLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "inspect the note".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let observed = collect_through_finished(&mut events).await;
+        let requested = observed
+            .iter()
+            .position(|event| matches!(event.event, SessionEvent::ToolCallRequested { .. }))
+            .unwrap();
+        let started = observed
+            .iter()
+            .position(|event| matches!(event.event, SessionEvent::ToolCallStarted { .. }))
+            .unwrap();
+        let finished = observed
+            .iter()
+            .position(|event| matches!(event.event, SessionEvent::ToolCallFinished { .. }))
+            .unwrap();
+        assert!(requested < started && started < finished);
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.tool_calls.len(), 1);
+        assert_eq!(focused.tool_calls[0].state, ToolCallState::Completed);
+        assert_eq!(
+            focused.tool_calls[0].result.as_deref(),
+            Some("tool result\n")
+        );
+        assert_eq!(
+            focused.runs[0].usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 3,
+            })
+        );
+
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "what did you read?".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].messages().len(), 5);
+        assert!(matches!(
+            requests[2].messages()[1].content(),
+            [ContentBlock::ToolCall { id, .. }] if id == "call_0"
+        ));
+        assert!(matches!(
+            requests[2].messages()[2].content(),
+            [ContentBlock::ToolResult { call_id, content, .. }]
+                if call_id == "call_0" && content == "tool result\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_interrupts_running_tools_without_reexecuting_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "read".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        let tool_call_id = ToolCallId::generate().unwrap();
+        let call = RuntimeToolCall {
+            id: tool_call_id,
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "provider-call".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            argument_error: None,
+        };
+        store
+            .persist_model_turn(
+                &claimed,
+                1,
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolCall {
+                        id: call.provider_call_id.clone(),
+                        name: call.name.clone(),
+                        arguments: serde_json::from_str(&call.arguments).unwrap(),
+                    }],
+                ),
+                vec![call],
+            )
+            .await
+            .unwrap();
+        let started = store.start_tool_call(&claimed, tool_call_id).await.unwrap();
+        drop(store);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: started.cursor,
+            })
+            .unwrap();
+        let recovered = collect_through_finished(&mut events).await;
+        assert!(matches!(
+            &recovered[0].event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.id == tool_call_id
+                    && tool_call.state == ToolCallState::Interrupted
+                    && tool_call.is_error
+        ));
+        assert!(matches!(
+            &recovered[1].event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Interrupted,
+                ..
+            }
+        ));
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.focused.unwrap().tool_calls[0].state,
+            ToolCallState::Interrupted
+        );
+
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            requests[0].messages()[2].content(),
+            [ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error: true,
+            }] if call_id == "provider-call" && content == INTERRUPTED_TOOL_RESULT
+        ));
+    }
+
+    #[tokio::test]
+    async fn orphaned_tool_call_blocks_replay_with_synthesized_interrupted_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "read".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        // Simulate the pre-fix crash window: the model turn committed with a
+        // ToolCall block, but no tool_calls rows were ever written.
+        store
+            .persist_model_turn(
+                &claimed,
+                1,
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolCall {
+                        id: "orphan-call".to_owned(),
+                        name: "read_file".to_owned(),
+                        arguments: serde_json::json!({"path": "note.txt"}),
+                    }],
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.receipt.committed_through,
+            })
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0].messages();
+        assert!(matches!(
+            messages[1].content(),
+            [ContentBlock::ToolCall { id, .. }] if id == "orphan-call"
+        ));
+        assert!(matches!(
+            messages[2].content(),
+            [ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error: true,
+            }] if call_id == "orphan-call" && content == INTERRUPTED_TOOL_RESULT
+        ));
+        // Provider validity: every ToolCall block must be answered by a
+        // ToolResult with the same call ID in a later message.
+        for (index, message) in messages.iter().enumerate() {
+            for block in message.content() {
+                if let ContentBlock::ToolCall { id, .. } = block {
+                    assert!(messages[index + 1..].iter().any(|candidate| {
+                        candidate.content().iter().any(|result| {
+                            matches!(
+                                result,
+                                ContentBlock::ToolResult { call_id, .. } if call_id == id
+                            )
+                        })
+                    }));
+                }
+            }
+        }
+    }
+
+    struct ContextBudgetLoader;
+
+    impl RuntimeLoader for ContextBudgetLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            Box::pin(async {
+                Runtime::new(ContextBudgetProvider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct ContextBudgetProvider;
+
+    impl Provider for ContextBudgetProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "x".repeat(MAX_CONTEXT_BYTES + 1),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn exceeding_the_context_budget_fails_the_run_with_a_policy_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(ContextBudgetLoader),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "fill the context".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let observed = collect_through_finished(&mut events).await;
+        let finished = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            finished,
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Policy,
+                    ref message,
+                }
+            } if message.contains("4 MiB limit")
+        ));
     }
 
     #[tokio::test]

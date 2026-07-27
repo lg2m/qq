@@ -14,6 +14,7 @@ use crossterm::{
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use qq_protocol::{
     MessageId, MessageRole, MessageSnapshot, MessageState, SessionId, SessionStatus,
+    ToolCallSnapshot, ToolCallState,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -326,16 +327,19 @@ impl FrameRenderer {
         let Some(session_id) = app.focused else {
             return vec![Line::styled("  Alt-N creates the first session.", muted())];
         };
-        let Some(messages) = app
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.messages.as_ref())
-        else {
+        let Some(session) = app.sessions.get(&session_id) else {
             return vec![Line::styled(
                 "  Loading session history...",
                 muted().italic(),
             )];
         };
+        let Some(messages) = session.messages.as_ref() else {
+            return vec![Line::styled(
+                "  Loading session history...",
+                muted().italic(),
+            )];
+        };
+        let tool_calls = session.tool_calls.as_deref().unwrap_or_default();
         let mut lines = Vec::new();
         let hidden = messages.len().saturating_sub(MAX_VISIBLE_MESSAGES);
         if hidden > 0 {
@@ -349,6 +353,15 @@ impl FrameRenderer {
                 lines.push(Line::default());
             }
             lines.extend(self.render_message(message, width));
+            if message.role == MessageRole::Assistant {
+                for tool_call in tool_calls
+                    .iter()
+                    .filter(|tool_call| tool_call.run_id == message.run_id)
+                {
+                    lines.push(Line::default());
+                    lines.extend(Self::render_tool_call(tool_call, width));
+                }
+            }
         }
         for prompt in app.pending_prompts(session_id) {
             if !lines.is_empty() {
@@ -436,6 +449,49 @@ impl FrameRenderer {
             lines.extend(indent_lines(body, prefix, width));
         }
         lines
+    }
+
+    fn render_tool_call(tool_call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
+        let prefix = "   ";
+        let mut header = Line::styled(prefix, muted());
+        header.push("TOOL", accent().bold());
+        header.push(format!("  {}", tool_call.name), normal().bold());
+        header.push(
+            format!("  {}", tool_state_label(tool_call.state)),
+            if tool_call.is_error {
+                failure()
+            } else {
+                muted()
+            },
+        );
+        let mut lines = vec![truncate_line(header, width)];
+        let arguments = bounded_tail(&tool_call.arguments, MAX_MARKDOWN_BYTES / 4);
+        let result = tool_call
+            .result
+            .as_deref()
+            .map(|result| bounded_tail(result, MAX_MARKDOWN_BYTES / 2));
+        let details = match result {
+            Some(result) => format!("arguments: `{arguments}`\n\n{result}"),
+            None => format!("arguments: `{arguments}`"),
+        };
+        lines.extend(indent_lines(
+            bounded_markdown_lines(&details, width.saturating_sub(prefix.len()).max(1)),
+            prefix,
+            width,
+        ));
+        lines
+    }
+}
+
+const fn tool_state_label(state: ToolCallState) -> &'static str {
+    match state {
+        ToolCallState::Requested => "requested",
+        ToolCallState::AwaitingApproval => "awaiting approval",
+        ToolCallState::Running => "running",
+        ToolCallState::Completed => "completed",
+        ToolCallState::Failed => "failed",
+        ToolCallState::Denied => "denied",
+        ToolCallState::Interrupted => "interrupted",
     }
 }
 
@@ -1175,6 +1231,8 @@ mod tests {
                     .map(|row| completed_message(row + 1, format!("row {row}")))
                     .collect(),
                 runs: Vec::new(),
+                tool_calls: Vec::new(),
+                has_older_tool_calls: false,
                 has_older_messages: false,
             }),
             has_older_sessions: false,
@@ -1212,6 +1270,32 @@ mod tests {
                 .chars()
                 .all(|character| terminal_safe_character(character) == Some(character))
         }));
+    }
+
+    #[test]
+    fn transcript_renders_replayed_tool_activity() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(vec![ToolCallSnapshot {
+            id: qq_protocol::ToolCallId::from_bytes([7; 16]),
+            session_id,
+            run_id: RunId::from_bytes([2; 16]),
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call-1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            state: ToolCallState::Completed,
+            result: Some("contents".to_owned()),
+            is_error: false,
+        }]);
+
+        let frame = FrameRenderer::default().frame(&mut app, 100, 30);
+        let text = frame_text(&frame);
+
+        assert!(text.contains("TOOL"));
+        assert!(text.contains("read_file"));
+        assert!(text.contains("contents"));
     }
 
     #[test]

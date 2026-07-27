@@ -9,17 +9,17 @@ use serde::{Deserialize, Serialize};
 mod ids;
 mod sessions;
 
-pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, WorkspaceId};
+pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
 pub use sessions::{
     CommandOutcome, CommandReceipt, CommandRequest, CursorError, EventCursor, MessageRole,
     MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
     ModelPricingTier, ModelSelection, RunFailure, RunOutcome, RunSnapshot, RunStatus,
     SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot, SessionStatus,
-    SessionSummary, SnapshotRequest, SubscribeRequest, TextChannel, TokenUsage, WorkspaceSnapshot,
-    WorkspaceSummary,
+    SessionSummary, SnapshotRequest, SubscribeRequest, TextChannel, TokenUsage, ToolCallSnapshot,
+    ToolCallState, WorkspaceSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
