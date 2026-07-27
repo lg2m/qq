@@ -106,23 +106,28 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     let factory = runtime::RuntimeFactory::system()?;
     let request = overrides.load_request()?;
     let config_factory = factory.clone();
-    let (snapshot, tui) = tokio::task::spawn_blocking(move || {
+    let (snapshot, tui, models) = tokio::task::spawn_blocking(move || {
         let snapshot = config_factory.load(&request)?;
         let tui = config::ConfigLoader::system()?.load_tui(request.cwd())?;
-        Ok::<_, runtime::RuntimeBuildError>((snapshot, tui))
+        let models = config_factory.configured_model_options(&snapshot);
+        Ok::<_, runtime::RuntimeBuildError>((snapshot, tui, models))
     })
     .await??;
+    let models = models
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<qq_tui::ModelOption>>();
     let mut embedded = None;
-    let connection = if let Some(connection) = client::discover().await? {
-        connection
+    let (connection, create_initial_session) = if let Some(connection) = client::discover().await? {
+        (connection, false)
     } else {
         let handler = Arc::new(runtime::RuntimeHandler::open(factory).await?);
         match server::start(handler, server::ServerOptions::for_user()?).await? {
-            server::StartOutcome::Existing(connection) => connection,
+            server::StartOutcome::Existing(connection) => (connection, false),
             server::StartOutcome::Started(server) => {
                 let connection = server.connection().clone();
                 embedded = Some(server);
-                connection
+                (connection, true)
             }
         }
     };
@@ -133,26 +138,17 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         max_output_tokens: Some(snapshot.max_output_tokens()),
         organization: snapshot.organization().map(str::to_owned),
     };
-    let models = client::SessionClient::new(connection.clone())?
-        .models(qq_protocol::ModelCatalogRequest {
-            workspace: workspace.to_string_lossy().into_owned(),
-            selection: configured_model.clone(),
-        })
-        .await?
-        .into_iter()
-        .map(|model| qq_tui::ModelOption {
-            provider: model.provider,
-            model: model.model,
-            name: model.name,
-            context_window: model.context_window,
-            selection: model.selection,
-        })
-        .collect::<Vec<_>>();
     let model = models
         .iter()
         .any(|option| option.selection.model == configured_model.model)
-        .then_some(configured_model);
-    let tui_client = client::TuiClient::start(connection, workspace, model.clone())?;
+        .then_some(configured_model.clone());
+    let tui_client = client::TuiClient::start(
+        connection,
+        workspace,
+        configured_model,
+        model.clone(),
+        create_initial_session,
+    )?;
     let result = qq_tui::run(
         tui_client,
         qq_tui::TuiOptions {

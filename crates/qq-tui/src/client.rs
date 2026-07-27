@@ -1,8 +1,8 @@
 use std::future::Future;
 
 use qq_protocol::{
-    CommandId, CommandReceipt, CommandRequest, SessionEventEnvelope, SnapshotRequest,
-    WorkspaceSnapshot,
+    CommandId, CommandReceipt, CommandRequest, ModelDescriptor, SessionEventEnvelope,
+    SnapshotRequest, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +16,10 @@ pub enum ClientUpdate {
     Connection(ConnectionState),
     Snapshot(WorkspaceSnapshot),
     ResetSnapshot(WorkspaceSnapshot),
+    Models {
+        models: Vec<ModelDescriptor>,
+        selected: Option<qq_protocol::ModelSelection>,
+    },
     Event(SessionEventEnvelope),
     CommandResult {
         command_id: CommandId,

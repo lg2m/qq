@@ -2,9 +2,9 @@ use std::collections::{HashMap, VecDeque};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
-    CommandId, CommandOutcome, CommandRequest, MessageSnapshot, MessageState, ModelSelection,
-    RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
-    SessionSummary, SnapshotRequest, TokenUsage, WorkspaceId, WorkspaceSnapshot,
+    CommandId, CommandOutcome, CommandRequest, MessageSnapshot, MessageState, ModelDescriptor,
+    ModelSelection, RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
+    SessionSnapshot, SessionSummary, SnapshotRequest, TokenUsage, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -81,6 +81,18 @@ pub struct ModelOption {
     pub name: Option<String>,
     pub context_window: Option<u32>,
     pub selection: ModelSelection,
+}
+
+impl From<ModelDescriptor> for ModelOption {
+    fn from(descriptor: ModelDescriptor) -> Self {
+        Self {
+            provider: descriptor.provider,
+            model: descriptor.model,
+            name: descriptor.name,
+            context_window: descriptor.context_window,
+            selection: descriptor.selection,
+        }
+    }
 }
 
 pub async fn run<P>(client: P, options: TuiOptions) -> Result<(), TuiError>
@@ -200,6 +212,10 @@ impl App {
                 self.status = Some("session state reset after reconnecting".to_owned());
                 self.apply_snapshot(snapshot)
             }
+            ClientUpdate::Models { models, selected } => {
+                self.apply_models(models, selected);
+                true
+            }
             ClientUpdate::Event(event) => self.apply_live_event(event),
             ClientUpdate::CommandResult { command_id, result } => {
                 match result {
@@ -230,6 +246,48 @@ impl App {
         }
     }
 
+    fn apply_models(
+        &mut self,
+        models: Vec<ModelDescriptor>,
+        selected_model: Option<ModelSelection>,
+    ) {
+        let selected = self.model_picker.as_ref().and_then(|picker| {
+            self.filtered_models()
+                .get(picker.selected)
+                .and_then(|index| self.models.get(*index))
+                .map(|model| (model.provider.clone(), model.model.clone()))
+        });
+        self.models = models.into_iter().map(Into::into).collect();
+        self.models.sort_by(|left, right| {
+            (&left.provider, &left.name, &left.model).cmp(&(
+                &right.provider,
+                &right.name,
+                &right.model,
+            ))
+        });
+        if let Some(selected_model) = selected_model {
+            self.model = selected_model;
+        }
+        for session in self.sessions.values_mut() {
+            session.context_window =
+                model_context_window(&self.models, session.summary.model.as_deref());
+        }
+        if self.model_picker.is_some() {
+            let filtered = self.filtered_models();
+            let selected = selected.and_then(|selected| {
+                filtered.iter().position(|index| {
+                    self.models.get(*index).is_some_and(|model| {
+                        (model.provider.as_str(), model.model.as_str())
+                            == (selected.0.as_str(), selected.1.as_str())
+                    })
+                })
+            });
+            if let Some(picker) = &mut self.model_picker {
+                picker.selected = selected.unwrap_or(0).min(filtered.len().saturating_sub(1));
+            }
+        }
+    }
+
     fn apply_snapshot(&mut self, snapshot: WorkspaceSnapshot) -> bool {
         let initial = self.workspace_id.is_none();
         if self
@@ -240,7 +298,11 @@ impl App {
             return true;
         }
         let snapshot_focus = snapshot.focused.as_ref().map(|focused| focused.summary.id);
-        if !initial && snapshot_focus.is_some() && snapshot_focus != self.focused {
+        if !initial
+            && self.focused.is_some()
+            && snapshot_focus.is_some()
+            && snapshot_focus != self.focused
+        {
             return false;
         }
         if snapshot.cursor.sequence < self.last_sequence
@@ -1484,6 +1546,101 @@ mod tests {
         });
 
         assert_eq!(app.focused_context_usage(), Some((24_000, 128_000)));
+    }
+
+    #[test]
+    fn discovered_models_refresh_existing_session_metadata() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        assert_eq!(app.focused_context_usage(), None);
+
+        app.apply_client_update(ClientUpdate::Models {
+            models: vec![ModelDescriptor {
+                provider: "openai".to_owned(),
+                model: "gpt-test".to_owned(),
+                name: Some("GPT Test".to_owned()),
+                context_window: Some(128_000),
+                selection: ModelSelection {
+                    model: Some("openai/gpt-test".to_owned()),
+                    max_output_tokens: Some(4_096),
+                    organization: None,
+                },
+            }],
+            selected: None,
+        });
+
+        let focused = app.focused.unwrap();
+        assert_eq!(app.models.len(), 1);
+        assert_eq!(app.sessions[&focused].context_window, Some(128_000));
+    }
+
+    #[test]
+    fn model_refresh_preserves_the_open_picker_selection_by_identity() {
+        let selection = ModelSelection {
+            model: Some("zeta/model-z".to_owned()),
+            max_output_tokens: Some(4_096),
+            organization: None,
+        };
+        let mut app = App::new(TuiOptions {
+            settings: Settings::default(),
+            model: selection.clone(),
+            models: vec![ModelOption {
+                provider: "zeta".to_owned(),
+                model: "model-z".to_owned(),
+                name: Some("Zeta".to_owned()),
+                context_window: None,
+                selection: selection.clone(),
+            }],
+        });
+        app.apply_snapshot(snapshot());
+        app.open_models();
+
+        app.apply_client_update(ClientUpdate::Models {
+            models: vec![
+                ModelDescriptor {
+                    provider: "alpha".to_owned(),
+                    model: "model-a".to_owned(),
+                    name: Some("Alpha".to_owned()),
+                    context_window: Some(64_000),
+                    selection: ModelSelection {
+                        model: Some("alpha/model-a".to_owned()),
+                        max_output_tokens: Some(4_096),
+                        organization: None,
+                    },
+                },
+                ModelDescriptor {
+                    provider: "zeta".to_owned(),
+                    model: "model-z".to_owned(),
+                    name: Some("Zeta".to_owned()),
+                    context_window: Some(128_000),
+                    selection: selection.clone(),
+                },
+            ],
+            selected: Some(selection.clone()),
+        });
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.model, selection);
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Command(CommandRequest {
+                command: SessionCommand::CreateSession { model, .. },
+                ..
+            }) if model == &selection
+        ));
+    }
+
+    #[test]
+    fn first_focused_snapshot_can_arrive_after_the_workspace_snapshot() {
+        let mut empty = snapshot();
+        empty.sessions.clear();
+        empty.focused = None;
+        let mut app = App::new(TuiOptions::default());
+
+        app.apply_snapshot(empty);
+        app.apply_snapshot(snapshot());
+
+        assert!(app.focused.is_some());
     }
 
     #[test]

@@ -74,8 +74,7 @@ impl RuntimeFactory {
         self.inner.config.load(request).map_err(Into::into)
     }
 
-    #[cfg(test)]
-    fn model_options(&self, snapshot: &ConfigSnapshot) -> Vec<ModelDescriptor> {
+    pub fn configured_model_options(&self, snapshot: &ConfigSnapshot) -> Vec<ModelDescriptor> {
         self.model_options_with_discovery(snapshot, &BTreeMap::new())
     }
 
@@ -210,12 +209,6 @@ impl RuntimeFactory {
                 path: requested_workspace,
             }
             .into());
-        }
-        let load = LoadRequest::from_process_env(&workspace, None)?;
-        match self.load(&load) {
-            Ok(snapshot) => return Ok(self.discovered_model_options(&snapshot)),
-            Err(RuntimeBuildError::Config(ConfigError::ModelRequired)) => {}
-            Err(error) => return Err(error),
         }
         let mut load =
             LoadRequest::from_process_env(&workspace, request.selection.max_output_tokens)?;
@@ -1160,12 +1153,12 @@ mod tests {
             .load(&fixture.request(r#"(version: 1, model: "openai/gpt-5.6")"#))
             .unwrap();
 
-        assert!(factory.model_options(&snapshot).is_empty());
+        assert!(factory.configured_model_options(&snapshot).is_empty());
 
         credentials
             .set("openai/default", "test-secret", false)
             .unwrap();
-        let options = factory.model_options(&snapshot);
+        let options = factory.configured_model_options(&snapshot);
         assert!(!options.is_empty());
         assert!(options.iter().all(|option| option.provider == "openai"));
         assert!(options.iter().any(|option| option.model == "gpt-5.6"));
