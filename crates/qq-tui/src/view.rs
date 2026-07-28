@@ -1177,8 +1177,13 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
         return Vec::new();
     }
     let mut lines = vec![Line::default()];
+    // Lines marked literal (code blocks, laid-out tables) keep character
+    // wrapping so column alignment survives; prose lines wrap at words.
+    let mut literal = vec![false];
+    let mut in_code_block = false;
     let mut styles = vec![normal()];
     let mut list_depth = 0_usize;
+    let mut table: Option<TableBuffer> = None;
     let parser = Parser::new_ext(source, Options::all());
     for event in parser {
         match event {
@@ -1201,6 +1206,13 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 Tag::CodeBlock(_) => {
                     ensure_line(&mut lines);
                     styles.push(warning());
+                    in_code_block = true;
+                    // The block's first text lands on the current (possibly
+                    // pre-existing) line, so flag it literal explicitly.
+                    literal.resize(lines.len(), true);
+                    if let Some(flag) = literal.last_mut() {
+                        *flag = true;
+                    }
                 }
                 Tag::List(_) => list_depth += 1,
                 Tag::Item => {
@@ -1214,6 +1226,26 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                     ensure_line(&mut lines);
                     lines.last_mut().expect("line exists").push("> ", muted());
                 }
+                Tag::Table(_) => table = Some(TableBuffer::default()),
+                Tag::TableHead => {
+                    if let Some(buffer) = table.as_mut() {
+                        buffer.has_header = true;
+                        buffer.begin_row();
+                    }
+                    let mut style = *styles.last().expect("base style remains");
+                    style.bold = true;
+                    styles.push(style);
+                }
+                Tag::TableRow => {
+                    if let Some(buffer) = table.as_mut() {
+                        buffer.begin_row();
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(buffer) = table.as_mut() {
+                        buffer.begin_cell();
+                    }
+                }
                 Tag::Link { .. }
                 | Tag::Image { .. }
                 | Tag::FootnoteDefinition(_)
@@ -1224,10 +1256,6 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 | Tag::Strikethrough
                 | Tag::Subscript
                 | Tag::Superscript
-                | Tag::Table(_)
-                | Tag::TableHead
-                | Tag::TableRow
-                | Tag::TableCell
                 | Tag::MetadataBlock(_) => {}
             },
             Event::End(tag) => match tag {
@@ -1235,6 +1263,9 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 | TagEnd::Heading(_)
                 | TagEnd::CodeBlock
                 | TagEnd::BlockQuote(_) => {
+                    if matches!(tag, TagEnd::CodeBlock) {
+                        in_code_block = false;
+                    }
                     ensure_line(&mut lines);
                     if matches!(tag, TagEnd::Heading(_) | TagEnd::CodeBlock) {
                         styles.pop();
@@ -1245,6 +1276,33 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 }
                 TagEnd::List(_) => list_depth = list_depth.saturating_sub(1),
                 TagEnd::Item => ensure_line(&mut lines),
+                TagEnd::Table => {
+                    if let Some(mut buffer) = table.take() {
+                        buffer.end_row();
+                        let rendered = layout_table(&buffer.rows, buffer.has_header, width.max(1));
+                        if !rendered.is_empty() {
+                            if lines.last().is_some_and(Line::is_empty) {
+                                lines.pop();
+                                literal.pop();
+                            }
+                            literal.resize(lines.len(), in_code_block);
+                            lines.extend(rendered);
+                            literal.resize(lines.len(), true);
+                            lines.push(Line::default());
+                        }
+                    }
+                }
+                TagEnd::TableHead => {
+                    styles.pop();
+                    if let Some(buffer) = table.as_mut() {
+                        buffer.end_row();
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(buffer) = table.as_mut() {
+                        buffer.end_row();
+                    }
+                }
                 TagEnd::Link
                 | TagEnd::Image
                 | TagEnd::FootnoteDefinition
@@ -1255,52 +1313,268 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 | TagEnd::Strikethrough
                 | TagEnd::Subscript
                 | TagEnd::Superscript
-                | TagEnd::Table
-                | TagEnd::TableHead
-                | TagEnd::TableRow
                 | TagEnd::TableCell
                 | TagEnd::MetadataBlock(_) => {}
             },
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                append_safe_text(
+                let style = *styles.last().expect("base style remains");
+                match table.as_mut() {
+                    Some(buffer) => buffer.append(&text, style),
+                    None => append_safe_text(&mut lines, &text, style),
+                }
+            }
+            Event::Code(code) => {
+                push_inline(table.as_mut(), &mut lines, &code, warning().bold());
+            }
+            // A soft break is a source-formatting line break: render it as a
+            // space so paragraphs reflow to the terminal width.
+            Event::SoftBreak => {
+                push_inline(
+                    table.as_mut(),
                     &mut lines,
-                    &text,
+                    " ",
                     *styles.last().expect("base style remains"),
                 );
             }
-            Event::Code(code) => {
-                lines
-                    .last_mut()
-                    .expect("line exists")
-                    .push(code.to_string(), warning().bold());
-            }
-            Event::SoftBreak | Event::HardBreak => lines.push(Line::default()),
+            Event::HardBreak => match table.as_mut() {
+                Some(buffer) => buffer.append(" ", normal()),
+                None => lines.push(Line::default()),
+            },
             Event::Rule => {
                 ensure_line(&mut lines);
                 lines.push(Line::styled("------------", muted()));
                 lines.push(Line::default());
             }
-            Event::TaskListMarker(checked) => lines
-                .last_mut()
-                .expect("line exists")
-                .push(if checked { "[x] " } else { "[ ] " }, accent()),
-            Event::FootnoteReference(reference) => lines
-                .last_mut()
-                .expect("line exists")
-                .push(format!("[{reference}]"), accent()),
-            Event::InlineMath(math) | Event::DisplayMath(math) => lines
-                .last_mut()
-                .expect("line exists")
-                .push(format!("${math}$"), warning()),
+            Event::TaskListMarker(checked) => push_inline(
+                table.as_mut(),
+                &mut lines,
+                if checked { "[x] " } else { "[ ] " },
+                accent(),
+            ),
+            Event::FootnoteReference(reference) => push_inline(
+                table.as_mut(),
+                &mut lines,
+                &format!("[{reference}]"),
+                accent(),
+            ),
+            Event::InlineMath(math) | Event::DisplayMath(math) => {
+                push_inline(table.as_mut(), &mut lines, &format!("${math}$"), warning());
+            }
         }
+        literal.resize(lines.len(), in_code_block);
     }
     while lines.last().is_some_and(Line::is_empty) {
         lines.pop();
+        literal.pop();
     }
     lines
         .into_iter()
-        .flat_map(|line| wrap_line(line, width.max(1)))
+        .zip(literal)
+        .flat_map(|(line, literal)| {
+            if literal {
+                wrap_line_chars(line, width.max(1))
+            } else {
+                wrap_line(line, width.max(1))
+            }
+        })
         .collect()
+}
+
+/// Routes inline content to the open table cell when one exists, otherwise to
+/// the current transcript line.
+fn push_inline(table: Option<&mut TableBuffer>, lines: &mut [Line], text: &str, style: Style) {
+    match table {
+        Some(buffer) => buffer.append(text, style),
+        None => lines
+            .last_mut()
+            .expect("line exists")
+            .push(text.to_owned(), style),
+    }
+}
+
+/// Narrowest useful column; below this per column the table stacks instead.
+const TABLE_MIN_COLUMN_WIDTH: usize = 3;
+/// Display width of the " │ " column separator.
+const TABLE_SEPARATOR_WIDTH: usize = 3;
+
+/// Buffers one table's rows of styled cells while the parser walks it, so the
+/// layout can size columns from complete content.
+#[derive(Default)]
+struct TableBuffer {
+    rows: Vec<Vec<Line>>,
+    row: Option<Vec<Line>>,
+    has_header: bool,
+}
+
+impl TableBuffer {
+    fn begin_row(&mut self) {
+        self.end_row();
+        self.row = Some(Vec::new());
+    }
+
+    fn end_row(&mut self) {
+        if let Some(row) = self.row.take()
+            && !row.is_empty()
+        {
+            self.rows.push(row);
+        }
+    }
+
+    fn begin_cell(&mut self) {
+        self.row.get_or_insert_default().push(Line::default());
+    }
+
+    /// Appends inline content to the current cell, creating row and cell on
+    /// demand so malformed or partial input never panics.
+    fn append(&mut self, text: &str, style: Style) {
+        let row = self.row.get_or_insert_default();
+        if row.is_empty() {
+            row.push(Line::default());
+        }
+        let safe = text
+            .chars()
+            .filter_map(terminal_safe_character)
+            .collect::<String>();
+        row.last_mut().expect("cell exists").push(safe, style);
+    }
+}
+
+/// Lays a buffered table out as aligned columns sized from content. When the
+/// natural table overflows the width, columns shrink proportionally and cells
+/// wrap within their column; when even minimum columns cannot fit, rows stack
+/// as `header: value` lines.
+fn layout_table(rows: &[Vec<Line>], has_header: bool, width: usize) -> Vec<Line> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return Vec::new();
+    }
+    let overhead = TABLE_SEPARATOR_WIDTH * (columns - 1);
+    let available = width.saturating_sub(overhead);
+    if available < columns * TABLE_MIN_COLUMN_WIDTH {
+        return layout_table_stacked(rows, has_header, width);
+    }
+    let natural = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .map(|row| row.get(column).map_or(0, Line::width))
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect::<Vec<_>>();
+    let mut widths = natural.clone();
+    if natural.iter().sum::<usize>() > available {
+        // Columns already within their fair share keep their natural width;
+        // repeat because each fixed column raises the fair share of the rest.
+        let mut remaining = available;
+        let mut flexible = (0..columns).collect::<Vec<_>>();
+        loop {
+            let fair = remaining / flexible.len().max(1);
+            let (fits, wide): (Vec<usize>, Vec<usize>) = flexible
+                .into_iter()
+                .partition(|column| natural[*column] <= fair);
+            if fits.is_empty() || wide.is_empty() {
+                flexible = if wide.is_empty() { fits } else { wide };
+                break;
+            }
+            for column in fits {
+                remaining = remaining.saturating_sub(natural[column]);
+            }
+            flexible = wide;
+        }
+        // The overflowing columns split the remaining space proportionally.
+        let flexible_total = flexible
+            .iter()
+            .map(|column| natural[*column])
+            .sum::<usize>()
+            .max(1);
+        for column in flexible {
+            widths[column] = (natural[column] * remaining / flexible_total)
+                .max(TABLE_MIN_COLUMN_WIDTH)
+                .min(natural[column].max(TABLE_MIN_COLUMN_WIDTH));
+        }
+        // Rounding and minimums can leave a small excess; take it back from
+        // the widest columns so the sum fits `available` again.
+        while widths.iter().sum::<usize>() > available {
+            let Some((index, _)) = widths
+                .iter()
+                .enumerate()
+                .filter(|(_, allocated)| **allocated > TABLE_MIN_COLUMN_WIDTH)
+                .max_by_key(|(_, allocated)| **allocated)
+            else {
+                break;
+            };
+            widths[index] -= 1;
+        }
+    }
+    let mut output = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let cells = (0..columns)
+            .map(|column| wrap_line(row.get(column).cloned().unwrap_or_default(), widths[column]))
+            .collect::<Vec<_>>();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        for cell_row in 0..height {
+            let mut line = Line::default();
+            for (column, cell) in cells.iter().enumerate() {
+                if column > 0 {
+                    line.push(" │ ", muted());
+                }
+                let content = cell.get(cell_row).cloned().unwrap_or_default();
+                let content_width = content.width();
+                for span in content.spans {
+                    line.push(span.text, span.style);
+                }
+                if column + 1 < columns {
+                    line.push(
+                        " ".repeat(widths[column].saturating_sub(content_width)),
+                        muted(),
+                    );
+                }
+            }
+            output.push(line);
+        }
+        if row_index == 0 && has_header && rows.len() > 1 {
+            let mut rule = Line::default();
+            for (column, column_width) in widths.iter().enumerate() {
+                if column > 0 {
+                    rule.push("─┼─", muted());
+                }
+                rule.push("─".repeat(*column_width), muted());
+            }
+            output.push(rule);
+        }
+    }
+    output
+}
+
+/// Very-narrow fallback: each data row becomes `header: value` lines with a
+/// muted divider between rows.
+fn layout_table_stacked(rows: &[Vec<Line>], has_header: bool, width: usize) -> Vec<Line> {
+    let (header, data) = if has_header && rows.len() > 1 {
+        (rows.first(), &rows[1..])
+    } else {
+        (None, rows)
+    };
+    let mut output = Vec::new();
+    for (row_index, row) in data.iter().enumerate() {
+        if row_index > 0 {
+            output.push(Line::styled("---", muted()));
+        }
+        for (column, cell) in row.iter().enumerate() {
+            let mut line = Line::default();
+            if let Some(title) = header.and_then(|header| header.get(column)) {
+                for span in &title.spans {
+                    line.push(span.text.clone(), span.style);
+                }
+                line.push(": ", muted());
+            }
+            for span in &cell.spans {
+                line.push(span.text.clone(), span.style);
+            }
+            output.extend(wrap_line(line, width.max(1)));
+        }
+    }
+    output
 }
 
 fn bounded_markdown_lines(source: &str, width: usize) -> Vec<Line> {
@@ -1331,7 +1605,83 @@ fn ensure_line(lines: &mut Vec<Line>) {
     }
 }
 
+/// A run of characters that wraps as one unit: either whitespace or a word.
+struct WrapToken {
+    whitespace: bool,
+    width: usize,
+    characters: Vec<(char, Style)>,
+}
+
+/// Wraps prose at whitespace, preserving span styles across breaks. A single
+/// token wider than the width falls back to character breaking, and the
+/// whitespace a break lands on is dropped rather than carried over.
 fn wrap_line(line: Line, width: usize) -> Vec<Line> {
+    if line.width() <= width {
+        return vec![line];
+    }
+    let mut tokens: Vec<WrapToken> = Vec::new();
+    for span in line.spans {
+        for character in span.text.chars() {
+            let whitespace = character.is_whitespace();
+            let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
+            match tokens.last_mut() {
+                Some(token) if token.whitespace == whitespace => {
+                    token.width += character_width;
+                    token.characters.push((character, span.style));
+                }
+                _ => tokens.push(WrapToken {
+                    whitespace,
+                    width: character_width,
+                    characters: vec![(character, span.style)],
+                }),
+            }
+        }
+    }
+    let mut output = vec![Line::default()];
+    let mut used = 0_usize;
+    for token in tokens {
+        if used + token.width <= width {
+            let line = output.last_mut().expect("output starts populated");
+            for (character, style) in token.characters {
+                line.push(character.to_string(), style);
+            }
+            used += token.width;
+        } else if token.whitespace {
+            if used > 0 {
+                output.push(Line::default());
+                used = 0;
+            }
+        } else if token.width <= width {
+            output.push(Line::default());
+            let line = output.last_mut().expect("output starts populated");
+            for (character, style) in token.characters {
+                line.push(character.to_string(), style);
+            }
+            used = token.width;
+        } else {
+            for (character, style) in token.characters {
+                let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
+                if used > 0 && used + character_width > width {
+                    output.push(Line::default());
+                    used = 0;
+                }
+                output
+                    .last_mut()
+                    .expect("output starts populated")
+                    .push(character.to_string(), style);
+                used += character_width;
+            }
+        }
+    }
+    while output.len() > 1 && output.last().is_some_and(Line::is_empty) {
+        output.pop();
+    }
+    output
+}
+
+/// Character wrapping for literal content (code blocks, table rows) where
+/// dropping or moving whitespace would break alignment.
+fn wrap_line_chars(line: Line, width: usize) -> Vec<Line> {
     let mut output = vec![Line::default()];
     let mut current_width = 0;
     for span in line.spans {
@@ -1568,6 +1918,150 @@ mod tests {
     fn markdown_rows_remain_within_the_render_width() {
         let lines = markdown_lines("**Streaming** text remains narrow and readable.", 9);
         assert!(lines.iter().all(|line| line.width() <= 9));
+    }
+
+    #[test]
+    fn tables_render_aligned_columns_with_a_header_separator() {
+        let source =
+            "| Order | Source |\n| --- | --- |\n| 1 | Built-in defaults |\n| 2 | Cached manifest |";
+        let lines = markdown_lines(source, 60);
+        let rows = frame_rows(&lines);
+
+        assert_eq!(
+            rows,
+            [
+                "Order │ Source".to_owned(),
+                format!("{}─┼─{}", "─".repeat(5), "─".repeat(17)),
+                "1     │ Built-in defaults".to_owned(),
+                "2     │ Cached manifest".to_owned(),
+            ]
+        );
+        assert!(lines[0].spans[0].style.bold, "header row renders bold");
+    }
+
+    #[test]
+    fn wide_tables_wrap_cell_content_within_columns() {
+        let source = "| Key | Description |\n| --- | --- |\n| alpha | a very long description that must wrap inside its own column |";
+        let width = 32;
+        let lines = markdown_lines(source, width);
+        let rows = frame_rows(&lines);
+
+        assert!(lines.iter().all(|line| line.width() <= width));
+        // The oversized description wraps into multiple physical rows.
+        assert!(rows.iter().filter(|row| row.contains('│')).count() > 2);
+        // Every column separator sits at the same display position.
+        let positions = rows
+            .iter()
+            .filter(|row| row.contains('│') || row.contains('┼'))
+            .map(|row| {
+                row.chars()
+                    .take_while(|character| *character != '│' && *character != '┼')
+                    .map(|character| UnicodeWidthChar::width(character).unwrap_or_default())
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        assert!(!positions.is_empty());
+        assert!(positions.iter().all(|position| *position == positions[0]));
+    }
+
+    #[test]
+    fn very_narrow_tables_stack_rows_as_header_value_lines() {
+        let source = "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n| 4 | 5 | 6 |";
+        let rows = frame_rows(&markdown_lines(source, 10));
+
+        assert_eq!(
+            rows,
+            ["A: 1", "B: 2", "C: 3", "---", "A: 4", "B: 5", "C: 6"]
+        );
+    }
+
+    #[test]
+    fn cjk_table_content_aligns_by_display_width() {
+        let source = "| 名前 | 説明 |\n| --- | --- |\n| 短い | 長い説明テキスト |";
+        let lines = markdown_lines(source, 40);
+        let rows = frame_rows(&lines);
+
+        assert!(lines.iter().all(|line| line.width() <= 40));
+        let positions = rows
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .take_while(|character| *character != '│' && *character != '┼')
+                    .map(|character| UnicodeWidthChar::width(character).unwrap_or_default())
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions, [5, 5, 5]);
+    }
+
+    #[test]
+    fn partial_streaming_table_input_never_panics_and_stays_bounded() {
+        let fragments = [
+            "| Order | Source",
+            "| Order | Source |\n| ---",
+            "| Order | Source |\n| --- | --- |\n| 1 | Built",
+            "| a |\n| --- |\n| b |\n\ntext after",
+            "| |\n| --- |\n| |",
+        ];
+        for fragment in fragments {
+            for width in 0..48 {
+                let lines = markdown_lines(fragment, width);
+                assert!(lines.iter().all(|line| line.width() <= width.max(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn word_wrap_breaks_at_whitespace_and_preserves_styles() {
+        let mut line = Line::default();
+        line.push("manage ", normal().bold());
+        line.push("daemons cleanly", normal());
+
+        let wrapped = wrap_line(line, 10);
+
+        assert_eq!(frame_rows(&wrapped), ["manage ", "daemons ", "cleanly"]);
+        assert_eq!(wrapped[0].spans[0].style, normal().bold());
+        assert_eq!(wrapped[1].spans[0].style, normal());
+    }
+
+    #[test]
+    fn overlong_tokens_fall_back_to_character_breaks() {
+        let mut line = Line::default();
+        line.push("ab", normal().bold());
+        line.push("cdefgh", normal());
+
+        let wrapped = wrap_line(line, 4);
+
+        assert_eq!(frame_rows(&wrapped), ["abcd", "efgh"]);
+        assert_eq!(wrapped[0].spans.len(), 2);
+        assert_eq!(wrapped[0].spans[0].style, normal().bold());
+        assert_eq!(wrapped[0].spans[1].style, normal());
+    }
+
+    #[test]
+    fn soft_breaks_reflow_paragraphs_to_the_render_width() {
+        // A source-wrapped paragraph joins into one row when it fits...
+        assert_eq!(
+            frame_rows(&markdown_lines("alpha beta\ngamma delta", 40)),
+            ["alpha beta gamma delta"]
+        );
+        // ...and rewraps at the terminal width, not the source width.
+        assert_eq!(
+            frame_rows(&markdown_lines("alpha beta\ngamma delta", 12)),
+            ["alpha beta ", "gamma delta"]
+        );
+        // A hard break still forces an explicit line break.
+        assert_eq!(
+            frame_rows(&markdown_lines("alpha  \nbeta", 40)),
+            ["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn code_blocks_keep_character_wrapping() {
+        let rows = frame_rows(&markdown_lines("```\nlet answer_value = 42;\n```", 12));
+
+        assert_eq!(rows, ["let answer_v", "alue = 42;"]);
     }
 
     #[test]
