@@ -141,6 +141,28 @@ Read-only tools (`read_file`, `list_dir`, `search`) never require approval
 inside the workspace and may execute concurrently. Everything else is a
 mutating or externally visible tool and goes through policy.
 
+## File References In Prompts
+
+`@<path>` in a prompt is a client feature, not a tool. It is the user
+putting a file into context: deterministic, immediate, no model round
+trip, and no approval — the user's own action needs no gate. Agent-driven
+discovery stays tool-based; `@` exists so the user never has to spend a
+turn telling the agent to go read a file they already have in mind.
+
+The client resolves references through the same capability containment as
+the tools — an `@` reference cannot escape the workspace either — and
+fuzzy completion reuses the `search` machinery rather than growing a
+second index. The file's content attaches to the user message as a
+content block, bounded and truncation-marked like a `read_file` result,
+persisted like any other message content, and counted against the session
+context budget.
+
+Attaching a file also records its content hash in the session's
+file-state map, exactly as `read_file` does. The read-before-write rule
+is therefore already satisfied for pinned files: the agent may edit an
+`@`-mentioned file without a redundant read, and the staleness CAS still
+protects the apply.
+
 ## Safe File Editing
 
 ### Containment
@@ -261,6 +283,29 @@ The allowlist is deliberately simple: exact commands or command prefixes
 (`cargo test`, `git status`), plus per-tool grants for MCP. No pattern DSL
 until real use demands one.
 
+### Grant Lifetimes
+
+A grant answers "may this run without asking", and the same grant shapes
+carry three lifetimes:
+
+- **Once** — approve a single call; nothing is recorded.
+- **Session** — approve-for-session records a grant consulted by every
+  later policy check in that session. Shell grants are command prefixes
+  matched at word granularity (`cargo test` covers `cargo test -p x`,
+  never `cargo testify`); other tools are granted by exact name.
+- **Workspace** — the grants a user always wants live in the `policy`
+  section of configuration, in the same layered documents as everything
+  else. Same shapes, longer lifetime: exact tool names, shell command
+  prefixes, and per-MCP-server tool allowlists. Config grants merge into
+  the session's grant set at session creation, with the existing config
+  layer precedence, so a managed source can constrain what a workspace
+  may allowlist.
+
+Workspace grants are written, not invented: the approval prompt grows an
+"always allow in this workspace" choice that promotes the grant into the
+workspace config document. Trust decisions land in the same reviewable
+file users already edit — no hidden allowlist store, no second syntax.
+
 Flow: when policy requires approval, the runtime persists and publishes
 `ToolApprovalRequested` and the run stays active but waiting — it holds its
 run permit, other sessions are unaffected, and cancellation still works. A
@@ -308,6 +353,11 @@ shell, the server, tool, and arguments for MCP.
      content-hash CAS, and atomic rename.
 4. `shell` with bounds, streaming output, and the command allowlist.
 5. MCP client, configuration, and namespaced tool integration.
+
+Two client-adjacent pieces ride alongside rather than in sequence: `@`
+file references in the TUI any time after 3b (they reuse containment and
+the file-state map), and workspace grants in configuration once session
+grants have seen real interactive use.
 
 Each step ships with tests for its failure paths — containment escapes,
 stale-file conflicts, approval denial and idempotent retry, timeout and
