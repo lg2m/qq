@@ -539,19 +539,6 @@ async fn execute_run(
         return;
     }
 
-    match inner.store.start_assistant(&claimed).await {
-        Ok(event) => inner.notify(event.cursor),
-        Err(error) => {
-            finish_run(
-                &inner,
-                &claimed,
-                persistence_failure("failed to persist the assistant message", &error),
-            )
-            .await;
-            return;
-        }
-    }
-
     let tool_cancellation = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(SessionToolGate {
         inner: Arc::clone(&inner),
@@ -583,7 +570,13 @@ async fn execute_run(
     let mut pending_text = String::new();
     let mut pending_channel = None;
     let mut flush_at = None;
-    let mut persisted_first_text = false;
+    // One assistant message per model turn: the message row is created
+    // lazily at the turn's first text delta (so call-only turns persist no
+    // message row) and finalized when the turn's `persist_model_turn`
+    // commits. `current_turn` is the 1-based ordinal of the turn currently
+    // streaming; text deltas always belong to it.
+    let mut current_turn: u16 = 1;
+    let mut current_message: Option<MessageId> = None;
     loop {
         let input = if let Some(deadline) = flush_at {
             tokio::select! {
@@ -613,9 +606,15 @@ async fn execute_run(
         };
         match input {
             RunInput::Flush => {
-                if let Err(error) =
-                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
                 {
                     finish_run(
                         &inner,
@@ -629,9 +628,15 @@ async fn execute_run(
             }
             stopped @ (RunInput::Cancelled | RunInput::Interrupted) => {
                 tool_cancellation.store(true, Ordering::Release);
-                if let Err(error) =
-                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
                 {
                     finish_run(
                         &inner,
@@ -656,9 +661,15 @@ async fn execute_run(
                 usage,
                 calls,
             })) => {
-                if let Err(error) =
-                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
                 {
                     finish_run(
                         &inner,
@@ -670,10 +681,15 @@ async fn execute_run(
                 }
                 flush_at = None;
                 accounting.record_turn(usage);
+                // The completed turn's message (if any) finalizes inside the
+                // same transaction as the turn row; the next turn's text will
+                // lazily start a fresh message.
+                let turn_message = current_message.take();
+                current_turn = turn_ordinal.saturating_add(1);
                 if message.has_content() || !calls.is_empty() {
                     match inner
                         .store
-                        .persist_model_turn(&claimed, turn_ordinal, message, calls)
+                        .persist_model_turn(&claimed, turn_ordinal, message, calls, turn_message)
                         .await
                     {
                         Ok(events) => {
@@ -747,8 +763,20 @@ async fn execute_run(
                 if text.is_empty() {
                     continue;
                 }
-                if !persisted_first_text {
-                    if let Err(error) = persist_text(&inner, &claimed, channel, text).await {
+                if current_message.is_none() {
+                    // A turn's first delta persists immediately: it creates
+                    // the turn's message row and publishes the new message
+                    // without batching latency.
+                    if let Err(error) = persist_text(
+                        &inner,
+                        &claimed,
+                        current_turn,
+                        &mut current_message,
+                        channel,
+                        text,
+                    )
+                    .await
+                    {
                         finish_run(
                             &inner,
                             &claimed,
@@ -757,13 +785,14 @@ async fn execute_run(
                         .await;
                         return;
                     }
-                    persisted_first_text = true;
                     continue;
                 }
                 if pending_channel.is_some_and(|pending| pending != channel)
                     && let Err(error) = flush_pending_text(
                         &inner,
                         &claimed,
+                        current_turn,
+                        &mut current_message,
                         &mut pending_channel,
                         &mut pending_text,
                     )
@@ -786,6 +815,8 @@ async fn execute_run(
                     if let Err(error) = flush_pending_text(
                         &inner,
                         &claimed,
+                        current_turn,
+                        &mut current_message,
                         &mut pending_channel,
                         &mut pending_text,
                     )
@@ -803,9 +834,15 @@ async fn execute_run(
                 }
             }
             RunInput::Event(Some(RuntimeEvent::Completed)) => {
-                if let Err(error) =
-                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
                 {
                     finish_run(
                         &inner,
@@ -825,9 +862,15 @@ async fn execute_run(
                 return;
             }
             RunInput::Event(Some(RuntimeEvent::Failed { kind, message })) => {
-                if let Err(error) =
-                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
                 {
                     finish_run(
                         &inner,
@@ -852,9 +895,15 @@ async fn execute_run(
                 return;
             }
             RunInput::Event(None) => {
-                if let Err(error) =
-                    flush_pending_text(&inner, &claimed, &mut pending_channel, &mut pending_text)
-                        .await
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
                 {
                     finish_run(
                         &inner,
@@ -887,18 +936,32 @@ enum RunInput {
 async fn flush_pending_text(
     inner: &SessionRuntimeInner,
     claimed: &ClaimedRun,
+    current_turn: u16,
+    current_message: &mut Option<MessageId>,
     channel: &mut Option<TextChannel>,
     text: &mut String,
 ) -> Result<(), SessionRuntimeError> {
     let Some(channel) = channel.take() else {
         return Ok(());
     };
-    persist_text(inner, claimed, channel, std::mem::take(text)).await
+    persist_text(
+        inner,
+        claimed,
+        current_turn,
+        current_message,
+        channel,
+        std::mem::take(text),
+    )
+    .await
 }
 
+/// Persists model text into the current turn's assistant message, creating
+/// that message on the turn's first chunk.
 async fn persist_text(
     inner: &SessionRuntimeInner,
     claimed: &ClaimedRun,
+    current_turn: u16,
+    current_message: &mut Option<MessageId>,
     channel: TextChannel,
     text: String,
 ) -> Result<(), SessionRuntimeError> {
@@ -908,16 +971,28 @@ async fn persist_text(
         while !remaining.is_char_boundary(end) {
             end -= 1;
         }
-        let event = inner
-            .store
-            .append_text(
-                claimed,
-                claimed.assistant_message_id,
-                channel,
-                remaining[..end].to_owned(),
-            )
-            .await?;
-        inner.notify(event.cursor);
+        let chunk = remaining[..end].to_owned();
+        match *current_message {
+            Some(message_id) => {
+                let event = inner
+                    .store
+                    .append_text(claimed, message_id, channel, chunk)
+                    .await?;
+                inner.notify(event.cursor);
+            }
+            None => {
+                let message_id =
+                    MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+                let events = inner
+                    .store
+                    .begin_assistant_message(claimed, message_id, current_turn, channel, chunk)
+                    .await?;
+                for event in events {
+                    inner.notify(event.cursor);
+                }
+                *current_message = Some(message_id);
+            }
+        }
         remaining = &remaining[end..];
     }
     Ok(())
@@ -1267,14 +1342,29 @@ impl Store {
         .await
     }
 
-    async fn start_assistant(
+    /// Creates the current turn's assistant message with its first text chunk
+    /// in one transaction, emitting `AssistantMessageStarted` then
+    /// `TextAppended`.
+    async fn begin_assistant_message(
         &self,
         claimed: &ClaimedRun,
-    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        message_id: MessageId,
+        turn_ordinal: u16,
+        channel: TextChannel,
+        text: String,
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
-            start_assistant(connection, store_id, &claimed)
+            begin_assistant_message(
+                connection,
+                store_id,
+                &claimed,
+                message_id,
+                turn_ordinal,
+                channel,
+                &text,
+            )
         })
         .await
     }
@@ -1298,12 +1388,16 @@ impl Store {
     /// requested in one transaction. A crash must never commit the turn's
     /// ToolCall blocks without their tool_calls rows: such orphans would replay
     /// as `tool_use` without `tool_result` and poison every later request.
+    /// The turn's assistant message (when the turn streamed text) is finalized
+    /// in the same transaction so no crash window can leave a committed turn
+    /// with a message still marked streaming.
     async fn persist_model_turn(
         &self,
         claimed: &ClaimedRun,
         turn_ordinal: u16,
         message: Message,
         calls: Vec<RuntimeToolCall>,
+        turn_message_id: Option<MessageId>,
     ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
@@ -1315,6 +1409,7 @@ impl Store {
                 turn_ordinal,
                 &message,
                 &calls,
+                turn_message_id,
             )
         })
         .await
@@ -1545,6 +1640,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  session_id TEXT NOT NULL REFERENCES sessions(id),
                  run_id TEXT NOT NULL REFERENCES runs(id),
                  ordinal INTEGER NOT NULL,
+                 turn_ordinal INTEGER NOT NULL DEFAULT 0,
                  role TEXT NOT NULL,
                  state TEXT NOT NULL,
                  output TEXT NOT NULL DEFAULT '',
@@ -1591,7 +1687,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_files_table(&transaction)?;
             transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '5')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '6')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1628,9 +1724,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_tool_tables(&transaction)?;
             create_grant_table(&transaction)?;
             create_session_files_table(&transaction)?;
+            add_messages_turn_ordinal_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1651,9 +1748,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_tool_tables(&transaction)?;
             create_grant_table(&transaction)?;
             create_session_files_table(&transaction)?;
+            add_messages_turn_ordinal_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1676,9 +1774,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             }
             create_grant_table(&transaction)?;
             create_session_files_table(&transaction)?;
+            add_messages_turn_ordinal_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1691,9 +1790,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .transaction()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_session_files_table(&transaction)?;
+            add_messages_turn_ordinal_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1701,7 +1801,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("5") => {}
+        Some("5") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            add_messages_turn_ordinal_column(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("6") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -1764,6 +1879,21 @@ fn create_tool_tables(connection: &Connection) -> Result<(), SessionRuntimeError
         .map_err(|_| SessionRuntimeError::Persistence)
 }
 
+/// Adds `messages.turn_ordinal` for stores created before per-turn assistant
+/// messages. Existing rows keep 0: legacy runs render as one message with the
+/// run's calls grouped after it.
+fn add_messages_turn_ordinal_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "messages", "turn_ordinal")? {
+        connection
+            .execute(
+                "ALTER TABLE messages ADD COLUMN turn_ordinal INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
 fn create_grant_table(connection: &Connection) -> Result<(), SessionRuntimeError> {
     connection
         .execute_batch(
@@ -1815,7 +1945,6 @@ struct ClaimedRun {
     session_id: SessionId,
     run_id: RunId,
     command_id: CommandId,
-    assistant_message_id: MessageId,
     model: ModelSelection,
     messages: Vec<Message>,
     started: SessionEventEnvelope,
@@ -2057,6 +2186,10 @@ fn execute_command(
             let workspace_id = parse_id(&workspace_id)?;
             let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
             let message_id = MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+            // Assistant message rows are created lazily, one per model turn,
+            // at each turn's first text delta. The run row's
+            // assistant_message_id starts as a placeholder and is updated to
+            // the current turn's message as the run advances.
             let assistant_message_id =
                 MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
             let ordinal: u64 = transaction
@@ -2078,20 +2211,6 @@ fn execute_command(
                         command_id.to_string(),
                         message_id.to_string(),
                         assistant_message_id.to_string(),
-                        now,
-                    ],
-                )
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            transaction
-                .execute(
-                    "INSERT INTO messages(
-                        id, session_id, run_id, ordinal, role, state, created_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, 'assistant', 'queued', ?5)",
-                    params![
-                        assistant_message_id.to_string(),
-                        session_id.to_string(),
-                        run_id.to_string(),
-                        ordinal + 1,
                         now,
                     ],
                 )
@@ -2439,7 +2558,6 @@ fn claim_next_run(
     let row = transaction
         .query_row(
             "SELECT r.id, r.session_id, r.command_id, r.user_message_id,
-                    r.assistant_message_id,
                     s.workspace_id, w.path, s.model, s.max_output_tokens, s.organization
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
@@ -2461,10 +2579,9 @@ fn claim_next_run(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<u32>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<u32>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
@@ -2475,7 +2592,6 @@ fn claim_next_run(
         session,
         command,
         user_message,
-        assistant_message,
         workspace,
         workspace_path,
         model,
@@ -2489,7 +2605,6 @@ fn claim_next_run(
     let session_id: SessionId = parse_id(&session)?;
     let command_id: CommandId = parse_id(&command)?;
     let user_message_id = parse_id::<MessageId>(&user_message)?;
-    let assistant_message_id = parse_id::<MessageId>(&assistant_message)?;
     let workspace_id: WorkspaceId = parse_id(&workspace)?;
     let now = now_ms();
     transaction
@@ -2546,7 +2661,6 @@ fn claim_next_run(
         session_id,
         run_id,
         command_id,
-        assistant_message_id,
         model: ModelSelection {
             model,
             max_output_tokens: max_tokens,
@@ -2557,27 +2671,58 @@ fn claim_next_run(
     }))
 }
 
-fn start_assistant(
+/// Creates the assistant message for one model turn and appends its first
+/// text chunk in a single transaction. The message row is created lazily at
+/// the turn's first delta — never at turn start — so call-only turns persist
+/// no message row at all. The run row's `assistant_message_id` is repointed
+/// here: crash recovery interrupts only the still-streaming current message.
+fn begin_assistant_message(
     connection: &mut Connection,
     store_id: StoreId,
     claimed: &ClaimedRun,
-) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    message_id: MessageId,
+    turn_ordinal: u16,
+    channel: TextChannel,
+    text: &str,
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    if text.is_empty() {
+        return Err(SessionRuntimeError::Persistence);
+    }
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    ensure_context_capacity(&transaction, claimed.session_id, text.len())?;
     let now = now_ms();
-    let updated = transaction
-        .execute(
-            "UPDATE messages SET state = 'streaming'
-             WHERE id = ?1 AND role = 'assistant' AND state = 'queued'",
-            [claimed.assistant_message_id.to_string()],
+    let ordinal: u64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM messages WHERE session_id = ?1",
+            [claimed.session_id.to_string()],
+            |row| row.get(0),
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    if updated != 1 {
-        return Err(SessionRuntimeError::Unavailable);
-    }
-    let message = load_message(&transaction, claimed.assistant_message_id)?;
-    let event = append_event(
+    transaction
+        .execute(
+            "INSERT INTO messages(
+                id, session_id, run_id, ordinal, turn_ordinal, role, state, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'assistant', 'streaming', ?6)",
+            params![
+                message_id.to_string(),
+                claimed.session_id.to_string(),
+                claimed.run_id.to_string(),
+                ordinal,
+                turn_ordinal,
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    transaction
+        .execute(
+            "UPDATE runs SET assistant_message_id = ?2 WHERE id = ?1",
+            params![claimed.run_id.to_string(), message_id.to_string()],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let message = load_message(&transaction, message_id)?;
+    let started = append_event(
         &transaction,
         EventContext {
             store_id,
@@ -2589,10 +2734,34 @@ fn start_assistant(
         },
         SessionEvent::AssistantMessageStarted { message },
     )?;
+    let column = match channel {
+        TextChannel::Output => "output",
+        TextChannel::Refusal => "refusal",
+    };
+    let sql = format!("UPDATE messages SET {column} = ?2 WHERE id = ?1");
+    transaction
+        .execute(&sql, params![message_id.to_string(), text])
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let appended = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::TextAppended {
+            message_id,
+            channel,
+            text: text.to_owned(),
+        },
+    )?;
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(event)
+    Ok(vec![started, appended])
 }
 
 fn append_text(
@@ -2652,6 +2821,7 @@ fn persist_model_turn(
     turn_ordinal: u16,
     message: &Message,
     calls: &[RuntimeToolCall],
+    turn_message_id: Option<MessageId>,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
     if message.role() != Role::Assistant {
         return Err(SessionRuntimeError::Persistence);
@@ -2670,6 +2840,22 @@ fn persist_model_turn(
         total.saturating_add(call.arguments.len())
     });
     ensure_context_capacity(&transaction, claimed.session_id, argument_bytes)?;
+    // Completing the turn's message in the same transaction as the turn row
+    // keeps message state and turn persistence atomic: after a crash, a
+    // streaming message always identifies exactly the turn that never
+    // committed, and recovery interrupts only that message.
+    if let Some(message_id) = turn_message_id {
+        let updated = transaction
+            .execute(
+                "UPDATE messages SET state = 'complete'
+                 WHERE id = ?1 AND run_id = ?2 AND state = 'streaming'",
+                params![message_id.to_string(), claimed.run_id.to_string()],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        if updated != 1 {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+    }
     transaction
         .execute(
             "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
@@ -3152,7 +3338,8 @@ fn complete_run(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     transaction
         .execute(
-            "UPDATE messages SET state = ?2 WHERE run_id = ?1 AND role = 'assistant'",
+            "UPDATE messages SET state = ?2
+             WHERE run_id = ?1 AND role = 'assistant' AND state = 'streaming'",
             params![claimed.run_id.to_string(), message_state],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3294,7 +3481,6 @@ fn recover_interrupted_runs(
             session_id,
             run_id,
             command_id: CommandId::from_bytes([0; 16]),
-            assistant_message_id: MessageId::from_bytes([0; 16]),
             model: ModelSelection::default(),
             messages: Vec::new(),
             started: SessionEventEnvelope {
@@ -3343,7 +3529,8 @@ fn complete_run_in_transaction(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     transaction
         .execute(
-            "UPDATE messages SET state = ?2 WHERE run_id = ?1 AND role = 'assistant'",
+            "UPDATE messages SET state = ?2
+             WHERE run_id = ?1 AND role = 'assistant' AND state = 'streaming'",
             params![claimed.run_id.to_string(), message_state],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3529,11 +3716,14 @@ fn load_session_snapshot(
     message_limit: u16,
 ) -> Result<SessionSnapshot, SessionRuntimeError> {
     let summary = load_session_summary(transaction, session_id)?;
+    // Messages order by run first, then by ordinal within the run, so a
+    // prompt queued while a run streams does not interleave with that run's
+    // later per-turn messages (which receive higher session ordinals).
     let mut statement = transaction
         .prepare(
-            "SELECT id FROM messages
-             WHERE session_id = ?1 AND NOT (role = 'assistant' AND state = 'queued')
-             ORDER BY ordinal DESC LIMIT ?2",
+            "SELECT m.id FROM messages m JOIN runs r ON r.id = m.run_id
+             WHERE m.session_id = ?1 AND NOT (m.role = 'assistant' AND m.state = 'queued')
+             ORDER BY r.created_at_ms DESC, r.rowid DESC, m.ordinal DESC LIMIT ?2",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let mut message_ids = statement
@@ -3754,34 +3944,38 @@ fn load_message(
 ) -> Result<MessageSnapshot, SessionRuntimeError> {
     connection
         .query_row(
-            "SELECT session_id, run_id, role, state, output, refusal, created_at_ms
+            "SELECT session_id, run_id, turn_ordinal, role, state, output, refusal, created_at_ms
              FROM messages WHERE id = ?1",
             [message_id.to_string()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, u16>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, u64>(7)?,
                 ))
             },
         )
         .map_err(|_| SessionRuntimeError::Persistence)
-        .and_then(|(session, run, role, state, output, refusal, created)| {
-            Ok(MessageSnapshot {
-                id: message_id,
-                session_id: parse_id(&session)?,
-                run_id: parse_id(&run)?,
-                role: parse_message_role(&role)?,
-                state: parse_message_state(&state)?,
-                output,
-                refusal,
-                created_at_ms: created,
-            })
-        })
+        .and_then(
+            |(session, run, turn_ordinal, role, state, output, refusal, created)| {
+                Ok(MessageSnapshot {
+                    id: message_id,
+                    session_id: parse_id(&session)?,
+                    run_id: parse_id(&run)?,
+                    turn_ordinal,
+                    role: parse_message_role(&role)?,
+                    state: parse_message_state(&state)?,
+                    output,
+                    refusal,
+                    created_at_ms: created,
+                })
+            },
+        )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3879,91 +4073,129 @@ fn load_model_context(
     for id in message_ids {
         let snapshot = load_message(transaction, parse_id(&id)?)?;
         match snapshot.role {
-            MessageRole::User => context.push(Message::user(snapshot.output)),
-            MessageRole::Assistant => {
-                let mut statement = transaction
-                    .prepare(
-                        "SELECT turn_ordinal, assistant_content_json FROM model_turns
-                         WHERE run_id = ?1 ORDER BY turn_ordinal",
+            MessageRole::User => {
+                context.push(Message::user(snapshot.output));
+                // A run's assistant output replays right after its prompt,
+                // from the model_turns rows rather than the per-turn message
+                // rows: call-only turns persist no message row, so messages
+                // alone cannot reconstruct the run. Only completed and
+                // interrupted runs replay — cancelled and failed runs are
+                // excluded, matching the previous message-state gate.
+                let status: String = transaction
+                    .query_row(
+                        "SELECT status FROM runs WHERE id = ?1",
+                        [snapshot.run_id.to_string()],
+                        |row| row.get(0),
                     )
                     .map_err(|_| SessionRuntimeError::Persistence)?;
-                let turns = statement
-                    .query_map([snapshot.run_id.to_string()], |row| {
-                        Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|_| SessionRuntimeError::Persistence)?
-                    .collect::<Result<Vec<_>, _>>()
+                if status == "completed" || status == "interrupted" {
+                    append_run_turns(transaction, snapshot.run_id, &mut context)?;
+                }
+            }
+            MessageRole::Assistant => {
+                let has_turns: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM model_turns WHERE run_id = ?1)",
+                        [snapshot.run_id.to_string()],
+                        |row| row.get(0),
+                    )
                     .map_err(|_| SessionRuntimeError::Persistence)?;
-                drop(statement);
-                if turns.is_empty() {
-                    let content = if snapshot.output.is_empty() {
-                        snapshot.refusal
-                    } else {
-                        snapshot.output
-                    };
-                    if !content.trim().is_empty() {
-                        context.push(Message::assistant(content));
-                    }
+                // Runs with persisted turns already replayed after their
+                // prompt; only legacy pre-tool-loop runs replay from the
+                // flat message text.
+                if has_turns {
                     continue;
                 }
-                for (turn_ordinal, content_json) in turns {
-                    let content: Vec<ContentBlock> =
-                        serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
-                            .map_err(|_| SessionRuntimeError::Persistence)?
-                            .into_iter()
-                            .map(ContentBlock::from)
-                            .collect();
-
-                    let mut statement = transaction
-                        .prepare(
-                            "SELECT provider_call_id, result, is_error FROM tool_calls
-                             WHERE run_id = ?1 AND turn_ordinal = ?2 AND result IS NOT NULL
-                             ORDER BY call_ordinal",
-                        )
-                        .map_err(|_| SessionRuntimeError::Persistence)?;
-                    let mut recorded = statement
-                        .query_map(params![snapshot.run_id.to_string(), turn_ordinal], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                (row.get::<_, String>(1)?, row.get::<_, bool>(2)?),
-                            ))
-                        })
-                        .map_err(|_| SessionRuntimeError::Persistence)?
-                        .collect::<Result<HashMap<String, (String, bool)>, _>>()
-                        .map_err(|_| SessionRuntimeError::Persistence)?;
-                    drop(statement);
-                    // Emit exactly one result per ToolCall block, in block order.
-                    // A block without a recorded result (a crash between the
-                    // turn commit and its tool_calls rows in an older store)
-                    // gets an explicit interrupted result so replayed context
-                    // stays provider-valid instead of poisoning the session.
-                    let results = content
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::ToolCall { id, .. } => Some(match recorded.remove(id) {
-                                Some((content, is_error)) => ContentBlock::ToolResult {
-                                    call_id: id.clone(),
-                                    content,
-                                    is_error,
-                                },
-                                None => ContentBlock::ToolResult {
-                                    call_id: id.clone(),
-                                    content: INTERRUPTED_TOOL_RESULT.to_owned(),
-                                    is_error: true,
-                                },
-                            }),
-                            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
-                        })
-                        .collect::<Vec<_>>();
-                    context.push(Message::new(Role::Assistant, content));
-                    if !results.is_empty() {
-                        context.push(Message::tool_results(results));
-                    }
+                let content = if snapshot.output.is_empty() {
+                    snapshot.refusal
+                } else {
+                    snapshot.output
+                };
+                if !content.trim().is_empty() {
+                    context.push(Message::assistant(content));
                 }
             }
         }
     }
     Ok(context)
+}
+
+/// Replays one run's persisted model turns (assistant content and tool
+/// results) into `context`, in turn order.
+fn append_run_turns(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    context: &mut Vec<Message>,
+) -> Result<(), SessionRuntimeError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT turn_ordinal, assistant_content_json FROM model_turns
+             WHERE run_id = ?1 ORDER BY turn_ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let turns = statement
+        .query_map([run_id.to_string()], |row| {
+            Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+    for (turn_ordinal, content_json) in turns {
+        let content: Vec<ContentBlock> =
+            serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .into_iter()
+                .map(ContentBlock::from)
+                .collect();
+
+        let mut statement = transaction
+            .prepare(
+                "SELECT provider_call_id, result, is_error FROM tool_calls
+                 WHERE run_id = ?1 AND turn_ordinal = ?2 AND result IS NOT NULL
+                 ORDER BY call_ordinal",
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let mut recorded = statement
+            .query_map(params![run_id.to_string(), turn_ordinal], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, String>(1)?, row.get::<_, bool>(2)?),
+                ))
+            })
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<HashMap<String, (String, bool)>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        drop(statement);
+        // Emit exactly one result per ToolCall block, in block order.
+        // A block without a recorded result (a crash between the
+        // turn commit and its tool_calls rows in an older store)
+        // gets an explicit interrupted result so replayed context
+        // stays provider-valid instead of poisoning the session.
+        let results = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall { id, .. } => Some(match recorded.remove(id) {
+                    Some((content, is_error)) => ContentBlock::ToolResult {
+                        call_id: id.clone(),
+                        content,
+                        is_error,
+                    },
+                    None => ContentBlock::ToolResult {
+                        call_id: id.clone(),
+                        content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                        is_error: true,
+                    },
+                }),
+                ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        context.push(Message::new(Role::Assistant, content));
+        if !results.is_empty() {
+            context.push(Message::tool_results(results));
+        }
+    }
+    Ok(())
 }
 
 fn load_tool_call(
@@ -4493,6 +4725,68 @@ mod tests {
         }
     }
 
+    /// Turn one streams text and then requests a tool call; turn two streams
+    /// closing text. Exercises per-turn assistant messages around calls.
+    struct TurnTextLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl RuntimeLoader for TurnTextLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                Runtime::new(TurnTextProvider { requests }, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct TurnTextProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for TurnTextProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            drop(requests);
+            if turn == 0 {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "Let me look. ".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: "call_0".to_owned(),
+                        name: "read_file".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: "call_0".to_owned(),
+                        json: r#"{"path":"note.txt"}"#.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: "call_0".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+    }
+
     impl Provider for DelayedProvider {
         fn stream(&self, request: ModelRequest) -> ProviderStream {
             self.requests.lock().unwrap().push(request);
@@ -4910,7 +5204,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "5"
+            "6"
         );
         assert!(
             !connection
@@ -4937,6 +5231,102 @@ mod tests {
         );
         assert!(has_column(&connection, "session_grants", "value").unwrap());
         assert!(has_column(&connection, "session_files", "content_hash").unwrap());
+        assert!(has_column(&connection, "messages", "turn_ordinal").unwrap());
+    }
+
+    #[test]
+    fn version_five_migration_defaults_existing_messages_to_turn_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        {
+            // A version-5 store whose messages table predates turn_ordinal,
+            // holding one completed legacy run.
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version', '5');
+                     CREATE TABLE workspaces (
+                         id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                         next_sequence INTEGER NOT NULL DEFAULT 0
+                     );
+                     INSERT INTO workspaces VALUES ('workspace', '/workspace', 0);
+                     CREATE TABLE sessions (
+                         id TEXT PRIMARY KEY,
+                         workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                         parent_id TEXT REFERENCES sessions(id),
+                         title TEXT NOT NULL, status TEXT NOT NULL, active_run_id TEXT,
+                         queued_prompts INTEGER NOT NULL DEFAULT 0, model TEXT,
+                         max_output_tokens INTEGER, organization TEXT,
+                         approval_mode TEXT NOT NULL DEFAULT 'ask',
+                         estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                         cost_known INTEGER NOT NULL DEFAULT 1,
+                         created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+                     );
+                     INSERT INTO sessions VALUES (
+                         'session', 'workspace', NULL, 'Old', 'idle', NULL, 0,
+                         'openai/gpt-test', 100, NULL, 'ask', 0, 1, 1, 1
+                     );
+                     CREATE TABLE runs (
+                         id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                         command_id TEXT NOT NULL UNIQUE, user_message_id TEXT NOT NULL,
+                         assistant_message_id TEXT NOT NULL, status TEXT NOT NULL,
+                         cancel_requested INTEGER NOT NULL DEFAULT 0, outcome_json TEXT,
+                         usage_json TEXT, estimated_cost_usd_nanos INTEGER,
+                         created_at_ms INTEGER NOT NULL, started_at_ms INTEGER,
+                         finished_at_ms INTEGER
+                     );
+                     INSERT INTO runs VALUES (
+                         'run', 'session', 'command', 'user-message', 'assistant-message',
+                         'completed', 0, NULL, NULL, NULL, 1, 1, 2
+                     );
+                     CREATE TABLE messages (
+                         id TEXT PRIMARY KEY,
+                         session_id TEXT NOT NULL REFERENCES sessions(id),
+                         run_id TEXT NOT NULL REFERENCES runs(id),
+                         ordinal INTEGER NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL,
+                         output TEXT NOT NULL DEFAULT '', refusal TEXT NOT NULL DEFAULT '',
+                         created_at_ms INTEGER NOT NULL,
+                         UNIQUE(session_id, ordinal)
+                     );
+                     INSERT INTO messages VALUES (
+                         'user-message', 'session', 'run', 1, 'user', 'complete', 'hi', '', 1
+                     );
+                     INSERT INTO messages VALUES (
+                         'assistant-message', 'session', 'run', 2, 'assistant', 'complete',
+                         'hello', '', 1
+                     );",
+                )
+                .unwrap();
+        }
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "6"
+        );
+        let (turn_ordinal, output, state) = connection
+            .query_row(
+                "SELECT turn_ordinal, output, state FROM messages WHERE id = 'assistant-message'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u16>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(turn_ordinal, 0);
+        assert_eq!(output, "hello");
+        assert_eq!(state, "complete");
     }
 
     #[test]
@@ -5335,6 +5725,301 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_turn_runs_emit_one_assistant_message_per_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "noted\n").unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(TurnTextLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "inspect the note".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let observed = collect_through_finished(&mut events).await;
+        let started = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::AssistantMessageStarted { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 2, "one assistant message per model turn");
+        assert_eq!(started[0].turn_ordinal, 1);
+        assert_eq!(started[1].turn_ordinal, 2);
+        assert_ne!(started[0].id, started[1].id);
+        // The second turn's message starts only after the first turn's tool
+        // call finished: text and calls replay in true execution order.
+        let first_started = observed
+            .iter()
+            .position(|event| {
+                matches!(&event.event, SessionEvent::AssistantMessageStarted { message }
+                    if message.id == started[0].id)
+            })
+            .unwrap();
+        let call_requested = observed
+            .iter()
+            .position(|event| matches!(event.event, SessionEvent::ToolCallRequested { .. }))
+            .unwrap();
+        let call_finished = observed
+            .iter()
+            .position(|event| matches!(event.event, SessionEvent::ToolCallFinished { .. }))
+            .unwrap();
+        let second_started = observed
+            .iter()
+            .position(|event| {
+                matches!(&event.event, SessionEvent::AssistantMessageStarted { message }
+                    if message.id == started[1].id)
+            })
+            .unwrap();
+        assert!(first_started < call_requested);
+        assert!(call_requested < call_finished);
+        assert!(call_finished < second_started);
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.messages.len(), 3);
+        assert_eq!(focused.messages[0].role, MessageRole::User);
+        assert_eq!(focused.messages[0].turn_ordinal, 0);
+        assert_eq!(focused.messages[1].role, MessageRole::Assistant);
+        assert_eq!(focused.messages[1].turn_ordinal, 1);
+        assert_eq!(focused.messages[1].output, "Let me look. ");
+        assert_eq!(focused.messages[1].state, MessageState::Complete);
+        assert_eq!(focused.messages[2].turn_ordinal, 2);
+        assert_eq!(focused.messages[2].output, "done");
+        assert_eq!(focused.messages[2].state, MessageState::Complete);
+        assert_eq!(focused.tool_calls.len(), 1);
+        assert_eq!(focused.tool_calls[0].turn_ordinal, 1);
+    }
+
+    #[tokio::test]
+    async fn call_only_turns_persist_no_message_row() {
+        let harness = scripted_runs_harness(
+            ApprovalMode::Auto,
+            vec![vec![("read_file", r#"{"path":"note.txt"}"#.to_owned())]],
+        )
+        .await;
+        std::fs::write(harness.workspace_path.join("note.txt"), "noted\n").unwrap();
+        let mut harness = harness;
+        submit_prompt(&harness, "read the note").await;
+        let observed = collect_through_finished(&mut harness.events).await;
+        let started = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::AssistantMessageStarted { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started.len(),
+            1,
+            "a call-only turn must not start an assistant message"
+        );
+        assert_eq!(started[0].turn_ordinal, 2);
+
+        let (workspace_id, _) = resolve_workspace(&harness.runtime, &harness.workspace_path).await;
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(
+            focused.messages.len(),
+            2,
+            "turn one requested a call without text, so it persists no message row"
+        );
+        assert_eq!(focused.messages[0].role, MessageRole::User);
+        assert_eq!(focused.messages[1].role, MessageRole::Assistant);
+        assert_eq!(focused.messages[1].turn_ordinal, 2);
+        assert_eq!(focused.messages[1].output, "done");
+        assert_eq!(focused.tool_calls[0].turn_ordinal, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_interrupts_only_the_current_turns_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "read".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        // Turn one: streamed text, then a completed tool call; the turn
+        // committed, finalizing its message.
+        let first_message = MessageId::generate().unwrap();
+        store
+            .begin_assistant_message(
+                &claimed,
+                first_message,
+                1,
+                TextChannel::Output,
+                "Checking. ".to_owned(),
+            )
+            .await
+            .unwrap();
+        let tool_call_id = ToolCallId::generate().unwrap();
+        let call = RuntimeToolCall {
+            id: tool_call_id,
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_0".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            argument_error: None,
+        };
+        store
+            .persist_model_turn(
+                &claimed,
+                1,
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Text {
+                            text: "Checking. ".to_owned(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: call.provider_call_id.clone(),
+                            name: call.name.clone(),
+                            arguments: serde_json::from_str(&call.arguments).unwrap(),
+                        },
+                    ],
+                ),
+                vec![call],
+                Some(first_message),
+            )
+            .await
+            .unwrap();
+        store.start_tool_call(&claimed, tool_call_id).await.unwrap();
+        store
+            .finish_tool_call(&claimed, tool_call_id, "noted\n".to_owned(), false, None)
+            .await
+            .unwrap();
+        // Turn two starts streaming, then the server crashes.
+        let second_message = MessageId::generate().unwrap();
+        store
+            .begin_assistant_message(
+                &claimed,
+                second_message,
+                2,
+                TextChannel::Output,
+                "So far".to_owned(),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(ScriptedLoader),
+        )
+        .await
+        .unwrap();
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.messages.len(), 3);
+        let first = focused
+            .messages
+            .iter()
+            .find(|message| message.id == first_message)
+            .unwrap();
+        let second = focused
+            .messages
+            .iter()
+            .find(|message| message.id == second_message)
+            .unwrap();
+        assert_eq!(
+            first.state,
+            MessageState::Complete,
+            "the committed turn's message must survive recovery untouched"
+        );
+        assert_eq!(second.state, MessageState::Interrupted);
+        assert_eq!(focused.runs[0].outcome, Some(RunOutcome::Interrupted));
+    }
+
+    #[tokio::test]
     async fn recovery_interrupts_running_tools_without_reexecuting_them() {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("sessions.sqlite3");
@@ -5406,6 +6091,7 @@ mod tests {
                     }],
                 ),
                 vec![call],
+                None,
             )
             .await
             .unwrap();
@@ -5542,6 +6228,7 @@ mod tests {
                     }],
                 ),
                 Vec::new(),
+                None,
             )
             .await
             .unwrap();
@@ -6783,6 +7470,7 @@ mod tests {
                     }],
                 ),
                 vec![call],
+                None,
             )
             .await
             .unwrap();
