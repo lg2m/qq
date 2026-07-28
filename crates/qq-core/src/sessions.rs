@@ -577,6 +577,11 @@ async fn execute_run(
     // streaming; text deltas always belong to it.
     let mut current_turn: u16 = 1;
     let mut current_message: Option<MessageId> = None;
+    // Live tool output batches on the same timer as model text. Text and tool
+    // output never accumulate at the same time: a turn's text is fully
+    // flushed when the turn completes, before any of its calls execute.
+    let mut pending_tool_call: Option<ToolCallId> = None;
+    let mut pending_tool_output = String::new();
     loop {
         let input = if let Some(deadline) = flush_at {
             tokio::select! {
@@ -624,6 +629,22 @@ async fn execute_run(
                     .await;
                     return;
                 }
+                if let Err(error) = flush_pending_tool_output(
+                    &inner,
+                    &claimed,
+                    &mut pending_tool_call,
+                    &mut pending_tool_output,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist tool output", &error),
+                    )
+                    .await;
+                    return;
+                }
                 flush_at = None;
             }
             stopped @ (RunInput::Cancelled | RunInput::Interrupted) => {
@@ -646,6 +667,8 @@ async fn execute_run(
                     .await;
                     return;
                 }
+                // Buffered live tool output is dropped rather than flushed:
+                // the interrupted call's terminal result replaces it.
                 let outcome = if matches!(stopped, RunInput::Cancelled) {
                     RunOutcome::Cancelled
                 } else {
@@ -729,12 +752,78 @@ async fn execute_run(
                     }
                 }
             }
+            RunInput::Event(Some(RuntimeEvent::ToolCallOutputDelta { id, chunk })) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                if pending_tool_call.is_some_and(|pending| pending != id)
+                    && let Err(error) = flush_pending_tool_output(
+                        &inner,
+                        &claimed,
+                        &mut pending_tool_call,
+                        &mut pending_tool_output,
+                    )
+                    .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist tool output", &error),
+                    )
+                    .await;
+                    return;
+                }
+                if pending_tool_output.is_empty() {
+                    pending_tool_call = Some(id);
+                    if flush_at.is_none() {
+                        flush_at = Some(tokio::time::Instant::now() + OUTPUT_BATCH_DELAY);
+                    }
+                }
+                pending_tool_output.push_str(&chunk);
+                if pending_tool_output.len() >= OUTPUT_BATCH_BYTES {
+                    if let Err(error) = flush_pending_tool_output(
+                        &inner,
+                        &claimed,
+                        &mut pending_tool_call,
+                        &mut pending_tool_output,
+                    )
+                    .await
+                    {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist tool output", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                    flush_at = None;
+                }
+            }
             RunInput::Event(Some(RuntimeEvent::ToolCallFinished {
                 id,
                 result,
                 is_error,
                 file_state,
             })) => {
+                // Any buffered live output flushes first so replay preserves
+                // the chunk-then-result order.
+                if let Err(error) = flush_pending_tool_output(
+                    &inner,
+                    &claimed,
+                    &mut pending_tool_call,
+                    &mut pending_tool_output,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist tool output", &error),
+                    )
+                    .await;
+                    return;
+                }
                 match inner
                     .store
                     .finish_tool_call(&claimed, id, result, is_error, file_state)
@@ -953,6 +1042,29 @@ async fn flush_pending_text(
         std::mem::take(text),
     )
     .await
+}
+
+/// Publishes any buffered live tool output as one batched
+/// `ToolCallOutputDelta` event.
+async fn flush_pending_tool_output(
+    inner: &SessionRuntimeInner,
+    claimed: &ClaimedRun,
+    pending_call: &mut Option<ToolCallId>,
+    pending_output: &mut String,
+) -> Result<(), SessionRuntimeError> {
+    let Some(tool_call_id) = pending_call.take() else {
+        return Ok(());
+    };
+    let chunk = std::mem::take(pending_output);
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let event = inner
+        .store
+        .append_tool_output(claimed, tool_call_id, chunk)
+        .await?;
+    inner.notify(event.cursor);
+    Ok(())
 }
 
 /// Persists model text into the current turn's assistant message, creating
@@ -1424,6 +1536,23 @@ impl Store {
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
             start_tool_call(connection, store_id, &claimed, tool_call_id)
+        })
+        .await
+    }
+
+    /// Publishes one batched chunk of live tool output. Chunks are
+    /// display/replay events only: they never touch the tool_call row, whose
+    /// bounded result is persisted by `finish_tool_call`.
+    async fn append_tool_output(
+        &self,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+        chunk: String,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            append_tool_call_output(connection, store_id, &claimed, tool_call_id, chunk)
         })
         .await
     }
@@ -2936,6 +3065,51 @@ fn start_tool_call(
             occurred_at_ms: now,
         },
         SessionEvent::ToolCallStarted { tool_call },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+/// Appends a `ToolCallOutputDelta` event for a running call. The chunk lives
+/// only in the event log (batched like text deltas so long builds render
+/// live); the call's bounded result remains the single durable output.
+fn append_tool_call_output(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    tool_call_id: ToolCallId,
+    chunk: String,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let running = transaction
+        .query_row(
+            "SELECT 1 FROM tool_calls WHERE id = ?1 AND run_id = ?2 AND state = 'running'",
+            params![tool_call_id.to_string(), claimed.run_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if running.is_none() {
+        return Err(SessionRuntimeError::ToolCallNotFound);
+    }
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now_ms(),
+        },
+        SessionEvent::ToolCallOutputDelta {
+            tool_call_id,
+            chunk,
+        },
     )?;
     transaction
         .commit()
@@ -7212,6 +7386,219 @@ mod tests {
             SessionEvent::ToolCallFinished { tool_call }
                 if tool_call.state == ToolCallState::Completed
         )));
+    }
+
+    /// Like `collect_through_finished`, with a deadline generous enough for
+    /// tests that spawn real child processes.
+    #[cfg(unix)]
+    async fn collect_through_finished_generously(
+        events: &mut SessionEventStream,
+    ) -> Vec<SessionEventEnvelope> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut observed = Vec::new();
+            while let Some(event) = events.next().await {
+                let event = event.unwrap();
+                let finished = matches!(event.event, SessionEvent::RunFinished { .. });
+                observed.push(event);
+                if finished {
+                    break;
+                }
+            }
+            observed
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_shell_calls_execute_stream_output_and_share_prefix_grants() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "shell",
+            r#"{"command":"echo approved-output"}"#,
+            2,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (observed, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        assert_eq!(tool_call.state, ToolCallState::AwaitingApproval);
+        let shell = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::ToolApprovalRequested { shell, .. } => shell.clone(),
+                _ => None,
+            })
+            .expect("shell approval requests carry the command preview");
+        assert_eq!(shell.command, "echo approved-output");
+        assert_eq!(shell.cwd, None);
+
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForSession {
+                grant: ApprovalGrant::ShellPrefix {
+                    prefix: "echo".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let observed = collect_through_finished_generously(&mut harness.events).await;
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. })),
+            "the echo prefix grant must cover the second call"
+        );
+        let completed = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::ToolCallFinished { tool_call }
+                    if tool_call.state == ToolCallState::Completed =>
+                {
+                    Some(tool_call.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 2);
+        for tool_call in &completed {
+            let result = tool_call.result.as_deref().unwrap();
+            assert!(result.contains("approved-output"), "{result}");
+            assert!(result.ends_with("exit code: 0"), "{result}");
+        }
+        // Live output was published, and before the call's terminal event.
+        let first_delta = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::ToolCallOutputDelta { tool_call_id, chunk }
+                        if *tool_call_id == completed[0].id && chunk.contains("approved-output")
+                )
+            })
+            .expect("shell output must stream as ToolCallOutputDelta events");
+        let finished = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::ToolCallFinished { tool_call } if tool_call.id == completed[0].id
+                )
+            })
+            .unwrap();
+        assert!(first_delta < finished);
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_sessions_deny_shell_without_prompting() {
+        let mut harness = approval_harness(
+            ApprovalMode::ReadOnly,
+            "shell",
+            r#"{"command":"echo blocked"}"#,
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. }))
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolCallOutputDelta { .. })),
+            "a denied command must never produce output"
+        );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.state == ToolCallState::Denied
+                    && tool_call.result.as_deref() == Some(approval::POLICY_DENIED_RESULT)
+        )));
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_run_interrupts_the_running_shell_call() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "shell",
+            r#"{"command":"echo running; sleep 30"}"#,
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveOnce,
+        )
+        .await
+        .unwrap();
+
+        // The first live chunk proves the command is running before the run
+        // is cancelled; no sleeps are used to sequence the race.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = harness.events.next().await.unwrap().unwrap();
+                if matches!(
+                    &event.event,
+                    SessionEvent::ToolCallOutputDelta { chunk, .. } if chunk.contains("running")
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the approved shell call must stream its first chunk");
+
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun {
+                    run_id: harness.run_id,
+                },
+            )
+            .await
+            .unwrap();
+        let observed = collect_through_finished_generously(&mut harness.events).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call: finished }
+                if finished.id == tool_call.id
+                    && finished.state == ToolCallState::Interrupted
+                    && finished.result.as_deref() == Some(INTERRUPTED_TOOL_RESULT)
+        )));
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Cancelled,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

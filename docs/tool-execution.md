@@ -1,7 +1,7 @@
 # QQ Tool Execution And Security Design
 
-Status: steps 1–3 of the sequencing are implemented (step 3b landing);
-steps 4 onward are direction.
+Status: steps 1–4 of the sequencing are implemented;
+step 5 onward is direction.
 
 ## Purpose
 
@@ -351,7 +351,7 @@ shell, the server, tool, and arguments for MCP.
      testable end-to-end while a wrong decision can cost nothing.
    - 3b — `edit_file`/`write_file` with read-before-write tracking,
      content-hash CAS, and atomic rename.
-4. `shell` with bounds, streaming output, and the command allowlist.
+4. `shell` with bounds, streaming output, and the command allowlist. Done.
 5. MCP client, configuration, and namespaced tool integration.
 
 Two client-adjacent pieces ride alongside rather than in sequence: `@`

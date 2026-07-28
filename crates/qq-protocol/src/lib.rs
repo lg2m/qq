@@ -20,7 +20,7 @@ pub use sessions::{
     TokenUsage, ToolCallSnapshot, ToolCallState, WorkspaceSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

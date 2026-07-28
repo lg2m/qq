@@ -557,6 +557,10 @@ impl App {
                 }
                 self.upsert_tool_call(tool_call.clone());
             }
+            // Live shell output chunks are display-only; rendering them in
+            // the transcript is follow-up TUI work, and the call's bounded
+            // result arrives on ToolCallFinished regardless.
+            SessionEvent::ToolCallOutputDelta { .. } => {}
             SessionEvent::ToolCallRequested { tool_call }
             | SessionEvent::ToolApprovalResolved { tool_call, .. }
             | SessionEvent::ToolCallStarted { tool_call }

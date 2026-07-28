@@ -507,6 +507,13 @@ pub enum SessionEvent {
     ToolCallStarted {
         tool_call: ToolCallSnapshot,
     },
+    /// A chunk of live tool output (streamed shell output), batched like text
+    /// deltas. Chunks are display-only: the authoritative bounded result
+    /// arrives on the `ToolCallFinished` snapshot.
+    ToolCallOutputDelta {
+        tool_call_id: ToolCallId,
+        chunk: String,
+    },
     ToolCallFinished {
         tool_call: ToolCallSnapshot,
     },
@@ -612,6 +619,22 @@ mod tests {
         assert_eq!(encoded["type"], "tool_call_finished");
         assert_eq!(encoded["tool_call"]["state"], "completed");
         assert_eq!(encoded["tool_call"]["name"], "read_file");
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn tool_output_deltas_have_a_stable_tagged_wire_shape() {
+        let event = SessionEvent::ToolCallOutputDelta {
+            tool_call_id: id(7),
+            chunk: "Compiling qq-core v0.1.0\n".to_owned(),
+        };
+
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "tool_call_output_delta");
+        assert_eq!(encoded["chunk"], "Compiling qq-core v0.1.0\n");
         assert_eq!(
             serde_json::from_value::<SessionEvent>(encoded).unwrap(),
             event

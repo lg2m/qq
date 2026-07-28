@@ -15,7 +15,10 @@ use cap_std::fs::Dir;
 use qq_provider::ToolSpec;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Semaphore;
+use tokio::{
+    io::AsyncReadExt,
+    sync::{Semaphore, mpsc},
+};
 
 pub(crate) const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -31,6 +34,15 @@ const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_FILES: usize = 10_000;
 const MAX_SEARCH_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BLOCKING_TOOL_TASKS: usize = 8;
+/// Combined stdout+stderr retained for one shell call: the first half of this
+/// budget is kept from the head of the output and the second half from the
+/// tail, with an explicit omission marker between them.
+const MAX_SHELL_OUTPUT_BYTES: usize = 128 * 1024;
+const SHELL_READ_CHUNK_BYTES: usize = 8 * 1024;
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
+const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
+/// How often a running shell command re-checks the cancellation flag.
+const SHELL_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const TRUNCATION_MARKER: &str = "\n...[truncated by qq]\n";
 static BLOCKING_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 /// One apply lock per canonical workspace path, shared by every session in
@@ -196,6 +208,7 @@ enum BuiltInTool {
     Search,
     EditFile,
     WriteFile,
+    Shell,
     #[cfg(test)]
     TestDelay,
     #[cfg(test)]
@@ -205,12 +218,13 @@ enum BuiltInTool {
 }
 
 impl BuiltInTool {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::ReadFile,
         Self::ListDir,
         Self::Search,
         Self::EditFile,
         Self::WriteFile,
+        Self::Shell,
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -220,6 +234,7 @@ impl BuiltInTool {
             "search" => Some(Self::Search),
             "edit_file" => Some(Self::EditFile),
             "write_file" => Some(Self::WriteFile),
+            "shell" => Some(Self::Shell),
             #[cfg(test)]
             "__test_delay" => Some(Self::TestDelay),
             #[cfg(test)]
@@ -300,6 +315,27 @@ impl BuiltInTool {
                     "additionalProperties": false
                 }),
             ),
+            Self::Shell => ToolSpec::new(
+                "shell",
+                "Run one shell command in the workspace via `sh -c`, capturing combined stdout and stderr. The command runs with a timeout (120 s by default) and its whole process group is killed when the timeout expires or the run is cancelled.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "minLength": 1 },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Working directory relative to the workspace root; defaults to the root."
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_SHELL_TIMEOUT_SECS
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            ),
             #[cfg(test)]
             Self::TestDelay | Self::TestMutate | Self::TestShell => {
                 unreachable!("test tools are not advertised")
@@ -326,9 +362,23 @@ pub(crate) async fn execute(
     name: String,
     arguments: String,
     cancelled: Arc<AtomicBool>,
+    output: Option<mpsc::UnboundedSender<String>>,
 ) -> ToolExecutionResult {
     if arguments.len() > MAX_ARGUMENT_BYTES {
         return ToolExecutionResult::error("tool arguments exceed the 64 KiB limit");
+    }
+    // Shell executes on the async runtime directly: it awaits a child process
+    // rather than doing blocking filesystem work, so it must neither occupy a
+    // blocking permit for its full (possibly 120 s) lifetime nor block a
+    // worker thread.
+    if matches!(BuiltInTool::from_name(&name), Some(BuiltInTool::Shell)) {
+        let arguments = match serde_json::from_str::<ShellArgs>(&arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return ToolExecutionResult::error(format!("invalid arguments: {error}"));
+            }
+        };
+        return run_shell(&workspace, &arguments, &cancelled, output.as_ref()).await;
     }
     let permit = match blocking_permits().acquire_owned().await {
         Ok(permit) => permit,
@@ -413,6 +463,16 @@ struct EditFileArgs {
 struct WriteFileArgs {
     path: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellArgs {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 #[cfg(test)]
@@ -509,6 +569,11 @@ fn execute_blocking(
                 }
             };
             write_file(workspace, file_state, &arguments)
+        }
+        // Shell is dispatched on the async runtime before the blocking
+        // executor is involved; reaching it here is an internal error.
+        Some(BuiltInTool::Shell) => {
+            ToolExecutionResult::error("shell commands must execute asynchronously")
         }
         #[cfg(test)]
         Some(BuiltInTool::TestDelay) => {
@@ -1214,6 +1279,324 @@ fn search(
     ToolExecutionResult::success(output)
 }
 
+/// The fate of one supervised shell command.
+enum ShellOutcome {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Cancelled,
+}
+
+/// Executes one bounded shell command on the async runtime: `sh -c` in its own
+/// process group with the workspace (or a contained subdirectory) as its
+/// working directory, combined stdout+stderr captured head+tail within the
+/// output budget, live chunks forwarded to `output`, and the whole process
+/// group killed on timeout, cancellation, or drop of the in-flight future.
+async fn run_shell(
+    workspace: &Workspace,
+    arguments: &ShellArgs,
+    cancelled: &AtomicBool,
+    output: Option<&mpsc::UnboundedSender<String>>,
+) -> ToolExecutionResult {
+    if cancelled.load(Ordering::Acquire) {
+        return ToolExecutionResult::error("tool execution was cancelled");
+    }
+    if arguments.command.trim().is_empty() {
+        return ToolExecutionResult::error("command must not be empty");
+    }
+    let timeout_seconds = arguments
+        .timeout_seconds
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS);
+    if timeout_seconds == 0 || timeout_seconds > MAX_SHELL_TIMEOUT_SECS {
+        return ToolExecutionResult::error(format!(
+            "timeout_seconds must be between 1 and {MAX_SHELL_TIMEOUT_SECS}"
+        ));
+    }
+    let cwd = match &arguments.cwd {
+        None => workspace.path().to_owned(),
+        Some(requested) => {
+            let relative = match contained_path(workspace, requested) {
+                Ok(relative) => relative,
+                Err(error) => return ToolExecutionResult::error(error),
+            };
+            if !workspace.root.is_dir(&relative) {
+                return ToolExecutionResult::error("cwd is not a directory");
+            }
+            workspace.path().join(relative)
+        }
+    };
+
+    let mut command = shell_command(&arguments.command);
+    command
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("could not start the command: {error}"));
+        }
+    };
+    // The child leads its own process group (pgid == pid); the guard kills the
+    // entire group on every abnormal exit path — timeout, cancellation, and
+    // this future being dropped mid-flight — so no descendant is orphaned.
+    let mut guard = ProcessGroupGuard::new(child.id());
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+    let mut capture = BoundedCapture::new(MAX_SHELL_OUTPUT_BYTES);
+    let mut streamed = 0_usize;
+    let mut stdout_buffer = vec![0_u8; SHELL_READ_CHUNK_BYTES];
+    let mut stderr_buffer = vec![0_u8; SHELL_READ_CHUNK_BYTES];
+    let mut cancel_poll = tokio::time::interval(SHELL_CANCEL_POLL);
+    cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            read = read_from(&mut stdout, &mut stdout_buffer), if stdout.is_some() => {
+                match read {
+                    Ok(0) | Err(_) => stdout = None,
+                    Ok(read) => {
+                        forward_shell_chunk(output, &mut streamed, &stdout_buffer[..read]);
+                        capture.push(&stdout_buffer[..read]);
+                    }
+                }
+            }
+            read = read_from(&mut stderr, &mut stderr_buffer), if stderr.is_some() => {
+                match read {
+                    Ok(0) | Err(_) => stderr = None,
+                    Ok(read) => {
+                        forward_shell_chunk(output, &mut streamed, &stderr_buffer[..read]);
+                        capture.push(&stderr_buffer[..read]);
+                    }
+                }
+            }
+            // The command is done only when both pipes reached end-of-file and
+            // the child was reaped; a grandchild that inherited a pipe keeps
+            // the call running (until the timeout) so its output is captured.
+            status = child.wait(), if stdout.is_none() && stderr.is_none() => {
+                // The child is reaped, so its pid (the group id) may be
+                // recycled: killing the group now could hit an innocent
+                // process. Surviving descendants closed their pipes, which is
+                // as detached as the timeout policy requires.
+                guard.disarm();
+                break ShellOutcome::Exited(status);
+            }
+            () = tokio::time::sleep_until(deadline) => break ShellOutcome::TimedOut,
+            _ = cancel_poll.tick() => {
+                if cancelled.load(Ordering::Acquire) {
+                    break ShellOutcome::Cancelled;
+                }
+            }
+        }
+    };
+
+    match outcome {
+        ShellOutcome::Exited(Ok(status)) => shell_result(capture, status),
+        ShellOutcome::Exited(Err(error)) => {
+            ToolExecutionResult::error(format!("could not observe the command exit: {error}"))
+        }
+        ShellOutcome::TimedOut => {
+            guard.kill();
+            // SIGKILL cannot be caught, so the reap completes promptly.
+            let _ = child.wait().await;
+            let mut content = capture.into_output();
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&format!(
+                "command timed out after {timeout_seconds} s; its process group was killed"
+            ));
+            ToolExecutionResult::error(content)
+        }
+        ShellOutcome::Cancelled => {
+            guard.kill();
+            let _ = child.wait().await;
+            ToolExecutionResult::error("tool execution was cancelled")
+        }
+    }
+}
+
+#[cfg(unix)]
+fn shell_command(command: &str) -> tokio::process::Command {
+    let mut shell = tokio::process::Command::new("/bin/sh");
+    shell.arg("-c").arg(command);
+    shell
+}
+
+#[cfg(not(unix))]
+fn shell_command(command: &str) -> tokio::process::Command {
+    let mut shell = tokio::process::Command::new("cmd");
+    shell.arg("/C").arg(command);
+    shell
+}
+
+/// Reads from a pipe that may already be closed; a closed side never resolves,
+/// letting `select!` disable it without re-arming.
+async fn read_from<R>(reader: &mut Option<R>, buffer: &mut [u8]) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match reader.as_mut() {
+        Some(reader) => reader.read(buffer).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Forwards one raw output chunk as a lossy UTF-8 delta, bounded by the same
+/// budget as the captured result so a runaway command cannot flood clients.
+fn forward_shell_chunk(
+    output: Option<&mpsc::UnboundedSender<String>>,
+    streamed: &mut usize,
+    bytes: &[u8],
+) {
+    let Some(sender) = output else {
+        return;
+    };
+    if *streamed >= MAX_SHELL_OUTPUT_BYTES {
+        return;
+    }
+    *streamed += bytes.len();
+    let _ = sender.send(String::from_utf8_lossy(bytes).into_owned());
+}
+
+fn shell_result(capture: BoundedCapture, status: std::process::ExitStatus) -> ToolExecutionResult {
+    let mut content = capture.into_output();
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    match status.code() {
+        Some(0) => {
+            content.push_str("exit code: 0");
+            ToolExecutionResult::success(content)
+        }
+        Some(code) => {
+            content.push_str(&format!("exit code: {code}"));
+            ToolExecutionResult::error(content)
+        }
+        None => {
+            #[cfg(unix)]
+            let detail = {
+                use std::os::unix::process::ExitStatusExt;
+                status
+                    .signal()
+                    .map(|signal| format!("command was terminated by signal {signal}"))
+            };
+            #[cfg(not(unix))]
+            let detail: Option<String> = None;
+            content.push_str(
+                &detail.unwrap_or_else(|| "command was terminated without an exit code".to_owned()),
+            );
+            ToolExecutionResult::error(content)
+        }
+    }
+}
+
+/// Kills a spawned command's whole process group when dropped, unless
+/// disarmed after a normal exit. Kill-on-drop is what guarantees run
+/// cancellation leaves no orphaned children even though cancellation drops
+/// the in-flight execution future without polling it further.
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: Option<rustix::process::Pid>,
+}
+
+impl ProcessGroupGuard {
+    fn new(child_id: Option<u32>) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pgid: child_id
+                    .and_then(|id| i32::try_from(id).ok())
+                    .and_then(rustix::process::Pid::from_raw),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child_id;
+            Self {}
+        }
+    }
+
+    /// Forgets the group after a normal exit; the reaped leader's pid may be
+    /// recycled, so killing the group then would be unsound.
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pgid = None;
+        }
+    }
+
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.take() {
+            let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Bounded head+tail capture of combined command output: the first half of
+/// the budget keeps the start of the output, the second half keeps a rolling
+/// window of its end, and everything between is counted as omitted.
+struct BoundedCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+    half: usize,
+}
+
+impl BoundedCapture {
+    fn new(budget: usize) -> Self {
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            total: 0,
+            half: budget / 2,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        let head_room = self.half.saturating_sub(self.head.len());
+        let take = head_room.min(bytes.len());
+        self.head.extend_from_slice(&bytes[..take]);
+        let rest = &bytes[take..];
+        if rest.is_empty() {
+            return;
+        }
+        self.tail.extend(rest.iter().copied());
+        if self.tail.len() > self.half {
+            let excess = self.tail.len() - self.half;
+            self.tail.drain(..excess);
+        }
+    }
+
+    fn into_output(self) -> String {
+        let omitted = self.total - self.head.len() as u64 - self.tail.len() as u64;
+        let tail = self.tail.into_iter().collect::<Vec<_>>();
+        if omitted == 0 {
+            let mut bytes = self.head;
+            bytes.extend_from_slice(&tail);
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+        format!(
+            "{}\n...[truncated by qq: {omitted} bytes omitted]...\n{}",
+            String::from_utf8_lossy(&self.head),
+            String::from_utf8_lossy(&tail),
+        )
+    }
+}
+
 fn contained_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, String> {
     if requested.is_empty() {
         return Err("path must not be empty".to_owned());
@@ -1820,6 +2203,275 @@ mod tests {
             r#"{"path":"missing/NOTES.md","content":"first\n"}"#,
         );
         assert!(missing_parent.is_error);
+    }
+
+    #[cfg(unix)]
+    async fn run_shell_tool(
+        workspace: Workspace,
+        arguments: &'static str,
+        cancelled: Arc<AtomicBool>,
+        output: Option<mpsc::UnboundedSender<String>>,
+    ) -> ToolExecutionResult {
+        execute(
+            workspace,
+            Arc::new(FileState::default()),
+            "shell".to_owned(),
+            arguments.to_owned(),
+            cancelled,
+            output,
+        )
+        .await
+    }
+
+    /// Polls until the process is gone, failing the test after a generous
+    /// deadline instead of asserting on a single sleep.
+    #[cfg(unix)]
+    async fn assert_process_exits(pid: u32) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let alive = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok());
+            if !alive {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "process {pid} is still alive after the kill deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn parse_marked_pid(content: &str) -> u32 {
+        let start = content.find("pid:").expect("output must mark the pid") + "pid:".len();
+        content[start..]
+            .split_whitespace()
+            .next()
+            .and_then(|pid| pid.parse().ok())
+            .expect("the marked pid must be numeric")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_runs_commands_streams_output_and_reports_the_exit_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let result = run_shell_tool(
+            workspace.clone(),
+            r#"{"command":"echo out; echo err 1>&2"}"#,
+            Arc::new(AtomicBool::new(false)),
+            Some(sender),
+        )
+        .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(result.content.contains("out\n"), "{}", result.content);
+        assert!(result.content.contains("err\n"), "{}", result.content);
+        assert!(
+            result.content.ends_with("exit code: 0"),
+            "{}",
+            result.content
+        );
+        let mut streamed = String::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            streamed.push_str(&chunk);
+        }
+        assert!(streamed.contains("out"), "streamed: {streamed}");
+        assert!(streamed.contains("err"), "streamed: {streamed}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_nonzero_exits_are_tool_errors_that_carry_the_exit_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        let result = run_shell_tool(
+            workspace.clone(),
+            r#"{"command":"echo before failure; exit 7"}"#,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("before failure"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.ends_with("exit code: 7"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_pins_the_working_directory_inside_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("sub")).unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        let inside = run_shell_tool(
+            workspace.clone(),
+            r#"{"command":"pwd","cwd":"sub"}"#,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await;
+        assert!(!inside.is_error, "unexpected error: {}", inside.content);
+        let expected = fs::canonicalize(directory.path().join("sub")).unwrap();
+        assert!(
+            inside.content.starts_with(expected.to_str().unwrap()),
+            "{}",
+            inside.content
+        );
+
+        for arguments in [
+            r#"{"command":"pwd","cwd":".."}"#,
+            r#"{"command":"pwd","cwd":"/"}"#,
+            r#"{"command":"pwd","cwd":"missing"}"#,
+        ] {
+            let escaped = run_shell_tool(
+                workspace.clone(),
+                arguments,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+            assert!(escaped.is_error, "cwd escape accepted: {arguments}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_rejects_empty_commands_and_out_of_range_timeouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        for arguments in [
+            r#"{"command":"   "}"#,
+            r#"{"command":"true","timeout_seconds":0}"#,
+            r#"{"command":"true","timeout_seconds":601}"#,
+        ] {
+            let result = run_shell_tool(
+                workspace.clone(),
+                arguments,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+            assert!(result.is_error, "invalid arguments accepted: {arguments}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_kills_the_whole_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        // The command starts a background child and then blocks: the timeout
+        // must kill the child too, not just the immediate `sh`.
+        let result = run_shell_tool(
+            workspace.clone(),
+            r#"{"command":"sleep 300 & echo pid:$!; wait","timeout_seconds":1}"#,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out"), "{}", result.content);
+        assert_process_exits(parse_marked_pid(&result.content)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_cancellation_kills_the_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let execution = tokio::spawn(run_shell_tool(
+            workspace.clone(),
+            r#"{"command":"sleep 300 & echo pid:$!; wait"}"#,
+            Arc::clone(&cancelled),
+            Some(sender),
+        ));
+        // The first live chunk proves the command is running and carries the
+        // background child's pid.
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("the running command must stream its first chunk")
+            .expect("the delta channel must be open while the command runs");
+        cancelled.store(true, Ordering::Release);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), execution)
+            .await
+            .expect("cancellation must stop the command promptly")
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("cancelled"), "{}", result.content);
+        assert_process_exits(parse_marked_pid(&chunk)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_output_is_truncated_head_and_tail_at_the_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+
+        // Pure-shell loop producing well over the 128 KiB budget with
+        // distinct head and tail lines.
+        let result = run_shell_tool(
+            workspace.clone(),
+            r#"{"command":"i=0; while [ $i -lt 40000 ]; do echo line-$i; i=$((i+1)); done"}"#,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(result.content.starts_with("line-0\n"), "head was not kept");
+        assert!(result.content.contains("line-39999"), "tail was not kept");
+        assert!(
+            result.content.contains("bytes omitted"),
+            "missing the truncation marker"
+        );
+        assert!(result.content.ends_with("exit code: 0"));
+        // Head+tail budget plus the marker and exit-code line.
+        assert!(result.content.len() <= MAX_SHELL_OUTPUT_BYTES + 256);
+    }
+
+    #[test]
+    fn bounded_capture_keeps_head_and_tail_and_counts_omitted_bytes() {
+        let mut capture = BoundedCapture::new(8);
+        capture.push(b"abcd");
+        assert_eq!(capture.into_output(), "abcd");
+
+        let mut capture = BoundedCapture::new(8);
+        capture.push(b"abcd");
+        capture.push(b"efgh");
+        assert_eq!(capture.into_output(), "abcdefgh");
+
+        let mut capture = BoundedCapture::new(8);
+        capture.push(b"abcdefgh");
+        capture.push(b"ij");
+        capture.push(b"klmnop");
+        // Head keeps the first 4 bytes, the rolling tail keeps the last 4.
+        assert_eq!(
+            capture.into_output(),
+            "abcd\n...[truncated by qq: 8 bytes omitted]...\nmnop"
+        );
     }
 
     #[test]
