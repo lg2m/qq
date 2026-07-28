@@ -13,18 +13,32 @@ use crossterm::{
 };
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use qq_protocol::{
-    MessageId, MessageRole, MessageSnapshot, MessageState, SessionId, SessionStatus,
+    MessageId, MessageRole, MessageSnapshot, MessageState, RunId, SessionId, SessionStatus,
     ToolCallSnapshot, ToolCallState,
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::{Layout, app::App, app::terminal_safe_character};
+use crate::{
+    Layout,
+    app::{App, ToolDetail, terminal_safe_character},
+};
 
 const MAX_RENDER_WIDTH: u16 = 320;
 const MAX_RENDER_HEIGHT: u16 = 160;
 const MAX_MARKDOWN_BYTES: usize = 32 * 1024;
 const MAX_VISIBLE_MESSAGES: usize = 64;
 const MAX_CACHED_MARKDOWN_ROWS: usize = MAX_RENDER_HEIGHT as usize;
+/// Runs with more than this many quiet tool calls fold into one summary row.
+const TOOL_FOLD_THRESHOLD: usize = 3;
+/// Emitted by qq-core tools when a result was cut short; excluded from counts.
+const TOOL_TRUNCATION_MARKER: &str = "...[truncated by qq]";
+const TOOL_SUBJECT_WIDTH: usize = 48;
+const MAX_TOOL_ERROR_BYTES: usize = 2 * 1024;
+const MAX_TOOL_ERROR_ROWS: usize = 6;
+const MAX_TOOL_DETAIL_BYTES: usize = 4 * 1024;
+const MAX_TOOL_ARGUMENT_ROWS: usize = 8;
+const MAX_TOOL_RESULT_ROWS: usize = 12;
+const TOOL_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
 
@@ -356,18 +370,33 @@ impl FrameRenderer {
                 muted(),
             ));
         }
+        let mut rendered_tool_runs: Vec<RunId> = Vec::new();
         for message in messages.iter().skip(hidden) {
             if !lines.is_empty() {
                 lines.push(Line::default());
+                // A user prompt starts a new turn; extra spacing keeps
+                // prompt/response boundaries scannable.
+                if message.role == MessageRole::User {
+                    lines.push(Line::default());
+                }
             }
             lines.extend(self.render_message(message, width));
-            if message.role == MessageRole::Assistant {
-                for tool_call in tool_calls
+            if message.role == MessageRole::Assistant
+                && !rendered_tool_runs.contains(&message.run_id)
+            {
+                let run_calls = tool_calls
                     .iter()
                     .filter(|tool_call| tool_call.run_id == message.run_id)
-                {
+                    .collect::<Vec<_>>();
+                if !run_calls.is_empty() {
+                    rendered_tool_runs.push(message.run_id);
                     lines.push(Line::default());
-                    lines.extend(Self::render_tool_call(tool_call, width));
+                    lines.extend(render_tool_calls(
+                        &run_calls,
+                        app.tool_detail,
+                        app.animation_tick,
+                        width,
+                    ));
                 }
             }
         }
@@ -375,12 +404,13 @@ impl FrameRenderer {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
-            let mut line = Line::styled("  ", muted());
+            let mut line = Line::styled(" ▌ ", warning());
             line.push("YOU  pending", warning().bold());
             lines.push(line);
             lines.extend(indent_lines(
                 bounded_markdown_lines(prompt, width.saturating_sub(3)),
-                "   ",
+                " ▌ ",
+                warning(),
                 width,
             ));
         }
@@ -394,20 +424,13 @@ impl FrameRenderer {
     }
 
     fn render_message(&mut self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
-        let prefix = "   ";
-        let role = match message.role {
-            MessageRole::User => "YOU",
-            MessageRole::Assistant => "QQ",
+        // User turns carry an accent bar so prompt boundaries stand out.
+        let (prefix, prefix_style, role, role_style) = match message.role {
+            MessageRole::User => (" ▌ ", accent(), "YOU", accent().bold()),
+            MessageRole::Assistant => ("   ", muted(), "QQ", normal().bold()),
         };
-        let mut header = Line::styled(prefix, muted());
-        header.push(
-            role,
-            if message.role == MessageRole::User {
-                accent().bold()
-            } else {
-                normal().bold()
-            },
-        );
+        let mut header = Line::styled(prefix, prefix_style);
+        header.push(role, role_style);
         if !matches!(message.state, MessageState::Complete) {
             header.push(
                 format!("  {}", message_state_label(message.state)),
@@ -415,7 +438,7 @@ impl FrameRenderer {
             );
         }
         let mut lines = vec![truncate_line(header, width)];
-        let content_width = width.saturating_sub(prefix.len()).max(1);
+        let content_width = width.saturating_sub(3).max(1);
         let terminal = matches!(
             message.state,
             MessageState::Complete
@@ -452,42 +475,264 @@ impl FrameRenderer {
             bounded_markdown_lines(&message_content(message), content_width)
         };
         if body.is_empty() {
-            lines.push(Line::styled(format!("{prefix}..."), muted()));
+            let mut ellipsis = Line::styled(prefix, prefix_style);
+            ellipsis.push("...", muted());
+            lines.push(ellipsis);
         } else {
-            lines.extend(indent_lines(body, prefix, width));
+            lines.extend(indent_lines(body, prefix, prefix_style, width));
         }
         lines
     }
+}
 
-    fn render_tool_call(tool_call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
-        let prefix = "   ";
-        let mut header = Line::styled(prefix, muted());
-        header.push("TOOL", accent().bold());
-        header.push(format!("  {}", tool_call.name), normal().bold());
-        header.push(
-            format!("  {}", tool_state_label(tool_call.state)),
-            if tool_call.is_error {
-                failure()
-            } else {
-                muted()
+/// Renders one run's tool calls: a folded count for quiet runs, otherwise one
+/// gutter line per call, with errors and the expanded detail level adding
+/// bounded body rows.
+fn render_tool_calls(
+    calls: &[&ToolCallSnapshot],
+    detail: ToolDetail,
+    tick: usize,
+    width: usize,
+) -> Vec<Line> {
+    let quiet = |call: &ToolCallSnapshot| call.state == ToolCallState::Completed && !call.is_error;
+    if detail == ToolDetail::Collapsed
+        && calls.len() > TOOL_FOLD_THRESHOLD
+        && calls.iter().all(|call| quiet(call))
+    {
+        return vec![tool_fold_line(calls, width)];
+    }
+    let mut lines = Vec::with_capacity(calls.len());
+    for call in calls {
+        lines.push(tool_summary_line(call, tick, width));
+        if call.is_error {
+            if let Some(result) = call.result.as_deref() {
+                lines.extend(tool_error_lines(result, width));
+            }
+        } else if detail == ToolDetail::Expanded {
+            lines.extend(tool_expanded_lines(call, width));
+        }
+    }
+    lines
+}
+
+fn tool_fold_line(calls: &[&ToolCallSnapshot], width: usize) -> Line {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for call in calls {
+        match counts.iter_mut().find(|(name, _)| *name == call.name) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((call.name.as_str(), 1)),
+        }
+    }
+    let mut line = Line::styled("   ", muted());
+    line.push("▸ ", accent());
+    line.push(format!("{} tool calls (", calls.len()), muted());
+    for (index, (name, count)) in counts.iter().enumerate() {
+        if index > 0 {
+            line.push(", ", muted());
+        }
+        line.push(format!("{name} ×{count}"), muted());
+    }
+    line.push(")", muted());
+    truncate_line(line, width)
+}
+
+/// One collapsed gutter line: state glyph, tool name, curated subject from the
+/// arguments, and a metric derived from the result.
+fn tool_summary_line(call: &ToolCallSnapshot, tick: usize, width: usize) -> Line {
+    let (glyph, glyph_style) = tool_state_glyph(call, tick);
+    let mut line = Line::styled("   ", muted());
+    line.push(glyph, glyph_style);
+    line.push(" ", muted());
+    line.push(call.name.as_str(), normal().dim());
+    if let Some(subject) = tool_subject(call) {
+        line.push(format!(" {subject}"), muted());
+    }
+    if let Some(metric) = tool_result_metric(call) {
+        line.push(format!(" ({metric})"), muted());
+    }
+    if call.state != ToolCallState::Completed {
+        line.push(
+            format!(" {}", tool_state_label(call.state)),
+            match call.state {
+                ToolCallState::Failed | ToolCallState::Denied => failure(),
+                ToolCallState::AwaitingApproval => warning(),
+                ToolCallState::Running => accent(),
+                ToolCallState::Requested
+                | ToolCallState::Interrupted
+                | ToolCallState::Completed => muted(),
             },
         );
-        let mut lines = vec![truncate_line(header, width)];
-        let arguments = bounded_tail(&tool_call.arguments, MAX_MARKDOWN_BYTES / 4);
-        let result = tool_call
-            .result
-            .as_deref()
-            .map(|result| bounded_tail(result, MAX_MARKDOWN_BYTES / 2));
-        let details = match result {
-            Some(result) => format!("arguments: `{arguments}`\n\n{result}"),
-            None => format!("arguments: `{arguments}`"),
-        };
-        lines.extend(indent_lines(
-            bounded_markdown_lines(&details, width.saturating_sub(prefix.len()).max(1)),
-            prefix,
+    }
+    truncate_line(line, width)
+}
+
+fn tool_state_glyph(call: &ToolCallSnapshot, tick: usize) -> (&'static str, Style) {
+    match call.state {
+        ToolCallState::Running => (TOOL_SPINNER[tick % TOOL_SPINNER.len()], accent()),
+        ToolCallState::Requested => ("◌", muted()),
+        ToolCallState::Completed => {
+            if call.is_error {
+                ("✗", failure())
+            } else {
+                ("●", muted())
+            }
+        }
+        ToolCallState::Failed | ToolCallState::Denied => ("✗", failure()),
+        ToolCallState::AwaitingApproval => ("◇", warning()),
+        ToolCallState::Interrupted => ("◌", muted()),
+    }
+}
+
+/// The most informative argument for known tools; a compact truncated argument
+/// preview otherwise, so new tool names degrade gracefully. Malformed JSON
+/// falls back to the raw truncated string.
+fn tool_subject(call: &ToolCallSnapshot) -> Option<String> {
+    let compact = || {
+        let text = preview(&call.arguments, TOOL_SUBJECT_WIDTH);
+        (!text.is_empty()).then_some(text)
+    };
+    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+        return compact();
+    };
+    match call.name.as_str() {
+        "read_file" | "list_dir" => arguments
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(|path| preview(path, TOOL_SUBJECT_WIDTH))
+            .or_else(compact),
+        "search" => arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(|query| format!("\"{}\"", preview(query, TOOL_SUBJECT_WIDTH)))
+            .or_else(compact),
+        _ => compact(),
+    }
+}
+
+/// A one-glance size for the result: line/entry/match counts for known tools,
+/// byte size for everything else. Errors expand instead of summarizing.
+fn tool_result_metric(call: &ToolCallSnapshot) -> Option<String> {
+    if call.is_error {
+        return None;
+    }
+    let result = call.result.as_deref()?;
+    let truncated = result.lines().any(|line| line == TOOL_TRUNCATION_MARKER);
+    let content_lines = || {
+        result
+            .lines()
+            .filter(|line| *line != TOOL_TRUNCATION_MARKER)
+            .count()
+    };
+    let metric = match call.name.as_str() {
+        "read_file" => count_noun(content_lines(), "line", "lines"),
+        "list_dir" => count_noun(content_lines(), "entry", "entries"),
+        "search" => {
+            if result.starts_with("No matches found.") {
+                "no matches".to_owned()
+            } else {
+                // Match rows are `path:line:content` or `path: filename
+                // match`, grouped per file, so counting consecutive distinct
+                // path prefixes counts files without allocating.
+                let mut matches = 0_usize;
+                let mut files = 0_usize;
+                let mut previous: Option<&str> = None;
+                for line in result.lines() {
+                    if line.is_empty() || line == TOOL_TRUNCATION_MARKER {
+                        continue;
+                    }
+                    matches += 1;
+                    let path = line.split(':').next().unwrap_or(line);
+                    if previous != Some(path) {
+                        files += 1;
+                        previous = Some(path);
+                    }
+                }
+                format!(
+                    "{}, {}",
+                    count_noun(matches, "match", "matches"),
+                    count_noun(files, "file", "files")
+                )
+            }
+        }
+        _ => format_result_size(result.len()),
+    };
+    if truncated {
+        Some(format!("{metric}, truncated"))
+    } else {
+        Some(metric)
+    }
+}
+
+/// Errors are the one case where content matters by default: show a bounded
+/// tail of the error text under the gutter line.
+fn tool_error_lines(result: &str, width: usize) -> Vec<Line> {
+    let text = bounded_tail(result, MAX_TOOL_ERROR_BYTES);
+    let total = text.lines().count();
+    let mut lines = Vec::new();
+    if total > MAX_TOOL_ERROR_ROWS || text.len() < result.len() {
+        lines.push(Line::styled("     ...", muted().italic()));
+    }
+    for line in text.lines().skip(total.saturating_sub(MAX_TOOL_ERROR_ROWS)) {
+        lines.push(truncate_line(
+            Line::styled(format!("     {line}"), failure().dim()),
             width,
         ));
-        lines
+    }
+    lines
+}
+
+/// Expanded detail: bounded pretty-printed arguments plus a bounded tail of
+/// the result. Oversized or malformed arguments render as a raw bounded tail.
+fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let pretty = if call.arguments.len() <= MAX_TOOL_DETAIL_BYTES {
+        serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .and_then(|value| serde_json::to_string_pretty(&value))
+            .ok()
+    } else {
+        None
+    };
+    let arguments = pretty
+        .as_deref()
+        .unwrap_or_else(|| bounded_tail(&call.arguments, MAX_TOOL_DETAIL_BYTES));
+    for (shown, line) in arguments.lines().enumerate() {
+        if shown == MAX_TOOL_ARGUMENT_ROWS {
+            lines.push(Line::styled("     ...", muted().italic()));
+            break;
+        }
+        lines.push(truncate_line(
+            Line::styled(format!("     {line}"), muted()),
+            width,
+        ));
+    }
+    if let Some(result) = call.result.as_deref() {
+        let text = bounded_tail(result, MAX_TOOL_DETAIL_BYTES);
+        let total = text.lines().count();
+        if total > MAX_TOOL_RESULT_ROWS || text.len() < result.len() {
+            lines.push(Line::styled("     ...", muted().italic()));
+        }
+        for line in text
+            .lines()
+            .skip(total.saturating_sub(MAX_TOOL_RESULT_ROWS))
+        {
+            lines.push(truncate_line(
+                Line::styled(format!("     {line}"), normal().dim()),
+                width,
+            ));
+        }
+    }
+    lines
+}
+
+fn count_noun(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+fn format_result_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{}.{} KB", bytes / 1024, (bytes % 1024) * 10 / 1024)
     }
 }
 
@@ -692,7 +937,8 @@ fn approval_prompt(app: &App, width: usize, height: usize) -> Vec<Line> {
         "y approves once, a approves for this session, n or Esc denies",
     )];
     lines.push(Line::default());
-    let mut name = Line::styled("  tool: ", muted());
+    let mut name = Line::styled("  ◇ ", warning());
+    name.push("tool: ", muted());
     name.push(tool_call.name.clone(), warning().bold());
     lines.push(truncate_line(name, width));
     if let Some(command) = shell_command_preview(tool_call) {
@@ -811,8 +1057,10 @@ fn footer_context(app: &App, width: usize) -> Line {
         .and_then(|session| session.model.as_deref())
         .or(app.model.model.as_deref())
         .unwrap_or("default");
+    let mut left = Line::styled(context, muted());
+    left.push(format!("  tools: {}", app.tool_detail.label()), muted());
     align_sides(
-        Line::styled(context, muted()),
+        left,
         Line::styled(format!("model: {selected_model} "), accent()),
         width,
     )
@@ -1103,11 +1351,11 @@ fn wrap_line(line: Line, width: usize) -> Vec<Line> {
     output
 }
 
-fn indent_lines(lines: Vec<Line>, prefix: &str, width: usize) -> Vec<Line> {
+fn indent_lines(lines: Vec<Line>, prefix: &str, prefix_style: Style, width: usize) -> Vec<Line> {
     lines
         .into_iter()
         .map(|line| {
-            let mut indented = Line::styled(prefix, muted());
+            let mut indented = Line::styled(prefix, prefix_style);
             for span in line.spans {
                 indented.push(span.text, span.style);
             }
@@ -1332,30 +1580,341 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn transcript_renders_replayed_tool_activity() {
-        let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
-        app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(vec![ToolCallSnapshot {
-            id: qq_protocol::ToolCallId::from_bytes([7; 16]),
-            session_id,
+    fn tool_call_snapshot(
+        byte: u8,
+        name: &str,
+        arguments: &str,
+        state: ToolCallState,
+        result: Option<&str>,
+        is_error: bool,
+    ) -> ToolCallSnapshot {
+        ToolCallSnapshot {
+            id: qq_protocol::ToolCallId::from_bytes([byte; 16]),
+            session_id: SessionId::from_bytes([1; 16]),
             run_id: RunId::from_bytes([2; 16]),
             turn_ordinal: 1,
-            call_ordinal: 1,
-            provider_call_id: "call-1".to_owned(),
-            name: "read_file".to_owned(),
-            arguments: r#"{"path":"note.txt"}"#.to_owned(),
-            state: ToolCallState::Completed,
-            result: Some("contents".to_owned()),
-            is_error: false,
-        }]);
+            call_ordinal: u16::from(byte),
+            provider_call_id: format!("call-{byte}"),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+            state,
+            result: result.map(str::to_owned),
+            is_error,
+        }
+    }
+
+    #[test]
+    fn transcript_renders_replayed_tool_activity_collapsed() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(vec![tool_call_snapshot(
+            7,
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+            ToolCallState::Completed,
+            Some("contents"),
+            false,
+        )]);
 
         let frame = FrameRenderer::default().frame(&mut app, 100, 30);
-        let text = frame_text(&frame);
+        let rows = frame_rows(&frame);
 
-        assert!(text.contains("TOOL"));
-        assert!(text.contains("read_file"));
-        assert!(text.contains("contents"));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("● read_file note.txt (1 line)"))
+        );
+        assert!(!frame_text(&frame).contains("contents"));
+    }
+
+    #[test]
+    fn collapsed_summaries_curate_known_tools() {
+        let cases = [
+            (
+                tool_call_snapshot(
+                    1,
+                    "read_file",
+                    r#"{"path":"src/config/loader.rs"}"#,
+                    ToolCallState::Completed,
+                    Some("a\nb\nc\n"),
+                    false,
+                ),
+                "   ● read_file src/config/loader.rs (3 lines)",
+            ),
+            (
+                tool_call_snapshot(
+                    2,
+                    "read_file",
+                    r#"{"path":"big.log"}"#,
+                    ToolCallState::Completed,
+                    Some("a\n...[truncated by qq]\n"),
+                    false,
+                ),
+                "   ● read_file big.log (1 line, truncated)",
+            ),
+            (
+                tool_call_snapshot(
+                    3,
+                    "search",
+                    r#"{"query":"pattern"}"#,
+                    ToolCallState::Completed,
+                    Some("src/a.rs:1:x pattern\nsrc/a.rs:9:pattern y\nsrc/b.rs: filename match\n"),
+                    false,
+                ),
+                "   ● search \"pattern\" (3 matches, 2 files)",
+            ),
+            (
+                tool_call_snapshot(
+                    4,
+                    "search",
+                    r#"{"query":"absent"}"#,
+                    ToolCallState::Completed,
+                    Some("No matches found.\n"),
+                    false,
+                ),
+                "   ● search \"absent\" (no matches)",
+            ),
+            (
+                tool_call_snapshot(
+                    5,
+                    "list_dir",
+                    r#"{"path":"crates/qq-core/src"}"#,
+                    ToolCallState::Completed,
+                    Some("lib.rs\nsessions.rs\ntools.rs\n"),
+                    false,
+                ),
+                "   ● list_dir crates/qq-core/src (3 entries)",
+            ),
+        ];
+        for (call, expected) in cases {
+            let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 120));
+            assert_eq!(rows, [expected]);
+        }
+    }
+
+    #[test]
+    fn unknown_tools_fall_back_to_compact_arguments_and_byte_size() {
+        let result = "x".repeat(2048);
+        let call = tool_call_snapshot(
+            1,
+            "edit_file",
+            r#"{"path":"src/main.rs","content":"fn main() {}"}"#,
+            ToolCallState::Completed,
+            Some(&result),
+            false,
+        );
+
+        let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 160));
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("● edit_file"));
+        assert!(rows[0].contains(r#"{"path":"src/main.rs","#));
+        assert!(rows[0].contains("(2.0 KB)"));
+    }
+
+    #[test]
+    fn malformed_arguments_fall_back_to_a_raw_preview() {
+        let call = tool_call_snapshot(
+            1,
+            "read_file",
+            "{not json",
+            ToolCallState::Completed,
+            Some("a\n"),
+            false,
+        );
+
+        let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 120));
+
+        assert!(rows[0].contains("read_file {not json (1 line)"));
+    }
+
+    #[test]
+    fn error_results_expand_under_the_summary_by_default() {
+        let call = tool_call_snapshot(
+            1,
+            "read_file",
+            r#"{"path":"gone.txt"}"#,
+            ToolCallState::Completed,
+            Some("path is not a file"),
+            true,
+        );
+
+        let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 120));
+
+        assert_eq!(rows[0], "   ✗ read_file gone.txt");
+        assert_eq!(rows[1], "     path is not a file");
+    }
+
+    #[test]
+    fn pending_states_show_their_glyph_and_label() {
+        let awaiting = tool_call_snapshot(
+            1,
+            "shell",
+            r#"{"command":"cargo test"}"#,
+            ToolCallState::AwaitingApproval,
+            None,
+            false,
+        );
+        let rows = frame_rows(&render_tool_calls(
+            &[&awaiting],
+            ToolDetail::Collapsed,
+            0,
+            120,
+        ));
+        assert_eq!(
+            rows,
+            ["   ◇ shell {\"command\":\"cargo test\"} awaiting approval"]
+        );
+
+        let running = tool_call_snapshot(
+            2,
+            "search",
+            r#"{"query":"x"}"#,
+            ToolCallState::Running,
+            None,
+            false,
+        );
+        let rows = frame_rows(&render_tool_calls(
+            &[&running],
+            ToolDetail::Collapsed,
+            1,
+            120,
+        ));
+        assert_eq!(rows, ["   ◓ search \"x\" running"]);
+    }
+
+    #[test]
+    fn quiet_runs_fold_into_a_single_counted_line() {
+        let mut calls = Vec::new();
+        for byte in 1..=4 {
+            calls.push(tool_call_snapshot(
+                byte,
+                "read_file",
+                r#"{"path":"a.rs"}"#,
+                ToolCallState::Completed,
+                Some("a\n"),
+                false,
+            ));
+        }
+        for byte in 5..=6 {
+            calls.push(tool_call_snapshot(
+                byte,
+                "search",
+                r#"{"query":"x"}"#,
+                ToolCallState::Completed,
+                Some("No matches found.\n"),
+                false,
+            ));
+        }
+        let references = calls.iter().collect::<Vec<_>>();
+
+        let rows = frame_rows(&render_tool_calls(
+            &references,
+            ToolDetail::Collapsed,
+            0,
+            120,
+        ));
+        assert_eq!(rows, ["   ▸ 6 tool calls (read_file ×4, search ×2)"]);
+
+        // An active or failed call keeps every line visible.
+        calls[5].state = ToolCallState::Running;
+        let references = calls.iter().collect::<Vec<_>>();
+        let rows = frame_rows(&render_tool_calls(
+            &references,
+            ToolDetail::Collapsed,
+            0,
+            120,
+        ));
+        assert_eq!(rows.len(), 6);
+
+        // Expanded detail never folds.
+        calls[5].state = ToolCallState::Completed;
+        let references = calls.iter().collect::<Vec<_>>();
+        let rows = frame_rows(&render_tool_calls(
+            &references,
+            ToolDetail::Expanded,
+            0,
+            120,
+        ));
+        assert!(rows.len() > 6);
+    }
+
+    #[test]
+    fn detail_cycling_reveals_arguments_and_result_tails() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(vec![tool_call_snapshot(
+            7,
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+            ToolCallState::Completed,
+            Some("alpha\nbeta"),
+            false,
+        )]);
+        let mut renderer = FrameRenderer::default();
+        let ctrl_o = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+        let collapsed = frame_rows(&renderer.frame(&mut app, 100, 30));
+        assert!(!collapsed.iter().any(|row| row.contains("beta")));
+        assert!(collapsed.iter().any(|row| row.contains("tools: collapsed")));
+
+        app.handle_terminal_event(ctrl_o.clone());
+        let expanded = frame_rows(&renderer.frame(&mut app, 100, 30));
+        assert!(
+            expanded
+                .iter()
+                .any(|row| row.contains("\"path\": \"note.txt\""))
+        );
+        assert!(expanded.iter().any(|row| row.contains("beta")));
+        assert!(expanded.iter().any(|row| row.contains("tools: expanded")));
+
+        app.handle_terminal_event(ctrl_o);
+        let collapsed = frame_rows(&renderer.frame(&mut app, 100, 30));
+        assert!(!collapsed.iter().any(|row| row.contains("beta")));
+    }
+
+    #[test]
+    fn tool_rows_respect_narrow_widths() {
+        let calls = [
+            tool_call_snapshot(
+                1,
+                "read_file",
+                r#"{"path":"a/very/long/path/that/never/ends.rs"}"#,
+                ToolCallState::Completed,
+                Some("line one that is fairly long\nline two\n"),
+                false,
+            ),
+            tool_call_snapshot(
+                2,
+                "shell",
+                r#"{"command":"cargo test --workspace --all-features"}"#,
+                ToolCallState::Failed,
+                Some("error: a very long failure message that overflows"),
+                true,
+            ),
+        ];
+        let references = calls.iter().collect::<Vec<_>>();
+        for width in 0..24 {
+            for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
+                let lines = render_tool_calls(&references, detail, 0, width);
+                assert!(lines.iter().all(|line| line.width() <= width));
+            }
+        }
+    }
+
+    #[test]
+    fn user_prompts_carry_an_accent_bar() {
+        let mut renderer = FrameRenderer::default();
+        let mut message = completed_message(1, "deploy the API".to_owned());
+        message.role = MessageRole::User;
+
+        let rows = frame_rows(&renderer.render_message(&message, 80));
+
+        assert!(rows[0].starts_with(" ▌ YOU"));
+        assert!(rows[1].starts_with(" ▌ "));
+        assert_eq!(
+            renderer.render_message(&message, 80)[0].spans[0].style,
+            accent()
+        );
     }
 
     #[test]

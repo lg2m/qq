@@ -132,6 +132,32 @@ pub(crate) struct SessionPicker {
     pub selected: Option<SessionId>,
 }
 
+/// How much of each tool call the transcript shows. Session-local because the
+/// persisted settings surface only carries keybindings and layout today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ToolDetail {
+    #[default]
+    Collapsed,
+    Expanded,
+}
+
+impl ToolDetail {
+    #[must_use]
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Expanded,
+            Self::Expanded => Self::Collapsed,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Collapsed => "collapsed",
+            Self::Expanded => "expanded",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct TranscriptViewport {
     context: Option<(Option<SessionId>, Layout)>,
@@ -170,6 +196,7 @@ pub(crate) struct App {
     pub status: Option<String>,
     pub animation_tick: usize,
     pub quit: bool,
+    pub tool_detail: ToolDetail,
     transcript_viewport: TranscriptViewport,
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
@@ -196,6 +223,7 @@ impl App {
             status: None,
             animation_tick: 0,
             quit: false,
+            tool_detail: ToolDetail::default(),
             transcript_viewport: TranscriptViewport::default(),
             last_sequence: 0,
             recent_events: VecDeque::new(),
@@ -696,6 +724,14 @@ impl App {
         }
         if let Some(action) = self.settings.action_for(key) {
             return self.handle_action(action);
+        }
+        // Ctrl-O cycles tool call detail. Checked after configured bindings so
+        // a user rebinding Ctrl-O keeps winning.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('o' | 'O'))
+        {
+            self.tool_detail = self.tool_detail.next();
+            return (true, Vec::new());
         }
         match key.code {
             KeyCode::Esc => {
@@ -2189,6 +2225,30 @@ mod tests {
         let retained = app.sessions[&session_id].messages.as_ref().unwrap();
         assert_eq!(retained.len(), usize::from(SNAPSHOT_MESSAGE_LIMIT));
         assert_eq!(retained.last().unwrap().output, "newest");
+    }
+
+    #[test]
+    fn ctrl_o_cycles_tool_detail_and_yields_to_overlays() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        assert_eq!(app.tool_detail, ToolDetail::Collapsed);
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        let (changed, requests) = app.handle_key(ctrl_o);
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.tool_detail, ToolDetail::Expanded);
+
+        app.handle_key(ctrl_o);
+        assert_eq!(app.tool_detail, ToolDetail::Collapsed);
+
+        // Pickers own the keyboard; the toggle must not fire underneath them.
+        app.session_picker = Some(SessionPicker {
+            query: String::new(),
+            selected: None,
+        });
+        app.handle_key(ctrl_o);
+        assert_eq!(app.tool_detail, ToolDetail::Collapsed);
     }
 
     #[test]
