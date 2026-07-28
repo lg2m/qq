@@ -17,12 +17,12 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandReceipt, EventCursor, MessageId, MessageRole, MessageSnapshot, MessageState,
-    ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId, RunOutcome, RunSnapshot,
-    RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
-    SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest,
-    TextChannel, TokenUsage, ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceId,
-    WorkspaceSnapshot, WorkspaceSummary,
+    CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole, MessageSnapshot,
+    MessageState, ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId, RunOutcome,
+    RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
+    SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
+    SubscribeRequest, TextChannel, TokenUsage, ToolCallId, ToolCallSnapshot, ToolCallState,
+    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -389,12 +389,13 @@ impl ToolGate for SessionToolGate {
                         }
                         _ => None,
                     };
+                    let edit = approval::edit_preview(&call.name, &call.arguments);
                     // Register before publishing the request so a client
                     // response can never race past the waiting run.
                     let mut resolved = inner.register_approval(call.id, claimed.run_id);
                     match inner
                         .store
-                        .request_tool_approval(&claimed, call.id, shell)
+                        .request_tool_approval(&claimed, call.id, shell, edit)
                         .await
                     {
                         Ok(event) => inner.notify(event.cursor),
@@ -1365,11 +1366,12 @@ impl Store {
         claimed: &ClaimedRun,
         tool_call_id: ToolCallId,
         shell: Option<ShellCommandPreview>,
+        edit: Option<EditPreview>,
     ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
-            request_tool_approval(connection, store_id, &claimed, tool_call_id, shell)
+            request_tool_approval(connection, store_id, &claimed, tool_call_id, shell, edit)
         })
         .await
     }
@@ -2823,6 +2825,7 @@ fn request_tool_approval(
     claimed: &ClaimedRun,
     tool_call_id: ToolCallId,
     shell: Option<ShellCommandPreview>,
+    edit: Option<EditPreview>,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let transaction = connection
         .transaction()
@@ -2849,7 +2852,11 @@ fn request_tool_approval(
             caused_by: Some(claimed.command_id),
             occurred_at_ms: now,
         },
-        SessionEvent::ToolApprovalRequested { tool_call, shell },
+        SessionEvent::ToolApprovalRequested {
+            tool_call,
+            shell,
+            edit,
+        },
     )?;
     transaction
         .commit()
@@ -6428,7 +6435,7 @@ mod tests {
             .await
             .unwrap();
         let awaiting = store
-            .request_tool_approval(&claimed, tool_call_id, None)
+            .request_tool_approval(&claimed, tool_call_id, None, None)
             .await
             .unwrap();
         drop(store);

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use qq_protocol::ApprovalMode;
+use qq_protocol::{ApprovalMode, EditPreview};
 use serde::Deserialize;
 
 pub(crate) const POLICY_DENIED_RESULT: &str =
@@ -83,6 +83,72 @@ pub(crate) fn classify(name: &str, arguments: &str) -> ToolClass {
         "__test_shell" => shell_class(arguments),
         _ if name.starts_with("mcp__") => ToolClass::Mcp,
         _ => ToolClass::Unknown,
+    }
+}
+
+const MAX_PREVIEW_SIDE_BYTES: usize = 2 * 1024;
+const PREVIEW_TRUNCATION_MARKER: &str = "[preview truncated]";
+
+/// Builds the approval-request preview for a file-modifying call: the
+/// workspace-relative path the model addressed and a bounded
+/// unified-diff-style rendering of the change. Returns None for other tools
+/// and for arguments the tool itself would reject.
+pub(crate) fn edit_preview(name: &str, arguments: &str) -> Option<EditPreview> {
+    #[derive(Deserialize)]
+    struct EditArguments {
+        path: String,
+        old_string: String,
+        new_string: String,
+    }
+    #[derive(Deserialize)]
+    struct WriteArguments {
+        path: String,
+        content: String,
+    }
+    match name {
+        "edit_file" => {
+            let arguments = serde_json::from_str::<EditArguments>(arguments).ok()?;
+            let mut diff = String::new();
+            push_diff_lines(&mut diff, '-', &arguments.old_string);
+            push_diff_lines(&mut diff, '+', &arguments.new_string);
+            Some(EditPreview {
+                path: arguments.path,
+                diff,
+            })
+        }
+        "write_file" => {
+            let arguments = serde_json::from_str::<WriteArguments>(arguments).ok()?;
+            let mut diff = String::new();
+            push_diff_lines(&mut diff, '+', &arguments.content);
+            Some(EditPreview {
+                path: arguments.path,
+                diff,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn push_diff_lines(diff: &mut String, sign: char, content: &str) {
+    let mut remaining = MAX_PREVIEW_SIDE_BYTES;
+    for line in content.lines() {
+        diff.push(sign);
+        diff.push(' ');
+        // The sign, separator, and newline count against the side budget so
+        // one side of a preview can never exceed it by more than the marker.
+        if line.len() + 3 > remaining {
+            let mut end = remaining.saturating_sub(3).min(line.len());
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            diff.push_str(&line[..end]);
+            diff.push_str(PREVIEW_TRUNCATION_MARKER);
+            diff.push('\n');
+            return;
+        }
+        remaining -= line.len() + 3;
+        diff.push_str(line);
+        diff.push('\n');
     }
 }
 
@@ -272,6 +338,43 @@ mod tests {
         assert!(!shell_prefix_matches("cargo test", "cargo testify"));
         assert!(!shell_prefix_matches("cargo test", "cargo"));
         assert!(!shell_prefix_matches("", "anything"));
+    }
+
+    #[test]
+    fn edit_previews_render_bounded_diffs_for_edit_and_write_calls() {
+        let preview = edit_preview(
+            "edit_file",
+            r#"{"path":"src/lib.rs","old_string":"fn a() {}\nfn b() {}","new_string":"fn a() {}"}"#,
+        )
+        .unwrap();
+        assert_eq!(preview.path, "src/lib.rs");
+        assert_eq!(preview.diff, "- fn a() {}\n- fn b() {}\n+ fn a() {}\n");
+
+        let preview = edit_preview(
+            "write_file",
+            r#"{"path":"NOTES.md","content":"line one\nline two"}"#,
+        )
+        .unwrap();
+        assert_eq!(preview.path, "NOTES.md");
+        assert_eq!(preview.diff, "+ line one\n+ line two\n");
+
+        assert_eq!(edit_preview("shell", r#"{"command":"ls"}"#), None);
+        assert_eq!(edit_preview("edit_file", r#"{"path":"x"}"#), None);
+
+        let oversized = serde_json::to_string(&serde_json::json!({
+            "path": "big.txt",
+            "old_string": "x".repeat(MAX_PREVIEW_SIDE_BYTES * 2),
+            "new_string": "y\n".repeat(MAX_PREVIEW_SIDE_BYTES),
+        }))
+        .unwrap();
+        let preview = edit_preview("edit_file", &oversized).unwrap();
+        // Each side may exceed its budget only by the truncation line's
+        // sign, separator, marker, and newline.
+        assert!(
+            preview.diff.len()
+                <= 2 * (MAX_PREVIEW_SIDE_BYTES + PREVIEW_TRUNCATION_MARKER.len() + 3)
+        );
+        assert_eq!(preview.diff.matches(PREVIEW_TRUNCATION_MARKER).count(), 2);
     }
 
     #[test]
