@@ -1,7 +1,7 @@
 # QQ Tool Execution And Security Design
 
-Status: steps 1–2 of the sequencing are implemented (step 2 landing);
-steps 3a onward are direction.
+Status: steps 1–3 of the sequencing are implemented (step 3b landing);
+steps 4 onward are direction.
 
 ## Purpose
 
