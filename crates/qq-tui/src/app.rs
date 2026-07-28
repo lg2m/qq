@@ -524,6 +524,14 @@ impl App {
                 }
             }
             SessionEvent::AssistantMessageStarted { message } => {
+                // A new turn's message means every earlier turn of the run
+                // has committed; the server finalized those messages inside
+                // the turn persist without a dedicated event.
+                self.complete_streamed_turns(
+                    envelope.session_id,
+                    message.run_id,
+                    message.turn_ordinal.saturating_sub(1),
+                );
                 self.push_message(message.clone());
             }
             SessionEvent::TextAppended {
@@ -553,6 +561,15 @@ impl App {
             | SessionEvent::ToolApprovalResolved { tool_call, .. }
             | SessionEvent::ToolCallStarted { tool_call }
             | SessionEvent::ToolCallFinished { tool_call } => {
+                if matches!(envelope.event, SessionEvent::ToolCallRequested { .. }) {
+                    // Calls are persisted with their completed turn, so the
+                    // turn's message (same ordinal) is finalized by then.
+                    self.complete_streamed_turns(
+                        envelope.session_id,
+                        tool_call.run_id,
+                        tool_call.turn_ordinal,
+                    );
+                }
                 if tool_call.state != ToolCallState::AwaitingApproval {
                     self.answered_approvals.remove(&tool_call.id);
                     self.edit_previews.remove(&tool_call.id);
@@ -586,8 +603,17 @@ impl App {
                         .iter_mut()
                         .filter(|message| message.run_id == *run_id)
                     {
-                        if message.role == qq_protocol::MessageRole::Assistant
-                            || message.state == MessageState::Queued
+                        // Turns finalized before the run ended keep their own
+                        // state; the outcome only settles the still-streaming
+                        // current turn (and queued rows).
+                        let settled = message.role == qq_protocol::MessageRole::Assistant
+                            && !matches!(
+                                message.state,
+                                MessageState::Queued | MessageState::Streaming
+                            );
+                        if !settled
+                            && (message.role == qq_protocol::MessageRole::Assistant
+                                || message.state == MessageState::Queued)
                         {
                             message.state = state;
                         }
@@ -616,6 +642,32 @@ impl App {
                 context_window,
                 loaded_through: 0,
             });
+    }
+
+    /// Marks a run's still-streaming assistant messages complete through the
+    /// given turn: the server finalizes a turn's message in the same
+    /// transaction as the turn's tool calls, without a dedicated event.
+    fn complete_streamed_turns(
+        &mut self,
+        session_id: SessionId,
+        run_id: qq_protocol::RunId,
+        through_turn: u16,
+    ) {
+        let Some(messages) = self
+            .sessions
+            .get_mut(&session_id)
+            .and_then(|session| session.messages.as_mut())
+        else {
+            return;
+        };
+        for message in messages.iter_mut().filter(|message| {
+            message.run_id == run_id
+                && message.role == qq_protocol::MessageRole::Assistant
+                && message.state == MessageState::Streaming
+                && message.turn_ordinal <= through_turn
+        }) {
+            message.state = MessageState::Complete;
+        }
     }
 
     fn push_message(&mut self, message: MessageSnapshot) {
@@ -2126,6 +2178,7 @@ mod tests {
             id: message_id,
             session_id,
             run_id,
+            turn_ordinal: 1,
             role: MessageRole::Assistant,
             state: MessageState::Streaming,
             output: String::new(),
@@ -2199,6 +2252,7 @@ mod tests {
                 id: message_id,
                 session_id,
                 run_id,
+                turn_ordinal: 1,
                 role: MessageRole::Assistant,
                 state: MessageState::Streaming,
                 output: String::new(),
@@ -2278,6 +2332,7 @@ mod tests {
                 id: MessageId::from_bytes((index as u128 + 1).to_be_bytes()),
                 session_id,
                 run_id,
+                turn_ordinal: 0,
                 role: MessageRole::Assistant,
                 state: MessageState::Complete,
                 output: index.to_string(),
@@ -2295,6 +2350,7 @@ mod tests {
             id: MessageId::from_bytes(u128::MAX.to_be_bytes()),
             session_id,
             run_id,
+            turn_ordinal: 0,
             role: MessageRole::Assistant,
             state: MessageState::Complete,
             output: "newest".to_owned(),

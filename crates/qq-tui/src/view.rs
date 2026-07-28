@@ -15,7 +15,7 @@ use crossterm::{
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use qq_protocol::{
-    MessageId, MessageRole, MessageSnapshot, MessageState, RunId, SessionId, SessionStatus,
+    MessageId, MessageRole, MessageSnapshot, MessageState, SessionId, SessionStatus,
     ToolCallSnapshot, ToolCallState,
 };
 use unicode_width::UnicodeWidthChar;
@@ -409,8 +409,7 @@ impl FrameRenderer {
                 muted(),
             ));
         }
-        let mut rendered_tool_runs: Vec<RunId> = Vec::new();
-        for message in messages.iter().skip(hidden) {
+        for (index, message) in messages.iter().enumerate().skip(hidden) {
             if !lines.is_empty() {
                 lines.push(Line::default());
                 // A user prompt starts a new turn; extra spacing keeps
@@ -420,15 +419,31 @@ impl FrameRenderer {
                 }
             }
             lines.extend(self.render_message(message, width));
-            if message.role == MessageRole::Assistant
-                && !rendered_tool_runs.contains(&message.run_id)
-            {
-                let run_calls = tool_calls
+            if message.role == MessageRole::Assistant {
+                // Group calls under the assistant message of their turn.
+                // Calls from turns without a message of their own (call-only
+                // turns, legacy turn 0 messages) attach after the nearest
+                // preceding assistant message of the run; the run's first
+                // rendered message also collects any earlier orphan turns.
+                let first_of_run = !messages[..index].iter().any(|earlier| {
+                    earlier.role == MessageRole::Assistant && earlier.run_id == message.run_id
+                });
+                let next_turn = messages[index + 1..]
                     .iter()
-                    .filter(|tool_call| tool_call.run_id == message.run_id)
+                    .find(|later| {
+                        later.role == MessageRole::Assistant && later.run_id == message.run_id
+                    })
+                    .map_or(u16::MAX, |later| later.turn_ordinal);
+                let mut run_calls = tool_calls
+                    .iter()
+                    .filter(|tool_call| {
+                        tool_call.run_id == message.run_id
+                            && tool_call.turn_ordinal < next_turn
+                            && (first_of_run || tool_call.turn_ordinal >= message.turn_ordinal)
+                    })
                     .collect::<Vec<_>>();
+                run_calls.sort_by_key(|tool_call| (tool_call.turn_ordinal, tool_call.call_ordinal));
                 if !run_calls.is_empty() {
-                    rendered_tool_runs.push(message.run_id);
                     lines.push(Line::default());
                     lines.extend(render_tool_calls(
                         &run_calls,
@@ -2004,6 +2019,7 @@ mod tests {
             id: MessageId::from_bytes([byte; 16]),
             session_id: SessionId::from_bytes([1; 16]),
             run_id: RunId::from_bytes([2; 16]),
+            turn_ordinal: 0,
             role: MessageRole::Assistant,
             state: MessageState::Complete,
             output,

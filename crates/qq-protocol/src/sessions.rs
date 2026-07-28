@@ -383,6 +383,11 @@ pub struct MessageSnapshot {
     pub id: MessageId,
     pub session_id: SessionId,
     pub run_id: RunId,
+    /// The model turn this message belongs to within its run. User messages
+    /// (and assistant messages persisted before per-turn messages existed)
+    /// carry 0; assistant turns are 1-based, matching tool-call ordinals.
+    #[serde(default)]
+    pub turn_ordinal: u16,
     pub role: MessageRole,
     pub state: MessageState,
     pub output: String,
@@ -704,6 +709,40 @@ mod tests {
             serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
             outcome
         );
+    }
+
+    #[test]
+    fn message_snapshots_round_trip_turn_ordinal_and_default_legacy_payloads_to_zero() {
+        let message = MessageSnapshot {
+            id: id(6),
+            session_id: id(3),
+            run_id: id(4),
+            turn_ordinal: 2,
+            role: MessageRole::Assistant,
+            state: MessageState::Streaming,
+            output: "checking".to_owned(),
+            refusal: String::new(),
+            created_at_ms: 11,
+        };
+        let event = SessionEvent::AssistantMessageStarted {
+            message: message.clone(),
+        };
+
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "assistant_message_started");
+        assert_eq!(encoded["message"]["turn_ordinal"], 2);
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            event
+        );
+
+        // Events persisted before the protocol carried turn_ordinal must
+        // still decode; legacy messages default to turn 0.
+        let mut legacy = serde_json::to_value(&message).unwrap();
+        legacy.as_object_mut().unwrap().remove("turn_ordinal");
+        let decoded = serde_json::from_value::<MessageSnapshot>(legacy).unwrap();
+        assert_eq!(decoded.turn_ordinal, 0);
+        assert_eq!(decoded.output, "checking");
     }
 
     #[test]
