@@ -1,11 +1,13 @@
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
-    io::{BufRead, BufReader, Read},
+    collections::HashMap,
+    fmt::Write as _,
+    io::{BufRead, BufReader, Cursor, Read, Take, Write as _},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -20,6 +22,9 @@ const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_READ_LINES: usize = 2_000;
 const MAX_READ_OFFSET: usize = 100_000;
 const MAX_READ_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+/// Files above this size cannot be edited or overwritten; matching the read
+/// scan cap means every editable file's whole-content hash is recordable.
+const MAX_EDIT_FILE_BYTES: u64 = MAX_READ_SCAN_BYTES;
 const MAX_DIRECTORY_ENTRIES: usize = 1_000;
 const MAX_SEARCH_ENTRIES: usize = 20_000;
 const MAX_SEARCH_RESULTS: usize = 200;
@@ -28,6 +33,10 @@ const MAX_SEARCH_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BLOCKING_TOOL_TASKS: usize = 8;
 const TRUNCATION_MARKER: &str = "\n...[truncated by qq]\n";
 static BLOCKING_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+/// One apply lock per canonical workspace path, shared by every session in
+/// this process; entries are pruned once no workspace handle keeps them alive.
+static APPLY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<StdMutex<()>>>>> = OnceLock::new();
+static TEMP_FILE_ORDINAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static TEST_EXECUTIONS_STARTED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -36,6 +45,9 @@ static TEST_EXECUTION_BARRIER: OnceLock<std::sync::Barrier> = OnceLock::new();
 #[derive(Clone)]
 pub(crate) struct Workspace {
     root: Arc<Dir>,
+    path: Arc<PathBuf>,
+    /// Serializes the hash-check-and-rename apply section for this workspace.
+    apply_lock: Arc<StdMutex<()>>,
 }
 
 impl Workspace {
@@ -70,8 +82,77 @@ impl Workspace {
 
         Ok(Self {
             root: Arc::new(Dir::from_std_file(root)),
+            apply_lock: apply_lock(path),
+            path: Arc::new(path.to_owned()),
         })
     }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn apply_lock(path: &Path) -> Arc<StdMutex<()>> {
+    let registry = APPLY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut locks = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(StdMutex::new(()));
+    locks.insert(path.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Content hashes for every workspace file one session has read, keyed by
+/// canonical workspace-relative path. `read_file` records into it on each
+/// successful read, applied edits refresh it, and a future `@` file
+/// attachment records through the same [`FileState::record`] seam so pinned
+/// files satisfy the read-before-write rule without a redundant read.
+#[derive(Default)]
+pub(crate) struct FileState {
+    entries: StdMutex<HashMap<String, String>>,
+}
+
+impl FileState {
+    pub(crate) fn with_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            entries: StdMutex::new(entries.into_iter().collect()),
+        }
+    }
+
+    pub(crate) fn record(&self, path: String, hash: String) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path, hash);
+    }
+
+    fn recorded(&self, path: &str) -> Option<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .cloned()
+    }
+}
+
+/// A file-state map entry produced by a successful tool execution, carried on
+/// the tool result so session persistence can record it durably.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileStateUpdate {
+    pub(crate) path: String,
+    pub(crate) hash: String,
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hash, "{byte:02x}");
+    }
+    hash
 }
 
 pub(crate) async fn open_workspace(
@@ -113,6 +194,8 @@ enum BuiltInTool {
     ReadFile,
     ListDir,
     Search,
+    EditFile,
+    WriteFile,
     #[cfg(test)]
     TestDelay,
     #[cfg(test)]
@@ -122,13 +205,21 @@ enum BuiltInTool {
 }
 
 impl BuiltInTool {
-    const ALL: [Self; 3] = [Self::ReadFile, Self::ListDir, Self::Search];
+    const ALL: [Self; 5] = [
+        Self::ReadFile,
+        Self::ListDir,
+        Self::Search,
+        Self::EditFile,
+        Self::WriteFile,
+    ];
 
     fn from_name(name: &str) -> Option<Self> {
         match name {
             "read_file" => Some(Self::ReadFile),
             "list_dir" => Some(Self::ListDir),
             "search" => Some(Self::Search),
+            "edit_file" => Some(Self::EditFile),
+            "write_file" => Some(Self::WriteFile),
             #[cfg(test)]
             "__test_delay" => Some(Self::TestDelay),
             #[cfg(test)]
@@ -181,6 +272,34 @@ impl BuiltInTool {
                     "additionalProperties": false
                 }),
             ),
+            Self::EditFile => ToolSpec::new(
+                "edit_file",
+                "Replace an exact string in a workspace file that was read earlier in this session. Fails if old_string is missing or ambiguous; set replace_all to replace every occurrence.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "old_string": { "type": "string", "minLength": 1 },
+                        "new_string": { "type": "string" },
+                        "replace_all": { "type": "boolean" }
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                    "additionalProperties": false
+                }),
+            ),
+            Self::WriteFile => ToolSpec::new(
+                "write_file",
+                "Create a workspace file, or fully overwrite one that was read earlier in this session.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }),
+            ),
             #[cfg(test)]
             Self::TestDelay | Self::TestMutate | Self::TestShell => {
                 unreachable!("test tools are not advertised")
@@ -203,6 +322,7 @@ pub(crate) fn specs() -> Vec<ToolSpec> {
 
 pub(crate) async fn execute(
     workspace: Workspace,
+    file_state: Arc<FileState>,
     name: String,
     arguments: String,
     cancelled: Arc<AtomicBool>,
@@ -216,7 +336,7 @@ pub(crate) async fn execute(
     };
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        execute_blocking(&workspace, &name, &arguments, &cancelled)
+        execute_blocking(&workspace, &file_state, &name, &arguments, &cancelled)
     })
     .await
     {
@@ -229,6 +349,9 @@ pub(crate) async fn execute(
 pub(crate) struct ToolExecutionResult {
     pub(crate) content: String,
     pub(crate) is_error: bool,
+    /// Set when the execution (re)recorded a file's content hash, so the
+    /// session store can persist the file-state map alongside the result.
+    pub(crate) file_state: Option<FileStateUpdate>,
 }
 
 impl ToolExecutionResult {
@@ -236,6 +359,7 @@ impl ToolExecutionResult {
         Self {
             content: truncate_result(content),
             is_error: false,
+            file_state: None,
         }
     }
 
@@ -243,6 +367,7 @@ impl ToolExecutionResult {
         Self {
             content: truncate_result(message.into()),
             is_error: true,
+            file_state: None,
         }
     }
 }
@@ -273,6 +398,23 @@ struct SearchArgs {
     path: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditFileArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+}
+
 #[cfg(test)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -281,6 +423,14 @@ struct TestDelayArgs {
     result: String,
     #[serde(default)]
     synchronize: bool,
+}
+
+#[cfg(test)]
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TestMutateArgs {
+    delay_ms: u64,
+    result: Option<String>,
 }
 
 #[cfg(test)]
@@ -306,6 +456,7 @@ fn default_search_path() -> String {
 
 fn execute_blocking(
     workspace: &Workspace,
+    file_state: &FileState,
     name: &str,
     arguments: &str,
     cancelled: &AtomicBool,
@@ -321,7 +472,7 @@ fn execute_blocking(
                     return ToolExecutionResult::error(format!("invalid arguments: {error}"));
                 }
             };
-            read_file(workspace, arguments, cancelled)
+            read_file(workspace, file_state, arguments, cancelled)
         }
         Some(BuiltInTool::ListDir) => {
             let arguments = match serde_json::from_str::<ListDirArgs>(arguments) {
@@ -340,6 +491,24 @@ fn execute_blocking(
                 }
             };
             search(workspace, arguments, cancelled)
+        }
+        Some(BuiltInTool::EditFile) => {
+            let arguments = match serde_json::from_str::<EditFileArgs>(arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("invalid arguments: {error}"));
+                }
+            };
+            edit_file(workspace, file_state, &arguments)
+        }
+        Some(BuiltInTool::WriteFile) => {
+            let arguments = match serde_json::from_str::<WriteFileArgs>(arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("invalid arguments: {error}"));
+                }
+            };
+            write_file(workspace, file_state, &arguments)
         }
         #[cfg(test)]
         Some(BuiltInTool::TestDelay) => {
@@ -364,7 +533,22 @@ fn execute_blocking(
             ToolExecutionResult::success(arguments.result)
         }
         #[cfg(test)]
-        Some(BuiltInTool::TestMutate) => ToolExecutionResult::success("mutated".to_owned()),
+        Some(BuiltInTool::TestMutate) => {
+            let arguments = match serde_json::from_str::<TestMutateArgs>(arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("invalid arguments: {error}"));
+                }
+            };
+            TEST_EXECUTIONS_STARTED.fetch_add(1, Ordering::Release);
+            for _ in 0..arguments.delay_ms {
+                if cancelled.load(Ordering::Acquire) {
+                    return ToolExecutionResult::error("tool execution was cancelled");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            ToolExecutionResult::success(arguments.result.unwrap_or_else(|| "mutated".to_owned()))
+        }
         #[cfg(test)]
         Some(BuiltInTool::TestShell) => ToolExecutionResult::success("shell ran".to_owned()),
         None => ToolExecutionResult::error(format!("unknown tool {name:?}")),
@@ -373,6 +557,7 @@ fn execute_blocking(
 
 fn read_file(
     workspace: &Workspace,
+    file_state: &FileState,
     arguments: ReadFileArgs,
     cancelled: &AtomicBool,
 ) -> ToolExecutionResult {
@@ -395,10 +580,37 @@ fn read_file(
         Ok(file) => file,
         Err(error) => return ToolExecutionResult::error(format!("could not open file: {error}")),
     };
-    let mut reader = BufReader::new(file).take(MAX_READ_SCAN_BYTES);
+    // The whole content (bounded by the scan cap) is read so the session's
+    // file-state map can record a full-file hash for the staleness guard.
+    // Larger files record nothing: they are not editable anyway.
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_READ_SCAN_BYTES + 1).read_to_end(&mut bytes) {
+        return ToolExecutionResult::error(format!("could not read file: {error}"));
+    }
+    let update = (bytes.len() as u64 <= MAX_READ_SCAN_BYTES).then(|| FileStateUpdate {
+        path: path.to_string_lossy().into_owned(),
+        hash: content_hash(&bytes),
+    });
+    let reader = BufReader::new(Cursor::new(bytes.as_slice())).take(MAX_READ_SCAN_BYTES);
+    let mut result = window_lines(reader, arguments.offset, arguments.limit, cancelled);
+    if !result.is_error
+        && let Some(update) = update
+    {
+        file_state.record(update.path.clone(), update.hash.clone());
+        result.file_state = Some(update);
+    }
+    result
+}
+
+fn window_lines<R: Read>(
+    mut reader: Take<BufReader<R>>,
+    offset: usize,
+    limit: usize,
+    cancelled: &AtomicBool,
+) -> ToolExecutionResult {
     let mut output = String::new();
     let mut line = Vec::new();
-    let end = arguments.offset.saturating_add(arguments.limit);
+    let end = offset.saturating_add(limit);
     for line_number in 1..end {
         if cancelled.load(Ordering::Acquire) {
             return ToolExecutionResult::error("tool execution was cancelled");
@@ -413,7 +625,7 @@ fn read_file(
         if read == 0 {
             break;
         }
-        if line_number >= arguments.offset {
+        if line_number >= offset {
             let text = match std::str::from_utf8(&line) {
                 Ok(text) => text,
                 // `error_len() == None` means the data ends inside a multibyte
@@ -445,6 +657,297 @@ fn read_file(
         }
     }
     ToolExecutionResult::success(output)
+}
+
+fn edit_file(
+    workspace: &Workspace,
+    file_state: &FileState,
+    arguments: &EditFileArgs,
+) -> ToolExecutionResult {
+    if arguments.old_string.is_empty() {
+        return ToolExecutionResult::error("old_string must not be empty");
+    }
+    if arguments.old_string == arguments.new_string {
+        return ToolExecutionResult::error(
+            "old_string and new_string are identical; there is nothing to change",
+        );
+    }
+    let path = match contained_path(workspace, &arguments.path) {
+        Ok(path) => path,
+        Err(error) => return ToolExecutionResult::error(error),
+    };
+    if !workspace.root.is_file(&path) {
+        return ToolExecutionResult::error("path is not a file");
+    }
+    let key = path.to_string_lossy().into_owned();
+    let Some(recorded) = file_state.recorded(&key) else {
+        return ToolExecutionResult::error(format!(
+            "{} has not been read in this session; call read_file on it first, then retry the edit",
+            arguments.path
+        ));
+    };
+
+    // The exclusive apply section: re-hash, validate, and rename while no
+    // other session can interleave a write to this workspace.
+    let guard = workspace
+        .apply_lock
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let current = match read_editable(workspace, &path) {
+        Ok(current) => current,
+        Err(error) => return ToolExecutionResult::error(error),
+    };
+    if content_hash(&current.bytes) != recorded {
+        return ToolExecutionResult::error(stale_file_error(&arguments.path));
+    }
+    let content = match std::str::from_utf8(&current.bytes) {
+        Ok(content) => content,
+        Err(_) => return ToolExecutionResult::error("file is not valid UTF-8"),
+    };
+    let occurrences = content.matches(&arguments.old_string).count();
+    if occurrences == 0 {
+        return ToolExecutionResult::error(format!(
+            "old_string was not found in {}; re-read the file and match its current content exactly",
+            arguments.path
+        ));
+    }
+    if occurrences > 1 && !arguments.replace_all {
+        return ToolExecutionResult::error(format!(
+            "old_string occurs {occurrences} times in {}; extend it until it is unique, or set replace_all",
+            arguments.path
+        ));
+    }
+    let new_content = if arguments.replace_all {
+        content.replace(&arguments.old_string, &arguments.new_string)
+    } else {
+        content.replacen(&arguments.old_string, &arguments.new_string, 1)
+    };
+    if new_content.len() as u64 > MAX_EDIT_FILE_BYTES {
+        return ToolExecutionResult::error(format!(
+            "the edited content exceeds the {} MiB file size limit",
+            MAX_EDIT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    if let Err(error) = apply_atomically(
+        workspace,
+        &path,
+        new_content.as_bytes(),
+        Some(current.permissions),
+    ) {
+        return ToolExecutionResult::error(error);
+    }
+    drop(guard);
+
+    let replaced = if arguments.replace_all {
+        occurrences
+    } else {
+        1
+    };
+    let hash = content_hash(new_content.as_bytes());
+    file_state.record(key.clone(), hash.clone());
+    let mut result = ToolExecutionResult::success(format!(
+        "Edited {}: replaced {replaced} occurrence(s).",
+        arguments.path
+    ));
+    result.file_state = Some(FileStateUpdate { path: key, hash });
+    result
+}
+
+fn write_file(
+    workspace: &Workspace,
+    file_state: &FileState,
+    arguments: &WriteFileArgs,
+) -> ToolExecutionResult {
+    if arguments.content.len() as u64 > MAX_EDIT_FILE_BYTES {
+        return ToolExecutionResult::error(format!(
+            "content exceeds the {} MiB file size limit",
+            MAX_EDIT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let path = match resolve_write_path(workspace, &arguments.path) {
+        Ok(path) => path,
+        Err(error) => return ToolExecutionResult::error(error),
+    };
+    let key = path.to_string_lossy().into_owned();
+
+    let guard = workspace
+        .apply_lock
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let created = match workspace.root.symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            // Overwrites follow the same read-before-write and staleness
+            // rules as edits; only brand-new files are exempt.
+            let Some(recorded) = file_state.recorded(&key) else {
+                return ToolExecutionResult::error(format!(
+                    "{} already exists but has not been read in this session; call read_file on it first, then retry the overwrite",
+                    arguments.path
+                ));
+            };
+            let current = match read_editable(workspace, &path) {
+                Ok(current) => current,
+                Err(error) => return ToolExecutionResult::error(error),
+            };
+            if content_hash(&current.bytes) != recorded {
+                return ToolExecutionResult::error(stale_file_error(&arguments.path));
+            }
+            if let Err(error) = apply_atomically(
+                workspace,
+                &path,
+                arguments.content.as_bytes(),
+                Some(current.permissions),
+            ) {
+                return ToolExecutionResult::error(error);
+            }
+            false
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return ToolExecutionResult::error("path is a symlink; address its target directly");
+        }
+        Ok(_) => return ToolExecutionResult::error("path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(error) =
+                apply_atomically(workspace, &path, arguments.content.as_bytes(), None)
+            {
+                return ToolExecutionResult::error(error);
+            }
+            true
+        }
+        Err(error) => {
+            return ToolExecutionResult::error(format!("could not inspect path: {error}"));
+        }
+    };
+    drop(guard);
+
+    let hash = content_hash(arguments.content.as_bytes());
+    file_state.record(key.clone(), hash.clone());
+    let mut result = ToolExecutionResult::success(format!(
+        "{} {} ({} bytes).",
+        if created { "Created" } else { "Wrote" },
+        arguments.path,
+        arguments.content.len()
+    ));
+    result.file_state = Some(FileStateUpdate { path: key, hash });
+    result
+}
+
+fn stale_file_error(path: &str) -> String {
+    format!("{path} changed since it was last read in this session; read it again and retry")
+}
+
+struct EditableFile {
+    bytes: Vec<u8>,
+    permissions: cap_std::fs::Permissions,
+}
+
+fn read_editable(workspace: &Workspace, path: &Path) -> Result<EditableFile, String> {
+    let file = workspace
+        .root
+        .open(path)
+        .map_err(|error| format!("could not open file: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect file: {error}"))?;
+    if metadata.len() > MAX_EDIT_FILE_BYTES {
+        return Err(format!(
+            "file exceeds the {} MiB editable size limit",
+            MAX_EDIT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
+    file.take(MAX_EDIT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read file: {error}"))?;
+    if bytes.len() as u64 > MAX_EDIT_FILE_BYTES {
+        return Err(format!(
+            "file exceeds the {} MiB editable size limit",
+            MAX_EDIT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(EditableFile {
+        bytes,
+        permissions: metadata.permissions(),
+    })
+}
+
+/// Resolves a `write_file` target, which may not exist yet: an existing path
+/// resolves through the same containment as every other tool, and a new file
+/// resolves its parent directory and re-attaches the final component.
+fn resolve_write_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, String> {
+    let resolve_error = match contained_path(workspace, requested) {
+        Ok(path) => return Ok(path),
+        Err(error) => error,
+    };
+    let requested_path = Path::new(requested);
+    if requested.is_empty() || requested_path.is_absolute() {
+        return Err(resolve_error);
+    }
+    let Some(file_name) = requested_path.file_name() else {
+        return Err(resolve_error);
+    };
+    let parent = match requested_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_string_lossy().into_owned(),
+        _ => ".".to_owned(),
+    };
+    let parent = contained_path(workspace, &parent)
+        .map_err(|error| format!("parent directory could not be resolved: {error}"))?;
+    if !workspace.root.is_dir(&parent) {
+        return Err("parent path is not a directory".to_owned());
+    }
+    if parent.as_os_str().is_empty() || parent == Path::new(".") {
+        Ok(PathBuf::from(file_name))
+    } else {
+        Ok(parent.join(file_name))
+    }
+}
+
+/// Writes `bytes` to a temporary file in the target's directory through the
+/// workspace capability, preserves permissions when replacing an existing
+/// file, and renames into place so readers never observe a partial write.
+fn apply_atomically(
+    workspace: &Workspace,
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<cap_std::fs::Permissions>,
+) -> Result<(), String> {
+    let temp_name = format!(
+        ".qq-apply-{}-{}.tmp",
+        std::process::id(),
+        TEMP_FILE_ORDINAL.fetch_add(1, Ordering::Relaxed),
+    );
+    let temp_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(&temp_name),
+        _ => PathBuf::from(&temp_name),
+    };
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut temp = workspace
+        .root
+        .open_with(&temp_path, &options)
+        .map_err(|error| format!("could not create a temporary file: {error}"))?;
+    let written = temp
+        .write_all(bytes)
+        .and_then(|()| temp.sync_all())
+        .map_err(|error| format!("could not write the temporary file: {error}"));
+    drop(temp);
+    let applied = written
+        .and_then(|()| match permissions {
+            Some(permissions) => workspace
+                .root
+                .set_permissions(&temp_path, permissions)
+                .map_err(|error| format!("could not preserve file permissions: {error}")),
+            None => Ok(()),
+        })
+        .and_then(|()| {
+            workspace
+                .root
+                .rename(&temp_path, &workspace.root, path)
+                .map_err(|error| format!("could not apply the change: {error}"))
+        });
+    if applied.is_err() {
+        let _ = workspace.root.remove_file(&temp_path);
+    }
+    applied
 }
 
 fn list_dir(
@@ -778,24 +1281,37 @@ mod tests {
 
     use super::*;
 
+    fn run_tool(
+        workspace: &Workspace,
+        state: &FileState,
+        name: &str,
+        arguments: &str,
+    ) -> ToolExecutionResult {
+        execute_blocking(workspace, state, name, arguments, &AtomicBool::new(false))
+    }
+
     #[test]
     fn read_and_list_are_bounded_and_deterministic() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("b.txt"), "one\ntwo\nthree\n").unwrap();
         fs::write(directory.path().join("a.txt"), "a").unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
 
-        let cancelled = AtomicBool::new(false);
-        let listed = execute_blocking(&workspace, "list_dir", r#"{"path":"."}"#, &cancelled);
+        let listed = run_tool(&workspace, &state, "list_dir", r#"{"path":"."}"#);
         assert_eq!(listed.content, "a.txt\nb.txt\n");
 
-        let read = execute_blocking(
+        let read = run_tool(
             &workspace,
+            &state,
             "read_file",
             r#"{"path":"b.txt","offset":2,"limit":1}"#,
-            &cancelled,
         );
         assert_eq!(read.content, "two\n");
+        let update = read.file_state.unwrap();
+        assert_eq!(update.path, "b.txt");
+        assert_eq!(update.hash, content_hash(b"one\ntwo\nthree\n"));
+        assert_eq!(state.recorded("b.txt"), Some(update.hash));
     }
 
     #[test]
@@ -808,11 +1324,11 @@ mod tests {
         .unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
 
-        let result = execute_blocking(
+        let result = run_tool(
             &workspace,
+            &FileState::default(),
             "read_file",
             r#"{"path":"large.txt"}"#,
-            &AtomicBool::new(false),
         );
 
         assert!(!result.is_error);
@@ -832,11 +1348,11 @@ mod tests {
         .unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
 
-        let result = execute_blocking(
+        let result = run_tool(
             &workspace,
+            &FileState::default(),
             "read_file",
             r#"{"path":"ansi.log"}"#,
-            &AtomicBool::new(false),
         );
 
         assert!(!result.is_error);
@@ -857,11 +1373,11 @@ mod tests {
         fs::write(directory.path().join("split.txt"), &content).unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
 
-        let result = execute_blocking(
+        let result = run_tool(
             &workspace,
+            &FileState::default(),
             "read_file",
             r#"{"path":"split.txt","offset":2,"limit":1}"#,
-            &AtomicBool::new(false),
         );
 
         assert!(!result.is_error, "unexpected error: {}", result.content);
@@ -880,11 +1396,11 @@ mod tests {
         fs::write(directory.path().join("exact.txt"), &content).unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
 
-        let result = execute_blocking(
+        let result = run_tool(
             &workspace,
+            &FileState::default(),
             "read_file",
             r#"{"path":"exact.txt","offset":2,"limit":1}"#,
-            &AtomicBool::new(false),
         );
 
         assert!(!result.is_error);
@@ -898,23 +1414,18 @@ mod tests {
         fs::write(outside.path().join("secret"), "hidden").unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
 
-        let cancelled = AtomicBool::new(false);
-        let parent = execute_blocking(
-            &workspace,
-            "read_file",
-            r#"{"path":"../secret"}"#,
-            &cancelled,
-        );
+        let state = FileState::default();
+        let parent = run_tool(&workspace, &state, "read_file", r#"{"path":"../secret"}"#);
         assert!(parent.is_error);
 
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(outside.path(), directory.path().join("outside")).unwrap();
-            let symlink = execute_blocking(
+            let symlink = run_tool(
                 &workspace,
+                &state,
                 "read_file",
                 r#"{"path":"outside/secret"}"#,
-                &cancelled,
             );
             assert!(symlink.is_error);
         }
@@ -927,11 +1438,11 @@ mod tests {
         fs::write(directory.path().join("src/needle.rs"), "hay\nneedle here\n").unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
 
-        let result = execute_blocking(
+        let result = run_tool(
             &workspace,
+            &FileState::default(),
             "search",
             r#"{"query":"needle"}"#,
-            &AtomicBool::new(false),
         );
         assert!(!result.is_error);
         assert!(result.content.contains("src/needle.rs: filename match"));
@@ -946,11 +1457,11 @@ mod tests {
         file.set_len(MAX_SEARCH_BYTES + 1).unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
 
-        let result = execute_blocking(
+        let result = run_tool(
             &workspace,
+            &FileState::default(),
             "search",
             r#"{"query":"needle"}"#,
-            &AtomicBool::new(false),
         );
 
         assert!(!result.is_error);
@@ -963,12 +1474,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("note.txt"), "content").unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
-        let cancelled = AtomicBool::new(true);
         let result = execute_blocking(
             &workspace,
+            &FileState::default(),
             "read_file",
             r#"{"path":"note.txt"}"#,
-            &cancelled,
+            &AtomicBool::new(true),
         );
         assert!(result.is_error);
         assert!(result.content.contains("cancelled"));
@@ -976,13 +1487,391 @@ mod tests {
         for index in 0..=MAX_DIRECTORY_ENTRIES {
             fs::write(directory.path().join(format!("entry-{index}")), "").unwrap();
         }
-        let result = execute_blocking(
+        let result = run_tool(
             &workspace,
+            &FileState::default(),
             "list_dir",
             r#"{"path":"."}"#,
-            &AtomicBool::new(false),
         );
         assert!(result.is_error);
         assert!(result.content.contains("more than"));
+    }
+
+    #[test]
+    fn edit_replaces_exact_strings_and_refreshes_the_recorded_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("main.rs"),
+            "fn one() {}\nfn two() {}\n",
+        )
+        .unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+        run_tool(&workspace, &state, "read_file", r#"{"path":"main.rs"}"#);
+
+        let edited = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"main.rs","old_string":"fn one() {}","new_string":"fn one() { start() }"}"#,
+        );
+        assert!(!edited.is_error, "unexpected error: {}", edited.content);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("main.rs")).unwrap(),
+            "fn one() { start() }\nfn two() {}\n"
+        );
+        let update = edited.file_state.unwrap();
+        assert_eq!(update.path, "main.rs");
+        assert_eq!(
+            update.hash,
+            content_hash(b"fn one() { start() }\nfn two() {}\n")
+        );
+
+        // The recorded hash was refreshed by the apply, so a follow-up edit
+        // needs no intervening read.
+        let followup = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"main.rs","old_string":"fn two() {}","new_string":"fn two() { end() }"}"#,
+        );
+        assert!(!followup.is_error, "unexpected error: {}", followup.content);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("main.rs")).unwrap(),
+            "fn one() { start() }\nfn two() { end() }\n"
+        );
+    }
+
+    #[test]
+    fn edit_replace_all_replaces_every_occurrence() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("list.txt"), "item\nitem\nitem\n").unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+        run_tool(&workspace, &state, "read_file", r#"{"path":"list.txt"}"#);
+
+        let edited = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"list.txt","old_string":"item","new_string":"entry","replace_all":true}"#,
+        );
+        assert!(!edited.is_error, "unexpected error: {}", edited.content);
+        assert!(edited.content.contains("3 occurrence"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("list.txt")).unwrap(),
+            "entry\nentry\nentry\n"
+        );
+    }
+
+    #[test]
+    fn edit_fails_precisely_on_absent_and_ambiguous_old_strings() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("list.txt"), "item\nitem\n").unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+        run_tool(&workspace, &state, "read_file", r#"{"path":"list.txt"}"#);
+
+        let absent = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"list.txt","old_string":"missing","new_string":"other"}"#,
+        );
+        assert!(absent.is_error);
+        assert!(absent.content.contains("not found"), "{}", absent.content);
+
+        let ambiguous = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"list.txt","old_string":"item","new_string":"entry"}"#,
+        );
+        assert!(ambiguous.is_error);
+        assert!(
+            ambiguous.content.contains("2 times") && ambiguous.content.contains("replace_all"),
+            "{}",
+            ambiguous.content
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("list.txt")).unwrap(),
+            "item\nitem\n"
+        );
+    }
+
+    #[test]
+    fn edits_and_overwrites_require_a_prior_read_in_this_session() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.txt"), "content\n").unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+
+        let edit = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"note.txt","old_string":"content","new_string":"changed"}"#,
+        );
+        assert!(edit.is_error);
+        assert!(edit.content.contains("read_file"), "{}", edit.content);
+
+        let overwrite = run_tool(
+            &workspace,
+            &state,
+            "write_file",
+            r#"{"path":"note.txt","content":"replaced\n"}"#,
+        );
+        assert!(overwrite.is_error);
+        assert!(
+            overwrite.content.contains("read_file"),
+            "{}",
+            overwrite.content
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("note.txt")).unwrap(),
+            "content\n"
+        );
+    }
+
+    #[test]
+    fn stale_files_fail_the_apply_until_they_are_reread() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.txt"), "original\n").unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+        run_tool(&workspace, &state, "read_file", r#"{"path":"note.txt"}"#);
+
+        // An external writer (editor, another process) changes the file
+        // between the read and the apply.
+        fs::write(directory.path().join("note.txt"), "external change\n").unwrap();
+        let stale = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"note.txt","old_string":"original","new_string":"edited"}"#,
+        );
+        assert!(stale.is_error);
+        assert!(stale.content.contains("changed since"), "{}", stale.content);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("note.txt")).unwrap(),
+            "external change\n"
+        );
+
+        run_tool(&workspace, &state, "read_file", r#"{"path":"note.txt"}"#);
+        let retried = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"note.txt","old_string":"external change","new_string":"edited"}"#,
+        );
+        assert!(!retried.is_error, "unexpected error: {}", retried.content);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("note.txt")).unwrap(),
+            "edited\n"
+        );
+    }
+
+    #[test]
+    fn concurrent_sessions_conflict_at_file_granularity() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("shared.txt"), "base\n").unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let winner = FileState::default();
+        let loser = FileState::default();
+        run_tool(&workspace, &winner, "read_file", r#"{"path":"shared.txt"}"#);
+        run_tool(&workspace, &loser, "read_file", r#"{"path":"shared.txt"}"#);
+
+        let won = run_tool(
+            &workspace,
+            &winner,
+            "edit_file",
+            r#"{"path":"shared.txt","old_string":"base","new_string":"winner"}"#,
+        );
+        assert!(!won.is_error, "unexpected error: {}", won.content);
+
+        let lost = run_tool(
+            &workspace,
+            &loser,
+            "edit_file",
+            r#"{"path":"shared.txt","old_string":"base","new_string":"loser"}"#,
+        );
+        assert!(lost.is_error);
+        assert!(lost.content.contains("changed since"), "{}", lost.content);
+
+        run_tool(&workspace, &loser, "read_file", r#"{"path":"shared.txt"}"#);
+        let reconciled = run_tool(
+            &workspace,
+            &loser,
+            "edit_file",
+            r#"{"path":"shared.txt","old_string":"winner","new_string":"reconciled"}"#,
+        );
+        assert!(
+            !reconciled.is_error,
+            "unexpected error: {}",
+            reconciled.content
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("shared.txt")).unwrap(),
+            "reconciled\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_applies_preserve_permissions_and_leave_no_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("run.sh");
+        fs::write(&target, "echo one\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o754)).unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+        run_tool(&workspace, &state, "read_file", r#"{"path":"run.sh"}"#);
+
+        let edited = run_tool(
+            &workspace,
+            &state,
+            "edit_file",
+            r#"{"path":"run.sh","old_string":"echo one","new_string":"echo two"}"#,
+        );
+        assert!(!edited.is_error, "unexpected error: {}", edited.content);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "echo two\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o754
+        );
+
+        let overwritten = run_tool(
+            &workspace,
+            &state,
+            "write_file",
+            r#"{"path":"run.sh","content":"echo three\n"}"#,
+        );
+        assert!(
+            !overwritten.is_error,
+            "unexpected error: {}",
+            overwritten.content
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o754
+        );
+        let leftovers = fs::read_dir(directory.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".qq-apply-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn write_file_creates_new_files_without_a_prior_read() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("docs")).unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+
+        let created = run_tool(
+            &workspace,
+            &state,
+            "write_file",
+            r#"{"path":"docs/NOTES.md","content":"first\n"}"#,
+        );
+        assert!(!created.is_error, "unexpected error: {}", created.content);
+        assert!(created.content.starts_with("Created"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("docs/NOTES.md")).unwrap(),
+            "first\n"
+        );
+        let update = created.file_state.unwrap();
+        assert_eq!(update.path, "docs/NOTES.md");
+        assert_eq!(update.hash, content_hash(b"first\n"));
+
+        // The create recorded the written content, so the same session may
+        // overwrite it without an intervening read.
+        let overwritten = run_tool(
+            &workspace,
+            &state,
+            "write_file",
+            r#"{"path":"docs/NOTES.md","content":"second\n"}"#,
+        );
+        assert!(
+            !overwritten.is_error,
+            "unexpected error: {}",
+            overwritten.content
+        );
+        assert!(overwritten.content.starts_with("Wrote"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("docs/NOTES.md")).unwrap(),
+            "second\n"
+        );
+
+        let missing_parent = run_tool(
+            &workspace,
+            &state,
+            "write_file",
+            r#"{"path":"missing/NOTES.md","content":"first\n"}"#,
+        );
+        assert!(missing_parent.is_error);
+    }
+
+    #[test]
+    fn edit_and_write_reject_containment_escapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("victim.txt"), "untouched\n").unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let state = FileState::default();
+
+        for arguments in [
+            r#"{"path":"../victim.txt","old_string":"untouched","new_string":"changed"}"#,
+            r#"{"path":"/etc/hosts","old_string":"localhost","new_string":"changed"}"#,
+        ] {
+            let result = run_tool(&workspace, &state, "edit_file", arguments);
+            assert!(result.is_error, "escape accepted: {arguments}");
+        }
+        for arguments in [
+            r#"{"path":"../victim.txt","content":"changed\n"}"#,
+            r#"{"path":"/tmp/qq-escape.txt","content":"changed\n"}"#,
+            r#"{"path":"..","content":"changed\n"}"#,
+        ] {
+            let result = run_tool(&workspace, &state, "write_file", arguments);
+            assert!(result.is_error, "escape accepted: {arguments}");
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), directory.path().join("outside")).unwrap();
+            let through_symlink = run_tool(
+                &workspace,
+                &state,
+                "write_file",
+                r#"{"path":"outside/victim.txt","content":"changed\n"}"#,
+            );
+            assert!(through_symlink.is_error);
+            std::os::unix::fs::symlink(
+                outside.path().join("victim.txt"),
+                directory.path().join("link.txt"),
+            )
+            .unwrap();
+            let onto_symlink = run_tool(
+                &workspace,
+                &state,
+                "edit_file",
+                r#"{"path":"link.txt","old_string":"untouched","new_string":"changed"}"#,
+            );
+            assert!(onto_symlink.is_error);
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "untouched\n"
+        );
     }
 }

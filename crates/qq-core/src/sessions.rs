@@ -32,6 +32,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     GateDecision, Runtime, RuntimeEvent, RuntimeToolCall, ToolGate, ToolGateFuture, approval,
+    tools::{FileState, FileStateUpdate},
 };
 
 const CONTROL_QUEUE_CAPACITY: usize = 256;
@@ -54,6 +55,7 @@ const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(8);
 const MAX_PERSISTED_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_GRANT_BYTES: usize = 256;
 const MAX_SESSION_GRANTS: u32 = 256;
+const MAX_SESSION_FILES: u32 = 4_096;
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
@@ -556,11 +558,26 @@ async fn execute_run(
         claimed: claimed.clone(),
         cancellation: cancellation.clone(),
     });
+    // The session's durable file-state map seeds the run so read-before-write
+    // tracking survives across runs (and server restarts) in one session.
+    let file_state = match inner.store.session_file_state(claimed.session_id).await {
+        Ok(entries) => Arc::new(FileState::with_entries(entries)),
+        Err(error) => {
+            finish_run(
+                &inner,
+                &claimed,
+                persistence_failure("failed to load the session file state", &error),
+            )
+            .await;
+            return;
+        }
+    };
     let mut events = loaded.runtime.run_loop(
         claimed.messages.clone(),
         PathBuf::from(&claimed.workspace),
         Arc::clone(&tool_cancellation),
         gate,
+        file_state,
     );
     let mut accounting = RunAccountingAccumulator::new(loaded.pricing.clone());
     let mut pending_text = String::new();
@@ -700,10 +717,11 @@ async fn execute_run(
                 id,
                 result,
                 is_error,
+                file_state,
             })) => {
                 match inner
                     .store
-                    .finish_tool_call(&claimed, id, result, is_error)
+                    .finish_tool_call(&claimed, id, result, is_error, file_state)
                     .await
                 {
                     Ok(event) => inner.notify(event.cursor),
@@ -1321,6 +1339,7 @@ impl Store {
         tool_call_id: ToolCallId,
         result: String,
         is_error: bool,
+        file_state: Option<FileStateUpdate>,
     ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
@@ -1332,7 +1351,27 @@ impl Store {
                 tool_call_id,
                 result,
                 is_error,
+                file_state,
             )
+        })
+        .await
+    }
+
+    async fn session_file_state(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<(String, String)>, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            let mut statement = connection
+                .prepare("SELECT path, content_hash FROM session_files WHERE session_id = ?1")
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            statement
+                .query_map([session_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)
         })
         .await
     }
@@ -1549,9 +1588,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_tool_tables(&transaction)?;
             create_grant_table(&transaction)?;
+            create_session_files_table(&transaction)?;
             transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '4')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '5')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1587,9 +1627,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_tool_tables(&transaction)?;
             create_grant_table(&transaction)?;
+            create_session_files_table(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1609,9 +1650,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_tool_tables(&transaction)?;
             create_grant_table(&transaction)?;
+            create_session_files_table(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1633,9 +1675,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                     .map_err(|_| SessionRuntimeError::Persistence)?;
             }
             create_grant_table(&transaction)?;
+            create_session_files_table(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1643,7 +1686,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("4") => {}
+        Some("4") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            create_session_files_table(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("5") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -1715,6 +1773,20 @@ fn create_grant_table(connection: &Connection) -> Result<(), SessionRuntimeError
                  value TEXT NOT NULL,
                  created_at_ms INTEGER NOT NULL,
                  UNIQUE(session_id, kind, value)
+             );",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)
+}
+
+fn create_session_files_table(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE session_files (
+                 session_id TEXT NOT NULL REFERENCES sessions(id),
+                 path TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 UNIQUE(session_id, path)
              );",
         )
         .map_err(|_| SessionRuntimeError::Persistence)
@@ -2692,6 +2764,7 @@ fn finish_tool_call(
     tool_call_id: ToolCallId,
     result: String,
     is_error: bool,
+    file_state: Option<FileStateUpdate>,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let transaction = connection
         .transaction()
@@ -2717,6 +2790,9 @@ fn finish_tool_call(
     if updated != 1 {
         return Err(SessionRuntimeError::Unavailable);
     }
+    if let Some(update) = file_state {
+        record_session_file(&transaction, claimed.session_id, &update, now)?;
+    }
     let tool_call = load_tool_call(&transaction, tool_call_id)?;
     let event = append_event(
         &transaction,
@@ -2734,6 +2810,38 @@ fn finish_tool_call(
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(event)
+}
+
+/// Upserts one file-state entry, evicting the least-recently recorded paths
+/// when the per-session bound is exceeded; an evicted file simply needs a
+/// re-read before its next edit.
+fn record_session_file(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    update: &FileStateUpdate,
+    now: u64,
+) -> Result<(), SessionRuntimeError> {
+    transaction
+        .execute(
+            "INSERT INTO session_files(session_id, path, content_hash, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, path) DO UPDATE
+             SET content_hash = excluded.content_hash,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![session_id.to_string(), update.path, update.hash, now],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    transaction
+        .execute(
+            "DELETE FROM session_files
+             WHERE session_id = ?1 AND rowid NOT IN (
+                 SELECT rowid FROM session_files WHERE session_id = ?1
+                 ORDER BY updated_at_ms DESC, rowid DESC LIMIT ?2
+             )",
+            params![session_id.to_string(), MAX_SESSION_FILES],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(())
 }
 
 fn load_approval_policy(
@@ -4470,6 +4578,154 @@ mod tests {
         }
     }
 
+    /// Replays a fixed tool-call script per run: run N issues its scripted
+    /// calls one per model turn, then completes with text.
+    struct ScriptedRunsLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        runs: Vec<Vec<(&'static str, String)>>,
+        loads: StdMutex<usize>,
+    }
+
+    impl RuntimeLoader for ScriptedRunsLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let mut loads = self.loads.lock().unwrap();
+            let script = self.runs.get(*loads).cloned().unwrap_or_default();
+            *loads += 1;
+            drop(loads);
+            let provider = ScriptedRunProvider {
+                requests: Arc::clone(&self.requests),
+                script,
+                turn: StdMutex::new(0),
+            };
+            Box::pin(async move {
+                Runtime::new(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct ScriptedRunProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        script: Vec<(&'static str, String)>,
+        turn: StdMutex<usize>,
+    }
+
+    impl Provider for ScriptedRunProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            match self.script.get(current) {
+                Some((name, arguments)) => Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: format!("call_{current}"),
+                        name: (*name).to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: format!("call_{current}"),
+                        json: arguments.clone(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: format!("call_{current}"),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ])),
+                None => Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ])),
+            }
+        }
+    }
+
+    struct ScriptedRunsHarness {
+        _directory: TempDir,
+        runtime: SessionRuntime,
+        workspace_path: PathBuf,
+        session_id: SessionId,
+        events: SessionEventStream,
+    }
+
+    async fn scripted_runs_harness(
+        mode: ApprovalMode,
+        runs: Vec<Vec<(&'static str, String)>>,
+    ) -> ScriptedRunsHarness {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(ScriptedRunsLoader {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                runs,
+                loads: StdMutex::new(0),
+            }),
+        )
+        .await
+        .unwrap();
+        let workspace_path = directory.path().to_owned();
+        let (workspace_id, _) = resolve_workspace(&runtime, &workspace_path).await;
+        let created = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: mode,
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        ScriptedRunsHarness {
+            _directory: directory,
+            runtime,
+            workspace_path,
+            session_id,
+            events,
+        }
+    }
+
+    async fn submit_prompt(harness: &ScriptedRunsHarness, prompt: &str) -> RunId {
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: prompt.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        run_id
+    }
+
     struct ApprovalHarness {
         _directory: TempDir,
         runtime: SessionRuntime,
@@ -4654,7 +4910,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "4"
+            "5"
         );
         assert!(
             !connection
@@ -4680,6 +4936,7 @@ mod tests {
             "ask"
         );
         assert!(has_column(&connection, "session_grants", "value").unwrap());
+        assert!(has_column(&connection, "session_files", "content_hash").unwrap());
     }
 
     #[test]
@@ -5125,13 +5382,15 @@ mod tests {
             .unwrap();
         let claimed = store.claim_next_run().await.unwrap().unwrap();
         let tool_call_id = ToolCallId::generate().unwrap();
+        // A mutating call crashed mid-execution: replay must surface an
+        // explicit interrupted result, never re-run the side effect.
         let call = RuntimeToolCall {
             id: tool_call_id,
             turn_ordinal: 1,
             call_ordinal: 1,
             provider_call_id: "provider-call".to_owned(),
-            name: "read_file".to_owned(),
-            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            name: "edit_file".to_owned(),
+            arguments: r#"{"path":"note.txt","old_string":"a","new_string":"b"}"#.to_owned(),
             argument_error: None,
         };
         store
@@ -6266,6 +6525,99 @@ mod tests {
             SessionEvent::ToolCallFinished { tool_call }
                 if tool_call.state == ToolCallState::Completed
         )));
+    }
+
+    #[tokio::test]
+    async fn edit_approvals_carry_the_diff_preview_and_apply_after_approval() {
+        let mut harness = scripted_runs_harness(
+            ApprovalMode::Ask,
+            vec![vec![
+                ("read_file", r#"{"path":"note.txt"}"#.to_owned()),
+                (
+                    "edit_file",
+                    r#"{"path":"note.txt","old_string":"hello world","new_string":"goodbye world"}"#
+                        .to_owned(),
+                ),
+            ]],
+        )
+        .await;
+        let note = harness.workspace_path.join("note.txt");
+        std::fs::write(&note, "hello world\n").unwrap();
+        let run_id = submit_prompt(&harness, "edit the note").await;
+
+        let (observed, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let edit = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::ToolApprovalRequested { edit, .. } => edit.clone(),
+                _ => None,
+            })
+            .expect("edit approval requests carry the diff preview");
+        assert_eq!(edit.path, "note.txt");
+        assert_eq!(edit.diff, "- hello world\n+ goodbye world\n");
+        assert_eq!(
+            std::fs::read_to_string(&note).unwrap(),
+            "hello world\n",
+            "nothing may be applied before approval"
+        );
+
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveOnce,
+        )
+        .await
+        .unwrap();
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.name == "edit_file" && tool_call.state == ToolCallState::Completed
+        )));
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "goodbye world\n");
+    }
+
+    #[tokio::test]
+    async fn auto_mode_applies_edits_without_prompting_and_file_state_survives_runs() {
+        let mut harness = scripted_runs_harness(
+            ApprovalMode::Auto,
+            vec![
+                vec![("read_file", r#"{"path":"note.txt"}"#.to_owned())],
+                vec![(
+                    "edit_file",
+                    r#"{"path":"note.txt","old_string":"hello","new_string":"goodbye"}"#.to_owned(),
+                )],
+            ],
+        )
+        .await;
+        let note = harness.workspace_path.join("note.txt");
+        std::fs::write(&note, "hello\n").unwrap();
+
+        submit_prompt(&harness, "read the note").await;
+        let first = collect_through_finished(&mut harness.events).await;
+        assert!(first.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.name == "read_file" && tool_call.state == ToolCallState::Completed
+        )));
+
+        // The second run edits without re-reading: the read-before-write rule
+        // is satisfied by the durable file-state map recorded by run one.
+        submit_prompt(&harness, "now edit it").await;
+        let second = collect_through_finished(&mut harness.events).await;
+        assert!(
+            !second
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. })),
+            "auto mode must not prompt for workspace edits"
+        );
+        assert!(second.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.name == "edit_file" && tool_call.state == ToolCallState::Completed
+        )));
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "goodbye\n");
     }
 
     #[tokio::test]
