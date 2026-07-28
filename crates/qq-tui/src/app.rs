@@ -678,10 +678,20 @@ impl App {
         else {
             return;
         };
-        if !messages.iter().any(|candidate| candidate.id == message.id) {
-            messages.push(message);
-            retain_recent_messages(messages);
+        if messages.iter().any(|candidate| candidate.id == message.id) {
+            return;
         }
+        // Server snapshots order messages by run first, then by ordinal
+        // within the run, so a prompt queued mid-run sorts after that run's
+        // later per-turn messages. Mirror that live: a message whose run is
+        // already present slots in right after the run's last message, and a
+        // new run appends (runs are created in queue order).
+        let position = messages
+            .iter()
+            .rposition(|candidate| candidate.run_id == message.run_id)
+            .map_or(messages.len(), |index| index + 1);
+        messages.insert(position, message);
+        retain_recent_messages(messages);
     }
 
     fn message_mut(
@@ -2360,6 +2370,76 @@ mod tests {
         let retained = app.sessions[&session_id].messages.as_ref().unwrap();
         assert_eq!(retained.len(), usize::from(SNAPSHOT_MESSAGE_LIMIT));
         assert_eq!(retained.last().unwrap().output, "newest");
+    }
+
+    #[test]
+    fn mid_run_queued_prompts_stay_after_the_streaming_runs_turn_messages() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        app.apply_snapshot(initial);
+        let streaming_run = id(4, RunId::from_bytes);
+        let queued_run = id(5, RunId::from_bytes);
+        let message = |byte, run_id, turn_ordinal, role, state, output: &str| MessageSnapshot {
+            id: id(byte, MessageId::from_bytes),
+            session_id,
+            run_id,
+            turn_ordinal,
+            role,
+            state,
+            output: output.to_owned(),
+            refusal: String::new(),
+            created_at_ms: u64::from(byte),
+        };
+
+        app.push_message(message(
+            6,
+            streaming_run,
+            0,
+            MessageRole::User,
+            MessageState::Complete,
+            "prompt one",
+        ));
+        app.push_message(message(
+            7,
+            streaming_run,
+            1,
+            MessageRole::Assistant,
+            MessageState::Complete,
+            "turn one",
+        ));
+        // A prompt queued mid-run arrives before the run's later per-turn
+        // messages...
+        app.push_message(message(
+            8,
+            queued_run,
+            0,
+            MessageRole::User,
+            MessageState::Queued,
+            "queued prompt",
+        ));
+        app.push_message(message(
+            9,
+            streaming_run,
+            2,
+            MessageRole::Assistant,
+            MessageState::Streaming,
+            "turn two",
+        ));
+
+        // ...yet the live list keeps the snapshot's run-first order: the
+        // whole streaming run, then the queued prompt's run.
+        let outputs = app.sessions[&session_id]
+            .messages
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|message| message.output.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            ["prompt one", "turn one", "turn two", "queued prompt"]
+        );
     }
 
     #[test]

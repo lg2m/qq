@@ -418,7 +418,6 @@ impl FrameRenderer {
                     lines.push(Line::default());
                 }
             }
-            lines.extend(self.render_message(message, width));
             if message.role == MessageRole::Assistant {
                 // Group calls under the assistant message of their turn.
                 // Calls from turns without a message of their own (call-only
@@ -443,15 +442,38 @@ impl FrameRenderer {
                     })
                     .collect::<Vec<_>>();
                 run_calls.sort_by_key(|tool_call| (tool_call.turn_ordinal, tool_call.call_ordinal));
-                if !run_calls.is_empty() {
+                // Call-only turns before the run's first message executed
+                // before its text streamed: render that head group ahead of
+                // the message so execution order holds from the first block.
+                let head = if first_of_run {
+                    run_calls
+                        .iter()
+                        .take_while(|tool_call| tool_call.turn_ordinal < message.turn_ordinal)
+                        .count()
+                } else {
+                    0
+                };
+                if head > 0 {
+                    lines.extend(render_tool_calls(
+                        &run_calls[..head],
+                        app.tool_detail,
+                        app.animation_tick,
+                        width,
+                    ));
+                    lines.push(Line::default());
+                }
+                lines.extend(self.render_message(message, width));
+                if run_calls.len() > head {
                     lines.push(Line::default());
                     lines.extend(render_tool_calls(
-                        &run_calls,
+                        &run_calls[head..],
                         app.tool_detail,
                         app.animation_tick,
                         width,
                     ));
                 }
+            } else {
+                lines.extend(self.render_message(message, width));
             }
         }
         for prompt in app.pending_prompts(session_id) {
@@ -763,6 +785,12 @@ fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
         ));
     }
     if let Some(result) = call.result.as_deref() {
+        // Completed edits whose result carries a unified diff render it with
+        // per-line diff coloring; today qq-core returns only a summary
+        // sentence, so plain results keep the raw treatment.
+        let diff = matches!(call.name.as_str(), "edit_file" | "write_file")
+            && !call.is_error
+            && looks_like_diff(result);
         let text = bounded_tail(result, MAX_TOOL_DETAIL_BYTES);
         let total = text.lines().count();
         if total > MAX_TOOL_RESULT_ROWS || text.len() < result.len() {
@@ -772,13 +800,37 @@ fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
             .lines()
             .skip(total.saturating_sub(MAX_TOOL_RESULT_ROWS))
         {
+            let style = if diff {
+                diff_line_style(line)
+            } else {
+                normal().dim()
+            };
             lines.push(truncate_line(
-                Line::styled(format!("     {line}"), normal().dim()),
+                Line::styled(format!("     {line}"), style),
                 width,
             ));
         }
     }
     lines
+}
+
+/// Whether text is unified-diff-shaped: a hunk header, or both added and
+/// removed lines. Prose summaries ("Edited x: replaced 1 occurrence(s).")
+/// never match, so diff coloring only applies to an actual diff.
+fn looks_like_diff(text: &str) -> bool {
+    let mut added = false;
+    let mut removed = false;
+    for line in text.lines() {
+        if line.starts_with("@@") {
+            return true;
+        }
+        added |= line.starts_with('+');
+        removed |= line.starts_with('-');
+        if added && removed {
+            return true;
+        }
+    }
+    false
 }
 
 fn count_noun(count: usize, singular: &str, plural: &str) -> String {
@@ -1121,9 +1173,10 @@ fn footer_context(app: &App, width: usize) -> Line {
     let context = match app.focused_context_usage() {
         Some((tokens, limit)) if limit > 0 => {
             let tenths = u128::from(tokens) * 1_000 / u128::from(limit);
-            format!(" context: {}.{}%", tenths / 10, tenths % 10)
+            format!(" context: {}.{}% / {limit}", tenths / 10, tenths % 10)
         }
-        Some(_) | None => " context: unavailable".to_owned(),
+        // Unknown usage reads as an empty gauge, never as a gap in the UI.
+        Some(_) | None => " context: 0.0%".to_owned(),
     };
     let focused = app
         .focused
@@ -1148,14 +1201,13 @@ fn footer_workspace(app: &App, width: usize) -> Line {
     } else {
         format!("cwd: {}", app.workspace_path)
     };
+    // An unknown cost reads as zero spend, never as a gap in the UI.
     let cost = app
         .focused
         .and_then(|id| app.sessions.get(&id))
         .and_then(|session| session.summary.estimated_cost_usd_nanos)
-        .map_or_else(
-            || "cost: unavailable ".to_owned(),
-            |cost| format!("cost: {} ", format_cost(cost)),
-        );
+        .unwrap_or(0);
+    let cost = format!("cost: {} ", format_cost(cost));
     align_sides(
         Line::styled(format!(" {workspace}"), muted()),
         Line::styled(cost, accent()),
@@ -2412,6 +2464,134 @@ mod tests {
     }
 
     #[test]
+    fn head_orphan_call_turns_render_before_the_runs_first_message() {
+        let mut app = app_with_messages(2);
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        let messages = session.messages.as_mut().unwrap();
+        messages[0].role = MessageRole::User;
+        messages[1].turn_ordinal = 2;
+        let call = |byte, turn, name: &str, arguments: &str, result: &str| {
+            let mut call = tool_call_snapshot(
+                byte,
+                name,
+                arguments,
+                ToolCallState::Completed,
+                Some(result),
+                false,
+            );
+            call.turn_ordinal = turn;
+            call
+        };
+        // Arrival order is scrambled; rendering re-sorts by (turn, call).
+        session.tool_calls = Some(vec![
+            call(5, 2, "search", r#"{"query":"x"}"#, "No matches found.\n"),
+            call(4, 1, "read_file", r#"{"path":"b.rs"}"#, "b\n"),
+            call(3, 1, "read_file", r#"{"path":"a.rs"}"#, "a\n"),
+        ]);
+
+        let rows = frame_rows(&FrameRenderer::default().transcript(&app, 80));
+
+        // The call-only turn 1 renders before the run's first message (turn
+        // 2), so the transcript reads in execution order.
+        assert_eq!(
+            rows,
+            [
+                " ▌ YOU",
+                " ▌ row 0",
+                "",
+                "   ● read_file a.rs (1 line)",
+                "   ● read_file b.rs (1 line)",
+                "",
+                "   QQ",
+                "   row 1",
+                "",
+                "   ● search \"x\" (no matches)",
+            ]
+        );
+    }
+
+    #[test]
+    fn consecutive_call_only_turns_merge_into_one_folded_group() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        session.messages.as_mut().unwrap()[0].turn_ordinal = 1;
+        let calls = [(2, 1), (3, 1), (4, 2), (5, 3)]
+            .into_iter()
+            .map(|(byte, turn)| {
+                let mut call = tool_call_snapshot(
+                    byte,
+                    "read_file",
+                    r#"{"path":"a.rs"}"#,
+                    ToolCallState::Completed,
+                    Some("a\n"),
+                    false,
+                );
+                call.turn_ordinal = turn;
+                call
+            })
+            .collect::<Vec<_>>();
+        session.tool_calls = Some(calls);
+
+        let rows = frame_rows(&FrameRenderer::default().transcript(&app, 80));
+
+        // The call-only turns 2 and 3 merge into turn 1's contiguous call
+        // group, and the four quiet calls fold as one, not per turn.
+        assert_eq!(
+            rows,
+            ["   QQ", "   row 0", "", "   ▸ 4 tool calls (read_file ×4)",]
+        );
+    }
+
+    #[test]
+    fn completed_edit_results_color_diff_shaped_content_at_expanded_detail() {
+        let diff_call = tool_call_snapshot(
+            1,
+            "edit_file",
+            r#"{"path":"src/lib.rs"}"#,
+            ToolCallState::Completed,
+            Some("@@ -1 +1 @@\n-old\n+new\n context"),
+            false,
+        );
+        let lines = render_tool_calls(&[&diff_call], ToolDetail::Expanded, 0, 80);
+        let style_of = |lines: &[Line], needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.text.contains(needle))
+                .map(|span| span.style)
+        };
+        assert_eq!(style_of(&lines, "@@ -1 +1 @@"), Some(accent().dim()));
+        assert_eq!(style_of(&lines, "-old"), Some(failure()));
+        assert_eq!(style_of(&lines, "+new"), Some(success()));
+        assert_eq!(style_of(&lines, " context"), Some(normal()));
+
+        // Today's summary results are not diff-shaped and keep the raw style.
+        let summary_call = tool_call_snapshot(
+            2,
+            "edit_file",
+            r#"{"path":"src/lib.rs"}"#,
+            ToolCallState::Completed,
+            Some("Edited src/lib.rs: replaced 1 occurrence(s)."),
+            false,
+        );
+        let lines = render_tool_calls(&[&summary_call], ToolDetail::Expanded, 0, 80);
+        assert_eq!(style_of(&lines, "Edited src/lib.rs"), Some(normal().dim()));
+    }
+
+    #[test]
+    fn diff_detection_requires_hunks_or_paired_change_lines() {
+        assert!(looks_like_diff("@@ -1 +1 @@\n context"));
+        assert!(looks_like_diff("-old\n+new"));
+        assert!(!looks_like_diff(
+            "Edited src/lib.rs: replaced 1 occurrence(s)."
+        ));
+        assert!(!looks_like_diff("+new line only"));
+        assert!(!looks_like_diff(""));
+    }
+
+    #[test]
     fn approval_prompts_render_edit_previews_as_colored_diffs() {
         let mut app = app_with_messages(1);
         let session_id = app.focused.unwrap();
@@ -2852,11 +3032,25 @@ mod tests {
         assert!(rows[0].ends_with("local"));
         assert!(!rows[0].contains("Threadline"));
         assert!(rows[9].contains("> Ask QQ..."));
-        assert!(rows[10].contains("context: 50.0%"));
+        assert!(rows[10].contains("context: 50.0% / 128000"));
         assert!(rows[10].ends_with("model: openai/gpt-test "));
         assert!(rows[11].contains("cwd: /workspace"));
         assert!(rows[11].ends_with("cost: $0.00 "));
         assert_eq!(frame[0].spans[0].style, brand().bold());
+    }
+
+    #[test]
+    fn footer_placeholders_read_as_zero_rather_than_unavailable() {
+        let mut app = app_with_messages(0);
+        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        session.summary.estimated_cost_usd_nanos = None;
+        session.latest_input_tokens = None;
+
+        let rows = frame_rows(&[footer_context(&app, 80), footer_workspace(&app, 80)]);
+
+        assert!(rows[0].contains("context: 0.0%"));
+        assert!(rows[1].ends_with("cost: $0.00 "));
+        assert!(!rows.iter().any(|row| row.contains("unavailable")));
     }
 
     #[test]
