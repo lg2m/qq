@@ -240,6 +240,38 @@ the command. OS-level sandboxing (Landlock on Linux) is a worthwhile later
 hardening step, but it is not a substitute for policy and is not part of the
 initial implementation.
 
+## Version Control
+
+QQ ships no built-in git or jj tools. The model already speaks both
+fluently through `shell`, and a `git_commit` tool would be a second,
+worse-documented spelling of the same operation carrying its own approval
+surface. First-class VCS support means the harness understands version
+control, not that the model needs new verbs.
+
+- **Read-only presets.** The default configuration layer's `policy`
+  section ships shell grant prefixes for the interrogative subcommands:
+  `git status`, `git diff`, `git log`, `git show`, `git blame`, and the
+  jj equivalents (`jj status`, `jj diff`, `jj log`, `jj op log`,
+  `jj show`). Under `ask` these run without prompting. They are ordinary
+  config grants: visible in the same reviewable file, removable by a
+  managed layer, matched at word granularity like every shell prefix.
+- **Mutating commands follow ordinary shell policy.** `commit`,
+  `checkout`, `rebase`, `restore` prompt under `ask` and are grantable
+  like any other prefix; nothing special-cases them.
+- **Outward-facing commands are never preset.** `git push`, `jj git
+  push`, and anything else that publishes stays prompt-always unless a
+  user writes the grant themselves. QQ does not make publishing a
+  default.
+- **jj is a policy entry, not a dependency.** jj users overwhelmingly
+  run colocated repos, so git-shaped harness features (run snapshots,
+  later worktree isolation) work for them unchanged. QQ takes no jj-lib
+  dependency; revisit only if jj-native workspaces become a real ask.
+
+The presets land with the workspace-config grant implementation — both
+are `policy`-section config work. The harness's own undo layer, run
+snapshots, is independent of the user's VCS and designed in
+docs/run-snapshots.md.
+
 ## MCP
 
 MCP is the extension mechanism. QQ does not grow a plugin API; anything
