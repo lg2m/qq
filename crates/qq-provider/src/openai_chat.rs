@@ -386,7 +386,17 @@ struct ChatCompletionsRequest<'a> {
 
 impl<'a> From<&'a ModelRequest> for ChatCompletionsRequest<'a> {
     fn from(request: &'a ModelRequest) -> Self {
-        let mut messages = Vec::with_capacity(request.messages().len());
+        let mut messages = Vec::with_capacity(request.messages().len() + 1);
+        // Chat Completions has no dedicated instructions slot; the system
+        // prompt travels as the leading system-role message.
+        if let Some(system) = request.system() {
+            messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: Some(Cow::Borrowed(system)),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
         for message in request.messages() {
             append_chat_messages(message, &mut messages);
         }
@@ -533,6 +543,7 @@ struct ChatFunction<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ChatRole {
+    System,
     User,
     Assistant,
     Tool,
@@ -1143,6 +1154,27 @@ mod tests {
                 "stream_options": {"include_usage": true},
                 "max_tokens": 321
             })
+        );
+    }
+
+    #[test]
+    fn maps_the_system_prompt_to_a_leading_system_message() {
+        let request = ModelRequest::new("chat-test", vec![Message::user("ping")], 64)
+            .with_system("You are QQ.");
+        let body = serde_json::to_value(ChatCompletionsRequest::from(&request)).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "system", "content": "You are QQ."},
+                {"role": "user", "content": "ping"}
+            ])
+        );
+
+        let without = ModelRequest::new("chat-test", vec![Message::user("ping")], 64);
+        let body = serde_json::to_value(ChatCompletionsRequest::from(&without)).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "user", "content": "ping"}])
         );
     }
 
