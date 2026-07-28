@@ -130,6 +130,52 @@ pub struct ModelDescriptor {
     pub selection: ModelSelection,
 }
 
+/// Per-session policy for tool calls that mutate state or leave the workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    ReadOnly,
+    #[default]
+    Ask,
+    Auto,
+}
+
+/// A client's answer to one pending tool approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    ApproveOnce,
+    ApproveForSession { grant: ApprovalGrant },
+    Deny,
+}
+
+/// A session-scoped allowlist entry recorded by approve-for-session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalGrant {
+    Tool { name: String },
+    ShellPrefix { prefix: String },
+}
+
+/// The durable outcome of one tool approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalResolution {
+    ApprovedOnce,
+    ApprovedForSession,
+    Denied,
+    DeniedTimeout,
+}
+
+/// Shell details carried by an approval request so clients can decide in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellCommandPreview {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
@@ -141,6 +187,8 @@ pub enum SessionCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_id: Option<SessionId>,
         model: ModelSelection,
+        #[serde(default)]
+        approval_mode: ApprovalMode,
     },
     SubmitPrompt {
         session_id: SessionId,
@@ -148,6 +196,15 @@ pub enum SessionCommand {
     },
     CancelRun {
         run_id: RunId,
+    },
+    RespondToolApproval {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        decision: ApprovalDecision,
+    },
+    SetApprovalMode {
+        session_id: SessionId,
+        mode: ApprovalMode,
     },
 }
 
@@ -186,6 +243,14 @@ pub enum CommandOutcome {
     RunAlreadyFinished {
         run_id: RunId,
         outcome: RunOutcome,
+    },
+    ToolApprovalResolved {
+        tool_call_id: ToolCallId,
+        resolution: ApprovalResolution,
+    },
+    ApprovalModeSet {
+        session_id: SessionId,
+        mode: ApprovalMode,
     },
 }
 
@@ -414,6 +479,15 @@ pub enum SessionEvent {
     ToolCallRequested {
         tool_call: ToolCallSnapshot,
     },
+    ToolApprovalRequested {
+        tool_call: ToolCallSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<ShellCommandPreview>,
+    },
+    ToolApprovalResolved {
+        tool_call: ToolCallSnapshot,
+        resolution: ApprovalResolution,
+    },
     ToolCallStarted {
         tool_call: ToolCallSnapshot,
     },
@@ -526,6 +600,97 @@ mod tests {
             serde_json::from_value::<SessionEvent>(encoded).unwrap(),
             event
         );
+    }
+
+    #[test]
+    fn approval_events_and_commands_round_trip_with_stable_tags() {
+        let tool_call = ToolCallSnapshot {
+            id: id(7),
+            session_id: id(3),
+            run_id: id(4),
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_1".to_owned(),
+            name: "shell".to_owned(),
+            arguments: r#"{"command":"cargo test"}"#.to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+        };
+        let requested = SessionEvent::ToolApprovalRequested {
+            tool_call: tool_call.clone(),
+            shell: Some(ShellCommandPreview {
+                command: "cargo test".to_owned(),
+                cwd: Some("crates/qq-core".to_owned()),
+            }),
+        };
+        let encoded = serde_json::to_value(&requested).unwrap();
+        assert_eq!(encoded["type"], "tool_approval_requested");
+        assert_eq!(encoded["tool_call"]["state"], "awaiting_approval");
+        assert_eq!(encoded["shell"]["command"], "cargo test");
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            requested
+        );
+
+        let resolved = SessionEvent::ToolApprovalResolved {
+            tool_call,
+            resolution: ApprovalResolution::DeniedTimeout,
+        };
+        let encoded = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(encoded["type"], "tool_approval_resolved");
+        assert_eq!(encoded["resolution"], "denied_timeout");
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            resolved
+        );
+
+        let command = SessionCommand::RespondToolApproval {
+            run_id: id(4),
+            tool_call_id: id(7),
+            decision: ApprovalDecision::ApproveForSession {
+                grant: ApprovalGrant::ShellPrefix {
+                    prefix: "cargo test".to_owned(),
+                },
+            },
+        };
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded["type"], "respond_tool_approval");
+        assert_eq!(encoded["decision"]["type"], "approve_for_session");
+        assert_eq!(encoded["decision"]["grant"]["type"], "shell_prefix");
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            command
+        );
+
+        let outcome = CommandOutcome::ToolApprovalResolved {
+            tool_call_id: id(7),
+            resolution: ApprovalResolution::ApprovedOnce,
+        };
+        let encoded = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(encoded["type"], "tool_approval_resolved");
+        assert_eq!(encoded["resolution"], "approved_once");
+        assert_eq!(
+            serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
+            outcome
+        );
+    }
+
+    #[test]
+    fn create_session_without_an_approval_mode_defaults_to_ask() {
+        let encoded = serde_json::json!({
+            "type": "create_session",
+            "workspace_id": id::<WorkspaceId>(2).to_string(),
+            "model": { "model": "test/model" },
+        });
+        let command = serde_json::from_value::<SessionCommand>(encoded).unwrap();
+        assert!(matches!(
+            command,
+            SessionCommand::CreateSession {
+                approval_mode: ApprovalMode::Ask,
+                ..
+            }
+        ));
     }
 
     #[test]

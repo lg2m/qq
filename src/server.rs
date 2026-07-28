@@ -557,7 +557,9 @@ fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router 
         .route("/v1/models", post(models))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/prompts", post(submit_prompt))
+        .route("/v1/sessions/approval-mode", post(set_approval_mode))
         .route("/v1/runs/cancel", post(cancel_run))
+        .route("/v1/tools/approvals", post(respond_tool_approval))
         .route(
             "/v1/workspaces/{workspace_id}/events",
             get(workspace_events),
@@ -678,6 +680,26 @@ async fn cancel_run(
 ) -> Response {
     session_command(state, body, |command| {
         matches!(command, SessionCommand::CancelRun { .. })
+    })
+    .await
+}
+
+async fn respond_tool_approval(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::RespondToolApproval { .. })
+    })
+    .await
+}
+
+async fn set_approval_mode(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::SetApprovalMode { .. })
     })
     .await
 }

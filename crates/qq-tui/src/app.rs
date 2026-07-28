@@ -2,10 +2,10 @@ use std::collections::{HashMap, VecDeque};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
-    CommandId, CommandOutcome, CommandRequest, MessageSnapshot, MessageState, ModelDescriptor,
-    ModelSelection, RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot, WorkspaceId,
-    WorkspaceSnapshot,
+    ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
+    CommandRequest, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection, RunOutcome,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionSummary,
+    SnapshotRequest, TokenUsage, ToolCallSnapshot, ToolCallState, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -143,8 +143,14 @@ struct TranscriptViewport {
 #[derive(Debug, Clone)]
 enum PendingIntent {
     Create,
-    Prompt { session_id: SessionId, text: String },
+    Prompt {
+        session_id: SessionId,
+        text: String,
+    },
     Cancel,
+    Approval {
+        tool_call_id: qq_protocol::ToolCallId,
+    },
 }
 
 pub(crate) struct App {
@@ -168,6 +174,7 @@ pub(crate) struct App {
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
     pending: HashMap<CommandId, PendingIntent>,
+    answered_approvals: std::collections::HashSet<qq_protocol::ToolCallId>,
 }
 
 impl App {
@@ -193,6 +200,7 @@ impl App {
             last_sequence: 0,
             recent_events: VecDeque::new(),
             pending: HashMap::new(),
+            answered_approvals: std::collections::HashSet::new(),
         }
     }
 
@@ -233,6 +241,23 @@ impl App {
                         }
                         if matches!(intent, Some(PendingIntent::Cancel)) {
                             self.status = Some("cancellation requested".to_owned());
+                        }
+                        if let CommandOutcome::ToolApprovalResolved { resolution, .. } =
+                            receipt.outcome
+                        {
+                            self.status = Some(
+                                match resolution {
+                                    ApprovalResolution::ApprovedOnce => "tool call approved",
+                                    ApprovalResolution::ApprovedForSession => {
+                                        "tool call approved for this session"
+                                    }
+                                    ApprovalResolution::Denied => "tool call denied",
+                                    ApprovalResolution::DeniedTimeout => {
+                                        "tool call already denied by timeout"
+                                    }
+                                }
+                                .to_owned(),
+                            );
                         }
                         if matches!(receipt.outcome, CommandOutcome::RunAlreadyFinished { .. }) {
                             self.status = Some("run already finished".to_owned());
@@ -480,8 +505,13 @@ impl App {
                 }
             }
             SessionEvent::ToolCallRequested { tool_call }
+            | SessionEvent::ToolApprovalRequested { tool_call, .. }
+            | SessionEvent::ToolApprovalResolved { tool_call, .. }
             | SessionEvent::ToolCallStarted { tool_call }
             | SessionEvent::ToolCallFinished { tool_call } => {
+                if tool_call.state != ToolCallState::AwaitingApproval {
+                    self.answered_approvals.remove(&tool_call.id);
+                }
                 self.upsert_tool_call(tool_call.clone());
             }
             SessionEvent::RunFinished {
@@ -590,11 +620,17 @@ impl App {
     }
 
     fn reject_pending(&mut self, command_id: CommandId, error: ClientFailure) {
-        if let Some(PendingIntent::Prompt { session_id, text }) = self.pending.remove(&command_id)
-            && self.focused == Some(session_id)
-            && self.input.is_empty()
-        {
-            self.input = text;
+        match self.pending.remove(&command_id) {
+            Some(PendingIntent::Prompt { session_id, text })
+                if self.focused == Some(session_id) && self.input.is_empty() =>
+            {
+                self.input = text;
+            }
+            Some(PendingIntent::Approval { tool_call_id }) => {
+                // Re-open the prompt so the user can answer again.
+                self.answered_approvals.remove(&tool_call_id);
+            }
+            _ => {}
         }
         self.status = Some(error.message().to_owned());
     }
@@ -651,6 +687,9 @@ impl App {
         }
         if self.model_picker.is_some() {
             return self.handle_model_picker_key(key);
+        }
+        if self.pending_approval().is_some() {
+            return self.handle_approval_key(key);
         }
         if let Some(result) = self.handle_slash_key(key.code) {
             return result;
@@ -1043,6 +1082,7 @@ impl App {
                     workspace_id,
                     parent_id,
                     model,
+                    approval_mode: ApprovalMode::default(),
                 },
             })],
         )
@@ -1104,6 +1144,62 @@ impl App {
             vec![ClientRequest::Command(CommandRequest {
                 command_id,
                 command: SessionCommand::CancelRun { run_id },
+            })],
+        )
+    }
+
+    /// The focused session's oldest unanswered tool approval, if any.
+    pub(crate) fn pending_approval(&self) -> Option<&ToolCallSnapshot> {
+        let session = self.sessions.get(&self.focused?)?;
+        session.tool_calls.as_ref()?.iter().find(|tool_call| {
+            tool_call.state == ToolCallState::AwaitingApproval
+                && !self.answered_approvals.contains(&tool_call.id)
+        })
+    }
+
+    fn handle_approval_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+        if matches!(self.settings.action_for(key), Some(Action::CancelRun)) {
+            return self.cancel_run();
+        }
+        match key.code {
+            KeyCode::Char('y' | 'Y') => self.respond_to_approval(ApprovalChoice::Once),
+            KeyCode::Char('a' | 'A') => self.respond_to_approval(ApprovalChoice::Session),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.respond_to_approval(ApprovalChoice::Deny)
+            }
+            _ => (false, Vec::new()),
+        }
+    }
+
+    fn respond_to_approval(&mut self, choice: ApprovalChoice) -> (bool, Vec<ClientRequest>) {
+        let Some(tool_call) = self.pending_approval() else {
+            return (false, Vec::new());
+        };
+        let tool_call_id = tool_call.id;
+        let run_id = tool_call.run_id;
+        let decision = match choice {
+            ApprovalChoice::Once => ApprovalDecision::ApproveOnce,
+            ApprovalChoice::Session => ApprovalDecision::ApproveForSession {
+                grant: approval_grant(tool_call),
+            },
+            ApprovalChoice::Deny => ApprovalDecision::Deny,
+        };
+        let Ok(command_id) = CommandId::generate() else {
+            self.status = Some("secure randomness is unavailable".to_owned());
+            return (true, Vec::new());
+        };
+        self.answered_approvals.insert(tool_call_id);
+        self.pending
+            .insert(command_id, PendingIntent::Approval { tool_call_id });
+        (
+            true,
+            vec![ClientRequest::Command(CommandRequest {
+                command_id,
+                command: SessionCommand::RespondToolApproval {
+                    run_id,
+                    tool_call_id,
+                    decision,
+                },
             })],
         )
     }
@@ -1193,9 +1289,10 @@ impl App {
                     session_id: candidate,
                     text,
                 } if *candidate == session_id => Some(text.as_str()),
-                PendingIntent::Create | PendingIntent::Prompt { .. } | PendingIntent::Cancel => {
-                    None
-                }
+                PendingIntent::Create
+                | PendingIntent::Prompt { .. }
+                | PendingIntent::Cancel
+                | PendingIntent::Approval { .. } => None,
             })
     }
 
@@ -1246,6 +1343,30 @@ impl App {
                 .and_then(|session| session.summary.parent_id);
         }
         depth
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ApprovalChoice {
+    Once,
+    Session,
+    Deny,
+}
+
+/// Derives the approve-for-session grant from the pending call: shell calls
+/// allowlist their exact command as a prefix, everything else grants the tool.
+fn approval_grant(tool_call: &ToolCallSnapshot) -> ApprovalGrant {
+    if tool_call.name == "shell"
+        && let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+        && let Some(command) = arguments.get("command").and_then(|value| value.as_str())
+        && !command.trim().is_empty()
+    {
+        return ApprovalGrant::ShellPrefix {
+            prefix: command.to_owned(),
+        };
+    }
+    ApprovalGrant::Tool {
+        name: tool_call.name.clone(),
     }
 }
 
@@ -1374,6 +1495,108 @@ mod tests {
 
         assert_eq!(app.input, "hello");
         assert_eq!(app.status.as_deref(), Some("offline"));
+    }
+
+    #[test]
+    fn approval_prompt_captures_keys_and_sends_the_decision() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        app.apply_snapshot(initial);
+        let tool_call = ToolCallSnapshot {
+            id: id(7, ToolCallId::from_bytes),
+            session_id,
+            run_id: id(4, RunId::from_bytes),
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_0".to_owned(),
+            name: "write_file".to_owned(),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+        };
+        app.upsert_tool_call(tool_call.clone());
+        assert_eq!(
+            app.pending_approval().map(|call| call.id),
+            Some(tool_call.id)
+        );
+
+        // The prompt captures ordinary typing instead of the composer.
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(requests.is_empty());
+        assert!(app.input.is_empty());
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            request.command,
+            SessionCommand::RespondToolApproval {
+                run_id: tool_call.run_id,
+                tool_call_id: tool_call.id,
+                decision: ApprovalDecision::ApproveOnce,
+            }
+        );
+        // Answered approvals stop prompting until the server responds.
+        assert!(app.pending_approval().is_none());
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(requests.is_empty());
+
+        // A failed command re-opens the prompt so the user can answer again.
+        app.apply_client_update(ClientUpdate::CommandResult {
+            command_id: request.command_id,
+            result: Err(ClientFailure::new("offline")),
+        });
+        assert!(app.pending_approval().is_some());
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
+            panic!("expected a command")
+        };
+        assert!(matches!(
+            request.command,
+            SessionCommand::RespondToolApproval {
+                decision: ApprovalDecision::Deny,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn approve_for_session_grants_shell_commands_as_prefixes() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        app.apply_snapshot(initial);
+        app.upsert_tool_call(ToolCallSnapshot {
+            id: id(8, ToolCallId::from_bytes),
+            session_id,
+            run_id: id(4, RunId::from_bytes),
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_0".to_owned(),
+            name: "shell".to_owned(),
+            arguments: r#"{"command":"cargo test --workspace","cwd":"crates"}"#.to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+        });
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
+            panic!("expected a command")
+        };
+        assert!(matches!(
+            request.command,
+            SessionCommand::RespondToolApproval {
+                decision: ApprovalDecision::ApproveForSession {
+                    grant: ApprovalGrant::ShellPrefix { prefix },
+                },
+                ..
+            } if prefix == "cargo test --workspace"
+        ));
     }
 
     #[test]

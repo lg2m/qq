@@ -16,12 +16,13 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use qq_protocol::{
-    CommandId, CommandOutcome, CommandReceipt, EventCursor, MessageId, MessageRole,
-    MessageSnapshot, MessageState, ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId,
-    RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope,
-    SessionId, SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, StoreId,
-    SubscribeRequest, TextChannel, TokenUsage, ToolCallId, ToolCallSnapshot, ToolCallState,
-    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
+    CommandReceipt, EventCursor, MessageId, MessageRole, MessageSnapshot, MessageState,
+    ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId, RunOutcome, RunSnapshot,
+    RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
+    SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest,
+    TextChannel, TokenUsage, ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceId,
+    WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -29,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
-use crate::{Runtime, RuntimeEvent, RuntimeToolCall};
+use crate::{
+    GateDecision, Runtime, RuntimeEvent, RuntimeToolCall, ToolGate, ToolGateFuture, approval,
+};
 
 const CONTROL_QUEUE_CAPACITY: usize = 256;
 const OUTPUT_QUEUE_CAPACITY: usize = 1024;
@@ -49,6 +52,9 @@ const MAX_MODEL_SELECTION_BYTES: usize = 512;
 const OUTPUT_BATCH_BYTES: usize = 8 * 1024;
 const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(8);
 const MAX_PERSISTED_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_GRANT_BYTES: usize = 256;
+const MAX_SESSION_GRANTS: u32 = 256;
+const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
 
@@ -85,6 +91,8 @@ pub type SessionEventStream =
 pub struct SessionRuntimeOptions {
     pub database_path: PathBuf,
     pub max_active_runs: usize,
+    /// How long an approval request may wait for a client before it is denied.
+    pub approval_timeout: Duration,
 }
 
 impl SessionRuntimeOptions {
@@ -93,6 +101,7 @@ impl SessionRuntimeOptions {
         Self {
             database_path,
             max_active_runs: 8,
+            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
         }
     }
 }
@@ -108,8 +117,15 @@ struct SessionRuntimeInner {
     permits: Arc<Semaphore>,
     schedule: mpsc::Sender<()>,
     cancellations: Mutex<HashMap<RunId, watch::Sender<bool>>>,
+    approvals: Mutex<HashMap<ToolCallId, PendingApproval>>,
+    approval_timeout: Duration,
     wakeups: Mutex<HashMap<WorkspaceId, watch::Sender<u64>>>,
     failed: watch::Sender<bool>,
+}
+
+struct PendingApproval {
+    run_id: RunId,
+    signal: oneshot::Sender<()>,
 }
 
 impl SessionRuntime {
@@ -130,6 +146,8 @@ impl SessionRuntime {
             permits: Arc::new(Semaphore::new(options.max_active_runs)),
             schedule,
             cancellations: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
+            approval_timeout: options.approval_timeout,
             wakeups: Mutex::new(HashMap::new()),
             failed,
         });
@@ -154,12 +172,19 @@ impl SessionRuntime {
             SessionCommand::CancelRun { run_id } => Some(run_id),
             _ => None,
         };
+        let signal_approval = match &command {
+            SessionCommand::RespondToolApproval { tool_call_id, .. } => Some(*tool_call_id),
+            _ => None,
+        };
         let should_schedule = matches!(command, SessionCommand::SubmitPrompt { .. });
         let applied = self.inner.store.command(command_id, command).await?;
         self.inner.notify(applied.receipt.committed_through);
 
         if let Some(run_id) = signal_run {
             self.inner.cancel(run_id);
+        }
+        if let Some(tool_call_id) = signal_approval {
+            self.inner.resolve_approval(tool_call_id);
         }
         if should_schedule || applied.schedule {
             self.request_schedule();
@@ -286,6 +311,141 @@ impl SessionRuntimeInner {
             sender.send_replace(true);
         }
     }
+
+    fn register_approval(&self, tool_call_id: ToolCallId, run_id: RunId) -> oneshot::Receiver<()> {
+        let (signal, receiver) = oneshot::channel();
+        if let Ok(mut approvals) = self.approvals.lock() {
+            approvals.insert(tool_call_id, PendingApproval { run_id, signal });
+        }
+        receiver
+    }
+
+    fn resolve_approval(&self, tool_call_id: ToolCallId) {
+        let Ok(mut approvals) = self.approvals.lock() else {
+            return;
+        };
+        if let Some(pending) = approvals.remove(&tool_call_id) {
+            let _ = pending.signal.send(());
+        }
+    }
+
+    fn remove_approval(&self, tool_call_id: ToolCallId) {
+        if let Ok(mut approvals) = self.approvals.lock() {
+            approvals.remove(&tool_call_id);
+        }
+    }
+
+    fn clear_run_approvals(&self, run_id: RunId) {
+        if let Ok(mut approvals) = self.approvals.lock() {
+            approvals.retain(|_, pending| pending.run_id != run_id);
+        }
+    }
+}
+
+/// Applies the session's approval policy to each requested tool call,
+/// persisting approval state before publishing it and holding the run open
+/// while a client decides.
+struct SessionToolGate {
+    inner: Arc<SessionRuntimeInner>,
+    claimed: ClaimedRun,
+    cancellation: watch::Receiver<bool>,
+}
+
+impl ToolGate for SessionToolGate {
+    fn resolve(&self, call: &RuntimeToolCall) -> ToolGateFuture {
+        let inner = Arc::clone(&self.inner);
+        let claimed = self.claimed.clone();
+        let call = call.clone();
+        let mut cancellation = self.cancellation.clone();
+        Box::pin(async move {
+            let internal_denial = || GateDecision::Deny {
+                message: "Tool approval state could not be persisted; the call was denied."
+                    .to_owned(),
+            };
+            let Ok((mode, grants)) = inner.store.approval_policy(claimed.session_id).await else {
+                return internal_denial();
+            };
+            let class = approval::classify(&call.name, &call.arguments);
+            match approval::evaluate(mode, &call.name, &class, &grants) {
+                approval::PolicyDecision::Execute => GateDecision::Execute,
+                approval::PolicyDecision::Deny => {
+                    let message = approval::POLICY_DENIED_RESULT.to_owned();
+                    match inner
+                        .store
+                        .deny_tool_call(&claimed, call.id, message.clone())
+                        .await
+                    {
+                        Ok(event) => {
+                            inner.notify(event.cursor);
+                            GateDecision::Deny { message }
+                        }
+                        Err(_) => internal_denial(),
+                    }
+                }
+                approval::PolicyDecision::RequireApproval => {
+                    let shell = match class {
+                        approval::ToolClass::Shell { command, cwd } => {
+                            Some(ShellCommandPreview { command, cwd })
+                        }
+                        _ => None,
+                    };
+                    // Register before publishing the request so a client
+                    // response can never race past the waiting run.
+                    let mut resolved = inner.register_approval(call.id, claimed.run_id);
+                    match inner
+                        .store
+                        .request_tool_approval(&claimed, call.id, shell)
+                        .await
+                    {
+                        Ok(event) => inner.notify(event.cursor),
+                        Err(_) => {
+                            inner.remove_approval(call.id);
+                            return internal_denial();
+                        }
+                    }
+                    let timed_out = tokio::select! {
+                        biased;
+                        changed = cancellation.changed() => {
+                            // Run cancellation or shutdown: leave the call
+                            // awaiting so run completion interrupts it.
+                            let _ = changed;
+                            inner.remove_approval(call.id);
+                            return GateDecision::Deny {
+                                message: "The run stopped before this approval was resolved."
+                                    .to_owned(),
+                            };
+                        }
+                        result = &mut resolved => result.is_err(),
+                        () = tokio::time::sleep(inner.approval_timeout) => true,
+                    };
+                    inner.remove_approval(call.id);
+                    match inner
+                        .store
+                        .conclude_tool_approval(&claimed, call.id, timed_out)
+                        .await
+                    {
+                        Ok(ConcludedApproval::Approved) => GateDecision::Execute,
+                        Ok(ConcludedApproval::Denied { message, event }) => {
+                            if let Some(event) = event {
+                                inner.notify(event.cursor);
+                            }
+                            GateDecision::Deny { message }
+                        }
+                        Ok(ConcludedApproval::StillWaiting) | Err(_) => internal_denial(),
+                    }
+                }
+            }
+        })
+    }
+}
+
+enum ConcludedApproval {
+    Approved,
+    Denied {
+        message: String,
+        event: Option<Box<SessionEventEnvelope>>,
+    },
+    StillWaiting,
 }
 
 async fn schedule_runs(
@@ -390,10 +550,16 @@ async fn execute_run(
     }
 
     let tool_cancellation = Arc::new(AtomicBool::new(false));
-    let mut events = loaded.runtime.run_messages_in_workspace_with_cancellation(
+    let gate = Arc::new(SessionToolGate {
+        inner: Arc::clone(&inner),
+        claimed: claimed.clone(),
+        cancellation: cancellation.clone(),
+    });
+    let mut events = loaded.runtime.run_loop(
         claimed.messages.clone(),
         PathBuf::from(&claimed.workspace),
         Arc::clone(&tool_cancellation),
+        gate,
     );
     let mut accounting = RunAccountingAccumulator::new(loaded.pricing.clone());
     let mut pending_text = String::new();
@@ -512,6 +678,9 @@ async fn execute_run(
                     }
                 }
             }
+            // Approval transitions (including denials) are persisted and
+            // published by the tool gate before this event is emitted.
+            RunInput::Event(Some(RuntimeEvent::ToolCallDenied { .. })) => {}
             RunInput::Event(Some(RuntimeEvent::ToolCallStarted { id })) => {
                 match inner.store.start_tool_call(&claimed, id).await {
                     Ok(event) => inner.notify(event.cursor),
@@ -754,6 +923,7 @@ async fn finish_run_accounted(
     if let Ok(mut cancellations) = inner.cancellations.lock() {
         cancellations.remove(&claimed.run_id);
     }
+    inner.clear_run_approvals(claimed.run_id);
 }
 
 #[derive(Clone)]
@@ -881,6 +1051,12 @@ pub enum SessionRuntimeError {
     ParentWorkspaceMismatch,
     #[error("run was not found")]
     RunNotFound,
+    #[error("tool call was not found for that run")]
+    ToolCallNotFound,
+    #[error("tool call is not awaiting approval")]
+    ApprovalNotPending,
+    #[error("approval grant is empty or exceeds the session limit")]
+    InvalidApprovalGrant,
     #[error("session follow-up queue is full")]
     QueueFull,
     #[error("session context exceeds the size limit")]
@@ -1160,6 +1336,58 @@ impl Store {
         .await
     }
 
+    async fn approval_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(ApprovalMode, approval::SessionGrants), SessionRuntimeError> {
+        self.call(Priority::Output, move |connection| {
+            load_approval_policy(connection, session_id)
+        })
+        .await
+    }
+
+    async fn deny_tool_call(
+        &self,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+        message: String,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            deny_tool_call(connection, store_id, &claimed, tool_call_id, &message)
+        })
+        .await
+    }
+
+    async fn request_tool_approval(
+        &self,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+        shell: Option<ShellCommandPreview>,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            request_tool_approval(connection, store_id, &claimed, tool_call_id, shell)
+        })
+        .await
+    }
+
+    async fn conclude_tool_approval(
+        &self,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+        timed_out: bool,
+    ) -> Result<ConcludedApproval, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            conclude_tool_approval(connection, store_id, &claimed, tool_call_id, timed_out)
+        })
+        .await
+    }
+
     async fn finish_run(
         &self,
         claimed: &ClaimedRun,
@@ -1250,6 +1478,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  model TEXT,
                  max_output_tokens INTEGER,
                  organization TEXT,
+                 approval_mode TEXT NOT NULL DEFAULT 'ask',
                  estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
                  cost_known INTEGER NOT NULL DEFAULT 1,
                  created_at_ms INTEGER NOT NULL,
@@ -1317,9 +1546,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .transaction()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_tool_tables(&transaction)?;
+            create_grant_table(&transaction)?;
             transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '3')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '4')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1342,6 +1572,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             for statement in [
                 "ALTER TABLE sessions ADD COLUMN estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE sessions ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'ask'",
                 "ALTER TABLE runs ADD COLUMN usage_json TEXT",
                 "ALTER TABLE runs ADD COLUMN estimated_cost_usd_nanos INTEGER",
             ] {
@@ -1353,9 +1584,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .execute("UPDATE sessions SET cost_known = 0", [])
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_tool_tables(&transaction)?;
+            create_grant_table(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '3' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1367,10 +1599,17 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             let transaction = connection
                 .transaction()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
-            create_tool_tables(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '3' WHERE key = 'schema_version'",
+                    "ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'ask'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            create_tool_tables(&transaction)?;
+            create_grant_table(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1378,7 +1617,31 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("3") => {}
+        Some("3") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            for statement in [
+                "ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'ask'",
+                "ALTER TABLE tool_calls ADD COLUMN approval_resolution TEXT",
+                "ALTER TABLE tool_calls ADD COLUMN resolved_at_ms INTEGER",
+            ] {
+                transaction
+                    .execute(statement, [])
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+            }
+            create_grant_table(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("4") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -1427,14 +1690,30 @@ fn create_tool_tables(connection: &Connection) -> Result<(), SessionRuntimeError
                  state TEXT NOT NULL,
                  result TEXT,
                  is_error INTEGER NOT NULL DEFAULT 0,
+                 approval_resolution TEXT,
                  requested_at_ms INTEGER NOT NULL,
                  started_at_ms INTEGER,
+                 resolved_at_ms INTEGER,
                  finished_at_ms INTEGER,
                  UNIQUE(run_id, turn_ordinal, provider_call_id),
                  UNIQUE(run_id, turn_ordinal, call_ordinal)
              );
              CREATE INDEX tool_calls_run_ordinal
                  ON tool_calls(run_id, turn_ordinal, call_ordinal);",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)
+}
+
+fn create_grant_table(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE session_grants (
+                 session_id TEXT NOT NULL REFERENCES sessions(id),
+                 kind TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE(session_id, kind, value)
+             );",
         )
         .map_err(|_| SessionRuntimeError::Persistence)
 }
@@ -1570,6 +1849,7 @@ fn execute_command(
             workspace_id,
             parent_id,
             model,
+            approval_mode,
         } => {
             if !model.model.as_ref().is_some_and(|value| {
                 value.len() <= MAX_MODEL_SELECTION_BYTES
@@ -1614,8 +1894,9 @@ fn execute_command(
                 .execute(
                     "INSERT INTO sessions(
                         id, workspace_id, parent_id, title, status, model,
-                        max_output_tokens, organization, created_at_ms, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, 'New session', 'idle', ?4, ?5, ?6, ?7, ?7)",
+                        max_output_tokens, organization, approval_mode,
+                        created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, 'New session', 'idle', ?4, ?5, ?6, ?7, ?8, ?8)",
                     params![
                         session_id.to_string(),
                         workspace_id.to_string(),
@@ -1623,6 +1904,7 @@ fn execute_command(
                         model.model,
                         model.max_output_tokens,
                         model.organization,
+                        approval_mode_str(approval_mode),
                         now,
                     ],
                 )
@@ -1882,6 +2164,181 @@ fn execute_command(
                     status == "queued",
                 )
             }
+        }
+        SessionCommand::RespondToolApproval {
+            run_id,
+            tool_call_id,
+            decision,
+        } => {
+            let (call_run, state, resolution) = transaction
+                .query_row(
+                    "SELECT run_id, state, approval_resolution FROM tool_calls WHERE id = ?1",
+                    [tool_call_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::ToolCallNotFound)?;
+            if parse_id::<RunId>(&call_run)? != run_id {
+                return Err(SessionRuntimeError::ToolCallNotFound);
+            }
+            let session_id: SessionId = transaction
+                .query_row(
+                    "SELECT session_id FROM runs WHERE id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)
+                .and_then(|session| parse_id(&session))?;
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            if let Some(resolution) = resolution {
+                // Idempotent: a second response returns the recorded outcome
+                // without touching the call again.
+                let resolution = parse_approval_resolution(&resolution)?;
+                let sequence = workspace_sequence(&transaction, workspace_id)?;
+                (
+                    CommandReceipt {
+                        command_id,
+                        committed_through: EventCursor {
+                            store_id,
+                            workspace_id,
+                            sequence,
+                        },
+                        outcome: CommandOutcome::ToolApprovalResolved {
+                            tool_call_id,
+                            resolution,
+                        },
+                    },
+                    false,
+                )
+            } else {
+                if state != "awaiting_approval" {
+                    return Err(SessionRuntimeError::ApprovalNotPending);
+                }
+                let resolution = match &decision {
+                    ApprovalDecision::ApproveOnce => ApprovalResolution::ApprovedOnce,
+                    ApprovalDecision::ApproveForSession { .. } => {
+                        ApprovalResolution::ApprovedForSession
+                    }
+                    ApprovalDecision::Deny => ApprovalResolution::Denied,
+                };
+                match &decision {
+                    ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveForSession { .. } => {
+                        transaction
+                            .execute(
+                                "UPDATE tool_calls
+                                 SET state = 'requested', approval_resolution = ?2,
+                                     resolved_at_ms = ?3
+                                 WHERE id = ?1 AND state = 'awaiting_approval'",
+                                params![
+                                    tool_call_id.to_string(),
+                                    approval_resolution_str(resolution),
+                                    now,
+                                ],
+                            )
+                            .map_err(|_| SessionRuntimeError::Persistence)?;
+                    }
+                    ApprovalDecision::Deny => {
+                        transaction
+                            .execute(
+                                "UPDATE tool_calls
+                                 SET state = 'denied', result = ?2, is_error = 1,
+                                     approval_resolution = ?3, resolved_at_ms = ?4,
+                                     finished_at_ms = ?4
+                                 WHERE id = ?1 AND state = 'awaiting_approval'",
+                                params![
+                                    tool_call_id.to_string(),
+                                    approval::USER_DENIED_RESULT,
+                                    approval_resolution_str(resolution),
+                                    now,
+                                ],
+                            )
+                            .map_err(|_| SessionRuntimeError::Persistence)?;
+                    }
+                }
+                if let ApprovalDecision::ApproveForSession { grant } = &decision {
+                    let (kind, value) = match grant {
+                        ApprovalGrant::Tool { name } => ("tool", name.trim()),
+                        ApprovalGrant::ShellPrefix { prefix } => ("shell_prefix", prefix.trim()),
+                    };
+                    if value.is_empty() || value.len() > MAX_GRANT_BYTES {
+                        return Err(SessionRuntimeError::InvalidApprovalGrant);
+                    }
+                    let grant_count: u32 = transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM session_grants WHERE session_id = ?1",
+                            [session_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    if grant_count >= MAX_SESSION_GRANTS {
+                        return Err(SessionRuntimeError::InvalidApprovalGrant);
+                    }
+                    transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO session_grants(
+                                 session_id, kind, value, created_at_ms
+                             ) VALUES (?1, ?2, ?3, ?4)",
+                            params![session_id.to_string(), kind, value, now],
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                }
+                let tool_call = load_tool_call(&transaction, tool_call_id)?;
+                let event = append_event(
+                    &transaction,
+                    EventContext {
+                        store_id,
+                        workspace_id,
+                        session_id,
+                        run_id: Some(run_id),
+                        caused_by: Some(command_id),
+                        occurred_at_ms: now,
+                    },
+                    SessionEvent::ToolApprovalResolved {
+                        tool_call,
+                        resolution,
+                    },
+                )?;
+                (
+                    CommandReceipt {
+                        command_id,
+                        committed_through: event.cursor,
+                        outcome: CommandOutcome::ToolApprovalResolved {
+                            tool_call_id,
+                            resolution,
+                        },
+                    },
+                    false,
+                )
+            }
+        }
+        SessionCommand::SetApprovalMode { session_id, mode } => {
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            transaction
+                .execute(
+                    "UPDATE sessions SET approval_mode = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                    params![session_id.to_string(), approval_mode_str(mode), now],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let sequence = workspace_sequence(&transaction, workspace_id)?;
+            (
+                CommandReceipt {
+                    command_id,
+                    committed_through: EventCursor {
+                        store_id,
+                        workspace_id,
+                        sequence,
+                    },
+                    outcome: CommandOutcome::ApprovalModeSet { session_id, mode },
+                },
+                false,
+            )
         }
     };
     let receipt_json =
@@ -2277,6 +2734,213 @@ fn finish_tool_call(
     Ok(event)
 }
 
+fn load_approval_policy(
+    connection: &mut Connection,
+    session_id: SessionId,
+) -> Result<(ApprovalMode, approval::SessionGrants), SessionRuntimeError> {
+    let mode = connection
+        .query_row(
+            "SELECT approval_mode FROM sessions WHERE id = ?1",
+            [session_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::SessionNotFound)?;
+    let mode = parse_approval_mode(&mode)?;
+    let mut statement = connection
+        .prepare("SELECT kind, value FROM session_grants WHERE session_id = ?1")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let rows = statement
+        .query_map([session_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut grants = approval::SessionGrants::default();
+    for (kind, value) in rows {
+        match kind.as_str() {
+            "tool" => {
+                grants.tools.insert(value);
+            }
+            "shell_prefix" => grants.shell_prefixes.push(value),
+            _ => return Err(SessionRuntimeError::Persistence),
+        }
+    }
+    Ok((mode, grants))
+}
+
+fn deny_tool_call(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    tool_call_id: ToolCallId,
+    message: &str,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let updated = transaction
+        .execute(
+            "UPDATE tool_calls
+             SET state = 'denied', result = ?2, is_error = 1, finished_at_ms = ?3
+             WHERE id = ?1 AND run_id = ?4 AND state = 'requested'",
+            params![
+                tool_call_id.to_string(),
+                message,
+                now,
+                claimed.run_id.to_string(),
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if updated != 1 {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let tool_call = load_tool_call(&transaction, tool_call_id)?;
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::ToolCallFinished { tool_call },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+fn request_tool_approval(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    tool_call_id: ToolCallId,
+    shell: Option<ShellCommandPreview>,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let updated = transaction
+        .execute(
+            "UPDATE tool_calls SET state = 'awaiting_approval'
+             WHERE id = ?1 AND run_id = ?2 AND state = 'requested'",
+            params![tool_call_id.to_string(), claimed.run_id.to_string()],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if updated != 1 {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let tool_call = load_tool_call(&transaction, tool_call_id)?;
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::ToolApprovalRequested { tool_call, shell },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+fn conclude_tool_approval(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    tool_call_id: ToolCallId,
+    timed_out: bool,
+) -> Result<ConcludedApproval, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let (state, resolution, result) = transaction
+        .query_row(
+            "SELECT state, approval_resolution, result FROM tool_calls
+             WHERE id = ?1 AND run_id = ?2",
+            params![tool_call_id.to_string(), claimed.run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::ToolCallNotFound)?;
+    if let Some(resolution) = resolution {
+        // A client resolution won the race; its transaction already
+        // persisted the state change and published the event.
+        return match parse_approval_resolution(&resolution)? {
+            ApprovalResolution::ApprovedOnce | ApprovalResolution::ApprovedForSession => {
+                Ok(ConcludedApproval::Approved)
+            }
+            ApprovalResolution::Denied | ApprovalResolution::DeniedTimeout => {
+                Ok(ConcludedApproval::Denied {
+                    message: result.unwrap_or_else(|| approval::USER_DENIED_RESULT.to_owned()),
+                    event: None,
+                })
+            }
+        };
+    }
+    if !timed_out || state != "awaiting_approval" {
+        return Ok(ConcludedApproval::StillWaiting);
+    }
+    let now = now_ms();
+    transaction
+        .execute(
+            "UPDATE tool_calls
+             SET state = 'denied', result = ?2, is_error = 1,
+                 approval_resolution = 'denied_timeout', resolved_at_ms = ?3,
+                 finished_at_ms = ?3
+             WHERE id = ?1 AND state = 'awaiting_approval'",
+            params![
+                tool_call_id.to_string(),
+                approval::TIMEOUT_DENIED_RESULT,
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let tool_call = load_tool_call(&transaction, tool_call_id)?;
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: None,
+            occurred_at_ms: now,
+        },
+        SessionEvent::ToolApprovalResolved {
+            tool_call,
+            resolution: ApprovalResolution::DeniedTimeout,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(ConcludedApproval::Denied {
+        message: approval::TIMEOUT_DENIED_RESULT.to_owned(),
+        event: Some(Box::new(event)),
+    })
+}
+
 fn ensure_context_capacity(
     transaction: &Transaction<'_>,
     session_id: SessionId,
@@ -2608,7 +3272,7 @@ fn interrupt_active_tool_calls(
     let mut statement = transaction
         .prepare(
             "SELECT id FROM tool_calls
-             WHERE run_id = ?1 AND state IN ('requested', 'running')
+             WHERE run_id = ?1 AND state IN ('requested', 'awaiting_approval', 'running')
              ORDER BY turn_ordinal, call_ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2624,7 +3288,7 @@ fn interrupt_active_tool_calls(
             .execute(
                 "UPDATE tool_calls
                  SET state = 'interrupted', result = ?2, is_error = 1, finished_at_ms = ?3
-                 WHERE id = ?1 AND state IN ('requested', 'running')",
+                 WHERE id = ?1 AND state IN ('requested', 'awaiting_approval', 'running')",
                 params![id.to_string(), INTERRUPTED_TOOL_RESULT, now],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3404,6 +4068,42 @@ fn parse_message_state(value: &str) -> Result<MessageState, SessionRuntimeError>
     }
 }
 
+const fn approval_mode_str(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::ReadOnly => "read_only",
+        ApprovalMode::Ask => "ask",
+        ApprovalMode::Auto => "auto",
+    }
+}
+
+fn parse_approval_mode(value: &str) -> Result<ApprovalMode, SessionRuntimeError> {
+    match value {
+        "read_only" => Ok(ApprovalMode::ReadOnly),
+        "ask" => Ok(ApprovalMode::Ask),
+        "auto" => Ok(ApprovalMode::Auto),
+        _ => Err(SessionRuntimeError::Persistence),
+    }
+}
+
+const fn approval_resolution_str(resolution: ApprovalResolution) -> &'static str {
+    match resolution {
+        ApprovalResolution::ApprovedOnce => "approved_once",
+        ApprovalResolution::ApprovedForSession => "approved_for_session",
+        ApprovalResolution::Denied => "denied",
+        ApprovalResolution::DeniedTimeout => "denied_timeout",
+    }
+}
+
+fn parse_approval_resolution(value: &str) -> Result<ApprovalResolution, SessionRuntimeError> {
+    match value {
+        "approved_once" => Ok(ApprovalResolution::ApprovedOnce),
+        "approved_for_session" => Ok(ApprovalResolution::ApprovedForSession),
+        "denied" => Ok(ApprovalResolution::Denied),
+        "denied_timeout" => Ok(ApprovalResolution::DeniedTimeout),
+        _ => Err(SessionRuntimeError::Persistence),
+    }
+}
+
 fn parse_tool_call_state(value: &str) -> Result<ToolCallState, SessionRuntimeError> {
     match value {
         "requested" => Ok(ToolCallState::Requested),
@@ -3691,6 +4391,203 @@ mod tests {
         }
     }
 
+    /// Requests `tool` once per tool turn, then completes with text.
+    struct ApprovalLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        tool: &'static str,
+        arguments: &'static str,
+        tool_turns: usize,
+    }
+
+    impl RuntimeLoader for ApprovalLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = ApprovalProvider {
+                requests: Arc::clone(&self.requests),
+                turn: StdMutex::new(0),
+                tool: self.tool,
+                arguments: self.arguments,
+                tool_turns: self.tool_turns,
+            };
+            Box::pin(async move {
+                Runtime::new(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct ApprovalProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        turn: StdMutex<usize>,
+        tool: &'static str,
+        arguments: &'static str,
+        tool_turns: usize,
+    }
+
+    impl Provider for ApprovalProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            let mut current = self.turn.lock().unwrap();
+            let turn = *current;
+            *current += 1;
+            drop(current);
+            if turn < self.tool_turns {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: format!("call_{turn}"),
+                        name: self.tool.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: format!("call_{turn}"),
+                        json: self.arguments.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: format!("call_{turn}"),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+    }
+
+    struct ApprovalHarness {
+        _directory: TempDir,
+        runtime: SessionRuntime,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        run_id: RunId,
+        events: SessionEventStream,
+    }
+
+    async fn approval_harness(
+        mode: ApprovalMode,
+        tool: &'static str,
+        arguments: &'static str,
+        tool_turns: usize,
+        approval_timeout: Duration,
+    ) -> ApprovalHarness {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions {
+                database_path: directory.path().join("sessions.sqlite3"),
+                max_active_runs: 1,
+                approval_timeout,
+            },
+            Arc::new(ApprovalLoader {
+                requests: Arc::clone(&requests),
+                tool,
+                arguments,
+                tool_turns,
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: mode,
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "mutate something".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        ApprovalHarness {
+            _directory: directory,
+            runtime,
+            requests,
+            workspace_id,
+            session_id,
+            run_id,
+            events,
+        }
+    }
+
+    async fn collect_until_approval_requested(
+        events: &mut SessionEventStream,
+    ) -> (Vec<SessionEventEnvelope>, ToolCallSnapshot) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut observed = Vec::new();
+            loop {
+                let event = events.next().await.unwrap().unwrap();
+                let requested = match &event.event {
+                    SessionEvent::ToolApprovalRequested { tool_call, .. } => {
+                        Some(tool_call.clone())
+                    }
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(tool_call) = requested {
+                    return (observed, tool_call);
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn respond_approval(
+        runtime: &SessionRuntime,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        decision: ApprovalDecision,
+    ) -> Result<CommandReceipt, SessionRuntimeError> {
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::RespondToolApproval {
+                    run_id,
+                    tool_call_id,
+                    decision,
+                },
+            )
+            .await
+    }
+
     async fn test_runtime() -> (TempDir, SessionRuntime) {
         let directory = tempfile::tempdir().unwrap();
         let runtime = SessionRuntime::open(
@@ -3750,7 +4647,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "3"
+            "4"
         );
         assert!(
             !connection
@@ -3764,6 +4661,18 @@ mod tests {
         assert!(has_column(&connection, "runs", "usage_json").unwrap());
         assert!(has_column(&connection, "tool_calls", "provider_call_id").unwrap());
         assert!(has_column(&connection, "model_turns", "assistant_content_json").unwrap());
+        assert!(has_column(&connection, "tool_calls", "approval_resolution").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT approval_mode FROM sessions WHERE id = 'old'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ask"
+        );
+        assert!(has_column(&connection, "session_grants", "value").unwrap());
     }
 
     #[test]
@@ -3844,6 +4753,7 @@ mod tests {
                         max_output_tokens: Some(256),
                         organization: None,
                     },
+                    approval_mode: ApprovalMode::default(),
                 },
             )
             .await
@@ -4188,6 +5098,7 @@ mod tests {
                         max_output_tokens: Some(256),
                         organization: None,
                     },
+                    approval_mode: ApprovalMode::default(),
                 },
             )
             .await
@@ -4331,6 +5242,7 @@ mod tests {
                         max_output_tokens: Some(256),
                         organization: None,
                     },
+                    approval_mode: ApprovalMode::default(),
                 },
             )
             .await
@@ -4660,6 +5572,7 @@ mod tests {
             SessionRuntimeOptions {
                 database_path: directory.path().join("sessions.sqlite3"),
                 max_active_runs: 1,
+                approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
             },
             Arc::new(CapturingLoader {
                 requests: Arc::clone(&requests),
@@ -4747,6 +5660,7 @@ mod tests {
                         max_output_tokens: Some(256),
                         organization: None,
                     },
+                    approval_mode: ApprovalMode::default(),
                 },
             )
             .await
@@ -4890,6 +5804,7 @@ mod tests {
             SessionRuntimeOptions {
                 database_path: directory.path().join("sessions.sqlite3"),
                 max_active_runs: 1,
+                approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
             },
             Arc::new(CapturingLoader {
                 requests: Arc::clone(&requests),
@@ -4977,6 +5892,574 @@ mod tests {
             captured[2].messages().last(),
             Some(&Message::user("first-b"))
         );
+    }
+
+    #[tokio::test]
+    async fn approving_once_executes_the_tool_after_the_client_decides() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (observed, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolCallRequested { .. }))
+        );
+        assert_eq!(tool_call.state, ToolCallState::AwaitingApproval);
+
+        let receipt = respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveOnce,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt.outcome,
+            CommandOutcome::ToolApprovalResolved {
+                tool_call_id: tool_call.id,
+                resolution: ApprovalResolution::ApprovedOnce,
+            }
+        );
+
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(matches!(
+            &observed[0].event,
+            SessionEvent::ToolApprovalResolved {
+                resolution: ApprovalResolution::ApprovedOnce,
+                ..
+            }
+        ));
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolCallStarted { .. }))
+        );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.state == ToolCallState::Completed
+                    && tool_call.result.as_deref() == Some("mutated")
+        )));
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+        let requests = harness.requests.lock().unwrap();
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult {
+                content,
+                is_error: false,
+                ..
+            }] if content == "mutated"
+        ));
+    }
+
+    #[tokio::test]
+    async fn denial_returns_a_tool_error_and_the_run_still_completes() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::Deny,
+        )
+        .await
+        .unwrap();
+
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolApprovalResolved {
+                tool_call,
+                resolution: ApprovalResolution::Denied,
+            } if tool_call.state == ToolCallState::Denied && tool_call.is_error
+        )));
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolCallStarted { .. }))
+        );
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+        let denied_result = {
+            let requests = harness.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            match requests[1].messages()[2].content() {
+                [
+                    ContentBlock::ToolResult {
+                        content,
+                        is_error: true,
+                        ..
+                    },
+                ] => content.clone(),
+                other => panic!("unexpected tool result content {other:?}"),
+            }
+        };
+        assert_eq!(denied_result, approval::USER_DENIED_RESULT);
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.focused.unwrap().tool_calls[0].state,
+            ToolCallState::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn responding_twice_returns_the_recorded_outcome_without_side_effects() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::Deny,
+        )
+        .await
+        .unwrap();
+        let _ = collect_through_finished(&mut harness.events).await;
+
+        // A retry with a different decision returns the recorded denial.
+        let retry = respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveOnce,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retry.outcome,
+            CommandOutcome::ToolApprovalResolved {
+                tool_call_id: tool_call.id,
+                resolution: ApprovalResolution::Denied,
+            }
+        );
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.focused.unwrap().tool_calls[0].state,
+            ToolCallState::Denied
+        );
+
+        assert_eq!(
+            respond_approval(
+                &harness.runtime,
+                harness.run_id,
+                ToolCallId::generate().unwrap(),
+                ApprovalDecision::ApproveOnce,
+            )
+            .await
+            .unwrap_err(),
+            SessionRuntimeError::ToolCallNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_approvals_are_denied_by_timeout_with_a_distinct_error() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            Duration::from_millis(50),
+        )
+        .await;
+        let (_, _) = collect_until_approval_requested(&mut harness.events).await;
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolApprovalResolved {
+                tool_call,
+                resolution: ApprovalResolution::DeniedTimeout,
+            } if tool_call.state == ToolCallState::Denied
+        )));
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+        let requests = harness.requests.lock().unwrap();
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult {
+                content,
+                is_error: true,
+                ..
+            }] if content == approval::TIMEOUT_DENIED_RESULT
+        ));
+    }
+
+    #[tokio::test]
+    async fn approve_for_session_grants_cover_later_calls_without_prompting() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            2,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForSession {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. })),
+            "the session grant must cover the second call"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    SessionEvent::ToolCallFinished { tool_call }
+                        if tool_call.state == ToolCallState::Completed
+                ))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_sessions_deny_mutating_tools_without_prompting() {
+        let mut harness = approval_harness(
+            ApprovalMode::ReadOnly,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. }))
+        );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.state == ToolCallState::Denied
+                    && tool_call.result.as_deref() == Some(approval::POLICY_DENIED_RESULT)
+        )));
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shell_approval_requests_carry_the_command_and_auto_mode_asks_without_a_grant() {
+        let mut harness = approval_harness(
+            ApprovalMode::Auto,
+            "__test_shell",
+            r#"{"command":"cargo test --workspace","cwd":"crates"}"#,
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (observed, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let shell = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::ToolApprovalRequested { shell, .. } => shell.clone(),
+                _ => None,
+            })
+            .expect("shell approval requests carry the command");
+        assert_eq!(shell.command, "cargo test --workspace");
+        assert_eq!(shell.cwd.as_deref(), Some("crates"));
+
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForSession {
+                grant: ApprovalGrant::ShellPrefix {
+                    prefix: "cargo test".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.state == ToolCallState::Completed
+        )));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_executes_mutating_tools_after_a_mode_change() {
+        let mut harness = approval_harness(
+            ApprovalMode::ReadOnly,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        // The first run is denied by read-only policy.
+        let _ = collect_through_finished(&mut harness.events).await;
+
+        let receipt = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SetApprovalMode {
+                    session_id: harness.session_id,
+                    mode: ApprovalMode::Auto,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.outcome,
+            CommandOutcome::ApprovalModeSet {
+                session_id: harness.session_id,
+                mode: ApprovalMode::Auto,
+            }
+        );
+
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "mutate again".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. }))
+        );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.state == ToolCallState::Completed
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_run_waiting_for_approval() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun {
+                    run_id: harness.run_id,
+                },
+            )
+            .await
+            .unwrap();
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call: finished }
+                if finished.id == tool_call.id
+                    && finished.state == ToolCallState::Interrupted
+        )));
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Cancelled,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_marks_awaiting_approval_calls_interrupted() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::Ask,
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "mutate".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        let tool_call_id = ToolCallId::generate().unwrap();
+        let call = RuntimeToolCall {
+            id: tool_call_id,
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_0".to_owned(),
+            name: "__test_mutate".to_owned(),
+            arguments: "{}".to_owned(),
+            argument_error: None,
+        };
+        store
+            .persist_model_turn(
+                &claimed,
+                1,
+                Message::new(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolCall {
+                        id: call.provider_call_id.clone(),
+                        name: call.name.clone(),
+                        arguments: serde_json::from_str(&call.arguments).unwrap(),
+                    }],
+                ),
+                vec![call],
+            )
+            .await
+            .unwrap();
+        let awaiting = store
+            .request_tool_approval(&claimed, tool_call_id, None)
+            .await
+            .unwrap();
+        drop(store);
+
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(ScriptedLoader),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: awaiting.cursor,
+            })
+            .unwrap();
+        let recovered = collect_through_finished(&mut events).await;
+        assert!(matches!(
+            &recovered[0].event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.id == tool_call_id
+                    && tool_call.state == ToolCallState::Interrupted
+                    && tool_call.is_error
+        ));
+        assert!(matches!(
+            &recovered[1].event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Interrupted,
+                ..
+            }
+        ));
     }
 
     #[cfg(unix)]

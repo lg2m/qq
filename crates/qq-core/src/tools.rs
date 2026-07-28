@@ -115,6 +115,10 @@ enum BuiltInTool {
     Search,
     #[cfg(test)]
     TestDelay,
+    #[cfg(test)]
+    TestMutate,
+    #[cfg(test)]
+    TestShell,
 }
 
 impl BuiltInTool {
@@ -127,6 +131,10 @@ impl BuiltInTool {
             "search" => Some(Self::Search),
             #[cfg(test)]
             "__test_delay" => Some(Self::TestDelay),
+            #[cfg(test)]
+            "__test_mutate" => Some(Self::TestMutate),
+            #[cfg(test)]
+            "__test_shell" => Some(Self::TestShell),
             _ => None,
         }
     }
@@ -174,7 +182,9 @@ impl BuiltInTool {
                 }),
             ),
             #[cfg(test)]
-            Self::TestDelay => unreachable!("test tools are not advertised"),
+            Self::TestDelay | Self::TestMutate | Self::TestShell => {
+                unreachable!("test tools are not advertised")
+            }
         }
     }
 }
@@ -353,6 +363,10 @@ fn execute_blocking(
             }
             ToolExecutionResult::success(arguments.result)
         }
+        #[cfg(test)]
+        Some(BuiltInTool::TestMutate) => ToolExecutionResult::success("mutated".to_owned()),
+        #[cfg(test)]
+        Some(BuiltInTool::TestShell) => ToolExecutionResult::success("shell ran".to_owned()),
         None => ToolExecutionResult::error(format!("unknown tool {name:?}")),
     }
 }
