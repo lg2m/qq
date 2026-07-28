@@ -335,11 +335,14 @@ impl Runtime {
                     return;
                 }
             };
+            let system: Arc<str> = Arc::from(agent_system_prompt(workspace.path()));
+
             let mut total_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
             for turn_ordinal in 1..=MAX_MODEL_TURNS {
                 let request = ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens)
-                    .with_tools(tools::specs());
+                    .with_tools(tools::specs())
+                    .with_system(Arc::clone(&system));
                 let mut provider_events = provider.stream(request);
                 let mut pending_calls = Vec::<PendingToolCall>::new();
                 let mut calls_by_provider_id = HashMap::<String, usize>::new();
@@ -693,6 +696,30 @@ impl Runtime {
     }
 }
 
+/// Version 1 of the base agent prompt. The text is versioned in code, not
+/// configuration: bump this note and review the diff whenever it changes.
+fn agent_system_prompt(workspace: &std::path::Path) -> String {
+    let mut tool_names = String::new();
+    for spec in tools::specs() {
+        if !tool_names.is_empty() {
+            tool_names.push_str(", ");
+        }
+        tool_names.push_str(spec.name());
+    }
+    format!(
+        "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
+         \n\
+         Available tools: {tool_names}. read_file, list_dir, and search are read-only; \
+         edit_file and write_file modify workspace files and may require user approval.\n\
+         \n\
+         Working conventions:\n\
+         - Read a file with read_file before editing or overwriting it; edits without a prior read in this session are rejected.\n\
+         - Prefer search over guessing file paths.\n\
+         - Give every tool path relative to the workspace root; absolute paths are rejected.",
+        root = workspace.display(),
+    )
+}
+
 fn append_turn_text(blocks: &mut Vec<TurnBlock>, text: &str) {
     match blocks.last_mut() {
         Some(TurnBlock::Text(existing)) => existing.push_str(text),
@@ -939,6 +966,11 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].tools().len(), 5);
+        let system = requests[0]
+            .system()
+            .expect("agent runs set a system prompt");
+        assert!(system.contains("edit_file"));
+        assert!(system.contains(directory.path().to_str().unwrap()));
         let result_message = &requests[1].messages()[2];
         assert!(matches!(
             result_message.content(),
