@@ -176,6 +176,15 @@ pub struct ShellCommandPreview {
     pub cwd: Option<String>,
 }
 
+/// Edit details carried by an approval request so clients can decide in place:
+/// the workspace-relative path and a bounded unified-diff-style preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditPreview {
+    pub path: String,
+    pub diff: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionCommand {
@@ -483,6 +492,8 @@ pub enum SessionEvent {
         tool_call: ToolCallSnapshot,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shell: Option<ShellCommandPreview>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<EditPreview>,
     },
     ToolApprovalResolved {
         tool_call: ToolCallSnapshot,
@@ -623,14 +634,33 @@ mod tests {
                 command: "cargo test".to_owned(),
                 cwd: Some("crates/qq-core".to_owned()),
             }),
+            edit: None,
         };
         let encoded = serde_json::to_value(&requested).unwrap();
         assert_eq!(encoded["type"], "tool_approval_requested");
         assert_eq!(encoded["tool_call"]["state"], "awaiting_approval");
         assert_eq!(encoded["shell"]["command"], "cargo test");
+        assert!(encoded.get("edit").is_none());
         assert_eq!(
             serde_json::from_value::<SessionEvent>(encoded).unwrap(),
             requested
+        );
+
+        let edit_requested = SessionEvent::ToolApprovalRequested {
+            tool_call: tool_call.clone(),
+            shell: None,
+            edit: Some(EditPreview {
+                path: "src/lib.rs".to_owned(),
+                diff: "- old\n+ new".to_owned(),
+            }),
+        };
+        let encoded = serde_json::to_value(&edit_requested).unwrap();
+        assert_eq!(encoded["edit"]["path"], "src/lib.rs");
+        assert_eq!(encoded["edit"]["diff"], "- old\n+ new");
+        assert!(encoded.get("shell").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            edit_requested
         );
 
         let resolved = SessionEvent::ToolApprovalResolved {

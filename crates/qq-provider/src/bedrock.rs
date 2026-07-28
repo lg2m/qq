@@ -36,8 +36,8 @@ use aws_sdk_bedrockruntime::{
     types::{
         ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart,
         ConversationRole, ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage,
-        StopReason, TokenUsage, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-        ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
+        StopReason, SystemContentBlock, TokenUsage, Tool, ToolConfiguration, ToolInputSchema,
+        ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
         error::ConverseStreamOutputError,
     },
 };
@@ -154,6 +154,7 @@ impl Provider for Bedrock {
             let response = client
                 .converse_stream()
                 .model_id(request.model_id)
+                .set_system(request.system)
                 .set_messages(Some(request.messages))
                 .set_tool_config(request.tool_config)
                 .inference_config(request.inference_config)
@@ -528,6 +529,7 @@ fn service_config(shared_config: &SdkConfig, api_key: Option<String>) -> Config 
 #[derive(Debug)]
 struct ConverseRequest {
     model_id: String,
+    system: Option<Vec<SystemContentBlock>>,
     messages: Vec<BedrockMessage>,
     tool_config: Option<ToolConfiguration>,
     inference_config: InferenceConfiguration,
@@ -588,6 +590,9 @@ impl TryFrom<&ModelRequest> for ConverseRequest {
 
         Ok(Self {
             model_id: request.model().to_owned(),
+            system: request
+                .system()
+                .map(|system| vec![SystemContentBlock::Text(system.to_owned())]),
             messages,
             tool_config,
             inference_config: InferenceConfiguration::builder()
@@ -1363,6 +1368,20 @@ mod tests {
         assert_eq!(mapped.messages[1].content()[0].as_text().unwrap(), "hi");
         assert_eq!(mapped.inference_config.max_tokens(), Some(512));
         assert!(mapped.tool_config.is_none());
+        assert!(mapped.system.is_none());
+    }
+
+    #[test]
+    fn maps_the_system_prompt_to_converse_system_blocks() {
+        let request = ModelRequest::new("anthropic.claude-test", vec![Message::user("ping")], 64)
+            .with_system("You are QQ.");
+        let mapped = ConverseRequest::try_from(&request).unwrap();
+        let system = mapped.system.unwrap();
+        assert_eq!(system.len(), 1);
+        assert!(
+            matches!(&system[0], SystemContentBlock::Text(text) if text == "You are QQ."),
+            "unexpected system block: {system:?}"
+        );
     }
 
     #[test]

@@ -353,10 +353,17 @@ fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerateContentRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<SystemInstruction<'a>>,
     contents: Vec<GoogleContent<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<GoogleTool<'a>>,
     generation_config: GenerationConfig,
+}
+
+#[derive(Serialize)]
+struct SystemInstruction<'a> {
+    parts: Vec<GooglePart<'a>>,
 }
 
 impl<'a> GenerateContentRequest<'a> {
@@ -433,6 +440,9 @@ impl<'a> GenerateContentRequest<'a> {
         };
 
         Ok(Self {
+            system_instruction: request.system().map(|text| SystemInstruction {
+                parts: vec![GooglePart::Text { text }],
+            }),
             contents,
             tools,
             generation_config: GenerationConfig { max_output_tokens },
@@ -856,6 +866,7 @@ mod tests {
     };
 
     use futures_util::StreamExt;
+    use serde_json::json;
 
     use super::*;
 
@@ -921,6 +932,24 @@ mod tests {
                 "generationConfig": {"maxOutputTokens": 64},
             })
         );
+    }
+
+    #[test]
+    fn maps_the_system_prompt_to_the_system_instruction_field() {
+        let request = ModelRequest::new("gemini-test", vec![Message::user("ping")], 64)
+            .with_system("You are QQ.");
+        let body =
+            serde_json::to_value(GenerateContentRequest::new(&request, 64).unwrap()).unwrap();
+        assert_eq!(
+            body["systemInstruction"],
+            json!({"parts": [{"text": "You are QQ."}]})
+        );
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "ping");
+
+        let without = ModelRequest::new("gemini-test", vec![Message::user("ping")], 64);
+        let body =
+            serde_json::to_value(GenerateContentRequest::new(&without, 64).unwrap()).unwrap();
+        assert!(body.get("systemInstruction").is_none());
     }
 
     #[tokio::test]

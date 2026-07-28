@@ -61,6 +61,7 @@ pub struct ModelRequest {
     model: Arc<str>,
     messages: Vec<Message>,
     tools: Vec<ToolSpec>,
+    system: Option<Arc<str>>,
     max_output_tokens: u32,
 }
 
@@ -71,6 +72,7 @@ impl ModelRequest {
             model: model.into(),
             messages,
             tools: Vec::new(),
+            system: None,
             max_output_tokens,
         }
     }
@@ -79,6 +81,15 @@ impl ModelRequest {
     #[must_use]
     pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Sets the system prompt; each codec maps it to its native
+    /// system/instructions slot. Requests without one keep their previous
+    /// wire shape.
+    #[must_use]
+    pub fn with_system(mut self, system: impl Into<Arc<str>>) -> Self {
+        self.system = Some(system.into());
         self
     }
 
@@ -95,6 +106,11 @@ impl ModelRequest {
     #[must_use]
     pub fn tools(&self) -> &[ToolSpec] {
         &self.tools
+    }
+
+    #[must_use]
+    pub fn system(&self) -> Option<&str> {
+        self.system.as_deref()
     }
 
     #[must_use]

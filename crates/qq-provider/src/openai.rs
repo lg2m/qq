@@ -434,6 +434,8 @@ fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
 #[derive(Serialize)]
 struct ResponsesRequest<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
     input: Vec<InputItem<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool<'a>>,
@@ -483,6 +485,7 @@ impl<'a> ResponsesRequest<'a> {
 
         Self {
             model: request.model(),
+            instructions: request.system(),
             input,
             tools: request.tools().iter().map(ResponsesTool::from).collect(),
             max_output_tokens: matches!(kind, ResponsesRequestKind::Standard)
@@ -909,6 +912,27 @@ mod tests {
                 "store": false
             })
         );
+    }
+
+    #[test]
+    fn maps_the_system_prompt_to_the_instructions_field() {
+        let request = ModelRequest::new("gpt-test", vec![Message::user("ping")], 64)
+            .with_system("You are QQ.");
+        let body = serde_json::to_value(ResponsesRequest::new(
+            &request,
+            ResponsesRequestKind::Standard,
+        ))
+        .unwrap();
+        assert_eq!(body["instructions"], "You are QQ.");
+        assert_eq!(body["input"][0]["content"], "ping");
+
+        let without = ModelRequest::new("gpt-test", vec![Message::user("ping")], 64);
+        let body = serde_json::to_value(ResponsesRequest::new(
+            &without,
+            ResponsesRequestKind::Standard,
+        ))
+        .unwrap();
+        assert!(body.get("instructions").is_none());
     }
 
     #[tokio::test]

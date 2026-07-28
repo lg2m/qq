@@ -12,15 +12,15 @@ mod sessions;
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
 pub use sessions::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandOutcome,
-    CommandReceipt, CommandRequest, CursorError, EventCursor, MessageRole, MessageSnapshot,
-    MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing, ModelPricingTier,
-    ModelSelection, RunFailure, RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent,
-    SessionEventEnvelope, SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview,
-    SnapshotRequest, SubscribeRequest, TextChannel, TokenUsage, ToolCallSnapshot, ToolCallState,
-    WorkspaceSnapshot, WorkspaceSummary,
+    CommandReceipt, CommandRequest, CursorError, EditPreview, EventCursor, MessageRole,
+    MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
+    ModelPricingTier, ModelSelection, RunFailure, RunOutcome, RunSnapshot, RunStatus,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot, SessionStatus,
+    SessionSummary, ShellCommandPreview, SnapshotRequest, SubscribeRequest, TextChannel,
+    TokenUsage, ToolCallSnapshot, ToolCallState, WorkspaceSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

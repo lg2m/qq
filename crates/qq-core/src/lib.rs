@@ -73,6 +73,9 @@ enum RuntimeEvent {
         id: ToolCallId,
         result: String,
         is_error: bool,
+        /// A file-state map entry recorded by this execution, persisted with
+        /// the result so the map can be rebuilt for later runs.
+        file_state: Option<tools::FileStateUpdate>,
     },
     Completed,
     Failed {
@@ -295,6 +298,7 @@ impl Runtime {
             Arc::new(StaticPolicyGate {
                 mode: ApprovalMode::Ask,
             }),
+            Arc::new(tools::FileState::default()),
         )
     }
 
@@ -304,6 +308,7 @@ impl Runtime {
         workspace: PathBuf,
         cancelled: Arc<AtomicBool>,
         gate: Arc<dyn ToolGate>,
+        file_state: Arc<tools::FileState>,
     ) -> RuntimeStream {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
@@ -330,12 +335,14 @@ impl Runtime {
                     return;
                 }
             };
+            let system: Arc<str> = Arc::from(agent_system_prompt(workspace.path()));
 
             let mut total_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
             for turn_ordinal in 1..=MAX_MODEL_TURNS {
                 let request = ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens)
-                    .with_tools(tools::specs());
+                    .with_tools(tools::specs())
+                    .with_system(Arc::clone(&system));
                 let mut provider_events = provider.stream(request);
                 let mut pending_calls = Vec::<PendingToolCall>::new();
                 let mut calls_by_provider_id = HashMap::<String, usize>::new();
@@ -591,6 +598,7 @@ impl Runtime {
                             results[index] = Some(tools::ToolExecutionResult {
                                 content: message.clone(),
                                 is_error: true,
+                                file_state: None,
                             });
                             yield RuntimeEvent::ToolCallDenied { id: call.id, message };
                         }
@@ -606,18 +614,21 @@ impl Runtime {
                     yield RuntimeEvent::ToolCallStarted { id: call.id };
                 }
 
-                let executions = approved.into_iter().map(|call| {
+                let execute_one = |call: RuntimeToolCall| {
                     let workspace = workspace.clone();
+                    let file_state = Arc::clone(&file_state);
                     let cancelled = Arc::clone(&cancelled);
                     async move {
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
                                 content: error,
                                 is_error: true,
+                                file_state: None,
                             },
                             None => {
                                 tools::execute(
                                     workspace,
+                                    file_state,
                                     call.name.clone(),
                                     call.arguments.clone(),
                                     cancelled,
@@ -627,15 +638,40 @@ impl Runtime {
                         };
                         (call, result)
                     }
+                };
+                // Read-only turns overlap under a small bound; a turn with any
+                // mutating or shell call runs entirely in request order so
+                // side effects never interleave and every read is
+                // deterministically ordered against the mutations.
+                let sequential = approved.iter().any(|call| {
+                    !matches!(
+                        approval::classify(&call.name, &call.arguments),
+                        approval::ToolClass::ReadOnly
+                    )
                 });
-                let mut executions = futures_stream::iter(executions).buffer_unordered(MAX_PARALLEL_READS);
-                while let Some((call, result)) = executions.next().await {
-                    results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
-                    yield RuntimeEvent::ToolCallFinished {
-                        id: call.id,
-                        result: result.content,
-                        is_error: result.is_error,
-                    };
+                if sequential {
+                    for call in approved {
+                        let (call, result) = execute_one(call).await;
+                        results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
+                        yield RuntimeEvent::ToolCallFinished {
+                            id: call.id,
+                            result: result.content,
+                            is_error: result.is_error,
+                            file_state: result.file_state,
+                        };
+                    }
+                } else {
+                    let mut executions = futures_stream::iter(approved.into_iter().map(execute_one))
+                        .buffer_unordered(MAX_PARALLEL_READS);
+                    while let Some((call, result)) = executions.next().await {
+                        results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
+                        yield RuntimeEvent::ToolCallFinished {
+                            id: call.id,
+                            result: result.content,
+                            is_error: result.is_error,
+                            file_state: result.file_state,
+                        };
+                    }
                 }
                 let result_blocks = calls
                     .iter()
@@ -658,6 +694,30 @@ impl Runtime {
             };
         })
     }
+}
+
+/// Version 1 of the base agent prompt. The text is versioned in code, not
+/// configuration: bump this note and review the diff whenever it changes.
+fn agent_system_prompt(workspace: &std::path::Path) -> String {
+    let mut tool_names = String::new();
+    for spec in tools::specs() {
+        if !tool_names.is_empty() {
+            tool_names.push_str(", ");
+        }
+        tool_names.push_str(spec.name());
+    }
+    format!(
+        "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
+         \n\
+         Available tools: {tool_names}. read_file, list_dir, and search are read-only; \
+         edit_file and write_file modify workspace files and may require user approval.\n\
+         \n\
+         Working conventions:\n\
+         - Read a file with read_file before editing or overwriting it; edits without a prior read in this session are rejected.\n\
+         - Prefer search over guessing file paths.\n\
+         - Give every tool path relative to the workspace root; absolute paths are rejected.",
+        root = workspace.display(),
+    )
 }
 
 fn append_turn_text(blocks: &mut Vec<TurnBlock>, text: &str) {
@@ -905,7 +965,12 @@ mod tests {
         );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].tools().len(), 3);
+        assert_eq!(requests[0].tools().len(), 5);
+        let system = requests[0]
+            .system()
+            .expect("agent runs set a system prompt");
+        assert!(system.contains("edit_file"));
+        assert!(system.contains(directory.path().to_str().unwrap()));
         let result_message = &requests[1].messages()[2];
         assert!(matches!(
             result_message.content(),
@@ -1022,6 +1087,7 @@ mod tests {
         let started = tools::test_executions_started();
         let execution = tokio::spawn(tools::execute(
             workspace,
+            Arc::new(tools::FileState::default()),
             "__test_delay".to_owned(),
             r#"{"delay_ms":500,"result":"late"}"#.to_owned(),
             Arc::clone(&cancelled),
@@ -1033,6 +1099,102 @@ mod tests {
         let result = execution.await.unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn mutating_calls_execute_sequentially_in_request_order() {
+        struct MutatingTurnProvider {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for MutatingTurnProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests.len();
+                requests.push(request);
+                drop(requests);
+                if turn == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "slow".to_owned(),
+                            name: "__test_mutate".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "slow".to_owned(),
+                            json: r#"{"delay_ms":50,"result":"slow"}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "slow".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "fast".to_owned(),
+                            name: "__test_mutate".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "fast".to_owned(),
+                            json: r#"{"delay_ms":1,"result":"fast"}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "fast".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            MutatingTurnProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        // With the concurrent read path the fast call would finish first (as
+        // the read-overlap test proves); a mutating turn must instead finish
+        // in request order because side effects may not interleave.
+        let events = runtime
+            .run_loop(
+                vec![Message::user("mutate twice")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(StaticPolicyGate {
+                    mode: ApprovalMode::Auto,
+                }),
+                Arc::new(tools::FileState::default()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let requested = events
+            .iter()
+            .flat_map(|event| match event {
+                RuntimeEvent::AssistantTurnCompleted { calls, .. } => {
+                    calls.iter().map(|call| call.id).collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let finished = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ToolCallFinished { id, result, .. } => Some((*id, result.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finished.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            requested
+        );
+        assert_eq!(finished[0].1, "slow");
+        assert_eq!(finished[1].1, "fast");
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
     }
 
     #[tokio::test]
@@ -1279,6 +1441,7 @@ mod tests {
                 Arc::new(RecordingGate {
                     consulted: Arc::clone(&consulted),
                 }),
+                Arc::new(tools::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;

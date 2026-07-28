@@ -455,6 +455,8 @@ fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
 #[derive(Serialize)]
 struct MessagesRequest<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<&'a str>,
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool<'a>>,
@@ -466,6 +468,7 @@ impl<'a> From<&'a ModelRequest> for MessagesRequest<'a> {
     fn from(request: &'a ModelRequest) -> Self {
         Self {
             model: request.model(),
+            system: request.system(),
             messages: request
                 .messages()
                 .iter()
@@ -1475,6 +1478,19 @@ mod tests {
                 "stream": true
             })
         );
+    }
+
+    #[test]
+    fn maps_the_system_prompt_to_the_native_system_field() {
+        let request = ModelRequest::new("claude-test", vec![Message::user("ping")], 64)
+            .with_system("You are QQ.");
+        let body = serde_json::to_value(MessagesRequest::from(&request)).unwrap();
+        assert_eq!(body["system"], "You are QQ.");
+        assert_eq!(body["messages"][0]["content"], "ping");
+
+        let without = ModelRequest::new("claude-test", vec![Message::user("ping")], 64);
+        let body = serde_json::to_value(MessagesRequest::from(&without)).unwrap();
+        assert!(body.get("system").is_none());
     }
 
     #[tokio::test]
