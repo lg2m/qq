@@ -69,6 +69,13 @@ enum RuntimeEvent {
         id: ToolCallId,
         message: String,
     },
+    /// A chunk of live output from a running tool (shell commands stream their
+    /// combined stdout+stderr). Display-only: the bounded result on
+    /// `ToolCallFinished` remains authoritative.
+    ToolCallOutputDelta {
+        id: ToolCallId,
+        chunk: String,
+    },
     ToolCallFinished {
         id: ToolCallId,
         result: String,
@@ -229,6 +236,7 @@ impl Runtime {
                     RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
                     | RuntimeEvent::ToolCallStarted { .. }
                     | RuntimeEvent::ToolCallDenied { .. }
+                    | RuntimeEvent::ToolCallOutputDelta { .. }
                     | RuntimeEvent::ToolCallFinished { .. } => {}
                     RuntimeEvent::Completed => {
                         yield RunEvent::Completed;
@@ -259,6 +267,7 @@ impl Runtime {
                     RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
                     | RuntimeEvent::ToolCallStarted { .. }
                     | RuntimeEvent::ToolCallDenied { .. }
+                    | RuntimeEvent::ToolCallOutputDelta { .. }
                     | RuntimeEvent::ToolCallFinished { .. } => {}
                     RuntimeEvent::Completed => {
                         yield RunEvent::Completed;
@@ -614,7 +623,10 @@ impl Runtime {
                     yield RuntimeEvent::ToolCallStarted { id: call.id };
                 }
 
-                let execute_one = |call: RuntimeToolCall| {
+                let execute_one = |call: RuntimeToolCall,
+                                   output: Option<
+                    tokio::sync::mpsc::UnboundedSender<String>,
+                >| {
                     let workspace = workspace.clone();
                     let file_state = Arc::clone(&file_state);
                     let cancelled = Arc::clone(&cancelled);
@@ -632,6 +644,7 @@ impl Runtime {
                                     call.name.clone(),
                                     call.arguments.clone(),
                                     cancelled,
+                                    output,
                                 )
                                 .await
                             }
@@ -651,7 +664,32 @@ impl Runtime {
                 });
                 if sequential {
                     for call in approved {
-                        let (call, result) = execute_one(call).await;
+                        // Live output chunks (shell) interleave with execution:
+                        // drain the channel while the call runs so long
+                        // commands render as they print.
+                        let call_id = call.id;
+                        let (delta_sender, mut deltas) =
+                            tokio::sync::mpsc::unbounded_channel::<String>();
+                        let mut execution = Box::pin(execute_one(call, Some(delta_sender)));
+                        let (call, result) = loop {
+                            tokio::select! {
+                                biased;
+                                chunk = deltas.recv() => match chunk {
+                                    Some(chunk) => {
+                                        yield RuntimeEvent::ToolCallOutputDelta { id: call_id, chunk };
+                                    }
+                                    // The execution dropped its sender early;
+                                    // nothing more can stream, so just finish.
+                                    None => break execution.await,
+                                },
+                                completed = &mut execution => break completed,
+                            }
+                        };
+                        // Chunks sent in the execution's final poll may still
+                        // be buffered; drain them before the terminal event.
+                        while let Ok(chunk) = deltas.try_recv() {
+                            yield RuntimeEvent::ToolCallOutputDelta { id: call_id, chunk };
+                        }
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                         yield RuntimeEvent::ToolCallFinished {
                             id: call.id,
@@ -661,7 +699,9 @@ impl Runtime {
                         };
                     }
                 } else {
-                    let mut executions = futures_stream::iter(approved.into_iter().map(execute_one))
+                    let mut executions = futures_stream::iter(
+                        approved.into_iter().map(|call| execute_one(call, None)),
+                    )
                         .buffer_unordered(MAX_PARALLEL_READS);
                     while let Some((call, result)) = executions.next().await {
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
@@ -696,7 +736,7 @@ impl Runtime {
     }
 }
 
-/// Version 1 of the base agent prompt. The text is versioned in code, not
+/// Version 2 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
 fn agent_system_prompt(workspace: &std::path::Path) -> String {
     let mut tool_names = String::new();
@@ -710,12 +750,14 @@ fn agent_system_prompt(workspace: &std::path::Path) -> String {
         "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
          \n\
          Available tools: {tool_names}. read_file, list_dir, and search are read-only; \
-         edit_file and write_file modify workspace files and may require user approval.\n\
+         edit_file and write_file modify workspace files and may require user approval; \
+         shell runs one command in the workspace with a bounded timeout and may require user approval.\n\
          \n\
          Working conventions:\n\
          - Read a file with read_file before editing or overwriting it; edits without a prior read in this session are rejected.\n\
          - Prefer search over guessing file paths.\n\
-         - Give every tool path relative to the workspace root; absolute paths are rejected.",
+         - Give every tool path relative to the workspace root; absolute paths are rejected.\n\
+         - Prefer edit_file and write_file over shell for changing files.",
         root = workspace.display(),
     )
 }
@@ -965,7 +1007,7 @@ mod tests {
         );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].tools().len(), 5);
+        assert_eq!(requests[0].tools().len(), 6);
         let system = requests[0]
             .system()
             .expect("agent runs set a system prompt");
@@ -1091,6 +1133,7 @@ mod tests {
             "__test_delay".to_owned(),
             r#"{"delay_ms":500,"result":"late"}"#.to_owned(),
             Arc::clone(&cancelled),
+            None,
         ));
         while tools::test_executions_started() == started {
             tokio::task::yield_now().await;
@@ -1194,6 +1237,94 @@ mod tests {
         );
         assert_eq!(finished[0].1, "slow");
         assert_eq!(finished[1].1, "fast");
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_calls_stream_output_deltas_before_their_result() {
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        struct ShellProvider {
+            turn: Mutex<usize>,
+        }
+
+        impl Provider for ShellProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                if current == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "run".to_owned(),
+                            name: "shell".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "run".to_owned(),
+                            json: r#"{"command":"echo streamed-hello"}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "run".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(
+            ShellProvider {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_loop(
+                vec![Message::user("run the command")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(tools::FileState::default()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let started = events
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::ToolCallStarted { .. }))
+            .unwrap();
+        let delta = events
+            .iter()
+            .position(|event| matches!(
+                event,
+                RuntimeEvent::ToolCallOutputDelta { chunk, .. } if chunk.contains("streamed-hello")
+            ))
+            .expect("shell output must stream as deltas");
+        let finished = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::ToolCallFinished { result, is_error: false, .. }
+                        if result.contains("streamed-hello") && result.ends_with("exit code: 0")
+                )
+            })
+            .expect("the bounded result must follow the streamed output");
+        assert!(started < delta && delta < finished);
         assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
     }
 
