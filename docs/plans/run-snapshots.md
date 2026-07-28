@@ -110,7 +110,7 @@ other policy knobs.
 
 ## Sequencing
 
-Independent of MCP (tool-execution step 5); the two share no files. The
+Independent of MCP (`docs/design/tools.md`); the two share no files. The
 natural order inside this workstream:
 
 1. Shadow store: create/open, dirty scan, snapshot commit, retention.

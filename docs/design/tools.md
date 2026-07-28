@@ -1,13 +1,10 @@
 # QQ Tool Execution And Security Design
 
-Status: steps 1–4 of the sequencing are implemented;
-step 5 onward is direction.
-
 ## Purpose
 
 This document defines how QQ agents read, search, and modify a workspace,
 execute shell commands, and call MCP tools. It resolves the tool-execution
-decisions deferred by `architecture.md` and `design.md`.
+decisions deferred by `architecture.md` and `product.md`.
 
 The design is ordered by the product priorities: speed and ease of use first,
 with correctness, durability, and workspace safety as baseline constraints. A
@@ -37,8 +34,8 @@ implementation.
 "Repeat until no tool calls" needs a ceiling — a model that keeps calling
 tools must not burn tokens forever. The loop is bounded three ways: tool
 calls per turn (16), tool calls per run (64), and model turns per run
-(default 32, becoming per-session configuration). The defaults are high
-enough that legitimate multi-step work never notices them.
+(32). The defaults are high enough that legitimate multi-step work never
+notices them.
 
 Hitting a ceiling ends the run with an explicit run outcome — not a silent
 stop, and not a generic failure — so clients can render "turn limit
@@ -48,7 +45,7 @@ stays usable; the next run starts with a fresh budget.
 ### Agent Instructions
 
 Tool declarations tell the model what it may call; they do not tell it
-that it is an agent. `ModelRequest` grows a system-prompt field, and
+that it is an agent. `ModelRequest` carries a system-prompt field, and
 `qq-core` owns a base agent prompt assembled per run: what the workspace
 is, which tools are available, and the working conventions — read a file
 before editing it, prefer `search` over guessing paths, cite paths
@@ -59,15 +56,16 @@ system/instructions slot; no codec invents its own preamble.
 
 ### Message And Content Model
 
-Tool calls require structured message content. `qq_provider::Message` grows
-from `role + String` to a role plus ordered content blocks:
+Tool calls require structured message content. `qq_provider::Message` is a
+role plus ordered content blocks:
 
 - `Text { text }`
 - `ToolCall { id, name, arguments }` (assistant turns)
 - `ToolResult { call_id, content, is_error }` (returned turns)
 
-`ModelRequest` gains the list of available tool declarations
-(`ToolSpec { name, description, input_schema }`), and `ProviderEvent` gains:
+`ModelRequest` carries the list of available tool declarations
+(`ToolSpec { name, description, input_schema }`), and `ProviderEvent`
+includes:
 
 - `ToolCallStarted { id, name }`
 - `ToolCallArgumentsDelta { id, json }`
@@ -75,16 +73,16 @@ from `role + String` to a role plus ordered content blocks:
 
 Each provider codec maps these to its wire protocol internally. Provider
 identity still must not branch in the request hot path; tool declarations are
-compiled into the request the same way messages are. This content-block
-refactor is the prerequisite for everything else in this document and should
-land first, with contract fixtures per codec.
+compiled into the request the same way messages are. This content-block model
+underpins everything else in this document; every codec carries contract
+fixtures for it.
 
 ### Persistence And Replay
 
 Tool calls follow the same authority rule as text: persist before publish.
 Each call is a row keyed by run, call id, name, arguments, state
 (`requested`, `awaiting_approval`, `running`, `completed`, `failed`,
-`denied`, `interrupted`), and result. New `SessionEvent` variants mirror the
+`denied`, `interrupted`), and result. `SessionEvent` variants mirror the
 state transitions so clients can replay a run and see exactly what the agent
 did:
 
@@ -217,7 +215,7 @@ sessions interleave safely at file granularity. Semantic conflicts surface as
 stale-file errors to the losing agent, which is the correct outcome: the
 model re-reads and reconciles, exactly as a human would after a rebase.
 
-This is the same progression `design.md` already commits to: concurrent
+This is the same progression `product.md` already commits to: concurrent
 sessions share a checkout safely at file granularity now; editing subagents
 get isolated worktrees later. Worktree orchestration stays deferred.
 
@@ -236,9 +234,9 @@ get isolated worktrees later. Worktree orchestration stays deferred.
 Shell is the one tool that cannot be contained by path checks — any command
 can touch anything the server process can. Containment is therefore the
 approval policy's job, and the honest framing is that `shell` approval trusts
-the command. OS-level sandboxing (Landlock on Linux) is a worthwhile later
-hardening step, but it is not a substitute for policy and is not part of the
-initial implementation.
+the command. OS-level sandboxing (Landlock on Linux) is a worthwhile
+hardening layer, but it is not a substitute for policy and is intentionally
+deferred.
 
 ## Version Control
 
@@ -267,10 +265,8 @@ control, not that the model needs new verbs.
   later worktree isolation) work for them unchanged. QQ takes no jj-lib
   dependency; revisit only if jj-native workspaces become a real ask.
 
-The presets land with the workspace-config grant implementation — both
-are `policy`-section config work. The harness's own undo layer, run
-snapshots, is independent of the user's VCS and designed in
-docs/run-snapshots.md.
+The harness's own undo layer, run snapshots, is independent of the
+user's VCS and planned in `docs/plans/run-snapshots.md`.
 
 ## MCP
 
@@ -367,34 +363,12 @@ shell, the server, tool, and arguments for MCP.
   hot path.
 - **MCP:** shared clients, per-server bounds, parallel across servers.
 
-## Sequencing
+## Failure-Path Testing
 
-1. Content-block message model, `ToolSpec`, and provider tool-call
-   events, with contract fixtures across all five codecs. No behavior
-   change for tool-less runs. Done.
-2. Tool loop in `qq-core` with read-only tools, capability containment,
-   parallel read execution, and tool-call persistence with replay
-   events. Done (landing).
-3. Split so the approval flow exists before anything it must guard:
-   - 3a — approval protocol: session approval modes,
-     `ToolApprovalRequested`/`ToolApprovalResolved` events, the
-     idempotent `RespondToolApproval` command, the TUI approval prompt,
-     and headless bounded-wait failure. Lands first so the flow is
-     testable end-to-end while a wrong decision can cost nothing.
-   - 3b — `edit_file`/`write_file` with read-before-write tracking,
-     content-hash CAS, and atomic rename.
-4. `shell` with bounds, streaming output, and the command allowlist. Done.
-5. MCP client, configuration, and namespaced tool integration.
-
-Two client-adjacent pieces ride alongside rather than in sequence: `@`
-file references in the TUI any time after 3b (they reuse containment and
-the file-state map), and workspace grants in configuration once session
-grants have seen real interactive use.
-
-Each step ships with tests for its failure paths — containment escapes,
-stale-file conflicts, approval denial and idempotent retry, timeout and
-cancellation kills, crash recovery marking `running` calls interrupted — and
-a benchmark for tool-call dispatch overhead once the loop exists.
+The failure paths carry direct tests — containment escapes, stale-file
+conflicts, approval denial and idempotent retry, timeout and cancellation
+kills, crash recovery marking `running` calls interrupted — and tool-call
+dispatch overhead has a benchmark.
 
 ## Intentionally Deferred
 

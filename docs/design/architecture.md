@@ -1,7 +1,5 @@
 # QQ Architecture
 
-Status: initial direction
-
 ## Purpose
 
 QQ is a local-first agent harness for querying LLMs and using them to inspect,
@@ -262,7 +260,7 @@ The first useful tool set is deliberately small:
 
 Tool calls and results are persisted and streamed so the user can understand
 what the agent did. Destructive or externally visible operations require an
-approval policy; the exact policy belongs in a separate tool-execution design.
+approval policy; the exact policy is defined in `tools.md`.
 
 A remote server can initially operate only on workspaces available on that
 server. A hosted coordinator plus outbound-connected desktop workers is a

@@ -1,7 +1,5 @@
 # Provider Validation
 
-Status: validation standard and implementation roadmap
-
 ## Purpose
 
 Provider support is valid only when QQ can prove all of the following:
@@ -254,18 +252,7 @@ Current gaps:
 - Codex OAuth has deterministic login tests but no approved live release check.
 - Model defaults and provider resolution are not yet owned by a model registry.
 
-## Implementation Order
-
-1. Add a checked-in matrix and `cargo xtask providers check offline` that maps
-   every row to its deterministic tests.
-2. Add isolated runtime composition tests for every protocol.
-3. Add the opt-in live runner with one provider at a time, strict budgets, and
-   sanitized result records.
-4. Add nightly CI using dedicated credentials, with unavailable credential rows
-   reported as skips.
-5. Retain the last green binary and run differential diagnosis automatically on
-   live failures.
-6. Make the complete matrix a release checklist, including manual Codex OAuth.
+## Completion Criteria
 
 A provider feature is complete only when its matrix rows exist, offline tests
 pass, the required live check passes, and failures remain diagnosable without
