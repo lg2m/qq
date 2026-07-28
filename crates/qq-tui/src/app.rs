@@ -3,9 +3,10 @@ use std::collections::{HashMap, VecDeque};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandRequest, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection, RunOutcome,
-    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionSummary,
-    SnapshotRequest, TokenUsage, ToolCallSnapshot, ToolCallState, WorkspaceId, WorkspaceSnapshot,
+    CommandRequest, EditPreview, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection,
+    RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
+    SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot, ToolCallState, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -202,6 +203,9 @@ pub(crate) struct App {
     recent_events: VecDeque<SessionEventEnvelope>,
     pending: HashMap<CommandId, PendingIntent>,
     answered_approvals: std::collections::HashSet<qq_protocol::ToolCallId>,
+    /// Diff previews carried by approval requests, kept only while the call
+    /// awaits an answer so the modal can show what an edit would change.
+    edit_previews: HashMap<qq_protocol::ToolCallId, EditPreview>,
 }
 
 impl App {
@@ -229,6 +233,7 @@ impl App {
             recent_events: VecDeque::new(),
             pending: HashMap::new(),
             answered_approvals: std::collections::HashSet::new(),
+            edit_previews: HashMap::new(),
         }
     }
 
@@ -248,6 +253,7 @@ impl App {
                 self.model_picker = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
+                self.edit_previews.clear();
                 self.status = Some("session state reset after reconnecting".to_owned());
                 self.apply_snapshot(snapshot)
             }
@@ -532,13 +538,24 @@ impl App {
                     }
                 }
             }
+            SessionEvent::ToolApprovalRequested {
+                tool_call, edit, ..
+            } => {
+                if tool_call.state != ToolCallState::AwaitingApproval {
+                    self.answered_approvals.remove(&tool_call.id);
+                }
+                if let Some(edit) = edit {
+                    self.edit_previews.insert(tool_call.id, edit.clone());
+                }
+                self.upsert_tool_call(tool_call.clone());
+            }
             SessionEvent::ToolCallRequested { tool_call }
-            | SessionEvent::ToolApprovalRequested { tool_call, .. }
             | SessionEvent::ToolApprovalResolved { tool_call, .. }
             | SessionEvent::ToolCallStarted { tool_call }
             | SessionEvent::ToolCallFinished { tool_call } => {
                 if tool_call.state != ToolCallState::AwaitingApproval {
                     self.answered_approvals.remove(&tool_call.id);
+                    self.edit_previews.remove(&tool_call.id);
                 }
                 self.upsert_tool_call(tool_call.clone());
             }
@@ -1193,6 +1210,11 @@ impl App {
         })
     }
 
+    /// The diff preview carried by the pending approval's request, if any.
+    pub(crate) fn pending_approval_edit(&self) -> Option<&EditPreview> {
+        self.edit_previews.get(&self.pending_approval()?.id)
+    }
+
     fn handle_approval_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
         if matches!(self.settings.action_for(key), Some(Action::CancelRun)) {
             return self.cancel_run();
@@ -1633,6 +1655,63 @@ mod tests {
                 ..
             } if prefix == "cargo test --workspace"
         ));
+    }
+
+    #[test]
+    fn edit_previews_are_kept_only_while_the_approval_is_pending() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        let workspace_id = initial.workspace.id;
+        let store_id = initial.cursor.store_id;
+        app.apply_snapshot(initial);
+        let run_id = id(4, RunId::from_bytes);
+        let envelope = |sequence, event| SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence,
+            },
+            session_id,
+            run_id: Some(run_id),
+            caused_by: None,
+            occurred_at_ms: sequence,
+            event,
+        };
+        let mut tool_call = ToolCallSnapshot {
+            id: id(7, ToolCallId::from_bytes),
+            session_id,
+            run_id,
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_0".to_owned(),
+            name: "edit_file".to_owned(),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+        };
+
+        app.apply_live_event(envelope(
+            2,
+            SessionEvent::ToolApprovalRequested {
+                tool_call: tool_call.clone(),
+                shell: None,
+                edit: Some(EditPreview {
+                    path: "note.txt".to_owned(),
+                    diff: "-old\n+new".to_owned(),
+                }),
+            },
+        ));
+        assert_eq!(
+            app.pending_approval_edit().map(|edit| edit.diff.as_str()),
+            Some("-old\n+new")
+        );
+
+        tool_call.state = ToolCallState::Running;
+        app.apply_live_event(envelope(3, SessionEvent::ToolCallStarted { tool_call }));
+        assert!(app.pending_approval_edit().is_none());
+        assert!(app.edit_previews.is_empty());
     }
 
     #[test]

@@ -8,10 +8,12 @@ use std::{
 use crossterm::{
     cursor::MoveTo,
     queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use qq_protocol::{
     MessageId, MessageRole, MessageSnapshot, MessageState, RunId, SessionId, SessionStatus,
     ToolCallSnapshot, ToolCallState,
@@ -45,6 +47,7 @@ const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Style {
     color: Option<Color>,
+    background: Option<Color>,
     bold: bool,
     dim: bool,
     italic: bool,
@@ -54,10 +57,16 @@ impl Style {
     const fn color(color: Color) -> Self {
         Self {
             color: Some(color),
+            background: None,
             bold: false,
             dim: false,
             italic: false,
         }
+    }
+
+    const fn on(mut self, background: Color) -> Self {
+        self.background = Some(background);
+        self
     }
 
     const fn bold(mut self) -> Self {
@@ -150,6 +159,36 @@ fn warning() -> Style {
 
 fn failure() -> Style {
     Style::color(Color::Red)
+}
+
+fn success() -> Style {
+    Style::color(Color::Green)
+}
+
+/// Dark surface tint behind code-block panels, distinct from the terminal
+/// background so a padded block reads as one solid slab.
+const SURFACE_COLOR: Color = Color::Rgb {
+    r: 38,
+    g: 40,
+    b: 48,
+};
+
+fn surface(style: Style) -> Style {
+    style.on(SURFACE_COLOR)
+}
+
+/// Unified-diff line coloring: additions green, removals red, hunk headers in
+/// the muted accent, context lines normal. Diff lines never reflow.
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("@@") {
+        accent().dim()
+    } else if line.starts_with('+') {
+        success()
+    } else if line.starts_with('-') {
+        failure()
+    } else {
+        normal()
+    }
 }
 
 #[derive(Default)]
@@ -401,7 +440,10 @@ impl FrameRenderer {
             }
         }
         for prompt in app.pending_prompts(session_id) {
+            // A pending prompt is a YOU boundary: the same two blank lines
+            // that precede any user turn.
             if !lines.is_empty() {
+                lines.push(Line::default());
                 lines.push(Line::default());
             }
             let mut line = Line::styled(" ▌ ", warning());
@@ -946,20 +988,39 @@ fn approval_prompt(app: &App, width: usize, height: usize) -> Vec<Line> {
         line.push(command, normal().bold());
         lines.push(truncate_line(line, width));
     }
-    lines.push(Line::styled("  arguments:", muted()));
-    let arguments = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
-        .and_then(|value| serde_json::to_string_pretty(&value))
-        .unwrap_or_else(|_| tool_call.arguments.clone());
-    let available = height.saturating_sub(lines.len() + 2).max(1);
-    for (shown, text) in arguments.lines().enumerate() {
-        if shown == available {
-            lines.push(Line::styled("    ...", muted().italic()));
-            break;
+    if let Some(edit) = app.pending_approval_edit() {
+        // An edit approval shows what would change instead of the raw
+        // arguments; diff lines truncate rather than reflow.
+        let mut line = Line::styled("  file: ", muted());
+        line.push(edit.path.clone(), normal().bold());
+        lines.push(truncate_line(line, width));
+        let available = height.saturating_sub(lines.len() + 2).max(1);
+        for (shown, text) in edit.diff.lines().enumerate() {
+            if shown == available {
+                lines.push(Line::styled("    ...", muted().italic()));
+                break;
+            }
+            lines.push(truncate_line(
+                Line::styled(format!("    {text}"), diff_line_style(text)),
+                width,
+            ));
         }
-        lines.push(truncate_line(
-            Line::styled(format!("    {text}"), normal()),
-            width,
-        ));
+    } else {
+        lines.push(Line::styled("  arguments:", muted()));
+        let arguments = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+            .and_then(|value| serde_json::to_string_pretty(&value))
+            .unwrap_or_else(|_| tool_call.arguments.clone());
+        let available = height.saturating_sub(lines.len() + 2).max(1);
+        for (shown, text) in arguments.lines().enumerate() {
+            if shown == available {
+                lines.push(Line::styled("    ...", muted().italic()));
+                break;
+            }
+            lines.push(truncate_line(
+                Line::styled(format!("    {text}"), normal()),
+                width,
+            ));
+        }
     }
     lines.push(Line::default());
     lines.push(Line::styled(
@@ -1180,10 +1241,10 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
     // Lines marked literal (code blocks, laid-out tables) keep character
     // wrapping so column alignment survives; prose lines wrap at words.
     let mut literal = vec![false];
-    let mut in_code_block = false;
     let mut styles = vec![normal()];
     let mut list_depth = 0_usize;
     let mut table: Option<TableBuffer> = None;
+    let mut code_block: Option<CodeBlockBuffer> = None;
     let parser = Parser::new_ext(source, Options::all());
     for event in parser {
         match event {
@@ -1191,6 +1252,11 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 Tag::Paragraph => {}
                 Tag::Heading { .. } => {
                     ensure_line(&mut lines);
+                    // A blank line above the heading separates it from the
+                    // preceding block; a leading heading stays flush.
+                    if lines.len() > 1 {
+                        lines.push(Line::default());
+                    }
                     styles.push(accent().bold());
                 }
                 Tag::Strong => {
@@ -1203,16 +1269,9 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                     style.italic = true;
                     styles.push(style);
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     ensure_line(&mut lines);
-                    styles.push(warning());
-                    in_code_block = true;
-                    // The block's first text lands on the current (possibly
-                    // pre-existing) line, so flag it literal explicitly.
-                    literal.resize(lines.len(), true);
-                    if let Some(flag) = literal.last_mut() {
-                        *flag = true;
-                    }
+                    code_block = Some(CodeBlockBuffer::new(&kind));
                 }
                 Tag::List(_) => list_depth += 1,
                 Tag::Item => {
@@ -1259,16 +1318,23 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 | Tag::MetadataBlock(_) => {}
             },
             Event::End(tag) => match tag {
-                TagEnd::Paragraph
-                | TagEnd::Heading(_)
-                | TagEnd::CodeBlock
-                | TagEnd::BlockQuote(_) => {
-                    if matches!(tag, TagEnd::CodeBlock) {
-                        in_code_block = false;
-                    }
+                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::BlockQuote(_) => {
                     ensure_line(&mut lines);
-                    if matches!(tag, TagEnd::Heading(_) | TagEnd::CodeBlock) {
+                    if matches!(tag, TagEnd::Heading(_)) {
                         styles.pop();
+                    }
+                }
+                TagEnd::CodeBlock => {
+                    if let Some(buffer) = code_block.take() {
+                        let rendered = layout_code_panel(&buffer, width.max(1));
+                        if lines.last().is_some_and(Line::is_empty) {
+                            lines.pop();
+                            literal.pop();
+                        }
+                        literal.resize(lines.len(), false);
+                        lines.extend(rendered);
+                        literal.resize(lines.len(), true);
+                        lines.push(Line::default());
                     }
                 }
                 TagEnd::Strong | TagEnd::Emphasis => {
@@ -1285,7 +1351,7 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                                 lines.pop();
                                 literal.pop();
                             }
-                            literal.resize(lines.len(), in_code_block);
+                            literal.resize(lines.len(), false);
                             lines.extend(rendered);
                             literal.resize(lines.len(), true);
                             lines.push(Line::default());
@@ -1317,10 +1383,14 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 | TagEnd::MetadataBlock(_) => {}
             },
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                let style = *styles.last().expect("base style remains");
-                match table.as_mut() {
-                    Some(buffer) => buffer.append(&text, style),
-                    None => append_safe_text(&mut lines, &text, style),
+                if let Some(buffer) = code_block.as_mut() {
+                    buffer.text.push_str(&text);
+                } else {
+                    let style = *styles.last().expect("base style remains");
+                    match table.as_mut() {
+                        Some(buffer) => buffer.append(&text, style),
+                        None => append_safe_text(&mut lines, &text, style),
+                    }
                 }
             }
             Event::Code(code) => {
@@ -1361,7 +1431,7 @@ fn markdown_lines(source: &str, width: usize) -> Vec<Line> {
                 push_inline(table.as_mut(), &mut lines, &format!("${math}$"), warning());
             }
         }
-        literal.resize(lines.len(), in_code_block);
+        literal.resize(lines.len(), false);
     }
     while lines.last().is_some_and(Line::is_empty) {
         lines.pop();
@@ -1575,6 +1645,90 @@ fn layout_table_stacked(rows: &[Vec<Line>], has_header: bool, width: usize) -> V
         }
     }
     output
+}
+
+/// The panel's left border glyph plus one cell of padding.
+const CODE_PANEL_GUTTER: &str = "│ ";
+/// Display width of [`CODE_PANEL_GUTTER`].
+const CODE_PANEL_GUTTER_WIDTH: usize = 2;
+
+/// Buffers one code block's text while the parser walks it, so the panel can
+/// be laid out from complete content. Streamed partial input closes the block
+/// at end of input, so an unterminated fence still renders as a panel.
+struct CodeBlockBuffer {
+    language: Option<String>,
+    text: String,
+}
+
+impl CodeBlockBuffer {
+    fn new(kind: &CodeBlockKind) -> Self {
+        let language = match kind {
+            CodeBlockKind::Fenced(info) => info
+                .split([',', ' ', '\t'])
+                .next()
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned),
+            CodeBlockKind::Indented => None,
+        };
+        Self {
+            language,
+            text: String::new(),
+        }
+    }
+}
+
+/// Lays a buffered code block out as a full-width tinted panel: a padding row
+/// carrying the right-aligned language label, character-wrapped content rows,
+/// and a closing padding row. Every row is padded to `width` so the tint
+/// reads as one solid panel rather than ragged highlights.
+fn layout_code_panel(block: &CodeBlockBuffer, width: usize) -> Vec<Line> {
+    let diff = block.language.as_deref() == Some("diff");
+    let content_width = width.saturating_sub(CODE_PANEL_GUTTER_WIDTH).max(1);
+    let mut top = Line::default();
+    if let Some(language) = block.language.as_deref() {
+        let label = language
+            .chars()
+            .filter_map(terminal_safe_character)
+            .collect::<String>();
+        let mut labelled = Line::styled(label, muted());
+        let label_width = labelled.width();
+        if label_width > 0 && label_width <= content_width {
+            top.push(" ".repeat(content_width - label_width), muted());
+            top.spans.append(&mut labelled.spans);
+        }
+    }
+    let mut output = vec![code_panel_row(top, width)];
+    for source_line in block.text.lines() {
+        let safe = source_line
+            .chars()
+            .filter_map(terminal_safe_character)
+            .collect::<String>();
+        let style = if diff {
+            diff_line_style(&safe)
+        } else {
+            normal()
+        };
+        for wrapped in wrap_line_chars(Line::styled(safe, style), content_width) {
+            output.push(code_panel_row(wrapped, width));
+        }
+    }
+    output.push(code_panel_row(Line::default(), width));
+    output
+}
+
+/// One physical panel row: the bordered gutter, the content, and enough
+/// trailing padding to carry the background tint to the full width.
+fn code_panel_row(content: Line, width: usize) -> Line {
+    let mut row = Line::styled(CODE_PANEL_GUTTER, surface(accent().dim()));
+    let content_width = content.width();
+    for span in content.spans {
+        row.push(span.text, surface(span.style));
+    }
+    row.push(
+        " ".repeat(width.saturating_sub(CODE_PANEL_GUTTER_WIDTH + content_width)),
+        surface(normal()),
+    );
+    row
 }
 
 fn bounded_markdown_lines(source: &str, width: usize) -> Vec<Line> {
@@ -1810,6 +1964,9 @@ fn write_line(output: &mut impl Write, line: &Line) -> io::Result<()> {
         queue!(output, SetAttribute(Attribute::Reset), ResetColor)?;
         if let Some(color) = span.style.color {
             queue!(output, SetForegroundColor(color))?;
+        }
+        if let Some(background) = span.style.background {
+            queue!(output, SetBackgroundColor(background))?;
         }
         if span.style.bold {
             queue!(output, SetAttribute(Attribute::Bold))?;
@@ -2061,7 +2218,88 @@ mod tests {
     fn code_blocks_keep_character_wrapping() {
         let rows = frame_rows(&markdown_lines("```\nlet answer_value = 42;\n```", 12));
 
-        assert_eq!(rows, ["let answer_v", "alue = 42;"]);
+        assert_eq!(
+            rows,
+            [
+                "│           ",
+                "│ let answer",
+                "│ _value = 4",
+                "│ 2;        ",
+                "│           ",
+            ]
+        );
+    }
+
+    #[test]
+    fn fenced_code_renders_as_a_tinted_panel_with_a_language_label() {
+        let width = 24;
+        let lines = markdown_lines("```rust\nlet x = 1;\n```", width);
+        let rows = frame_rows(&lines);
+
+        assert_eq!(
+            rows,
+            [
+                format!("│ {}rust", " ".repeat(18)),
+                format!("│ let x = 1;{}", " ".repeat(12)),
+                format!("│{}", " ".repeat(23)),
+            ]
+        );
+        // Every row is padded to the full width with the surface tint so the
+        // panel reads as one solid slab.
+        assert!(lines.iter().all(|line| line.width() == width));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.background == Some(SURFACE_COLOR))
+        );
+        assert_eq!(lines[0].spans[0].style, surface(accent().dim()));
+        assert_eq!(lines[0].spans[1].style, surface(muted()));
+    }
+
+    #[test]
+    fn diff_fenced_blocks_color_lines_inside_the_panel() {
+        let source = "```diff\n@@ -1,2 +1,2 @@\n-old line\n+new line\n context\n```";
+        let lines = markdown_lines(source, 30);
+
+        let style_of = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.text.contains(needle))
+                .map(|span| span.style)
+        };
+        assert_eq!(style_of("@@ -1,2 +1,2 @@"), Some(surface(accent().dim())));
+        assert_eq!(style_of("-old line"), Some(surface(failure())));
+        assert_eq!(style_of("+new line"), Some(surface(success())));
+        assert_eq!(style_of(" context"), Some(surface(normal())));
+        assert!(lines.iter().all(|line| line.width() == 30));
+    }
+
+    #[test]
+    fn unterminated_fences_render_panels_safely_mid_stream() {
+        let fragments = [
+            "```",
+            "```rust",
+            "```rust\nfn main() {",
+            "prose\n\n```diff\n+partial",
+        ];
+        for fragment in fragments {
+            for width in 0..48 {
+                let lines = markdown_lines(fragment, width);
+                assert!(lines.iter().all(|line| line.width() <= width.max(1)));
+            }
+        }
+        // A fence still streaming renders as a panel with the text so far.
+        let rows = frame_rows(&markdown_lines("```rust\nfn main() {", 24));
+        assert!(rows.iter().any(|row| row.starts_with("│ fn main() {")));
+    }
+
+    #[test]
+    fn headings_get_a_blank_line_above_and_lists_stay_tight() {
+        let rows = frame_rows(&markdown_lines("intro\n# Title\n- alpha\n- beta", 40));
+
+        assert_eq!(rows, ["intro", "", "Title", "- alpha", "- beta"]);
     }
 
     #[test]
@@ -2118,6 +2356,92 @@ mod tests {
                 .any(|row| row.contains("● read_file note.txt (1 line)"))
         );
         assert!(!frame_text(&frame).contains("contents"));
+    }
+
+    #[test]
+    fn transcript_spacing_separates_blocks_and_doubles_before_prompts() {
+        let mut app = app_with_messages(3);
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        let messages = session.messages.as_mut().unwrap();
+        messages[0].role = MessageRole::User;
+        messages[2].role = MessageRole::User;
+        session.tool_calls = Some(vec![tool_call_snapshot(
+            7,
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+            ToolCallState::Completed,
+            Some("contents"),
+            false,
+        )]);
+
+        let rows = frame_rows(&FrameRenderer::default().transcript(&app, 80));
+
+        assert_eq!(
+            rows,
+            [
+                " ▌ YOU",
+                " ▌ row 0",
+                "",
+                "   QQ",
+                "   row 1",
+                "",
+                "   ● read_file note.txt (1 line)",
+                "",
+                "",
+                " ▌ YOU",
+                " ▌ row 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_prompts_render_edit_previews_as_colored_diffs() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        let tool_call = tool_call_snapshot(
+            9,
+            "edit_file",
+            r#"{"path":"src/lib.rs","content":"new"}"#,
+            ToolCallState::AwaitingApproval,
+            None,
+            false,
+        );
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: StoreId::from_bytes([4; 16]),
+                workspace_id: app.workspace_id.unwrap(),
+                sequence: 2,
+            },
+            session_id,
+            run_id: Some(tool_call.run_id),
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::ToolApprovalRequested {
+                tool_call,
+                shell: None,
+                edit: Some(qq_protocol::EditPreview {
+                    path: "src/lib.rs".to_owned(),
+                    diff: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                }),
+            },
+        }));
+
+        let frame = FrameRenderer::default().frame(&mut app, 80, 24);
+        let rows = frame_rows(&frame);
+
+        assert!(rows.iter().any(|row| row.contains("file: src/lib.rs")));
+        assert!(!frame_text(&frame).contains("arguments:"));
+        let style_of = |needle: &str| {
+            frame
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.text.contains(needle))
+                .map(|span| span.style)
+        };
+        assert_eq!(style_of("@@ -1 +1 @@"), Some(accent().dim()));
+        assert_eq!(style_of("-old"), Some(failure()));
+        assert_eq!(style_of("+new"), Some(success()));
     }
 
     #[test]
@@ -2422,6 +2746,17 @@ mod tests {
         assert!(!rendered.contains("\u{1b}]52"));
         assert!(!rendered.contains('\u{7}'));
         assert!(!rendered.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn panel_rows_emit_the_surface_background_to_the_terminal() {
+        let row = code_panel_row(Line::styled("x", normal()), 8);
+        let mut rendered = Vec::new();
+
+        write_line(&mut rendered, &row).unwrap();
+
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.contains("48;2;38;40;48"));
     }
 
     #[test]
