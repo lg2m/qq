@@ -292,6 +292,50 @@ beyond the built-in tools arrives as an MCP server.
 
 MCP tools execute outside the workspace containment model, so they are
 externally visible by default and require approval unless allowlisted.
+Within a turn they execute in the sequential (mutating) path, never the
+concurrent read-only path: an external call's side effects must not
+interleave with other calls in the same turn.
+
+### MCP Configuration
+
+Servers are declared in the `mcp` section of the ordinary layered
+documents, keyed by name. Names become the middle segment of
+`mcp__<server>__<tool>`, so a name may not contain `__` (validation
+rejects it) and the grammar stays unambiguous. Entries replace whole
+declarations by name across layers; `Remove` deletes a server declared by
+an earlier layer. Workspace declarations are sensitive operations behind
+the same trust flow as providers, and remote configuration may not
+declare servers at all.
+
+```ron
+(
+    version: 1,
+    mcp: {
+        "executor": Stdio(
+            command: "./executor.sh",
+            args: ["--serve"],
+            // Environment variables passed through to the child, which
+            // otherwise starts from a cleared environment plus PATH/HOME.
+            env: ["EXECUTOR_API_KEY"],
+            eager: true,                  // connect at startup, not first use
+            allow: ["execute", "skills"], // per-server tool allowlist
+        ),
+        "linear": Http(
+            url: "https://mcp.linear.app/mcp",
+            bearer: Env("LINEAR_TOKEN"),  // sourced like every other secret
+            call_timeout_seconds: 60,     // default 60, max 600
+            max_concurrent_calls: 4,      // per-server bound, default 4
+        ),
+    },
+)
+```
+
+One deliberate divergence from the grant design above: the per-MCP-server
+tool allowlist lives on the server's own `mcp` entry rather than in the
+`policy` section, because `policy` is currently managed-source-only while
+MCP allowlists are an ordinary workspace trust decision. The entries
+still become exact-name grants (`mcp__<server>__<tool>`) in the same
+grant set the approval flow consults.
 
 ## Approval Policy
 

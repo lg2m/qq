@@ -9,6 +9,7 @@ publish = false
 [workspace]
 members = [
   "crates/qq-core",
+  "crates/qq-mcp",
   "crates/qq-provider",
   "crates/qq-protocol",
   "crates/qq-tui",
@@ -46,12 +47,17 @@ hmac = "0.12"
 http-body = "1"
 keyring = "4"
 qq-core = { path = "crates/qq-core" }
+qq-mcp = { path = "crates/qq-mcp" }
 qq-provider = { path = "crates/qq-provider" }
 qq-protocol = { path = "crates/qq-protocol" }
 qq-tui = { path = "crates/qq-tui" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls", "stream", "webpki-roots"] }
+# reqwest 0.13.2 dropped the optional `webpki-roots` dependency (and with it
+# the implicit `webpki-roots` feature); the `rustls` feature verifies against
+# platform trust roots via rustls-platform-verifier instead.
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "form", "json", "rustls", "stream"] }
+rmcp = { version = "3.0.0", default-features = false, features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 ron = "0.12"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
@@ -74,6 +80,7 @@ getrandom.workspace = true
 hmac.workspace = true
 keyring.workspace = true
 qq-core.workspace = true
+qq-mcp.workspace = true
 qq-provider.workspace = true
 qq-protocol.workspace = true
 qq-tui.workspace = true

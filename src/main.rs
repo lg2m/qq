@@ -14,6 +14,7 @@ mod catalog;
 mod cli;
 mod client;
 mod config;
+mod mcp;
 mod models;
 mod output;
 mod providers;

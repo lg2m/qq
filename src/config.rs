@@ -24,6 +24,10 @@ pub use tui::{TuiConfigSnapshot, TuiSourceReport};
 
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MCP_CALL_TIMEOUT_SECONDS: u64 = 60;
+pub const MAX_MCP_CALL_TIMEOUT_SECONDS: u64 = 600;
+pub const DEFAULT_MCP_MAX_CONCURRENT_CALLS: u32 = 4;
+pub const MAX_MCP_MAX_CONCURRENT_CALLS: u32 = 64;
 
 /// All process-dependent inputs captured before a configuration load begins.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -494,6 +498,82 @@ impl Connection {
 
     const fn references_local_credential(&self) -> bool {
         self.auth.references_local_credential()
+    }
+}
+
+/// How a configured MCP server is reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpTransport {
+    /// Spawn `command args...` and speak MCP over its stdio. `env` lists
+    /// environment variables passed through from the server process; the
+    /// child otherwise starts from a cleared environment (plus `PATH` and
+    /// `HOME`).
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<String>,
+    },
+    /// Streamable-HTTP endpoint; the bearer token is sourced like every
+    /// other secret in the configuration system.
+    Http {
+        url: String,
+        bearer: Option<SecretRef>,
+    },
+}
+
+/// One configuration-declared MCP server, merged across layers by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpServerConfig {
+    transport: McpTransport,
+    eager: bool,
+    allow: Vec<String>,
+    call_timeout_seconds: u64,
+    max_concurrent_calls: u32,
+}
+
+impl McpServerConfig {
+    pub(crate) const fn new(
+        transport: McpTransport,
+        eager: bool,
+        allow: Vec<String>,
+        call_timeout_seconds: u64,
+        max_concurrent_calls: u32,
+    ) -> Self {
+        Self {
+            transport,
+            eager,
+            allow,
+            call_timeout_seconds,
+            max_concurrent_calls,
+        }
+    }
+
+    #[must_use]
+    pub const fn transport(&self) -> &McpTransport {
+        &self.transport
+    }
+
+    /// Connect at server startup instead of on first use.
+    #[must_use]
+    pub const fn eager(&self) -> bool {
+        self.eager
+    }
+
+    /// Bare tool names allowlisted by configuration; they become
+    /// `mcp__<server>__<tool>` grants in the approval policy.
+    #[must_use]
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
+
+    #[must_use]
+    pub const fn call_timeout_seconds(&self) -> u64 {
+        self.call_timeout_seconds
+    }
+
+    #[must_use]
+    pub const fn max_concurrent_calls(&self) -> u32 {
+        self.max_concurrent_calls
     }
 }
 
@@ -987,6 +1067,8 @@ pub enum ConfigKey {
     Providers,
     Provider(String),
     Policy,
+    Mcp,
+    McpServer(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1085,6 +1167,7 @@ pub struct ConfigSnapshot {
     model: ModelRoute,
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
+    mcp: BTreeMap<String, McpServerConfig>,
     policy: EffectivePolicy,
     reports: Vec<SourceReport>,
     provenance: ConfigProvenance,
@@ -1109,6 +1192,12 @@ impl ConfigSnapshot {
     #[must_use]
     pub const fn providers(&self) -> &BTreeMap<String, ProviderConfig> {
         &self.providers
+    }
+
+    /// Configuration-declared MCP servers by name.
+    #[must_use]
+    pub const fn mcp_servers(&self) -> &BTreeMap<String, McpServerConfig> {
+        &self.mcp
     }
 
     #[must_use]
@@ -1215,6 +1304,8 @@ pub enum ConfigError {
     LiteralSecretForbidden { origin: SourceIdentity },
     #[error("remote configuration cannot select local credential references: {origin}")]
     RemoteCredentialReferenceForbidden { origin: SourceIdentity },
+    #[error("remote configuration cannot declare MCP servers: {origin}")]
+    RemoteMcpForbidden { origin: SourceIdentity },
     #[error("project configuration trust is required")]
     TrustRequired {
         pending: Vec<PendingTrust>,

@@ -13,9 +13,11 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AwsAuth, BedrockAuth, ConfigError, ConfigKey, ConfigProvenance, ConfigSnapshot, Connection,
-    DEFAULT_MAX_OUTPUT_TOKENS, EffectivePolicy, HttpAccess, HttpCredential, InputModality,
-    ModelMetadata, ModelRoute, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind,
-    RuntimeOverrides, SecretRef, SourceIdentity, SourceKind, SourceReport,
+    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MCP_CALL_TIMEOUT_SECONDS, DEFAULT_MCP_MAX_CONCURRENT_CALLS,
+    EffectivePolicy, HttpAccess, HttpCredential, InputModality, MAX_MCP_CALL_TIMEOUT_SECONDS,
+    MAX_MCP_MAX_CONCURRENT_CALLS, McpServerConfig, McpTransport, ModelMetadata, ModelRoute,
+    ProviderAccess, ProviderApi, ProviderConfig, ProviderKind, RuntimeOverrides, SecretRef,
+    SourceIdentity, SourceKind, SourceReport,
 };
 
 pub(super) fn deserialize_unique_btree_map<'de, D, K, V>(
@@ -351,6 +353,55 @@ impl ProviderEntryPatch {
     }
 }
 
+/// One declared MCP server. Entries replace whole declarations by name
+/// (unlike provider patches there is no per-field layering) and `Remove`
+/// deletes a server declared by an earlier layer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum McpServerPatch {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Vec<String>,
+        #[serde(default)]
+        eager: bool,
+        #[serde(default)]
+        allow: Vec<String>,
+        #[serde(default)]
+        call_timeout_seconds: Option<u64>,
+        #[serde(default)]
+        max_concurrent_calls: Option<u32>,
+    },
+    Http {
+        url: String,
+        #[serde(default)]
+        bearer: Option<SecretRef>,
+        #[serde(default)]
+        eager: bool,
+        #[serde(default)]
+        allow: Vec<String>,
+        #[serde(default)]
+        call_timeout_seconds: Option<u64>,
+        #[serde(default)]
+        max_concurrent_calls: Option<u32>,
+    },
+    Remove,
+}
+
+impl McpServerPatch {
+    fn contains_literal_secret(&self) -> bool {
+        matches!(
+            self,
+            Self::Http {
+                bearer: Some(SecretRef::Value(_)),
+                ..
+            }
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct PolicyPatch {
@@ -374,6 +425,8 @@ pub(super) struct Document {
     max_output_tokens: Field<u32>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     providers: Field<UniqueMap<String, ProviderEntryPatch>>,
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    mcp: Field<UniqueMap<String, McpServerPatch>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy: Option<PolicyPatch>,
 }
@@ -419,6 +472,16 @@ impl Document {
                 origin: origin.clone(),
             });
         }
+        // MCP declarations name commands to execute and endpoints to call;
+        // remote configuration may never plant them.
+        if origin.kind() == SourceKind::Remote && self.mcp.is_present() {
+            return Err(ConfigError::RemoteMcpForbidden {
+                origin: origin.clone(),
+            });
+        }
+        if let Field::Set(servers) = &self.mcp {
+            validate_mcp_servers(servers, origin)?;
+        }
         if let Some(policy) = &self.policy {
             validate_policy_names(policy, origin)?;
         }
@@ -426,7 +489,10 @@ impl Document {
     }
 
     pub(super) fn has_sensitive_operations(&self) -> bool {
-        self.organization.is_present() || self.model.is_present() || self.providers.is_present()
+        self.organization.is_present()
+            || self.model.is_present()
+            || self.providers.is_present()
+            || self.mcp.is_present()
     }
 
     pub(super) fn sensitive_digest(&self) -> Result<Option<String>, ConfigError> {
@@ -442,6 +508,8 @@ impl Document {
             model: Option<&'a StringField>,
             #[serde(skip_serializing_if = "Option::is_none")]
             providers: Option<&'a Field<UniqueMap<String, ProviderEntryPatch>>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            mcp: Option<&'a Field<UniqueMap<String, McpServerPatch>>>,
         }
 
         fn present<T>(field: &Field<T>) -> Option<&Field<T>> {
@@ -452,6 +520,7 @@ impl Document {
             organization: self.organization.is_present().then_some(&self.organization),
             model: self.model.is_present().then_some(&self.model),
             providers: present(&self.providers),
+            mcp: present(&self.mcp),
         };
         let canonical =
             serde_json::to_vec(&projection).map_err(|error| ConfigError::StateSerialization {
@@ -483,6 +552,12 @@ impl Document {
                 touched.extend(providers.0.keys().cloned().map(ConfigKey::Provider));
             }
         }
+        if self.mcp.is_present() {
+            touched.push(ConfigKey::Mcp);
+            if let Field::Set(servers) = &self.mcp {
+                touched.extend(servers.0.keys().cloned().map(ConfigKey::McpServer));
+            }
+        }
         if self.policy.is_some() {
             touched.push(ConfigKey::Policy);
         }
@@ -490,13 +565,21 @@ impl Document {
     }
 
     pub(super) fn contains_literal_secret(&self) -> bool {
-        match &self.providers {
+        let providers = match &self.providers {
             Field::Set(providers) => providers
                 .0
                 .values()
                 .any(ProviderEntryPatch::contains_literal_secret),
             Field::Missing | Field::Clear => false,
-        }
+        };
+        let mcp = match &self.mcp {
+            Field::Set(servers) => servers
+                .0
+                .values()
+                .any(McpServerPatch::contains_literal_secret),
+            Field::Missing | Field::Clear => false,
+        };
+        providers || mcp
     }
 
     fn references_local_credential(&self) -> bool {
@@ -516,6 +599,103 @@ impl Document {
     pub(super) fn matches_organization(&self, name: &str) -> bool {
         matches!(&self.organization, StringField::Set(value) if value == name)
     }
+}
+
+const MAX_MCP_SERVER_NAME_BYTES: usize = 64;
+
+/// Server names must keep the `mcp__<server>__<tool>` grammar unambiguous:
+/// ASCII letters, digits, hyphens, or underscores, and never `__`.
+fn valid_mcp_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_MCP_SERVER_NAME_BYTES
+        && !name.contains("__")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn validate_mcp_servers(
+    servers: &UniqueMap<String, McpServerPatch>,
+    origin: &SourceIdentity,
+) -> Result<(), ConfigError> {
+    let invalid = |message: String| ConfigError::Parse {
+        origin: origin.clone(),
+        message,
+    };
+    for (name, patch) in &servers.0 {
+        if !valid_mcp_server_name(name) {
+            return Err(invalid(format!(
+                "mcp server name {name:?} is invalid; use 1-{MAX_MCP_SERVER_NAME_BYTES} ASCII \
+                 letters, digits, hyphens, or single underscores (`__` is the tool namespace \
+                 separator)"
+            )));
+        }
+        let (allow, call_timeout_seconds, max_concurrent_calls) = match patch {
+            McpServerPatch::Stdio {
+                command,
+                allow,
+                call_timeout_seconds,
+                max_concurrent_calls,
+                ..
+            } => {
+                if command.trim().is_empty() {
+                    return Err(invalid(format!("mcp server {name:?} has an empty command")));
+                }
+                (allow, call_timeout_seconds, max_concurrent_calls)
+            }
+            McpServerPatch::Http {
+                url,
+                allow,
+                call_timeout_seconds,
+                max_concurrent_calls,
+                ..
+            } => {
+                let valid_scheme = ["https://", "http://"].into_iter().any(|scheme| {
+                    url.len() > scheme.len()
+                        && url
+                            .get(..scheme.len())
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                });
+                if !valid_scheme {
+                    return Err(invalid(format!(
+                        "mcp server {name:?} must use an http:// or https:// URL"
+                    )));
+                }
+                (allow, call_timeout_seconds, max_concurrent_calls)
+            }
+            McpServerPatch::Remove => continue,
+        };
+        let mut unique = BTreeSet::new();
+        for tool in allow {
+            if tool.trim().is_empty() {
+                return Err(invalid(format!(
+                    "mcp server {name:?} allowlists an empty tool name"
+                )));
+            }
+            if !unique.insert(tool) {
+                return Err(invalid(format!(
+                    "mcp server {name:?} allowlists duplicate tool {tool:?}"
+                )));
+            }
+        }
+        if let Some(timeout) = call_timeout_seconds
+            && !(1..=MAX_MCP_CALL_TIMEOUT_SECONDS).contains(timeout)
+        {
+            return Err(invalid(format!(
+                "mcp server {name:?} call_timeout_seconds must be between 1 and \
+                 {MAX_MCP_CALL_TIMEOUT_SECONDS}"
+            )));
+        }
+        if let Some(bound) = max_concurrent_calls
+            && !(1..=MAX_MCP_MAX_CONCURRENT_CALLS).contains(bound)
+        {
+            return Err(invalid(format!(
+                "mcp server {name:?} max_concurrent_calls must be between 1 and \
+                 {MAX_MCP_MAX_CONCURRENT_CALLS}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_policy_names(policy: &PolicyPatch, origin: &SourceIdentity) -> Result<(), ConfigError> {
@@ -550,6 +730,7 @@ pub(super) struct MergeState {
     model: Option<String>,
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
+    mcp: BTreeMap<String, McpServerConfig>,
     policy: EffectivePolicy,
     provenance: ConfigProvenance,
 }
@@ -607,6 +788,7 @@ impl MergeState {
                 model: None,
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 providers,
+                mcp: BTreeMap::new(),
                 policy: EffectivePolicy::default(),
                 provenance,
             },
@@ -639,6 +821,7 @@ impl MergeState {
             self.provenance.model = Some(source.clone());
         }
         self.apply_providers(&document.providers, source);
+        self.apply_mcp(&document.mcp);
         if let Some(policy) = &document.policy {
             self.compose_policy(policy);
         }
@@ -798,6 +981,72 @@ impl MergeState {
         }
     }
 
+    fn apply_mcp(&mut self, patch: &Field<UniqueMap<String, McpServerPatch>>) {
+        match patch {
+            Field::Missing => {}
+            Field::Clear => self.mcp.clear(),
+            Field::Set(patches) => {
+                for (name, patch) in &patches.0 {
+                    match patch {
+                        McpServerPatch::Remove => {
+                            self.mcp.remove(name);
+                        }
+                        McpServerPatch::Stdio {
+                            command,
+                            args,
+                            env,
+                            eager,
+                            allow,
+                            call_timeout_seconds,
+                            max_concurrent_calls,
+                        } => {
+                            self.mcp.insert(
+                                name.clone(),
+                                McpServerConfig::new(
+                                    McpTransport::Stdio {
+                                        command: command.clone(),
+                                        args: args.clone(),
+                                        env: env.clone(),
+                                    },
+                                    *eager,
+                                    allow.clone(),
+                                    call_timeout_seconds
+                                        .unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECONDS),
+                                    max_concurrent_calls
+                                        .unwrap_or(DEFAULT_MCP_MAX_CONCURRENT_CALLS),
+                                ),
+                            );
+                        }
+                        McpServerPatch::Http {
+                            url,
+                            bearer,
+                            eager,
+                            allow,
+                            call_timeout_seconds,
+                            max_concurrent_calls,
+                        } => {
+                            self.mcp.insert(
+                                name.clone(),
+                                McpServerConfig::new(
+                                    McpTransport::Http {
+                                        url: url.clone(),
+                                        bearer: bearer.clone(),
+                                    },
+                                    *eager,
+                                    allow.clone(),
+                                    call_timeout_seconds
+                                        .unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECONDS),
+                                    max_concurrent_calls
+                                        .unwrap_or(DEFAULT_MCP_MAX_CONCURRENT_CALLS),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn provider_for_patch(&mut self, name: &str, kind: ProviderKind) -> &mut ProviderConfig {
         let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
             let mut provider = crate::providers::builtin(kind);
@@ -864,6 +1113,7 @@ impl MergeState {
             model,
             max_output_tokens: self.max_output_tokens,
             providers: self.providers,
+            mcp: self.mcp,
             policy: self.policy,
             reports,
             provenance: self.provenance,

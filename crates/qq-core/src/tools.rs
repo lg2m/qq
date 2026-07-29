@@ -395,6 +395,16 @@ pub(crate) async fn execute(
     }
 }
 
+/// Wraps an externally produced result (an MCP call outcome) in the same
+/// bounded-result truncation as built-in tool executions.
+pub(crate) fn bounded_result(content: String, is_error: bool) -> ToolExecutionResult {
+    if is_error {
+        ToolExecutionResult::error(content)
+    } else {
+        ToolExecutionResult::success(content)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolExecutionResult {
     pub(crate) content: String,

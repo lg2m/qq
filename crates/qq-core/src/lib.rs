@@ -23,9 +23,11 @@ use qq_provider::{
 use thiserror::Error;
 
 mod approval;
+mod mcp;
 mod sessions;
 mod tools;
 
+pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult};
 pub use sessions::{
     LoadedRuntime, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader,
     SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
@@ -135,17 +137,15 @@ pub(crate) trait ToolGate: Send + Sync {
 
 struct StaticPolicyGate {
     mode: ApprovalMode,
+    /// Workspace-configured grants (today: MCP allowlist entries by exact
+    /// namespaced name). Mode still wins: read-only denies granted tools.
+    grants: approval::SessionGrants,
 }
 
 impl ToolGate for StaticPolicyGate {
     fn resolve(&self, call: &RuntimeToolCall) -> ToolGateFuture {
         let class = approval::classify(&call.name, &call.arguments);
-        let decision = match approval::evaluate(
-            self.mode,
-            &call.name,
-            &class,
-            &approval::SessionGrants::default(),
-        ) {
+        let decision = match approval::evaluate(self.mode, &call.name, &class, &self.grants) {
             approval::PolicyDecision::Execute => GateDecision::Execute,
             approval::PolicyDecision::Deny => GateDecision::Deny {
                 message: approval::POLICY_DENIED_RESULT.to_owned(),
@@ -179,6 +179,7 @@ pub struct Runtime {
     provider: Arc<dyn Provider>,
     model: Arc<str>,
     max_output_tokens: u32,
+    mcp: Option<Arc<dyn McpRegistry>>,
 }
 
 impl Runtime {
@@ -208,7 +209,17 @@ impl Runtime {
             provider,
             model,
             max_output_tokens,
+            mcp: None,
         })
+    }
+
+    /// Attaches a registry of configuration-declared MCP servers. Its cached
+    /// tool declarations join the built-ins for every run of this runtime,
+    /// and `mcp__`-named calls dispatch to it.
+    #[must_use]
+    pub fn with_mcp_registry(mut self, registry: Arc<dyn McpRegistry>) -> Self {
+        self.mcp = Some(registry);
+        self
     }
 
     /// Runs one command and returns events as they become available.
@@ -303,12 +314,23 @@ impl Runtime {
         workspace: PathBuf,
         cancelled: Arc<AtomicBool>,
     ) -> RuntimeStream {
+        // Configuration allowlists are the only grants a gate-less run has;
+        // read-only mode still denies them inside `evaluate`.
+        let grants = approval::SessionGrants {
+            tools: self
+                .mcp
+                .as_ref()
+                .map(|registry| registry.config_grants().into_iter().collect())
+                .unwrap_or_default(),
+            shell_prefixes: Vec::new(),
+        };
         self.run_loop(
             messages,
             workspace,
             cancelled,
             Arc::new(StaticPolicyGate {
                 mode: ApprovalMode::Ask,
+                grants,
             }),
             Arc::new(tools::FileState::default()),
         )
@@ -325,6 +347,7 @@ impl Runtime {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
         let max_output_tokens = self.max_output_tokens;
+        let mcp = self.mcp.clone();
         Box::pin(stream! {
             let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
             yield RuntimeEvent::Started;
@@ -347,13 +370,29 @@ impl Runtime {
                     return;
                 }
             };
-            let system: Arc<str> = Arc::from(agent_system_prompt(workspace.path()));
+            // MCP declarations join the built-ins once per run: the cached
+            // specs are fetched here (connecting lazily on first use) so
+            // every turn of the run sees one stable tool list. The `mcp__`
+            // prefix keeps collisions with built-ins impossible, and specs
+            // that do not carry it are discarded to keep dispatch unambiguous.
+            let mut tool_specs = tools::specs();
+            if let Some(registry) = &mcp {
+                for spec in registry.tool_specs().await {
+                    if spec.name().starts_with(MCP_TOOL_PREFIX)
+                        && spec.name().len() <= MAX_TOOL_NAME_BYTES
+                        && !tool_specs.iter().any(|existing| existing.name() == spec.name())
+                    {
+                        tool_specs.push(spec);
+                    }
+                }
+            }
+            let system: Arc<str> = Arc::from(agent_system_prompt(workspace.path(), &tool_specs));
 
             let mut total_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
             for turn_ordinal in 1..=MAX_MODEL_TURNS {
                 let request = ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens)
-                    .with_tools(tools::specs())
+                    .with_tools(tool_specs.clone())
                     .with_system(Arc::clone(&system));
                 let mut provider_events = provider.stream(request);
                 let mut pending_calls = Vec::<PendingToolCall>::new();
@@ -633,6 +672,7 @@ impl Runtime {
                     let workspace = workspace.clone();
                     let file_state = Arc::clone(&file_state);
                     let cancelled = Arc::clone(&cancelled);
+                    let mcp = mcp.clone();
                     async move {
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
@@ -640,6 +680,17 @@ impl Runtime {
                                 is_error: true,
                                 file_state: None,
                             },
+                            // MCP calls dispatch to the shared registry; the
+                            // outcome flows through the same bounded-result
+                            // truncation as built-in tools, so an MCP call is
+                            // indistinguishable from a built-in on the wire.
+                            None if call.name.starts_with(MCP_TOOL_PREFIX) && mcp.is_some() => {
+                                let outcome = mcp
+                                    .expect("the MCP registry was just checked")
+                                    .call(call.name.clone(), call.arguments.clone(), cancelled)
+                                    .await;
+                                tools::bounded_result(outcome.content, outcome.is_error)
+                            }
                             None => {
                                 tools::execute(
                                     workspace,
@@ -745,22 +796,30 @@ impl Runtime {
     }
 }
 
-/// Version 2 of the base agent prompt. The text is versioned in code, not
+/// Version 3 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
-fn agent_system_prompt(workspace: &std::path::Path) -> String {
+fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSpec]) -> String {
     let mut tool_names = String::new();
-    for spec in tools::specs() {
+    let mut has_mcp = false;
+    for spec in specs {
         if !tool_names.is_empty() {
             tool_names.push_str(", ");
         }
         tool_names.push_str(spec.name());
+        has_mcp |= spec.name().starts_with(MCP_TOOL_PREFIX);
     }
+    let mcp_note = if has_mcp {
+        " Tools named mcp__<server>__<tool> call external MCP servers, execute outside the \
+         workspace, and may require user approval."
+    } else {
+        ""
+    };
     format!(
         "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
          \n\
          Available tools: {tool_names}. read_file, list_dir, and search are read-only; \
          edit_file and write_file modify workspace files and may require user approval; \
-         shell runs one command in the workspace with a bounded timeout and may require user approval.\n\
+         shell runs one command in the workspace with a bounded timeout and may require user approval.{mcp_note}\n\
          \n\
          Working conventions:\n\
          - Read a file with read_file before editing or overwriting it; edits without a prior read in this session are rejected.\n\
@@ -1218,6 +1277,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(StaticPolicyGate {
                     mode: ApprovalMode::Auto,
+                    grants: approval::SessionGrants::default(),
                 }),
                 Arc::new(tools::FileState::default()),
             )
@@ -1849,5 +1909,297 @@ mod tests {
                 message,
             } if message.contains("offline")
         ));
+    }
+
+    struct MockMcpRegistry {
+        specs: Vec<qq_provider::ToolSpec>,
+        grants: Vec<String>,
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+        result: McpToolResult,
+    }
+
+    impl MockMcpRegistry {
+        fn returning(result: McpToolResult) -> Self {
+            Self {
+                specs: vec![qq_provider::ToolSpec::new(
+                    "mcp__srv__ping",
+                    "Ping the fixture server.",
+                    serde_json::json!({"type": "object"}),
+                )],
+                grants: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                result,
+            }
+        }
+    }
+
+    impl McpRegistry for MockMcpRegistry {
+        fn tool_specs(&self) -> McpSpecsFuture {
+            let specs = self.specs.clone();
+            Box::pin(async move { specs })
+        }
+
+        fn config_grants(&self) -> Vec<String> {
+            self.grants.clone()
+        }
+
+        fn call(
+            &self,
+            name: String,
+            arguments: String,
+            _cancelled: Arc<AtomicBool>,
+        ) -> McpCallFuture {
+            self.calls.lock().unwrap().push((name, arguments.clone()));
+            let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    /// Scripts one `mcp__srv__ping` call on the first turn, then completes.
+    struct McpCallProvider {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for McpCallProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            drop(requests);
+            if turn == 0 {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: "call_0".to_owned(),
+                        name: "mcp__srv__ping".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: "call_0".to_owned(),
+                        json: r#"{"value":1}"#.to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted {
+                        id: "call_0".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn merges_mcp_declarations_and_dispatches_granted_calls_to_the_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = MockMcpRegistry::returning(McpToolResult {
+            content: "pong".to_owned(),
+            is_error: false,
+        });
+        // A spec that violates the namespace contract must be discarded.
+        registry.specs.push(qq_provider::ToolSpec::new(
+            "rogue_tool",
+            "not namespaced",
+            serde_json::json!({"type": "object"}),
+        ));
+        // The configuration allowlist covers the call, so gate-less Ask mode
+        // executes it without an approval round trip.
+        registry.grants = vec!["mcp__srv__ping".to_owned()];
+        let calls = Arc::clone(&registry.calls);
+        let runtime = Runtime::new(
+            McpCallProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_mcp_registry(Arc::new(registry));
+
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("ping")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, is_error: false, .. } if result == "pong"
+        )));
+        let requests = requests.lock().unwrap();
+        let names = requests[0]
+            .tools()
+            .iter()
+            .map(qq_provider::ToolSpec::name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"mcp__srv__ping"));
+        assert!(
+            !names.contains(&"rogue_tool"),
+            "specs outside the mcp__ namespace must be discarded"
+        );
+        assert_eq!(requests[0].tools().len(), 7);
+        let system = requests[0].system().unwrap();
+        assert!(system.contains("mcp__srv__ping"));
+        assert!(system.contains("MCP servers"));
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error: false,
+            }] if call_id == "call_0" && content == "pong"
+        ));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [("mcp__srv__ping".to_owned(), r#"{"value":1}"#.to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_failures_are_tool_errors_and_results_are_truncated() {
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = MockMcpRegistry::returning(McpToolResult {
+            content: "the server exploded".to_owned(),
+            is_error: true,
+        });
+        let runtime = Runtime::new(
+            McpCallProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_mcp_registry(Arc::new(registry));
+        let events = runtime
+            .run_loop(
+                vec![Message::user("ping")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(tools::FileState::default()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, is_error: true, .. }
+                if result == "the server exploded"
+        )));
+        assert!(
+            matches!(events.last(), Some(RuntimeEvent::Completed)),
+            "an MCP failure must never fail the run"
+        );
+
+        let oversized = "x".repeat(tools::MAX_TOOL_RESULT_BYTES + 1024);
+        let registry = MockMcpRegistry::returning(McpToolResult {
+            content: oversized,
+            is_error: false,
+        });
+        let runtime = Runtime::new(
+            McpCallProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_mcp_registry(Arc::new(registry));
+        let events = runtime
+            .run_loop(
+                vec![Message::user("ping")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(tools::FileState::default()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::ToolCallFinished { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("the oversized MCP result must still finish");
+        assert!(result.len() <= tools::MAX_TOOL_RESULT_BYTES);
+        assert!(result.contains("truncated by qq"));
+    }
+
+    #[tokio::test]
+    async fn ungranted_mcp_calls_are_denied_unattended_and_unknown_names_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = MockMcpRegistry::returning(McpToolResult {
+            content: "pong".to_owned(),
+            is_error: false,
+        });
+        let runtime = Runtime::new(
+            McpCallProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_mcp_registry(Arc::new(registry));
+        // No configuration grant covers the call: gate-less Ask mode denies
+        // without executing, and the run still completes.
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("ping")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallDenied { message, .. }
+                if message == approval::UNATTENDED_DENIED_RESULT
+        )));
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        // Without a registry, an approved mcp__ call falls through to the
+        // built-in dispatcher's precise unknown-tool error.
+        let runtime = Runtime::new(
+            McpCallProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run_loop(
+                vec![Message::user("ping")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(tools::FileState::default()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, is_error: true, .. }
+                if result.contains("unknown tool")
+        )));
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
     }
 }
