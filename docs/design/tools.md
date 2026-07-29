@@ -330,12 +330,12 @@ declare servers at all.
 )
 ```
 
-One deliberate divergence from the grant design above: the per-MCP-server
-tool allowlist lives on the server's own `mcp` entry rather than in the
-`policy` section, because `policy` is currently managed-source-only while
-MCP allowlists are an ordinary workspace trust decision. The entries
-still become exact-name grants (`mcp__<server>__<tool>`) in the same
-grant set the approval flow consults.
+One deliberate convenience: the per-MCP-server tool allowlist lives on
+the server's own `mcp` entry, next to the declaration it scopes, even
+though the `policy` section also accepts workspace grants. The entries
+are folded into the resolved grant set as exact names
+(`mcp__<server>__<tool>`) — the same set the approval flow consults, and
+the same set a managed `deny_tools` list can filter.
 
 ## Approval Policy
 
@@ -378,6 +378,65 @@ Workspace grants are written, not invented: the approval prompt grows an
 "always allow in this workspace" choice that promotes the grant into the
 workspace config document. Trust decisions land in the same reviewable
 file users already edit — no hidden allowlist store, no second syntax.
+
+### Workspace Grant Configuration
+
+Grants live in the `policy` section of the ordinary layered documents.
+Any non-remote source may declare the two grant shapes; the constraint
+fields stay managed-only:
+
+```ron
+// Workspace or user configuration.
+(
+    version: 1,
+    policy: (
+        allow_tools: ["edit_file", "mcp__executor__execute"],
+        allow_shell_prefixes: ["cargo test", "git status"],
+    ),
+)
+
+// Managed configuration constrains what lower layers may grant.
+(
+    version: 1,
+    policy: (
+        deny_tools: ["mcp__executor__execute"],
+        deny_shell_prefixes: ["git push"],
+    ),
+)
+```
+
+- **Shapes and grammar.** `allow_tools` entries are exact tool names
+  (built-in names, or `mcp__<server>__<tool>` with the server segment
+  obeying the MCP name rules). `allow_shell_prefixes` entries are word-
+  granularity command prefixes: non-empty, no control characters, no
+  surrounding whitespace. Duplicates within one list are rejected;
+  across layers the sets dedupe naturally.
+- **Layering.** Later layers extend the accumulated set, and
+  `Remove("name")` deletes a grant declared by an earlier layer — the
+  same removal-marker idiom `mcp` and `providers` use.
+- **Managed constraint.** `deny_tools` and `deny_shell_prefixes` are
+  managed/MDM-only and filter lower-layer grants out of the effective
+  set rather than erroring. Tool denies match exact names, including
+  folded MCP allowlist entries. A denied shell prefix removes every
+  grant it covers at word granularity *and* every broader grant that
+  would cover the denied commands (`cargo` denied removes `cargo test`;
+  `cargo test` denied also removes a bare `cargo` grant, because a
+  config-layer filter cannot partially subtract a broader grant).
+- **Trust.** Workspace-declared grants are sensitive operations behind
+  the same trust flow as MCP declarations, and remote configuration may
+  not declare them at all.
+- **Promotion.** The approval prompt's workspace-lifetime choice appends
+  the grant to `.qq/config.ron` by targeted text insertion — comments
+  and formatting survive — with an atomic temp-and-rename write that
+  must reparse before it lands. Promotion refuses grants the managed
+  layer denies. Because the write is the user's own decision, the file's
+  new trust digest is recorded immediately — but only when the file was
+  already trusted (or had no sensitive content) beforehand, so promotion
+  never launders trust for unreviewed declarations.
+- **Resolution.** The effective configuration exposes the resolved grant
+  set (declared grants plus folded MCP allowlists, minus denies), which
+  seeds each session's grant set at creation with the existing config
+  layer precedence.
 
 Flow: when policy requires approval, the runtime persists and publishes
 `ToolApprovalRequested` and the run stays active but waiting — it holds its

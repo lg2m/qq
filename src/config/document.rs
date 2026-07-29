@@ -16,8 +16,8 @@ use super::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MCP_CALL_TIMEOUT_SECONDS, DEFAULT_MCP_MAX_CONCURRENT_CALLS,
     EffectivePolicy, HttpAccess, HttpCredential, InputModality, MAX_MCP_CALL_TIMEOUT_SECONDS,
     MAX_MCP_MAX_CONCURRENT_CALLS, McpServerConfig, McpTransport, ModelMetadata, ModelRoute,
-    ProviderAccess, ProviderApi, ProviderConfig, ProviderKind, RuntimeOverrides, SecretRef,
-    SourceIdentity, SourceKind, SourceReport,
+    PolicyGrants, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind, RuntimeOverrides,
+    SecretRef, SourceIdentity, SourceKind, SourceReport, WorkspaceGrant,
 };
 
 pub(super) fn deserialize_unique_btree_map<'de, D, K, V>(
@@ -402,6 +402,30 @@ impl McpServerPatch {
     }
 }
 
+/// Marks one grant removed from the set accumulated by earlier layers, the
+/// same idiom `mcp`/`providers` use, spelled `Remove("name")` in RON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum GrantRemoval {
+    Remove(String),
+}
+
+/// One entry in a `policy` grant list: a plain string adds the grant, and
+/// `Remove("name")` deletes a grant declared by an earlier layer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum GrantEntry {
+    Remove(GrantRemoval),
+    Allow(String),
+}
+
+impl GrantEntry {
+    fn name(&self) -> &str {
+        match self {
+            Self::Allow(name) | Self::Remove(GrantRemoval::Remove(name)) => name,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct PolicyPatch {
@@ -411,6 +435,37 @@ struct PolicyPatch {
     require_https: Option<bool>,
     allow_custom_providers: Option<bool>,
     allow_literal_secrets: Option<bool>,
+    /// Approval grants: exact tool names that run without prompting.
+    /// Declarable by ordinary (workspace/user) sources.
+    allow_tools: Option<Vec<GrantEntry>>,
+    /// Approval grants: shell command prefixes matched at word granularity.
+    /// Declarable by ordinary (workspace/user) sources.
+    allow_shell_prefixes: Option<Vec<GrantEntry>>,
+    /// Managed-only: exact tool names filtered out of the effective grant set
+    /// no matter which lower layer declared them.
+    deny_tools: Option<Vec<String>>,
+    /// Managed-only: shell prefixes whose word-granularity overlap filters
+    /// lower-layer shell grants out of the effective grant set.
+    deny_shell_prefixes: Option<Vec<String>>,
+}
+
+impl PolicyPatch {
+    /// Fields only administrator-controlled (Managed/MDM) sources may set.
+    fn has_managed_only_fields(&self) -> bool {
+        self.allowed_providers.is_some()
+            || self.denied_providers.is_some()
+            || self.max_output_tokens.is_some()
+            || self.require_https.is_some()
+            || self.allow_custom_providers.is_some()
+            || self.allow_literal_secrets.is_some()
+            || self.deny_tools.is_some()
+            || self.deny_shell_prefixes.is_some()
+    }
+
+    /// Approval grants any source may declare, gated by workspace trust.
+    fn has_grants(&self) -> bool {
+        self.allow_tools.is_some() || self.allow_shell_prefixes.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,11 +506,22 @@ impl Document {
     }
 
     fn validate(&self, origin: &SourceIdentity) -> Result<(), ConfigError> {
-        if self.policy.is_some() && !matches!(origin.kind(), SourceKind::Managed | SourceKind::Mdm)
-        {
-            return Err(ConfigError::PolicyOutsideManaged {
-                origin: origin.clone(),
-            });
+        if let Some(policy) = &self.policy {
+            if policy.has_managed_only_fields()
+                && !matches!(origin.kind(), SourceKind::Managed | SourceKind::Mdm)
+            {
+                return Err(ConfigError::PolicyOutsideManaged {
+                    origin: origin.clone(),
+                });
+            }
+            // Approval grants name commands and tools that run without
+            // prompting; remote configuration may never plant them, exactly
+            // like MCP declarations.
+            if origin.kind() == SourceKind::Remote && policy.has_grants() {
+                return Err(ConfigError::RemotePolicyGrantsForbidden {
+                    origin: origin.clone(),
+                });
+            }
         }
         if self.contains_literal_secret()
             && !matches!(
@@ -493,11 +559,20 @@ impl Document {
             || self.model.is_present()
             || self.providers.is_present()
             || self.mcp.is_present()
+            || self.policy.as_ref().is_some_and(PolicyPatch::has_grants)
     }
 
     pub(super) fn sensitive_digest(&self) -> Result<Option<String>, ConfigError> {
         if !self.has_sensitive_operations() {
             return Ok(None);
+        }
+
+        #[derive(Serialize)]
+        struct GrantsProjection<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            allow_tools: Option<&'a Vec<GrantEntry>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            allow_shell_prefixes: Option<&'a Vec<GrantEntry>>,
         }
 
         #[derive(Serialize)]
@@ -510,6 +585,8 @@ impl Document {
             providers: Option<&'a Field<UniqueMap<String, ProviderEntryPatch>>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             mcp: Option<&'a Field<UniqueMap<String, McpServerPatch>>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            policy_grants: Option<GrantsProjection<'a>>,
         }
 
         fn present<T>(field: &Field<T>) -> Option<&Field<T>> {
@@ -521,6 +598,14 @@ impl Document {
             model: self.model.is_present().then_some(&self.model),
             providers: present(&self.providers),
             mcp: present(&self.mcp),
+            policy_grants: self
+                .policy
+                .as_ref()
+                .filter(|policy| policy.has_grants())
+                .map(|policy| GrantsProjection {
+                    allow_tools: policy.allow_tools.as_ref(),
+                    allow_shell_prefixes: policy.allow_shell_prefixes.as_ref(),
+                }),
         };
         let canonical =
             serde_json::to_vec(&projection).map_err(|error| ConfigError::StateSerialization {
@@ -598,6 +683,48 @@ impl Document {
 
     pub(super) fn matches_organization(&self, name: &str) -> bool {
         matches!(&self.organization, StringField::Set(value) if value == name)
+    }
+
+    /// Whether this document's own `policy` entries net out to declaring the
+    /// grant: an `Allow` not undone by a later `Remove` in the same list.
+    pub(super) fn declares_policy_grant(&self, grant: &WorkspaceGrant) -> bool {
+        let Some(policy) = &self.policy else {
+            return false;
+        };
+        let (entries, value) = match grant {
+            WorkspaceGrant::Tool(name) => (policy.allow_tools.as_ref(), name),
+            WorkspaceGrant::ShellPrefix(prefix) => (policy.allow_shell_prefixes.as_ref(), prefix),
+        };
+        let Some(entries) = entries else {
+            return false;
+        };
+        let mut present = false;
+        for entry in entries {
+            match entry {
+                GrantEntry::Allow(name) if name == value => present = true,
+                GrantEntry::Remove(GrantRemoval::Remove(name)) if name == value => present = false,
+                _ => {}
+            }
+        }
+        present
+    }
+
+    /// Accumulates this document's managed deny lists for the promotion
+    /// writer's refusal check.
+    pub(super) fn collect_policy_denies(
+        &self,
+        deny_tools: &mut Vec<String>,
+        deny_shell_prefixes: &mut Vec<String>,
+    ) {
+        let Some(policy) = &self.policy else {
+            return;
+        };
+        if let Some(tools) = &policy.deny_tools {
+            deny_tools.extend(tools.iter().cloned());
+        }
+        if let Some(prefixes) = &policy.deny_shell_prefixes {
+            deny_shell_prefixes.extend(prefixes.iter().cloned());
+        }
     }
 }
 
@@ -699,6 +826,10 @@ fn validate_mcp_servers(
 }
 
 fn validate_policy_names(policy: &PolicyPatch, origin: &SourceIdentity) -> Result<(), ConfigError> {
+    let invalid = |message: String| ConfigError::Parse {
+        origin: origin.clone(),
+        message,
+    };
     for (field, values) in [
         ("allowed_providers", policy.allowed_providers.as_ref()),
         ("denied_providers", policy.denied_providers.as_ref()),
@@ -709,20 +840,146 @@ fn validate_policy_names(policy: &PolicyPatch, origin: &SourceIdentity) -> Resul
         let mut unique = BTreeSet::new();
         for value in values {
             if value.is_empty() {
-                return Err(ConfigError::Parse {
-                    origin: origin.clone(),
-                    message: format!("policy field {field} contains an empty provider name"),
-                });
+                return Err(invalid(format!(
+                    "policy field {field} contains an empty provider name"
+                )));
             }
             if !unique.insert(value) {
-                return Err(ConfigError::Parse {
-                    origin: origin.clone(),
-                    message: format!("policy field {field} contains duplicate value {value:?}"),
-                });
+                return Err(invalid(format!(
+                    "policy field {field} contains duplicate value {value:?}"
+                )));
+            }
+        }
+    }
+    for (field, entries, tool_shaped) in [
+        ("allow_tools", policy.allow_tools.as_deref(), true),
+        (
+            "allow_shell_prefixes",
+            policy.allow_shell_prefixes.as_deref(),
+            false,
+        ),
+    ] {
+        let Some(entries) = entries else {
+            continue;
+        };
+        let mut unique = BTreeSet::new();
+        for entry in entries {
+            let name = entry.name();
+            validate_grant_value(name, tool_shaped)
+                .map_err(|message| invalid(format!("policy field {field}: {message}")))?;
+            if !unique.insert(name) {
+                return Err(invalid(format!(
+                    "policy field {field} contains duplicate value {name:?}"
+                )));
+            }
+        }
+    }
+    for (field, values, tool_shaped) in [
+        ("deny_tools", policy.deny_tools.as_deref(), true),
+        (
+            "deny_shell_prefixes",
+            policy.deny_shell_prefixes.as_deref(),
+            false,
+        ),
+    ] {
+        let Some(values) = values else {
+            continue;
+        };
+        let mut unique = BTreeSet::new();
+        for value in values {
+            validate_grant_value(value, tool_shaped)
+                .map_err(|message| invalid(format!("policy field {field}: {message}")))?;
+            if !unique.insert(value) {
+                return Err(invalid(format!(
+                    "policy field {field} contains duplicate value {value:?}"
+                )));
             }
         }
     }
     Ok(())
+}
+
+const MAX_TOOL_GRANT_NAME_BYTES: usize = 128;
+const MAX_SHELL_PREFIX_GRANT_BYTES: usize = 512;
+
+fn validate_grant_value(value: &str, tool_shaped: bool) -> Result<(), String> {
+    if tool_shaped {
+        validate_tool_grant_name(value)
+    } else {
+        validate_shell_prefix_grant(value)
+    }
+}
+
+/// Tool grants follow tool declaration names: 1-128 bytes of ASCII letters,
+/// digits, hyphens, or underscores. Names starting with `mcp__` must complete
+/// the `mcp__<server>__<tool>` grammar, with the server segment obeying the
+/// MCP server-name rules.
+pub(super) fn validate_tool_grant_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > MAX_TOOL_GRANT_NAME_BYTES {
+        return Err(format!(
+            "tool name {name:?} must be 1-{MAX_TOOL_GRANT_NAME_BYTES} bytes"
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!(
+            "tool name {name:?} may only use ASCII letters, digits, hyphens, or underscores"
+        ));
+    }
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        let valid = rest
+            .split_once("__")
+            .is_some_and(|(server, tool)| valid_mcp_server_name(server) && !tool.is_empty());
+        if !valid {
+            return Err(format!(
+                "MCP tool name {name:?} must take the form mcp__<server>__<tool>"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Shell prefix grants are matched at word granularity, so they must be
+/// non-empty, contain no control characters, and carry no surrounding
+/// whitespace.
+pub(super) fn validate_shell_prefix_grant(prefix: &str) -> Result<(), String> {
+    if prefix.trim().is_empty() {
+        return Err("shell prefix must not be empty".to_owned());
+    }
+    if prefix.len() > MAX_SHELL_PREFIX_GRANT_BYTES {
+        return Err(format!(
+            "shell prefix {prefix:?} must be at most {MAX_SHELL_PREFIX_GRANT_BYTES} bytes"
+        ));
+    }
+    if prefix != prefix.trim() {
+        return Err(format!(
+            "shell prefix {prefix:?} must not have leading or trailing whitespace"
+        ));
+    }
+    if prefix.chars().any(char::is_control) {
+        return Err(format!(
+            "shell prefix {prefix:?} must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Word-granularity overlap between a denied prefix and a granted prefix. A
+/// deny removes both narrower grants it covers (`cargo` denies `cargo test`)
+/// and broader grants that would cover the denied commands (`cargo test`
+/// denied removes a bare `cargo` grant), because a config-layer filter cannot
+/// partially subtract a broader grant.
+pub(super) fn shell_prefixes_overlap(denied: &str, granted: &str) -> bool {
+    word_prefix_covers(denied, granted) || word_prefix_covers(granted, denied)
+}
+
+fn word_prefix_covers(prefix: &str, candidate: &str) -> bool {
+    candidate == prefix
+        || candidate
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
 pub(super) struct MergeState {
@@ -823,7 +1080,7 @@ impl MergeState {
         self.apply_providers(&document.providers, source);
         self.apply_mcp(&document.mcp);
         if let Some(policy) = &document.policy {
-            self.compose_policy(policy);
+            self.compose_policy(policy, source);
         }
     }
 
@@ -1061,7 +1318,7 @@ impl MergeState {
         provider
     }
 
-    fn compose_policy(&mut self, patch: &PolicyPatch) {
+    fn compose_policy(&mut self, patch: &PolicyPatch, source: &SourceIdentity) {
         if let Some(incoming) = &patch.allowed_providers {
             let incoming: BTreeSet<_> = incoming.iter().cloned().collect();
             let combined = match &self.policy.allowed_providers {
@@ -1095,6 +1352,30 @@ impl MergeState {
         if let Some(incoming) = patch.allow_literal_secrets {
             self.policy.allow_literal_secrets &= incoming;
         }
+        apply_grant_entries(
+            patch.allow_tools.as_deref(),
+            &mut self.policy.allow_tools,
+            &mut self.provenance.grant_tools,
+            source,
+        );
+        apply_grant_entries(
+            patch.allow_shell_prefixes.as_deref(),
+            &mut self.policy.allow_shell_prefixes,
+            &mut self.provenance.grant_shell_prefixes,
+            source,
+        );
+        // Denies are monotonic across layers, like denied_providers.
+        if let Some(incoming) = &patch.deny_tools {
+            let mut combined: BTreeSet<_> = self.policy.deny_tools.iter().cloned().collect();
+            combined.extend(incoming.iter().cloned());
+            self.policy.deny_tools = combined.into_iter().collect();
+        }
+        if let Some(incoming) = &patch.deny_shell_prefixes {
+            let mut combined: BTreeSet<_> =
+                self.policy.deny_shell_prefixes.iter().cloned().collect();
+            combined.extend(incoming.iter().cloned());
+            self.policy.deny_shell_prefixes = combined.into_iter().collect();
+        }
     }
 
     pub(super) fn finish(self, reports: Vec<SourceReport>) -> Result<ConfigSnapshot, ConfigError> {
@@ -1108,6 +1389,7 @@ impl MergeState {
             self.max_output_tokens,
             &self.providers,
         )?;
+        let grants = resolve_policy_grants(&self.policy, &self.mcp);
         Ok(ConfigSnapshot {
             organization: self.organization,
             model,
@@ -1115,10 +1397,68 @@ impl MergeState {
             providers: self.providers,
             mcp: self.mcp,
             policy: self.policy,
+            grants,
             reports,
             provenance: self.provenance,
         })
     }
+}
+
+fn apply_grant_entries(
+    entries: Option<&[GrantEntry]>,
+    current: &mut Vec<String>,
+    provenance: &mut BTreeMap<String, SourceIdentity>,
+    source: &SourceIdentity,
+) {
+    let Some(entries) = entries else {
+        return;
+    };
+    let mut combined: BTreeSet<String> = current.drain(..).collect();
+    for entry in entries {
+        match entry {
+            GrantEntry::Allow(name) => {
+                combined.insert(name.clone());
+                provenance.insert(name.clone(), source.clone());
+            }
+            GrantEntry::Remove(GrantRemoval::Remove(name)) => {
+                combined.remove(name);
+                provenance.remove(name);
+            }
+        }
+    }
+    *current = combined.into_iter().collect();
+}
+
+/// Resolves the effective grant set: declared tool and shell-prefix grants
+/// plus every per-MCP-server allowlist entry folded in as an exact
+/// `mcp__<server>__<tool>` name, minus everything the managed deny lists
+/// filter out.
+fn resolve_policy_grants(
+    policy: &EffectivePolicy,
+    mcp: &BTreeMap<String, McpServerConfig>,
+) -> PolicyGrants {
+    let mut tools: BTreeSet<String> = policy.allow_tools.iter().cloned().collect();
+    for (server, config) in mcp {
+        for tool in config.allow() {
+            tools.insert(format!("mcp__{server}__{tool}"));
+        }
+    }
+    let tools = tools
+        .into_iter()
+        .filter(|name| !policy.deny_tools.iter().any(|denied| denied == name))
+        .collect();
+    let shell_prefixes = policy
+        .allow_shell_prefixes
+        .iter()
+        .filter(|granted| {
+            !policy
+                .deny_shell_prefixes
+                .iter()
+                .any(|denied| shell_prefixes_overlap(denied, granted))
+        })
+        .cloned()
+        .collect();
+    PolicyGrants::new(tools, shell_prefixes)
 }
 
 fn apply_optional<T: Clone>(field: &Field<T>, current: &mut Option<T>) -> bool {

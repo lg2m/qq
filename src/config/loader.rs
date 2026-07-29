@@ -302,12 +302,12 @@ fn selected_organization(
     Ok(organization)
 }
 
-struct MdmDocument {
+pub(super) struct MdmDocument {
     source: SourceIdentity,
-    document: Document,
+    pub(super) document: Document,
 }
 
-fn read_mdm_document(loader: &ConfigLoader) -> Result<Option<MdmDocument>, ConfigError> {
+pub(super) fn read_mdm_document(loader: &ConfigLoader) -> Result<Option<MdmDocument>, ConfigError> {
     let Some(MdmConfiguration { origin, content }) = loader.mdm_reader.read()? else {
         return Ok(None);
     };
@@ -411,7 +411,7 @@ pub(super) fn grant_pending_trust(
 
 #[derive(Clone, Debug)]
 pub(super) struct FileCandidate {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     kind: SourceKind,
 }
 
@@ -509,7 +509,7 @@ fn is_vcs_root(directory: &Path) -> bool {
         .any(|marker| directory.join(marker).exists())
 }
 
-fn discover_layer_directory(
+pub(super) fn discover_layer_directory(
     directory: &Path,
     primary_name: &str,
     fragment_name: &str,
@@ -721,7 +721,7 @@ struct TrustRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TrustState {
+pub(super) struct TrustState {
     version: u32,
     records: Vec<TrustRecord>,
 }
@@ -736,7 +736,7 @@ impl Default for TrustState {
 }
 
 impl TrustState {
-    fn load(paths: &ConfigPaths) -> Result<Self, ConfigError> {
+    pub(super) fn load(paths: &ConfigPaths) -> Result<Self, ConfigError> {
         let Some(candidate) = discover_file(paths.trust_file(), SourceKind::TrustState, false)?
         else {
             return Ok(Self::default());
@@ -772,19 +772,19 @@ impl TrustState {
         Ok(state)
     }
 
-    fn contains(&self, path: &Path, digest: &str) -> bool {
+    pub(super) fn contains(&self, path: &Path, digest: &str) -> bool {
         self.records
             .iter()
             .any(|record| record.path == path && record.digest == digest)
     }
 
-    fn insert(&mut self, path: PathBuf, digest: String) {
+    pub(super) fn insert(&mut self, path: PathBuf, digest: String) {
         if !self.contains(&path, &digest) {
             self.records.push(TrustRecord { path, digest });
         }
     }
 
-    fn save(&mut self, paths: &ConfigPaths) -> Result<(), ConfigError> {
+    pub(super) fn save(&mut self, paths: &ConfigPaths) -> Result<(), ConfigError> {
         self.records
             .sort_by(|left, right| (&left.path, &left.digest).cmp(&(&right.path, &right.digest)));
         ensure_data_directory(&paths.data_dir)?;
@@ -869,10 +869,10 @@ pub(super) fn ensure_data_directory(path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
-struct TrustStateLock(File);
+pub(super) struct TrustStateLock(File);
 
 impl TrustStateLock {
-    fn acquire(paths: &ConfigPaths) -> Result<Self, ConfigError> {
+    pub(super) fn acquire(paths: &ConfigPaths) -> Result<Self, ConfigError> {
         ensure_data_directory(&paths.data_dir)?;
         let path = paths.trust_lock_file();
         let mut options = OpenOptions::new();
@@ -934,7 +934,7 @@ fn validate_private_file_mode(path: &Path, metadata: &fs::Metadata) -> Result<()
 }
 
 #[cfg(unix)]
-fn validate_managed_directory_if_present(path: &Path) -> Result<(), ConfigError> {
+pub(super) fn validate_managed_directory_if_present(path: &Path) -> Result<(), ConfigError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => validate_managed_metadata(path, &metadata, true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -946,12 +946,12 @@ fn validate_managed_directory_if_present(path: &Path) -> Result<(), ConfigError>
 }
 
 #[cfg(not(unix))]
-fn validate_managed_directory_if_present(_path: &Path) -> Result<(), ConfigError> {
+pub(super) fn validate_managed_directory_if_present(_path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn validate_managed_file(path: &Path) -> Result<(), ConfigError> {
+pub(super) fn validate_managed_file(path: &Path) -> Result<(), ConfigError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| ConfigError::Io {
         path: path.to_owned(),
         error,
@@ -960,7 +960,7 @@ fn validate_managed_file(path: &Path) -> Result<(), ConfigError> {
 }
 
 #[cfg(not(unix))]
-fn validate_managed_file(_path: &Path) -> Result<(), ConfigError> {
+pub(super) fn validate_managed_file(_path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 

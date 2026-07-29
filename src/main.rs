@@ -259,7 +259,17 @@ fn config_command(
                     "max_output_tokens" => snapshot.provenance().max_output_tokens(),
                     _ => field
                         .strip_prefix("provider.")
-                        .and_then(|name| snapshot.provenance().provider(name)),
+                        .and_then(|name| snapshot.provenance().provider(name))
+                        .or_else(|| {
+                            field
+                                .strip_prefix("grant.tool.")
+                                .and_then(|name| snapshot.provenance().grant_tool(name))
+                        })
+                        .or_else(|| {
+                            field
+                                .strip_prefix("grant.shell.")
+                                .and_then(|prefix| snapshot.provenance().grant_shell_prefix(prefix))
+                        }),
                 }
                 .cloned()
             };
@@ -304,6 +314,22 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
             config::ProviderKind::Custom => "Custom",
         };
         println!("  {name}: {kind}");
+    }
+    // Grants are not secrets; they render unredacted.
+    let grants = snapshot.grants();
+    println!("policy grants:");
+    println!("  tools: {}", join_or_none(grants.tools()));
+    println!(
+        "  shell prefixes: {}",
+        join_or_none(grants.shell_prefixes())
+    );
+}
+
+fn join_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "<none>".to_owned()
+    } else {
+        values.join(", ")
     }
 }
 

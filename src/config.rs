@@ -17,6 +17,7 @@ use thiserror::Error;
 mod document;
 mod loader;
 mod managed;
+mod promote;
 mod remote;
 mod tui;
 
@@ -331,6 +332,19 @@ impl ConfigLoader {
 
     pub fn organizations(&self) -> Result<Vec<OrganizationEnrollment>, ConfigError> {
         remote::list(&self.paths)
+    }
+
+    /// Durably records an approval grant in the workspace's
+    /// `.qq/config.ron` policy section, creating the file or section when
+    /// absent and preserving unrelated user content otherwise. The write is
+    /// atomic (temp file + rename), idempotent for a grant the document
+    /// already declares, and refused when the managed layer denies the grant.
+    pub fn promote_workspace_grant(
+        &self,
+        workspace_dir: &Path,
+        grant: &WorkspaceGrant,
+    ) -> Result<GrantPromotion, ConfigError> {
+        promote::promote_workspace_grant(self, workspace_dir, grant)
     }
 
     #[cfg(test)]
@@ -945,6 +959,10 @@ pub struct EffectivePolicy {
     require_https: bool,
     allow_custom_providers: bool,
     allow_literal_secrets: bool,
+    allow_tools: Vec<String>,
+    allow_shell_prefixes: Vec<String>,
+    deny_tools: Vec<String>,
+    deny_shell_prefixes: Vec<String>,
 }
 
 impl Default for EffectivePolicy {
@@ -956,6 +974,10 @@ impl Default for EffectivePolicy {
             require_https: false,
             allow_custom_providers: true,
             allow_literal_secrets: true,
+            allow_tools: Vec::new(),
+            allow_shell_prefixes: Vec::new(),
+            deny_tools: Vec::new(),
+            deny_shell_prefixes: Vec::new(),
         }
     }
 }
@@ -989,6 +1011,120 @@ impl EffectivePolicy {
     #[must_use]
     pub const fn allow_literal_secrets(&self) -> bool {
         self.allow_literal_secrets
+    }
+
+    /// Exact tool names granted across layers, before deny filtering and
+    /// before per-MCP-server allowlists are folded in. Prefer
+    /// [`ConfigSnapshot::grants`] for the resolved set.
+    #[must_use]
+    pub fn allow_tools(&self) -> &[String] {
+        &self.allow_tools
+    }
+
+    /// Shell command prefixes granted across layers, before deny filtering.
+    /// Prefer [`ConfigSnapshot::grants`] for the resolved set.
+    #[must_use]
+    pub fn allow_shell_prefixes(&self) -> &[String] {
+        &self.allow_shell_prefixes
+    }
+
+    /// Managed-only: exact tool names filtered out of the effective grants.
+    #[must_use]
+    pub fn deny_tools(&self) -> &[String] {
+        &self.deny_tools
+    }
+
+    /// Managed-only: shell prefixes whose word-granularity overlap filters
+    /// lower-layer shell grants.
+    #[must_use]
+    pub fn deny_shell_prefixes(&self) -> &[String] {
+        &self.deny_shell_prefixes
+    }
+}
+
+/// The resolved workspace grant set: exact tool names (with per-MCP-server
+/// allowlists folded in as `mcp__<server>__<tool>`) and shell command
+/// prefixes, after managed deny filtering. Grants are not secrets; the values
+/// render unredacted. Session creation seeds its grant set from this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PolicyGrants {
+    tools: Vec<String>,
+    shell_prefixes: Vec<String>,
+}
+
+impl PolicyGrants {
+    pub(crate) const fn new(tools: Vec<String>, shell_prefixes: Vec<String>) -> Self {
+        Self {
+            tools,
+            shell_prefixes,
+        }
+    }
+
+    /// Exact tool names allowed to run without prompting, sorted and deduped.
+    #[must_use]
+    pub fn tools(&self) -> &[String] {
+        &self.tools
+    }
+
+    /// Shell command prefixes matched at word granularity, sorted and deduped.
+    #[must_use]
+    pub fn shell_prefixes(&self) -> &[String] {
+        &self.shell_prefixes
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.shell_prefixes.is_empty()
+    }
+}
+
+/// One approval grant with workspace lifetime: an exact tool name (built-in
+/// or `mcp__<server>__<tool>`) or a shell command prefix matched at word
+/// granularity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceGrant {
+    Tool(String),
+    ShellPrefix(String),
+}
+
+impl WorkspaceGrant {
+    #[must_use]
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Tool(value) | Self::ShellPrefix(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromotionOutcome {
+    /// The grant was appended and durably written.
+    Added,
+    /// The document already declared the grant; nothing was written.
+    AlreadyPresent,
+}
+
+/// Result of promoting a grant into workspace configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantPromotion {
+    path: PathBuf,
+    outcome: PromotionOutcome,
+}
+
+impl GrantPromotion {
+    pub(crate) const fn new(path: PathBuf, outcome: PromotionOutcome) -> Self {
+        Self { path, outcome }
+    }
+
+    /// The workspace configuration file that carries the grant.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> PromotionOutcome {
+        self.outcome
     }
 }
 
@@ -1109,6 +1245,8 @@ pub struct ConfigProvenance {
     model: Option<SourceIdentity>,
     max_output_tokens: Option<SourceIdentity>,
     providers: BTreeMap<String, SourceIdentity>,
+    grant_tools: BTreeMap<String, SourceIdentity>,
+    grant_shell_prefixes: BTreeMap<String, SourceIdentity>,
 }
 
 impl ConfigProvenance {
@@ -1135,6 +1273,28 @@ impl ConfigProvenance {
     #[must_use]
     pub const fn providers(&self) -> &BTreeMap<String, SourceIdentity> {
         &self.providers
+    }
+
+    /// The layer that last declared the tool grant still in effect.
+    #[must_use]
+    pub fn grant_tool(&self, name: &str) -> Option<&SourceIdentity> {
+        self.grant_tools.get(name)
+    }
+
+    /// The layer that last declared the shell-prefix grant still in effect.
+    #[must_use]
+    pub fn grant_shell_prefix(&self, prefix: &str) -> Option<&SourceIdentity> {
+        self.grant_shell_prefixes.get(prefix)
+    }
+
+    #[must_use]
+    pub const fn grant_tools(&self) -> &BTreeMap<String, SourceIdentity> {
+        &self.grant_tools
+    }
+
+    #[must_use]
+    pub const fn grant_shell_prefixes(&self) -> &BTreeMap<String, SourceIdentity> {
+        &self.grant_shell_prefixes
     }
 }
 
@@ -1169,6 +1329,7 @@ pub struct ConfigSnapshot {
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
     policy: EffectivePolicy,
+    grants: PolicyGrants,
     reports: Vec<SourceReport>,
     provenance: ConfigProvenance,
 }
@@ -1203,6 +1364,14 @@ impl ConfigSnapshot {
     #[must_use]
     pub const fn policy(&self) -> &EffectivePolicy {
         &self.policy
+    }
+
+    /// The resolved workspace grant set consulted at session creation:
+    /// declared tool and shell-prefix grants plus folded per-MCP-server
+    /// allowlists, after managed deny filtering.
+    #[must_use]
+    pub const fn grants(&self) -> &PolicyGrants {
+        &self.grants
     }
 
     #[must_use]
@@ -1298,8 +1467,14 @@ pub enum ConfigError {
         origin: SourceIdentity,
         version: u32,
     },
-    #[error("policy is only allowed in managed configuration: {origin}")]
+    #[error("managed-only policy settings are only allowed in managed configuration: {origin}")]
     PolicyOutsideManaged { origin: SourceIdentity },
+    #[error("remote configuration cannot declare approval grants: {origin}")]
+    RemotePolicyGrantsForbidden { origin: SourceIdentity },
+    #[error("workspace grant is invalid: {message}")]
+    InvalidGrant { message: String },
+    #[error("workspace grant {grant:?} is denied by managed policy {rule}")]
+    GrantDeniedByManaged { grant: String, rule: &'static str },
     #[error("literal secret values are forbidden in {origin}")]
     LiteralSecretForbidden { origin: SourceIdentity },
     #[error("remote configuration cannot select local credential references: {origin}")]
