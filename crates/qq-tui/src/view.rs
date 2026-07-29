@@ -1286,7 +1286,9 @@ fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
             let rest = std::mem::take(first);
             let spans = match rest.spans.split_first() {
                 Some((first_span, rest_spans))
-                    if first_span.text == " > " || first_span.text == "   " || first_span.text == " … " =>
+                    if first_span.text == " > "
+                        || first_span.text == "   "
+                        || first_span.text == " … " =>
                 {
                     rest_spans.to_vec()
                 }
