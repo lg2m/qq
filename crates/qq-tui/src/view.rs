@@ -16,7 +16,7 @@ use crossterm::{
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use qq_protocol::{
     MessageId, MessageRole, MessageSnapshot, MessageState, SessionId, SessionStatus,
-    ToolCallSnapshot, ToolCallState,
+    ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -40,6 +40,8 @@ const MAX_TOOL_ERROR_ROWS: usize = 6;
 const MAX_TOOL_DETAIL_BYTES: usize = 4 * 1024;
 const MAX_TOOL_ARGUMENT_ROWS: usize = 8;
 const MAX_TOOL_RESULT_ROWS: usize = 12;
+/// Rows of live streamed output shown under a running call's one-liner.
+const MAX_LIVE_TAIL_ROWS: usize = 6;
 const TOOL_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
@@ -456,6 +458,7 @@ impl FrameRenderer {
                 if head > 0 {
                     lines.extend(render_tool_calls(
                         &run_calls[..head],
+                        &app.live_tool_output,
                         app.tool_detail,
                         app.animation_tick,
                         width,
@@ -467,6 +470,7 @@ impl FrameRenderer {
                     lines.push(Line::default());
                     lines.extend(render_tool_calls(
                         &run_calls[head..],
+                        &app.live_tool_output,
                         app.tool_detail,
                         app.animation_tick,
                         width,
@@ -566,9 +570,12 @@ impl FrameRenderer {
 
 /// Renders one run's tool calls: a folded count for quiet runs, otherwise one
 /// gutter line per call, with errors and the expanded detail level adding
-/// bounded body rows.
+/// bounded body rows. Running calls with buffered live output show a bounded
+/// tail of it at every detail level — a running command's output is the thing
+/// the user is waiting for.
 fn render_tool_calls(
     calls: &[&ToolCallSnapshot],
+    live_output: &HashMap<ToolCallId, String>,
     detail: ToolDetail,
     tick: usize,
     width: usize,
@@ -589,6 +596,11 @@ fn render_tool_calls(
             }
         } else if detail == ToolDetail::Expanded {
             lines.extend(tool_expanded_lines(call, width));
+        }
+        if call.state == ToolCallState::Running
+            && let Some(output) = live_output.get(&call.id)
+        {
+            lines.extend(tool_live_output_lines(output, width));
         }
     }
     lines
@@ -784,13 +796,20 @@ fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
             width,
         ));
     }
-    if let Some(result) = call.result.as_deref() {
-        // Completed edits whose result carries a unified diff render it with
-        // per-line diff coloring; today qq-core returns only a summary
-        // sentence, so plain results keep the raw treatment.
-        let diff = matches!(call.name.as_str(), "edit_file" | "write_file")
-            && !call.is_error
-            && looks_like_diff(result);
+    // Calls carrying a diff display payload render it in place of the raw
+    // result string; diff-shaped results without a payload (shell output,
+    // older stores) keep the looks_like_diff heuristic as a fallback.
+    let (body, diff) = match &call.display {
+        Some(ToolCallDisplay::Diff { diff, .. }) => (Some(diff.as_str()), true),
+        None => {
+            let result = call.result.as_deref();
+            let diff = matches!(call.name.as_str(), "edit_file" | "write_file")
+                && !call.is_error
+                && result.is_some_and(looks_like_diff);
+            (result, diff)
+        }
+    };
+    if let Some(result) = body {
         let text = bounded_tail(result, MAX_TOOL_DETAIL_BYTES);
         let total = text.lines().count();
         if total > MAX_TOOL_RESULT_ROWS || text.len() < result.len() {
@@ -812,6 +831,33 @@ fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
         }
     }
     lines
+}
+
+/// The last few complete lines of a running call's streamed output, muted
+/// and literal (character wrap, never reflowed) under the call's one-liner.
+/// Only whole lines render: a chunk may end mid-line, and a partial line
+/// reads as garbage until its newline arrives.
+fn tool_live_output_lines(output: &str, width: usize) -> Vec<Line> {
+    let complete = &output[..output.rfind('\n').map_or(0, |index| index + 1)];
+    let content_width = width.saturating_sub(5).max(1);
+    let total = complete.lines().count();
+    let mut rows = Vec::new();
+    for line in complete
+        .lines()
+        .skip(total.saturating_sub(MAX_LIVE_TAIL_ROWS))
+    {
+        let safe = line
+            .chars()
+            .filter_map(terminal_safe_character)
+            .collect::<String>();
+        rows.extend(wrap_line_chars(Line::styled(safe, muted()), content_width));
+    }
+    // Long lines wrap into extra rows; keep the tail bounded regardless.
+    let excess = rows.len().saturating_sub(MAX_LIVE_TAIL_ROWS);
+    if excess > 0 {
+        rows.drain(..excess);
+    }
+    indent_lines(rows, "     ", muted(), width)
 }
 
 /// Whether text is unified-diff-shaped: a hunk header, or both added and
@@ -2400,6 +2446,7 @@ mod tests {
             state,
             result: result.map(str::to_owned),
             is_error,
+            display: None,
         }
     }
 
@@ -2554,7 +2601,7 @@ mod tests {
             Some("@@ -1 +1 @@\n-old\n+new\n context"),
             false,
         );
-        let lines = render_tool_calls(&[&diff_call], ToolDetail::Expanded, 0, 80);
+        let lines = render_tool_calls(&[&diff_call], &HashMap::new(), ToolDetail::Expanded, 0, 80);
         let style_of = |lines: &[Line], needle: &str| {
             lines
                 .iter()
@@ -2576,8 +2623,113 @@ mod tests {
             Some("Edited src/lib.rs: replaced 1 occurrence(s)."),
             false,
         );
-        let lines = render_tool_calls(&[&summary_call], ToolDetail::Expanded, 0, 80);
+        let lines = render_tool_calls(
+            &[&summary_call],
+            &HashMap::new(),
+            ToolDetail::Expanded,
+            0,
+            80,
+        );
         assert_eq!(style_of(&lines, "Edited src/lib.rs"), Some(normal().dim()));
+    }
+
+    #[test]
+    fn display_payload_diffs_replace_the_result_summary_at_expanded_detail() {
+        let mut call = tool_call_snapshot(
+            3,
+            "edit_file",
+            r#"{"path":"src/lib.rs"}"#,
+            ToolCallState::Completed,
+            Some("Edited src/lib.rs: replaced 1 occurrence(s)."),
+            false,
+        );
+        call.display = Some(ToolCallDisplay::Diff {
+            path: "src/lib.rs".to_owned(),
+            diff: "- old line\n+ new line\n".to_owned(),
+        });
+
+        let lines = render_tool_calls(&[&call], &HashMap::new(), ToolDetail::Expanded, 0, 80);
+        let style_of = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.text.contains(needle))
+                .map(|span| span.style)
+        };
+        assert_eq!(style_of("- old line"), Some(failure()));
+        assert_eq!(style_of("+ new line"), Some(success()));
+        // The payload renders instead of the raw summary sentence.
+        assert!(style_of("replaced 1 occurrence").is_none());
+
+        // Collapsed detail keeps the one-liner; the payload adds no rows.
+        let lines = render_tool_calls(&[&call], &HashMap::new(), ToolDetail::Collapsed, 0, 80);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn running_calls_show_a_live_output_tail_of_complete_lines() {
+        let call = tool_call_snapshot(
+            3,
+            "shell",
+            r#"{"command":"cargo build"}"#,
+            ToolCallState::Running,
+            None,
+            false,
+        );
+        let mut live = HashMap::new();
+        live.insert(
+            call.id,
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven b\u{7}ell\npartial".to_owned(),
+        );
+
+        for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
+            let rows = frame_rows(&render_tool_calls(&[&call], &live, detail, 0, 80));
+            assert!(rows[0].contains("shell"), "the spinner one-liner stays");
+            let tail_start = rows.len() - MAX_LIVE_TAIL_ROWS;
+            assert_eq!(
+                &rows[tail_start..],
+                [
+                    "     two",
+                    "     three",
+                    "     four",
+                    "     five",
+                    "     six",
+                    // Control characters are stripped; the mid-line chunk
+                    // tail stays hidden until its newline arrives.
+                    "     seven bell",
+                ]
+            );
+            assert!(!rows.iter().any(|row| row.contains("partial")));
+        }
+
+        // Overlong lines wrap literally at the character level and the tail
+        // stays bounded in rows.
+        let mut live = HashMap::new();
+        live.insert(call.id, format!("{}\n", "x".repeat(40)));
+        let rows = frame_rows(&render_tool_calls(
+            &[&call],
+            &live,
+            ToolDetail::Collapsed,
+            0,
+            20,
+        ));
+        assert_eq!(rows[1], format!("     {}", "x".repeat(15)));
+        assert_eq!(rows[2], format!("     {}", "x".repeat(15)));
+        assert!(rows.len() <= 1 + MAX_LIVE_TAIL_ROWS);
+
+        // Calls that are no longer running render no tail even if a stale
+        // buffer lingers.
+        let mut finished = call.clone();
+        finished.state = ToolCallState::Completed;
+        finished.result = Some("ok\n".to_owned());
+        let rows = frame_rows(&render_tool_calls(
+            &[&finished],
+            &live,
+            ToolDetail::Collapsed,
+            0,
+            80,
+        ));
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
@@ -2700,7 +2852,13 @@ mod tests {
             ),
         ];
         for (call, expected) in cases {
-            let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 120));
+            let rows = frame_rows(&render_tool_calls(
+                &[&call],
+                &HashMap::new(),
+                ToolDetail::Collapsed,
+                0,
+                120,
+            ));
             assert_eq!(rows, [expected]);
         }
     }
@@ -2717,7 +2875,13 @@ mod tests {
             false,
         );
 
-        let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 160));
+        let rows = frame_rows(&render_tool_calls(
+            &[&call],
+            &HashMap::new(),
+            ToolDetail::Collapsed,
+            0,
+            160,
+        ));
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].contains("● edit_file"));
@@ -2736,7 +2900,13 @@ mod tests {
             false,
         );
 
-        let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 120));
+        let rows = frame_rows(&render_tool_calls(
+            &[&call],
+            &HashMap::new(),
+            ToolDetail::Collapsed,
+            0,
+            120,
+        ));
 
         assert!(rows[0].contains("read_file {not json (1 line)"));
     }
@@ -2752,7 +2922,13 @@ mod tests {
             true,
         );
 
-        let rows = frame_rows(&render_tool_calls(&[&call], ToolDetail::Collapsed, 0, 120));
+        let rows = frame_rows(&render_tool_calls(
+            &[&call],
+            &HashMap::new(),
+            ToolDetail::Collapsed,
+            0,
+            120,
+        ));
 
         assert_eq!(rows[0], "   ✗ read_file gone.txt");
         assert_eq!(rows[1], "     path is not a file");
@@ -2770,6 +2946,7 @@ mod tests {
         );
         let rows = frame_rows(&render_tool_calls(
             &[&awaiting],
+            &HashMap::new(),
             ToolDetail::Collapsed,
             0,
             120,
@@ -2789,6 +2966,7 @@ mod tests {
         );
         let rows = frame_rows(&render_tool_calls(
             &[&running],
+            &HashMap::new(),
             ToolDetail::Collapsed,
             1,
             120,
@@ -2823,6 +3001,7 @@ mod tests {
 
         let rows = frame_rows(&render_tool_calls(
             &references,
+            &HashMap::new(),
             ToolDetail::Collapsed,
             0,
             120,
@@ -2834,6 +3013,7 @@ mod tests {
         let references = calls.iter().collect::<Vec<_>>();
         let rows = frame_rows(&render_tool_calls(
             &references,
+            &HashMap::new(),
             ToolDetail::Collapsed,
             0,
             120,
@@ -2845,6 +3025,7 @@ mod tests {
         let references = calls.iter().collect::<Vec<_>>();
         let rows = frame_rows(&render_tool_calls(
             &references,
+            &HashMap::new(),
             ToolDetail::Expanded,
             0,
             120,
@@ -2909,7 +3090,7 @@ mod tests {
         let references = calls.iter().collect::<Vec<_>>();
         for width in 0..24 {
             for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
-                let lines = render_tool_calls(&references, detail, 0, width);
+                let lines = render_tool_calls(&references, &HashMap::new(), detail, 0, width);
                 assert!(lines.iter().all(|line| line.width() <= width));
             }
         }

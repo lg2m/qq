@@ -395,6 +395,17 @@ pub struct MessageSnapshot {
     pub created_at_ms: u64,
 }
 
+/// A UI-facing rendering payload carried alongside a tool call's result.
+/// Display-only: model context assembly never includes it, so it can hold
+/// richer content than the bounded result string the model sees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolCallDisplay {
+    /// A bounded unified-diff-style rendering of a completed
+    /// `edit_file`/`write_file` call.
+    Diff { path: String, diff: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallSnapshot {
@@ -410,6 +421,8 @@ pub struct ToolCallSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<ToolCallDisplay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +625,7 @@ mod tests {
                 state: ToolCallState::Completed,
                 result: Some("QQ".to_owned()),
                 is_error: false,
+                display: None,
             },
         };
 
@@ -622,6 +636,55 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SessionEvent>(encoded).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn tool_call_display_payloads_round_trip_and_legacy_payloads_decode_to_none() {
+        let tool_call = ToolCallSnapshot {
+            id: id(7),
+            session_id: id(3),
+            run_id: id(4),
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_1".to_owned(),
+            name: "edit_file".to_owned(),
+            arguments: r#"{"path":"src/lib.rs"}"#.to_owned(),
+            state: ToolCallState::Completed,
+            result: Some("Edited src/lib.rs: replaced 1 occurrence(s).".to_owned()),
+            is_error: false,
+            display: Some(ToolCallDisplay::Diff {
+                path: "src/lib.rs".to_owned(),
+                diff: "- old\n+ new\n".to_owned(),
+            }),
+        };
+
+        let encoded = serde_json::to_value(&tool_call).unwrap();
+        assert_eq!(encoded["display"]["type"], "diff");
+        assert_eq!(encoded["display"]["diff"], "- old\n+ new\n");
+        assert_eq!(
+            serde_json::from_value::<ToolCallSnapshot>(encoded).unwrap(),
+            tool_call
+        );
+
+        // Calls persisted before the protocol carried a display payload must
+        // still decode; legacy snapshots default to no payload.
+        let mut legacy = serde_json::to_value(&tool_call).unwrap();
+        legacy.as_object_mut().unwrap().remove("display");
+        let decoded = serde_json::from_value::<ToolCallSnapshot>(legacy).unwrap();
+        assert_eq!(decoded.display, None);
+        assert_eq!(decoded.result, tool_call.result);
+
+        // Snapshots without a payload keep their previous wire shape.
+        let bare = ToolCallSnapshot {
+            display: None,
+            ..tool_call
+        };
+        let encoded = serde_json::to_value(&bare).unwrap();
+        assert!(encoded.get("display").is_none());
+        assert_eq!(
+            serde_json::from_value::<ToolCallSnapshot>(encoded).unwrap(),
+            bare
         );
     }
 
@@ -655,6 +718,7 @@ mod tests {
             state: ToolCallState::AwaitingApproval,
             result: None,
             is_error: false,
+            display: None,
         };
         let requested = SessionEvent::ToolApprovalRequested {
             tool_call: tool_call.clone(),

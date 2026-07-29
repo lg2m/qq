@@ -21,8 +21,8 @@ use qq_protocol::{
     MessageState, ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId, RunOutcome,
     RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
     SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
-    SubscribeRequest, TextChannel, TokenUsage, ToolCallId, ToolCallSnapshot, ToolCallState,
-    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot,
+    ToolCallState, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -805,6 +805,7 @@ async fn execute_run(
                 result,
                 is_error,
                 file_state,
+                display,
             })) => {
                 // Any buffered live output flushes first so replay preserves
                 // the chunk-then-result order.
@@ -826,7 +827,7 @@ async fn execute_run(
                 }
                 match inner
                     .store
-                    .finish_tool_call(&claimed, id, result, is_error, file_state)
+                    .finish_tool_call(&claimed, id, result, is_error, file_state, display)
                     .await
                 {
                     Ok(event) => inner.notify(event.cursor),
@@ -1564,6 +1565,7 @@ impl Store {
         result: String,
         is_error: bool,
         file_state: Option<FileStateUpdate>,
+        display: Option<ToolCallDisplay>,
     ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
@@ -1576,6 +1578,7 @@ impl Store {
                 result,
                 is_error,
                 file_state,
+                display,
             )
         })
         .await
@@ -1816,7 +1819,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_files_table(&transaction)?;
             transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '6')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '7')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1856,7 +1859,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_messages_turn_ordinal_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1880,7 +1883,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_messages_turn_ordinal_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1904,9 +1907,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_grant_table(&transaction)?;
             create_session_files_table(&transaction)?;
             add_messages_turn_ordinal_column(&transaction)?;
+            add_tool_calls_display_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1920,9 +1924,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_session_files_table(&transaction)?;
             add_messages_turn_ordinal_column(&transaction)?;
+            add_tool_calls_display_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1935,9 +1940,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .transaction()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             add_messages_turn_ordinal_column(&transaction)?;
+            add_tool_calls_display_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1945,7 +1951,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("6") => {}
+        Some("6") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            add_tool_calls_display_column(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("7") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -1994,6 +2015,7 @@ fn create_tool_tables(connection: &Connection) -> Result<(), SessionRuntimeError
                  state TEXT NOT NULL,
                  result TEXT,
                  is_error INTEGER NOT NULL DEFAULT 0,
+                 display_json TEXT,
                  approval_resolution TEXT,
                  requested_at_ms INTEGER NOT NULL,
                  started_at_ms INTEGER,
@@ -2018,6 +2040,18 @@ fn add_messages_turn_ordinal_column(connection: &Connection) -> Result<(), Sessi
                 "ALTER TABLE messages ADD COLUMN turn_ordinal INTEGER NOT NULL DEFAULT 0",
                 [],
             )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+/// Adds `tool_calls.display_json` for stores created before tool calls
+/// carried a UI display payload. Existing rows keep NULL: legacy results
+/// render from their bounded result string alone.
+fn add_tool_calls_display_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "tool_calls", "display_json")? {
+        connection
+            .execute("ALTER TABLE tool_calls ADD COLUMN display_json TEXT", [])
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     Ok(())
@@ -3117,6 +3151,10 @@ fn append_tool_call_output(
     Ok(event)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one persisted row update; bundling the columns adds nothing"
+)]
 fn finish_tool_call(
     connection: &mut Connection,
     store_id: StoreId,
@@ -3125,17 +3163,25 @@ fn finish_tool_call(
     result: String,
     is_error: bool,
     file_state: Option<FileStateUpdate>,
+    display: Option<ToolCallDisplay>,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    // The display payload is deliberately absent from the capacity check: it
+    // never enters model context, so it cannot crowd the context budget.
     ensure_context_capacity(&transaction, claimed.session_id, result.len())?;
     let now = now_ms();
     let state = if is_error { "failed" } else { "completed" };
+    let display_json = display
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
     let updated = transaction
         .execute(
             "UPDATE tool_calls
-             SET state = ?2, result = ?3, is_error = ?4, finished_at_ms = ?5
+             SET state = ?2, result = ?3, is_error = ?4, finished_at_ms = ?5, display_json = ?7
              WHERE id = ?1 AND run_id = ?6 AND state = 'running'",
             params![
                 tool_call_id.to_string(),
@@ -3144,6 +3190,7 @@ fn finish_tool_call(
                 is_error,
                 now,
                 claimed.run_id.to_string(),
+                display_json,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -4379,7 +4426,8 @@ fn load_tool_call(
     connection
         .query_row(
             "SELECT r.session_id, t.run_id, t.turn_ordinal, t.call_ordinal,
-                    t.provider_call_id, t.name, t.arguments_json, t.state, t.result, t.is_error
+                    t.provider_call_id, t.name, t.arguments_json, t.state, t.result, t.is_error,
+                    t.display_json
              FROM tool_calls t JOIN runs r ON r.id = t.run_id WHERE t.id = ?1",
             [tool_call_id.to_string()],
             |row| {
@@ -4394,12 +4442,25 @@ fn load_tool_call(
                     row.get::<_, String>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, bool>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
         .map_err(|_| SessionRuntimeError::Persistence)
         .and_then(
-            |(session, run, turn, call, provider_id, name, arguments, state, result, is_error)| {
+            |(
+                session,
+                run,
+                turn,
+                call,
+                provider_id,
+                name,
+                arguments,
+                state,
+                result,
+                is_error,
+                display,
+            )| {
                 Ok(ToolCallSnapshot {
                     id: tool_call_id,
                     session_id: parse_id(&session)?,
@@ -4412,6 +4473,11 @@ fn load_tool_call(
                     state: parse_tool_call_state(&state)?,
                     result,
                     is_error,
+                    display: display
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRuntimeError::Persistence)?,
                 })
             },
         )
@@ -5120,6 +5186,7 @@ mod tests {
     struct ScriptedRunsHarness {
         _directory: TempDir,
         runtime: SessionRuntime,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
         workspace_path: PathBuf,
         session_id: SessionId,
         events: SessionEventStream,
@@ -5130,10 +5197,11 @@ mod tests {
         runs: Vec<Vec<(&'static str, String)>>,
     ) -> ScriptedRunsHarness {
         let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let runtime = SessionRuntime::open(
             SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
             Arc::new(ScriptedRunsLoader {
-                requests: Arc::new(StdMutex::new(Vec::new())),
+                requests: Arc::clone(&requests),
                 runs,
                 loads: StdMutex::new(0),
             }),
@@ -5170,6 +5238,7 @@ mod tests {
         ScriptedRunsHarness {
             _directory: directory,
             runtime,
+            requests,
             workspace_path,
             session_id,
             events,
@@ -5378,7 +5447,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "6"
+            "7"
         );
         assert!(
             !connection
@@ -5393,6 +5462,7 @@ mod tests {
         assert!(has_column(&connection, "tool_calls", "provider_call_id").unwrap());
         assert!(has_column(&connection, "model_turns", "assistant_content_json").unwrap());
         assert!(has_column(&connection, "tool_calls", "approval_resolution").unwrap());
+        assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         assert_eq!(
             connection
                 .query_row(
@@ -5469,6 +5539,23 @@ mod tests {
                      INSERT INTO messages VALUES (
                          'assistant-message', 'session', 'run', 2, 'assistant', 'complete',
                          'hello', '', 1
+                     );
+                     CREATE TABLE tool_calls (
+                         id TEXT PRIMARY KEY,
+                         run_id TEXT NOT NULL REFERENCES runs(id),
+                         turn_ordinal INTEGER NOT NULL,
+                         call_ordinal INTEGER NOT NULL,
+                         provider_call_id TEXT NOT NULL,
+                         name TEXT NOT NULL,
+                         arguments_json TEXT NOT NULL,
+                         state TEXT NOT NULL,
+                         result TEXT,
+                         is_error INTEGER NOT NULL DEFAULT 0,
+                         approval_resolution TEXT,
+                         requested_at_ms INTEGER NOT NULL,
+                         started_at_ms INTEGER,
+                         resolved_at_ms INTEGER,
+                         finished_at_ms INTEGER
                      );",
                 )
                 .unwrap();
@@ -5483,8 +5570,9 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "6"
+            "7"
         );
+        assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
             .query_row(
                 "SELECT turn_ordinal, output, state FROM messages WHERE id = 'assistant-message'",
@@ -5501,6 +5589,74 @@ mod tests {
         assert_eq!(turn_ordinal, 0);
         assert_eq!(output, "hello");
         assert_eq!(state, "complete");
+    }
+
+    #[test]
+    fn version_six_migration_adds_the_display_column_and_keeps_existing_calls_bare() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        {
+            // A version-6 store whose tool_calls table predates display_json,
+            // holding one completed edit call.
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version', '6');
+                     CREATE TABLE tool_calls (
+                         id TEXT PRIMARY KEY,
+                         run_id TEXT NOT NULL,
+                         turn_ordinal INTEGER NOT NULL,
+                         call_ordinal INTEGER NOT NULL,
+                         provider_call_id TEXT NOT NULL,
+                         name TEXT NOT NULL,
+                         arguments_json TEXT NOT NULL,
+                         state TEXT NOT NULL,
+                         result TEXT,
+                         is_error INTEGER NOT NULL DEFAULT 0,
+                         approval_resolution TEXT,
+                         requested_at_ms INTEGER NOT NULL,
+                         started_at_ms INTEGER,
+                         resolved_at_ms INTEGER,
+                         finished_at_ms INTEGER
+                     );
+                     INSERT INTO tool_calls VALUES (
+                         'call', 'run', 1, 1, 'call_0', 'edit_file', '{}',
+                         'completed', 'Edited note.txt: replaced 1 occurrence(s).',
+                         0, NULL, 1, 1, NULL, 2
+                     );",
+                )
+                .unwrap();
+        }
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "7"
+        );
+        let (display_json, result) = connection
+            .query_row(
+                "SELECT display_json, result FROM tool_calls WHERE id = 'call'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(display_json, None);
+        assert_eq!(
+            result.as_deref(),
+            Some("Edited note.txt: replaced 1 occurrence(s).")
+        );
     }
 
     #[test]
@@ -6140,7 +6296,14 @@ mod tests {
             .unwrap();
         store.start_tool_call(&claimed, tool_call_id).await.unwrap();
         store
-            .finish_tool_call(&claimed, tool_call_id, "noted\n".to_owned(), false, None)
+            .finish_tool_call(
+                &claimed,
+                tool_call_id,
+                "noted\n".to_owned(),
+                false,
+                None,
+                None,
+            )
             .await
             .unwrap();
         // Turn two starts streaming, then the server crashes.
@@ -7692,6 +7855,100 @@ mod tests {
                 if tool_call.name == "edit_file" && tool_call.state == ToolCallState::Completed
         )));
         assert_eq!(std::fs::read_to_string(&note).unwrap(), "goodbye\n");
+    }
+
+    #[tokio::test]
+    async fn completed_edits_persist_a_display_diff_the_model_context_never_carries() {
+        let mut harness = scripted_runs_harness(
+            ApprovalMode::Auto,
+            vec![
+                vec![
+                    ("read_file", r#"{"path":"note.txt"}"#.to_owned()),
+                    (
+                        "edit_file",
+                        r#"{"path":"note.txt","old_string":"hello","new_string":"goodbye"}"#
+                            .to_owned(),
+                    ),
+                ],
+                Vec::new(),
+            ],
+        )
+        .await;
+        let note = harness.workspace_path.join("note.txt");
+        std::fs::write(&note, "hello\n").unwrap();
+
+        submit_prompt(&harness, "edit the note").await;
+        let observed = collect_through_finished(&mut harness.events).await;
+        let finished_call = |name: &str| {
+            observed
+                .iter()
+                .find_map(|event| match &event.event {
+                    SessionEvent::ToolCallFinished { tool_call } if tool_call.name == name => {
+                        Some(tool_call.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let edited = finished_call("edit_file");
+        assert_eq!(edited.state, ToolCallState::Completed);
+        // The model-facing result stays the compact summary; the diff rides
+        // in the display payload only.
+        assert_eq!(
+            edited.result.as_deref(),
+            Some("Edited note.txt: replaced 1 occurrence(s).")
+        );
+        assert_eq!(
+            edited.display,
+            Some(ToolCallDisplay::Diff {
+                path: "note.txt".to_owned(),
+                diff: "- hello\n+ goodbye\n".to_owned(),
+            })
+        );
+        assert_eq!(finished_call("read_file").display, None);
+
+        // The payload persists with the call and replays in snapshots.
+        let (workspace_id, _) = resolve_workspace(&harness.runtime, &harness.workspace_path).await;
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        let persisted = focused
+            .tool_calls
+            .iter()
+            .find(|call| call.id == edited.id)
+            .unwrap();
+        assert_eq!(persisted.display, edited.display);
+
+        // A follow-up run reassembles model context from the store: the
+        // summary result replays, the display diff never does.
+        submit_prompt(&harness, "what changed?").await;
+        let _ = collect_through_finished(&mut harness.events).await;
+        let requests = harness.requests.lock().unwrap();
+        let follow_up = requests.last().unwrap();
+        let tool_results = follow_up
+            .messages()
+            .iter()
+            .flat_map(|message| message.content())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(tool_results.contains(&"Edited note.txt: replaced 1 occurrence(s)."));
+        assert!(
+            !tool_results
+                .iter()
+                .any(|content| content.contains("+ goodbye")),
+            "the display diff must never enter model context"
+        );
     }
 
     #[tokio::test]

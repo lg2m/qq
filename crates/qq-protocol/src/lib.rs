@@ -17,10 +17,11 @@ pub use sessions::{
     ModelPricingTier, ModelSelection, RunFailure, RunOutcome, RunSnapshot, RunStatus,
     SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot, SessionStatus,
     SessionSummary, ShellCommandPreview, SnapshotRequest, SubscribeRequest, TextChannel,
-    TokenUsage, ToolCallSnapshot, ToolCallState, WorkspaceSnapshot, WorkspaceSummary,
+    TokenUsage, ToolCallDisplay, ToolCallSnapshot, ToolCallState, WorkspaceSnapshot,
+    WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -83,6 +83,9 @@ enum RuntimeEvent {
         /// A file-state map entry recorded by this execution, persisted with
         /// the result so the map can be rebuilt for later runs.
         file_state: Option<tools::FileStateUpdate>,
+        /// A UI-facing payload persisted with the result (the applied diff of
+        /// a successful edit). Never enters model context.
+        display: Option<qq_protocol::ToolCallDisplay>,
     },
     Completed,
     Failed {
@@ -691,11 +694,15 @@ impl Runtime {
                             yield RuntimeEvent::ToolCallOutputDelta { id: call_id, chunk };
                         }
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
+                        let display = (!result.is_error)
+                            .then(|| approval::edit_result_display(&call.name, &call.arguments))
+                            .flatten();
                         yield RuntimeEvent::ToolCallFinished {
                             id: call.id,
                             result: result.content,
                             is_error: result.is_error,
                             file_state: result.file_state,
+                            display,
                         };
                     }
                 } else {
@@ -710,6 +717,8 @@ impl Runtime {
                             result: result.content,
                             is_error: result.is_error,
                             file_state: result.file_state,
+                            // Read-only turns never carry an edit display.
+                            display: None,
                         };
                     }
                 }
