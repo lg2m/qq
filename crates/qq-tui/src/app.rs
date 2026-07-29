@@ -796,19 +796,7 @@ impl App {
                 (changed, Vec::new())
             }
             Event::Paste(text) => {
-                let before = self.input.len();
-                for character in text.chars() {
-                    if self.input.len() + character.len_utf8() > MAX_INPUT_BYTES {
-                        break;
-                    }
-                    if let Some(character) = terminal_safe_character(character) {
-                        self.input.push(character);
-                    }
-                }
-                let changed = self.input.len() != before;
-                if changed {
-                    self.slash_selected = 0;
-                }
+                let changed = self.push_composer_text(&text);
                 (changed, Vec::new())
             }
             Event::Mouse(mouse) if self.model_picker.is_none() && self.session_picker.is_none() => {
@@ -837,6 +825,12 @@ impl App {
         }
         if self.pending_approval().is_some() {
             return self.handle_approval_key(key);
+        }
+        // Shift-Enter inserts a newline in the composer. Handle it before slash
+        // completion and configured bindings so it never submits.
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+            let changed = self.push_input('\n');
+            return (changed, Vec::new());
         }
         if let Some(result) = self.handle_slash_key(key.code) {
             return result;
@@ -1365,7 +1359,7 @@ impl App {
     }
 
     fn push_input(&mut self, character: char) -> bool {
-        let Some(character) = terminal_safe_character(character) else {
+        let Some(character) = composer_character(character) else {
             return false;
         };
         if self.input.len() + character.len_utf8() > MAX_INPUT_BYTES {
@@ -1374,6 +1368,23 @@ impl App {
         self.input.push(character);
         self.slash_selected = 0;
         true
+    }
+
+    fn push_composer_text(&mut self, text: &str) -> bool {
+        let before = self.input.len();
+        for character in text.chars() {
+            if self.input.len() + character.len_utf8() > MAX_INPUT_BYTES {
+                break;
+            }
+            if let Some(character) = composer_character(character) {
+                self.input.push(character);
+            }
+        }
+        let changed = self.input.len() != before;
+        if changed {
+            self.slash_selected = 0;
+        }
+        changed
     }
 
     fn handle_slash_key(&mut self, code: KeyCode) -> Option<(bool, Vec<ClientRequest>)> {
@@ -1585,6 +1596,19 @@ pub(crate) fn terminal_safe_character(character: char) -> Option<char> {
     Some(character)
 }
 
+/// Sanitizes characters for the prompt composer.
+///
+/// Unlike [`terminal_safe_character`], hard newlines are preserved so Shift-Enter
+/// and multiline paste can build multi-line prompts. Carriage returns are dropped
+/// so CRLF paste collapses to a single newline.
+fn composer_character(character: char) -> Option<char> {
+    match character {
+        '\n' => Some('\n'),
+        '\r' => None,
+        character => terminal_safe_character(character),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::MouseEvent;
@@ -1647,6 +1671,27 @@ mod tests {
             }),
             has_older_sessions: false,
         }
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_without_submitting() {
+        let mut app = App::new(TuiOptions::default());
+        app.input = "hello".to_owned();
+        let (changed, requests) =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.input, "hello\n");
+    }
+
+    #[test]
+    fn paste_preserves_newlines_in_the_composer() {
+        let mut app = App::new(TuiOptions::default());
+        let (changed, requests) =
+            app.handle_terminal_event(Event::Paste("alpha\r\nbeta\ngamma".to_owned()));
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.input, "alpha\nbeta\ngamma");
     }
 
     #[test]

@@ -258,7 +258,18 @@ impl FrameRenderer {
         }
 
         let mut lines = vec![header(app, width), context(app, width)];
-        let body_height = height.saturating_sub(5);
+        // Header, context, and two footer rows are fixed. The composer can grow
+        // with wrapped multi-line input, so body height is computed after the
+        // composer is laid out against the remaining space.
+        const FIXED_CHROME_ROWS: usize = 4;
+        let max_composer_rows = height
+            .saturating_sub(FIXED_CHROME_ROWS)
+            .saturating_sub(1)
+            .max(1);
+        let composer_lines = composer(app, width, max_composer_rows);
+        let body_height = height
+            .saturating_sub(FIXED_CHROME_ROWS)
+            .saturating_sub(composer_lines.len());
         let overlay = app.model_picker.is_some()
             || app.session_picker.is_some()
             || app.pending_approval().is_some();
@@ -284,7 +295,7 @@ impl FrameRenderer {
             overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
         }
         lines.extend(body);
-        lines.push(composer(app, width));
+        lines.extend(composer_lines);
         lines.push(footer_context(app, width));
         lines.push(footer_workspace(app, width));
         fit_height(lines, height)
@@ -1197,22 +1208,77 @@ fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) ->
     truncate_line(line, width)
 }
 
-fn composer(app: &App, width: usize) -> Line {
-    let mut line = Line::styled(" > ", accent().bold());
-    if app.input.is_empty() {
-        line.push("Ask QQ...", muted().italic());
+fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
+    let max_rows = max_rows.max(1);
+    let caret = if app.animation_tick.is_multiple_of(2) {
+        "|"
     } else {
-        line.push(tail_by_width(&app.input, width.saturating_sub(5)), normal());
+        " "
+    };
+    if app.input.is_empty() {
+        let mut line = Line::styled(" > ", accent().bold());
+        line.push("Ask QQ...", muted().italic());
+        line.push(caret, accent());
+        return vec![truncate_line(line, width)];
     }
-    line.push(
-        if app.animation_tick.is_multiple_of(2) {
-            "|"
+
+    // Keep hard newlines from Shift-Enter / paste, then soft-wrap each logical
+    // line inside the content column so every visual row keeps a gutter.
+    let content_width = width.saturating_sub(3).max(1);
+    let mut wrapped = Vec::new();
+    for (line_index, part) in app.input.split('\n').enumerate() {
+        let content_rows = if part.is_empty() {
+            vec![Line::default()]
         } else {
-            " "
-        },
-        accent(),
-    );
-    truncate_line(line, width)
+            wrap_line_chars(Line::styled(part, normal()), content_width)
+        };
+        for (row_index, content) in content_rows.into_iter().enumerate() {
+            let mut row = if line_index == 0 && row_index == 0 {
+                Line::styled(" > ", accent().bold())
+            } else {
+                Line::styled("   ", muted())
+            };
+            for span in content.spans {
+                row.push(span.text, span.style);
+            }
+            wrapped.push(row);
+        }
+    }
+
+    if let Some(last) = wrapped.last_mut() {
+        last.push(caret, accent());
+        *last = truncate_line(std::mem::take(last), width);
+    }
+
+    // When the draft outgrows the reserved composer region, keep the tail so
+    // the caret and newest typing stay visible.
+    if wrapped.len() > max_rows {
+        let skip = wrapped.len() - max_rows;
+        wrapped.drain(..skip);
+        if let Some(first) = wrapped.first_mut() {
+            let mut clipped = Line::styled(" … ", muted());
+            let rest = std::mem::take(first);
+            let spans = match rest.spans.split_first() {
+                Some((first_span, rest_spans))
+                    if first_span.text == " > " || first_span.text == "   " || first_span.text == " … " =>
+                {
+                    rest_spans.to_vec()
+                }
+                _ => rest.spans,
+            };
+            for span in spans {
+                clipped.push(span.text, span.style);
+            }
+            *first = truncate_line(clipped, width);
+        }
+    }
+
+    if wrapped.is_empty() {
+        let mut line = Line::styled(" > ", accent().bold());
+        line.push(caret, accent());
+        wrapped.push(truncate_line(line, width));
+    }
+    wrapped
 }
 
 fn footer_context(app: &App, width: usize) -> Line {
@@ -2030,20 +2096,6 @@ fn fit_height(mut lines: Vec<Line>, height: usize) -> Vec<Line> {
     lines.resize(height, Line::default());
     lines.truncate(height);
     lines
-}
-
-fn tail_by_width(text: &str, width: usize) -> String {
-    let mut output = Vec::new();
-    let mut used = 0;
-    for character in text.chars().rev() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
-        if used + character_width > width {
-            break;
-        }
-        output.push(character);
-        used += character_width;
-    }
-    output.into_iter().rev().collect()
 }
 
 fn preview(text: &str, width: usize) -> String {
@@ -3253,6 +3305,24 @@ mod tests {
         let frame = FrameRenderer::default().frame(&mut app, 80, 14);
 
         assert!(frame_rows(&frame).iter().all(|row| !row.contains("  |  ")));
+    }
+
+    #[test]
+    fn composer_renders_hard_newlines_across_multiple_rows() {
+        let mut app = App::new(TuiOptions::default());
+        app.input = "hello\nworld".to_owned();
+        app.animation_tick = 0;
+        let rows = frame_rows(&composer(&app, 40, 8));
+        assert_eq!(rows, vec![" > hello".to_owned(), "   world|".to_owned()]);
+    }
+
+    #[test]
+    fn composer_keeps_the_tail_when_max_rows_clip() {
+        let mut app = App::new(TuiOptions::default());
+        app.input = "one\ntwo\nthree\nfour".to_owned();
+        app.animation_tick = 1; // steady caret space, simpler assertions
+        let rows = frame_rows(&composer(&app, 40, 2));
+        assert_eq!(rows, vec![" … three".to_owned(), "   four ".to_owned()]);
     }
 
     #[test]
