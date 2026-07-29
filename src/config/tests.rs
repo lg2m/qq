@@ -739,3 +739,152 @@ fn binding_labels(settings: &qq_tui::Settings, action: qq_tui::Action) -> Vec<St
         .map(|(_, bindings)| bindings.iter().map(ToString::to_string).collect())
         .unwrap_or_default()
 }
+
+#[test]
+fn mcp_servers_parse_layer_by_name_and_apply_defaults() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(
+            version: 1,
+            mcp: {
+                "executor": Stdio(
+                    command: "./executor.sh",
+                    args: ["--serve"],
+                    env: ["EXECUTOR_API_KEY"],
+                    eager: true,
+                    allow: ["execute", "skills"],
+                    call_timeout_seconds: 120,
+                    max_concurrent_calls: 2,
+                ),
+                "linear": Http(
+                    url: "https://mcp.linear.app/mcp",
+                    bearer: Env("LINEAR_TOKEN"),
+                ),
+                "search": Http(url: "https://search.example.test/mcp"),
+            },
+        )"#,
+    );
+    // The workspace layer removes one server by name after trust is granted.
+    tree.write("work/qq.ron", r#"(version: 1, mcp: {"linear": Remove})"#);
+    let request = tree.request();
+    assert!(
+        matches!(
+            tree.loader().load(&request),
+            Err(ConfigError::TrustRequired { .. })
+        ),
+        "workspace MCP declarations must require trust"
+    );
+    tree.loader().grant_pending_trust(&request).unwrap();
+
+    let snapshot = tree.loader().load(&request).unwrap();
+    let servers = snapshot.mcp_servers();
+    assert_eq!(
+        servers.keys().collect::<Vec<_>>(),
+        ["executor", "search"],
+        "the removed server must not survive the workspace layer"
+    );
+
+    let executor = &servers["executor"];
+    assert!(executor.eager());
+    assert_eq!(executor.allow(), ["execute", "skills"]);
+    assert_eq!(executor.call_timeout_seconds(), 120);
+    assert_eq!(executor.max_concurrent_calls(), 2);
+    assert!(matches!(
+        executor.transport(),
+        McpTransport::Stdio { command, args, env }
+            if command == "./executor.sh"
+                && args == &["--serve".to_owned()]
+                && env == &["EXECUTOR_API_KEY".to_owned()]
+    ));
+
+    let search = &servers["search"];
+    assert!(!search.eager());
+    assert!(search.allow().is_empty());
+    assert_eq!(
+        search.call_timeout_seconds(),
+        DEFAULT_MCP_CALL_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        search.max_concurrent_calls(),
+        DEFAULT_MCP_MAX_CONCURRENT_CALLS
+    );
+    assert!(matches!(
+        search.transport(),
+        McpTransport::Http { url, bearer: None } if url == "https://search.example.test/mcp"
+    ));
+}
+
+#[test]
+fn rejects_invalid_mcp_declarations() {
+    let origin = SourceIdentity::virtual_source(SourceKind::Inline, "inline test");
+    let parse = |mcp_entry: &str| {
+        document::Document::parse(&format!(r#"(version: 1, mcp: {{{mcp_entry}}})"#), &origin)
+    };
+    let expect_message = |mcp_entry: &str, needle: &str| match parse(mcp_entry) {
+        Err(ConfigError::Parse { message, .. }) => {
+            assert!(
+                message.contains(needle),
+                "{message:?} must mention {needle:?}"
+            );
+        }
+        other => panic!("expected a parse error for {mcp_entry:?}, got {other:?}"),
+    };
+
+    // `__` inside a server name would make `mcp__<server>__<tool>` ambiguous.
+    expect_message(
+        r#""bad__name": Stdio(command: "./tool.sh")"#,
+        "mcp server name",
+    );
+    expect_message(r#""spaced name": Stdio(command: "./tool.sh")"#, "invalid");
+    expect_message(r#""empty": Stdio(command: " ")"#, "empty command");
+    expect_message(
+        r#""web": Http(url: "ftp://example.test")"#,
+        "http:// or https://",
+    );
+    expect_message(
+        r#""slow": Stdio(command: "./tool.sh", call_timeout_seconds: 0)"#,
+        "call_timeout_seconds",
+    );
+    expect_message(
+        r#""wide": Http(url: "https://example.test/mcp", max_concurrent_calls: 100)"#,
+        "max_concurrent_calls",
+    );
+    expect_message(
+        r#""dup": Stdio(command: "./tool.sh", allow: ["a", "a"])"#,
+        "duplicate tool",
+    );
+    expect_message(
+        r#""blank": Stdio(command: "./tool.sh", allow: [""])"#,
+        "empty tool name",
+    );
+
+    assert!(parse(r#""fine": Stdio(command: "./tool.sh")"#).is_ok());
+}
+
+#[test]
+fn mcp_declarations_are_scoped_by_source_kind() {
+    let content = r#"(
+        version: 1,
+        mcp: {"srv": Http(url: "https://example.test/mcp", bearer: Value("token"))},
+    )"#;
+
+    // Remote configuration may never plant MCP servers.
+    let remote = SourceIdentity::virtual_source(SourceKind::Remote, "remote test");
+    assert!(matches!(
+        document::Document::parse(
+            r#"(version: 1, mcp: {"srv": Http(url: "https://example.test/mcp")})"#,
+            &remote,
+        ),
+        Err(ConfigError::RemoteMcpForbidden { .. })
+    ));
+
+    // A literal bearer token follows the same scope rule as provider secrets.
+    let project = SourceIdentity::virtual_source(SourceKind::Project, "project test");
+    assert!(matches!(
+        document::Document::parse(content, &project),
+        Err(ConfigError::LiteralSecretForbidden { .. })
+    ));
+    let inline = SourceIdentity::virtual_source(SourceKind::Inline, "inline test");
+    assert!(document::Document::parse(content, &inline).is_ok());
+}

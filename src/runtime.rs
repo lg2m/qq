@@ -47,6 +47,7 @@ struct RuntimeFactoryInner {
     credentials: CredentialStore,
     providers: ProviderCompiler,
     discovery: ModelDiscovery,
+    mcp: crate::mcp::McpRegistryCache,
     cache: Mutex<VecDeque<(RuntimeKey, Arc<Runtime>)>>,
 }
 
@@ -65,6 +66,7 @@ impl RuntimeFactory {
                 credentials,
                 providers: ProviderCompiler::new()?,
                 discovery: ModelDiscovery::new()?,
+                mcp: crate::mcp::McpRegistryCache::new(),
                 cache: Mutex::new(VecDeque::new()),
             }),
         })
@@ -320,11 +322,23 @@ impl RuntimeFactory {
             .ok_or_else(|| RuntimeBuildError::UnknownProvider(provider_id.to_owned()))?;
         let (recipe, provider_key) =
             self.prepare_provider(provider_id, snapshot.model().model(), provider_config)?;
+        // Configured MCP servers ride the runtime: the shared registry (one
+        // client per server, cached by declaration digest) attaches here, and
+        // its digest joins the cache key so declaration changes rebuild.
+        let mcp = self
+            .inner
+            .mcp
+            .registry_for_snapshot(&self.inner.credentials, snapshot)?;
+        let (mcp_registry, mcp_key) = match mcp {
+            Some((registry, key)) => (Some(registry), key),
+            None => (None, Vec::new()),
+        };
         let key = RuntimeKey::new(
             provider_id,
             snapshot.model().model(),
             snapshot.max_output_tokens(),
             &provider_key,
+            &mcp_key,
         );
 
         {
@@ -338,11 +352,15 @@ impl RuntimeFactory {
             }
         }
 
-        let runtime = Arc::new(Runtime::with_provider(
+        let mut runtime = Runtime::with_provider(
             self.inner.providers.compile(recipe)?,
             snapshot.model().model(),
             snapshot.max_output_tokens(),
-        )?);
+        )?;
+        if let Some(registry) = mcp_registry {
+            runtime = runtime.with_mcp_registry(registry);
+        }
+        let runtime = Arc::new(runtime);
 
         let mut cache = self
             .inner
@@ -959,12 +977,19 @@ fn update_digest(digest: &mut Sha256, value: &[u8]) {
 struct RuntimeKey([u8; 32]);
 
 impl RuntimeKey {
-    fn new(provider: &str, model: &str, max_output_tokens: u32, provider_key: &[u8]) -> Self {
+    fn new(
+        provider: &str,
+        model: &str,
+        max_output_tokens: u32,
+        provider_key: &[u8],
+        mcp_key: &[u8],
+    ) -> Self {
         let mut digest = Sha256::new();
         update_digest(&mut digest, provider.as_bytes());
         update_digest(&mut digest, model.as_bytes());
         digest.update(max_output_tokens.to_le_bytes());
         update_digest(&mut digest, provider_key);
+        update_digest(&mut digest, mcp_key);
         Self(digest.finalize().into())
     }
 }
@@ -991,6 +1016,8 @@ pub enum RuntimeBuildError {
     IncompleteProvider(String),
     #[error("provider {provider:?} uses an API that is not available yet: {api:?}")]
     UnsupportedApi { provider: String, api: ProviderApi },
+    #[error(transparent)]
+    Mcp(#[from] qq_mcp::McpConfigError),
     #[error("runtime cache is unavailable")]
     CacheUnavailable,
     #[error(transparent)]
@@ -1020,6 +1047,7 @@ impl RuntimeBuildError {
                 qq_provider::ProviderErrorKind::Response => RunFailureKind::ProviderResponse,
                 qq_provider::ProviderErrorKind::Protocol => RunFailureKind::ProviderProtocol,
             },
+            Self::Mcp(_) => RunFailureKind::Configuration,
             Self::Runtime(_)
             | Self::UnknownProvider(_)
             | Self::IncompleteProvider(_)
