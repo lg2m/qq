@@ -5,8 +5,8 @@ use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
     CommandRequest, EditPreview, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection,
     RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
-    SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot, ToolCallState, WorkspaceId,
-    WorkspaceSnapshot,
+    SessionStatus, SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot, ToolCallState,
+    WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -38,10 +38,11 @@ enum SlashAction {
     Models,
     New,
     Sessions,
+    Compact,
     Quit,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 6] = [
+const SLASH_COMMANDS: [SlashCommand; 7] = [
     SlashCommand {
         name: "/models",
         description: "choose a model",
@@ -61,6 +62,11 @@ const SLASH_COMMANDS: [SlashCommand; 6] = [
         name: "/new",
         description: "create a session",
         action: SlashAction::New,
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "compact session context",
+        action: SlashAction::Compact,
     },
     SlashCommand {
         name: "/quit",
@@ -187,6 +193,7 @@ enum PendingIntent {
         text: String,
     },
     Cancel,
+    Compact,
     Approval {
         tool_call_id: qq_protocol::ToolCallId,
     },
@@ -325,6 +332,9 @@ impl App {
                             self.status = Some("run already finished".to_owned());
                         }
                         match &receipt.outcome {
+                            CommandOutcome::CompactionQueued { .. } => {
+                                self.status = Some("compacting session...".to_owned());
+                            }
                             CommandOutcome::SessionModelSet { model, .. } => {
                                 self.status = Some(format!(
                                     "session model set to {}",
@@ -646,6 +656,19 @@ impl App {
                     self.live_tool_output.remove(&tool_call.id);
                 }
                 self.upsert_tool_call(tool_call.clone());
+            }
+            SessionEvent::SessionCompacted {
+                session,
+                before_bytes,
+                after_bytes,
+                ..
+            } => {
+                self.upsert_summary(session.clone());
+                self.status = Some(format!(
+                    "compacted: {} -> {}",
+                    format_bytes(*before_bytes),
+                    format_bytes(*after_bytes)
+                ));
             }
             SessionEvent::RunFinished {
                 session,
@@ -1502,11 +1525,28 @@ impl App {
         if prompt.is_empty() {
             return (false, Vec::new());
         }
-        if let Some(action) = SLASH_COMMANDS
-            .iter()
-            .find(|command| command.name == prompt)
-            .map(|command| command.action)
-        {
+        // Composer commands: input starting with '/' is never sent to the
+        // model. The first token names the command; an unknown name shows a
+        // hint instead of becoming a prompt.
+        if prompt.starts_with('/') {
+            let name = prompt.split_whitespace().next().unwrap_or(&prompt);
+            let Some(action) = SLASH_COMMANDS
+                .iter()
+                .find(|command| command.name == name)
+                .map(|command| command.action)
+            else {
+                self.status = Some(format!(
+                    "unknown command {name}; try {}",
+                    SLASH_COMMANDS
+                        .iter()
+                        .map(|command| command.name)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+                self.input.clear();
+                self.slash_selected = 0;
+                return (true, Vec::new());
+            };
             return self.execute_slash_action(action);
         }
         let Some(session_id) = self.focused else {
@@ -1530,6 +1570,34 @@ impl App {
             vec![ClientRequest::Command(CommandRequest {
                 command_id,
                 command: SessionCommand::SubmitPrompt { session_id, prompt },
+            })],
+        )
+    }
+
+    fn compact_session(&mut self) -> (bool, Vec<ClientRequest>) {
+        let Some(session_id) = self.focused else {
+            self.status = Some("create a session before compacting".to_owned());
+            return (true, Vec::new());
+        };
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.summary.status != SessionStatus::Idle)
+        {
+            self.status = Some("compaction needs an idle session; wait or cancel first".to_owned());
+            return (true, Vec::new());
+        }
+        let Ok(command_id) = CommandId::generate() else {
+            self.status = Some("secure randomness is unavailable".to_owned());
+            return (true, Vec::new());
+        };
+        self.pending.insert(command_id, PendingIntent::Compact);
+        self.status = Some("compacting session...".to_owned());
+        (
+            true,
+            vec![ClientRequest::Command(CommandRequest {
+                command_id,
+                command: SessionCommand::CompactSession { session_id },
             })],
         )
     }
@@ -1682,6 +1750,7 @@ impl App {
             SlashAction::Models => self.open_models(),
             SlashAction::New => self.create_session(None),
             SlashAction::Sessions => self.open_sessions(),
+            SlashAction::Compact => self.compact_session(),
         }
     }
 
@@ -1723,6 +1792,7 @@ impl App {
                 PendingIntent::Create
                 | PendingIntent::Prompt { .. }
                 | PendingIntent::Cancel
+                | PendingIntent::Compact
                 | PendingIntent::Approval { .. } => None,
             })
     }
@@ -1827,6 +1897,24 @@ fn retain_recent_tool_calls(tool_calls: &mut Vec<ToolCallSnapshot>) {
     if excess > 0 {
         tool_calls.drain(..excess);
     }
+}
+
+/// Renders a byte count for the status line: whole bytes below 1 KiB, one
+/// decimal of KiB/MiB/GiB above it.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
+    ];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            #[expect(clippy::cast_precision_loss, reason = "display rounding only")]
+            let value = bytes as f64 / scale as f64;
+            return format!("{value:.1} {unit}");
+        }
+    }
+    format!("{bytes} B")
 }
 
 const fn total_input_tokens(usage: TokenUsage) -> u64 {
@@ -2193,6 +2281,97 @@ mod tests {
     }
 
     #[test]
+    fn compact_slash_command_sends_compact_session_for_the_focused_idle_session() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        let session_id = app.focused.unwrap();
+        app.input = "/compact".to_owned();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
+            panic!("expected a command")
+        };
+        assert_eq!(
+            request.command,
+            SessionCommand::CompactSession { session_id }
+        );
+        assert!(app.input.is_empty());
+        assert_eq!(app.status.as_deref(), Some("compacting session..."));
+    }
+
+    #[test]
+    fn compact_refuses_while_the_focused_session_is_not_idle() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        initial.sessions[0].status = SessionStatus::Running;
+        initial.focused.as_mut().unwrap().summary.status = SessionStatus::Running;
+        app.apply_snapshot(initial);
+        app.input = "/compact".to_owned();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(requests.is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("compaction needs an idle session; wait or cancel first")
+        );
+    }
+
+    #[test]
+    fn unknown_slash_commands_hint_instead_of_prompting() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        app.input = "/frobnicate the context".to_owned();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            requests.is_empty(),
+            "slash input must never become a prompt"
+        );
+        assert!(app.input.is_empty());
+        let status = app.status.as_deref().unwrap();
+        assert!(
+            status.starts_with("unknown command /frobnicate"),
+            "{status}"
+        );
+        assert!(status.contains("/compact"), "{status}");
+    }
+
+    #[test]
+    fn session_compacted_events_surface_the_shrink_in_the_status_line() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let session = initial.focused.as_ref().unwrap().summary.clone();
+        let (store_id, workspace_id) = (initial.cursor.store_id, initial.workspace.id);
+        app.apply_snapshot(initial);
+
+        app.apply_live_event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: session.id,
+            run_id: None,
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::SessionCompacted {
+                session,
+                summary: Some("intent: keep going".to_owned()),
+                before_bytes: 3_250_586,
+                after_bytes: 245_760,
+            },
+        });
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("compacted: 3.1 MiB -> 240.0 KiB")
+        );
+    }
+
+    #[test]
     fn new_slash_command_creates_a_root_session_with_the_selected_model() {
         let model = ModelSelection {
             model: Some("openai/gpt-test".to_owned()),
@@ -2233,12 +2412,20 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/models", "/sessions", "/resume", "/new", "/quit", "/exit"]
+            [
+                "/models",
+                "/sessions",
+                "/resume",
+                "/new",
+                "/compact",
+                "/quit",
+                "/exit"
+            ]
         );
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.slash_selected, 5);
+        assert_eq!(app.slash_selected, 6);
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }

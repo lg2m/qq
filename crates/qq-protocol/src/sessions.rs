@@ -231,6 +231,13 @@ pub enum SessionCommand {
     PruneSessions {
         workspace_id: WorkspaceId,
     },
+    /// Compacts the session's model context: an internal summarization run
+    /// replaces everything before a new cutoff marker with a structured
+    /// summary. Valid only while the session is idle; refused while a run is
+    /// active or queued. The client transcript is untouched.
+    CompactSession {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +294,10 @@ pub enum CommandOutcome {
     SessionsPruned {
         workspace_id: WorkspaceId,
         deleted: u32,
+    },
+    CompactionQueued {
+        session_id: SessionId,
+        run_id: RunId,
     },
 }
 
@@ -572,6 +583,17 @@ pub enum SessionEvent {
     CancellationRequested {
         session: SessionSummary,
         run_id: RunId,
+    },
+    /// A compaction committed: the session's context assembly now starts from
+    /// a fresh summary. Carries the refreshed summary (the compaction run has
+    /// finished by the time this is published), a bounded excerpt of the
+    /// summary text, and the assembled context size before and after.
+    SessionCompacted {
+        session: SessionSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        before_bytes: u64,
+        after_bytes: u64,
     },
     RunFinished {
         session: SessionSummary,
@@ -960,6 +982,76 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
             pruned
+        );
+    }
+
+    #[test]
+    fn compaction_commands_outcomes_and_events_round_trip_with_stable_tags() {
+        let session_id = id::<SessionId>(3);
+        let run_id = id::<RunId>(4);
+
+        let command = SessionCommand::CompactSession { session_id };
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded["type"], "compact_session");
+        assert_eq!(encoded["session_id"], session_id.to_string());
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            command
+        );
+
+        let outcome = CommandOutcome::CompactionQueued { session_id, run_id };
+        let encoded = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(encoded["type"], "compaction_queued");
+        assert_eq!(encoded["run_id"], run_id.to_string());
+        assert_eq!(
+            serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
+            outcome
+        );
+
+        let event = SessionEvent::SessionCompacted {
+            session: SessionSummary {
+                id: session_id,
+                workspace_id: id(2),
+                parent_id: None,
+                title: "Session".to_owned(),
+                status: SessionStatus::Idle,
+                active_run_id: None,
+                queued_prompts: 0,
+                model: Some("test/model".to_owned()),
+                estimated_cost_usd_nanos: None,
+                updated_at_ms: 11,
+                last_outcome: Some(RunOutcome::Completed),
+            },
+            summary: Some("intent: ship compaction".to_owned()),
+            before_bytes: 3_200_000,
+            after_bytes: 240_000,
+        };
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "session_compacted");
+        assert_eq!(encoded["before_bytes"], 3_200_000);
+        assert_eq!(encoded["after_bytes"], 240_000);
+        assert_eq!(encoded["summary"], "intent: ship compaction");
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            event
+        );
+
+        // The summary excerpt is optional and absent from the wire when the
+        // event omits it.
+        let bare = SessionEvent::SessionCompacted {
+            session: match &event {
+                SessionEvent::SessionCompacted { session, .. } => session.clone(),
+                _ => unreachable!(),
+            },
+            summary: None,
+            before_bytes: 1,
+            after_bytes: 1,
+        };
+        let encoded = serde_json::to_value(&bare).unwrap();
+        assert!(encoded.get("summary").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            bare
         );
     }
 

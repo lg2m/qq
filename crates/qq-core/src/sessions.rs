@@ -39,6 +39,19 @@ const CONTROL_QUEUE_CAPACITY: usize = 256;
 const OUTPUT_QUEUE_CAPACITY: usize = 1024;
 const MAX_PENDING_PROMPTS: u16 = 16;
 const MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+/// The assembly recency window: the last K model turns keep their tool
+/// results verbatim. Read-only results older than that are replaced by
+/// one-line stubs during context assembly (the stored rows are untouched).
+/// Sits with the context budget because the budget measures the assembled,
+/// pruned size.
+const CONTEXT_PRUNE_KEEP_TURNS: usize = 4;
+/// Longest argument excerpt embedded in a pruned-result stub.
+const CONTEXT_PRUNE_STUB_ARGUMENT_BYTES: usize = 256;
+/// Compaction summaries retained per session, newest first. History is kept
+/// (not deleted eagerly) so a bad compaction can be rolled back later.
+const COMPACTION_HISTORY_ROWS: u32 = 3;
+/// Longest summary excerpt carried on the `SessionCompacted` event.
+const MAX_EVENT_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_REPLAY_EVENTS: u16 = 128;
 const MAX_SNAPSHOT_SESSIONS: u16 = 512;
@@ -59,6 +72,30 @@ const MAX_SESSION_FILES: u32 = 4_096;
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
+/// Read-only built-in tools whose results context assembly may replace with
+/// stubs: the agent can re-derive them on demand. Mutating, shell, and MCP
+/// results are never pruned — their outputs are not re-derivable.
+const PRUNABLE_READ_ONLY_TOOLS: [&str; 3] = ["read_file", "list_dir", "search"];
+/// Prefixes the latest compaction summary when assembly replays it as the
+/// conversation's opening message.
+const COMPACTION_SUMMARY_PREAMBLE: &str = "The earlier part of this conversation was compacted \
+into the summary below. Treat it as authoritative context; the verbatim conversation resumes \
+after it.";
+/// The fixed instruction appended as the final user message of a compaction
+/// run. It demands the structured schema; the mechanically seeded file list
+/// is appended beneath it.
+const COMPACTION_INSTRUCTION: &str = "Summarize this conversation so it can replace the \
+transcript as model context. Do not call any tools. Reply with exactly these sections:\n\
+1. Intent: what the user is trying to accomplish, in their terms.\n\
+2. Decisions and constraints: each decision with its why. Use exact names, paths, and flags \
+verbatim; vague references are forbidden.\n\
+3. Work state: what was done, what is in flight, what is pending.\n\
+4. Files touched: annotate the seeded list below with each file's role; add any files it is \
+missing.\n\
+5. Errors: every error seen and how it was resolved, with error strings verbatim.\n\
+6. User messages: every user message, preserved verbatim or near-verbatim.\n\
+If the conversation begins with a prior compaction summary, fold it into these sections rather \
+than referring to it.";
 
 pub type RuntimeLoadFuture =
     Pin<Box<dyn Future<Output = Result<LoadedRuntime, RuntimeLoadError>> + Send + 'static>>;
@@ -451,6 +488,20 @@ enum ConcludedApproval {
     StillWaiting,
 }
 
+/// Denies every tool call. Compaction runs summarize existing context; a
+/// call the instruction forbade costs one denied round trip and persists
+/// nothing.
+struct CompactionRunGate;
+
+impl ToolGate for CompactionRunGate {
+    fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+        Box::pin(std::future::ready(GateDecision::Deny {
+            message: "Tools are unavailable during compaction; produce the summary directly."
+                .to_owned(),
+        }))
+    }
+}
+
 async fn schedule_runs(
     inner: std::sync::Weak<SessionRuntimeInner>,
     mut receiver: mpsc::Receiver<()>,
@@ -540,11 +591,18 @@ async fn execute_run(
     }
 
     let tool_cancellation = Arc::new(AtomicBool::new(false));
-    let gate = Arc::new(SessionToolGate {
-        inner: Arc::clone(&inner),
-        claimed: claimed.clone(),
-        cancellation: cancellation.clone(),
-    });
+    let internal = claimed.kind == RunKind::Compaction;
+    // Internal summarization runs are denied every tool: their instruction
+    // forbids calls and their only product is the summary text.
+    let gate: Arc<dyn ToolGate> = if internal {
+        Arc::new(CompactionRunGate)
+    } else {
+        Arc::new(SessionToolGate {
+            inner: Arc::clone(&inner),
+            claimed: claimed.clone(),
+            cancellation: cancellation.clone(),
+        })
+    };
     // The session's durable file-state map seeds the run so read-before-write
     // tracking survives across runs (and server restarts) in one session.
     let file_state = match inner.store.session_file_state(claimed.session_id).await {
@@ -582,6 +640,9 @@ async fn execute_run(
     // flushed when the turn completes, before any of its calls execute.
     let mut pending_tool_call: Option<ToolCallId> = None;
     let mut pending_tool_output = String::new();
+    // An internal run's streamed output never joins the transcript; the
+    // summary accumulates here and persists as a compaction row instead.
+    let mut summary_text = String::new();
     loop {
         let input = if let Some(deadline) = flush_at {
             tokio::select! {
@@ -684,6 +745,21 @@ async fn execute_run(
                 usage,
                 calls,
             })) => {
+                if internal {
+                    // Usage and cost account like any run; the turn's text
+                    // joins the summary instead of the transcript.
+                    accounting.record_turn(usage);
+                    for block in message.content() {
+                        if let ContentBlock::Text { text } = block {
+                            if !summary_text.is_empty() {
+                                summary_text.push('\n');
+                            }
+                            summary_text.push_str(text);
+                        }
+                    }
+                    current_turn = turn_ordinal.saturating_add(1);
+                    continue;
+                }
                 if let Err(error) = flush_pending_text(
                     &inner,
                     &claimed,
@@ -739,6 +815,9 @@ async fn execute_run(
             // published by the tool gate before this event is emitted.
             RunInput::Event(Some(RuntimeEvent::ToolCallDenied { .. })) => {}
             RunInput::Event(Some(RuntimeEvent::ToolCallStarted { id })) => {
+                if internal {
+                    continue;
+                }
                 match inner.store.start_tool_call(&claimed, id).await {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
@@ -753,7 +832,7 @@ async fn execute_run(
                 }
             }
             RunInput::Event(Some(RuntimeEvent::ToolCallOutputDelta { id, chunk })) => {
-                if chunk.is_empty() {
+                if internal || chunk.is_empty() {
                     continue;
                 }
                 if pending_tool_call.is_some_and(|pending| pending != id)
@@ -807,6 +886,9 @@ async fn execute_run(
                 file_state,
                 display,
             })) => {
+                if internal {
+                    continue;
+                }
                 // Any buffered live output flushes first so replay preserves
                 // the chunk-then-result order.
                 if let Err(error) = flush_pending_tool_output(
@@ -850,7 +932,9 @@ async fn execute_run(
                     RuntimeEvent::RefusalDelta { text } => (TextChannel::Refusal, text),
                     _ => unreachable!("matched text event"),
                 };
-                if text.is_empty() {
+                // Internal runs stream no transcript text; the summary is
+                // captured from the completed turn instead.
+                if internal || text.is_empty() {
                     continue;
                 }
                 if current_message.is_none() {
@@ -924,6 +1008,43 @@ async fn execute_run(
                 }
             }
             RunInput::Event(Some(RuntimeEvent::Completed)) => {
+                if internal {
+                    let summary = std::mem::take(&mut summary_text);
+                    if summary.trim().is_empty() {
+                        finish_run_accounted(
+                            &inner,
+                            &claimed,
+                            RunOutcome::Failed {
+                                failure: RunFailure {
+                                    kind: RunFailureKind::ProviderResponse,
+                                    message: "compaction produced an empty summary".to_owned(),
+                                },
+                            },
+                            Some(accounting.snapshot()),
+                        )
+                        .await;
+                        return;
+                    }
+                    match inner
+                        .store
+                        .finish_compaction_run(&claimed, summary, Some(accounting.snapshot()))
+                        .await
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                inner.notify(event.cursor);
+                            }
+                        }
+                        Err(_) => {
+                            inner.failed.send_replace(true);
+                        }
+                    }
+                    if let Ok(mut cancellations) = inner.cancellations.lock() {
+                        cancellations.remove(&claimed.run_id);
+                    }
+                    inner.clear_run_approvals(claimed.run_id);
+                    return;
+                }
                 if let Err(error) = flush_pending_text(
                     &inner,
                     &claimed,
@@ -1671,6 +1792,23 @@ impl Store {
         })
         .await
     }
+
+    /// Atomically commits a compaction summary with its cutoff marker and
+    /// settles the internal run, publishing `RunFinished` and
+    /// `SessionCompacted` from the same transaction.
+    async fn finish_compaction_run(
+        &self,
+        claimed: &ClaimedRun,
+        summary: String,
+        accounting: Option<RunAccounting>,
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            complete_compaction(connection, store_id, &claimed, summary, accounting)
+        })
+        .await
+    }
 }
 
 fn database_worker(
@@ -1761,6 +1899,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  user_message_id TEXT NOT NULL,
                  assistant_message_id TEXT NOT NULL,
                   status TEXT NOT NULL,
+                  kind TEXT NOT NULL DEFAULT 'prompt',
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
                    outcome_json TEXT,
                    usage_json TEXT,
@@ -1819,9 +1958,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_tool_tables(&transaction)?;
             create_grant_table(&transaction)?;
             create_session_files_table(&transaction)?;
+            create_session_compactions_table(&transaction)?;
             transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '7')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '8')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1859,9 +1999,11 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_grant_table(&transaction)?;
             create_session_files_table(&transaction)?;
             add_messages_turn_ordinal_column(&transaction)?;
+            create_session_compactions_table(&transaction)?;
+            add_runs_kind_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1883,9 +2025,11 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_grant_table(&transaction)?;
             create_session_files_table(&transaction)?;
             add_messages_turn_ordinal_column(&transaction)?;
+            create_session_compactions_table(&transaction)?;
+            add_runs_kind_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1910,9 +2054,11 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_files_table(&transaction)?;
             add_messages_turn_ordinal_column(&transaction)?;
             add_tool_calls_display_column(&transaction)?;
+            create_session_compactions_table(&transaction)?;
+            add_runs_kind_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1927,9 +2073,11 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_files_table(&transaction)?;
             add_messages_turn_ordinal_column(&transaction)?;
             add_tool_calls_display_column(&transaction)?;
+            create_session_compactions_table(&transaction)?;
+            add_runs_kind_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1943,9 +2091,11 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             add_messages_turn_ordinal_column(&transaction)?;
             add_tool_calls_display_column(&transaction)?;
+            create_session_compactions_table(&transaction)?;
+            add_runs_kind_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1958,9 +2108,11 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .transaction()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             add_tool_calls_display_column(&transaction)?;
+            create_session_compactions_table(&transaction)?;
+            add_runs_kind_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1968,7 +2120,23 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("7") => {}
+        Some("7") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            create_session_compactions_table(&transaction)?;
+            add_runs_kind_column(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("8") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -2087,6 +2255,41 @@ fn create_session_files_table(connection: &Connection) -> Result<(), SessionRunt
         .map_err(|_| SessionRuntimeError::Persistence)
 }
 
+/// One committed compaction: the structured summary and the message-ordinal
+/// cutoff it replaces. Assembly reads the newest row; older rows are bounded
+/// history retained for a future rollback command.
+fn create_session_compactions_table(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE session_compactions (
+                 session_id TEXT NOT NULL REFERENCES sessions(id),
+                 run_id TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 cutoff_ordinal INTEGER NOT NULL,
+                 before_bytes INTEGER NOT NULL,
+                 after_bytes INTEGER NOT NULL,
+                 created_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX session_compactions_session
+                 ON session_compactions(session_id, created_at_ms DESC);",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)
+}
+
+/// Adds `runs.kind` for stores created before internal compaction runs.
+/// Existing rows keep 'prompt'.
+fn add_runs_kind_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "runs", "kind")? {
+        connection
+            .execute(
+                "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'prompt'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
 fn has_column(
     connection: &Connection,
     table: &str,
@@ -2103,6 +2306,24 @@ fn has_column(
     Ok(columns.iter().any(|candidate| candidate == column))
 }
 
+/// What a run row exists for. Prompt runs answer a user message and their
+/// output joins the transcript; compaction runs are internal — their request
+/// and streamed output never become session messages, and their product is a
+/// summary row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    Prompt,
+    Compaction,
+}
+
+fn parse_run_kind(value: &str) -> Result<RunKind, SessionRuntimeError> {
+    match value {
+        "prompt" => Ok(RunKind::Prompt),
+        "compaction" => Ok(RunKind::Compaction),
+        _ => Err(SessionRuntimeError::Persistence),
+    }
+}
+
 #[derive(Clone)]
 struct ClaimedRun {
     workspace_id: WorkspaceId,
@@ -2110,6 +2331,7 @@ struct ClaimedRun {
     session_id: SessionId,
     run_id: RunId,
     command_id: CommandId,
+    kind: RunKind,
     model: ModelSelection,
     messages: Vec<Message>,
     started: SessionEventEnvelope,
@@ -2313,27 +2535,11 @@ fn execute_command(
             if queued >= MAX_PENDING_PROMPTS {
                 return Err(SessionRuntimeError::QueueFull);
             }
-            let context_bytes: u64 = transaction
-                .query_row(
-                    "SELECT
-                         (SELECT COALESCE(SUM(
-                             length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
-                         ), 0) FROM messages WHERE session_id = ?1)
-                         +
-                         (SELECT COALESCE(SUM(
-                             length(CAST(t.arguments_json AS BLOB))
-                             + length(CAST(COALESCE(t.result, '') AS BLOB))
-                         ), 0) FROM tool_calls t JOIN runs r ON r.id = t.run_id
-                            WHERE r.session_id = ?1)",
-                    [session_id.to_string()],
-                    |row| row.get(0),
-                )
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            if usize::try_from(context_bytes)
-                .unwrap_or(usize::MAX)
-                .saturating_add(prompt.len())
-                > MAX_CONTEXT_BYTES
-            {
+            // The budget measures what the next run would actually send: the
+            // assembled context after summary cutoff and result pruning, not
+            // the raw persisted rows.
+            let context_bytes = assembled_context_bytes(&transaction, session_id)?;
+            if context_bytes.saturating_add(prompt.len()) > MAX_CONTEXT_BYTES {
                 return Err(SessionRuntimeError::ContextTooLarge);
             }
             let workspace_id = parse_id(&workspace_id)?;
@@ -2804,6 +3010,79 @@ fn execute_command(
                 false,
             )
         }
+        SessionCommand::CompactSession { session_id } => {
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            let (status, active_run, queued): (String, Option<String>, u16) = transaction
+                .query_row(
+                    "SELECT status, active_run_id, queued_prompts FROM sessions WHERE id = ?1",
+                    [session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::SessionNotFound)?;
+            // Compaction is valid only while the session is idle: a running
+            // run keeps the context it started with, and a queued prompt
+            // must not race the summarizer.
+            if status != "idle" || active_run.is_some() || queued > 0 {
+                return Err(SessionRuntimeError::SessionActive);
+            }
+            let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+            // Internal runs persist no message rows; the ids are placeholders
+            // satisfying the runs schema.
+            let user_message_id =
+                MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+            let assistant_message_id =
+                MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+            transaction
+                .execute(
+                    "INSERT INTO runs(
+                        id, session_id, command_id, user_message_id, assistant_message_id,
+                        status, kind, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 'compaction', ?6)",
+                    params![
+                        run_id.to_string(),
+                        session_id.to_string(),
+                        command_id.to_string(),
+                        user_message_id.to_string(),
+                        assistant_message_id.to_string(),
+                        now,
+                    ],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            // The internal run flows through the ordinary queue accounting so
+            // claiming it decrements like any prompt.
+            transaction
+                .execute(
+                    "UPDATE sessions
+                     SET status = 'queued', queued_prompts = queued_prompts + 1,
+                         updated_at_ms = ?2
+                     WHERE id = ?1",
+                    params![session_id.to_string(), now],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let summary = load_session_summary(&transaction, session_id)?;
+            let event = append_event(
+                &transaction,
+                EventContext {
+                    store_id,
+                    workspace_id,
+                    session_id,
+                    run_id: Some(run_id),
+                    caused_by: Some(command_id),
+                    occurred_at_ms: now,
+                },
+                SessionEvent::SessionUpdated { session: summary },
+            )?;
+            (
+                CommandReceipt {
+                    command_id,
+                    committed_through: event.cursor,
+                    outcome: CommandOutcome::CompactionQueued { session_id, run_id },
+                },
+                true,
+            )
+        }
     };
     let receipt_json =
         serde_json::to_string(&receipt).map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2828,7 +3107,7 @@ fn claim_next_run(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let row = transaction
         .query_row(
-            "SELECT r.id, r.session_id, r.command_id, r.user_message_id,
+            "SELECT r.id, r.session_id, r.command_id, r.user_message_id, r.kind,
                     s.workspace_id, w.path, s.model, s.max_output_tokens, s.organization
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
@@ -2850,9 +3129,10 @@ fn claim_next_run(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<u32>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<u32>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )
@@ -2863,6 +3143,7 @@ fn claim_next_run(
         session,
         command,
         user_message,
+        kind,
         workspace,
         workspace_path,
         model,
@@ -2876,6 +3157,7 @@ fn claim_next_run(
     let session_id: SessionId = parse_id(&session)?;
     let command_id: CommandId = parse_id(&command)?;
     let user_message_id = parse_id::<MessageId>(&user_message)?;
+    let kind = parse_run_kind(&kind)?;
     let workspace_id: WorkspaceId = parse_id(&workspace)?;
     let now = now_ms();
     transaction
@@ -2899,14 +3181,30 @@ fn claim_next_run(
             params![session, run, now],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let user_ordinal: u64 = transaction
-        .query_row(
-            "SELECT ordinal FROM messages WHERE id = ?1",
-            [user_message_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let messages = load_model_context(&transaction, session_id, user_ordinal)?;
+    let messages = match kind {
+        RunKind::Prompt => {
+            let user_ordinal: u64 = transaction
+                .query_row(
+                    "SELECT ordinal FROM messages WHERE id = ?1",
+                    [user_message_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            load_model_context(&transaction, session_id, user_ordinal)?
+        }
+        RunKind::Compaction => {
+            // The summarization request is the session's assembled context —
+            // latest summary plus verbatim span, with result pruning — and
+            // the fixed instruction as the final user message. A prior
+            // summary therefore folds into the next one naturally.
+            let mut context = load_model_context(&transaction, session_id, u64::MAX)?;
+            context.push(Message::user(compaction_instruction(
+                &transaction,
+                session_id,
+            )?));
+            context
+        }
+    };
     let summary = load_session_summary(&transaction, session_id)?;
     let started = append_event(
         &transaction,
@@ -2932,6 +3230,7 @@ fn claim_next_run(
         session_id,
         run_id,
         command_id,
+        kind,
         model: ModelSelection {
             model,
             max_output_tokens: max_tokens,
@@ -3576,27 +3875,12 @@ fn ensure_context_capacity(
     session_id: SessionId,
     additional: usize,
 ) -> Result<(), SessionRuntimeError> {
-    let persisted_bytes: u64 = transaction
-        .query_row(
-            "SELECT
-                 (SELECT COALESCE(SUM(
-                     length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
-                 ), 0) FROM messages WHERE session_id = ?1)
-                 +
-                 (SELECT COALESCE(SUM(
-                     length(CAST(t.arguments_json AS BLOB))
-                     + length(CAST(COALESCE(t.result, '') AS BLOB))
-                 ), 0) FROM tool_calls t JOIN runs r ON r.id = t.run_id
-                    WHERE r.session_id = ?1)",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    if usize::try_from(persisted_bytes)
-        .unwrap_or(usize::MAX)
-        .saturating_add(additional)
-        > MAX_CONTEXT_BYTES
-    {
+    // The budget measures the assembled context — after the compaction
+    // cutoff and with stale read-only results pruned — because that is what
+    // the next request actually carries; raw persisted rows may be far
+    // larger without ever reaching the provider.
+    let assembled = assembled_context_bytes(transaction, session_id)?;
+    if assembled.saturating_add(additional) > MAX_CONTEXT_BYTES {
         return Err(SessionRuntimeError::OutputTooLarge);
     }
     Ok(())
@@ -3612,10 +3896,136 @@ fn complete_run(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    let event = finalize_run(&transaction, store_id, claimed, outcome, accounting)?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+/// Commits a compaction: the summary row and cutoff marker persist in the
+/// same transaction that settles the internal run, so a crash anywhere
+/// before the commit leaves no marker and the command can simply be retried.
+/// Events (RunFinished, then SessionCompacted) are appended before commit —
+/// persist-before-publish like every other event.
+fn complete_compaction(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    summary: String,
+    accounting: Option<RunAccounting>,
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    // A cancel that raced the summarizer's completion wins: the run settles
+    // cancelled and no marker is committed.
+    let outcome = cancellation_wins(&transaction, claimed.run_id, RunOutcome::Completed)?;
+    let mut events = Vec::with_capacity(2);
+    if matches!(outcome, RunOutcome::Completed) {
+        let now = now_ms();
+        let before_bytes = assembled_context_bytes(&transaction, claimed.session_id)?;
+        let cutoff_ordinal: u64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(ordinal), 0) FROM messages WHERE session_id = ?1",
+                [claimed.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .execute(
+                "INSERT INTO session_compactions(
+                     session_id, run_id, summary, cutoff_ordinal,
+                     before_bytes, after_bytes, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                params![
+                    claimed.session_id.to_string(),
+                    claimed.run_id.to_string(),
+                    summary,
+                    cutoff_ordinal,
+                    u64::try_from(before_bytes).unwrap_or(u64::MAX),
+                    now,
+                ],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        // With the marker in place, assembly is the summary alone.
+        let after_bytes = assembled_context_bytes(&transaction, claimed.session_id)?;
+        transaction
+            .execute(
+                "UPDATE session_compactions SET after_bytes = ?3
+                 WHERE session_id = ?1 AND run_id = ?2",
+                params![
+                    claimed.session_id.to_string(),
+                    claimed.run_id.to_string(),
+                    u64::try_from(after_bytes).unwrap_or(u64::MAX),
+                ],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        // Bounded history, newest rows kept; no eager deletion beyond it so
+        // a future rollback command can restore the previous compaction.
+        transaction
+            .execute(
+                "DELETE FROM session_compactions
+                 WHERE session_id = ?1 AND rowid NOT IN (
+                     SELECT rowid FROM session_compactions WHERE session_id = ?1
+                     ORDER BY rowid DESC LIMIT ?2
+                 )",
+                params![claimed.session_id.to_string(), COMPACTION_HISTORY_ROWS],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        events.push(finalize_run(
+            &transaction,
+            store_id,
+            claimed,
+            outcome,
+            accounting,
+        )?);
+        let session = load_session_summary(&transaction, claimed.session_id)?;
+        events.push(append_event(
+            &transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by: Some(claimed.command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::SessionCompacted {
+                session,
+                summary: Some(truncate_utf8(summary, MAX_EVENT_SUMMARY_BYTES)),
+                before_bytes: u64::try_from(before_bytes).unwrap_or(u64::MAX),
+                after_bytes: u64::try_from(after_bytes).unwrap_or(u64::MAX),
+            },
+        )?);
+    } else {
+        events.push(finalize_run(
+            &transaction,
+            store_id,
+            claimed,
+            outcome,
+            accounting,
+        )?);
+    }
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(events)
+}
+
+/// Settles a claimed run inside an open transaction: outcome, usage and cost
+/// accounting, message states, session status, and the `RunFinished` event.
+fn finalize_run(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    outcome: RunOutcome,
+    accounting: Option<RunAccounting>,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let now = now_ms();
-    let outcome = cancellation_wins(&transaction, claimed.run_id, outcome)?;
+    let outcome = cancellation_wins(transaction, claimed.run_id, outcome)?;
     interrupt_active_tool_calls(
-        &transaction,
+        transaction,
         store_id,
         claimed,
         Some(claimed.command_id),
@@ -3690,9 +4100,9 @@ fn complete_run(
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let summary = load_session_summary(&transaction, claimed.session_id)?;
-    let event = append_event(
-        &transaction,
+    let summary = load_session_summary(transaction, claimed.session_id)?;
+    append_event(
+        transaction,
         EventContext {
             store_id,
             workspace_id: claimed.workspace_id,
@@ -3707,11 +4117,7 @@ fn complete_run(
             outcome,
             usage,
         },
-    )?;
-    transaction
-        .commit()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(event)
+    )
 }
 
 fn finish_queued_run(
@@ -3810,6 +4216,10 @@ fn recover_interrupted_runs(
             session_id,
             run_id,
             command_id: CommandId::from_bytes([0; 16]),
+            // Recovery settles the run row generically; a crashed compaction
+            // committed no marker, so interrupting it leaves nothing behind
+            // and the command can simply be retried.
+            kind: RunKind::Prompt,
             model: ModelSelection::default(),
             messages: Vec::new(),
             started: SessionEventEnvelope {
@@ -4377,28 +4787,47 @@ impl From<PersistedContentBlock> for ContentBlock {
     }
 }
 
+/// Assembles the provider messages for one session: the latest compaction
+/// summary (when one exists), then the verbatim transcript after its cutoff,
+/// with read-only tool results outside the recency window replaced by stubs.
+/// The stored rows are never modified — pruning and summarization are
+/// properties of assembly alone.
 fn load_model_context(
     transaction: &Transaction<'_>,
     session_id: SessionId,
     through_ordinal: u64,
 ) -> Result<Vec<Message>, SessionRuntimeError> {
+    let compaction = latest_compaction(transaction, session_id)?;
+    let cutoff_ordinal = compaction
+        .as_ref()
+        .map_or(0, |compaction| compaction.cutoff_ordinal);
+    // SQLite integers are i64; `u64::MAX` means "everything".
+    let through_ordinal = through_ordinal.min(u64::try_from(i64::MAX).unwrap_or(u64::MAX));
     let mut statement = transaction
         .prepare(
             "SELECT id FROM messages
-             WHERE session_id = ?1 AND ordinal <= ?2 AND state IN ('complete', 'interrupted')
+             WHERE session_id = ?1 AND ordinal <= ?2 AND ordinal > ?3
+               AND state IN ('complete', 'interrupted')
              ORDER BY ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let message_ids = statement
-        .query_map(params![session_id.to_string(), through_ordinal], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(
+            params![session_id.to_string(), through_ordinal, cutoff_ordinal],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(|_| SessionRuntimeError::Persistence)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     drop(statement);
 
     let mut context = Vec::new();
+    if let Some(compaction) = compaction {
+        context.push(Message::user(format!(
+            "{COMPACTION_SUMMARY_PREAMBLE}\n\n{}",
+            compaction.summary
+        )));
+    }
     for id in message_ids {
         let snapshot = load_message(transaction, parse_id(&id)?)?;
         match snapshot.role {
@@ -4407,9 +4836,11 @@ fn load_model_context(
                 // A run's assistant output replays right after its prompt,
                 // from the model_turns rows rather than the per-turn message
                 // rows: call-only turns persist no message row, so messages
-                // alone cannot reconstruct the run. Only completed and
-                // interrupted runs replay — cancelled and failed runs are
-                // excluded, matching the previous message-state gate.
+                // alone cannot reconstruct the run. Completed and interrupted
+                // runs replay, and so does a still-running run so capacity
+                // measurement mid-run sees its committed turns — cancelled
+                // and failed runs are excluded, matching the previous
+                // message-state gate.
                 let status: String = transaction
                     .query_row(
                         "SELECT status FROM runs WHERE id = ?1",
@@ -4417,7 +4848,7 @@ fn load_model_context(
                         |row| row.get(0),
                     )
                     .map_err(|_| SessionRuntimeError::Persistence)?;
-                if status == "completed" || status == "interrupted" {
+                if status == "completed" || status == "interrupted" || status == "running" {
                     append_run_turns(transaction, snapshot.run_id, &mut context)?;
                 }
             }
@@ -4446,7 +4877,196 @@ fn load_model_context(
             }
         }
     }
+    prune_stale_tool_results(&mut context);
     Ok(context)
+}
+
+/// One persisted compaction: the summary that replaces everything at or
+/// before `cutoff_ordinal` in assembly.
+struct CompactionRow {
+    summary: String,
+    cutoff_ordinal: u64,
+}
+
+fn latest_compaction(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Option<CompactionRow>, SessionRuntimeError> {
+    connection
+        .query_row(
+            "SELECT summary, cutoff_ordinal FROM session_compactions
+             WHERE session_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            [session_id.to_string()],
+            |row| {
+                Ok(CompactionRow {
+                    summary: row.get(0)?,
+                    cutoff_ordinal: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)
+}
+
+/// Replaces read-only tool results older than the recency window with
+/// one-line stubs. Only the built-in read-only tools are prunable — their
+/// results are re-derivable on demand; mutating, shell, and MCP outputs are
+/// not. The window keeps the last [`CONTEXT_PRUNE_KEEP_TURNS`] model turns
+/// (assistant messages) verbatim. `is_error` is preserved so an error result
+/// stays an error stub.
+fn prune_stale_tool_results(context: &mut [Message]) {
+    let assistant_positions = context
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role() == Role::Assistant)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let Some(&window_start) = assistant_positions
+        .len()
+        .checked_sub(CONTEXT_PRUNE_KEEP_TURNS)
+        .and_then(|index| assistant_positions.get(index))
+    else {
+        return;
+    };
+    // Map provider call ids to the tool that produced them; the ToolResult
+    // block alone does not name its tool.
+    let mut calls = HashMap::new();
+    for message in context.iter() {
+        for block in message.content() {
+            if let ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } = block
+            {
+                calls.insert(id.clone(), (name.clone(), arguments.to_string()));
+            }
+        }
+    }
+    for message in &mut context[..window_start] {
+        let needs_pruning = message.content().iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { call_id, content, .. }
+                if prunable_stub(&calls, call_id, content).is_some())
+        });
+        if !needs_pruning {
+            continue;
+        }
+        let content = message
+            .content()
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => match prunable_stub(&calls, call_id, content) {
+                    Some(stub) => ContentBlock::ToolResult {
+                        call_id: call_id.clone(),
+                        content: stub,
+                        is_error: *is_error,
+                    },
+                    None => block.clone(),
+                },
+                block => block.clone(),
+            })
+            .collect();
+        *message = Message::new(message.role(), content);
+    }
+}
+
+/// The stub replacing a prunable read-only result, or `None` when the result
+/// must stay verbatim (unknown call, non-read-only tool, or already smaller
+/// than the stub would be).
+fn prunable_stub(
+    calls: &HashMap<String, (String, String)>,
+    call_id: &str,
+    content: &str,
+) -> Option<String> {
+    let (name, arguments) = calls.get(call_id)?;
+    if !PRUNABLE_READ_ONLY_TOOLS.contains(&name.as_str()) {
+        return None;
+    }
+    let mut arguments = arguments.clone();
+    if arguments.len() > CONTEXT_PRUNE_STUB_ARGUMENT_BYTES {
+        arguments = truncate_utf8(arguments, CONTEXT_PRUNE_STUB_ARGUMENT_BYTES);
+        arguments.push_str("...");
+    }
+    let stub = format!(
+        "[pruned: {name} {arguments} returned {} bytes; call it again if needed]",
+        content.len()
+    );
+    (content.len() > stub.len()).then_some(stub)
+}
+
+/// The byte weight the assembled context contributes to the session budget:
+/// message text, tool-call names and arguments, and (pruned) tool results.
+fn context_bytes(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(Message::content)
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.len(),
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => id.len() + name.len() + arguments.to_string().len(),
+            ContentBlock::ToolResult {
+                call_id, content, ..
+            } => call_id.len() + content.len(),
+        })
+        .fold(0_usize, usize::saturating_add)
+}
+
+/// Measures the session's context as the next run would assemble it —
+/// summary plus post-cutoff transcript with pruning applied — plus any text
+/// still streaming into the current turn's message, which has not joined a
+/// committed turn yet but will.
+fn assembled_context_bytes(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<usize, SessionRuntimeError> {
+    let context = load_model_context(transaction, session_id, u64::MAX)?;
+    let streaming_bytes: u64 = transaction
+        .query_row(
+            "SELECT COALESCE(SUM(
+                 length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
+             ), 0) FROM messages WHERE session_id = ?1 AND state = 'streaming'",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(context_bytes(&context)
+        .saturating_add(usize::try_from(streaming_bytes).unwrap_or(usize::MAX)))
+}
+
+/// The final user message of a compaction run: the fixed structured-schema
+/// instruction plus the file list seeded mechanically from the session's
+/// file-state table.
+fn compaction_instruction(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<String, SessionRuntimeError> {
+    let mut statement = connection
+        .prepare("SELECT path FROM session_files WHERE session_id = ?1 ORDER BY path")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let paths = statement
+        .query_map([session_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut instruction = String::from(COMPACTION_INSTRUCTION);
+    instruction.push_str("\n\nFiles touched (seeded from the session file-state table):\n");
+    if paths.is_empty() {
+        instruction.push_str("(none recorded)\n");
+    } else {
+        for path in paths {
+            instruction.push_str("- ");
+            instruction.push_str(&path);
+            instruction.push('\n');
+        }
+    }
+    Ok(instruction)
 }
 
 /// Replays one run's persisted model turns (assistant content and tool
@@ -4735,6 +5355,7 @@ fn delete_idle_session(
         "DELETE FROM runs WHERE session_id = ?1",
         "DELETE FROM session_grants WHERE session_id = ?1",
         "DELETE FROM session_files WHERE session_id = ?1",
+        "DELETE FROM session_compactions WHERE session_id = ?1",
         "DELETE FROM sessions WHERE id = ?1",
     ] {
         transaction
@@ -5858,6 +6479,7 @@ mod tests {
             "model_turns",
             "session_grants",
             "session_files",
+            "session_compactions",
         ] {
             let count: u32 = connection
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -6068,7 +6690,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "7"
+            "8"
         );
         assert!(
             !connection
@@ -6191,7 +6813,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "7"
+            "8"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -6259,7 +6881,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "7"
+            "8"
         );
         let (display_json, result) = connection
             .query_row(
@@ -6278,6 +6900,338 @@ mod tests {
             result.as_deref(),
             Some("Edited note.txt: replaced 1 occurrence(s).")
         );
+    }
+
+    #[test]
+    fn version_seven_migration_adds_compaction_storage_and_run_kinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        {
+            // A version-7 store whose runs table predates internal run kinds
+            // and that has no compaction storage.
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version', '7');
+                     CREATE TABLE runs (
+                         id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                         command_id TEXT NOT NULL UNIQUE, user_message_id TEXT NOT NULL,
+                         assistant_message_id TEXT NOT NULL, status TEXT NOT NULL,
+                         cancel_requested INTEGER NOT NULL DEFAULT 0, outcome_json TEXT,
+                         usage_json TEXT, estimated_cost_usd_nanos INTEGER,
+                         created_at_ms INTEGER NOT NULL, started_at_ms INTEGER,
+                         finished_at_ms INTEGER
+                     );
+                     INSERT INTO runs VALUES (
+                         'run', 'session', 'command', 'user', 'assistant',
+                         'completed', 0, NULL, NULL, NULL, 1, 1, 2
+                     );",
+                )
+                .unwrap();
+        }
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "8"
+        );
+        assert!(has_column(&connection, "runs", "kind").unwrap());
+        assert_eq!(
+            connection
+                .query_row("SELECT kind FROM runs WHERE id = 'run'", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "prompt"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_compactions", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn assembly_pruning_stubs_old_read_only_results_and_preserves_errors() {
+        let call = |id: &str, name: &str| ContentBlock::ToolCall {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        let result = |id: &str, is_error: bool| ContentBlock::ToolResult {
+            call_id: id.to_owned(),
+            content: "y".repeat(500),
+            is_error,
+        };
+        let mut context = vec![
+            Message::user("start"),
+            Message::new(Role::Assistant, vec![call("c1", "read_file")]),
+            Message::tool_results(vec![result("c1", false)]),
+            Message::new(Role::Assistant, vec![call("c2", "shell")]),
+            Message::tool_results(vec![result("c2", false)]),
+            Message::new(Role::Assistant, vec![call("c3", "read_file")]),
+            Message::tool_results(vec![result("c3", true)]),
+            // The recency window: the last four model turns stay verbatim.
+            Message::new(Role::Assistant, vec![call("c4", "read_file")]),
+            Message::tool_results(vec![result("c4", false)]),
+            Message::assistant("a"),
+            Message::assistant("b"),
+            Message::assistant("c"),
+        ];
+        let before = context_bytes(&context);
+
+        prune_stale_tool_results(&mut context);
+
+        let results = context
+            .iter()
+            .flat_map(Message::content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => Some((call_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results[0],
+            (
+                "c1",
+                "[pruned: read_file {\"path\":\"src/lib.rs\"} returned 500 bytes; \
+                 call it again if needed]",
+                false
+            )
+        );
+        // Shell output is not re-derivable; it survives outside the window.
+        assert_eq!(results[1].0, "c2");
+        assert!(results[1].1.starts_with("yyy"));
+        // Errors prune to error stubs: content stubbed, is_error preserved.
+        assert!(results[2].1.starts_with("[pruned: read_file"));
+        assert!(results[2].2, "the error flag must survive pruning");
+        // Inside the window everything stays verbatim.
+        assert!(results[3].1.starts_with("yyy"));
+        assert!(context_bytes(&context) < before);
+    }
+
+    #[test]
+    fn capacity_accounting_measures_the_pruned_assembly_not_raw_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (mut connection, store_id) = open_database(&path).unwrap();
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let session_id = SessionId::from_bytes([2; 16]);
+        let run_id = RunId::from_bytes([3; 16]);
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path, next_sequence) VALUES (?1, '/w', 0)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, model,
+                                      created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'S', 'idle', 'test/model', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id, session_id, command_id, user_message_id,
+                                  assistant_message_id, status, kind, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'completed', 'prompt', 1)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    CommandId::from_bytes([4; 16]).to_string(),
+                    MessageId::from_bytes([5; 16]).to_string(),
+                    MessageId::from_bytes([6; 16]).to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(id, session_id, run_id, ordinal, role, state,
+                                      output, created_at_ms)
+                 VALUES (?1, ?2, ?3, 1, 'user', 'complete', 'hi', 1)",
+                params![
+                    MessageId::from_bytes([5; 16]).to_string(),
+                    session_id.to_string(),
+                    run_id.to_string(),
+                ],
+            )
+            .unwrap();
+        // Two early read_file turns whose results total ~6 MiB of stored
+        // rows — well over the 4 MiB budget — followed by four text turns
+        // that push them out of the recency window.
+        for (turn, provider_id) in [(1, "c1"), (2, "c2")] {
+            connection
+                .execute(
+                    "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        run_id.to_string(),
+                        turn,
+                        format!(
+                            "[{{\"type\":\"tool_call\",\"id\":\"{provider_id}\",\
+                             \"name\":\"read_file\",\"arguments\":{{\"path\":\"big.txt\"}}}}]"
+                        ),
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO tool_calls(id, run_id, turn_ordinal, call_ordinal,
+                                            provider_call_id, name, arguments_json, state,
+                                            result, is_error, requested_at_ms)
+                     VALUES (?1, ?2, ?3, 0, ?4, 'read_file', '{\"path\":\"big.txt\"}',
+                             'completed', ?5, 0, 1)",
+                    params![
+                        format!("call-{provider_id}"),
+                        run_id.to_string(),
+                        turn,
+                        provider_id,
+                        "z".repeat(3 * 1024 * 1024),
+                    ],
+                )
+                .unwrap();
+        }
+        for turn in 3..=6 {
+            connection
+                .execute(
+                    "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
+                     VALUES (?1, ?2, '[{\"type\":\"text\",\"text\":\"ok\"}]')",
+                    params![run_id.to_string(), turn],
+                )
+                .unwrap();
+        }
+
+        let transaction = connection.transaction().unwrap();
+        let assembled = assembled_context_bytes(&transaction, session_id).unwrap();
+        drop(transaction);
+        assert!(
+            assembled < 64 * 1024,
+            "stale results must assemble as stubs, got {assembled} bytes"
+        );
+
+        // A prompt fits because the budget measures the pruned assembly, not
+        // the ~6 MiB of stored result rows.
+        let applied = execute_command(
+            &mut connection,
+            store_id,
+            CommandId::from_bytes([9; 16]),
+            SessionCommand::SubmitPrompt {
+                session_id,
+                prompt: "continue".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            applied.receipt.outcome,
+            CommandOutcome::PromptQueued { .. }
+        ));
+    }
+
+    #[test]
+    fn interrupted_compaction_commits_no_marker_and_can_be_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (mut connection, store_id) = open_database(&path).unwrap();
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let session_id = SessionId::from_bytes([2; 16]);
+        let run_id = RunId::from_bytes([3; 16]);
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path, next_sequence) VALUES (?1, '/w', 0)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        // A compaction run crashed mid-summarization: still marked running,
+        // and — because summary and marker commit atomically with the run's
+        // completion — no session_compactions row exists.
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, active_run_id,
+                                      model, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'S', 'running', ?3, 'test/model', 1, 1)",
+                params![
+                    session_id.to_string(),
+                    workspace_id.to_string(),
+                    run_id.to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id, session_id, command_id, user_message_id,
+                                  assistant_message_id, status, kind, created_at_ms,
+                                  started_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'compaction', 1, 1)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    CommandId::from_bytes([4; 16]).to_string(),
+                    MessageId::from_bytes([5; 16]).to_string(),
+                    MessageId::from_bytes([6; 16]).to_string(),
+                ],
+            )
+            .unwrap();
+
+        recover_interrupted_runs(&mut connection, store_id).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM runs WHERE id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "interrupted"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_compactions", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0,
+            "a crashed compaction must leave no marker"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM sessions WHERE id = ?1",
+                    [session_id.to_string()],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "idle"
+        );
+
+        // The command can simply be retried.
+        let applied = execute_command(
+            &mut connection,
+            store_id,
+            CommandId::from_bytes([9; 16]),
+            SessionCommand::CompactSession { session_id },
+        )
+        .unwrap();
+        assert!(matches!(
+            applied.receipt.outcome,
+            CommandOutcome::CompactionQueued { session_id: queued, .. }
+                if queued == session_id
+        ));
     }
 
     #[test]
@@ -6382,6 +7336,353 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// Collects events until the compaction commits (`SessionCompacted`),
+    /// which is published after the internal run's `RunFinished`.
+    async fn collect_through_compacted(
+        events: &mut SessionEventStream,
+    ) -> Vec<SessionEventEnvelope> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut observed = Vec::new();
+            while let Some(event) = events.next().await {
+                let event = event.unwrap();
+                let compacted = matches!(event.event, SessionEvent::SessionCompacted { .. });
+                observed.push(event);
+                if compacted {
+                    break;
+                }
+            }
+            observed
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn compact_session(runtime: &SessionRuntime, session_id: SessionId) -> RunId {
+        let receipt = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CompactSession { session_id },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::CompactionQueued { run_id, .. } = receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        run_id
+    }
+
+    /// The concatenated text of each message in a captured provider request.
+    fn request_texts(request: &ModelRequest) -> Vec<String> {
+        request
+            .messages()
+            .iter()
+            .map(|message| {
+                message
+                    .content()
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compact_session_is_refused_while_a_run_is_active_and_runs_toolless_after() {
+        let mut harness = session_management_harness().await;
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "do work".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+
+        // Idle-only: refused with the same error DeleteSession uses while a
+        // run is active.
+        assert_eq!(
+            harness
+                .runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::CompactSession {
+                        session_id: harness.session_id,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            SessionRuntimeError::SessionActive
+        );
+
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            tool_call.id,
+            ApprovalDecision::Deny,
+        )
+        .await
+        .unwrap();
+        collect_through_finished(&mut harness.events).await;
+
+        // Idle now: the compaction queues and executes through the ordinary
+        // machinery. The provider requests a tool on its first turn, but
+        // internal runs deny every call without persisting or prompting.
+        let compaction_run = compact_session(&harness.runtime, harness.session_id).await;
+        let observed = collect_through_compacted(&mut harness.events).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                if *run_id == compaction_run
+        )));
+        assert!(
+            !observed.iter().any(|event| matches!(
+                &event.event,
+                SessionEvent::PromptQueued { .. }
+                    | SessionEvent::AssistantMessageStarted { .. }
+                    | SessionEvent::ToolCallRequested { .. }
+                    | SessionEvent::ToolApprovalRequested { .. }
+            )),
+            "an internal run must publish no transcript or tool events"
+        );
+        // The summarizer loaded through the ordinary loader path.
+        assert_eq!(harness.models.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_runs_account_usage_and_cost_but_join_no_transcript() {
+        let (directory, runtime) = test_runtime().await;
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "say hello".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        collect_through_finished(&mut events).await;
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 8,
+                message_limit: 32,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.messages.len(), 2);
+        let cost_before = focused.summary.estimated_cost_usd_nanos.unwrap();
+
+        let compaction_run = compact_session(&runtime, session_id).await;
+        let observed = collect_through_compacted(&mut events).await;
+
+        // Usage and cost account like any run.
+        let usage = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { run_id, usage, .. } if *run_id == compaction_run => {
+                    Some(*usage)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                cache_read_input_tokens: 2,
+                cache_write_input_tokens: 1,
+                output_tokens: 5,
+            })
+        );
+        let (before_bytes, after_bytes, summary_excerpt) = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCompacted {
+                    before_bytes,
+                    after_bytes,
+                    summary,
+                    ..
+                } => Some((*before_bytes, *after_bytes, summary.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert!(before_bytes > 0);
+        assert!(after_bytes > 0);
+        assert_eq!(summary_excerpt.as_deref(), Some("hello"));
+
+        // The transcript is untouched: no new message rows, one more run,
+        // cost increased, session idle again.
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 8,
+                message_limit: 32,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.messages.len(), 2);
+        assert_eq!(focused.runs.len(), 2);
+        assert_eq!(focused.summary.status, SessionStatus::Idle);
+        assert!(focused.summary.estimated_cost_usd_nanos.unwrap() > cost_before);
+    }
+
+    #[tokio::test]
+    async fn assembly_after_compaction_is_summary_plus_verbatim_span_and_recompaction_folds() {
+        let mut harness = scripted_runs_harness(ApprovalMode::Ask, vec![]).await;
+        submit_prompt(&harness, "first prompt").await;
+        collect_through_finished(&mut harness.events).await;
+
+        compact_session(&harness.runtime, harness.session_id).await;
+        collect_through_compacted(&mut harness.events).await;
+        {
+            // The summarization request is the assembled context plus the
+            // fixed instruction, with the file list seeded mechanically.
+            let requests = harness.requests.lock().unwrap();
+            let texts = request_texts(&requests[1]);
+            assert!(texts.iter().any(|text| text == "first prompt"));
+            let instruction = texts.last().unwrap();
+            assert!(instruction.starts_with("Summarize this conversation"));
+            assert!(instruction.contains("Files touched"));
+            assert!(instruction.contains("(none recorded)"));
+        }
+
+        submit_prompt(&harness, "second prompt").await;
+        collect_through_finished(&mut harness.events).await;
+        {
+            // Assembly is now summary + verbatim span after the marker; the
+            // original prompt survives only inside the summary.
+            let requests = harness.requests.lock().unwrap();
+            let texts = request_texts(&requests[2]);
+            assert!(texts[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
+            assert_eq!(texts[1], "second prompt");
+            assert!(!texts.iter().any(|text| text == "first prompt"));
+        }
+
+        // Recompaction summarizes the prior summary plus the span since.
+        compact_session(&harness.runtime, harness.session_id).await;
+        collect_through_compacted(&mut harness.events).await;
+        {
+            let requests = harness.requests.lock().unwrap();
+            let texts = request_texts(&requests[3]);
+            assert!(texts[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
+            assert!(texts.iter().any(|text| text == "second prompt"));
+            assert!(
+                texts
+                    .last()
+                    .unwrap()
+                    .starts_with("Summarize this conversation")
+            );
+        }
+
+        submit_prompt(&harness, "third prompt").await;
+        collect_through_finished(&mut harness.events).await;
+        {
+            // Only the newest summary replays; prior summaries are folded in,
+            // not stacked.
+            let requests = harness.requests.lock().unwrap();
+            let texts = request_texts(requests.last().unwrap());
+            assert_eq!(texts.len(), 2);
+            assert!(texts[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
+            assert_eq!(texts[1], "third prompt");
+        }
+
+        // Bounded history: both compactions are retained for future rollback.
+        let connection = Connection::open(harness.workspace_path.join("sessions.sqlite3")).unwrap();
+        let compactions: u32 = connection
+            .query_row("SELECT COUNT(*) FROM session_compactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(compactions, 2);
+    }
+
+    #[tokio::test]
+    async fn assembly_prunes_stale_read_only_results_but_never_mutating_ones() {
+        let note = "n".repeat(600);
+        let written = "w".repeat(600);
+        let mut harness = scripted_runs_harness(
+            ApprovalMode::Auto,
+            vec![
+                vec![
+                    ("read_file", r#"{"path":"note.txt"}"#.to_owned()),
+                    (
+                        "write_file",
+                        format!(r#"{{"path":"out.txt","content":"{written}"}}"#),
+                    ),
+                ],
+                vec![],
+                vec![],
+                vec![("read_file", r#"{"path":"note.txt"}"#.to_owned())],
+                vec![],
+            ],
+        )
+        .await;
+        std::fs::write(harness.workspace_path.join("note.txt"), &note).unwrap();
+
+        for prompt in ["one", "two", "three", "four", "five"] {
+            submit_prompt(&harness, prompt).await;
+            collect_through_finished(&mut harness.events).await;
+        }
+
+        let requests = harness.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        let results = last
+            .messages()
+            .iter()
+            .flat_map(Message::content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 3);
+        // The old read is a stub naming the tool, arguments, and size.
+        assert!(
+            results[0].starts_with("[pruned: read_file {\"path\":\"note.txt\"} returned"),
+            "stale read-only result must be stubbed, got {:?}",
+            results[0]
+        );
+        assert!(results[0].ends_with("call it again if needed]"));
+        // The equally old mutation is never pruned: not re-derivable.
+        assert!(
+            !results[1].starts_with("[pruned"),
+            "mutating results must never be pruned, got {:?}",
+            results[1]
+        );
+        // The recent read stays verbatim.
+        assert!(
+            results[2].contains("nnnn"),
+            "recent results must stay verbatim, got {:?}",
+            results[2]
+        );
     }
 
     #[tokio::test]

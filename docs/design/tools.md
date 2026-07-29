@@ -107,18 +107,19 @@ the token hot path.
 
 Bounding each result is not enough; the accumulated context needs its own
 bound. Every persist — message text, tool-call arguments, tool results —
-runs a capacity check in the same transaction: the summed bytes of the
-session's persisted messages, arguments, and results must stay under a
+runs a capacity check in the same transaction: the session's **assembled**
+context (what the next run would actually send, after the compaction
+cutoff and with stale read-only results pruned to stubs) must stay under a
 fixed per-session cap (4 MiB), and a persist that would exceed it fails
-the run. That is the current policy: a backstop against unbounded growth,
-not window management.
+the run. That is the backstop against unbounded growth, not window
+management.
 
-The direction for when accumulated tool results threaten the model
-window: truncate oldest tool-result content first, keeping the call and
-an explicit truncation marker in place, before touching conversation
-text. Tool output is re-derivable — the agent can re-read anything it
-still needs — while conversation text is not, so results are the cheapest
-context to shed.
+Result pruning is the first shedding mechanism (`docs/plans/compaction.md`):
+during assembly, read-only built-in results older than the last few model
+turns are replaced by one-line stubs naming the tool, arguments, and size,
+because the agent can re-derive them on demand. Mutating, shell, and MCP
+outputs are never pruned — they are not re-derivable. The stored rows are
+untouched; pruning is a property of assembly alone.
 
 ## Built-In Tools
 

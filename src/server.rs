@@ -561,6 +561,7 @@ fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router 
         .route("/v1/sessions/model", post(set_session_model))
         .route("/v1/sessions/delete", post(delete_session))
         .route("/v1/sessions/prune", post(prune_sessions))
+        .route("/v1/sessions/compact", post(compact_session))
         .route("/v1/runs/cancel", post(cancel_run))
         .route("/v1/tools/approvals", post(respond_tool_approval))
         .route(
@@ -733,6 +734,16 @@ async fn prune_sessions(
 ) -> Response {
     session_command(state, body, |command| {
         matches!(command, SessionCommand::PruneSessions { .. })
+    })
+    .await
+}
+
+async fn compact_session(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::CompactSession { .. })
     })
     .await
 }
@@ -1598,6 +1609,7 @@ mod tests {
             },
             SessionCommand::DeleteSession { session_id },
             SessionCommand::PruneSessions { workspace_id },
+            SessionCommand::CompactSession { session_id },
         ] {
             let command_id = qq_protocol::CommandId::from_bytes([9; 16]);
             let receipt = client.command(command_id, command.clone()).await.unwrap();
@@ -1619,7 +1631,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(commands.lock().unwrap().len(), 3);
+        assert_eq!(commands.lock().unwrap().len(), 4);
 
         server.shutdown().await.unwrap();
     }

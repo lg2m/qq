@@ -1,6 +1,8 @@
 # Context Compaction
 
-Status: proposed.
+Status: steps 1–2 of the sequencing are implemented (result pruning in
+assembly; `CompactSession` + `/compact` with summary/marker storage);
+steps 3–4 are direction.
 
 Long sessions outgrow model context. Today the runtime fails the run
 when the assembled context exceeds the session budget; compaction
