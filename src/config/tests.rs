@@ -863,6 +863,346 @@ fn rejects_invalid_mcp_declarations() {
 }
 
 #[test]
+fn policy_grants_layer_extend_remove_deny_and_fold_mcp_allowlists() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(
+            version: 1,
+            mcp: {"executor": Stdio(command: "./executor.sh", allow: ["execute"])},
+            policy: (
+                allow_tools: ["web_fetch"],
+                allow_shell_prefixes: ["git status", "cargo build"],
+            ),
+        )"#,
+    );
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(
+            version: 1,
+            policy: (
+                allow_tools: ["edit_file", Remove("web_fetch")],
+                allow_shell_prefixes: ["cargo test"],
+            ),
+        )"#,
+    );
+    tree.write(
+        "managed/managed.ron",
+        r#"(
+            version: 1,
+            policy: (deny_tools: ["edit_file"], deny_shell_prefixes: ["cargo"]),
+        )"#,
+    );
+    let request = tree.request();
+    assert!(
+        matches!(
+            tree.loader().load(&request),
+            Err(ConfigError::TrustRequired { .. })
+        ),
+        "workspace grant declarations must require trust"
+    );
+    tree.loader().grant_pending_trust(&request).unwrap();
+
+    let snapshot = tree.loader().load(&request).unwrap();
+    // Raw merged policy: later layers extend, Remove deletes, denies record.
+    assert_eq!(snapshot.policy().allow_tools(), ["edit_file"]);
+    assert_eq!(
+        snapshot.policy().allow_shell_prefixes(),
+        ["cargo build", "cargo test", "git status"]
+    );
+    assert_eq!(snapshot.policy().deny_tools(), ["edit_file"]);
+    assert_eq!(snapshot.policy().deny_shell_prefixes(), ["cargo"]);
+    // Resolved grants: MCP allowlists fold in as exact names, managed denies
+    // filter both exact tools and word-granularity shell overlaps.
+    assert_eq!(snapshot.grants().tools(), ["mcp__executor__execute"]);
+    assert_eq!(snapshot.grants().shell_prefixes(), ["git status"]);
+    // Provenance follows the layer that declared each surviving grant.
+    assert_eq!(
+        snapshot
+            .provenance()
+            .grant_tool("edit_file")
+            .unwrap()
+            .kind(),
+        SourceKind::Project
+    );
+    assert!(snapshot.provenance().grant_tool("web_fetch").is_none());
+    assert_eq!(
+        snapshot
+            .provenance()
+            .grant_shell_prefix("git status")
+            .unwrap()
+            .kind(),
+        SourceKind::Global
+    );
+}
+
+#[test]
+fn policy_grant_declarations_are_scoped_by_source_kind() {
+    let grants = r#"(version: 1, policy: (allow_tools: ["edit_file"]))"#;
+
+    // Remote configuration may never plant approval grants.
+    let remote = SourceIdentity::virtual_source(SourceKind::Remote, "remote test");
+    assert!(matches!(
+        document::Document::parse(grants, &remote),
+        Err(ConfigError::RemotePolicyGrantsForbidden { .. })
+    ));
+
+    // Grants are ordinary workspace configuration behind the trust flow.
+    let project = SourceIdentity::virtual_source(SourceKind::Project, "project test");
+    assert!(document::Document::parse(grants, &project).is_ok());
+
+    // The managed-only constraint fields stay managed-only.
+    let deny = r#"(version: 1, policy: (deny_tools: ["edit_file"]))"#;
+    assert!(matches!(
+        document::Document::parse(deny, &project),
+        Err(ConfigError::PolicyOutsideManaged { .. })
+    ));
+    let managed = SourceIdentity::virtual_source(SourceKind::Managed, "managed test");
+    assert!(document::Document::parse(deny, &managed).is_ok());
+}
+
+#[test]
+fn rejects_invalid_policy_grant_declarations() {
+    let origin = SourceIdentity::virtual_source(SourceKind::Managed, "managed test");
+    let parse = |policy: &str| {
+        document::Document::parse(&format!("(version: 1, policy: ({policy}))"), &origin)
+    };
+    let expect_message = |policy: &str, needle: &str| match parse(policy) {
+        Err(ConfigError::Parse { message, .. }) => {
+            assert!(
+                message.contains(needle),
+                "{message:?} must mention {needle:?}"
+            );
+        }
+        other => panic!("expected a parse error for {policy:?}, got {other:?}"),
+    };
+
+    expect_message(r#"allow_tools: ["bad name"]"#, "ASCII");
+    expect_message(r#"allow_tools: [""]"#, "1-128");
+    expect_message(r#"allow_tools: ["mcp__executor"]"#, "mcp__<server>__<tool>");
+    expect_message(
+        r#"allow_tools: ["mcp__executor__"]"#,
+        "mcp__<server>__<tool>",
+    );
+    expect_message(r#"allow_tools: ["edit_file", "edit_file"]"#, "duplicate");
+    expect_message(
+        r#"allow_tools: ["edit_file", Remove("edit_file")]"#,
+        "duplicate",
+    );
+    expect_message(r#"allow_shell_prefixes: [""]"#, "empty");
+    expect_message(r#"allow_shell_prefixes: [" cargo test"]"#, "whitespace");
+    expect_message(r#"allow_shell_prefixes: ["git\tstatus"]"#, "control");
+    expect_message(r#"deny_tools: ["bad name"]"#, "ASCII");
+    expect_message(r#"deny_shell_prefixes: ["cargo", "cargo"]"#, "duplicate");
+
+    assert!(parse(r#"allow_tools: ["mcp__executor__execute", "edit_file"]"#).is_ok());
+    assert!(parse(r#"allow_shell_prefixes: ["cargo test -p qq"]"#).is_ok());
+}
+
+#[test]
+fn promotes_grants_into_a_fresh_workspace_config() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    let workspace = tree.path("work");
+
+    let first = loader
+        .promote_workspace_grant(&workspace, &WorkspaceGrant::Tool("edit_file".to_owned()))
+        .unwrap();
+    assert_eq!(first.outcome(), PromotionOutcome::Added);
+    assert!(first.path().ends_with(".qq/config.ron"));
+
+    let second = loader
+        .promote_workspace_grant(
+            &workspace,
+            &WorkspaceGrant::ShellPrefix("cargo test".to_owned()),
+        )
+        .unwrap();
+    assert_eq!(second.outcome(), PromotionOutcome::Added);
+
+    // Repeated promotion is idempotent and writes nothing.
+    let written = fs::read_to_string(tree.path("work/.qq/config.ron")).unwrap();
+    let repeat = loader
+        .promote_workspace_grant(&workspace, &WorkspaceGrant::Tool("edit_file".to_owned()))
+        .unwrap();
+    assert_eq!(repeat.outcome(), PromotionOutcome::AlreadyPresent);
+    assert_eq!(
+        fs::read_to_string(tree.path("work/.qq/config.ron")).unwrap(),
+        written
+    );
+
+    // Each write round-trips through the loader without a trust prompt: the
+    // promotion is the user's own decision, so its digest is trusted.
+    let snapshot = loader.load(&tree.request()).unwrap();
+    assert_eq!(snapshot.grants().tools(), ["edit_file"]);
+    assert_eq!(snapshot.grants().shell_prefixes(), ["cargo test"]);
+}
+
+#[test]
+fn promotion_preserves_unrelated_content_and_existing_policy() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    let workspace = tree.path("work");
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(
+    // Keep this comment.
+    version: 1,
+    max_output_tokens: 9,
+    policy: (
+        allow_shell_prefixes: [
+            "git status",
+        ],
+    ),
+)"#,
+    );
+    let request = tree.request();
+    loader.grant_pending_trust(&request).unwrap();
+
+    loader
+        .promote_workspace_grant(
+            &workspace,
+            &WorkspaceGrant::ShellPrefix("cargo test".to_owned()),
+        )
+        .unwrap();
+    loader
+        .promote_workspace_grant(
+            &workspace,
+            &WorkspaceGrant::Tool("mcp__executor__execute".to_owned()),
+        )
+        .unwrap();
+
+    let content = fs::read_to_string(tree.path("work/.qq/config.ron")).unwrap();
+    assert!(content.contains("// Keep this comment."), "{content}");
+    assert!(content.contains("max_output_tokens: 9"), "{content}");
+    assert!(content.contains("\"git status\""), "{content}");
+
+    let snapshot = loader.load(&request).unwrap();
+    assert_eq!(snapshot.max_output_tokens(), 9);
+    assert_eq!(snapshot.grants().tools(), ["mcp__executor__execute"]);
+    assert_eq!(
+        snapshot.grants().shell_prefixes(),
+        ["cargo test", "git status"]
+    );
+}
+
+#[test]
+fn promotion_appends_to_single_line_lists() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, policy: (allow_tools: ["write_file"]))"#,
+    );
+    let request = tree.request();
+    loader.grant_pending_trust(&request).unwrap();
+
+    loader
+        .promote_workspace_grant(
+            &tree.path("work"),
+            &WorkspaceGrant::Tool("edit_file".to_owned()),
+        )
+        .unwrap();
+
+    let content = fs::read_to_string(tree.path("work/.qq/config.ron")).unwrap();
+    assert!(
+        content.contains(r#"allow_tools: ["edit_file", "write_file"]"#),
+        "{content}"
+    );
+    let snapshot = loader.load(&request).unwrap();
+    assert_eq!(snapshot.grants().tools(), ["edit_file", "write_file"]);
+}
+
+#[test]
+fn promotion_is_refused_when_managed_policy_denies_the_grant() {
+    let tree = TempTree::new();
+    tree.write(
+        "managed/managed.ron",
+        r#"(version: 1, policy: (deny_tools: ["edit_file"], deny_shell_prefixes: ["cargo"]))"#,
+    );
+    let loader = tree.loader();
+    let workspace = tree.path("work");
+
+    assert!(matches!(
+        loader.promote_workspace_grant(&workspace, &WorkspaceGrant::Tool("edit_file".to_owned())),
+        Err(ConfigError::GrantDeniedByManaged {
+            rule: "deny_tools",
+            ..
+        })
+    ));
+    // Word-granularity overlap: the denied "cargo" covers "cargo test".
+    assert!(matches!(
+        loader.promote_workspace_grant(
+            &workspace,
+            &WorkspaceGrant::ShellPrefix("cargo test".to_owned()),
+        ),
+        Err(ConfigError::GrantDeniedByManaged {
+            rule: "deny_shell_prefixes",
+            ..
+        })
+    ));
+    assert!(
+        !tree.path("work/.qq/config.ron").exists(),
+        "a refused promotion must not write"
+    );
+
+    // Unrelated prefixes stay grantable under the same managed policy.
+    assert!(
+        loader
+            .promote_workspace_grant(
+                &workspace,
+                &WorkspaceGrant::ShellPrefix("git status".to_owned()),
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn promotion_rejects_invalid_grants() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    let workspace = tree.path("work");
+    for grant in [
+        WorkspaceGrant::Tool("bad name".to_owned()),
+        WorkspaceGrant::Tool("mcp__executor".to_owned()),
+        WorkspaceGrant::ShellPrefix(String::new()),
+        WorkspaceGrant::ShellPrefix("git\nstatus".to_owned()),
+    ] {
+        assert!(
+            matches!(
+                loader.promote_workspace_grant(&workspace, &grant),
+                Err(ConfigError::InvalidGrant { .. })
+            ),
+            "accepted {grant:?}"
+        );
+    }
+    assert!(!tree.path("work/.qq/config.ron").exists());
+}
+
+#[test]
+fn promotion_does_not_launder_pending_trust() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, mcp: {"executor": Stdio(command: "./executor.sh")})"#,
+    );
+
+    // The untrusted MCP declaration stays pending: promotion writes the grant
+    // but must not grant trust for content the user never reviewed.
+    let promotion = loader
+        .promote_workspace_grant(
+            &tree.path("work"),
+            &WorkspaceGrant::Tool("edit_file".to_owned()),
+        )
+        .unwrap();
+    assert_eq!(promotion.outcome(), PromotionOutcome::Added);
+    assert!(matches!(
+        loader.load(&tree.request()),
+        Err(ConfigError::TrustRequired { .. })
+    ));
+}
+
+#[test]
 fn mcp_declarations_are_scoped_by_source_kind() {
     let content = r#"(
         version: 1,

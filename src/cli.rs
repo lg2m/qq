@@ -78,7 +78,8 @@ pub enum ConfigCommand {
     Show,
     /// Explain the source of one effective field.
     Explain {
-        /// Field name: model, organization, max_output_tokens, or provider.NAME.
+        /// Field name: model, organization, max_output_tokens, provider.NAME,
+        /// grant.tool.NAME, or grant.shell.PREFIX.
         field: String,
     },
 }
