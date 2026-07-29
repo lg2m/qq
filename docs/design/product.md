@@ -1,7 +1,5 @@
 # QQ Product Design
 
-Status: initial direction
-
 ## Product Intent
 
 QQ is an agent and LLM tool for building software. It should let a developer
@@ -171,26 +169,6 @@ Do not create these products or scaffolds during the initial Rust work:
 
 Future web and mobile clients are expected, but the HTTP/SSE protocol is the
 only preparation they need now.
-
-## Documentation To Add Next
-
-Other agents can develop focused documents from this direction without
-changing its scope:
-
-- **CLI specification:** command hierarchy, configuration precedence, exit
-  codes, and human versus machine output.
-- **Protocol specification:** HTTP resources, command schemas, SSE event
-  envelope, replay, idempotency, and protocol versioning.
-- **Persistence specification:** SQLite schema, migrations, retention, and
-  recovery invariants.
-- **Agent runtime specification:** run state machine, context assembly,
-  cancellation, retries, limits, and model integration.
-- **Tool execution and security design:** workspace containment, approvals,
-  shell policy, secrets, and remote-server authorization.
-- **TUI interaction design:** views, keyboard model, streaming, diffs,
-  approvals, errors, and accessibility.
-- **Performance plan:** benchmarks, representative workloads, budgets, and
-  profiling workflow.
 
 ## Open Decisions
 

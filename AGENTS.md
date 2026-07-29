@@ -8,8 +8,8 @@ automation, and a long-running HTTP/SSE server. Speed and developer experience
 are product requirements; correctness, durability, and safe execution are
 baseline constraints.
 
-Read `docs/architecture.md` before changing system boundaries. It records the
-initial direction, not a license to pre-build deferred features.
+Read `docs/design/architecture.md` before changing system boundaries. It
+records the initial direction, not a license to pre-build deferred features.
 
 ## Repository Map
 
