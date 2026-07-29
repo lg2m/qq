@@ -218,7 +218,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "version": "0.1.0",
   "pid": 12345
 }
