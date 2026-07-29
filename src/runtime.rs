@@ -873,6 +873,7 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
         | SessionRuntimeError::PromptTooLarge
         | SessionRuntimeError::WorkspaceNotFound
         | SessionRuntimeError::SessionNotFound
+        | SessionRuntimeError::SessionActive
         | SessionRuntimeError::ParentWorkspaceMismatch
         | SessionRuntimeError::RunNotFound
         | SessionRuntimeError::ToolCallNotFound

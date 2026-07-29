@@ -71,6 +71,11 @@ where
                     return Err(TuiError::ClientStopped);
                 };
                 dirty |= app.apply_client_update(update);
+                for request in app.take_requests() {
+                    if let Err(error) = client.try_send(request.clone()) {
+                        dirty |= apply_send_failure(&mut app, request, error);
+                    }
+                }
             }
             _ = animation_tick.tick(), if app.has_activity() => {
                 dirty |= app.advance_animation();

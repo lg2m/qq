@@ -215,6 +215,22 @@ pub enum SessionCommand {
         session_id: SessionId,
         mode: ApprovalMode,
     },
+    /// Repoints the session's model. Takes effect when the next run is
+    /// claimed; a run already executing keeps the model it started with.
+    SetSessionModel {
+        session_id: SessionId,
+        model: ModelSelection,
+    },
+    /// Deletes an idle session and every row it owns. Refused while the
+    /// session has an active run; the client cancels first.
+    DeleteSession {
+        session_id: SessionId,
+    },
+    /// Deletes every idle session in the workspace that never received a
+    /// message (the residue of creating sessions without prompting them).
+    PruneSessions {
+        workspace_id: WorkspaceId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +276,17 @@ pub enum CommandOutcome {
     ApprovalModeSet {
         session_id: SessionId,
         mode: ApprovalMode,
+    },
+    SessionModelSet {
+        session_id: SessionId,
+        model: ModelSelection,
+    },
+    SessionDeleted {
+        session_id: SessionId,
+    },
+    SessionsPruned {
+        workspace_id: WorkspaceId,
+        deleted: u32,
     },
 }
 
@@ -484,6 +511,18 @@ pub struct SessionEventEnvelope {
 pub enum SessionEvent {
     SessionCreated {
         session: SessionSummary,
+    },
+    /// A non-run mutation of the session row (today: its model selection).
+    /// Carries the full updated summary so clients re-render without a
+    /// round trip.
+    SessionUpdated {
+        session: SessionSummary,
+    },
+    /// The session and every row it owned were deleted. Earlier events for
+    /// the session remain in the workspace log; replaying them and then this
+    /// event converges every client on the deleted state.
+    SessionDeleted {
+        session_id: SessionId,
     },
     PromptQueued {
         session: SessionSummary,
@@ -847,6 +886,117 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn session_management_commands_round_trip_with_stable_tags() {
+        let session_id = id::<SessionId>(3);
+        let workspace_id = id::<WorkspaceId>(2);
+
+        let set_model = SessionCommand::SetSessionModel {
+            session_id,
+            model: ModelSelection {
+                model: Some("test/model".to_owned()),
+                max_output_tokens: Some(256),
+                organization: None,
+            },
+        };
+        let encoded = serde_json::to_value(&set_model).unwrap();
+        assert_eq!(encoded["type"], "set_session_model");
+        assert_eq!(encoded["model"]["model"], "test/model");
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            set_model
+        );
+
+        let delete = SessionCommand::DeleteSession { session_id };
+        let encoded = serde_json::to_value(&delete).unwrap();
+        assert_eq!(encoded["type"], "delete_session");
+        assert_eq!(encoded["session_id"], session_id.to_string());
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            delete
+        );
+
+        let prune = SessionCommand::PruneSessions { workspace_id };
+        let encoded = serde_json::to_value(&prune).unwrap();
+        assert_eq!(encoded["type"], "prune_sessions");
+        assert_eq!(encoded["workspace_id"], workspace_id.to_string());
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            prune
+        );
+
+        let model_set = CommandOutcome::SessionModelSet {
+            session_id,
+            model: ModelSelection {
+                model: Some("test/model".to_owned()),
+                max_output_tokens: None,
+                organization: None,
+            },
+        };
+        let encoded = serde_json::to_value(&model_set).unwrap();
+        assert_eq!(encoded["type"], "session_model_set");
+        assert_eq!(
+            serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
+            model_set
+        );
+
+        let deleted = CommandOutcome::SessionDeleted { session_id };
+        let encoded = serde_json::to_value(&deleted).unwrap();
+        assert_eq!(encoded["type"], "session_deleted");
+        assert_eq!(
+            serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
+            deleted
+        );
+
+        let pruned = CommandOutcome::SessionsPruned {
+            workspace_id,
+            deleted: 3,
+        };
+        let encoded = serde_json::to_value(&pruned).unwrap();
+        assert_eq!(encoded["type"], "sessions_pruned");
+        assert_eq!(encoded["deleted"], 3);
+        assert_eq!(
+            serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
+            pruned
+        );
+    }
+
+    #[test]
+    fn session_update_and_deletion_events_round_trip_with_stable_tags() {
+        let session_id = id::<SessionId>(3);
+        let updated = SessionEvent::SessionUpdated {
+            session: SessionSummary {
+                id: session_id,
+                workspace_id: id(2),
+                parent_id: None,
+                title: "Session".to_owned(),
+                status: SessionStatus::Idle,
+                active_run_id: None,
+                queued_prompts: 0,
+                model: Some("test/model-b".to_owned()),
+                estimated_cost_usd_nanos: None,
+                updated_at_ms: 11,
+                last_outcome: None,
+            },
+        };
+        let encoded = serde_json::to_value(&updated).unwrap();
+        assert_eq!(encoded["type"], "session_updated");
+        assert_eq!(encoded["session"]["model"], "test/model-b");
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            updated
+        );
+
+        let deleted = SessionEvent::SessionDeleted { session_id };
+        let encoded = serde_json::to_value(&deleted).unwrap();
+        assert_eq!(encoded["type"], "session_deleted");
+        assert_eq!(encoded["session_id"], session_id.to_string());
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            deleted
+        );
     }
 
     #[test]

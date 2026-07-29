@@ -135,6 +135,14 @@ pub(crate) struct ModelPicker {
 pub(crate) struct SessionPicker {
     pub query: String,
     pub selected: Option<SessionId>,
+    /// A destructive action awaiting its inline y/n answer.
+    pub confirm: Option<SessionPickerConfirm>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionPickerConfirm {
+    Delete(SessionId),
+    Prune,
 }
 
 /// How much of each tool call the transcript shows. Session-local because the
@@ -213,6 +221,10 @@ pub(crate) struct App {
     /// Bounded tails of live streamed output per running tool call, dropped
     /// when the call reaches a terminal state or the session state reloads.
     pub live_tool_output: HashMap<qq_protocol::ToolCallId, String>,
+    /// Requests produced while applying client updates (for example the
+    /// snapshot fetch after a remote deletion refocuses), drained by the
+    /// terminal loop after each update.
+    queued_requests: Vec<ClientRequest>,
 }
 
 impl App {
@@ -242,7 +254,14 @@ impl App {
             answered_approvals: std::collections::HashSet::new(),
             edit_previews: HashMap::new(),
             live_tool_output: HashMap::new(),
+            queued_requests: Vec::new(),
         }
+    }
+
+    /// Requests queued by [`Self::apply_client_update`]; the terminal loop
+    /// drains and sends them after each update.
+    pub fn take_requests(&mut self) -> Vec<ClientRequest> {
+        std::mem::take(&mut self.queued_requests)
     }
 
     pub fn apply_client_update(&mut self, update: ClientUpdate) -> bool {
@@ -304,6 +323,27 @@ impl App {
                         }
                         if matches!(receipt.outcome, CommandOutcome::RunAlreadyFinished { .. }) {
                             self.status = Some("run already finished".to_owned());
+                        }
+                        match &receipt.outcome {
+                            CommandOutcome::SessionModelSet { model, .. } => {
+                                self.status = Some(format!(
+                                    "session model set to {}",
+                                    model.model.as_deref().unwrap_or("default")
+                                ));
+                            }
+                            CommandOutcome::SessionDeleted { .. } => {
+                                self.status = Some("session deleted".to_owned());
+                            }
+                            CommandOutcome::SessionsPruned { deleted: 0, .. } => {
+                                self.status = Some("no empty sessions to delete".to_owned());
+                            }
+                            CommandOutcome::SessionsPruned { deleted: 1, .. } => {
+                                self.status = Some("deleted 1 empty session".to_owned());
+                            }
+                            CommandOutcome::SessionsPruned { deleted, .. } => {
+                                self.status = Some(format!("deleted {deleted} empty sessions"));
+                            }
+                            _ => {}
                         }
                     }
                     Err(error) => self.reject_pending(command_id, error),
@@ -513,6 +553,12 @@ impl App {
                     self.focused = Some(session.id);
                 }
             }
+            SessionEvent::SessionUpdated { session } => {
+                self.upsert_summary(session.clone());
+            }
+            SessionEvent::SessionDeleted { session_id } => {
+                self.remove_session(*session_id);
+            }
             SessionEvent::PromptQueued {
                 session, message, ..
             } => {
@@ -667,6 +713,77 @@ impl App {
                 context_window,
                 loaded_through: 0,
             });
+    }
+
+    /// Drops a deleted session from every client map, mirroring the server's
+    /// cascade: its children become roots, its per-call display state and
+    /// optimistic prompts are discarded, and a deleted focus moves to the
+    /// nearest remaining session (or clears).
+    fn remove_session(&mut self, session_id: SessionId) {
+        if !self.sessions.contains_key(&session_id) {
+            return;
+        }
+        let refocus = if self.focused == Some(session_id) {
+            let order = self.thread_order();
+            order
+                .iter()
+                .position(|candidate| *candidate == session_id)
+                .and_then(|index| {
+                    order
+                        .get(index + 1)
+                        .or_else(|| {
+                            index
+                                .checked_sub(1)
+                                .and_then(|previous| order.get(previous))
+                        })
+                        .copied()
+                })
+        } else {
+            None
+        };
+        let Some(removed) = self.sessions.remove(&session_id) else {
+            return;
+        };
+        for call in removed.tool_calls.iter().flatten() {
+            self.live_tool_output.remove(&call.id);
+            self.edit_previews.remove(&call.id);
+            self.answered_approvals.remove(&call.id);
+        }
+        self.pending.retain(|_, intent| {
+            !matches!(
+                intent,
+                PendingIntent::Prompt { session_id: target, .. } if *target == session_id
+            )
+        });
+        // The server detaches children on delete; mirror it so they stay
+        // reachable as roots until the next summary refresh.
+        for session in self.sessions.values_mut() {
+            if session.summary.parent_id == Some(session_id) {
+                session.summary.parent_id = None;
+            }
+        }
+        if self.focused == Some(session_id) {
+            self.focused = refocus;
+            if let (Some(next), Some(workspace_id)) = (refocus, self.workspace_id) {
+                self.queued_requests
+                    .push(ClientRequest::Snapshot(SnapshotRequest {
+                        workspace_id,
+                        focused_session_id: Some(next),
+                        session_limit: SNAPSHOT_SESSION_LIMIT,
+                        message_limit: SNAPSHOT_MESSAGE_LIMIT,
+                    }));
+            }
+        }
+        if let Some(picker) = &mut self.session_picker {
+            if matches!(picker.confirm, Some(SessionPickerConfirm::Delete(pending)) if pending == session_id)
+            {
+                picker.confirm = None;
+            }
+            if picker.selected == Some(session_id) {
+                picker.selected = None;
+                self.reset_session_picker_selection();
+            }
+        }
     }
 
     /// Marks a run's still-streaming assistant messages complete through the
@@ -1004,14 +1121,27 @@ impl App {
                 }
                 (true, Vec::new())
             }
+            // Enter applies the model to the focused session; without a
+            // focus it keeps the historical create behavior. Ctrl-N always
+            // creates a session with the selected model.
             KeyCode::Enter => {
-                let selected = self
-                    .model_picker
-                    .as_ref()
-                    .and_then(|picker| filtered.get(picker.selected))
-                    .and_then(|index| self.models.get(*index))
-                    .map(|option| option.selection.clone());
-                let Some(model) = selected else {
+                let Some(model) = self.selected_picker_model(&filtered) else {
+                    return (false, Vec::new());
+                };
+                let focused = self
+                    .focused
+                    .filter(|session_id| self.sessions.contains_key(session_id));
+                let result = match focused {
+                    Some(session_id) => self.set_session_model(session_id, model),
+                    None => self.create_session_with_model(None, model),
+                };
+                if !result.1.is_empty() {
+                    self.model_picker = None;
+                }
+                result
+            }
+            KeyCode::Char('n' | 'N') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let Some(model) = self.selected_picker_model(&filtered) else {
                     return (false, Vec::new());
                 };
                 let result = self.create_session_with_model(None, model);
@@ -1045,6 +1175,32 @@ impl App {
         }
     }
 
+    fn selected_picker_model(&self, filtered: &[usize]) -> Option<ModelSelection> {
+        self.model_picker
+            .as_ref()
+            .and_then(|picker| filtered.get(picker.selected))
+            .and_then(|index| self.models.get(*index))
+            .map(|option| option.selection.clone())
+    }
+
+    fn set_session_model(
+        &mut self,
+        session_id: SessionId,
+        model: ModelSelection,
+    ) -> (bool, Vec<ClientRequest>) {
+        let Ok(command_id) = CommandId::generate() else {
+            self.status = Some("secure randomness is unavailable".to_owned());
+            return (true, Vec::new());
+        };
+        (
+            true,
+            vec![ClientRequest::Command(CommandRequest {
+                command_id,
+                command: SessionCommand::SetSessionModel { session_id, model },
+            })],
+        )
+    }
+
     fn push_model_search(&mut self, text: &str) -> bool {
         let Some(picker) = &mut self.model_picker else {
             return false;
@@ -1070,6 +1226,7 @@ impl App {
                 .focused
                 .filter(|session_id| self.sessions.contains_key(session_id))
                 .or_else(|| self.thread_order().first().copied()),
+            confirm: None,
         });
         (true, Vec::new())
     }
@@ -1098,6 +1255,13 @@ impl App {
             .session_picker
             .as_ref()
             .and_then(|picker| picker.selected);
+        if let Some(confirm) = self
+            .session_picker
+            .as_ref()
+            .and_then(|picker| picker.confirm)
+        {
+            return self.handle_session_picker_confirm_key(key, confirm);
+        }
         let position =
             selected.and_then(|selected| filtered.iter().position(|session| *session == selected));
         match key.code {
@@ -1141,6 +1305,17 @@ impl App {
                 self.reset_session_picker_selection();
                 (changed, Vec::new())
             }
+            // Ctrl-modified so plain letters keep feeding the search query.
+            KeyCode::Delete => self.request_delete_confirmation(selected, &filtered),
+            KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.request_delete_confirmation(selected, &filtered)
+            }
+            KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(picker) = &mut self.session_picker {
+                    picker.confirm = Some(SessionPickerConfirm::Prune);
+                }
+                (true, Vec::new())
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -1154,6 +1329,85 @@ impl App {
             }
             _ => (false, Vec::new()),
         }
+    }
+
+    fn request_delete_confirmation(
+        &mut self,
+        selected: Option<SessionId>,
+        filtered: &[SessionId],
+    ) -> (bool, Vec<ClientRequest>) {
+        let Some(selected) = selected.filter(|selected| filtered.contains(selected)) else {
+            return (false, Vec::new());
+        };
+        if self
+            .sessions
+            .get(&selected)
+            .is_some_and(|session| session.summary.active_run_id.is_some())
+        {
+            self.status = Some("cancel the active run before deleting".to_owned());
+            return (true, Vec::new());
+        }
+        if let Some(picker) = &mut self.session_picker {
+            picker.confirm = Some(SessionPickerConfirm::Delete(selected));
+        }
+        (true, Vec::new())
+    }
+
+    fn handle_session_picker_confirm_key(
+        &mut self,
+        key: KeyEvent,
+        confirm: SessionPickerConfirm,
+    ) -> (bool, Vec<ClientRequest>) {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                if let Some(picker) = &mut self.session_picker {
+                    picker.confirm = None;
+                }
+                match confirm {
+                    SessionPickerConfirm::Delete(session_id) => self.delete_session(session_id),
+                    SessionPickerConfirm::Prune => self.prune_sessions(),
+                }
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                if let Some(picker) = &mut self.session_picker {
+                    picker.confirm = None;
+                }
+                (true, Vec::new())
+            }
+            _ => (false, Vec::new()),
+        }
+    }
+
+    fn delete_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
+        let Ok(command_id) = CommandId::generate() else {
+            self.status = Some("secure randomness is unavailable".to_owned());
+            return (true, Vec::new());
+        };
+        (
+            true,
+            vec![ClientRequest::Command(CommandRequest {
+                command_id,
+                command: SessionCommand::DeleteSession { session_id },
+            })],
+        )
+    }
+
+    fn prune_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
+        let Some(workspace_id) = self.workspace_id else {
+            self.status = Some("workspace is still connecting".to_owned());
+            return (true, Vec::new());
+        };
+        let Ok(command_id) = CommandId::generate() else {
+            self.status = Some("secure randomness is unavailable".to_owned());
+            return (true, Vec::new());
+        };
+        (
+            true,
+            vec![ClientRequest::Command(CommandRequest {
+                command_id,
+                command: SessionCommand::PruneSessions { workspace_id },
+            })],
+        )
     }
 
     fn push_session_search(&mut self, text: &str) -> bool {
@@ -2025,6 +2279,226 @@ mod tests {
     }
 
     #[test]
+    fn session_picker_deletes_the_highlighted_session_after_a_confirm() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        let session_id = app.focused.unwrap();
+        app.open_sessions();
+
+        // The confirm gate: Ctrl-D asks, n keeps, y deletes.
+        let (changed, requests) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(
+            app.session_picker.as_ref().unwrap().confirm,
+            Some(SessionPickerConfirm::Delete(session_id))
+        );
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(requests.is_empty());
+        assert_eq!(app.session_picker.as_ref().unwrap().confirm, None);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Command(CommandRequest {
+                command: SessionCommand::DeleteSession { session_id: target },
+                ..
+            }) if *target == session_id
+        ));
+        assert_eq!(app.session_picker.as_ref().unwrap().confirm, None);
+    }
+
+    #[test]
+    fn session_picker_refuses_to_delete_a_session_with_an_active_run() {
+        let mut initial = snapshot();
+        let run_id = id(8, RunId::from_bytes);
+        initial.sessions[0].active_run_id = Some(run_id);
+        initial.focused.as_mut().unwrap().summary.active_run_id = Some(run_id);
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(initial);
+        app.open_sessions();
+
+        let (changed, requests) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.session_picker.as_ref().unwrap().confirm, None);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("cancel the active run before deleting")
+        );
+    }
+
+    #[test]
+    fn session_picker_prunes_empty_sessions_after_a_confirm() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        let workspace_id = app.workspace_id.unwrap();
+        app.open_sessions();
+
+        let (changed, requests) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(
+            app.session_picker.as_ref().unwrap().confirm,
+            Some(SessionPickerConfirm::Prune)
+        );
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Command(CommandRequest {
+                command: SessionCommand::PruneSessions { workspace_id: target },
+                ..
+            }) if *target == workspace_id
+        ));
+    }
+
+    #[test]
+    fn session_deleted_event_drops_state_and_refocuses_a_neighbor() {
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let deleted = initial.sessions[0].id;
+        let neighbor = id(9, SessionId::from_bytes);
+        initial.sessions.push(SessionSummary {
+            id: neighbor,
+            workspace_id,
+            parent_id: None,
+            title: "Neighbor".to_owned(),
+            status: SessionStatus::Idle,
+            active_run_id: None,
+            queued_prompts: 0,
+            model: Some("openai/gpt-test".to_owned()),
+            estimated_cost_usd_nanos: Some(0),
+            updated_at_ms: 0,
+            last_outcome: None,
+        });
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(initial);
+        assert_eq!(app.focused, Some(deleted));
+        let tool_call_id = id(7, qq_protocol::ToolCallId::from_bytes);
+        app.sessions
+            .get_mut(&deleted)
+            .unwrap()
+            .tool_calls
+            .as_mut()
+            .unwrap()
+            .push(ToolCallSnapshot {
+                id: tool_call_id,
+                session_id: deleted,
+                run_id: id(8, RunId::from_bytes),
+                turn_ordinal: 1,
+                call_ordinal: 0,
+                provider_call_id: "call_0".to_owned(),
+                name: "shell".to_owned(),
+                arguments: "{}".to_owned(),
+                state: ToolCallState::Running,
+                result: None,
+                is_error: false,
+                display: None,
+            });
+        app.live_tool_output
+            .insert(tool_call_id, "output tail".to_owned());
+        app.open_sessions();
+
+        let changed = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: id(3, StoreId::from_bytes),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: deleted,
+            run_id: None,
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::SessionDeleted {
+                session_id: deleted,
+            },
+        }));
+
+        assert!(changed);
+        assert!(!app.sessions.contains_key(&deleted));
+        assert!(!app.live_tool_output.contains_key(&tool_call_id));
+        assert_eq!(app.focused, Some(neighbor));
+        assert_eq!(
+            app.session_picker.as_ref().unwrap().selected,
+            Some(neighbor)
+        );
+        // The refocus fetches the neighbor's transcript.
+        let requests = app.take_requests();
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Snapshot(SnapshotRequest {
+                focused_session_id: Some(session_id),
+                ..
+            }) if *session_id == neighbor
+        ));
+        assert!(app.take_requests().is_empty());
+    }
+
+    #[test]
+    fn session_deleted_event_clears_focus_when_no_session_remains() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let deleted = initial.sessions[0].id;
+        app.apply_snapshot(initial);
+        assert_eq!(app.focused, Some(deleted));
+
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: id(3, StoreId::from_bytes),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: deleted,
+            run_id: None,
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::SessionDeleted {
+                session_id: deleted,
+            },
+        }));
+
+        assert!(app.sessions.is_empty());
+        assert_eq!(app.focused, None);
+        assert!(app.take_requests().is_empty());
+    }
+
+    #[test]
+    fn session_updated_event_repoints_the_session_model() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let session_id = initial.sessions[0].id;
+        let mut updated = initial.sessions[0].clone();
+        updated.model = Some("anthropic/claude-sonnet-5".to_owned());
+        app.apply_snapshot(initial);
+
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: id(3, StoreId::from_bytes),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id,
+            run_id: None,
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::SessionUpdated { session: updated },
+        }));
+
+        assert_eq!(
+            app.sessions[&session_id].summary.model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+    }
+
+    #[test]
     fn context_usage_uses_latest_reported_input_and_model_limit() {
         let selection = ModelSelection {
             model: Some("openai/gpt-test".to_owned()),
@@ -2163,12 +2637,15 @@ mod tests {
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.model, selection);
+        // A session is focused, so Enter applies the preserved selection to
+        // it rather than creating a new session.
+        let focused = app.focused.unwrap();
         assert!(matches!(
             &requests[0],
             ClientRequest::Command(CommandRequest {
-                command: SessionCommand::CreateSession { model, .. },
+                command: SessionCommand::SetSessionModel { session_id, model },
                 ..
-            }) if model == &selection
+            }) if model == &selection && *session_id == focused
         ));
     }
 
@@ -2186,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_filters_and_creates_an_immutable_model_session() {
+    fn model_picker_applies_to_the_focused_session_and_ctrl_n_creates() {
         let selection = ModelSelection {
             model: Some("anthropic/claude-sonnet-5".to_owned()),
             max_output_tokens: Some(8_192),
@@ -2212,7 +2689,64 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.filtered_models(), vec![0]);
 
+        // Enter with a focused session repoints that session's model.
+        let focused = app.focused.unwrap();
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let ClientRequest::Command(request) = &requests[0] else {
+            panic!("expected set-session-model command")
+        };
+        assert!(matches!(
+            &request.command,
+            SessionCommand::SetSessionModel { session_id, model }
+                if model == &selection && *session_id == focused
+        ));
+        assert!(app.model_picker.is_none());
+
+        // Ctrl-N creates a fresh session with the selected model instead.
+        app.open_models();
+        let (_, requests) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        let ClientRequest::Command(request) = &requests[0] else {
+            panic!("expected create-session command")
+        };
+        assert!(matches!(
+            &request.command,
+            SessionCommand::CreateSession {
+                parent_id: None,
+                model,
+                ..
+            } if model == &selection
+        ));
+        assert!(app.model_picker.is_none());
+    }
+
+    #[test]
+    fn model_picker_enter_without_a_focused_session_creates_one() {
+        let selection = ModelSelection {
+            model: Some("anthropic/claude-sonnet-5".to_owned()),
+            max_output_tokens: Some(8_192),
+            organization: None,
+        };
+        let mut app = App::new(TuiOptions {
+            settings: Settings::default(),
+            model: ModelSelection::default(),
+            models: vec![ModelOption {
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet-5".to_owned(),
+                name: Some("Claude Sonnet 5".to_owned()),
+                context_window: Some(200_000),
+                selection: selection.clone(),
+            }],
+        });
+        let mut empty = snapshot();
+        empty.sessions.clear();
+        empty.focused = None;
+        app.apply_snapshot(empty);
+        assert!(app.focused.is_none());
+        app.open_models();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
         let ClientRequest::Command(request) = &requests[0] else {
             panic!("expected create-session command")
         };
@@ -2641,6 +3175,7 @@ mod tests {
         app.session_picker = Some(SessionPicker {
             query: String::new(),
             selected: None,
+            confirm: None,
         });
         app.handle_key(ctrl_o);
         assert_eq!(app.tool_detail, ToolDetail::Collapsed);
@@ -2777,6 +3312,7 @@ mod tests {
         app.session_picker = Some(SessionPicker {
             query: String::new(),
             selected: app.focused,
+            confirm: None,
         });
         assert!(!app.handle_terminal_event(wheel).0);
         assert!(!app.handle_terminal_event(page).0);

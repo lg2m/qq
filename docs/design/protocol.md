@@ -43,7 +43,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 ```
 
 Clients and servers must agree on this value.
@@ -192,6 +192,9 @@ POST /v1/models
 POST /v1/sessions
 POST /v1/sessions/prompts
 POST /v1/sessions/approval-mode
+POST /v1/sessions/model
+POST /v1/sessions/delete
+POST /v1/sessions/prune
 POST /v1/runs/cancel
 POST /v1/tools/approvals
 GET  /v1/workspaces/{workspace_id}/events
@@ -208,7 +211,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 11,
+  "protocol_version": 12,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -439,6 +442,102 @@ Outcome:
 }
 ```
 
+### `POST /v1/sessions/model`
+
+```json
+{
+  "command_id": "...",
+  "command": {
+    "type": "set_session_model",
+    "session_id": "...",
+    "model": {
+      "model": "provider/model-id",
+      "max_output_tokens": 8192,
+      "organization": null
+    }
+  }
+}
+```
+
+Repoints the session's model. The selection is validated exactly like
+`create_session`. It takes effect when the next run is claimed; a run that is
+already executing keeps the model it started with.
+
+Outcome:
+
+```json
+{
+  "type": "session_model_set",
+  "session_id": "...",
+  "model": { "model": "provider/model-id" }
+}
+```
+
+Emits `session_updated` carrying the full refreshed `SessionSummary`.
+
+### `POST /v1/sessions/delete`
+
+```json
+{
+  "command_id": "...",
+  "command": {
+    "type": "delete_session",
+    "session_id": "..."
+  }
+}
+```
+
+Deletes the session and every row it owns — runs, messages, model turns, tool
+calls, session files, and grants — in one transaction. Rejected with `400`
+while the session has an active run; cancel the run first. Child sessions
+survive as roots.
+
+The session's rows in the workspace event log are deliberately **kept**:
+cursors promise a gapless `previous + 1` sequence to subscribers, so removing
+event rows would break every replay that spans the deletion. Replaying the
+kept events is harmless because the trailing `session_deleted` event
+converges any client on the deleted state; snapshots never include deleted
+sessions.
+
+Outcome:
+
+```json
+{
+  "type": "session_deleted",
+  "session_id": "..."
+}
+```
+
+Emits `session_deleted`.
+
+### `POST /v1/sessions/prune`
+
+```json
+{
+  "command_id": "...",
+  "command": {
+    "type": "prune_sessions",
+    "workspace_id": "..."
+  }
+}
+```
+
+Deletes every idle session in the workspace that has no messages and no runs
+(the residue of creating sessions without prompting them), with the same
+per-session guarantees as `delete_session`.
+
+Outcome:
+
+```json
+{
+  "type": "sessions_pruned",
+  "workspace_id": "...",
+  "deleted": 2
+}
+```
+
+Emits one `session_deleted` per deleted session.
+
 ### `POST /v1/workspaces/snapshot`
 
 Not a command. Request:
@@ -590,6 +689,8 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `type` | Principal fields | When |
 | --- | --- | --- |
 | `session_created` | `session` | New session row committed |
+| `session_updated` | `session` | Non-run session mutation (today: model repointed) |
+| `session_deleted` | `session_id` | Session and its rows deleted; earlier events remain |
 | `prompt_queued` | `session`, `message`, `run`, `queue_position` | User prompt accepted |
 | `run_started` | `session`, `run_id` | Run leaves the queue |
 | `assistant_message_started` | `message` | A model turn's message begins streaming |
