@@ -1,7 +1,5 @@
 # QQ Protocol Specification
 
-Status: implemented through protocol version 8
-
 ## Purpose
 
 This document specifies the versioned HTTP/SSE wire protocol between QQ
@@ -21,9 +19,9 @@ Canonical source of truth for schemas and tags:
 
 Related documents:
 
-- `docs/architecture.md` — system shape and transport choices
-- `docs/tool-execution.md` — tool loop, approvals, and security policy
-- `docs/transcript-rendering.md` — client presentation of session history
+- `docs/design/architecture.md` — system shape and transport choices
+- `docs/design/tools.md` — tool loop, approvals, and security policy
+- `docs/design/transcript.md` — client presentation of session history
 
 ## Design Principles
 
