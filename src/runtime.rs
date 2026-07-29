@@ -429,9 +429,12 @@ impl RuntimeFactory {
             HttpCredential::OpenAiCodex { profile } => {
                 let profile = profile.as_deref().unwrap_or("default");
                 PreparedHttpAuth::RequestTime {
-                    auth: HttpAuth::RequestTime(
-                        self.inner.credentials.codex_request_credentials(profile),
-                    ),
+                    auth: HttpAuth::RequestTime {
+                        credentials: self.inner.credentials.codex_request_credentials(profile),
+                        // ChatGPT Codex rejects standard Responses fields such
+                        // as max_output_tokens.
+                        codex_responses: true,
+                    },
                     key_auth: ResolvedAuth::NoAuth,
                     identity: vec![("credential-profile".to_owned(), profile.to_owned())],
                 }
@@ -448,11 +451,13 @@ impl RuntimeFactory {
                     None => ResolvedAuth::NoAuth,
                 };
                 PreparedHttpAuth::RequestTime {
-                    auth: HttpAuth::RequestTime(
-                        self.inner
+                    auth: HttpAuth::RequestTime {
+                        credentials: self
+                            .inner
                             .credentials
                             .xai_request_credentials(profile, api_key.clone()),
-                    ),
+                        codex_responses: false,
+                    },
                     key_auth,
                     identity: vec![("credential-profile".to_owned(), profile.to_owned())],
                 }

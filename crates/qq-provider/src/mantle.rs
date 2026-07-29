@@ -174,6 +174,7 @@ fn build_provider(
                 api_key.map_or(ResponsesAuth::NoAuth, ResponsesAuth::Bearer),
                 [],
                 authorizer,
+                false,
             )?)
         }
         HttpProtocol::OpenAiChatCompletions => MantleProvider::OpenAiChatCompletions(

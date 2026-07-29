@@ -26,6 +26,10 @@ const MAX_DISCOVERED_MODELS: usize = 4_096;
 const MAX_CACHE_ENTRIES: usize = 32;
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
+// Codex gates `/models` on a supported Codex client version, not QQ's package
+// version. Keep this at least as high as the newest listed model's
+// `minimal_client_version`.
+const CODEX_MODELS_CLIENT_VERSION: &str = "0.144.0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiscoveredModel {
@@ -138,7 +142,7 @@ impl ModelDiscovery {
             (ProviderKind::OpenAiCodex, _) => {
                 endpoint
                     .query_pairs_mut()
-                    .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+                    .append_pair("client_version", CODEX_MODELS_CLIENT_VERSION);
             }
             _ => {}
         }

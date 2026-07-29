@@ -110,12 +110,14 @@ impl OpenAi {
         auth: ResponsesAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, ProviderError> {
+        let codex_request_shape = matches!(&auth, ResponsesAuth::Codex { .. });
         Self::with_client_and_authorizer(
             client,
             endpoint,
             auth,
             static_headers,
             RequestAuthorizer::default(),
+            codex_request_shape,
         )
     }
 
@@ -125,8 +127,12 @@ impl OpenAi {
         auth: ResponsesAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
         authorizer: RequestAuthorizer,
+        codex_request_shape: bool,
     ) -> Result<Self, ProviderError> {
-        let request_kind = if matches!(&auth, ResponsesAuth::Codex { .. }) {
+        // Codex rejects standard Responses fields such as max_output_tokens.
+        // Request-time Codex auth keeps secrets out of ResponsesAuth, so the
+        // compiler must pass the body shape explicitly.
+        let request_kind = if codex_request_shape || matches!(&auth, ResponsesAuth::Codex { .. }) {
             ResponsesRequestKind::Codex
         } else {
             ResponsesRequestKind::Standard
@@ -175,7 +181,10 @@ impl Provider for OpenAi {
                 Err(api_error(response, redactions.as_ref()).await)?
             };
 
-            if !is_event_stream(&response) {
+            // ChatGPT Codex streams valid SSE frames but often omits
+            // Content-Type entirely. Standard OpenAI Responses still requires
+            // text/event-stream so a JSON success body cannot be misread.
+            if !accepts_responses_stream(&response, request_kind) {
                 Err(ProviderError::Protocol(
                     "OpenAI returned a non-SSE response".to_owned(),
                 ))?;
@@ -420,6 +429,20 @@ fn is_request_controlled_header(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn accepts_responses_stream(
+    response: &reqwest::Response,
+    request_kind: ResponsesRequestKind,
+) -> bool {
+    if is_event_stream(response) {
+        return true;
+    }
+    matches!(request_kind, ResponsesRequestKind::Codex)
+        && response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .is_none()
 }
 
 fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
@@ -1234,6 +1257,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_accepts_sse_without_content_type() {
+        // Live ChatGPT Codex responses stream SSE frames with no Content-Type.
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        );
+        let (endpoint, server) = serve_once(
+            "/backend-api/codex/responses",
+            "200 OK",
+            "",
+            body,
+        );
+        let provider = OpenAi::with_endpoint(
+            &endpoint,
+            ResponsesAuth::Codex {
+                access_token: "codex-test-access-token".to_owned(),
+                account_id: "workspace-test-id".to_owned(),
+                is_fedramp: false,
+            },
+            [],
+            true,
+        )
+        .unwrap();
+
+        let events = provider
+            .stream(ModelRequest::new(
+                "gpt-5.4-mini",
+                vec![Message::user("ping")],
+                128,
+            ))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::OutputTextDelta {
+                    text: "pong".to_owned(),
+                },
+                ProviderEvent::Completed { usage: None },
+            ]
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn standard_responses_still_require_event_stream_content_type() {
+        let body = "data: {\"type\":\"response.completed\"}\n\n";
+        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "", body);
+        let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
+
+        let events = provider
+            .stream(ModelRequest::new(
+                "gpt-test",
+                vec![Message::user("ping")],
+                128,
+            ))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            &events[..],
+            [Err(ProviderError::Protocol(message))]
+                if message == "OpenAI returned a non-SSE response"
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn streams_tool_calls_with_attributed_arguments_to_completion() {
         let body = concat!(
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
@@ -1414,8 +1511,15 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let request = read_request(&mut stream);
+            // Empty content_type omits the header so Codex's live missing
+            // Content-Type behavior can be regression-tested.
+            let content_type_header = if content_type.is_empty() {
+                String::new()
+            } else {
+                format!("Content-Type: {content_type}\r\n")
+            };
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\n{content_type_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();

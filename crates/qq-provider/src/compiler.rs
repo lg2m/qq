@@ -61,13 +61,14 @@ impl ProviderCompiler {
 
         match recipe.protocol {
             HttpProtocol::OpenAiResponses => {
-                let (auth, authorizer) = responses_auth(recipe.auth)?;
+                let (auth, authorizer, codex_request_shape) = responses_auth(recipe.auth)?;
                 Ok(Arc::new(OpenAi::with_client_and_authorizer(
                     client,
                     endpoint,
                     auth,
                     recipe.headers,
                     authorizer,
+                    codex_request_shape,
                 )?))
             }
             HttpProtocol::OpenAiChatCompletions => {
@@ -260,7 +261,14 @@ pub enum HttpAuth {
         account_id: String,
         is_fedramp: bool,
     },
-    RequestTime(SharedRequestCredentialProvider),
+    /// Credentials resolved on each request.
+    ///
+    /// `codex_responses` selects the Codex Responses body shape (omit
+    /// `max_output_tokens`) when the recipe uses OpenAI Responses.
+    RequestTime {
+        credentials: SharedRequestCredentialProvider,
+        codex_responses: bool,
+    },
 }
 
 impl fmt::Debug for HttpAuth {
@@ -285,20 +293,31 @@ impl fmt::Debug for HttpAuth {
                 .field("access_token", &"<redacted>")
                 .field("account_id", &"<redacted>")
                 .finish_non_exhaustive(),
-            Self::RequestTime(_) => formatter.write_str("RequestTime([REDACTED])"),
+            Self::RequestTime {
+                codex_responses, ..
+            } => formatter
+                .debug_struct("RequestTime")
+                .field("credentials", &"[REDACTED]")
+                .field("codex_responses", codex_responses)
+                .finish(),
         }
     }
 }
 
-fn responses_auth(auth: HttpAuth) -> Result<(ResponsesAuth, RequestAuthorizer), ProviderError> {
+fn responses_auth(
+    auth: HttpAuth,
+) -> Result<(ResponsesAuth, RequestAuthorizer, bool), ProviderError> {
     match auth {
-        HttpAuth::NoAuth => Ok((ResponsesAuth::NoAuth, RequestAuthorizer::default())),
-        HttpAuth::ApiKey(secret) | HttpAuth::Bearer(secret) => {
-            Ok((ResponsesAuth::Bearer(secret), RequestAuthorizer::default()))
-        }
+        HttpAuth::NoAuth => Ok((ResponsesAuth::NoAuth, RequestAuthorizer::default(), false)),
+        HttpAuth::ApiKey(secret) | HttpAuth::Bearer(secret) => Ok((
+            ResponsesAuth::Bearer(secret),
+            RequestAuthorizer::default(),
+            false,
+        )),
         HttpAuth::Header(name, secret) => Ok((
             ResponsesAuth::Header(name, secret),
             RequestAuthorizer::default(),
+            false,
         )),
         HttpAuth::Codex {
             access_token,
@@ -311,10 +330,15 @@ fn responses_auth(auth: HttpAuth) -> Result<(ResponsesAuth, RequestAuthorizer), 
                 is_fedramp,
             },
             RequestAuthorizer::default(),
+            true,
         )),
-        HttpAuth::RequestTime(credentials) => Ok((
+        HttpAuth::RequestTime {
+            credentials,
+            codex_responses,
+        } => Ok((
             ResponsesAuth::NoAuth,
             RequestAuthorizer::request_credentials(credentials),
+            codex_responses,
         )),
     }
 }
@@ -335,7 +359,7 @@ fn chat_completions_auth(
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
-        HttpAuth::RequestTime(credentials) => Ok((
+        HttpAuth::RequestTime { credentials, .. } => Ok((
             ChatCompletionsAuth::NoAuth,
             RequestAuthorizer::request_credentials(credentials),
         )),
@@ -358,7 +382,7 @@ fn anthropic_auth(auth: HttpAuth) -> Result<(AnthropicAuth, RequestAuthorizer), 
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
-        HttpAuth::RequestTime(credentials) => Ok((
+        HttpAuth::RequestTime { credentials, .. } => Ok((
             AnthropicAuth::NoAuth,
             RequestAuthorizer::request_credentials(credentials),
         )),
@@ -374,7 +398,7 @@ fn google_auth(auth: HttpAuth) -> Result<GoogleAuth, ProviderError> {
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
-        HttpAuth::RequestTime(_) => Err(ProviderError::Configuration(
+        HttpAuth::RequestTime { .. } => Err(ProviderError::Configuration(
             "request-time credentials are not supported by Google GenerateContent".to_owned(),
         )),
     }
@@ -433,6 +457,70 @@ mod tests {
             request_header(head, "authorization"),
             Some("Bearer test-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn request_time_codex_auth_omits_max_output_tokens() {
+        let (base_url, server) = serve_once("data: {\"type\":\"response.completed\"}\n\n");
+        let compiler = ProviderCompiler::new().unwrap();
+        let provider = compiler
+            .compile(ProviderRecipe::http(HttpProviderRecipe::new(
+                EndpointSpec::exact(format!("{base_url}/backend-api/codex/responses"), true),
+                HttpProtocol::OpenAiResponses,
+                HttpAuth::RequestTime {
+                    credentials: SharedRequestCredentialProvider::new(StaticCodexCredentials),
+                    codex_responses: true,
+                },
+            )))
+            .unwrap();
+
+        let events = provider
+            .stream(ModelRequest::new(
+                "gpt-test",
+                vec![Message::user("ping")],
+                128,
+            ))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::Completed { usage: None })
+        ));
+        let request = server.join().unwrap();
+        let (head, request_body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            request_header(head, "authorization"),
+            Some("Bearer codex-test-access-token")
+        );
+        assert_eq!(
+            request_header(head, "chatgpt-account-id"),
+            Some("workspace-test-id")
+        );
+        assert_eq!(request_header(head, "originator"), Some("qq"));
+
+        let request_body: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        assert_eq!(request_body["model"], "gpt-test");
+        assert!(
+            !request_body
+                .as_object()
+                .unwrap()
+                .contains_key("max_output_tokens")
+        );
+    }
+
+    struct StaticCodexCredentials;
+
+    impl crate::RequestCredentialProvider for StaticCodexCredentials {
+        fn credential(&self) -> crate::RequestCredentialFuture<'_> {
+            Box::pin(async {
+                crate::RequestCredential::codex(
+                    "codex-test-access-token",
+                    "workspace-test-id",
+                    false,
+                )
+            })
+        }
     }
 
     #[test]
