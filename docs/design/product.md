@@ -175,10 +175,11 @@ only preparation they need now.
 These choices should be resolved by focused designs or small benchmarks rather
 than assumptions:
 
-- Exact HTTP, TUI, and SQLite crates.
-- How `qq` discovers or selects an existing server.
-- Authentication for a server exposed on a Tailscale address.
-- Session control when several clients are attached.
-- First model provider and credential flow.
-- Default approval policy for shell commands and file changes.
+- Authentication for a server exposed on a Tailscale address (loopback
+  bearer-token auth is settled; the remote story is not).
+- Session control when several clients are attached to one session.
 - Concrete startup, latency, memory, and binary-size targets.
+
+Decisions previously listed here — crate choices, server discovery,
+provider and credential flow, and default approval policy — are made and
+recorded in `architecture.md`, `providers.md`, and `tools.md`.
