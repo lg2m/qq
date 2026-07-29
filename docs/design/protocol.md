@@ -43,16 +43,14 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
 values (1–12) belonged to pre-release iterations and no released build
 speaks them. The number is a build-compatibility counter, not a product
-version — being "high" carries no meaning.
-
-```text
-```
+version — being "high" carries no meaning. Version 2 added session
+compaction (`compact_session`, `session_compacted`).
 
 Clients and servers must agree on this value.
 
@@ -203,6 +201,7 @@ POST /v1/sessions/approval-mode
 POST /v1/sessions/model
 POST /v1/sessions/delete
 POST /v1/sessions/prune
+POST /v1/sessions/compact
 POST /v1/runs/cancel
 POST /v1/tools/approvals
 GET  /v1/workspaces/{workspace_id}/events
@@ -546,6 +545,48 @@ Outcome:
 
 Emits one `session_deleted` per deleted session.
 
+### `POST /v1/sessions/compact`
+
+```json
+{
+  "command_id": "...",
+  "command": {
+    "type": "compact_session",
+    "session_id": "..."
+  }
+}
+```
+
+Compacts the session's model context. Valid only while the session is idle:
+rejected with `400` while a run is active or prompts are queued, exactly like
+`delete_session`'s active-run refusal. The command queues an **internal**
+summarization run that flows through the ordinary run machinery (permits,
+cancellation via `cancel_run`, usage and cost accounting) but whose request
+messages and streamed output never join the session transcript. Its product
+is a durable summary row plus a cutoff marker, committed atomically with the
+run's completion; later runs assemble context as agent instructions + latest
+summary + verbatim transcript after the marker. The client transcript is
+untouched. A crash mid-summarization commits no marker; retry the command.
+
+A later `compact_session` summarizes the current summary together with the
+span since the marker, so repeated compactions fold rather than stack. A
+small bounded history of prior compactions is retained server-side.
+
+Outcome:
+
+```json
+{
+  "type": "compaction_queued",
+  "session_id": "...",
+  "run_id": "..."
+}
+```
+
+Emits `session_updated` (the session shows queued), then the internal run's
+`run_started` and `run_finished`, then `session_compacted` when the summary
+commits. A failed or cancelled summarization emits only `run_finished` with
+that outcome and leaves assembly unchanged.
+
 ### `POST /v1/workspaces/snapshot`
 
 Not a command. Request:
@@ -697,7 +738,7 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `type` | Principal fields | When |
 | --- | --- | --- |
 | `session_created` | `session` | New session row committed |
-| `session_updated` | `session` | Non-run session mutation (today: model repointed) |
+| `session_updated` | `session` | Non-run session mutation (model repointed, compaction queued) |
 | `session_deleted` | `session_id` | Session and its rows deleted; earlier events remain |
 | `prompt_queued` | `session`, `message`, `run`, `queue_position` | User prompt accepted |
 | `run_started` | `session`, `run_id` | Run leaves the queue |
@@ -711,11 +752,18 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `tool_call_finished` | `tool_call` | Execution ended with result/error |
 | `cancellation_requested` | `session`, `run_id` | Cancel command accepted for a live run |
 | `run_finished` | `session`, `run_id`, `outcome`, optional `usage` | Terminal run state |
+| `session_compacted` | `session`, optional `summary`, `before_bytes`, `after_bytes` | Compaction summary + cutoff committed |
 
 Text channels:
 
 - `output` — normal assistant text
 - `refusal` — model refusal text
+
+`session_compacted` carries the refreshed `SessionSummary` (the internal run
+has already finished when it is published), a bounded excerpt of the summary
+text (optional on the wire), and the assembled context size in bytes before
+and after the compaction so clients can surface the shrink without waiting
+for the next run's usage.
 
 ### Snapshots embedded in events
 

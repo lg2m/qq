@@ -643,6 +643,7 @@ impl SessionClient {
             SessionCommand::SetSessionModel { .. } => "/v1/sessions/model",
             SessionCommand::DeleteSession { .. } => "/v1/sessions/delete",
             SessionCommand::PruneSessions { .. } => "/v1/sessions/prune",
+            SessionCommand::CompactSession { .. } => "/v1/sessions/compact",
         };
         self.post_json(
             path,
