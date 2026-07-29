@@ -21,6 +21,10 @@ const MAX_RECENT_EVENTS: usize = 1024;
 const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
 const MAX_RECENT_TOOL_CALLS: usize = 64;
+/// Per-call cap on buffered live tool output. The buffer is a display tail,
+/// not a record: the head drops first, and the persisted bounded result
+/// replaces the buffer when the call finishes.
+const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub(crate) struct SlashCommand {
@@ -206,6 +210,9 @@ pub(crate) struct App {
     /// Diff previews carried by approval requests, kept only while the call
     /// awaits an answer so the modal can show what an edit would change.
     edit_previews: HashMap<qq_protocol::ToolCallId, EditPreview>,
+    /// Bounded tails of live streamed output per running tool call, dropped
+    /// when the call reaches a terminal state or the session state reloads.
+    pub live_tool_output: HashMap<qq_protocol::ToolCallId, String>,
 }
 
 impl App {
@@ -234,6 +241,7 @@ impl App {
             pending: HashMap::new(),
             answered_approvals: std::collections::HashSet::new(),
             edit_previews: HashMap::new(),
+            live_tool_output: HashMap::new(),
         }
     }
 
@@ -254,6 +262,7 @@ impl App {
                 self.last_sequence = 0;
                 self.recent_events.clear();
                 self.edit_previews.clear();
+                self.live_tool_output.clear();
                 self.status = Some("session state reset after reconnecting".to_owned());
                 self.apply_snapshot(snapshot)
             }
@@ -431,6 +440,9 @@ impl App {
             session.messages = None;
             session.tool_calls = None;
         }
+        // A snapshot replaces live per-call state wholesale; buffered output
+        // for calls it no longer reports as running would render forever.
+        self.live_tool_output.clear();
         let mut messages = snapshot.messages;
         retain_recent_messages(&mut messages);
         let mut tool_calls = snapshot.tool_calls;
@@ -557,10 +569,15 @@ impl App {
                 }
                 self.upsert_tool_call(tool_call.clone());
             }
-            // Live shell output chunks are display-only; rendering them in
-            // the transcript is follow-up TUI work, and the call's bounded
-            // result arrives on ToolCallFinished regardless.
-            SessionEvent::ToolCallOutputDelta { .. } => {}
+            // Live tool output chunks are display-only: they feed the bounded
+            // tail under a running call's line, and the call's authoritative
+            // bounded result arrives on ToolCallFinished regardless.
+            SessionEvent::ToolCallOutputDelta {
+                tool_call_id,
+                chunk,
+            } => {
+                self.append_live_tool_output(*tool_call_id, chunk);
+            }
             SessionEvent::ToolCallRequested { tool_call }
             | SessionEvent::ToolApprovalResolved { tool_call, .. }
             | SessionEvent::ToolCallStarted { tool_call }
@@ -577,6 +594,10 @@ impl App {
                 if tool_call.state != ToolCallState::AwaitingApproval {
                     self.answered_approvals.remove(&tool_call.id);
                     self.edit_previews.remove(&tool_call.id);
+                }
+                if tool_call_state_is_terminal(tool_call.state) {
+                    // The persisted bounded result takes over from the tail.
+                    self.live_tool_output.remove(&tool_call.id);
                 }
                 self.upsert_tool_call(tool_call.clone());
             }
@@ -709,6 +730,21 @@ impl App {
             .as_mut()?
             .iter_mut()
             .find(|message| message.id == message_id)
+    }
+
+    /// Appends one live output chunk to a call's tail buffer, dropping the
+    /// oldest bytes past the bound. Trimming lands on a character boundary so
+    /// a chunk split mid-UTF-8 sequence still renders sanely.
+    fn append_live_tool_output(&mut self, tool_call_id: qq_protocol::ToolCallId, chunk: &str) {
+        let buffer = self.live_tool_output.entry(tool_call_id).or_default();
+        buffer.push_str(chunk);
+        if buffer.len() > MAX_LIVE_TOOL_OUTPUT_BYTES {
+            let mut start = buffer.len() - MAX_LIVE_TOOL_OUTPUT_BYTES;
+            while !buffer.is_char_boundary(start) {
+                start += 1;
+            }
+            buffer.drain(..start);
+        }
     }
 
     fn upsert_tool_call(&mut self, tool_call: ToolCallSnapshot) {
@@ -1503,6 +1539,18 @@ fn retain_recent_messages(messages: &mut Vec<MessageSnapshot>) {
     }
 }
 
+const fn tool_call_state_is_terminal(state: ToolCallState) -> bool {
+    match state {
+        ToolCallState::Completed
+        | ToolCallState::Failed
+        | ToolCallState::Denied
+        | ToolCallState::Interrupted => true,
+        ToolCallState::Requested | ToolCallState::AwaitingApproval | ToolCallState::Running => {
+            false
+        }
+    }
+}
+
 fn retain_recent_tool_calls(tool_calls: &mut Vec<ToolCallSnapshot>) {
     let excess = tool_calls.len().saturating_sub(MAX_RECENT_TOOL_CALLS);
     if excess > 0 {
@@ -1639,6 +1687,7 @@ mod tests {
             state: ToolCallState::AwaitingApproval,
             result: None,
             is_error: false,
+            display: None,
         };
         app.upsert_tool_call(tool_call.clone());
         assert_eq!(
@@ -1706,6 +1755,7 @@ mod tests {
             state: ToolCallState::AwaitingApproval,
             result: None,
             is_error: false,
+            display: None,
         });
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -1756,6 +1806,7 @@ mod tests {
             state: ToolCallState::AwaitingApproval,
             result: None,
             is_error: false,
+            display: None,
         };
 
         app.apply_live_event(envelope(
@@ -2222,6 +2273,7 @@ mod tests {
             state: ToolCallState::Requested,
             result: None,
             is_error: false,
+            display: None,
         };
         app.apply_live_event(event(
             4,
@@ -2246,6 +2298,85 @@ mod tests {
             app.sessions[&session_id].tool_calls.as_deref(),
             Some([tool_call].as_slice())
         );
+    }
+
+    #[test]
+    fn live_tool_output_keeps_a_bounded_tail_and_drops_on_terminal_states() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        let workspace_id = initial.workspace.id;
+        let store_id = initial.cursor.store_id;
+        app.apply_snapshot(initial.clone());
+        let run_id = id(4, RunId::from_bytes);
+        let tool_call_id = id(6, ToolCallId::from_bytes);
+        let event = |sequence, event| SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence,
+            },
+            session_id,
+            run_id: Some(run_id),
+            caused_by: None,
+            occurred_at_ms: sequence,
+            event,
+        };
+        let delta = |sequence, chunk: &str| {
+            event(
+                sequence,
+                SessionEvent::ToolCallOutputDelta {
+                    tool_call_id,
+                    chunk: chunk.to_owned(),
+                },
+            )
+        };
+
+        app.apply_live_event(delta(2, "hello "));
+        app.apply_live_event(delta(3, "world\n"));
+        assert_eq!(
+            app.live_tool_output.get(&tool_call_id).map(String::as_str),
+            Some("hello world\n")
+        );
+
+        // Overflow drops the head — the tail is a live view, not a record —
+        // and trimming lands on a character boundary even when the bound
+        // falls inside a multi-byte character.
+        app.apply_live_event(delta(4, &"€".repeat(2 * MAX_LIVE_TOOL_OUTPUT_BYTES / 3)));
+        let buffer = app.live_tool_output.get(&tool_call_id).unwrap();
+        assert!(buffer.len() <= MAX_LIVE_TOOL_OUTPUT_BYTES);
+        assert!(buffer.len() > MAX_LIVE_TOOL_OUTPUT_BYTES - 4);
+        assert!(buffer.chars().all(|character| character == '€'));
+
+        // A terminal state hands display over to the persisted result.
+        app.apply_live_event(event(
+            5,
+            SessionEvent::ToolCallFinished {
+                tool_call: ToolCallSnapshot {
+                    id: tool_call_id,
+                    session_id,
+                    run_id,
+                    turn_ordinal: 1,
+                    call_ordinal: 1,
+                    provider_call_id: "call-1".to_owned(),
+                    name: "shell".to_owned(),
+                    arguments: r#"{"command":"cargo build"}"#.to_owned(),
+                    state: ToolCallState::Completed,
+                    result: Some("ok\n".to_owned()),
+                    is_error: false,
+                    display: None,
+                },
+            },
+        ));
+        assert!(app.live_tool_output.is_empty());
+
+        // A session snapshot reload replaces live per-call state wholesale.
+        app.apply_live_event(delta(6, "restarted\n"));
+        assert!(!app.live_tool_output.is_empty());
+        let mut reloaded = initial;
+        reloaded.cursor.sequence = 7;
+        app.apply_snapshot(reloaded);
+        assert!(app.live_tool_output.is_empty());
     }
 
     #[test]
