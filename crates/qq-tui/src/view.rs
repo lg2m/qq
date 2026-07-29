@@ -979,7 +979,11 @@ fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     let filtered = app.filtered_sessions();
     let mut lines = vec![section(
         "SESSIONS",
-        "type to search, Up/Down select, Enter focuses, Esc closes",
+        if picker.confirm.is_some() {
+            "y confirms, n or Esc cancels"
+        } else {
+            "type to search, Enter focuses, Ctrl-D deletes, Ctrl-P prunes empty, Esc closes"
+        },
     )];
     lines.push(Line::styled(
         format!(
@@ -996,6 +1000,24 @@ fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
             accent()
         },
     ));
+    if let Some(confirm) = picker.confirm {
+        let question = match confirm {
+            crate::app::SessionPickerConfirm::Delete(session_id) => {
+                let title = app
+                    .sessions
+                    .get(&session_id)
+                    .map_or("this session", |session| session.summary.title.as_str());
+                format!("  ◇ delete '{title}'? y deletes, n keeps")
+            }
+            crate::app::SessionPickerConfirm::Prune => {
+                "  ◇ delete every empty session in this workspace? y deletes, n keeps".to_owned()
+            }
+        };
+        lines.push(truncate_line(
+            Line::styled(question, warning().bold()),
+            width,
+        ));
+    }
     lines.push(Line::default());
     if filtered.is_empty() {
         lines.push(Line::styled(
@@ -1038,7 +1060,11 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     let filtered = app.filtered_models();
     let mut lines = vec![section(
         "MODELS",
-        "type to search, Up/Down select, Enter creates session, Esc closes",
+        if app.focused.is_some() {
+            "type to search, Enter sets the session model, Ctrl-N creates a session, Esc closes"
+        } else {
+            "type to search, Up/Down select, Enter creates session, Esc closes"
+        },
     )];
     lines.push(Line::styled(
         format!(
@@ -3384,6 +3410,7 @@ mod tests {
         app.session_picker = Some(crate::app::SessionPicker {
             query: String::new(),
             selected,
+            confirm: None,
         });
 
         let frame = FrameRenderer::default().frame(&mut app, 80, 12);
@@ -3400,6 +3427,7 @@ mod tests {
         app.session_picker = Some(crate::app::SessionPicker {
             query: "missing".to_owned(),
             selected: None,
+            confirm: None,
         });
 
         let frame = FrameRenderer::default().frame(&mut app, 80, 12);
@@ -3407,6 +3435,63 @@ mod tests {
 
         assert!(text.contains("search: missing"));
         assert!(text.contains("No matching sessions."));
+    }
+
+    #[test]
+    fn session_picker_renders_delete_and_prune_confirmations() {
+        let mut app = app_with_messages(0);
+        let session_id = SessionId::from_bytes([1; 16]);
+        app.session_picker = Some(crate::app::SessionPicker {
+            query: String::new(),
+            selected: Some(session_id),
+            confirm: Some(crate::app::SessionPickerConfirm::Delete(session_id)),
+        });
+
+        let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+        let text = frame_text(&frame);
+        assert!(text.contains("y confirms, n or Esc cancels"));
+        assert!(text.contains("delete 'Session'? y deletes, n keeps"));
+
+        app.session_picker.as_mut().unwrap().confirm =
+            Some(crate::app::SessionPickerConfirm::Prune);
+        let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+        let text = frame_text(&frame);
+        assert!(text.contains("delete every empty session in this workspace?"));
+
+        // Without a pending confirmation the hint advertises both actions.
+        app.session_picker.as_mut().unwrap().confirm = None;
+        let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+        let text = frame_text(&frame);
+        assert!(text.contains("Ctrl-D deletes, Ctrl-P prunes empty"));
+    }
+
+    #[test]
+    fn model_picker_hint_reflects_apply_versus_create() {
+        let mut app = app_with_messages(0);
+        app.models.push(crate::app::ModelOption {
+            provider: "openai".to_owned(),
+            model: "gpt-test".to_owned(),
+            name: Some("GPT Test".to_owned()),
+            context_window: None,
+            selection: ModelSelection {
+                model: Some("openai/gpt-test".to_owned()),
+                max_output_tokens: None,
+                organization: None,
+            },
+        });
+        app.model_picker = Some(crate::app::ModelPicker {
+            query: String::new(),
+            selected: 0,
+        });
+
+        let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+        let text = frame_text(&frame);
+        assert!(text.contains("Enter sets the session model, Ctrl-N creates a session"));
+
+        app.focused = None;
+        let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+        let text = frame_text(&frame);
+        assert!(text.contains("Enter creates session"));
     }
 
     #[test]

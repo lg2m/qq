@@ -21,7 +21,7 @@ pub use sessions::{
     WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -640,6 +640,9 @@ impl SessionClient {
             SessionCommand::CancelRun { .. } => "/v1/runs/cancel",
             SessionCommand::RespondToolApproval { .. } => "/v1/tools/approvals",
             SessionCommand::SetApprovalMode { .. } => "/v1/sessions/approval-mode",
+            SessionCommand::SetSessionModel { .. } => "/v1/sessions/model",
+            SessionCommand::DeleteSession { .. } => "/v1/sessions/delete",
+            SessionCommand::PruneSessions { .. } => "/v1/sessions/prune",
         };
         self.post_json(
             path,

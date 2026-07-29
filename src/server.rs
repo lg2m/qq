@@ -558,6 +558,9 @@ fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router 
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/prompts", post(submit_prompt))
         .route("/v1/sessions/approval-mode", post(set_approval_mode))
+        .route("/v1/sessions/model", post(set_session_model))
+        .route("/v1/sessions/delete", post(delete_session))
+        .route("/v1/sessions/prune", post(prune_sessions))
         .route("/v1/runs/cancel", post(cancel_run))
         .route("/v1/tools/approvals", post(respond_tool_approval))
         .route(
@@ -700,6 +703,36 @@ async fn set_approval_mode(
 ) -> Response {
     session_command(state, body, |command| {
         matches!(command, SessionCommand::SetApprovalMode { .. })
+    })
+    .await
+}
+
+async fn set_session_model(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::SetSessionModel { .. })
+    })
+    .await
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::DeleteSession { .. })
+    })
+    .await
+}
+
+async fn prune_sessions(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::PruneSessions { .. })
     })
     .await
 }
@@ -1513,6 +1546,81 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].selection, selection);
         assert_eq!(models[0].context_window, Some(128_000));
+        server.shutdown().await.unwrap();
+    }
+
+    struct CommandEchoHandler {
+        commands: Arc<Mutex<Vec<CommandRequest>>>,
+    }
+
+    impl AskHandler for CommandEchoHandler {
+        fn command(&self, request: CommandRequest) -> crate::server::CommandFuture {
+            self.commands.lock().unwrap().push(request.clone());
+            Box::pin(async move {
+                Ok(CommandReceipt {
+                    command_id: request.command_id,
+                    committed_through: qq_protocol::EventCursor {
+                        store_id: qq_protocol::StoreId::from_bytes([1; 16]),
+                        workspace_id: qq_protocol::WorkspaceId::from_bytes([2; 16]),
+                        sequence: 1,
+                    },
+                    outcome: qq_protocol::CommandOutcome::SessionDeleted {
+                        session_id: qq_protocol::SessionId::from_bytes([3; 16]),
+                    },
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn session_management_commands_reach_their_routes_and_only_theirs() {
+        let directory = TestDirectory::new();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let server = start_test_server(
+            directory.paths(),
+            Arc::new(CommandEchoHandler {
+                commands: Arc::clone(&commands),
+            }),
+        )
+        .await;
+        let client = crate::client::SessionClient::new(server.connection().clone()).unwrap();
+        let session_id = qq_protocol::SessionId::from_bytes([3; 16]);
+        let workspace_id = qq_protocol::WorkspaceId::from_bytes([2; 16]);
+
+        for command in [
+            SessionCommand::SetSessionModel {
+                session_id,
+                model: qq_protocol::ModelSelection {
+                    model: Some("test/model".to_owned()),
+                    max_output_tokens: Some(256),
+                    organization: None,
+                },
+            },
+            SessionCommand::DeleteSession { session_id },
+            SessionCommand::PruneSessions { workspace_id },
+        ] {
+            let command_id = qq_protocol::CommandId::from_bytes([9; 16]);
+            let receipt = client.command(command_id, command.clone()).await.unwrap();
+            assert_eq!(receipt.command_id, command_id);
+            assert_eq!(commands.lock().unwrap().last().unwrap().command, command);
+        }
+
+        // A command posted to another command's route is rejected before the
+        // handler sees it.
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = server
+            .connection()
+            .authorize(http.post(server.connection().endpoint("/v1/sessions/model")))
+            .json(&CommandRequest {
+                command_id: qq_protocol::CommandId::from_bytes([9; 16]),
+                command: SessionCommand::DeleteSession { session_id },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(commands.lock().unwrap().len(), 3);
+
         server.shutdown().await.unwrap();
     }
 

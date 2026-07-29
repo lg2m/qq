@@ -1252,6 +1252,8 @@ pub enum SessionRuntimeError {
     WorkspaceLimitReached,
     #[error("session was not found")]
     SessionNotFound,
+    #[error("session has an active run")]
+    SessionActive,
     #[error("workspace session limit reached")]
     SessionLimitReached,
     #[error("parent session does not belong to the workspace")]
@@ -2217,19 +2219,7 @@ fn execute_command(
             model,
             approval_mode,
         } => {
-            if !model.model.as_ref().is_some_and(|value| {
-                value.len() <= MAX_MODEL_SELECTION_BYTES
-                    && value
-                        .split_once('/')
-                        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
-            }) || model.max_output_tokens == Some(0)
-                || model
-                    .organization
-                    .as_ref()
-                    .is_some_and(|value| value.len() > MAX_MODEL_SELECTION_BYTES)
-            {
-                return Err(SessionRuntimeError::InvalidModelSelection);
-            }
+            validate_model_selection(&model)?;
             ensure_workspace(&transaction, workspace_id)?;
             let session_count: u32 = transaction
                 .query_row(
@@ -2692,6 +2682,124 @@ fn execute_command(
                         sequence,
                     },
                     outcome: CommandOutcome::ApprovalModeSet { session_id, mode },
+                },
+                false,
+            )
+        }
+        SessionCommand::SetSessionModel { session_id, model } => {
+            validate_model_selection(&model)?;
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            transaction
+                .execute(
+                    "UPDATE sessions
+                     SET model = ?2, max_output_tokens = ?3, organization = ?4,
+                         updated_at_ms = ?5
+                     WHERE id = ?1",
+                    params![
+                        session_id.to_string(),
+                        model.model,
+                        model.max_output_tokens,
+                        model.organization,
+                        now,
+                    ],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            // The new selection is read at claim time (`claim_next_run`), so
+            // it applies to the next run; an executing run keeps the
+            // `ClaimedRun` model it started with.
+            let summary = load_session_summary(&transaction, session_id)?;
+            let event = append_event(
+                &transaction,
+                EventContext {
+                    store_id,
+                    workspace_id,
+                    session_id,
+                    run_id: None,
+                    caused_by: Some(command_id),
+                    occurred_at_ms: now,
+                },
+                SessionEvent::SessionUpdated { session: summary },
+            )?;
+            (
+                CommandReceipt {
+                    command_id,
+                    committed_through: event.cursor,
+                    outcome: CommandOutcome::SessionModelSet { session_id, model },
+                },
+                false,
+            )
+        }
+        SessionCommand::DeleteSession { session_id } => {
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            let event = delete_idle_session(
+                &transaction,
+                store_id,
+                workspace_id,
+                session_id,
+                command_id,
+                now,
+            )?;
+            (
+                CommandReceipt {
+                    command_id,
+                    committed_through: event.cursor,
+                    outcome: CommandOutcome::SessionDeleted { session_id },
+                },
+                false,
+            )
+        }
+        SessionCommand::PruneSessions { workspace_id } => {
+            ensure_workspace(&transaction, workspace_id)?;
+            // Idle sessions that never received a message: the residue left
+            // by creating sessions without prompting them. Anything with a
+            // run row (even a cancelled one) is history worth keeping.
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM sessions
+                     WHERE workspace_id = ?1 AND status = 'idle'
+                       AND active_run_id IS NULL AND queued_prompts = 0
+                       AND NOT EXISTS (
+                           SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM runs WHERE runs.session_id = sessions.id
+                       )
+                     ORDER BY rowid",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let victims = statement
+                .query_map([workspace_id.to_string()], |row| row.get::<_, String>(0))
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            drop(statement);
+            let mut cursor = EventCursor {
+                store_id,
+                workspace_id,
+                sequence: workspace_sequence(&transaction, workspace_id)?,
+            };
+            let mut deleted: u32 = 0;
+            for victim in victims {
+                let session_id: SessionId = parse_id(&victim)?;
+                let event = delete_idle_session(
+                    &transaction,
+                    store_id,
+                    workspace_id,
+                    session_id,
+                    command_id,
+                    now,
+                )?;
+                cursor = event.cursor;
+                deleted += 1;
+            }
+            (
+                CommandReceipt {
+                    command_id,
+                    committed_through: cursor,
+                    outcome: CommandOutcome::SessionsPruned {
+                        workspace_id,
+                        deleted,
+                    },
                 },
                 false,
             )
@@ -4563,6 +4671,90 @@ fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
     u64::try_from(total).ok()
 }
 
+/// The model-selection rules shared by `CreateSession` and `SetSessionModel`:
+/// a bounded `provider/model` route, a nonzero token budget, and a bounded
+/// organization.
+fn validate_model_selection(model: &ModelSelection) -> Result<(), SessionRuntimeError> {
+    if !model.model.as_ref().is_some_and(|value| {
+        value.len() <= MAX_MODEL_SELECTION_BYTES
+            && value
+                .split_once('/')
+                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+    }) || model.max_output_tokens == Some(0)
+        || model
+            .organization
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_MODEL_SELECTION_BYTES)
+    {
+        return Err(SessionRuntimeError::InvalidModelSelection);
+    }
+    Ok(())
+}
+
+/// Deletes one idle session and every row it owns, then appends
+/// `SessionDeleted`, all inside the caller's transaction.
+///
+/// Refused while the session has an active run. That guard also keeps the
+/// runtime's in-memory maps clean without extra plumbing: cancellation
+/// senders and pending approvals exist only for claimed (executing) runs and
+/// are removed when the run finishes, so a deletable session can have none.
+///
+/// The session's rows in the `events` log are deliberately kept. Workspace
+/// cursors promise a gapless `previous + 1` sequence to subscribers (and the
+/// sequence counter lives on the workspace row, so deletion could never
+/// regress it), which means deleting event rows would break every replay
+/// that spans the deletion. Replaying the kept events is harmless: the
+/// trailing `SessionDeleted` converges any client on the deleted state.
+fn delete_idle_session(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    workspace_id: WorkspaceId,
+    session_id: SessionId,
+    command_id: CommandId,
+    now: u64,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let active_run: Option<String> = transaction
+        .query_row(
+            "SELECT active_run_id FROM sessions WHERE id = ?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::SessionNotFound)?;
+    if active_run.is_some() {
+        return Err(SessionRuntimeError::SessionActive);
+    }
+    let session = session_id.to_string();
+    // Children survive their parent as root sessions.
+    for statement in [
+        "UPDATE sessions SET parent_id = NULL WHERE parent_id = ?1",
+        "DELETE FROM tool_calls WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?1)",
+        "DELETE FROM model_turns WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?1)",
+        "DELETE FROM messages WHERE session_id = ?1",
+        "DELETE FROM runs WHERE session_id = ?1",
+        "DELETE FROM session_grants WHERE session_id = ?1",
+        "DELETE FROM session_files WHERE session_id = ?1",
+        "DELETE FROM sessions WHERE id = ?1",
+    ] {
+        transaction
+            .execute(statement, [&session])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    append_event(
+        transaction,
+        EventContext {
+            store_id,
+            workspace_id,
+            session_id,
+            run_id: None,
+            caused_by: Some(command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::SessionDeleted { session_id },
+    )
+}
+
 fn ensure_workspace(
     connection: &Connection,
     workspace_id: WorkspaceId,
@@ -5397,6 +5589,435 @@ mod tests {
         .await
         .unwrap();
         (directory, runtime)
+    }
+
+    /// Records the model each run is loaded with, then behaves like a
+    /// one-tool-turn approval run: the run parks at a `__test_mutate`
+    /// approval, which gives tests a deterministic "run is active" point.
+    struct RecordingApprovalLoader {
+        models: Arc<StdMutex<Vec<Option<String>>>>,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl RuntimeLoader for RecordingApprovalLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            self.models.lock().unwrap().push(request.model.model);
+            let provider = ApprovalProvider {
+                requests: Arc::clone(&self.requests),
+                turn: StdMutex::new(0),
+                tool: "__test_mutate",
+                arguments: "{}",
+                tool_turns: 1,
+            };
+            Box::pin(async move {
+                Runtime::new(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct SessionManagementHarness {
+        directory: TempDir,
+        runtime: SessionRuntime,
+        models: Arc<StdMutex<Vec<Option<String>>>>,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        store_id: StoreId,
+        events: SessionEventStream,
+    }
+
+    async fn session_management_harness() -> SessionManagementHarness {
+        let directory = tempfile::tempdir().unwrap();
+        let models = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(RecordingApprovalLoader {
+                models: Arc::clone(&models),
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        SessionManagementHarness {
+            directory,
+            runtime,
+            models,
+            workspace_id,
+            session_id,
+            store_id: created.committed_through.store_id,
+            events,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_session_model_applies_to_the_next_run_but_not_the_active_one() {
+        let mut harness = session_management_harness().await;
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "first run".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        // The run is now claimed and parked at its tool approval.
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+
+        let receipt = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SetSessionModel {
+                    session_id: harness.session_id,
+                    model: ModelSelection {
+                        model: Some("test/model-b".to_owned()),
+                        max_output_tokens: Some(512),
+                        organization: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &receipt.outcome,
+            CommandOutcome::SessionModelSet { session_id, model }
+                if *session_id == harness.session_id
+                    && model.model.as_deref() == Some("test/model-b")
+        ));
+        let updated = harness.events.next().await.unwrap().unwrap();
+        assert!(matches!(
+            &updated.event,
+            SessionEvent::SessionUpdated { session }
+                if session.model.as_deref() == Some("test/model-b")
+                    && session.active_run_id == Some(run_id)
+        ));
+
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            tool_call.id,
+            ApprovalDecision::Deny,
+        )
+        .await
+        .unwrap();
+        collect_through_finished(&mut harness.events).await;
+
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "second run".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            tool_call.id,
+            ApprovalDecision::Deny,
+        )
+        .await
+        .unwrap();
+        collect_through_finished(&mut harness.events).await;
+
+        // The active run kept its claimed model; only the next run loads the
+        // repointed one.
+        assert_eq!(
+            *harness.models.lock().unwrap(),
+            vec![
+                Some("test/model".to_owned()),
+                Some("test/model-b".to_owned())
+            ]
+        );
+
+        // The same validation as CreateSession applies.
+        assert_eq!(
+            harness
+                .runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::SetSessionModel {
+                        session_id: harness.session_id,
+                        model: ModelSelection::default(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+            SessionRuntimeError::InvalidModelSelection
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_is_refused_while_running_then_cascades_completely() {
+        let mut harness = session_management_harness().await;
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "do work".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+
+        // Refused while the run is active; the client cancels first.
+        assert_eq!(
+            harness
+                .runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::DeleteSession {
+                        session_id: harness.session_id,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            SessionRuntimeError::SessionActive
+        );
+
+        // Approving for the session also writes a grant row to cascade over.
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForSession {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        collect_through_finished(&mut harness.events).await;
+
+        let command_id = CommandId::generate().unwrap();
+        let command = SessionCommand::DeleteSession {
+            session_id: harness.session_id,
+        };
+        let receipt = harness
+            .runtime
+            .command(command_id, command.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            CommandOutcome::SessionDeleted { session_id } if session_id == harness.session_id
+        ));
+        // Idempotent: the retry returns the original durable receipt.
+        assert_eq!(
+            harness.runtime.command(command_id, command).await.unwrap(),
+            receipt
+        );
+
+        // Every session-owned row is gone in one transaction; the event log
+        // keeps its rows so replays stay gapless.
+        let connection =
+            Connection::open(harness.directory.path().join("sessions.sqlite3")).unwrap();
+        for table in [
+            "sessions",
+            "runs",
+            "messages",
+            "tool_calls",
+            "model_turns",
+            "session_grants",
+            "session_files",
+        ] {
+            let count: u32 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must be empty after the delete");
+        }
+        let events: u32 = connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert!(events > 0, "the workspace event log is append-only");
+        drop(connection);
+
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: None,
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert!(snapshot.sessions.is_empty());
+
+        // A replay across the deletion stays contiguous and ends deleted.
+        let mut replay = harness
+            .runtime
+            .subscribe(SubscribeRequest {
+                workspace_id: harness.workspace_id,
+                after: EventCursor {
+                    store_id: harness.store_id,
+                    workspace_id: harness.workspace_id,
+                    sequence: 0,
+                },
+            })
+            .unwrap();
+        let mut expected_sequence = 0;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), replay.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            expected_sequence += 1;
+            assert_eq!(event.cursor.sequence, expected_sequence);
+            if matches!(event.event, SessionEvent::SessionDeleted { session_id }
+                if session_id == harness.session_id)
+            {
+                break;
+            }
+        }
+
+        // Deleting again with a fresh command is an ordinary not-found.
+        assert_eq!(
+            harness
+                .runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::DeleteSession {
+                        session_id: harness.session_id,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            SessionRuntimeError::SessionNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_only_idle_sessions_without_messages() {
+        let (directory, runtime) = test_runtime().await;
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let kept = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id: kept } = kept.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut empties = Vec::new();
+        for _ in 0..2 {
+            let CommandOutcome::SessionCreated { session_id } =
+                create_session(&runtime, workspace_id, None).await.outcome
+            else {
+                panic!("unexpected receipt")
+            };
+            empties.push(session_id);
+        }
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: kept,
+                    prompt: "keep me".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: queued.committed_through,
+            })
+            .unwrap();
+        collect_through_finished(&mut events).await;
+
+        let receipt = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::PruneSessions { workspace_id },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            CommandOutcome::SessionsPruned { deleted: 2, .. }
+        ));
+
+        // One SessionDeleted per victim; the prompted session survives.
+        let mut deleted = Vec::new();
+        while deleted.len() < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let SessionEvent::SessionDeleted { session_id } = event.event {
+                deleted.push(session_id);
+            }
+        }
+        assert_eq!(deleted, empties);
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: None,
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![kept]
+        );
+
+        // A second prune finds nothing left to delete.
+        let receipt = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::PruneSessions { workspace_id },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            CommandOutcome::SessionsPruned { deleted: 0, .. }
+        ));
     }
 
     #[test]
