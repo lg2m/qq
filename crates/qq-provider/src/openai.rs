@@ -1265,12 +1265,7 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n",
             "data: {\"type\":\"response.completed\"}\n\n",
         );
-        let (endpoint, server) = serve_once(
-            "/backend-api/codex/responses",
-            "200 OK",
-            "",
-            body,
-        );
+        let (endpoint, server) = serve_once("/backend-api/codex/responses", "200 OK", "", body);
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Codex {
