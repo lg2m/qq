@@ -43,7 +43,15 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 1
+```
+
+The counter restarted at 1 on 2026-07-28, before any release; earlier
+values (1–12) belonged to pre-release iterations and no released build
+speaks them. The number is a build-compatibility counter, not a product
+version — being "high" carries no meaning.
+
+```text
 ```
 
 Clients and servers must agree on this value.
@@ -211,7 +219,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 12,
+  "protocol_version": 1,
   "version": "0.1.0",
   "pid": 12345
 }
