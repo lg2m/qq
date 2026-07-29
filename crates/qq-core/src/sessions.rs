@@ -780,6 +780,10 @@ async fn execute_run(
                 }
                 flush_at = None;
                 accounting.record_turn(usage);
+                // The completed turn's usage measures the context the run now
+                // occupies; the turn transaction publishes it so the meter
+                // moves while the tool loop is still running.
+                let context_tokens = usage.map(turn_context_tokens);
                 // The completed turn's message (if any) finalizes inside the
                 // same transaction as the turn row; the next turn's text will
                 // lazily start a fresh message.
@@ -788,7 +792,14 @@ async fn execute_run(
                 if message.has_content() || !calls.is_empty() {
                     match inner
                         .store
-                        .persist_model_turn(&claimed, turn_ordinal, message, calls, turn_message)
+                        .persist_model_turn(
+                            &claimed,
+                            turn_ordinal,
+                            message,
+                            calls,
+                            turn_message,
+                            context_tokens,
+                        )
                         .await
                     {
                         Ok(events) => {
@@ -1257,11 +1268,13 @@ async fn finish_run_accounted(
 #[derive(Clone)]
 struct RunAccounting {
     usage: Option<TokenUsage>,
+    context_tokens: Option<u64>,
     estimated_cost_usd_nanos: Option<u64>,
 }
 
 struct RunAccountingAccumulator {
     usage: Option<TokenUsage>,
+    context_tokens: Option<u64>,
     estimated_cost_usd_nanos: Option<u64>,
     pricing: Option<ModelPricing>,
     saw_turn: bool,
@@ -1271,6 +1284,7 @@ impl RunAccountingAccumulator {
     fn new(pricing: Option<ModelPricing>) -> Self {
         Self {
             usage: Some(TokenUsage::default()),
+            context_tokens: None,
             estimated_cost_usd_nanos: pricing.as_ref().map(|_| 0),
             pricing,
             saw_turn: false,
@@ -1284,6 +1298,12 @@ impl RunAccountingAccumulator {
             self.estimated_cost_usd_nanos = None;
             return;
         };
+        // Context occupancy is the latest reported turn's input total, not a
+        // sum: every model request re-sends the whole conversation, so the
+        // last request measures what the context window currently holds. A
+        // usage-less turn keeps the previous turn's figure as the best
+        // available estimate.
+        self.context_tokens = Some(turn_context_tokens(usage));
         self.usage = self.usage.and_then(|total| add_usage(total, usage));
         if self.usage.is_none() {
             self.estimated_cost_usd_nanos = None;
@@ -1297,12 +1317,22 @@ impl RunAccountingAccumulator {
     fn snapshot(&self) -> RunAccounting {
         RunAccounting {
             usage: self.saw_turn.then_some(self.usage).flatten(),
+            context_tokens: self.context_tokens,
             estimated_cost_usd_nanos: self
                 .saw_turn
                 .then_some(self.estimated_cost_usd_nanos)
                 .flatten(),
         }
     }
+}
+
+/// The input-token total of one model turn (fresh input plus cache reads and
+/// writes): what that turn's request occupied of the model context window.
+const fn turn_context_tokens(usage: TokenUsage) -> u64 {
+    usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.cache_write_input_tokens)
 }
 
 fn add_usage(left: TokenUsage, right: TokenUsage) -> Option<TokenUsage> {
@@ -1627,6 +1657,9 @@ impl Store {
     /// The turn's assistant message (when the turn streamed text) is finalized
     /// in the same transaction so no crash window can leave a committed turn
     /// with a message still marked streaming.
+    /// The turn's reported context occupancy (its input-token total) rides
+    /// the same transaction: it updates the run row and publishes
+    /// `RunContextUpdated` so clients track context while the run progresses.
     async fn persist_model_turn(
         &self,
         claimed: &ClaimedRun,
@@ -1634,6 +1667,7 @@ impl Store {
         message: Message,
         calls: Vec<RuntimeToolCall>,
         turn_message_id: Option<MessageId>,
+        context_tokens: Option<u64>,
     ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
@@ -1646,6 +1680,7 @@ impl Store {
                 &message,
                 &calls,
                 turn_message_id,
+                context_tokens,
             )
         })
         .await
@@ -1903,6 +1938,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
                    outcome_json TEXT,
                    usage_json TEXT,
+                   context_tokens INTEGER,
                    estimated_cost_usd_nanos INTEGER,
                  created_at_ms INTEGER NOT NULL,
                  started_at_ms INTEGER,
@@ -1961,7 +1997,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '8')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '9')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2001,9 +2037,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_messages_turn_ordinal_column(&transaction)?;
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
+            add_runs_context_tokens_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2027,9 +2064,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_messages_turn_ordinal_column(&transaction)?;
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
+            add_runs_context_tokens_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2056,9 +2094,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_tool_calls_display_column(&transaction)?;
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
+            add_runs_context_tokens_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2075,9 +2114,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_tool_calls_display_column(&transaction)?;
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
+            add_runs_context_tokens_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2093,9 +2133,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_tool_calls_display_column(&transaction)?;
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
+            add_runs_context_tokens_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2110,9 +2151,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             add_tool_calls_display_column(&transaction)?;
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
+            add_runs_context_tokens_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2126,9 +2168,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
+            add_runs_context_tokens_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2136,7 +2179,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("8") => {}
+        Some("8") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            add_runs_context_tokens_column(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("9") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -2285,6 +2343,18 @@ fn add_runs_kind_column(connection: &Connection) -> Result<(), SessionRuntimeErr
                 "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'prompt'",
                 [],
             )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+/// Adds `runs.context_tokens` for stores created before the last model
+/// turn's input-token total was persisted separately from the run's summed
+/// billing usage. Existing rows keep NULL: clients fall back to the sum.
+fn add_runs_context_tokens_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "runs", "context_tokens")? {
+        connection
+            .execute("ALTER TABLE runs ADD COLUMN context_tokens INTEGER", [])
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     Ok(())
@@ -3384,6 +3454,10 @@ fn append_text(
     Ok(event)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one persisted turn transaction; bundling the columns adds nothing"
+)]
 fn persist_model_turn(
     connection: &mut Connection,
     store_id: StoreId,
@@ -3392,6 +3466,7 @@ fn persist_model_turn(
     message: &Message,
     calls: &[RuntimeToolCall],
     turn_message_id: Option<MessageId>,
+    context_tokens: Option<u64>,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
     if message.role() != Role::Assistant {
         return Err(SessionRuntimeError::Persistence);
@@ -3466,6 +3541,32 @@ fn persist_model_turn(
                 occurred_at_ms: now,
             },
             SessionEvent::ToolCallRequested { tool_call },
+        )?);
+    }
+    // Persist-before-publish like every other event: the run row records the
+    // turn's context occupancy in the same transaction that commits the turn,
+    // and the lightweight update event rides along for live meters.
+    if let Some(context_tokens) = context_tokens {
+        transaction
+            .execute(
+                "UPDATE runs SET context_tokens = ?2 WHERE id = ?1",
+                params![claimed.run_id.to_string(), context_tokens],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        events.push(append_event(
+            &transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by: Some(claimed.command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::RunContextUpdated {
+                run_id: claimed.run_id,
+                context_tokens,
+            },
         )?);
     }
     transaction
@@ -4059,11 +4160,14 @@ fn finalize_run(
     } else {
         (current_cost, current_cost_known)
     };
+    // COALESCE keeps the last per-turn figure when the terminal accounting
+    // carries none (an unaccounted finish after turns already committed).
     transaction
         .execute(
             "UPDATE runs
              SET status = ?2, outcome_json = ?3, finished_at_ms = ?4,
-                 usage_json = ?5, estimated_cost_usd_nanos = ?6
+                 usage_json = ?5, estimated_cost_usd_nanos = ?6,
+                 context_tokens = COALESCE(?7, context_tokens)
              WHERE id = ?1 AND outcome_json IS NULL",
             params![
                 claimed.run_id.to_string(),
@@ -4071,10 +4175,14 @@ fn finalize_run(
                 outcome_json,
                 now,
                 usage_json,
-                cost
+                cost,
+                accounting
+                    .as_ref()
+                    .and_then(|accounting| accounting.context_tokens),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    let context_tokens = run_context_tokens(transaction, claimed.run_id)?;
     transaction
         .execute(
             "UPDATE messages SET state = ?2
@@ -4116,8 +4224,24 @@ fn finalize_run(
             run_id: claimed.run_id,
             outcome,
             usage,
+            context_tokens,
         },
     )
+}
+
+/// The run row's persisted context occupancy: the input-token total of its
+/// last committed model turn, NULL until a turn reports usage.
+fn run_context_tokens(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<u64>, SessionRuntimeError> {
+    connection
+        .query_row(
+            "SELECT context_tokens FROM runs WHERE id = ?1",
+            [run_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)
 }
 
 fn finish_queued_run(
@@ -4175,6 +4299,8 @@ fn finish_queued_run(
             run_id,
             outcome,
             usage: None,
+            // A queued run never reached the model; no context to report.
+            context_tokens: None,
         },
     )
 }
@@ -4298,7 +4424,10 @@ fn complete_run_in_transaction(
             session: summary,
             run_id: claimed.run_id,
             outcome,
+            // Recovery knows no summed usage, but the run row keeps the last
+            // committed turn's context occupancy.
             usage: None,
+            context_tokens: run_context_tokens(transaction, claimed.run_id)?,
         },
     )
 }
@@ -5214,7 +5343,8 @@ fn load_tool_call(
 fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, SessionRuntimeError> {
     connection
         .query_row(
-            "SELECT session_id, status, outcome_json, usage_json, estimated_cost_usd_nanos
+            "SELECT session_id, status, outcome_json, usage_json, context_tokens,
+                    estimated_cost_usd_nanos
              FROM runs WHERE id = ?1",
             [run_id.to_string()],
             |row| {
@@ -5224,11 +5354,12 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<u64>>(4)?,
+                    row.get::<_, Option<u64>>(5)?,
                 ))
             },
         )
         .map_err(|_| SessionRuntimeError::Persistence)
-        .and_then(|(session, status, outcome, usage, cost)| {
+        .and_then(|(session, status, outcome, usage, context_tokens, cost)| {
             Ok(RunSnapshot {
                 id: run_id,
                 session_id: parse_id(&session)?,
@@ -5243,6 +5374,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     .map(serde_json::from_str)
                     .transpose()
                     .map_err(|_| SessionRuntimeError::Persistence)?,
+                context_tokens,
                 estimated_cost_usd_nanos: cost,
             })
         })
@@ -6690,7 +6822,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "8"
+            "9"
         );
         assert!(
             !connection
@@ -6813,7 +6945,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "8"
+            "9"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -6881,7 +7013,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "8"
+            "9"
         );
         let (display_json, result) = connection
             .query_row(
@@ -6940,7 +7072,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "8"
+            "9"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -8213,6 +8345,7 @@ mod tests {
                 ),
                 vec![call],
                 Some(first_message),
+                None,
             )
             .await
             .unwrap();
@@ -8351,6 +8484,7 @@ mod tests {
                 ),
                 vec![call],
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -8487,6 +8621,7 @@ mod tests {
                     }],
                 ),
                 Vec::new(),
+                None,
                 None,
             )
             .await
@@ -10036,6 +10171,7 @@ mod tests {
                     }],
                 ),
                 vec![call],
+                None,
                 None,
             )
             .await

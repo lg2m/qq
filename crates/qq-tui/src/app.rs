@@ -497,11 +497,13 @@ impl App {
         retain_recent_messages(&mut messages);
         let mut tool_calls = snapshot.tool_calls;
         retain_recent_tool_calls(&mut tool_calls);
-        let latest_input_tokens = snapshot
-            .runs
-            .iter()
-            .rev()
-            .find_map(|run| run.usage.map(total_input_tokens));
+        // Context occupancy is the newest run's last-turn figure. Runs
+        // persisted before `context_tokens` existed fall back to their summed
+        // usage: an overestimate, but a present number beats none.
+        let latest_input_tokens = snapshot.runs.iter().rev().find_map(|run| {
+            run.context_tokens
+                .or_else(|| run.usage.map(total_input_tokens))
+        });
         let context_window = model_context_window(&self.models, snapshot.summary.model.as_deref());
         self.sessions.insert(
             snapshot.summary.id,
@@ -670,17 +672,26 @@ impl App {
                     format_bytes(*after_bytes)
                 ));
             }
+            SessionEvent::RunContextUpdated { context_tokens, .. } => {
+                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    session.latest_input_tokens = Some(*context_tokens);
+                }
+            }
             SessionEvent::RunFinished {
                 session,
                 run_id,
                 outcome,
                 usage,
+                context_tokens,
             } => {
                 self.upsert_summary(session.clone());
-                if let Some(usage) = usage
+                // The last turn's figure is the context occupancy; the summed
+                // usage is a legacy fallback only (it overstates multi-turn
+                // runs but beats showing nothing).
+                if let Some(tokens) = (*context_tokens).or_else(|| usage.map(total_input_tokens))
                     && let Some(session) = self.sessions.get_mut(&envelope.session_id)
                 {
-                    session.latest_input_tokens = Some(total_input_tokens(*usage));
+                    session.latest_input_tokens = Some(tokens);
                 }
                 if let Some(messages) = self
                     .sessions
@@ -2725,14 +2736,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn context_usage_uses_latest_reported_input_and_model_limit() {
+    fn context_meter_app() -> App {
         let selection = ModelSelection {
             model: Some("openai/gpt-test".to_owned()),
             max_output_tokens: Some(4_096),
             organization: None,
         };
-        let mut app = App::new(TuiOptions {
+        App::new(TuiOptions {
             settings: Settings::default(),
             model: selection.clone(),
             models: vec![ModelOption {
@@ -2742,9 +2752,16 @@ mod tests {
                 context_window: Some(128_000),
                 selection,
             }],
-        });
+        })
+    }
+
+    #[test]
+    fn context_usage_uses_last_turn_tokens_live_updates_and_the_model_limit() {
+        let mut app = context_meter_app();
         let mut initial = snapshot();
         let session_id = initial.focused.as_ref().unwrap().summary.id;
+        // The snapshot rehydrates the meter from the run's last-turn figure,
+        // not its multi-turn billing sum (12_500 here).
         initial.focused.as_mut().unwrap().runs.push(RunSnapshot {
             id: id(7, RunId::from_bytes),
             session_id,
@@ -2756,6 +2773,82 @@ mod tests {
                 cache_write_input_tokens: 500,
                 output_tokens: 1_000,
             }),
+            context_tokens: Some(9_000),
+            estimated_cost_usd_nanos: Some(1),
+        });
+        let summary = initial.focused.as_ref().unwrap().summary.clone();
+        let workspace_id = initial.workspace.id;
+        let store_id = initial.cursor.store_id;
+        app.apply_snapshot(initial);
+
+        assert_eq!(app.focused_context_usage(), Some((9_000, 128_000)));
+
+        // A committed model turn moves the meter while the run is still going.
+        app.apply_live_event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 2,
+            },
+            session_id,
+            run_id: Some(id(8, RunId::from_bytes)),
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::RunContextUpdated {
+                run_id: id(8, RunId::from_bytes),
+                context_tokens: 15_000,
+            },
+        });
+        assert_eq!(app.focused_context_usage(), Some((15_000, 128_000)));
+
+        // RunFinished settles the meter on the final turn's figure even
+        // though the run's summed usage is larger (24_000 here).
+        app.apply_live_event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 3,
+            },
+            session_id,
+            run_id: Some(id(8, RunId::from_bytes)),
+            caused_by: None,
+            occurred_at_ms: 3,
+            event: SessionEvent::RunFinished {
+                session: summary,
+                run_id: id(8, RunId::from_bytes),
+                outcome: RunOutcome::Completed,
+                usage: Some(TokenUsage {
+                    input_tokens: 20_000,
+                    cache_read_input_tokens: 3_000,
+                    cache_write_input_tokens: 1_000,
+                    output_tokens: 2_000,
+                }),
+                context_tokens: Some(18_000),
+            },
+        });
+
+        assert_eq!(app.focused_context_usage(), Some((18_000, 128_000)));
+    }
+
+    #[test]
+    fn context_usage_falls_back_to_summed_usage_for_legacy_runs() {
+        let mut app = context_meter_app();
+        let mut initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        // A run persisted before context_tokens existed reports only its
+        // summed usage; the overestimate beats an empty meter.
+        initial.focused.as_mut().unwrap().runs.push(RunSnapshot {
+            id: id(7, RunId::from_bytes),
+            session_id,
+            status: RunStatus::Completed,
+            outcome: Some(RunOutcome::Completed),
+            usage: Some(TokenUsage {
+                input_tokens: 10_000,
+                cache_read_input_tokens: 2_000,
+                cache_write_input_tokens: 500,
+                output_tokens: 1_000,
+            }),
+            context_tokens: None,
             estimated_cost_usd_nanos: Some(1),
         });
         let summary = initial.focused.as_ref().unwrap().summary.clone();
@@ -2785,6 +2878,7 @@ mod tests {
                     cache_write_input_tokens: 1_000,
                     output_tokens: 2_000,
                 }),
+                context_tokens: None,
             },
         });
 
