@@ -91,10 +91,12 @@ An omitted action inherits the previous layer. An empty list disables that
 action. Invalid chords and collisions are rejected before the TUI starts.
 
 The interactive composer recognizes `/models`, `/new`, `/sessions` (also
-`/resume`), and `/quit` (also `/exit`). Selecting a model creates a new session
-because a session's model is immutable. The picker only lists built-in
-providers with an available credential, and the footer shows context usage,
-the selected model, working directory, and focused session cost. Slash command
-suggestions run immediately when selected with Enter or Tab. QQ names a session
-from its first prompt; `/sessions` supports typing to search those names before
-selecting one with Enter.
+`/resume`), and `/quit` (also `/exit`). `/models` applies the choice to the
+focused session (or creates one when none is focused); Ctrl-N always creates a
+new session with the selected model. The pick also becomes the client default
+for later `/new` creates until you choose another model. The picker only lists
+built-in providers with an available credential, and the footer shows context
+usage, the selected model, working directory, and focused session cost. Slash
+command suggestions run immediately when selected with Enter or Tab. QQ names a
+session from its first prompt; `/sessions` supports typing to search those names
+before selecting one with Enter.

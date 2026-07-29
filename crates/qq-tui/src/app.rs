@@ -1192,6 +1192,9 @@ impl App {
             self.status = Some("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
+        // Remember the pick as the client default so /new and later creates
+        // keep using it until the user chooses another model.
+        self.model = model.clone();
         (
             true,
             vec![ClientRequest::Command(CommandRequest {
@@ -1476,6 +1479,9 @@ impl App {
             self.status = Some("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
+        // Keep the chosen model as the client default for the rest of this TUI
+        // process until /models picks something else.
+        self.model = model.clone();
         self.pending.insert(command_id, PendingIntent::Create);
         (
             true,
@@ -2723,7 +2729,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.filtered_models(), vec![0]);
 
-        // Enter with a focused session repoints that session's model.
+        // Enter with a focused session repoints that session's model and
+        // remembers it as the client default for later /new creates.
         let focused = app.focused.unwrap();
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ClientRequest::Command(request) = &requests[0] else {
@@ -2734,6 +2741,7 @@ mod tests {
             SessionCommand::SetSessionModel { session_id, model }
                 if model == &selection && *session_id == focused
         ));
+        assert_eq!(app.model, selection);
         assert!(app.model_picker.is_none());
 
         // Ctrl-N creates a fresh session with the selected model instead.
@@ -2751,6 +2759,7 @@ mod tests {
                 ..
             } if model == &selection
         ));
+        assert_eq!(app.model, selection);
         assert!(app.model_picker.is_none());
     }
 
@@ -2792,7 +2801,54 @@ mod tests {
                 ..
             } if model == &selection
         ));
+        assert_eq!(app.model, selection);
         assert!(app.model_picker.is_none());
+    }
+
+    #[test]
+    fn model_picker_selection_becomes_the_default_for_new_sessions() {
+        let initial = ModelSelection {
+            model: Some("openai/gpt-test".to_owned()),
+            max_output_tokens: Some(4_096),
+            organization: None,
+        };
+        let switched = ModelSelection {
+            model: Some("anthropic/claude-sonnet-5".to_owned()),
+            max_output_tokens: Some(8_192),
+            organization: None,
+        };
+        let mut app = App::new(TuiOptions {
+            settings: Settings::default(),
+            model: initial,
+            models: vec![ModelOption {
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet-5".to_owned(),
+                name: Some("Claude Sonnet 5".to_owned()),
+                context_window: Some(200_000),
+                selection: switched.clone(),
+            }],
+        });
+        app.apply_snapshot(snapshot());
+        app.open_models();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Command(CommandRequest {
+                command: SessionCommand::SetSessionModel { model, .. },
+                ..
+            }) if model == &switched
+        ));
+        assert_eq!(app.model, switched);
+
+        let (_, requests) = app.handle_action(Action::CreateRootSession);
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Command(CommandRequest {
+                command: SessionCommand::CreateSession { model, .. },
+                ..
+            }) if model == &switched
+        ));
     }
 
     #[test]
