@@ -411,6 +411,12 @@ pub struct RunSnapshot {
     pub outcome: Option<RunOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    /// Input-token total (fresh input + cache reads + cache writes) of the
+    /// run's final completed model turn: the model context occupancy after
+    /// the run. Distinct from `usage`, which sums every turn for billing.
+    /// Absent on runs persisted before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd_nanos: Option<u64>,
 }
@@ -595,12 +601,24 @@ pub enum SessionEvent {
         before_bytes: u64,
         after_bytes: u64,
     },
+    /// A model turn committed mid-run: the run's context occupancy moved.
+    /// `context_tokens` is the completed turn's input-token total (fresh
+    /// input + cache reads + cache writes) — what the turn's request occupied
+    /// of the model's context window. Deliberately small: no snapshots.
+    RunContextUpdated {
+        run_id: RunId,
+        context_tokens: u64,
+    },
     RunFinished {
         session: SessionSummary,
         run_id: RunId,
         outcome: RunOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
+        /// The final completed model turn's input-token total (context
+        /// occupancy), as opposed to `usage`, which sums every turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u64>,
     },
 }
 
@@ -1112,14 +1130,101 @@ mod tests {
             run_id: id(4),
             outcome: RunOutcome::Completed,
             usage: None,
+            context_tokens: None,
         };
 
         let encoded = serde_json::to_value(&event).unwrap();
 
         assert!(encoded.get("usage").is_none());
+        assert!(encoded.get("context_tokens").is_none());
         assert_eq!(
             serde_json::from_value::<SessionEvent>(encoded).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn run_context_events_and_fields_round_trip_and_legacy_payloads_decode_to_none() {
+        let updated = SessionEvent::RunContextUpdated {
+            run_id: id(4),
+            context_tokens: 12_500,
+        };
+        let encoded = serde_json::to_value(&updated).unwrap();
+        assert_eq!(encoded["type"], "run_context_updated");
+        assert_eq!(encoded["context_tokens"], 12_500);
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            updated
+        );
+
+        let finished = SessionEvent::RunFinished {
+            session: SessionSummary {
+                id: id(3),
+                workspace_id: id(2),
+                parent_id: None,
+                title: "Session".to_owned(),
+                status: SessionStatus::Idle,
+                active_run_id: None,
+                queued_prompts: 0,
+                model: Some("test/model".to_owned()),
+                estimated_cost_usd_nanos: None,
+                updated_at_ms: 11,
+                last_outcome: Some(RunOutcome::Completed),
+            },
+            run_id: id(4),
+            outcome: RunOutcome::Completed,
+            usage: Some(TokenUsage {
+                input_tokens: 30,
+                cache_read_input_tokens: 4,
+                cache_write_input_tokens: 2,
+                output_tokens: 9,
+            }),
+            context_tokens: Some(16),
+        };
+        let encoded = serde_json::to_value(&finished).unwrap();
+        assert_eq!(encoded["type"], "run_finished");
+        assert_eq!(encoded["context_tokens"], 16);
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            finished
+        );
+
+        let run = RunSnapshot {
+            id: id(4),
+            session_id: id(3),
+            status: RunStatus::Completed,
+            outcome: Some(RunOutcome::Completed),
+            usage: Some(TokenUsage {
+                input_tokens: 30,
+                cache_read_input_tokens: 4,
+                cache_write_input_tokens: 2,
+                output_tokens: 9,
+            }),
+            context_tokens: Some(16),
+            estimated_cost_usd_nanos: Some(1),
+        };
+        let encoded = serde_json::to_value(&run).unwrap();
+        assert_eq!(encoded["context_tokens"], 16);
+        assert_eq!(serde_json::from_value::<RunSnapshot>(encoded).unwrap(), run);
+
+        // Runs persisted before the protocol carried context tokens must
+        // still decode; legacy snapshots default to no value.
+        let mut legacy = serde_json::to_value(&run).unwrap();
+        legacy.as_object_mut().unwrap().remove("context_tokens");
+        let decoded = serde_json::from_value::<RunSnapshot>(legacy).unwrap();
+        assert_eq!(decoded.context_tokens, None);
+        assert_eq!(decoded.usage, run.usage);
+
+        // Snapshots without a value keep their previous wire shape.
+        let bare = RunSnapshot {
+            context_tokens: None,
+            ..run
+        };
+        let encoded = serde_json::to_value(&bare).unwrap();
+        assert!(encoded.get("context_tokens").is_none());
+        assert_eq!(
+            serde_json::from_value::<RunSnapshot>(encoded).unwrap(),
+            bare
         );
     }
 }

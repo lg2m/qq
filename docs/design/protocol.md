@@ -43,14 +43,16 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
 values (1–12) belonged to pre-release iterations and no released build
 speaks them. The number is a build-compatibility counter, not a product
 version — being "high" carries no meaning. Version 2 added session
-compaction (`compact_session`, `session_compacted`).
+compaction (`compact_session`, `session_compacted`); version 3 added
+run context occupancy (`run_context_updated`,
+`RunSnapshot.context_tokens`).
 
 Clients and servers must agree on this value.
 
@@ -218,7 +220,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -750,8 +752,9 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `tool_call_started` | `tool_call` | Execution began |
 | `tool_call_output_delta` | `tool_call_id`, `chunk` | Incremental output from a running call (shell) |
 | `tool_call_finished` | `tool_call` | Execution ended with result/error |
+| `run_context_updated` | `run_id`, `context_tokens` | A model turn committed; context occupancy moved |
 | `cancellation_requested` | `session`, `run_id` | Cancel command accepted for a live run |
-| `run_finished` | `session`, `run_id`, `outcome`, optional `usage` | Terminal run state |
+| `run_finished` | `session`, `run_id`, `outcome`, optional `usage`, optional `context_tokens` | Terminal run state |
 | `session_compacted` | `session`, optional `summary`, `before_bytes`, `after_bytes` | Compaction summary + cutoff committed |
 
 Text channels:
@@ -799,12 +802,20 @@ Session status: `idle`, `queued`, `running`.
   "status": "running",
   "outcome": null,
   "usage": null,
-  "estimated_cost_usd_nanos": null
+  "estimated_cost_usd_nanos": null,
+  "context_tokens": null
 }
 ```
 
 Run status: `queued`, `running`, `completed`, `cancelled`, `failed`,
 `interrupted`.
+
+`usage` sums every model turn in the run and is the billing figure;
+`context_tokens` is the final completed turn's input-token total (fresh
+input + cache reads + cache writes) — the run's context occupancy.
+`run_context_updated` streams the same figure per committed turn so
+clients can show a live context meter during long runs; it carries no
+snapshots and is absent for runs persisted before version 3.
 
 **`MessageSnapshot`**
 
