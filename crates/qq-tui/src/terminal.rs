@@ -4,7 +4,8 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream,
+        EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Attribute, Print, ResetColor, SetAttribute},
@@ -141,11 +142,28 @@ impl Drop for TerminalGuard {
 }
 
 fn enable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
-    execute!(output, EnableBracketedPaste, EnableMouseCapture)
+    // Kitty keyboard progressive enhancement lets compatible terminals report
+    // modified keys such as Shift-Enter. Unsupported terminals ignore the CSI.
+    // Always push/pop rather than probing: the support query blocks on stdin
+    // and races the async event loop.
+    execute!(
+        output,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        ),
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
 }
 
 fn disable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
-    execute!(output, DisableMouseCapture, DisableBracketedPaste)
+    execute!(
+        output,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
+    )
 }
 
 #[cfg(unix)]
@@ -171,7 +189,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_input_modes_enable_and_restore_mouse_reporting() {
+    fn terminal_input_modes_enable_and_restore_keyboard_mouse_and_paste() {
         let mut entered = Vec::new();
         let mut restored = Vec::new();
 
@@ -180,9 +198,12 @@ mod tests {
 
         let entered = String::from_utf8(entered).unwrap();
         let restored = String::from_utf8(restored).unwrap();
+        // Kitty keyboard protocol: DISAMBIGUATE | REPORT_EVENT_TYPES => 3
+        assert!(entered.contains("\x1b[>3u"));
         assert!(entered.contains("\x1b[?1000h"));
         assert!(entered.contains("\x1b[?2004h"));
         assert!(restored.contains("\x1b[?1000l"));
         assert!(restored.contains("\x1b[?2004l"));
+        assert!(restored.contains("\x1b[<1u"));
     }
 }

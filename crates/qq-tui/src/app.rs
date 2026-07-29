@@ -943,9 +943,9 @@ impl App {
         if self.pending_approval().is_some() {
             return self.handle_approval_key(key);
         }
-        // Shift-Enter inserts a newline in the composer. Handle it before slash
-        // completion and configured bindings so it never submits.
-        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        // Newline chords insert into the composer. Handle them before slash
+        // completion and configured bindings so they never submit.
+        if is_composer_newline_key(key) {
             let changed = self.push_input('\n');
             return (changed, Vec::new());
         }
@@ -1863,6 +1863,23 @@ fn composer_character(character: char) -> Option<char> {
     }
 }
 
+/// Keys that insert a hard newline in the composer without submitting.
+///
+/// Shift-Enter is the primary chord. Without kitty keyboard enhancement many
+/// terminals cannot report Shift on Enter, so Alt-Enter and Ctrl-J (the raw
+/// line-feed / historical newline) are accepted as fallbacks.
+fn is_composer_newline_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT),
+        // In raw mode a bare LF arrives as Ctrl-J rather than Enter.
+        KeyCode::Char('j' | 'J') if key.modifiers == KeyModifiers::CONTROL => true,
+        KeyCode::Char('\n') => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::MouseEvent;
@@ -1936,6 +1953,23 @@ mod tests {
         assert!(changed);
         assert!(requests.is_empty());
         assert_eq!(app.input, "hello\n");
+    }
+
+    #[test]
+    fn alt_enter_and_ctrl_j_insert_newlines_without_submitting() {
+        let mut app = App::new(TuiOptions::default());
+        app.input = "hello".to_owned();
+
+        let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.input, "hello\n");
+
+        let (changed, requests) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.input, "hello\n\n");
     }
 
     #[test]
