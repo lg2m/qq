@@ -43,7 +43,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 11
 ```
 
 Clients and servers must agree on this value.
@@ -208,7 +208,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 8,
+  "protocol_version": 11,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -592,12 +592,13 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `session_created` | `session` | New session row committed |
 | `prompt_queued` | `session`, `message`, `run`, `queue_position` | User prompt accepted |
 | `run_started` | `session`, `run_id` | Run leaves the queue |
-| `assistant_message_started` | `message` | Assistant message begins streaming |
+| `assistant_message_started` | `message` | A model turn's message begins streaming |
 | `text_appended` | `message_id`, `channel`, `text` | Output or refusal delta |
 | `tool_call_requested` | `tool_call` | Model finished requesting a tool call |
 | `tool_approval_requested` | `tool_call`, optional `shell`, optional `edit` | Policy needs a human decision |
 | `tool_approval_resolved` | `tool_call`, `resolution` | Approval decision recorded |
 | `tool_call_started` | `tool_call` | Execution began |
+| `tool_call_output_delta` | `tool_call_id`, `chunk` | Incremental output from a running call (shell) |
 | `tool_call_finished` | `tool_call` | Execution ended with result/error |
 | `cancellation_requested` | `session`, `run_id` | Cancel command accepted for a live run |
 | `run_finished` | `session`, `run_id`, `outcome`, optional `usage` | Terminal run state |
@@ -657,6 +658,7 @@ Run status: `queued`, `running`, `completed`, `cancelled`, `failed`,
   "run_id": "...",
   "role": "assistant",
   "state": "streaming",
+  "turn_ordinal": 1,
   "output": "partial text",
   "refusal": "",
   "created_at_ms": 1710000000123
@@ -666,6 +668,12 @@ Run status: `queued`, `running`, `completed`, `cancelled`, `failed`,
 Roles: `user`, `assistant`.  
 Message state: `queued`, `streaming`, `complete`, `cancelled`, `failed`,
 `interrupted`.
+
+The unit of assistant output is the model turn: each turn that produces
+text gets its own message, `turn_ordinal` 1-based and matching the
+ordinals on that turn's tool calls, so clients can render text and calls
+in execution order. User messages and rows persisted before per-turn
+messages use `turn_ordinal` 0.
 
 **`ToolCallSnapshot`**
 
@@ -681,12 +689,18 @@ Message state: `queued`, `streaming`, `complete`, `cancelled`, `failed`,
   "arguments": "{\"path\":\"README.md\"}",
   "state": "completed",
   "result": "# QQ\n...",
-  "is_error": false
+  "is_error": false,
+  "display": { "type": "diff", "path": "src/lib.rs", "diff": "- old\n+ new\n" }
 }
 ```
 
 Tool state: `requested`, `awaiting_approval`, `running`, `completed`,
 `failed`, `denied`, `interrupted`.
+
+`display` is an optional, extensible tagged payload for client rendering
+only (first variant: `diff`, carried by successful `edit_file` and
+`write_file` calls). It is absent unless populated, never enters model
+context, and the `result` string remains authoritative.
 
 ### Approval previews
 

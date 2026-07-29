@@ -97,9 +97,16 @@ Two sources render as unified diffs with per-line coloring:
 
 - `EditPreview.diff` in the approval modal (carried on
   `ToolApprovalRequested`).
-- Completed `edit_file`/`write_file` calls at Detailed/Expanded tool
-  detail levels — when diff content is available for the call, it
-  renders as a colored diff rather than raw tool output.
+- Completed `edit_file`/`write_file` calls at the expanded tool detail
+  level, from the call's `display` payload — an extensible tagged
+  snapshot field (first variant: diff) persisted alongside the result,
+  populated on successful completion, and excluded by construction from
+  model context and the session context budget. The model sees the
+  summary result string; the transcript sees the diff. The approval
+  preview and the persisted display share one diff builder with two
+  bounds (2 KiB per side for previews, 32 KiB per side persisted, same
+  truncation marker). Diff-shaped results without a payload (shell
+  output, legacy stores) still color via shape detection.
 
 Coloring: `+` lines green, `-` lines red, `@@` hunk headers in the muted
 accent, context lines normal. Diff lines are literal (character wrap, no
@@ -112,3 +119,12 @@ Streamed shell tool output arrives as `ToolCallOutputDelta` events and
 renders live under the running call, inside the same call-group layout,
 so a long build is watchable as it happens rather than only after the
 call completes.
+
+Live output is a tail, not a record: the client buffers at most 4 KiB
+per running call, dropping the head on a character boundary, and shows
+the last few complete lines (up to six rows, muted, character-wrapped,
+control characters stripped) at every detail level — a running command's
+output is the thing the user is waiting for. A trailing partial line
+waits for its newline. The buffer is discarded when the call reaches a
+terminal state or a snapshot reloads; the bounded result persisted on
+the tool call is always authoritative.
