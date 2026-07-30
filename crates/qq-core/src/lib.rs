@@ -134,6 +134,31 @@ pub(crate) enum GateDecision {
 
 pub(crate) type ToolGateFuture = Pin<Box<dyn Future<Output = GateDecision> + Send + 'static>>;
 
+/// The outcome one spawned sub-agent call returns to its parent. The content
+/// flows through the same bounded-result truncation as built-in tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnAgentOutcome {
+    pub(crate) content: String,
+    pub(crate) is_error: bool,
+}
+
+pub(crate) type SpawnAgentFuture =
+    Pin<Box<dyn Future<Output = SpawnAgentOutcome> + Send + 'static>>;
+
+/// Runs one sub-agent task to completion on behalf of a `spawn_agent` call.
+/// The session runtime installs a spawner for eligible runs only: child
+/// sessions (and session-less runs) get none, so the tool is neither declared
+/// nor dispatchable there. Dropping the returned future must cancel the
+/// in-flight child work.
+pub(crate) trait SubagentSpawner: Send + Sync {
+    fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture;
+}
+
+/// The dispatcher's defensive answer when `spawn_agent` is called by a run
+/// that has no spawner (a child session, or a run outside the session layer).
+pub(crate) const SPAWN_UNAVAILABLE_RESULT: &str =
+    "spawn_agent is not available in this session; sub-agents cannot spawn sub-agents.";
+
 /// Resolves approval policy for tool calls before they execute. The session
 /// runtime installs a gate that persists approval state and waits for clients;
 /// gate-less runs fall back to a static policy that cannot prompt.
@@ -348,11 +373,23 @@ impl Runtime {
 
     pub(crate) fn run_loop(
         &self,
+        messages: Vec<Message>,
+        workspace: PathBuf,
+        cancelled: Arc<AtomicBool>,
+        gate: Arc<dyn ToolGate>,
+        file_state: Arc<tools::FileState>,
+    ) -> RuntimeStream {
+        self.run_loop_with_spawner(messages, workspace, cancelled, gate, file_state, None)
+    }
+
+    pub(crate) fn run_loop_with_spawner(
+        &self,
         mut messages: Vec<Message>,
         workspace: PathBuf,
         cancelled: Arc<AtomicBool>,
         gate: Arc<dyn ToolGate>,
         file_state: Arc<tools::FileState>,
+        spawner: Option<Arc<dyn SubagentSpawner>>,
     ) -> RuntimeStream {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
@@ -386,6 +423,11 @@ impl Runtime {
             // prefix keeps collisions with built-ins impossible, and specs
             // that do not carry it are discarded to keep dispatch unambiguous.
             let mut tool_specs = tools::specs();
+            // The sub-agent tool is declared only when this run may spawn:
+            // depth is one, so child runs (spawner-less) never see it.
+            if spawner.is_some() {
+                tool_specs.push(tools::spawn_agent_spec());
+            }
             if let Some(registry) = &mcp {
                 for spec in registry.tool_specs().await {
                     if spec.name().starts_with(MCP_TOOL_PREFIX)
@@ -697,12 +739,44 @@ impl Runtime {
                     let file_state = Arc::clone(&file_state);
                     let cancelled = Arc::clone(&cancelled);
                     let mcp = mcp.clone();
+                    let spawner = spawner.clone();
                     async move {
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
                                 content: error,
                                 is_error: true,
                                 file_state: None,
+                            },
+                            // spawn_agent dispatches to the session layer. A
+                            // run without a spawner rejects the call outright:
+                            // the declaration is already absent there, but a
+                            // model may still guess the name.
+                            None if call.name == tools::SPAWN_AGENT_TOOL => match &spawner {
+                                Some(spawner) => {
+                                    match serde_json::from_str::<tools::SpawnAgentArgs>(
+                                        &call.arguments,
+                                    ) {
+                                        Ok(arguments) if arguments.task.trim().is_empty() => {
+                                            tools::bounded_result(
+                                                "task must not be empty".to_owned(),
+                                                true,
+                                            )
+                                        }
+                                        Ok(arguments) => {
+                                            let outcome = spawner
+                                                .spawn(arguments.task, arguments.model)
+                                                .await;
+                                            tools::bounded_result(outcome.content, outcome.is_error)
+                                        }
+                                        Err(error) => tools::bounded_result(
+                                            format!("invalid arguments: {error}"),
+                                            true,
+                                        ),
+                                    }
+                                }
+                                None => {
+                                    tools::bounded_result(SPAWN_UNAVAILABLE_RESULT.to_owned(), true)
+                                }
                             },
                             // MCP calls dispatch to the shared registry; the
                             // outcome flows through the same bounded-result
@@ -820,21 +894,37 @@ impl Runtime {
     }
 }
 
-/// Version 3 of the base agent prompt. The text is versioned in code, not
+/// Version 4 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
 fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSpec]) -> String {
     let mut tool_names = String::new();
     let mut has_mcp = false;
+    let mut has_spawn = false;
     for spec in specs {
         if !tool_names.is_empty() {
             tool_names.push_str(", ");
         }
         tool_names.push_str(spec.name());
         has_mcp |= spec.name().starts_with(MCP_TOOL_PREFIX);
+        has_spawn |= spec.name() == tools::SPAWN_AGENT_TOOL;
     }
     let mcp_note = if has_mcp {
         " Tools named mcp__<server>__<tool> call external MCP servers, execute outside the \
          workspace, and may require user approval."
+    } else {
+        ""
+    };
+    let spawn_section = if has_spawn {
+        "\n\nDelegation:\n\
+         - spawn_agent runs a one-shot read-only sub-agent in this workspace from a \
+         self-contained task brief and returns only its final answer.\n\
+         - Delegate when all three hold: the raw evidence would dwarf the distilled answer, \
+         you will not need that evidence verbatim later, and the task needs no mid-flight \
+         steering.\n\
+         - Default to working inline: single reads, searches, and quick lookups are never \
+         worth a sub-agent.\n\
+         - Exception: several independent questions are worth delegating even when each is \
+         small, because sub-agents run concurrently."
     } else {
         ""
     };
@@ -849,7 +939,7 @@ fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSp
          - Read a file with read_file before editing or overwriting it; edits without a prior read in this session are rejected.\n\
          - Prefer search over guessing file paths.\n\
          - Give every tool path relative to the workspace root; absolute paths are rejected.\n\
-         - Prefer edit_file and write_file over shell for changing files.",
+         - Prefer edit_file and write_file over shell for changing files.{spawn_section}",
         root = workspace.display(),
     )
 }
@@ -2232,5 +2322,184 @@ mod tests {
                 if result.contains("unknown tool")
         )));
         assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+    }
+
+    /// Scripts one `spawn_agent` call on the first turn, then completes.
+    struct SpawnCallProvider {
+        turn: Mutex<usize>,
+    }
+
+    impl Provider for SpawnCallProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            if current == 0 {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: "call_0".to_owned(),
+                        name: "spawn_agent".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: "call_0".to_owned(),
+                        json: r#"{"task":"count the widgets"}"#.to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted {
+                        id: "call_0".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+    }
+
+    type SpawnedTasks = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    struct StubSpawner {
+        outcome: SpawnAgentOutcome,
+        tasks: SpawnedTasks,
+    }
+
+    impl SubagentSpawner for StubSpawner {
+        fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture {
+            self.tasks.lock().unwrap().push((task, model));
+            let outcome = self.outcome.clone();
+            Box::pin(std::future::ready(outcome))
+        }
+    }
+
+    #[tokio::test]
+    async fn spawner_less_runs_neither_declare_nor_dispatch_spawn_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSpawnProvider {
+            inner: SpawnCallProvider,
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for CapturingSpawnProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                self.requests.lock().unwrap().push(request.clone());
+                self.inner.stream(request)
+            }
+        }
+
+        let runtime = Runtime::new(
+            CapturingSpawnProvider {
+                inner: SpawnCallProvider {
+                    turn: Mutex::new(0),
+                },
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        // run_messages_in_workspace passes no spawner: the tool must be
+        // absent from the declarations and rejected by dispatch.
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("go")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, is_error: true, .. }
+                if result == SPAWN_UNAVAILABLE_RESULT
+        )));
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        let requests = requests.lock().unwrap();
+        assert!(
+            !requests[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == tools::SPAWN_AGENT_TOOL)
+        );
+        let system = requests[0].system().unwrap();
+        assert!(!system.contains("Delegation:"));
+    }
+
+    #[tokio::test]
+    async fn spawner_runs_declare_the_tool_and_truncate_oversized_child_answers() {
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let spawner = Arc::new(StubSpawner {
+            outcome: SpawnAgentOutcome {
+                content: "x".repeat(tools::MAX_TOOL_RESULT_BYTES + 1024),
+                is_error: false,
+            },
+            tasks: Arc::clone(&tasks),
+        });
+        let runtime = Runtime::new(
+            SpawnCallProvider {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run_loop_with_spawner(
+                vec![Message::user("go")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(tools::FileState::default()),
+                Some(spawner),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::ToolCallFinished {
+                    result,
+                    is_error: false,
+                    ..
+                } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("the spawn call must finish successfully");
+        assert!(result.len() <= tools::MAX_TOOL_RESULT_BYTES);
+        assert!(result.contains("truncated by qq"));
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        assert_eq!(
+            tasks.lock().unwrap().as_slice(),
+            [("count the widgets".to_owned(), None)]
+        );
+    }
+
+    #[test]
+    fn agent_prompt_teaches_delegation_only_when_spawn_agent_is_declared() {
+        let workspace = std::path::Path::new("/tmp/qq-prompt-test");
+        let without = agent_system_prompt(workspace, &tools::specs());
+        assert!(!without.contains("spawn_agent"));
+        assert!(!without.contains("Delegation:"));
+
+        let mut specs = tools::specs();
+        specs.push(tools::spawn_agent_spec());
+        let with = agent_system_prompt(workspace, &specs);
+        assert!(with.contains("spawn_agent"));
+        assert!(with.contains("Delegation:"));
+        assert!(with.contains("independent questions"));
+        assert!(with.contains("read-only sub-agent"));
     }
 }
