@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Layout,
-    Settings, terminal,
+    Settings, composer::Composer, terminal,
 };
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
@@ -25,6 +25,7 @@ const MAX_RECENT_TOOL_CALLS: usize = 64;
 /// not a record: the head drops first, and the persisted bounded result
 /// replaces the buffer when the call finishes.
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
+const MAX_PROMPT_HISTORY: usize = 100;
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub(crate) struct SlashCommand {
@@ -210,7 +211,10 @@ pub(crate) struct App {
     pub focused: Option<SessionId>,
     pub session_picker: Option<SessionPicker>,
     pub model_picker: Option<ModelPicker>,
-    pub input: String,
+    pub composer: Composer,
+    prompt_history: HashMap<SessionId, VecDeque<String>>,
+    history_position: Option<usize>,
+    history_draft: Option<String>,
     slash_selected: usize,
     pub connection: ConnectionState,
     pub status: Option<String>,
@@ -247,7 +251,10 @@ impl App {
             focused: None,
             session_picker: None,
             model_picker: None,
-            input: String::new(),
+            composer: Composer::default(),
+            prompt_history: HashMap::new(),
+            history_position: None,
+            history_draft: None,
             slash_selected: 0,
             connection: ConnectionState::Connecting,
             status: None,
@@ -495,6 +502,21 @@ impl App {
         self.live_tool_output.clear();
         let mut messages = snapshot.messages;
         retain_recent_messages(&mut messages);
+        let history = messages
+            .iter()
+            .filter(|message| message.role == qq_protocol::MessageRole::User)
+            .map(|message| message.output.clone())
+            .filter(|prompt| !prompt.trim().is_empty())
+            .collect::<VecDeque<_>>();
+        self.prompt_history.insert(
+            snapshot.summary.id,
+            history
+                .into_iter()
+                .rev()
+                .take(MAX_PROMPT_HISTORY)
+                .rev()
+                .collect(),
+        );
         let mut tool_calls = snapshot.tool_calls;
         retain_recent_tool_calls(&mut tool_calls);
         // Context occupancy is the newest run's last-turn figure. Runs
@@ -920,9 +942,9 @@ impl App {
     fn reject_pending(&mut self, command_id: CommandId, error: ClientFailure) {
         match self.pending.remove(&command_id) {
             Some(PendingIntent::Prompt { session_id, text })
-                if self.focused == Some(session_id) && self.input.is_empty() =>
+                if self.focused == Some(session_id) && self.composer.text.is_empty() =>
             {
-                self.input = text;
+                self.composer.replace(text);
             }
             Some(PendingIntent::Approval { tool_call_id }) => {
                 // Re-open the prompt so the user can answer again.
@@ -1017,10 +1039,28 @@ impl App {
                 (changed, Vec::new())
             }
             KeyCode::Backspace => {
-                let changed = self.input.pop().is_some();
+                let changed = self.composer.backspace();
                 if changed {
+                    self.reset_history_browse();
                     self.slash_selected = 0;
                 }
+                (changed, Vec::new())
+            }
+            KeyCode::Delete => {
+                let changed = self.composer.delete();
+                if changed {
+                    self.reset_history_browse();
+                }
+                (changed, Vec::new())
+            }
+            KeyCode::Left => (self.composer.move_left(), Vec::new()),
+            KeyCode::Right => (self.composer.move_right(), Vec::new()),
+            KeyCode::Up => {
+                let changed = self.composer.move_up() || self.browse_prompt_history(false);
+                (changed, Vec::new())
+            }
+            KeyCode::Down => {
+                let changed = self.composer.move_down() || self.browse_prompt_history(true);
                 (changed, Vec::new())
             }
             KeyCode::Char(character)
@@ -1474,6 +1514,7 @@ impl App {
 
     fn focus_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
         self.focused = Some(session_id);
+        self.reset_history_browse();
         let Some(workspace_id) = self.workspace_id else {
             return (true, Vec::new());
         };
@@ -1532,7 +1573,7 @@ impl App {
     }
 
     fn submit_prompt(&mut self) -> (bool, Vec<ClientRequest>) {
-        let prompt = self.input.trim().to_owned();
+        let prompt = self.composer.text.trim().to_owned();
         if prompt.is_empty() {
             return (false, Vec::new());
         }
@@ -1554,7 +1595,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join(" ")
                 ));
-                self.input.clear();
+                self.composer.clear();
                 self.slash_selected = 0;
                 return (true, Vec::new());
             };
@@ -1568,7 +1609,9 @@ impl App {
             self.status = Some("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
-        self.input.clear();
+        self.record_prompt(session_id, &prompt);
+        self.composer.clear();
+        self.reset_history_browse();
         self.pending.insert(
             command_id,
             PendingIntent::Prompt {
@@ -1583,6 +1626,61 @@ impl App {
                 command: SessionCommand::SubmitPrompt { session_id, prompt },
             })],
         )
+    }
+
+    fn record_prompt(&mut self, session_id: SessionId, prompt: &str) {
+        let history = self.prompt_history.entry(session_id).or_default();
+        if history.back().is_some_and(|previous| previous == prompt) {
+            return;
+        }
+        history.push_back(prompt.to_owned());
+        while history.len() > MAX_PROMPT_HISTORY {
+            history.pop_front();
+        }
+    }
+
+    fn browse_prompt_history(&mut self, forward: bool) -> bool {
+        let Some(session_id) = self.focused else {
+            return false;
+        };
+        let Some(history) = self.prompt_history.get(&session_id) else {
+            return false;
+        };
+        if history.is_empty() {
+            return false;
+        }
+
+        if forward {
+            let Some(position) = self.history_position else {
+                return false;
+            };
+            if position + 1 < history.len() {
+                self.history_position = Some(position + 1);
+                self.composer.replace(history[position + 1].clone());
+            } else {
+                self.history_position = None;
+                self.composer
+                    .replace(self.history_draft.take().unwrap_or_default());
+            }
+            return true;
+        }
+
+        let position = match self.history_position {
+            Some(0) => return false,
+            Some(position) => position - 1,
+            None => {
+                self.history_draft = Some(self.composer.text.clone());
+                history.len() - 1
+            }
+        };
+        self.history_position = Some(position);
+        self.composer.replace(history[position].clone());
+        true
+    }
+
+    fn reset_history_browse(&mut self) {
+        self.history_position = None;
+        self.history_draft = None;
     }
 
     fn compact_session(&mut self) -> (bool, Vec<ClientRequest>) {
@@ -1701,26 +1799,28 @@ impl App {
         let Some(character) = composer_character(character) else {
             return false;
         };
-        if self.input.len() + character.len_utf8() > MAX_INPUT_BYTES {
+        if self.composer.text.len() + character.len_utf8() > MAX_INPUT_BYTES {
             return false;
         }
-        self.input.push(character);
+        self.composer.insert(character);
+        self.reset_history_browse();
         self.slash_selected = 0;
         true
     }
 
     fn push_composer_text(&mut self, text: &str) -> bool {
-        let before = self.input.len();
+        let before = self.composer.text.len();
         for character in text.chars() {
-            if self.input.len() + character.len_utf8() > MAX_INPUT_BYTES {
+            if self.composer.text.len() + character.len_utf8() > MAX_INPUT_BYTES {
                 break;
             }
             if let Some(character) = composer_character(character) {
-                self.input.push(character);
+                self.composer.insert(character);
             }
         }
-        let changed = self.input.len() != before;
+        let changed = self.composer.text.len() != before;
         if changed {
+            self.reset_history_browse();
             self.slash_selected = 0;
         }
         changed
@@ -1751,7 +1851,7 @@ impl App {
     }
 
     fn execute_slash_action(&mut self, action: SlashAction) -> (bool, Vec<ClientRequest>) {
-        self.input.clear();
+        self.composer.clear();
         self.slash_selected = 0;
         match action {
             SlashAction::Quit => {
@@ -1766,12 +1866,14 @@ impl App {
     }
 
     pub(crate) fn filtered_slash_commands(&self) -> Vec<&'static SlashCommand> {
-        if !self.input.starts_with('/') || self.input.chars().any(char::is_whitespace) {
+        if !self.composer.text.starts_with('/')
+            || self.composer.text.chars().any(char::is_whitespace)
+        {
             return Vec::new();
         }
         SLASH_COMMANDS
             .iter()
-            .filter(|command| command.name.starts_with(&self.input))
+            .filter(|command| command.name.starts_with(&self.composer.text))
             .collect()
     }
 
@@ -2052,29 +2154,29 @@ mod tests {
     #[test]
     fn shift_enter_inserts_a_newline_without_submitting() {
         let mut app = App::new(TuiOptions::default());
-        app.input = "hello".to_owned();
+        app.composer.text = "hello".to_owned();
         let (changed, requests) =
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(app.input, "hello\n");
+        assert_eq!(app.composer.text, "hello\n");
     }
 
     #[test]
     fn alt_enter_and_ctrl_j_insert_newlines_without_submitting() {
         let mut app = App::new(TuiOptions::default());
-        app.input = "hello".to_owned();
+        app.composer.text = "hello".to_owned();
 
         let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(app.input, "hello\n");
+        assert_eq!(app.composer.text, "hello\n");
 
         let (changed, requests) =
             app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(app.input, "hello\n\n");
+        assert_eq!(app.composer.text, "hello\n\n");
     }
 
     #[test]
@@ -2084,26 +2186,26 @@ mod tests {
             app.handle_terminal_event(Event::Paste("alpha\r\nbeta\ngamma".to_owned()));
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(app.input, "alpha\nbeta\ngamma");
+        assert_eq!(app.composer.text, "alpha\nbeta\ngamma");
     }
 
     #[test]
     fn submit_is_optimistic_but_restores_a_rejected_prompt() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
-        app.input = "hello".to_owned();
+        app.composer.text = "hello".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
             panic!("expected command")
         };
-        assert!(app.input.is_empty());
+        assert!(app.composer.text.is_empty());
         app.apply_client_update(ClientUpdate::CommandResult {
             command_id: request.command_id,
             result: Err(ClientFailure::new("offline")),
         });
 
-        assert_eq!(app.input, "hello");
+        assert_eq!(app.composer.text, "hello");
         assert_eq!(app.status.as_deref(), Some("offline"));
     }
 
@@ -2136,7 +2238,7 @@ mod tests {
         // The prompt captures ordinary typing instead of the composer.
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(requests.is_empty());
-        assert!(app.input.is_empty());
+        assert!(app.composer.text.is_empty());
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
@@ -2275,7 +2377,7 @@ mod tests {
         app.apply_snapshot(snapshot());
 
         for command in ["/sessions", "/resume"] {
-            app.input = command.to_owned();
+            app.composer.text = command.to_owned();
             let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(requests.is_empty());
             assert!(app.session_picker.is_some());
@@ -2284,7 +2386,7 @@ mod tests {
 
         for command in ["/quit", "/exit"] {
             let mut app = App::new(TuiOptions::default());
-            app.input = command.to_owned();
+            app.composer.text = command.to_owned();
             let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(requests.is_empty());
             assert!(app.quit);
@@ -2296,7 +2398,7 @@ mod tests {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
         let session_id = app.focused.unwrap();
-        app.input = "/compact".to_owned();
+        app.composer.text = "/compact".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -2307,7 +2409,7 @@ mod tests {
             request.command,
             SessionCommand::CompactSession { session_id }
         );
-        assert!(app.input.is_empty());
+        assert!(app.composer.text.is_empty());
         assert_eq!(app.status.as_deref(), Some("compacting session..."));
     }
 
@@ -2318,7 +2420,7 @@ mod tests {
         initial.sessions[0].status = SessionStatus::Running;
         initial.focused.as_mut().unwrap().summary.status = SessionStatus::Running;
         app.apply_snapshot(initial);
-        app.input = "/compact".to_owned();
+        app.composer.text = "/compact".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -2333,7 +2435,7 @@ mod tests {
     fn unknown_slash_commands_hint_instead_of_prompting() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
-        app.input = "/frobnicate the context".to_owned();
+        app.composer.text = "/frobnicate the context".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -2341,7 +2443,7 @@ mod tests {
             requests.is_empty(),
             "slash input must never become a prompt"
         );
-        assert!(app.input.is_empty());
+        assert!(app.composer.text.is_empty());
         let status = app.status.as_deref().unwrap();
         assert!(
             status.starts_with("unknown command /frobnicate"),
@@ -2395,7 +2497,7 @@ mod tests {
             models: Vec::new(),
         });
         app.apply_snapshot(snapshot());
-        app.input = "/new".to_owned();
+        app.composer.text = "/new".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -2416,7 +2518,7 @@ mod tests {
     fn slash_autocomplete_filters_selects_and_executes_commands() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
-        app.input = "/".to_owned();
+        app.composer.text = "/".to_owned();
 
         assert_eq!(
             app.filtered_slash_commands()
@@ -2443,11 +2545,11 @@ mod tests {
         assert_eq!(app.slash_selected, 0);
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(app.input.is_empty());
+        assert!(app.composer.text.is_empty());
         assert!(app.session_picker.is_some());
 
         app.session_picker = None;
-        app.input = "/qu".to_owned();
+        app.composer.text = "/qu".to_owned();
         app.slash_selected = 0;
         assert_eq!(
             app.filtered_slash_commands()[0].name,
@@ -2455,7 +2557,7 @@ mod tests {
             "a command prefix should hide unrelated commands"
         );
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.input.is_empty());
+        assert!(app.composer.text.is_empty());
         assert!(app.quit);
     }
 
@@ -2481,7 +2583,7 @@ mod tests {
         });
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(initial);
-        app.input = "/sessions".to_owned();
+        app.composer.text = "/sessions".to_owned();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         let (changed, requests) = app.handle_terminal_event(Event::Paste("LOGIN".to_owned()));
@@ -3002,7 +3104,7 @@ mod tests {
             }],
         });
         app.apply_snapshot(snapshot());
-        app.input = "/models".to_owned();
+        app.composer.text = "/models".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(requests.is_empty());
@@ -3152,7 +3254,7 @@ mod tests {
         let mut app = App::new(TuiOptions::default());
         let snapshot = snapshot();
         app.apply_snapshot(snapshot.clone());
-        app.input = "keep me".to_owned();
+        app.composer.text = "keep me".to_owned();
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
             panic!("expected command")
@@ -3164,7 +3266,7 @@ mod tests {
             result: Err(ClientFailure::new("server restarted")),
         });
 
-        assert_eq!(app.input, "keep me");
+        assert_eq!(app.composer.text, "keep me");
     }
 
     #[test]

@@ -292,17 +292,18 @@ impl FrameRenderer {
         }
 
         let mut lines = vec![header(app, width), context(app, width)];
-        // Header, context, and two footer rows are fixed. The composer can grow
-        // with wrapped multi-line input, so body height is computed after the
-        // composer is laid out against the remaining space.
-        const FIXED_CHROME_ROWS: usize = 4;
+        let status_lines = status_notice(app, width);
+        // Header, context, two footer rows, and the optional notice are fixed.
+        // The composer can grow with wrapped multi-line input, so body height is
+        // computed after the composer is laid out against the remaining space.
+        let fixed_chrome_rows = 4 + status_lines.len();
         let max_composer_rows = height
-            .saturating_sub(FIXED_CHROME_ROWS)
+            .saturating_sub(fixed_chrome_rows)
             .saturating_sub(1)
             .max(1);
         let composer_lines = composer(app, width, max_composer_rows);
         let body_height = height
-            .saturating_sub(FIXED_CHROME_ROWS)
+            .saturating_sub(fixed_chrome_rows)
             .saturating_sub(composer_lines.len());
         let overlay = app.model_picker.is_some()
             || app.session_picker.is_some()
@@ -329,6 +330,7 @@ impl FrameRenderer {
             overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
         }
         lines.extend(body);
+        lines.extend(status_lines);
         lines.extend(composer_lines);
         lines.push(footer_context(app, width));
         lines.push(footer_workspace(app, width));
@@ -1004,10 +1006,17 @@ fn context(app: &App, width: usize) -> Line {
             muted(),
         );
     }
-    if let Some(status) = &app.status {
-        line.push(format!("  |  {status}"), warning());
-    }
     truncate_line(line, width)
+}
+
+fn status_notice(app: &App, width: usize) -> Vec<Line> {
+    let Some(status) = &app.status else {
+        return Vec::new();
+    };
+    wrap_line(
+        Line::styled(format!("  warning: {status}"), warning().bold()),
+        width.max(1),
+    )
 }
 
 fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
@@ -1277,18 +1286,23 @@ fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
     } else {
         " "
     };
-    if app.input.is_empty() {
+    if app.composer.text.is_empty() {
         let mut line = Line::styled(" > ", accent().bold());
         line.push("Ask QQ...", muted().italic());
         line.push(caret, accent());
         return vec![truncate_line(line, width)];
     }
 
+    // Insert the visual caret into a rendering copy. Composer offsets are UTF-8
+    // byte boundaries, so this remains correct for non-ASCII input.
+    let mut display_text = app.composer.text.clone();
+    display_text.insert_str(app.composer.cursor(), caret);
+
     // Keep hard newlines from Shift-Enter / paste, then soft-wrap each logical
     // line inside the content column so every visual row keeps a gutter.
     let content_width = width.saturating_sub(3).max(1);
     let mut wrapped = Vec::new();
-    for (line_index, part) in app.input.split('\n').enumerate() {
+    for (line_index, part) in display_text.split('\n').enumerate() {
         let content_rows = if part.is_empty() {
             vec![Line::default()]
         } else {
@@ -1305,11 +1319,6 @@ fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
             }
             wrapped.push(row);
         }
-    }
-
-    if let Some(last) = wrapped.last_mut() {
-        last.push(caret, accent());
-        *last = truncate_line(std::mem::take(last), width);
     }
 
     // When the draft outgrows the reserved composer region, keep the tail so
@@ -3761,7 +3770,7 @@ mod tests {
     #[test]
     fn composer_renders_hard_newlines_across_multiple_rows() {
         let mut app = App::new(TuiOptions::default());
-        app.input = "hello\nworld".to_owned();
+        app.composer.text = "hello\nworld".to_owned();
         app.animation_tick = 0;
         let rows = frame_rows(&composer(&app, 40, 8));
         assert_eq!(rows, vec![" > hello".to_owned(), "   world|".to_owned()]);
@@ -3770,7 +3779,7 @@ mod tests {
     #[test]
     fn composer_keeps_the_tail_when_max_rows_clip() {
         let mut app = App::new(TuiOptions::default());
-        app.input = "one\ntwo\nthree\nfour".to_owned();
+        app.composer.text = "one\ntwo\nthree\nfour".to_owned();
         app.animation_tick = 1; // steady caret space, simpler assertions
         let rows = frame_rows(&composer(&app, 40, 2));
         assert_eq!(rows, vec![" … three".to_owned(), "   four ".to_owned()]);
@@ -3779,14 +3788,14 @@ mod tests {
     #[test]
     fn slash_autocomplete_is_filtered_above_the_composer() {
         let mut app = app_with_messages(1);
-        app.input = "/".to_owned();
+        app.composer.text = "/".to_owned();
         let frame = FrameRenderer::default().frame(&mut app, 80, 16);
         let text = frame_text(&frame);
         for command in ["/models", "/sessions", "/resume", "/new", "/quit", "/exit"] {
             assert!(text.contains(command));
         }
 
-        app.input = "/qu".to_owned();
+        app.composer.text = "/qu".to_owned();
         let frame = FrameRenderer::default().frame(&mut app, 80, 14);
         let text = frame_text(&frame);
 

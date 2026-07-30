@@ -4,6 +4,7 @@
 
 mod app;
 mod client;
+mod composer;
 mod settings;
 mod terminal;
 mod view;
