@@ -361,6 +361,7 @@ fn is_request_controlled_header(name: &HeaderName) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
+            | "user-agent"
     )
 }
 
@@ -898,12 +899,22 @@ mod tests {
     fn rejects_static_overrides_and_invalid_headers() {
         for name in [
             "authorization",
-            "host",
-            "content-length",
-            "connection",
-            "transfer-encoding",
             "accept",
+            "connection",
+            "content-length",
             "content-type",
+            "expect",
+            "host",
+            "http2-settings",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "user-agent",
         ] {
             let error = OpenAiChatCompletions::with_endpoint(
                 "https://example.com/v1/chat/completions",
@@ -927,6 +938,10 @@ mod tests {
         assert!(matches!(error, ProviderError::Configuration(_)));
 
         for headers in [
+            vec![
+                ("x-test".to_owned(), "one".to_owned()),
+                ("X-Test".to_owned(), "two".to_owned()),
+            ],
             vec![("bad header".to_owned(), "value".to_owned())],
             vec![("x-test".to_owned(), "bad\r\nvalue".to_owned())],
         ] {
@@ -940,6 +955,61 @@ mod tests {
             .expect("invalid header must be rejected");
             assert!(matches!(error, ProviderError::Configuration(_)));
         }
+    }
+
+    #[test]
+    fn configured_headers_are_sensitive_and_redactions_are_normalized() {
+        let (headers, redactions) = build_headers(
+            ChatCompletionsAuth::Header("x-auth".to_owned(), "long-test-secret".to_owned()),
+            [
+                ("x-first".to_owned(), "test-secret".to_owned()),
+                ("x-second".to_owned(), "long-test-secret".to_owned()),
+                ("x-third".to_owned(), "alpha".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        assert!(headers.values().all(HeaderValue::is_sensitive));
+        assert_eq!(redactions, ["long-test-secret", "test-secret", "alpha"]);
+        assert_eq!(
+            sanitize_message("long-test-secret test-secret alpha", &redactions),
+            "[REDACTED] [REDACTED] [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn byte_accounting_preserves_exact_limits_overflow_and_error_text() {
+        let mut output = 3;
+        add_output_bytes(&mut output, 2, 5).unwrap();
+        assert_eq!(output, 5);
+        assert_eq!(
+            add_output_bytes(&mut output, 1, 5).unwrap_err().to_string(),
+            "provider stream was invalid: OpenAI-compatible output exceeded the configured size limit"
+        );
+
+        let mut output = usize::MAX;
+        assert_eq!(
+            add_output_bytes(&mut output, 1, usize::MAX)
+                .unwrap_err()
+                .to_string(),
+            "provider stream was invalid: OpenAI-compatible output size overflowed"
+        );
+
+        let mut wire = 3;
+        add_wire_bytes(&mut wire, 2, 5).unwrap();
+        assert_eq!(wire, 5);
+        assert_eq!(
+            add_wire_bytes(&mut wire, 1, 5).unwrap_err().to_string(),
+            "provider stream was invalid: OpenAI-compatible stream exceeded the configured wire size limit"
+        );
+
+        let mut wire = usize::MAX;
+        assert_eq!(
+            add_wire_bytes(&mut wire, 1, usize::MAX)
+                .unwrap_err()
+                .to_string(),
+            "provider stream was invalid: OpenAI-compatible wire size overflowed"
+        );
     }
 
     #[test]

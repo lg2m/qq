@@ -18,6 +18,54 @@ No single test layer proves all five properties. Default tests must remain
 offline and deterministic, while opt-in live canaries detect upstream API,
 credential, permission, and model availability changes.
 
+## HTTP Exchange Execution
+
+The direct HTTP adapters share a transport seam before their protocol decoders:
+OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, and Google
+GenerateContent all build a request, authorize and send it, reject unsuccessful
+statuses, enforce response-byte limits, and then hand chunks to an SSE decoder.
+That seam belongs to the existing private `http` module rather than to each
+adapter.
+
+The target ownership is:
+
+- `http.rs` owns client policy, globally controlled-header safety, request-time
+  authorization and execution, transport-error sanitization, bounded non-2xx
+  bodies, success response metadata, and a wire-limited response-body stream.
+- `limits.rs` owns calculated stream budgets and reusable checked byte counters.
+- Each adapter continues to own endpoint and request-body construction,
+  protocol-owned/authentication headers, interpretation of non-2xx bodies,
+  accepted success content types, SSE configuration, protocol state, output
+  event accounting, and conversion to `ProviderEvent`.
+
+The exchange returns either a successful response whose body can only be read
+through the wire-limited stream, or a rejection containing status and an
+already bounded body. It does not accept callbacks or know provider error JSON
+schemas. This keeps the transport implementation deep without creating a
+"generic provider" abstraction that leaks every protocol distinction into its
+interface. The Responses adapter may, for example, retain its explicit Codex
+exception for a missing SSE content type.
+
+Header consolidation follows the same boundary. The HTTP module defines the
+universal request-controlled names and a builder that parses names and values,
+marks sensitive values, rejects case-insensitive duplicates and reserved-name
+overrides, and produces normalized redactions. Adapters add their small set of
+protocol-owned names and continue to validate protocol-specific auth choices.
+Secrets never move into generic debug-visible configuration.
+
+Migration must preserve observable wire contracts and error classification,
+except that every adapter will consistently reject a configured `user-agent`.
+Move one adapter at a time, beginning with Chat Completions, and delete each
+adapter's local wire counter, controlled-header list, send/status branch, and
+error-body reader only after its contract tests pass. Responses moves last
+because request-time Codex authorization and its content-type exception exercise
+the full seam. Bedrock's SDK transport remains outside the HTTP exchange, but it
+should use the common output byte counter from `limits.rs`.
+
+The implementation sequence, proposed interfaces, compatibility decisions, and
+acceptance tests are recorded in
+[`docs/plans/http-exchange.md`](../plans/http-exchange.md).
+
 ## Validation Matrix
 
 Every supported deployment and authentication path must appear in one checked-in

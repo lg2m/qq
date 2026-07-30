@@ -428,6 +428,7 @@ fn is_request_controlled_header(name: &HeaderName) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
+            | "user-agent"
     )
 }
 
@@ -848,12 +849,22 @@ mod tests {
     fn rejects_static_overrides_duplicate_headers_and_invalid_headers() {
         for name in [
             "authorization",
-            "host",
-            "content-length",
-            "connection",
-            "transfer-encoding",
             "accept",
+            "connection",
+            "content-length",
             "content-type",
+            "expect",
+            "host",
+            "http2-settings",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "user-agent",
         ] {
             let error = OpenAi::with_endpoint(
                 "https://example.com/v1/responses",

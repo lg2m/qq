@@ -138,32 +138,25 @@ fn is_loopback_host(url: &Url) -> bool {
 mod tests {
     use std::{
         io::{Read, Write},
-        net::TcpListener,
-        thread,
+        net::{TcpListener, TcpStream},
+        thread::{self, JoinHandle},
     };
 
     use super::*;
 
     #[tokio::test]
-    async fn error_body_is_bounded_to_sixteen_kibibytes() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1_024];
-            let _ = stream.read(&mut request).unwrap();
-            let body = vec![b'x'; ERROR_BODY_BYTES_LIMIT + 1_024];
-            write!(
-                stream,
+    async fn error_body_stops_at_exactly_sixteen_kibibytes() {
+        let body = vec![b'x'; ERROR_BODY_BYTES_LIMIT + 1_024];
+        let (url, server) = serve_response(
+            format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n",
                 body.len()
-            )
-            .unwrap();
-            stream.write_all(&body).unwrap();
-        });
+            ),
+            body,
+        );
         let response = build_direct_client()
             .unwrap()
-            .get(format!("http://{address}/error"))
+            .get(url)
             .send()
             .await
             .unwrap();
@@ -173,5 +166,107 @@ mod tests {
         assert_eq!(body.len(), ERROR_BODY_BYTES_LIMIT);
         assert!(body.iter().all(|byte| *byte == b'x'));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn error_body_preserves_partial_bytes_when_the_read_fails() {
+        let partial = b"partial provider error".to_vec();
+        let (url, server) = serve_response(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 1024\r\n\r\n".to_owned(),
+            partial.clone(),
+        );
+        let response = build_direct_client()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+
+        let body = read_error_body(response).await;
+
+        assert_eq!(body, partial);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_response_streams_all_wire_bytes() {
+        let body = b"first second third".to_vec();
+        let (url, server) = serve_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            ),
+            body.clone(),
+        );
+        let response = build_direct_client()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        assert!(is_event_stream(&response));
+
+        let streamed = response
+            .bytes_stream()
+            .map(|chunk| chunk.unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+
+        assert_eq!(streamed, body);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn body_read_transport_errors_are_url_free_and_redacted() {
+        let secret = "body-read-test-secret";
+        let (url, server) = serve_response(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_owned(),
+            format!("{secret}\r\n").into_bytes(),
+        );
+        let response = build_direct_client()
+            .unwrap()
+            .get(format!("{url}?credential={secret}"))
+            .send()
+            .await
+            .unwrap();
+        let error = response
+            .bytes_stream()
+            .next()
+            .await
+            .expect("malformed chunk framing must produce a body item")
+            .unwrap_err();
+
+        let error = transport_error(error, &[secret.to_owned()]);
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("credential="));
+        assert!(!rendered.contains('\n'));
+        server.join().unwrap();
+    }
+
+    fn serve_response(headers: String, body: Vec<u8>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/response", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_head(&mut stream);
+            stream.write_all(headers.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        (url, server)
+    }
+
+    fn read_request_head(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1_024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
     }
 }
