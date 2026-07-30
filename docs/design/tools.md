@@ -365,7 +365,11 @@ carry three lifetimes:
 - **Session** — approve-for-session records a grant consulted by every
   later policy check in that session. Shell grants are command prefixes
   matched at word granularity (`cargo test` covers `cargo test -p x`,
-  never `cargo testify`); other tools are granted by exact name.
+  never `cargo testify`); other tools are granted by exact name. A
+  prefix never extends over shell control characters — a command
+  containing `|`, `;`, `&`, redirection, or substitution is more than
+  one program, so it matches only a grant equal to the exact string.
+  The check is quote-blind on purpose: it errs toward prompting.
 - **Workspace** — the grants a user always wants live in the `policy`
   section of configuration, in the same layered documents as everything
   else. Same shapes, longer lifetime: exact tool names, shell command

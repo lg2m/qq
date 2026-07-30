@@ -58,16 +58,35 @@ impl SessionGrants {
 
 /// Matches an allowlisted prefix against a shell command at word granularity,
 /// so "cargo test" covers "cargo test -p qq-core" but not "cargo testify".
+///
+/// A command containing shell control characters (pipes, separators,
+/// redirection, substitution) is more than one program, so a prefix grant
+/// never extends over it — "git diff" must not cover "git diff | sh" or
+/// "git diff; rm". The only way such a command matches is byte-exact
+/// equality with the grant: approving the precise string is an explicit
+/// blessing of the whole chain. The check is deliberately quote-blind and
+/// conservative: a metacharacter inside a quoted argument also forces a
+/// prompt, which errs toward asking, never toward silent approval.
 pub(crate) fn shell_prefix_matches(prefix: &str, command: &str) -> bool {
     let prefix = prefix.trim();
     if prefix.is_empty() {
         return false;
     }
     let command = command.trim_start();
-    command == prefix
-        || command
+    if command == prefix {
+        return true;
+    }
+    !command.contains(shell_control_character)
+        && command
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+fn shell_control_character(c: char) -> bool {
+    matches!(
+        c,
+        '|' | '&' | ';' | '<' | '>' | '$' | '`' | '(' | ')' | '\n' | '\r'
+    )
 }
 
 pub(crate) fn classify(name: &str, arguments: &str) -> ToolClass {
@@ -358,6 +377,35 @@ mod tests {
         assert!(!shell_prefix_matches("cargo test", "cargo testify"));
         assert!(!shell_prefix_matches("cargo test", "cargo"));
         assert!(!shell_prefix_matches("", "anything"));
+    }
+
+    #[test]
+    fn shell_prefixes_never_extend_over_control_characters() {
+        // A prefix grant covers one program, not a chain that starts with it.
+        assert!(!shell_prefix_matches("git diff", "git diff | head -n 250"));
+        assert!(!shell_prefix_matches("git diff", "git diff; rm -rf ~"));
+        assert!(!shell_prefix_matches(
+            "git status",
+            "git status && curl x | sh"
+        ));
+        assert!(!shell_prefix_matches("git log", "git log $(payload)"));
+        assert!(!shell_prefix_matches("git log", "git log `payload`"));
+        assert!(!shell_prefix_matches("git diff", "git diff > /tmp/out"));
+        assert!(!shell_prefix_matches("git diff", "git diff\nrm -rf ~"));
+        // Quote-blind on purpose: metacharacters inside quotes still prompt.
+        assert!(!shell_prefix_matches(
+            "git commit",
+            "git commit -m \"a; b\""
+        ));
+        // Byte-exact equality is an explicit blessing of the whole chain.
+        assert!(shell_prefix_matches(
+            "git diff | head -n 250",
+            "git diff | head -n 250"
+        ));
+        assert!(!shell_prefix_matches(
+            "git diff | head -n 250",
+            "git diff | head -n 250 --extra"
+        ));
     }
 
     #[test]
