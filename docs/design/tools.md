@@ -34,8 +34,10 @@ implementation.
 "Repeat until no tool calls" needs a ceiling — a model that keeps calling
 tools must not burn tokens forever. The loop is bounded three ways: tool
 calls per turn (16), tool calls per run (64), and model turns per run
-(32). The defaults are high enough that legitimate multi-step work never
-notices them.
+(65). The turn ceiling is one greater than the call ceiling so a run that
+uses its last allowed tool call always gets a final model turn in which to
+return an answer. The defaults are high enough that legitimate multi-step
+work rarely notices them.
 
 Hitting a ceiling ends the run with an explicit run outcome — not a silent
 stop, and not a generic failure — so clients can render "turn limit

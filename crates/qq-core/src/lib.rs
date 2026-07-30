@@ -1952,6 +1952,49 @@ mod tests {
             })
         ));
 
+        struct FiniteToolTurns {
+            turn: Mutex<usize>,
+        }
+
+        impl Provider for FiniteToolTurns {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                if current == MAX_TOOL_CALLS_PER_RUN {
+                    return Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]));
+                }
+                let id = format!("call-{current}");
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "unknown".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: "{}".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted { id }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+
+        let runtime = Runtime::new(
+            FiniteToolTurns {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(events.last(), Some(&RunEvent::Completed));
+
         struct EndlessToolTurns {
             turn: Mutex<usize>,
         }
@@ -1994,7 +2037,7 @@ mod tests {
             Some(RunEvent::Failed {
                 kind: RunFailureKind::Policy,
                 message,
-            }) if message.contains("model turns")
+            }) if message.contains("64 calls")
         ));
     }
 
