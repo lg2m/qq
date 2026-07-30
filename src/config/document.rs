@@ -982,6 +982,23 @@ fn word_prefix_covers(prefix: &str, candidate: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
+/// Read-only version-control commands granted by the compiled defaults, per
+/// the Version Control section of docs/design/tools.md. Ordinary grants: a
+/// later layer can `Remove(...)` any of them and a managed deny filters them.
+/// Interrogative subcommands only — nothing here mutates or publishes.
+const VCS_READ_ONLY_PRESETS: &[&str] = &[
+    "git blame",
+    "git diff",
+    "git log",
+    "git show",
+    "git status",
+    "jj diff",
+    "jj log",
+    "jj op log",
+    "jj show",
+    "jj status",
+];
+
 pub(super) struct MergeState {
     organization: Option<String>,
     model: Option<String>,
@@ -1032,12 +1049,20 @@ impl MergeState {
                 .cloned()
                 .map(|name| (name, source.clone()))
                 .collect(),
+            grant_shell_prefixes: VCS_READ_ONLY_PRESETS
+                .iter()
+                .map(|prefix| ((*prefix).to_owned(), source.clone()))
+                .collect(),
             ..ConfigProvenance::default()
         };
         let report = SourceReport::new(
             source,
             super::SourceStatus::Applied,
-            vec![ConfigKey::MaxOutputTokens, ConfigKey::Providers],
+            vec![
+                ConfigKey::MaxOutputTokens,
+                ConfigKey::Providers,
+                ConfigKey::Policy,
+            ],
         );
         (
             Self {
@@ -1046,7 +1071,13 @@ impl MergeState {
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 providers,
                 mcp: BTreeMap::new(),
-                policy: EffectivePolicy::default(),
+                policy: EffectivePolicy {
+                    allow_shell_prefixes: VCS_READ_ONLY_PRESETS
+                        .iter()
+                        .map(|prefix| (*prefix).to_owned())
+                        .collect(),
+                    ..EffectivePolicy::default()
+                },
                 provenance,
             },
             report,

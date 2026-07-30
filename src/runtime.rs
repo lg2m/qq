@@ -1267,7 +1267,9 @@ mod tests {
         let request = LoadRequest::from_process_env(&workspace, None).unwrap();
         factory.inner.config.grant_pending_trust(&request).unwrap();
         let seed = WorkspaceGrantAuthority::seed_grants(&factory, &workspace).await;
-        assert_eq!(seed.shell_prefixes, ["cargo test"]);
+        assert!(seed.shell_prefixes.contains(&"cargo test".to_owned()));
+        // The compiled VCS read-only presets ride along with declared grants.
+        assert!(seed.shell_prefixes.contains(&"git status".to_owned()));
 
         // Promotion writes the grant durably and reports the file; repeating
         // it is idempotent, and the next seed carries the promoted grant.
@@ -1291,7 +1293,7 @@ mod tests {
         ));
         let seed = WorkspaceGrantAuthority::seed_grants(&factory, &workspace).await;
         assert_eq!(seed.tools, ["edit_file"]);
-        assert_eq!(seed.shell_prefixes, ["cargo test"]);
+        assert!(seed.shell_prefixes.contains(&"cargo test".to_owned()));
 
         // A managed deny refuses the promotion; the failure is data.
         fs::write(

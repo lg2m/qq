@@ -908,14 +908,43 @@ fn policy_grants_layer_extend_remove_deny_and_fold_mcp_allowlists() {
     assert_eq!(snapshot.policy().allow_tools(), ["edit_file"]);
     assert_eq!(
         snapshot.policy().allow_shell_prefixes(),
-        ["cargo build", "cargo test", "git status"]
+        [
+            "cargo build",
+            "cargo test",
+            "git blame",
+            "git diff",
+            "git log",
+            "git show",
+            "git status",
+            "jj diff",
+            "jj log",
+            "jj op log",
+            "jj show",
+            "jj status",
+        ]
     );
     assert_eq!(snapshot.policy().deny_tools(), ["edit_file"]);
     assert_eq!(snapshot.policy().deny_shell_prefixes(), ["cargo"]);
     // Resolved grants: MCP allowlists fold in as exact names, managed denies
-    // filter both exact tools and word-granularity shell overlaps.
+    // filter both exact tools and word-granularity shell overlaps. The VCS
+    // read-only presets from the compiled defaults survive alongside the
+    // globally declared "git status".
     assert_eq!(snapshot.grants().tools(), ["mcp__executor__execute"]);
-    assert_eq!(snapshot.grants().shell_prefixes(), ["git status"]);
+    assert_eq!(
+        snapshot.grants().shell_prefixes(),
+        [
+            "git blame",
+            "git diff",
+            "git log",
+            "git show",
+            "git status",
+            "jj diff",
+            "jj log",
+            "jj op log",
+            "jj show",
+            "jj status",
+        ]
+    );
     // Provenance follows the layer that declared each surviving grant.
     assert_eq!(
         snapshot
@@ -933,6 +962,57 @@ fn policy_grants_layer_extend_remove_deny_and_fold_mcp_allowlists() {
             .unwrap()
             .kind(),
         SourceKind::Global
+    );
+}
+
+#[test]
+fn vcs_read_only_presets_ship_in_compiled_defaults_and_stay_removable() {
+    let tree = TempTree::new();
+    // No user configuration beyond a model: the presets alone are effective.
+    tree.write("global/config.ron", r#"(version: 1, model: "test/model")"#);
+    let snapshot = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(
+        snapshot.grants().shell_prefixes(),
+        [
+            "git blame",
+            "git diff",
+            "git log",
+            "git show",
+            "git status",
+            "jj diff",
+            "jj log",
+            "jj op log",
+            "jj show",
+            "jj status",
+        ]
+    );
+    assert_eq!(
+        snapshot
+            .provenance()
+            .grant_shell_prefix("git blame")
+            .unwrap()
+            .kind(),
+        SourceKind::Compiled
+    );
+
+    // Presets are ordinary grants: a workspace layer removes one, a managed
+    // deny filters a whole family.
+    let tree = TempTree::new();
+    tree.write("global/config.ron", r#"(version: 1, model: "test/model")"#);
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, policy: (allow_shell_prefixes: [Remove("git diff")]))"#,
+    );
+    tree.write(
+        "managed/managed.ron",
+        r#"(version: 1, policy: (deny_shell_prefixes: ["jj"]))"#,
+    );
+    let request = tree.request();
+    tree.loader().grant_pending_trust(&request).unwrap();
+    let snapshot = tree.loader().load(&request).unwrap();
+    assert_eq!(
+        snapshot.grants().shell_prefixes(),
+        ["git blame", "git log", "git show", "git status"]
     );
 }
 
@@ -1034,7 +1114,22 @@ fn promotes_grants_into_a_fresh_workspace_config() {
     // promotion is the user's own decision, so its digest is trusted.
     let snapshot = loader.load(&tree.request()).unwrap();
     assert_eq!(snapshot.grants().tools(), ["edit_file"]);
-    assert_eq!(snapshot.grants().shell_prefixes(), ["cargo test"]);
+    assert_eq!(
+        snapshot.grants().shell_prefixes(),
+        [
+            "cargo test",
+            "git blame",
+            "git diff",
+            "git log",
+            "git show",
+            "git status",
+            "jj diff",
+            "jj log",
+            "jj op log",
+            "jj show",
+            "jj status",
+        ]
+    );
 }
 
 #[test]
@@ -1081,7 +1176,19 @@ fn promotion_preserves_unrelated_content_and_existing_policy() {
     assert_eq!(snapshot.grants().tools(), ["mcp__executor__execute"]);
     assert_eq!(
         snapshot.grants().shell_prefixes(),
-        ["cargo test", "git status"]
+        [
+            "cargo test",
+            "git blame",
+            "git diff",
+            "git log",
+            "git show",
+            "git status",
+            "jj diff",
+            "jj log",
+            "jj op log",
+            "jj show",
+            "jj status",
+        ]
     );
 }
 

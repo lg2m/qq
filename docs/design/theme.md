@@ -1,0 +1,241 @@
+# QQ TUI Themes
+
+## Purpose
+
+The TUI paints with a small set of semantic color roles. Themes map those roles
+to concrete colors so the default look stays stable while users can ship their
+own palettes without touching layout or keybinding config.
+
+Themes are load-time configuration. Invalid themes fail before the TUI starts,
+the same way invalid key chords do.
+
+## Current Baseline
+
+Until a theme is selected, the renderer uses the compiled default palette:
+
+| Role | Default |
+|------|---------|
+| `text` | white |
+| `muted` | dark grey (dim) |
+| `accent` | cyan |
+| `brand` | `#ff9f43` |
+| `warning` | yellow |
+| `error` | red |
+| `success` | green |
+| `surface` | `#262830` (code-block background) |
+
+These roles are the only colors the view should depend on. Attributes such as
+bold, dim, and italic stay in the renderer; themes supply colors only.
+
+## Selection
+
+Theme selection lives in `tui.ron` beside layout and bindings:
+
+```ron
+(
+    version: 1,
+    theme: "qq",
+    layout: Threadline,
+    bindings: (
+        select_threadline: ["F1"],
+        // ...
+    ),
+)
+```
+
+`theme` is a string name. When omitted, the compiled default `"qq"` is used.
+
+`tui.ron` continues to layer as today:
+
+```text
+compiled defaults
+  → global tui.ron
+  → project .qq/tui.ron from repository root to cwd
+```
+
+Later layers may override the theme name. The resolved name is then loaded once
+when TUI settings are compiled.
+
+## Theme Documents
+
+Custom themes are RON documents named `<name>.ron`.
+
+### Discovery
+
+Given a selected name `N`, resolve the first match in this order:
+
+1. Compiled-in themes (`qq` is always present).
+2. Global `themes/N.ron` under the QQ configuration directory.
+3. Project `.qq/themes/N.ron`, walking from the repository root to the current
+   directory. The nearest file wins when several project layers define the same
+   name.
+
+Unknown names are a configuration error.
+
+### Document Shape
+
+```ron
+(
+    version: 1,
+    // Optional color aliases referenced by role values.
+    defs: {
+        "base": "#191724",
+        "surface": "#1f1d2e",
+        "muted": "#6e6a86",
+        "text": "#e0def4",
+        "rose": "#eb6f92",
+        "pine": "#31748f",
+        "gold": "#f6c177",
+        "foam": "#9ccfd8",
+    },
+    colors: (
+        text: "text",
+        muted: "muted",
+        accent: "foam",
+        brand: "rose",
+        warning: "gold",
+        error: "rose",
+        success: "pine",
+        surface: "surface",
+    ),
+)
+```
+
+Rules:
+
+- `version` must be `1`.
+- `defs` is optional. Keys are alias names; values are color literals.
+- `colors` is required and must set every role listed below.
+- Each role value is either a `defs` name or a color literal.
+- Color literals are `#RRGGBB` (case-insensitive hex).
+- Unknown fields are rejected.
+- Missing roles, unknown alias names, and malformed literals are rejected.
+- Alias cycles are rejected.
+
+### Required Roles
+
+| Role | Use |
+|------|-----|
+| `text` | Primary foreground |
+| `muted` | Secondary / de-emphasized text |
+| `accent` | Interactive highlights, user-turn markers, list markers |
+| `brand` | Product mark (`qq` header) |
+| `warning` | Pending work, caution, non-fatal attention |
+| `error` | Failures, destructive emphasis, diff removals |
+| `success` | Completed success, diff additions |
+| `surface` | Recessed panel background (code blocks) |
+
+Markdown and unified diffs reuse these roles in v1:
+
+- headings and list markers → `accent`
+- block quotes and chrome → `muted`
+- inline code emphasis may use `warning` where the renderer already does
+- diff additions → `success`
+- diff removals → `error`
+- diff hunk headers → muted `accent`
+
+## Runtime Model
+
+`qq-tui` owns a resolved theme value:
+
+```rust
+pub struct Theme {
+    pub text: Color,
+    pub muted: Color,
+    pub accent: Color,
+    pub brand: Color,
+    pub warning: Color,
+    pub error: Color,
+    pub success: Color,
+    pub surface: Color,
+}
+```
+
+`Theme::default_qq()` returns the compiled baseline and is the fallback when no
+theme name is configured.
+
+Configuration loading:
+
+1. Load layered `tui.ron` documents.
+2. Resolve the effective theme name (default `"qq"`).
+3. Load and validate the theme document for that name.
+4. Expand aliases into concrete colors.
+5. Attach the resolved `Theme` to TUI options alongside layout and bindings.
+
+The view must not hardcode palette colors. Style helpers read from the active
+`Theme` (`theme.text()`, `theme.accent()`, and so on). Frame rendering, markdown
+layout, and diff coloring all share that single resolved value for the process.
+
+## Default Theme
+
+The compiled theme id is `"qq"`. Its colors match the baseline table above so
+existing installs keep the current look when `theme` is omitted or set to
+`"qq"`.
+
+Users create custom themes by adding files under the global or project `themes`
+directory and selecting the file stem from `tui.ron`:
+
+```text
+# global example
+~/.config/qq/themes/rose-pine.ron
+
+# project example
+.qq/themes/rose-pine.ron
+```
+
+```ron
+// tui.ron
+(
+    version: 1,
+    theme: "rose-pine",
+)
+```
+
+## Errors
+
+Theme failures are configuration errors reported before the TUI starts:
+
+- unsupported theme document version
+- unknown theme name
+- unreadable theme file
+- parse failure
+- missing required role
+- unknown `defs` reference
+- malformed color literal
+- alias cycle
+
+Provenance should record which source supplied the theme name and, when loaded
+from disk, which path supplied the theme document.
+
+## Out Of Scope (v1)
+
+- Per-role light/dark dual maps
+- Syntax-highlight token palettes
+- Terminal background clear / full chrome skinning beyond `surface`
+- Hot reload while the TUI is running
+- In-TUI theme picker or `/theme` command
+- Importing foreign theme file formats
+- Inline theme bodies embedded inside `tui.ron`
+
+These can extend the same role model later without changing selection or
+discovery.
+
+## Implementation Sketch
+
+1. Add `Theme` to `qq-tui` and thread it through `TuiOptions` / settings.
+2. Replace hardcoded palette helpers in the view with theme-backed styles.
+3. Extend `tui.ron` loading with an optional `theme` field.
+4. Resolve theme files from compiled, global, and project locations.
+5. Ship the compiled `"qq"` theme and document the custom-theme workflow.
+6. Tests: default resolution, layered name override, `defs` aliases, unknown
+   name, incomplete theme, bad hex, and a render smoke path with a non-default
+   palette.
+
+## Design Constraints
+
+- Prefer the smallest role set the renderer already needs.
+- Keep theme files data-only; no scripting or conditional logic.
+- Fail fast at load time rather than falling back silently to partial palettes.
+- Do not leak configuration document types into the render hot path; pass one
+  resolved `Theme`.
+- Measure nothing exotic for v1: theme resolution runs once at startup.

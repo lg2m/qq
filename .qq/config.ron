@@ -12,4 +12,14 @@
             auth: ApiKey(Stored("bedrock/default")),
         ),
     },
+    mcp: {
+        "executor": Http(
+            url: "https://executor.sh/lg2m/mcp",
+            // optional bearer if the endport requires one:
+            // bearer: Env("EXECUTOR_TOKEN"),
+            // or: bearer: Stored("executor/default"),
+            allow: ["execute", "skills", "resume"],
+            eager: true, // connect at startup instead of first use
+        )
+    },
 )
