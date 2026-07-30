@@ -1171,7 +1171,8 @@ fn approval_prompt(app: &App, width: usize, height: usize) -> Vec<Line> {
     let tool_call = app.pending_approval().expect("an approval is pending");
     let mut lines = vec![section(
         "TOOL APPROVAL",
-        "y approves once, a approves for this session, n or Esc denies",
+        "y approves once, a approves for this session, w always allows in this workspace, \
+         n or Esc denies",
     )];
     lines.push(Line::default());
     let mut name = Line::styled("  ◇ ", warning());
@@ -1219,7 +1220,7 @@ fn approval_prompt(app: &App, width: usize, height: usize) -> Vec<Line> {
     }
     lines.push(Line::default());
     lines.push(Line::styled(
-        "  [y] approve once   [a] approve for session   [n]/[Esc] deny",
+        "  [y] approve once   [a] for session   [w] for workspace   [n]/[Esc] deny",
         accent().bold(),
     ));
     fit_height(lines, height)
@@ -3302,6 +3303,13 @@ mod tests {
         assert_eq!(style_of("@@ -1 +1 @@"), Some(accent().dim()));
         assert_eq!(style_of("-old"), Some(failure()));
         assert_eq!(style_of("+new"), Some(success()));
+        // The modal offers all four decisions, including workspace lifetime.
+        assert!(rows.iter().any(|row| {
+            row.contains("[y] approve once")
+                && row.contains("[a] for session")
+                && row.contains("[w] for workspace")
+                && row.contains("[n]/[Esc] deny")
+        }));
     }
 
     #[test]

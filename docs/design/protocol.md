@@ -43,7 +43,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -52,7 +52,10 @@ speaks them. The number is a build-compatibility counter, not a product
 version — being "high" carries no meaning. Version 2 added session
 compaction (`compact_session`, `session_compacted`); version 3 added
 run context occupancy (`run_context_updated`,
-`RunSnapshot.context_tokens`).
+`RunSnapshot.context_tokens`); version 4 added workspace-lifetime
+approvals (the `approve_for_workspace` decision, the
+`approved_for_workspace` resolution, and the
+`workspace_grant_promoted` event).
 
 Clients and servers must agree on this value.
 
@@ -220,7 +223,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 3,
+  "protocol_version": 4,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -314,7 +317,10 @@ Outcome:
 }
 ```
 
-Emits `session_created`.
+Emits `session_created`. The workspace's effective config grants (see
+`docs/design/tools.md`, "Grant Lifetimes") are copied into the new
+session's grant set inside the creation transaction; a later config edit
+affects only sessions created afterwards.
 
 ### `POST /v1/sessions/prompts`
 
@@ -392,9 +398,10 @@ Decision variants:
 | --- | --- |
 | `approve_once` | Run this call only |
 | `approve_for_session` | Run this call and record a session grant |
+| `approve_for_workspace` | Like `approve_for_session`, plus promote the grant into workspace configuration |
 | `deny` | Reject the call |
 
-`approve_for_session` includes a grant:
+`approve_for_session` and `approve_for_workspace` include a grant:
 
 ```json
 { "type": "approve_for_session", "grant": { "type": "tool", "name": "edit_file" } }
@@ -402,7 +409,7 @@ Decision variants:
 
 ```json
 {
-  "type": "approve_for_session",
+  "type": "approve_for_workspace",
   "grant": { "type": "shell_prefix", "prefix": "cargo test" }
 }
 ```
@@ -417,8 +424,27 @@ Outcome:
 }
 ```
 
-Resolution values: `approved_once`, `approved_for_session`, `denied`,
-`denied_timeout`.
+Resolution values: `approved_once`, `approved_for_session`,
+`approved_for_workspace`, `denied`, `denied_timeout`.
+
+`approve_for_workspace` resolves the approval exactly like
+`approve_for_session` — the session grant is recorded in the same
+transaction, so the waiting run proceeds immediately — and additionally
+requests that the grant be written into the workspace's `.qq/config.ron`
+policy section. That durable write happens after the approval commits and
+its fate arrives as a separate `workspace_grant_promoted` event carrying
+one of:
+
+```json
+{ "type": "written", "path": "/repo/.qq/config.ron" }
+{ "type": "already_present", "path": "/repo/.qq/config.ron" }
+{ "type": "failed", "message": "..." }
+```
+
+A `failed` outcome (managed-layer deny, IO error) is informational only:
+the approval stands and the session grant remains in force. Retrying the
+`respond_tool_approval` command with the same `command_id` replays the
+original receipt and does not re-run the promotion.
 
 ### `POST /v1/sessions/approval-mode`
 
@@ -749,6 +775,7 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `tool_call_requested` | `tool_call` | Model finished requesting a tool call |
 | `tool_approval_requested` | `tool_call`, optional `shell`, optional `edit` | Policy needs a human decision |
 | `tool_approval_resolved` | `tool_call`, `resolution` | Approval decision recorded |
+| `workspace_grant_promoted` | `grant`, `outcome` | An approve-for-workspace promotion finished (`written`, `already_present`, or non-fatal `failed`) |
 | `tool_call_started` | `tool_call` | Execution began |
 | `tool_call_output_delta` | `tool_call_id`, `chunk` | Incremental output from a running call (shell) |
 | `tool_call_finished` | `tool_call` | Execution ended with result/error |
