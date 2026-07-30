@@ -12,8 +12,8 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     http::{
-        build_client, build_direct_client, is_event_stream, read_error_body, transport_error,
-        validate_endpoint,
+        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, build_client,
+        build_direct_client, transport_error, validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -50,11 +50,9 @@ impl fmt::Debug for ChatCompletionsAuth {
 
 /// A client for OpenAI-compatible Chat Completions endpoints.
 pub struct OpenAiChatCompletions {
-    client: reqwest::Client,
+    exchange: HttpExchange,
     endpoint: reqwest::Url,
     headers: HeaderMap,
-    redactions: Arc<[String]>,
-    authorizer: RequestAuthorizer,
 }
 
 impl OpenAiChatCompletions {
@@ -112,63 +110,57 @@ impl OpenAiChatCompletions {
         let (headers, redactions) = build_headers(auth, static_headers)?;
 
         Ok(Self {
-            client,
+            exchange: HttpExchange::new(client, authorizer, Arc::from(redactions)),
             endpoint,
             headers,
-            redactions: Arc::from(redactions),
-            authorizer,
         })
     }
 }
 
 impl Provider for OpenAiChatCompletions {
     fn stream(&self, request: ModelRequest) -> ProviderStream {
-        let client = self.client.clone();
+        let exchange = self.exchange.clone();
         let endpoint = self.endpoint.clone();
         let headers = self.headers.clone();
-        let redactions = Arc::clone(&self.redactions);
-        let authorizer = self.authorizer.clone();
 
         Box::pin(try_stream! {
-            let mut redactions = redactions.as_ref().to_vec();
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = ChatCompletionsRequest::from(&request);
-            let mut wire_request = client
-                .post(endpoint)
+            let wire_request = exchange
+                .request(reqwest::Method::POST, endpoint)
                 .headers(headers)
                 .header(ACCEPT, "text/event-stream")
                 .json(&body)
                 .build()
-                .map_err(|error| transport_error(error, redactions.as_ref()))?;
-            redactions.extend(authorizer.authorize(&mut wire_request).await?);
-            let response = client
-                .execute(wire_request)
-                .await
-                .map_err(|error| transport_error(error, redactions.as_ref()))?;
-
-            let response = if response.status().is_success() {
-                response
-            } else {
-                Err(api_error(response, redactions.as_ref()).await)?
+                .map_err(|error| transport_error(error, exchange.static_redactions()))?;
+            let outcome = exchange
+                .execute(
+                    wire_request,
+                    limits.wire,
+                    ExchangeMessages {
+                        wire_overflow: "OpenAI-compatible wire size overflowed",
+                        wire_limit: "OpenAI-compatible stream exceeded the configured wire size limit",
+                    },
+                )
+                .await?;
+            let response = match outcome {
+                ExchangeOutcome::Success(response) => response,
+                ExchangeOutcome::Rejected(rejection) => Err(api_error(rejection))?,
             };
 
-            if !is_event_stream(&response) {
+            if !crate::http::is_event_stream_headers(response.headers()) {
                 Err(ProviderError::Protocol(
                     "OpenAI-compatible provider returned a non-SSE response".to_owned(),
                 ))?;
             }
 
-            let mut chunks = response.bytes_stream();
+            let redactions = Arc::<[String]>::from(response.redactions());
+            let mut chunks = response.into_body();
             let mut decoder = sse_decoder(limits.event);
             let mut output_bytes = ByteCounter::new(
                 limits.output,
                 "OpenAI-compatible output size overflowed",
                 "OpenAI-compatible output exceeded the configured size limit",
-            );
-            let mut wire_bytes = ByteCounter::new(
-                limits.wire,
-                "OpenAI-compatible wire size overflowed",
-                "OpenAI-compatible stream exceeded the configured wire size limit",
             );
             let mut usage = None;
             // Maps streamed tool-call array indexes to call ids so argument
@@ -177,9 +169,7 @@ impl Provider for OpenAiChatCompletions {
             let mut tool_calls: BTreeMap<u64, String> = BTreeMap::new();
 
             while let Some(chunk) = chunks.next().await {
-                let chunk = chunk
-                    .map_err(|error| transport_error(error, redactions.as_ref()))?;
-                wire_bytes.add(chunk.len())?;
+                let chunk = chunk?;
 
                 for event in decoder.push(&chunk)? {
                     let data = event.data.trim();
@@ -786,19 +776,20 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
     }
 }
 
-async fn api_error(response: reqwest::Response, redactions: &[String]) -> ProviderError {
-    let status = response.status();
+fn api_error(rejection: HttpRejection) -> ProviderError {
+    let status = rejection.status();
     let fallback = status
         .canonical_reason()
         .unwrap_or("OpenAI-compatible request failed")
         .to_owned();
-    let body = read_error_body(response).await;
-    let body_text = String::from_utf8_lossy(&body);
-    let message = serde_json::from_slice::<ApiErrorEnvelope>(&body)
+    let body_text = String::from_utf8_lossy(rejection.body());
+    let message = serde_json::from_slice::<ApiErrorEnvelope>(rejection.body())
         .ok()
         .and_then(|envelope| envelope.error.message)
         .or_else(|| (!body_text.trim().is_empty()).then(|| body_text.into_owned()))
-        .map_or(fallback, |message| sanitize_message(&message, redactions));
+        .map_or(fallback, |message| {
+            sanitize_message(&message, rejection.redactions())
+        });
 
     ProviderError::Api {
         status: status.as_u16(),
@@ -1404,6 +1395,55 @@ mod tests {
             request_header(head, "authorization"),
             Some("Bearer test-api-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn request_time_bearer_auth_is_applied_and_redacted_from_rejections() {
+        const SECRET: &str = "dynamic-chat-test-secret";
+
+        let body = format!(r#"{{"error":{{"message":"invalid {SECRET}"}}}}"#);
+        let (endpoint, server) = serve_once(
+            "/v1/chat/completions",
+            "401 Unauthorized",
+            "application/json",
+            vec![body.into_bytes()],
+        );
+        let credentials =
+            crate::SharedRequestCredentialProvider::new(StaticBearerCredential(SECRET));
+        let provider = OpenAiChatCompletions::with_client_and_authorizer(
+            build_direct_client().unwrap(),
+            reqwest::Url::parse(&endpoint).unwrap(),
+            ChatCompletionsAuth::NoAuth,
+            [],
+            RequestAuthorizer::request_credentials(credentials),
+        )
+        .unwrap();
+
+        let error = provider
+            .stream(test_request())
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Api { status: 401, .. }));
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(SECRET));
+
+        let request = String::from_utf8(server.join().unwrap()).unwrap();
+        let head = request.split_once("\r\n\r\n").unwrap().0;
+        assert_eq!(
+            request_header(head, "authorization"),
+            Some("Bearer dynamic-chat-test-secret")
+        );
+    }
+
+    struct StaticBearerCredential(&'static str);
+
+    impl crate::RequestCredentialProvider for StaticBearerCredential {
+        fn credential(&self) -> crate::RequestCredentialFuture<'_> {
+            Box::pin(async { crate::RequestCredential::bearer(self.0) })
+        }
     }
 
     #[tokio::test]

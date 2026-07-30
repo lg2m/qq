@@ -14,7 +14,7 @@ pub use sessions::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandOutcome,
     CommandReceipt, CommandRequest, CursorError, EditPreview, EventCursor, MessageRole,
     MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
-    ModelPricingTier, ModelSelection, RunFailure, RunOutcome, RunSnapshot, RunStatus,
+    ModelPricingTier, ModelSelection, RunActivity, RunFailure, RunOutcome, RunSnapshot, RunStatus,
     SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot, SessionStatus,
     SessionSummary, ShellCommandPreview, SnapshotRequest, SubscribeRequest, TextChannel,
     TokenUsage, ToolCallDisplay, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome,
@@ -48,6 +48,9 @@ impl RunCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEvent {
     Started,
+    ActivityChanged {
+        activity: RunActivity,
+    },
     OutputTextDelta {
         text: String,
     },

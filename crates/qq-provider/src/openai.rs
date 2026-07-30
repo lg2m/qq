@@ -591,7 +591,10 @@ enum StreamingEvent {
     #[serde(rename = "error")]
     Error {
         code: Option<String>,
-        message: String,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        error: Option<ApiError>,
     },
     #[serde(other)]
     Other,
@@ -651,7 +654,10 @@ struct ApiErrorEnvelope {
 #[derive(Deserialize)]
 struct ApiError {
     code: Option<String>,
-    message: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -676,8 +682,11 @@ enum DecodedEvent {
 
 fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedEvent, ProviderError> {
     let event: StreamingEvent = serde_json::from_str(data).map_err(|error| {
+        // Include a short sanitized payload snippet so live Codex/OpenAI
+        // decode failures remain diagnosable without logging the full stream.
+        let snippet = truncate_chars(data.trim(), 240);
         ProviderError::Protocol(sanitize_message(
-            &format!("could not decode OpenAI event: {error}"),
+            &format!("could not decode OpenAI event: {error}; payload={snippet}"),
             redactions,
         ))
     })?;
@@ -719,10 +728,7 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedEvent, Provi
                 kind: ProviderErrorKind::Response,
                 message: "OpenAI did not provide a reason".to_owned(),
             },
-            |error| ProviderError::ResponseFailed {
-                kind: openai_error_kind(error.code.as_deref()),
-                message: sanitize_message(&error.message, redactions),
-            },
+            |error| response_failed_from_api_error(error, redactions),
         )),
         StreamingEvent::Incomplete { response } => Err(ProviderError::ResponseIncomplete(
             response
@@ -733,12 +739,52 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedEvent, Provi
                     |reason| sanitize_message(&reason, redactions),
                 ),
         )),
-        StreamingEvent::Error { code, message } => Err(ProviderError::ResponseFailed {
-            kind: openai_error_kind(code.as_deref()),
-            message: sanitize_message(&message, redactions),
+        StreamingEvent::Error {
+            code,
+            message,
+            error,
+        } => Err(match error {
+            Some(error) => response_failed_from_api_error(
+                ApiError {
+                    code: code.or(error.code),
+                    message: message.or(error.message),
+                    error_type: error.error_type,
+                },
+                redactions,
+            ),
+            None => ProviderError::ResponseFailed {
+                kind: openai_error_kind(code.as_deref()),
+                message: sanitize_message(
+                    message
+                        .as_deref()
+                        .unwrap_or("OpenAI did not provide a reason"),
+                    redactions,
+                ),
+            },
         }),
         StreamingEvent::Other => Ok(DecodedEvent::Ignored),
     }
+}
+
+fn response_failed_from_api_error(error: ApiError, redactions: &[String]) -> ProviderError {
+    ProviderError::ResponseFailed {
+        kind: openai_error_kind(error.code.as_deref().or(error.error_type.as_deref())),
+        message: sanitize_message(
+            error
+                .message
+                .as_deref()
+                .unwrap_or("OpenAI did not provide a reason"),
+            redactions,
+        ),
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn provider_usage(usage: ResponsesUsage) -> Result<ProviderUsage, ProviderError> {
@@ -775,8 +821,8 @@ async fn api_error(response: reqwest::Response, redactions: &[String]) -> Provid
     let body = read_error_body(response).await;
     let body = String::from_utf8_lossy(&body);
     let message = serde_json::from_str::<ApiErrorEnvelope>(&body)
-        .map(|envelope| envelope.error.message)
         .ok()
+        .and_then(|envelope| envelope.error.message)
         .or_else(|| (!body.trim().is_empty()).then(|| body.into_owned()))
         .map_or(fallback, |message| sanitize_message(&message, redactions));
 
@@ -1075,9 +1121,44 @@ mod tests {
             &[],
         )
         .unwrap_err();
+        // Official OpenAI/Codex Responses error events nest the diagnostic
+        // under `error` and may include sequence/param metadata.
+        let nested = decode_event(
+            r#"{"type":"error","sequence_number":3,"error":{"type":"invalid_request_error","code":"invalid_prompt","message":"boom","param":null}}"#,
+            &[],
+        )
+        .unwrap_err();
+        let missing_message =
+            decode_event(r#"{"type":"error","code":"server_error"}"#, &[]).unwrap_err();
+        let nested_failed = decode_event(
+            r#"{"type":"response.failed","response":{"error":{"code":"server_error"}}}"#,
+            &[],
+        )
+        .unwrap_err();
+        let undecodable = decode_event(r#"{"type":"response.completed","response":[]}"#, &[])
+            .unwrap_err()
+            .to_string();
 
         assert_eq!(error.to_string(), "provider response failed: rate limited");
         assert_eq!(error.kind(), crate::ProviderErrorKind::RateLimited);
+        assert_eq!(nested.to_string(), "provider response failed: boom");
+        assert_eq!(nested.kind(), crate::ProviderErrorKind::InvalidRequest);
+        assert_eq!(
+            missing_message.to_string(),
+            "provider response failed: OpenAI did not provide a reason"
+        );
+        assert_eq!(
+            missing_message.kind(),
+            crate::ProviderErrorKind::Unavailable
+        );
+        assert_eq!(
+            nested_failed.to_string(),
+            "provider response failed: OpenAI did not provide a reason"
+        );
+        assert_eq!(nested_failed.kind(), crate::ProviderErrorKind::Unavailable);
+        assert!(undecodable.contains("could not decode OpenAI event:"));
+        assert!(undecodable.contains("payload="));
+        assert!(undecodable.contains("response.completed"));
     }
 
     #[test]

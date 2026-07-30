@@ -4,9 +4,9 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Mou
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
     CommandRequest, EditPreview, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection,
-    RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
-    SessionStatus, SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot, ToolCallState,
-    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot,
+    RunActivity, RunId, RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
+    SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot,
+    ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -131,6 +131,10 @@ pub(crate) struct SessionView {
     pub tool_calls: Option<Vec<ToolCallSnapshot>>,
     pub latest_input_tokens: Option<u64>,
     pub context_window: Option<u32>,
+    /// Latest replaceable liveness state for the active run. Snapshots do not
+    /// currently carry it, so reconnects fall back to a generic running label
+    /// until the next live activity event arrives.
+    pub activity: Option<(RunId, RunActivity)>,
     loaded_through: u64,
 }
 
@@ -466,6 +470,7 @@ impl App {
                         tool_calls: None,
                         latest_input_tokens: None,
                         context_window,
+                        activity: None,
                         loaded_through: snapshot_sequence,
                     });
             }
@@ -538,6 +543,7 @@ impl App {
                 tool_calls: Some(tool_calls),
                 latest_input_tokens,
                 context_window,
+                activity: None,
                 loaded_through,
             },
         );
@@ -616,6 +622,11 @@ impl App {
                     }) {
                         message.state = MessageState::Complete;
                     }
+                }
+            }
+            SessionEvent::RunActivityChanged { run_id, activity } => {
+                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    session.activity = Some((*run_id, *activity));
                 }
             }
             SessionEvent::AssistantMessageStarted { message } => {
@@ -725,6 +736,9 @@ impl App {
                 context_tokens,
             } => {
                 self.upsert_summary(session.clone());
+                if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
+                    view.activity = None;
+                }
                 // The last turn's figure is the context occupancy; the summed
                 // usage is a legacy fallback only (it overstates multi-turn
                 // runs but beats showing nothing).
@@ -785,6 +799,7 @@ impl App {
                 tool_calls: None,
                 latest_input_tokens: None,
                 context_window,
+                activity: None,
                 loaded_through: 0,
             });
     }

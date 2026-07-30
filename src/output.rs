@@ -20,7 +20,7 @@ pub async fn render(
 
     while let Some(event) = events.next().await {
         match event {
-            RunEvent::Started => {}
+            RunEvent::Started | RunEvent::ActivityChanged { .. } => {}
             RunEvent::OutputTextDelta { text } | RunEvent::RefusalDelta { text } => {
                 let text = output_text(&text, mode);
                 writer.write_all(text.as_bytes())?;
