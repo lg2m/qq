@@ -27,6 +27,16 @@ const MAX_RECENT_TOOL_CALLS: usize = 64;
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
 const MAX_PROMPT_HISTORY: usize = 100;
 const MOUSE_SCROLL_ROWS: usize = 3;
+/// Notices are deliberately ephemeral. At the 125 ms UI tick this keeps each
+/// notice visible for five seconds without making it permanent UI.
+const NOTICE_TICKS: u16 = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeLevel {
+    Info,
+    Warning,
+    Error,
+}
 
 pub(crate) struct SlashCommand {
     pub name: &'static str,
@@ -197,8 +207,12 @@ enum PendingIntent {
         session_id: SessionId,
         text: String,
     },
-    Cancel,
-    Compact,
+    Cancel {
+        session_id: SessionId,
+    },
+    Compact {
+        session_id: SessionId,
+    },
     Approval {
         tool_call_id: qq_protocol::ToolCallId,
     },
@@ -222,6 +236,11 @@ pub(crate) struct App {
     slash_selected: usize,
     pub connection: ConnectionState,
     pub status: Option<String>,
+    /// Session owning the current transient notice. A notice never follows
+    /// the user into another session.
+    status_session_id: Option<SessionId>,
+    pub(crate) status_level: NoticeLevel,
+    status_ticks_left: u16,
     pub animation_tick: usize,
     pub quit: bool,
     pub tool_detail: ToolDetail,
@@ -262,6 +281,9 @@ impl App {
             slash_selected: 0,
             connection: ConnectionState::Connecting,
             status: None,
+            status_session_id: None,
+            status_level: NoticeLevel::Info,
+            status_ticks_left: 0,
             animation_tick: 0,
             quit: false,
             tool_detail: ToolDetail::default(),
@@ -300,7 +322,7 @@ impl App {
                 self.recent_events.clear();
                 self.edit_previews.clear();
                 self.live_tool_output.clear();
-                self.status = Some("session state reset after reconnecting".to_owned());
+                self.set_warning("session state reset after reconnecting".to_owned());
                 self.apply_snapshot(snapshot)
             }
             ClientUpdate::Models { models, selected } => {
@@ -319,13 +341,16 @@ impl App {
                         {
                             self.focused = Some(session_id);
                         }
-                        if matches!(intent, Some(PendingIntent::Cancel)) {
-                            self.status = Some("cancellation requested".to_owned());
+                        if let Some(PendingIntent::Cancel { session_id }) = intent.as_ref() {
+                            self.set_info_for(
+                                Some(*session_id),
+                                "cancellation requested".to_owned(),
+                            );
                         }
                         if let CommandOutcome::ToolApprovalResolved { resolution, .. } =
                             receipt.outcome
                         {
-                            self.status = Some(
+                            self.set_info(
                                 match resolution {
                                     ApprovalResolution::ApprovedOnce => "tool call approved",
                                     ApprovalResolution::ApprovedForSession => {
@@ -343,29 +368,35 @@ impl App {
                             );
                         }
                         if matches!(receipt.outcome, CommandOutcome::RunAlreadyFinished { .. }) {
-                            self.status = Some("run already finished".to_owned());
+                            self.set_warning("run already finished".to_owned());
                         }
                         match &receipt.outcome {
-                            CommandOutcome::CompactionQueued { .. } => {
-                                self.status = Some("compacting session...".to_owned());
+                            CommandOutcome::CompactionQueued { session_id, .. } => {
+                                self.set_info_for(
+                                    Some(*session_id),
+                                    "compacting session...".to_owned(),
+                                );
                             }
-                            CommandOutcome::SessionModelSet { model, .. } => {
-                                self.status = Some(format!(
-                                    "session model set to {}",
-                                    model.model.as_deref().unwrap_or("default")
-                                ));
+                            CommandOutcome::SessionModelSet { session_id, model } => {
+                                self.set_info_for(
+                                    Some(*session_id),
+                                    format!(
+                                        "session model set to {}",
+                                        model.model.as_deref().unwrap_or("default")
+                                    ),
+                                );
                             }
                             CommandOutcome::SessionDeleted { .. } => {
-                                self.status = Some("session deleted".to_owned());
+                                self.set_warning("session deleted".to_owned());
                             }
                             CommandOutcome::SessionsPruned { deleted: 0, .. } => {
-                                self.status = Some("no empty sessions to delete".to_owned());
+                                self.set_warning("no empty sessions to delete".to_owned());
                             }
                             CommandOutcome::SessionsPruned { deleted: 1, .. } => {
-                                self.status = Some("deleted 1 empty session".to_owned());
+                                self.set_warning("deleted 1 empty session".to_owned());
                             }
                             CommandOutcome::SessionsPruned { deleted, .. } => {
-                                self.status = Some(format!("deleted {deleted} empty sessions"));
+                                self.set_warning(format!("deleted {deleted} empty sessions"));
                             }
                             _ => {}
                         }
@@ -375,7 +406,7 @@ impl App {
                 true
             }
             ClientUpdate::SnapshotFailed(error) => {
-                self.status = Some(error.message().to_owned());
+                self.set_warning(error.message().to_owned());
                 true
             }
         }
@@ -429,7 +460,7 @@ impl App {
             .workspace_id
             .is_some_and(|workspace| workspace != snapshot.workspace.id)
         {
-            self.status = Some("server returned a snapshot for another workspace".to_owned());
+            self.set_warning("server returned a snapshot for another workspace".to_owned());
             return true;
         }
         let snapshot_focus = snapshot.focused.as_ref().map(|focused| focused.summary.id);
@@ -446,7 +477,7 @@ impl App {
                 .front()
                 .is_none_or(|event| event.cursor.sequence > snapshot.cursor.sequence + 1)
         {
-            self.status = Some("snapshot was too stale; reconnecting is required".to_owned());
+            self.set_warning("snapshot was too stale; reconnecting is required".to_owned());
             return true;
         }
 
@@ -554,7 +585,7 @@ impl App {
             .workspace_id
             .is_some_and(|workspace| workspace != event.cursor.workspace_id)
         {
-            self.status = Some("server sent an event for another workspace".to_owned());
+            self.set_warning("server sent an event for another workspace".to_owned());
             return true;
         }
         if event.cursor.sequence <= self.last_sequence {
@@ -562,7 +593,7 @@ impl App {
         }
         if self.last_sequence != 0 && event.cursor.sequence != self.last_sequence + 1 {
             self.connection = ConnectionState::Replaying;
-            self.status = Some("session event gap detected".to_owned());
+            self.set_warning("session event gap detected".to_owned());
             return true;
         }
         self.workspace_id.get_or_insert(event.cursor.workspace_id);
@@ -704,7 +735,7 @@ impl App {
             // The follow-through of an approve-for-workspace decision. A
             // failure is informational: the session grant already stands.
             SessionEvent::WorkspaceGrantPromoted { outcome, .. } => {
-                self.status = Some(match outcome {
+                self.set_warning(match outcome {
                     WorkspaceGrantOutcome::Written { path } => {
                         format!("grant written to {path}")
                     }
@@ -723,11 +754,14 @@ impl App {
                 ..
             } => {
                 self.upsert_summary(session.clone());
-                self.status = Some(format!(
-                    "compacted: {} -> {}",
-                    format_bytes(*before_bytes),
-                    format_bytes(*after_bytes)
-                ));
+                self.set_info_for(
+                    Some(envelope.session_id),
+                    format!(
+                        "compacted: {} -> {}",
+                        format_bytes(*before_bytes),
+                        format_bytes(*after_bytes)
+                    ),
+                );
             }
             SessionEvent::RunContextUpdated { context_tokens, .. } => {
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
@@ -785,7 +819,7 @@ impl App {
                     }
                 }
                 if let RunOutcome::Failed { failure } = outcome {
-                    self.status = Some(failure.message.clone());
+                    self.set_error_for(Some(envelope.session_id), failure.message.clone());
                 }
             }
         }
@@ -978,8 +1012,67 @@ impl App {
         }
     }
 
+    fn set_notice_for(&mut self, session_id: Option<SessionId>, text: String, level: NoticeLevel) {
+        self.status = Some(text);
+        self.status_session_id = session_id;
+        self.status_level = level;
+        self.status_ticks_left = NOTICE_TICKS;
+    }
+
+    fn set_notice(&mut self, text: String, level: NoticeLevel) {
+        self.set_notice_for(self.focused, text, level);
+    }
+
+    fn set_info_for(&mut self, session_id: Option<SessionId>, text: String) {
+        self.set_notice_for(session_id, text, NoticeLevel::Info);
+    }
+
+    fn set_info(&mut self, text: String) {
+        self.set_notice(text, NoticeLevel::Info);
+    }
+
+    fn set_warning(&mut self, text: String) {
+        self.set_notice(text, NoticeLevel::Warning);
+    }
+
+    fn set_error_for(&mut self, session_id: Option<SessionId>, text: String) {
+        self.set_notice_for(session_id, text, NoticeLevel::Error);
+    }
+
+    pub(crate) fn visible_status(&self) -> Option<(&str, NoticeLevel)> {
+        if self.status_session_id != self.focused {
+            return None;
+        }
+        self.status.as_deref().map(|text| (text, self.status_level))
+    }
+
+    fn expire_status(&mut self) -> bool {
+        if self.status.is_none() || self.status_ticks_left == 0 {
+            return false;
+        }
+        self.status_ticks_left -= 1;
+        if self.status_ticks_left == 0 {
+            self.status = None;
+            return true;
+        }
+        false
+    }
+
     fn reject_pending(&mut self, command_id: CommandId, error: ClientFailure) {
-        match self.pending.remove(&command_id) {
+        let intent = self.pending.remove(&command_id);
+        let status_session_id = match &intent {
+            Some(PendingIntent::Prompt { session_id, .. })
+            | Some(PendingIntent::Cancel { session_id })
+            | Some(PendingIntent::Compact { session_id }) => Some(*session_id),
+            Some(PendingIntent::Approval { tool_call_id }) => self
+                .sessions
+                .values()
+                .flat_map(|session| session.tool_calls.iter().flatten())
+                .find(|tool_call| tool_call.id == *tool_call_id)
+                .map(|tool_call| tool_call.session_id),
+            Some(PendingIntent::Create) | None => self.focused,
+        };
+        match intent {
             Some(PendingIntent::Prompt { session_id, text })
                 if self.focused == Some(session_id) && self.composer.text.is_empty() =>
             {
@@ -991,7 +1084,7 @@ impl App {
             }
             _ => {}
         }
-        self.status = Some(error.message().to_owned());
+        self.set_error_for(status_session_id, error.message().to_owned());
     }
 
     pub fn handle_terminal_event(&mut self, event: Event) -> (bool, Vec<ClientRequest>) {
@@ -1183,7 +1276,7 @@ impl App {
 
     fn open_models(&mut self) -> (bool, Vec<ClientRequest>) {
         if self.models.is_empty() {
-            self.status = Some("no authenticated providers have selectable models".to_owned());
+            self.set_warning("no authenticated providers have selectable models".to_owned());
             return (true, Vec::new());
         }
         self.session_picker = None;
@@ -1302,7 +1395,7 @@ impl App {
         model: ModelSelection,
     ) -> (bool, Vec<ClientRequest>) {
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
         // Remember the pick as the client default so /new and later creates
@@ -1460,7 +1553,7 @@ impl App {
             .get(&selected)
             .is_some_and(|session| session.summary.active_run_id.is_some())
         {
-            self.status = Some("cancel the active run before deleting".to_owned());
+            self.set_warning("cancel the active run before deleting".to_owned());
             return (true, Vec::new());
         }
         if let Some(picker) = &mut self.session_picker {
@@ -1496,7 +1589,7 @@ impl App {
 
     fn delete_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
         (
@@ -1510,11 +1603,11 @@ impl App {
 
     fn prune_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
         let Some(workspace_id) = self.workspace_id else {
-            self.status = Some("workspace is still connecting".to_owned());
+            self.set_warning("workspace is still connecting".to_owned());
             return (true, Vec::new());
         };
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
         (
@@ -1582,15 +1675,15 @@ impl App {
                 .split_once('/')
                 .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
         }) {
-            self.status = Some("choose a model with /models before creating a session".to_owned());
+            self.set_warning("choose a model with /models before creating a session".to_owned());
             return (true, Vec::new());
         }
         let Some(workspace_id) = self.workspace_id else {
-            self.status = Some("workspace is still connecting".to_owned());
+            self.set_warning("workspace is still connecting".to_owned());
             return (true, Vec::new());
         };
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
         // Keep the chosen model as the client default for the rest of this TUI
@@ -1626,7 +1719,7 @@ impl App {
                 .find(|command| command.name == name)
                 .map(|command| command.action)
             else {
-                self.status = Some(format!(
+                self.set_warning(format!(
                     "unknown command {name}; try {}",
                     SLASH_COMMANDS
                         .iter()
@@ -1641,11 +1734,11 @@ impl App {
             return self.execute_slash_action(action);
         }
         let Some(session_id) = self.focused else {
-            self.status = Some("create a session before sending a prompt".to_owned());
+            self.set_warning("create a session before sending a prompt".to_owned());
             return (true, Vec::new());
         };
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
         self.record_prompt(session_id, &prompt);
@@ -1724,7 +1817,7 @@ impl App {
 
     fn compact_session(&mut self) -> (bool, Vec<ClientRequest>) {
         let Some(session_id) = self.focused else {
-            self.status = Some("create a session before compacting".to_owned());
+            self.set_warning("create a session before compacting".to_owned());
             return (true, Vec::new());
         };
         if self
@@ -1732,15 +1825,16 @@ impl App {
             .get(&session_id)
             .is_some_and(|session| session.summary.status != SessionStatus::Idle)
         {
-            self.status = Some("compaction needs an idle session; wait or cancel first".to_owned());
+            self.set_warning("compaction needs an idle session; wait or cancel first".to_owned());
             return (true, Vec::new());
         }
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
-        self.pending.insert(command_id, PendingIntent::Compact);
-        self.status = Some("compacting session...".to_owned());
+        self.pending
+            .insert(command_id, PendingIntent::Compact { session_id });
+        self.set_info("compacting session...".to_owned());
         (
             true,
             vec![ClientRequest::Command(CommandRequest {
@@ -1751,19 +1845,24 @@ impl App {
     }
 
     fn cancel_run(&mut self) -> (bool, Vec<ClientRequest>) {
+        let Some(session_id) = self.focused else {
+            self.set_warning("focused session has no active run".to_owned());
+            return (true, Vec::new());
+        };
         let Some(run_id) = self
-            .focused
-            .and_then(|session_id| self.sessions.get(&session_id))
+            .sessions
+            .get(&session_id)
             .and_then(|session| session.summary.active_run_id)
         else {
-            self.status = Some("focused session has no active run".to_owned());
+            self.set_warning("focused session has no active run".to_owned());
             return (true, Vec::new());
         };
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
-        self.pending.insert(command_id, PendingIntent::Cancel);
+        self.pending
+            .insert(command_id, PendingIntent::Cancel { session_id });
         (
             true,
             vec![ClientRequest::Command(CommandRequest {
@@ -1819,7 +1918,7 @@ impl App {
             ApprovalChoice::Deny => ApprovalDecision::Deny,
         };
         let Ok(command_id) = CommandId::generate() else {
-            self.status = Some("secure randomness is unavailable".to_owned());
+            self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
         };
         self.answered_approvals.insert(tool_call_id);
@@ -1926,15 +2025,18 @@ impl App {
 
     pub fn advance_animation(&mut self) -> bool {
         self.animation_tick = self.animation_tick.wrapping_add(1);
-        self.sessions
+        let active = self
+            .sessions
             .values()
-            .any(|session| matches!(session.summary.status, qq_protocol::SessionStatus::Running))
+            .any(|session| matches!(session.summary.status, qq_protocol::SessionStatus::Running));
+        self.expire_status() || active
     }
 
     pub fn has_activity(&self) -> bool {
-        self.sessions
-            .values()
-            .any(|session| matches!(session.summary.status, qq_protocol::SessionStatus::Running))
+        self.status.is_some()
+            || self.sessions.values().any(|session| {
+                matches!(session.summary.status, qq_protocol::SessionStatus::Running)
+            })
     }
 
     pub fn pending_prompts(&self, session_id: SessionId) -> impl Iterator<Item = &str> {
@@ -1947,8 +2049,8 @@ impl App {
                 } if *candidate == session_id => Some(text.as_str()),
                 PendingIntent::Create
                 | PendingIntent::Prompt { .. }
-                | PendingIntent::Cancel
-                | PendingIntent::Compact
+                | PendingIntent::Cancel { .. }
+                | PendingIntent::Compact { .. }
                 | PendingIntent::Approval { .. } => None,
             })
     }
@@ -2531,6 +2633,49 @@ mod tests {
         );
         assert!(app.composer.text.is_empty());
         assert_eq!(app.status.as_deref(), Some("compacting session..."));
+        assert_eq!(
+            app.visible_status(),
+            Some(("compacting session...", NoticeLevel::Info))
+        );
+    }
+
+    #[test]
+    fn notices_only_render_for_the_session_that_owns_them() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        let owner = app.focused.unwrap();
+        let other = id(9, SessionId::from_bytes);
+
+        app.set_error_for(Some(owner), "model request failed".to_owned());
+        assert_eq!(
+            app.visible_status(),
+            Some(("model request failed", NoticeLevel::Error))
+        );
+
+        app.focused = Some(other);
+        assert_eq!(app.visible_status(), None);
+
+        app.focused = Some(owner);
+        assert_eq!(
+            app.visible_status(),
+            Some(("model request failed", NoticeLevel::Error))
+        );
+    }
+
+    #[test]
+    fn warning_and_error_notices_expire() {
+        for level in [NoticeLevel::Warning, NoticeLevel::Error] {
+            let mut app = App::new(TuiOptions::default());
+            app.apply_snapshot(snapshot());
+            app.set_notice("temporary notice".to_owned(), level);
+
+            for _ in 0..NOTICE_TICKS {
+                app.advance_animation();
+            }
+
+            assert_eq!(app.visible_status(), None, "{level:?} notice remained");
+            assert!(!app.has_activity());
+        }
     }
 
     #[test]

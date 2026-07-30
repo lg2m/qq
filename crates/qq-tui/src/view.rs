@@ -1011,9 +1011,14 @@ fn context(app: &App, width: usize) -> Line {
 
 fn status_notice(app: &App, width: usize) -> Vec<Line> {
     let mut lines = Vec::new();
-    if let Some(status) = &app.status {
+    if let Some((status, level)) = app.visible_status() {
+        let (prefix, style) = match level {
+            crate::app::NoticeLevel::Info => ("", accent()),
+            crate::app::NoticeLevel::Warning => ("warning: ", warning()),
+            crate::app::NoticeLevel::Error => ("error: ", failure()),
+        };
         lines.extend(wrap_line(
-            Line::styled(format!("  warning: {status}"), warning().bold()),
+            Line::styled(format!("  {prefix}{status}"), style.bold()),
             width.max(1),
         ));
     }
