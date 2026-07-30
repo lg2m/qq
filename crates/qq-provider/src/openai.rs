@@ -15,7 +15,7 @@ use crate::{
         build_client, build_direct_client, is_event_stream, read_error_body, transport_error,
         validate_endpoint,
     },
-    limits::StreamLimits,
+    limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
@@ -192,8 +192,16 @@ impl Provider for OpenAi {
 
             let mut chunks = response.bytes_stream();
             let mut decoder = sse_decoder(limits.event);
-            let mut output_bytes = 0;
-            let mut wire_bytes = 0_usize;
+            let mut output_bytes = ByteCounter::new(
+                limits.output,
+                "OpenAI output size overflowed",
+                "OpenAI output exceeded the configured size limit",
+            );
+            let mut wire_bytes = ByteCounter::new(
+                limits.wire,
+                "OpenAI wire size overflowed",
+                "OpenAI stream exceeded the configured wire size limit",
+            );
             // Maps streamed function-call item ids to call ids so argument
             // deltas and item completions can be attributed after the added
             // event; the call id is what round-trips into function_call_output.
@@ -201,14 +209,7 @@ impl Provider for OpenAi {
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
                     .map_err(|error| transport_error(error, redactions.as_ref()))?;
-                wire_bytes = wire_bytes.checked_add(chunk.len()).ok_or_else(|| {
-                    ProviderError::Protocol("OpenAI wire size overflowed".to_owned())
-                })?;
-                if wire_bytes > limits.wire {
-                    Err(ProviderError::Protocol(
-                        "OpenAI stream exceeded the configured wire size limit".to_owned(),
-                    ))?;
-                }
+                wire_bytes.add(chunk.len())?;
 
                 for event in decoder.push(&chunk)? {
                     let data = event.data;
@@ -218,11 +219,11 @@ impl Provider for OpenAi {
 
                     match decode_event(&data, redactions.as_ref())? {
                         DecodedEvent::OutputTextDelta(text) => {
-                            add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                            output_bytes.add(text.len())?;
                             yield ProviderEvent::OutputTextDelta { text };
                         }
                         DecodedEvent::RefusalDelta(text) => {
-                            add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                            output_bytes.add(text.len())?;
                             yield ProviderEvent::RefusalDelta { text };
                         }
                         DecodedEvent::ToolCallStarted { item_id, call_id, name } => {
@@ -237,7 +238,7 @@ impl Provider for OpenAi {
                         DecodedEvent::ToolCallArguments { item_id, json } => {
                             match tool_calls.get(&item_id) {
                                 Some(call_id) => {
-                                    add_output_bytes(&mut output_bytes, json.len(), limits.output)?;
+                                    output_bytes.add(json.len())?;
                                     yield ProviderEvent::ToolCallArgumentsDelta {
                                         id: call_id.clone(),
                                         json,
@@ -763,23 +764,6 @@ fn openai_error_kind(code: Option<&str>) -> ProviderErrorKind {
         Some("server_error" | "service_unavailable") => ProviderErrorKind::Unavailable,
         _ => ProviderErrorKind::Response,
     }
-}
-
-fn add_output_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current
-        .checked_add(additional)
-        .ok_or_else(|| ProviderError::Protocol("OpenAI output size overflowed".to_owned()))?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "OpenAI output exceeded the configured size limit".to_owned(),
-        ));
-    }
-
-    Ok(())
 }
 
 async fn api_error(response: reqwest::Response, redactions: &[String]) -> ProviderError {

@@ -15,7 +15,7 @@ use crate::{
         build_client, build_direct_client, is_event_stream, read_error_body, transport_error,
         validate_endpoint,
     },
-    limits::StreamLimits,
+    limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
@@ -160,8 +160,16 @@ impl Provider for OpenAiChatCompletions {
 
             let mut chunks = response.bytes_stream();
             let mut decoder = sse_decoder(limits.event);
-            let mut output_bytes = 0_usize;
-            let mut wire_bytes = 0_usize;
+            let mut output_bytes = ByteCounter::new(
+                limits.output,
+                "OpenAI-compatible output size overflowed",
+                "OpenAI-compatible output exceeded the configured size limit",
+            );
+            let mut wire_bytes = ByteCounter::new(
+                limits.wire,
+                "OpenAI-compatible wire size overflowed",
+                "OpenAI-compatible stream exceeded the configured wire size limit",
+            );
             let mut usage = None;
             // Maps streamed tool-call array indexes to call ids so argument
             // fragments and the finish reason can be attributed after the
@@ -171,7 +179,7 @@ impl Provider for OpenAiChatCompletions {
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
                     .map_err(|error| transport_error(error, redactions.as_ref()))?;
-                add_wire_bytes(&mut wire_bytes, chunk.len(), limits.wire)?;
+                wire_bytes.add(chunk.len())?;
 
                 for event in decoder.push(&chunk)? {
                     let data = event.data.trim();
@@ -194,19 +202,11 @@ impl Provider for OpenAiChatCompletions {
                     for delta in decoded.deltas {
                         match delta {
                             DecodedDelta::OutputText(text) => {
-                                add_output_bytes(
-                                    &mut output_bytes,
-                                    text.len(),
-                                    limits.output,
-                                )?;
+                                output_bytes.add(text.len())?;
                                 yield ProviderEvent::OutputTextDelta { text };
                             }
                             DecodedDelta::Refusal(text) => {
-                                add_output_bytes(
-                                    &mut output_bytes,
-                                    text.len(),
-                                    limits.output,
-                                )?;
+                                output_bytes.add(text.len())?;
                                 yield ProviderEvent::RefusalDelta { text };
                             }
                             DecodedDelta::ToolCallStarted { index, id, name } => {
@@ -221,11 +221,7 @@ impl Provider for OpenAiChatCompletions {
                             DecodedDelta::ToolCallArguments { index, json } => {
                                 match tool_calls.get(&index) {
                                     Some(id) => {
-                                        add_output_bytes(
-                                            &mut output_bytes,
-                                            json.len(),
-                                            limits.output,
-                                        )?;
+                                        output_bytes.add(json.len())?;
                                         yield ProviderEvent::ToolCallArgumentsDelta {
                                             id: id.clone(),
                                             json,
@@ -790,38 +786,6 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
     }
 }
 
-fn add_output_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current.checked_add(additional).ok_or_else(|| {
-        ProviderError::Protocol("OpenAI-compatible output size overflowed".to_owned())
-    })?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "OpenAI-compatible output exceeded the configured size limit".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn add_wire_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current.checked_add(additional).ok_or_else(|| {
-        ProviderError::Protocol("OpenAI-compatible wire size overflowed".to_owned())
-    })?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "OpenAI-compatible stream exceeded the configured wire size limit".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 async fn api_error(response: reqwest::Response, redactions: &[String]) -> ProviderError {
     let status = response.status();
     let fallback = status
@@ -978,36 +942,25 @@ mod tests {
     }
 
     #[test]
-    fn byte_accounting_preserves_exact_limits_overflow_and_error_text() {
-        let mut output = 3;
-        add_output_bytes(&mut output, 2, 5).unwrap();
-        assert_eq!(output, 5);
+    fn adapter_byte_accounting_preserves_error_text() {
+        let mut output = ByteCounter::new(
+            4,
+            "OpenAI-compatible output size overflowed",
+            "OpenAI-compatible output exceeded the configured size limit",
+        );
         assert_eq!(
-            add_output_bytes(&mut output, 1, 5).unwrap_err().to_string(),
+            output.add(5).unwrap_err().to_string(),
             "provider stream was invalid: OpenAI-compatible output exceeded the configured size limit"
         );
 
-        let mut output = usize::MAX;
-        assert_eq!(
-            add_output_bytes(&mut output, 1, usize::MAX)
-                .unwrap_err()
-                .to_string(),
-            "provider stream was invalid: OpenAI-compatible output size overflowed"
+        let mut wire = ByteCounter::new(
+            usize::MAX,
+            "OpenAI-compatible wire size overflowed",
+            "OpenAI-compatible stream exceeded the configured wire size limit",
         );
-
-        let mut wire = 3;
-        add_wire_bytes(&mut wire, 2, 5).unwrap();
-        assert_eq!(wire, 5);
+        wire.add(usize::MAX).unwrap();
         assert_eq!(
-            add_wire_bytes(&mut wire, 1, 5).unwrap_err().to_string(),
-            "provider stream was invalid: OpenAI-compatible stream exceeded the configured wire size limit"
-        );
-
-        let mut wire = usize::MAX;
-        assert_eq!(
-            add_wire_bytes(&mut wire, 1, usize::MAX)
-                .unwrap_err()
-                .to_string(),
+            wire.add(1).unwrap_err().to_string(),
             "provider stream was invalid: OpenAI-compatible wire size overflowed"
         );
     }
@@ -1132,8 +1085,10 @@ mod tests {
         let event_error = sse_decoder(8)
             .push(b"data: this event keeps going")
             .unwrap_err();
-        let output_error = add_output_bytes(&mut 3, 2, 4).unwrap_err();
-        let wire_error = add_wire_bytes(&mut 7, 2, 8).unwrap_err();
+        let mut output = ByteCounter::new(4, "output overflow", "output limit");
+        let output_error = output.add(5).unwrap_err();
+        let mut wire = ByteCounter::new(8, "wire overflow", "wire limit");
+        let wire_error = wire.add(9).unwrap_err();
 
         assert!(matches!(event_error, ProviderError::Protocol(_)));
         assert!(matches!(output_error, ProviderError::Protocol(_)));

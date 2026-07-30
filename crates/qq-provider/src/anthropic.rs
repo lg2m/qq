@@ -15,7 +15,7 @@ use crate::{
         build_client, build_direct_client, is_event_stream, read_error_body, transport_error,
         validate_endpoint,
     },
-    limits::StreamLimits,
+    limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, SseEvent, Utf8ErrorMessage},
@@ -205,8 +205,16 @@ impl Provider for AnthropicMessages {
 
             let mut chunks = response.bytes_stream();
             let mut decoder = sse_decoder(limits.event);
-            let mut output_bytes = 0_usize;
-            let mut wire_bytes = 0_usize;
+            let mut output_bytes = ByteCounter::new(
+                limits.output,
+                "Anthropic-compatible output size overflowed",
+                "Anthropic-compatible output exceeded the configured size limit",
+            );
+            let mut wire_bytes = ByteCounter::new(
+                limits.wire,
+                "Anthropic-compatible wire size overflowed",
+                "Anthropic-compatible stream exceeded the configured wire size limit",
+            );
             let mut usage = None;
             // Maps streamed content-block indexes to tool-call ids so argument
             // deltas and block stops can be attributed after the start event.
@@ -215,7 +223,7 @@ impl Provider for AnthropicMessages {
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
                     .map_err(|error| transport_error(error, redactions.as_ref()))?;
-                add_wire_bytes(&mut wire_bytes, chunk.len(), limits.wire)?;
+                wire_bytes.add(chunk.len())?;
 
                 for event in decoder.push(&chunk)? {
                     match decode_event(event, redactions.as_ref())? {
@@ -223,7 +231,7 @@ impl Provider for AnthropicMessages {
                             if text.is_empty() {
                                 continue;
                             }
-                            add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                            output_bytes.add(text.len())?;
                             yield ProviderEvent::OutputTextDelta { text };
                         }
                         DecodedEvent::MessageStart(start) => {
@@ -237,7 +245,7 @@ impl Provider for AnthropicMessages {
                         }
                         DecodedEvent::MessageDelta { refusal, output_tokens } => {
                             if let Some(text) = refusal {
-                                add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                                output_bytes.add(text.len())?;
                                 yield ProviderEvent::RefusalDelta { text };
                             }
                             if let Some(output_tokens) = output_tokens {
@@ -266,7 +274,7 @@ impl Provider for AnthropicMessages {
                         DecodedEvent::ToolCallArguments { index, json } => {
                             match tool_calls.get(&index) {
                                 Some(id) => {
-                                    add_output_bytes(&mut output_bytes, json.len(), limits.output)?;
+                                    output_bytes.add(json.len())?;
                                     yield ProviderEvent::ToolCallArgumentsDelta {
                                         id: id.clone(),
                                         json,
@@ -887,38 +895,6 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
     }
 }
 
-fn add_output_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current.checked_add(additional).ok_or_else(|| {
-        ProviderError::Protocol("Anthropic-compatible output size overflowed".to_owned())
-    })?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "Anthropic-compatible output exceeded the configured size limit".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn add_wire_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current.checked_add(additional).ok_or_else(|| {
-        ProviderError::Protocol("Anthropic-compatible wire size overflowed".to_owned())
-    })?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "Anthropic-compatible stream exceeded the configured wire size limit".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 async fn api_error(response: reqwest::Response, redactions: &[String]) -> ProviderError {
     let status = response.status();
     let fallback = status
@@ -1295,8 +1271,10 @@ mod tests {
         let event_error = sse_decoder(8)
             .push(b"data: this event keeps going")
             .unwrap_err();
-        let output_error = add_output_bytes(&mut 3, 2, 4).unwrap_err();
-        let wire_error = add_wire_bytes(&mut 7, 2, 8).unwrap_err();
+        let mut output = ByteCounter::new(4, "output overflow", "output limit");
+        let output_error = output.add(5).unwrap_err();
+        let mut wire = ByteCounter::new(8, "wire overflow", "wire limit");
+        let wire_error = wire.add(9).unwrap_err();
 
         assert!(matches!(mismatch, ProviderError::Protocol(_)));
         assert!(matches!(event_error, ProviderError::Protocol(_)));

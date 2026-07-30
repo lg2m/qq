@@ -1,6 +1,6 @@
 # Deepen HTTP Exchange Execution
 
-Status: in progress. Stage 1 behavior-freezing tests are complete.
+Status: in progress. Stages 1 and 2 are complete.
 
 ## Goal
 
@@ -174,9 +174,13 @@ all headers generic configuration.
    bodies, successful response streaming, and sanitized body-read failures.
    Existing adapter contract tests retain non-SSE success policy and
    provider-specific HTTP error decoding.
-2. **Extract byte accounting.** Add the checked counter to `limits.rs`; migrate
-   output counters in the four HTTP adapters and Bedrock. Preserve exact error
-   strings and test overflow plus one-byte-over-limit behavior centrally.
+2. **Extract byte accounting. Complete.** Added `ByteCounter` to `limits.rs`
+   with centralized exact-limit, one-byte-over-limit, and checked-overflow tests.
+   Migrated output accounting in OpenAI Responses, OpenAI Chat Completions,
+   Anthropic Messages, Google GenerateContent, and Bedrock while preserving
+   adapter-owned diagnostic strings and accounting semantics. The direct HTTP
+   adapters also use the counter for wire bytes pending ownership by the
+   exchange in stage 3.
 3. **Introduce the exchange types.** Implement request-time authorization,
    execution, status split, bounded rejection, and limited success stream in
    `http.rs`. Unit-test this seam against a localhost server, including dynamic

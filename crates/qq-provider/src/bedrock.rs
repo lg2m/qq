@@ -51,7 +51,9 @@ use tokio::sync::{OnceCell, Semaphore};
 
 use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role, limits::StreamLimits, request_auth::AwsCredentialLease,
+    ProviderStream, ProviderUsage, Role,
+    limits::{ByteCounter, StreamLimits},
+    request_auth::AwsCredentialLease,
     sanitize::sanitize_message,
 };
 
@@ -170,7 +172,11 @@ impl Provider for Bedrock {
                     )
                 })?;
             let mut receiver = response.stream;
-            let mut output_bytes = 0_usize;
+            let mut output_bytes = ByteCounter::new(
+                limits.output,
+                "Amazon Bedrock output size overflowed",
+                "Amazon Bedrock output exceeded the configured size limit",
+            );
             let mut message_stopped = false;
             // Maps streamed content-block indexes to tool-call ids so argument
             // deltas and block stops can be attributed after the start event.
@@ -199,7 +205,7 @@ impl Provider for Bedrock {
                         if text.is_empty() {
                             continue;
                         }
-                        add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                        output_bytes.add(text.len())?;
                         yield ProviderEvent::OutputTextDelta { text };
                     }
                     DecodedEvent::Refusal(text) => {
@@ -208,7 +214,7 @@ impl Provider for Bedrock {
                                 "Amazon Bedrock returned more than one messageStop".to_owned(),
                             ))?;
                         }
-                        add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                        output_bytes.add(text.len())?;
                         yield ProviderEvent::RefusalDelta { text };
                         message_stopped = true;
                     }
@@ -236,7 +242,7 @@ impl Provider for Bedrock {
                             ))?;
                         }
                         let id = tool_calls.arguments(index)?.to_owned();
-                        add_output_bytes(&mut output_bytes, json.len(), limits.output)?;
+                        output_bytes.add(json.len())?;
                         yield ProviderEvent::ToolCallArgumentsDelta { id, json };
                     }
                     DecodedEvent::BlockStopped { index } => {
@@ -1067,22 +1073,6 @@ impl fmt::Write for BoundedLength {
     }
 }
 
-fn add_output_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current.checked_add(additional).ok_or_else(|| {
-        ProviderError::Protocol("Amazon Bedrock output size overflowed".to_owned())
-    })?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "Amazon Bedrock output exceeded the configured size limit".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -1685,7 +1675,8 @@ mod tests {
                 .unwrap(),
         );
         let event_error = check_stream_event_size(&event, 8).unwrap_err();
-        let output_error = add_output_bytes(&mut 7, 2, 8).unwrap_err();
+        let mut output = ByteCounter::new(8, "output overflow", "output limit");
+        let output_error = output.add(9).unwrap_err();
 
         assert!(matches!(event_error, ProviderError::Protocol(_)));
         assert!(matches!(output_error, ProviderError::Protocol(_)));

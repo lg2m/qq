@@ -12,7 +12,7 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     http::{build_client, is_event_stream, read_error_body, transport_error, validate_endpoint},
-    limits::StreamLimits,
+    limits::{ByteCounter, StreamLimits},
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
 };
@@ -171,8 +171,16 @@ impl Provider for GoogleGenerateContent {
 
             let mut chunks = response.bytes_stream();
             let mut decoder = sse_decoder(limits.event);
-            let mut output_bytes = 0_usize;
-            let mut wire_bytes = 0_usize;
+            let mut output_bytes = ByteCounter::new(
+                limits.output,
+                "Google GenerateContent output size overflowed",
+                "Google GenerateContent output exceeded the configured size limit",
+            );
+            let mut wire_bytes = ByteCounter::new(
+                limits.wire,
+                "Google GenerateContent wire size overflowed",
+                "Google GenerateContent stream exceeded the configured wire size limit",
+            );
             let mut usage = None;
             // Gemini assigns no tool-call ids; a per-stream ordinal keeps the
             // synthesized ids deterministic.
@@ -181,13 +189,13 @@ impl Provider for GoogleGenerateContent {
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
                     .map_err(|error| transport_error(error, redactions.as_ref()))?;
-                add_wire_bytes(&mut wire_bytes, chunk.len(), limits.wire)?;
+                wire_bytes.add(chunk.len())?;
 
                 for frame in decoder.push(&chunk)? {
                     for event in decode_event(&frame.data, &mut tool_call_ordinal, redactions.as_ref())? {
                         match event {
                             DecodedEvent::OutputText(text) => {
-                                add_output_bytes(&mut output_bytes, text.len(), limits.output)?;
+                                output_bytes.add(text.len())?;
                                 yield ProviderEvent::OutputTextDelta { text };
                             }
                             DecodedEvent::Usage(event_usage) => {
@@ -198,7 +206,7 @@ impl Provider for GoogleGenerateContent {
                                 }
                             }
                             DecodedEvent::ToolCall { id, name, arguments } => {
-                                add_output_bytes(&mut output_bytes, arguments.len(), limits.output)?;
+                                output_bytes.add(arguments.len())?;
                                 yield ProviderEvent::ToolCallStarted {
                                     id: id.clone(),
                                     name,
@@ -805,38 +813,6 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
     }
 }
 
-fn add_output_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current.checked_add(additional).ok_or_else(|| {
-        ProviderError::Protocol("Google GenerateContent output size overflowed".to_owned())
-    })?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "Google GenerateContent output exceeded the configured size limit".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn add_wire_bytes(
-    current: &mut usize,
-    additional: usize,
-    limit: usize,
-) -> Result<(), ProviderError> {
-    *current = current.checked_add(additional).ok_or_else(|| {
-        ProviderError::Protocol("Google GenerateContent wire size overflowed".to_owned())
-    })?;
-    if *current > limit {
-        return Err(ProviderError::Protocol(
-            "Google GenerateContent stream exceeded the configured wire size limit".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 async fn api_error(response: reqwest::Response, redactions: &[String]) -> ProviderError {
     let status = response.status();
     let fallback = status
@@ -1374,14 +1350,10 @@ mod tests {
             Err(ProviderError::Protocol(_))
         ));
 
-        assert!(matches!(
-            add_output_bytes(&mut 0, 5, 4),
-            Err(ProviderError::Protocol(_))
-        ));
-        assert!(matches!(
-            add_wire_bytes(&mut 0, 5, 4),
-            Err(ProviderError::Protocol(_))
-        ));
+        let mut output = ByteCounter::new(4, "output overflow", "output limit");
+        assert!(matches!(output.add(5), Err(ProviderError::Protocol(_))));
+        let mut wire = ByteCounter::new(4, "wire overflow", "wire limit");
+        assert!(matches!(wire.add(5), Err(ProviderError::Protocol(_))));
     }
 
     fn serve_once(status: u16, content_type: &str, body: &str) -> (String, JoinHandle<String>) {
