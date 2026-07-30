@@ -189,9 +189,9 @@ all headers generic configuration.
    stream. Localhost tests cover status splitting, narrow metadata, exact and
    over-limit streaming, bounded rejection bodies, request-time bearer
    authorization, deterministic redaction normalization, and dynamic credential
-   redaction on body-read failures. A temporary non-test dead-code allowance
-   remains for compatibility helpers until the remaining HTTP adapter
-   migrations finish.
+   redaction on body-read failures. A temporary non-test dead-code allowance was
+   introduced for compatibility helpers and removed after the HTTP adapter
+   migrations finished.
 4. **Migrate Chat Completions. Complete.** Chat Completions now owns an
    `HttpExchange` and sends built requests through `HttpExchange::execute`.
    Success metadata remains adapter-validated, while successful body reads use
