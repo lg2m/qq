@@ -1010,13 +1010,29 @@ fn context(app: &App, width: usize) -> Line {
 }
 
 fn status_notice(app: &App, width: usize) -> Vec<Line> {
-    let Some(status) = &app.status else {
-        return Vec::new();
-    };
-    wrap_line(
-        Line::styled(format!("  warning: {status}"), warning().bold()),
-        width.max(1),
-    )
+    let mut lines = Vec::new();
+    if let Some(status) = &app.status {
+        lines.extend(wrap_line(
+            Line::styled(format!("  warning: {status}"), warning().bold()),
+            width.max(1),
+        ));
+    }
+    if let Some(session) = app.focused.and_then(|id| app.sessions.get(&id))
+        && session.summary.status == SessionStatus::Running
+    {
+        let label = match session.activity.map(|(_, activity)| activity) {
+            Some(qq_protocol::RunActivity::WaitingForProvider) => "waiting for model",
+            Some(qq_protocol::RunActivity::GeneratingResponse) => "generating response",
+            Some(qq_protocol::RunActivity::PreparingToolCall) => "preparing tool call",
+            None => "working",
+        };
+        let spinner = TOOL_SPINNER[app.animation_tick % TOOL_SPINNER.len()];
+        lines.extend(wrap_line(
+            Line::styled(format!("  {spinner} {label}…"), accent().bold()),
+            width.max(1),
+        ));
+    }
+    lines
 }
 
 fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {

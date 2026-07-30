@@ -18,11 +18,12 @@ use futures_util::StreamExt;
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
     CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole, MessageSnapshot,
-    MessageState, ModelPricing, ModelSelection, RunFailure, RunFailureKind, RunId, RunOutcome,
-    RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
-    SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot,
-    ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    MessageState, ModelPricing, ModelSelection, RunActivity, RunFailure, RunFailureKind, RunId,
+    RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope,
+    SessionId, SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview,
+    SnapshotRequest, StoreId, SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay,
+    ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome, WorkspaceId,
+    WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -847,6 +848,23 @@ async fn execute_run(
                 return;
             }
             RunInput::Event(Some(RuntimeEvent::Started)) => {}
+            RunInput::Event(Some(RuntimeEvent::ActivityChanged { activity })) => {
+                if internal {
+                    continue;
+                }
+                match inner.store.append_run_activity(&claimed, activity).await {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist run activity", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             RunInput::Event(Some(RuntimeEvent::AssistantTurnCompleted {
                 turn_ordinal,
                 message,
@@ -1835,6 +1853,19 @@ impl Store {
                 turn_message_id,
                 context_tokens,
             )
+        })
+        .await
+    }
+
+    async fn append_run_activity(
+        &self,
+        claimed: &ClaimedRun,
+        activity: RunActivity,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            append_run_activity(connection, store_id, &claimed, activity)
         })
         .await
     }
@@ -3812,6 +3843,50 @@ fn start_tool_call(
             occurred_at_ms: now,
         },
         SessionEvent::ToolCallStarted { tool_call },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+/// Appends replaceable liveness information for an active run. Activity is
+/// retained in the event log for reconnect/replay, but does not alter model
+/// context or transcript rows.
+fn append_run_activity(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    activity: RunActivity,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let running = transaction
+        .query_row(
+            "SELECT 1 FROM runs WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
+            params![claimed.run_id.to_string(), claimed.session_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if running.is_none() {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now_ms(),
+        },
+        SessionEvent::RunActivityChanged {
+            run_id: claimed.run_id,
+            activity,
+        },
     )?;
     transaction
         .commit()

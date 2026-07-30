@@ -347,6 +347,19 @@ pub enum RunStatus {
     Interrupted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunActivity {
+    /// The request is being assembled or QQ is waiting for the provider's
+    /// first meaningful stream event.
+    WaitingForProvider,
+    /// The provider is streaming user-visible assistant text.
+    GeneratingResponse,
+    /// The provider is constructing one or more tool calls. Arguments may be
+    /// incomplete and are deliberately not exposed by this status channel.
+    PreparingToolCall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunOutcome {
@@ -577,6 +590,12 @@ pub enum SessionEvent {
     RunStarted {
         session: SessionSummary,
         run_id: RunId,
+    },
+    /// Replaceable liveness information for an active run. This describes
+    /// harness/provider state, not assistant transcript content.
+    RunActivityChanged {
+        run_id: RunId,
+        activity: RunActivity,
     },
     AssistantMessageStarted {
         message: MessageSnapshot,

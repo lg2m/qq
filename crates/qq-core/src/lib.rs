@@ -16,7 +16,9 @@ use std::{
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
-use qq_protocol::{ApprovalMode, RunCommand, RunEvent, RunFailureKind, TokenUsage, ToolCallId};
+use qq_protocol::{
+    ApprovalMode, RunActivity, RunCommand, RunEvent, RunFailureKind, TokenUsage, ToolCallId,
+};
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
 };
@@ -49,6 +51,9 @@ const MAX_PARALLEL_READS: usize = 4;
 #[derive(Debug, Clone, PartialEq)]
 enum RuntimeEvent {
     Started,
+    ActivityChanged {
+        activity: RunActivity,
+    },
     OutputTextDelta {
         text: String,
     },
@@ -239,6 +244,9 @@ impl Runtime {
             while let Some(event) = events.next().await {
                 match event {
                     RuntimeEvent::Started => yield RunEvent::Started,
+                    RuntimeEvent::ActivityChanged { activity } => {
+                        yield RunEvent::ActivityChanged { activity };
+                    }
                     RuntimeEvent::OutputTextDelta { text } => {
                         yield RunEvent::OutputTextDelta { text };
                     }
@@ -274,6 +282,7 @@ impl Runtime {
             while let Some(event) = events.next().await {
                 match event {
                     RuntimeEvent::Started => yield RunEvent::Started,
+                    RuntimeEvent::ActivityChanged { activity } => yield RunEvent::ActivityChanged { activity },
                     RuntimeEvent::OutputTextDelta { text } => yield RunEvent::OutputTextDelta { text },
                     RuntimeEvent::RefusalDelta { text } => yield RunEvent::RefusalDelta { text },
                     RuntimeEvent::AssistantTurnCompleted { usage: Some(usage), .. } => {
@@ -395,6 +404,8 @@ impl Runtime {
                 let request = ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens)
                     .with_tools(tool_specs.clone())
                     .with_system(Arc::clone(&system));
+                let mut activity = RunActivity::WaitingForProvider;
+                yield RuntimeEvent::ActivityChanged { activity };
                 let mut provider_events = provider.stream(request);
                 let mut pending_calls = Vec::<PendingToolCall>::new();
                 let mut calls_by_provider_id = HashMap::<String, usize>::new();
@@ -405,6 +416,10 @@ impl Runtime {
                 while let Some(event) = provider_events.next().await {
                     match event {
                         Ok(ProviderEvent::OutputTextDelta { text }) => {
+                            if activity != RunActivity::GeneratingResponse {
+                                activity = RunActivity::GeneratingResponse;
+                                yield RuntimeEvent::ActivityChanged { activity };
+                            }
                             if model_text_bytes.saturating_add(text.len()) > MAX_RUN_MODEL_TEXT_BYTES {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::Policy,
@@ -417,6 +432,10 @@ impl Runtime {
                             yield RuntimeEvent::OutputTextDelta { text };
                         }
                         Ok(ProviderEvent::RefusalDelta { text }) => {
+                            if activity != RunActivity::GeneratingResponse {
+                                activity = RunActivity::GeneratingResponse;
+                                yield RuntimeEvent::ActivityChanged { activity };
+                            }
                             if model_text_bytes.saturating_add(text.len()) > MAX_RUN_MODEL_TEXT_BYTES {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::Policy,
@@ -429,6 +448,10 @@ impl Runtime {
                             yield RuntimeEvent::RefusalDelta { text };
                         }
                         Ok(ProviderEvent::ToolCallStarted { id, name }) => {
+                            if activity != RunActivity::PreparingToolCall {
+                                activity = RunActivity::PreparingToolCall;
+                                yield RuntimeEvent::ActivityChanged { activity };
+                            }
                             if id.is_empty() || id.len() > MAX_TOOL_CALL_ID_BYTES {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,
@@ -937,6 +960,12 @@ mod tests {
             events,
             vec![
                 RunEvent::Started,
+                RunEvent::ActivityChanged {
+                    activity: RunActivity::WaitingForProvider,
+                },
+                RunEvent::ActivityChanged {
+                    activity: RunActivity::GeneratingResponse,
+                },
                 RunEvent::OutputTextDelta {
                     text: "hel".to_owned()
                 },
@@ -1684,14 +1713,19 @@ mod tests {
             .await;
 
         assert_eq!(events[0], RunEvent::Started);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::ActivityChanged {
+                activity: RunActivity::PreparingToolCall
+            }
+        )));
         assert!(matches!(
-            &events[1],
-            RunEvent::Failed {
+            events.last(),
+            Some(RunEvent::Failed {
                 kind: RunFailureKind::ProviderProtocol,
                 ..
-            }
+            })
         ));
-        assert_eq!(events.len(), 2);
     }
 
     #[tokio::test]
@@ -1713,15 +1747,13 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
 
+        assert_eq!(events[0], RunEvent::Started);
         assert!(matches!(
-            events.as_slice(),
-            [
-                RunEvent::Started,
-                RunEvent::Failed {
-                    kind: RunFailureKind::ProviderProtocol,
-                    ..
-                }
-            ]
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderProtocol,
+                ..
+            })
         ));
     }
 
@@ -1743,15 +1775,13 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
 
+        assert_eq!(events[0], RunEvent::Started);
         assert!(matches!(
-            events.as_slice(),
-            [
-                RunEvent::Started,
-                RunEvent::Failed {
-                    kind: RunFailureKind::Policy,
-                    ..
-                }
-            ]
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::Policy,
+                ..
+            })
         ));
     }
 
@@ -1904,11 +1934,11 @@ mod tests {
 
         assert_eq!(events[0], RunEvent::Started);
         assert!(matches!(
-            &events[1],
-            RunEvent::Failed {
+            events.last(),
+            Some(RunEvent::Failed {
                 kind: RunFailureKind::ProviderTransport,
                 message,
-            } if message.contains("offline")
+            }) if message.contains("offline")
         ));
     }
 
