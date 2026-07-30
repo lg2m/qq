@@ -1,6 +1,9 @@
 # Sub-Agent Sessions
 
-Status: proposed.
+Status: step 1 implemented (`spawn_agent` builtin: read-only child
+sessions, depth/concurrency/budget caps, cancellation propagation, and
+the step-3 prompt guidance in the versioned base prompt). The
+worker-model config knob and cost roll-up (step 2) are pending.
 
 Main-session context is premium real estate: every byte of gathered
 evidence is re-sent on every later turn, crowds out reasoning, and ages

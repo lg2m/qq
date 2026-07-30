@@ -91,7 +91,10 @@ fn shell_control_character(c: char) -> bool {
 
 pub(crate) fn classify(name: &str, arguments: &str) -> ToolClass {
     match name {
-        "read_file" | "list_dir" | "search" => ToolClass::ReadOnly,
+        // spawn_agent is read-only: its child session runs in read-only
+        // approval mode, so the call carries no mutation authority and never
+        // needs an approval prompt.
+        "read_file" | "list_dir" | "search" | crate::tools::SPAWN_AGENT_TOOL => ToolClass::ReadOnly,
         "edit_file" | "write_file" => ToolClass::Mutating,
         "shell" => shell_class(arguments),
         #[cfg(test)]
@@ -484,6 +487,7 @@ mod tests {
     #[test]
     fn classification_reads_shell_arguments_and_namespaces() {
         assert_eq!(classify("search", "{}"), ToolClass::ReadOnly);
+        assert_eq!(classify("spawn_agent", "{}"), ToolClass::ReadOnly);
         assert_eq!(classify("edit_file", "{}"), ToolClass::Mutating);
         assert_eq!(
             classify("shell", r#"{"command":"cargo test","cwd":"crates"}"#),

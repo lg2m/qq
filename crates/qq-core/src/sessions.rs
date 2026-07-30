@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -32,7 +32,8 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use crate::{
-    GateDecision, Runtime, RuntimeEvent, RuntimeToolCall, ToolGate, ToolGateFuture, approval,
+    GateDecision, Runtime, RuntimeEvent, RuntimeToolCall, SpawnAgentFuture, SpawnAgentOutcome,
+    SubagentSpawner, ToolGate, ToolGateFuture, approval,
     tools::{FileState, FileStateUpdate},
 };
 
@@ -80,6 +81,12 @@ const MAX_GRANT_BYTES: usize = 256;
 const MAX_SESSION_GRANTS: u32 = 256;
 const MAX_SESSION_FILES: u32 = 4_096;
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Child runs one parent run may hold in flight at once. Spawn calls beyond
+/// this cap queue behind it inside the parent's turn rather than failing.
+const MAX_CONCURRENT_CHILDREN_PER_RUN: usize = 3;
+/// Total children one parent run may spawn before further `spawn_agent`
+/// calls return a tool error.
+const MAX_SPAWNED_CHILDREN_PER_RUN: usize = 8;
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
 /// Read-only built-in tools whose results context assembly may replace with
@@ -224,6 +231,15 @@ struct SessionRuntimeInner {
     loader: Arc<dyn RuntimeLoader>,
     grant_authority: Option<Arc<dyn WorkspaceGrantAuthority>>,
     permits: Arc<Semaphore>,
+    /// Run permits for child (sub-agent) sessions, deliberately a separate
+    /// pool from `permits`: a parent run holds its permit for its whole
+    /// lifetime, including while it awaits a spawned child. If children drew
+    /// from the same pool, `max_active_runs` parents all awaiting children
+    /// would leave no permit with which any child could ever start — a
+    /// deadlock. Children cannot spawn (depth is one), so no such wait cycle
+    /// exists against this pool. Sized like the root pool so global run
+    /// concurrency stays bounded at twice `max_active_runs`.
+    child_permits: Arc<Semaphore>,
     schedule: mpsc::Sender<()>,
     cancellations: Mutex<HashMap<RunId, watch::Sender<bool>>>,
     approvals: Mutex<HashMap<ToolCallId, PendingApproval>>,
@@ -254,6 +270,7 @@ impl SessionRuntime {
             loader,
             grant_authority: options.grant_authority,
             permits: Arc::new(Semaphore::new(options.max_active_runs)),
+            child_permits: Arc::new(Semaphore::new(options.max_active_runs)),
             schedule,
             cancellations: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
@@ -623,6 +640,223 @@ impl ToolGate for CompactionRunGate {
     }
 }
 
+/// Executes `spawn_agent` calls for one parent run: creates a read-only child
+/// session, submits the task as its prompt through the ordinary command
+/// machinery (so every session event flows to clients and the child renders
+/// like any session), and resolves with the child run's final assistant text.
+struct SessionSubagentSpawner {
+    inner: Arc<SessionRuntimeInner>,
+    parent: ClaimedRun,
+    /// Bounds this run's children in flight; excess spawn calls in one turn
+    /// wait here rather than erroring.
+    slots: Arc<Semaphore>,
+    /// Children this run has spawned so far, capped at
+    /// [`MAX_SPAWNED_CHILDREN_PER_RUN`].
+    spawned: Arc<AtomicUsize>,
+}
+
+impl SubagentSpawner for SessionSubagentSpawner {
+    fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture {
+        let inner = Arc::clone(&self.inner);
+        let parent = self.parent.clone();
+        let slots = Arc::clone(&self.slots);
+        let spawned = Arc::clone(&self.spawned);
+        Box::pin(async move { spawn_child_run(inner, parent, slots, spawned, task, model).await })
+    }
+}
+
+fn spawn_error(content: impl Into<String>) -> SpawnAgentOutcome {
+    SpawnAgentOutcome {
+        content: content.into(),
+        is_error: true,
+    }
+}
+
+/// One `spawn_agent` execution. Every child failure mode — command errors, a
+/// failed, cancelled, or empty child run — resolves to an error *tool result*
+/// for the parent's model, never a parent run failure.
+async fn spawn_child_run(
+    inner: Arc<SessionRuntimeInner>,
+    parent: ClaimedRun,
+    slots: Arc<Semaphore>,
+    spawned: Arc<AtomicUsize>,
+    task: String,
+    model: Option<String>,
+) -> SpawnAgentOutcome {
+    // The budget counts attempts, so a failing spawn also consumes it.
+    if spawned.fetch_add(1, Ordering::AcqRel) >= MAX_SPAWNED_CHILDREN_PER_RUN {
+        return spawn_error(format!(
+            "this run already spawned {MAX_SPAWNED_CHILDREN_PER_RUN} sub-agents; \
+             continue with what they returned"
+        ));
+    }
+    let mut selection = parent.model.clone();
+    if let Some(model) = model {
+        let model = model.trim().to_owned();
+        if model.is_empty() {
+            return spawn_error("model must not be empty when provided");
+        }
+        selection.model = Some(model);
+    }
+    // Wait for a child slot before creating anything: spawn calls queued
+    // behind the concurrency cap must not pile up sessions they cannot run.
+    let Ok(_slot) = Arc::clone(&slots).acquire_owned().await else {
+        return spawn_error("the sub-agent scheduler is unavailable");
+    };
+    let Ok(command_id) = CommandId::generate() else {
+        return spawn_error("the sub-agent session could not be created");
+    };
+    // Children run read-only, so workspace config grants (which only widen
+    // mutating/shell/MCP approval) could never apply; none are seeded.
+    let created = match inner
+        .store
+        .command_with_seed(
+            command_id,
+            SessionCommand::CreateSession {
+                workspace_id: parent.workspace_id,
+                parent_id: Some(parent.session_id),
+                model: selection,
+                approval_mode: ApprovalMode::ReadOnly,
+            },
+            WorkspaceGrantSeed::default(),
+        )
+        .await
+    {
+        Ok(applied) => applied,
+        Err(error) => {
+            return spawn_error(format!(
+                "the sub-agent session could not be created: {error}"
+            ));
+        }
+    };
+    inner.notify(created.receipt.committed_through);
+    let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+        return spawn_error("the sub-agent session could not be created");
+    };
+    // Subscribe to the workspace's event wakeups before queueing the prompt
+    // so the child's completion can never slip past the wait below.
+    let Ok(mut wakeup) = inner.subscribe(
+        parent.workspace_id,
+        created.receipt.committed_through.sequence,
+    ) else {
+        return spawn_error("the sub-agent could not be awaited");
+    };
+    let Ok(command_id) = CommandId::generate() else {
+        return spawn_error("the sub-agent task could not be submitted");
+    };
+    let queued = match inner
+        .store
+        .command_with_seed(
+            command_id,
+            SessionCommand::SubmitPrompt {
+                session_id,
+                prompt: task,
+            },
+            WorkspaceGrantSeed::default(),
+        )
+        .await
+    {
+        Ok(applied) => applied,
+        Err(error) => {
+            return spawn_error(format!(
+                "the sub-agent task could not be submitted: {error}"
+            ));
+        }
+    };
+    inner.notify(queued.receipt.committed_through);
+    let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+        return spawn_error("the sub-agent task could not be submitted");
+    };
+    let _ = inner.schedule.try_send(());
+    // Parent cancellation reaches the child by drop: the cancelled parent's
+    // tool loop is dropped wholesale, dropping this future mid-await, and the
+    // guard then cancels the still-running child run.
+    let mut guard = CancelChildOnDrop {
+        inner: Arc::clone(&inner),
+        run_id: Some(run_id),
+    };
+    let outcome = loop {
+        match inner.store.run_outcome(run_id).await {
+            Ok(Some(outcome)) => break outcome,
+            Ok(None) => {}
+            Err(error) => {
+                guard.disarm();
+                return spawn_error(format!("the sub-agent outcome could not be read: {error}"));
+            }
+        }
+        if wakeup.changed().await.is_err() {
+            guard.disarm();
+            return spawn_error("the session runtime shut down while the sub-agent was running");
+        }
+    };
+    guard.disarm();
+    match outcome {
+        RunOutcome::Completed => match inner.store.run_final_text(run_id).await {
+            Ok(text) if text.trim().is_empty() => {
+                spawn_error("the sub-agent completed without producing any text")
+            }
+            Ok(text) => SpawnAgentOutcome {
+                content: text,
+                is_error: false,
+            },
+            Err(error) => spawn_error(format!("the sub-agent answer could not be read: {error}")),
+        },
+        RunOutcome::Cancelled => spawn_error("the sub-agent run was cancelled"),
+        RunOutcome::Interrupted => spawn_error("the sub-agent run was interrupted"),
+        RunOutcome::Failed { failure } => {
+            spawn_error(format!("the sub-agent run failed: {}", failure.message))
+        }
+    }
+}
+
+/// Cancels a still-running child run when the spawn future awaiting it is
+/// dropped before the child finished.
+struct CancelChildOnDrop {
+    inner: Arc<SessionRuntimeInner>,
+    run_id: Option<RunId>,
+}
+
+impl CancelChildOnDrop {
+    fn disarm(&mut self) {
+        self.run_id = None;
+    }
+}
+
+impl Drop for CancelChildOnDrop {
+    fn drop(&mut self) {
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        let inner = Arc::clone(&self.inner);
+        // Drop cannot await; outside a runtime (process teardown) there is
+        // nothing left to cancel for.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let Ok(command_id) = CommandId::generate() else {
+                return;
+            };
+            let Ok(applied) = inner
+                .store
+                .command_with_seed(
+                    command_id,
+                    SessionCommand::CancelRun { run_id },
+                    WorkspaceGrantSeed::default(),
+                )
+                .await
+            else {
+                return;
+            };
+            inner.notify(applied.receipt.committed_through);
+            inner.cancel(run_id);
+            if applied.schedule {
+                let _ = inner.schedule.try_send(());
+            }
+        });
+    }
+}
+
 async fn schedule_runs(
     inner: std::sync::Weak<SessionRuntimeInner>,
     mut receiver: mpsc::Receiver<()>,
@@ -634,38 +868,48 @@ async fn schedule_runs(
         if *inner.failed.borrow() {
             return;
         }
-        loop {
-            let permit = match Arc::clone(&inner.permits).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => break,
+        // Root runs and child (sub-agent) runs are claimed from separate
+        // queues against separate permit pools; see `child_permits` for why
+        // sharing one pool would deadlock parents awaiting their children.
+        for children in [false, true] {
+            let pool = if children {
+                &inner.child_permits
+            } else {
+                &inner.permits
             };
-            let claimed = match inner.store.claim_next_run().await {
-                Ok(Some(claimed)) => claimed,
-                Ok(None) => break,
-                Err(_) => {
-                    inner.failed.send_replace(true);
-                    return;
+            loop {
+                let permit = match Arc::clone(pool).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
+                let claimed = match inner.store.claim_next_run(children).await {
+                    Ok(Some(claimed)) => claimed,
+                    Ok(None) => break,
+                    Err(_) => {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
+                };
+                inner.notify(claimed.started.cursor);
+                let (cancel, cancel_receiver) = watch::channel(false);
+                if let Ok(mut cancellations) = inner.cancellations.lock() {
+                    cancellations.insert(claimed.run_id, cancel);
                 }
-            };
-            inner.notify(claimed.started.cursor);
-            let (cancel, cancel_receiver) = watch::channel(false);
-            if let Ok(mut cancellations) = inner.cancellations.lock() {
-                cancellations.insert(claimed.run_id, cancel);
-            }
-            match inner.store.cancellation_requested(claimed.run_id).await {
-                Ok(true) => inner.cancel(claimed.run_id),
-                Ok(false) => {}
-                Err(_) => {
-                    inner.failed.send_replace(true);
-                    return;
+                match inner.store.cancellation_requested(claimed.run_id).await {
+                    Ok(true) => inner.cancel(claimed.run_id),
+                    Ok(false) => {}
+                    Err(_) => {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                 }
+                let task_inner = Arc::clone(&inner);
+                tokio::spawn(async move {
+                    execute_run(Arc::clone(&task_inner), claimed, cancel_receiver).await;
+                    drop(permit);
+                    let _ = task_inner.schedule.try_send(());
+                });
             }
-            let task_inner = Arc::clone(&inner);
-            tokio::spawn(async move {
-                execute_run(Arc::clone(&task_inner), claimed, cancel_receiver).await;
-                drop(permit);
-                let _ = task_inner.schedule.try_send(());
-            });
         }
     }
 }
@@ -746,12 +990,26 @@ async fn execute_run(
             return;
         }
     };
-    let mut events = loaded.runtime.run_loop(
+    // Only prompt runs of root sessions may spawn sub-agents: internal runs
+    // call no tools at all, and child runs are depth-capped (the tool is
+    // neither declared nor dispatchable without a spawner).
+    let spawner: Option<Arc<dyn SubagentSpawner>> = if internal || claimed.child {
+        None
+    } else {
+        Some(Arc::new(SessionSubagentSpawner {
+            inner: Arc::clone(&inner),
+            parent: claimed.clone(),
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CHILDREN_PER_RUN)),
+            spawned: Arc::new(AtomicUsize::new(0)),
+        }))
+    };
+    let mut events = loaded.runtime.run_loop_with_spawner(
         claimed.messages.clone(),
         PathBuf::from(&claimed.workspace),
         Arc::clone(&tool_cancellation),
         gate,
         file_state,
+        spawner,
     );
     let mut accounting = RunAccountingAccumulator::new(loaded.pricing.clone());
     let mut pending_text = String::new();
@@ -1784,10 +2042,17 @@ impl Store {
         .await
     }
 
-    async fn claim_next_run(&self) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
+    /// Claims the next queued run from one of the two scheduling queues:
+    /// child-session runs when `children` is set, root-session runs
+    /// otherwise. The queues are separate because each draws from its own
+    /// permit pool.
+    async fn claim_next_run(
+        &self,
+        children: bool,
+    ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
         let store_id = self.store_id;
         self.call(Priority::Control, move |connection| {
-            claim_next_run(connection, store_id)
+            claim_next_run(connection, store_id, children)
         })
         .await
     }
@@ -2053,6 +2318,63 @@ impl Store {
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
             complete_compaction(connection, store_id, &claimed, summary, accounting)
+        })
+        .await
+    }
+
+    /// The terminal outcome of one run, if it has reached one. Polled by
+    /// spawn futures awaiting their child run.
+    async fn run_outcome(&self, run_id: RunId) -> Result<Option<RunOutcome>, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            let outcome = connection
+                .query_row(
+                    "SELECT outcome_json FROM runs WHERE id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::RunNotFound)?;
+            outcome
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|_| SessionRuntimeError::Persistence)
+        })
+        .await
+    }
+
+    /// The assistant text one run produced: its completed assistant messages
+    /// in order, output and refusal channels concatenated. This is what a
+    /// `spawn_agent` call returns to the parent.
+    async fn run_final_text(&self, run_id: RunId) -> Result<String, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT output, refusal FROM messages
+                     WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
+                     ORDER BY ordinal",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let rows = statement
+                .query_map([run_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let mut text = String::new();
+            for row in rows {
+                let (output, refusal) = row.map_err(|_| SessionRuntimeError::Persistence)?;
+                for part in [output, refusal] {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&part);
+                }
+            }
+            Ok(text)
         })
         .await
     }
@@ -2653,6 +2975,10 @@ struct ClaimedRun {
     run_id: RunId,
     command_id: CommandId,
     kind: RunKind,
+    /// Whether the run belongs to a child (sub-agent) session. Guaranteed by
+    /// the claim query's parent filter; child runs may not spawn further
+    /// children.
+    child: bool,
     model: ModelSelection,
     messages: Vec<Message>,
     started: SessionEventEnvelope,
@@ -3502,6 +3828,7 @@ fn execute_command(
 fn claim_next_run(
     connection: &mut Connection,
     store_id: StoreId,
+    children: bool,
 ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
     let transaction = connection
         .transaction()
@@ -3514,6 +3841,7 @@ fn claim_next_run(
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
              WHERE r.status = 'queued' AND s.active_run_id IS NULL
+               AND (s.parent_id IS NOT NULL) = ?1
              ORDER BY COALESCE((
                          SELECT MAX(previous.started_at_ms)
                          FROM runs previous
@@ -3521,7 +3849,7 @@ fn claim_next_run(
                      ), 0),
                       r.created_at_ms, r.rowid
              LIMIT 1",
-            [],
+            [children],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -3677,6 +4005,7 @@ fn claim_next_run(
         run_id,
         command_id,
         kind,
+        child: children,
         model,
         messages,
         started,
@@ -3790,6 +4119,9 @@ fn claim_auto_compaction(
         run_id,
         command_id,
         kind: RunKind::Compaction,
+        // Compaction runs are internal: execute_run never installs the
+        // subagent spawner for them, so child-ness is irrelevant here.
+        child: false,
         model,
         messages: context,
         started,
@@ -5010,8 +5342,10 @@ fn recover_interrupted_runs(
             command_id: CommandId::from_bytes([0; 16]),
             // Recovery settles the run row generically; a crashed compaction
             // committed no marker, so interrupting it leaves nothing behind
-            // and the command can simply be retried.
+            // and the command can simply be retried. `child` is likewise
+            // irrelevant here: recovery never runs the tool loop.
             kind: RunKind::Prompt,
+            child: false,
             model: ModelSelection::default(),
             messages: Vec::new(),
             over_budget: false,
@@ -9553,7 +9887,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
         // Turn one: streamed text, then a completed tool call; the turn
         // committed, finalizing its message.
         let first_message = MessageId::generate().unwrap();
@@ -9708,7 +10042,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
         let tool_call_id = ToolCallId::generate().unwrap();
         // A mutating call crashed mid-execution: replay must surface an
         // explicit interrupted result, never re-run the side effect.
@@ -9856,7 +10190,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
         // Simulate the pre-fix crash window: the model turn committed with a
         // ToolCall block, but no tool_calls rows were ever written.
         store
@@ -10281,7 +10615,7 @@ mod tests {
             panic!("unexpected receipt")
         };
 
-        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
         store
             .command(
                 CommandId::generate().unwrap(),
@@ -11711,7 +12045,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let claimed = store.claim_next_run().await.unwrap().unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
         let tool_call_id = ToolCallId::generate().unwrap();
         let call = RuntimeToolCall {
             id: tool_call_id,
@@ -11807,5 +12141,652 @@ mod tests {
             };
         assert_eq!(error, SessionRuntimeError::Persistence);
         assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+    }
+
+    // ----- spawn_agent (sub-agent sessions) -----
+
+    /// Loads providers for spawn tests: model-routed entries first (children
+    /// given an explicit model route), then a per-load queue (deterministic
+    /// for the single-parent tests: the parent always loads first), then a
+    /// fallback that completes with "done".
+    struct QueueLoader {
+        routed: Vec<(&'static str, Arc<dyn Provider>)>,
+        queue: StdMutex<Vec<Arc<dyn Provider>>>,
+    }
+
+    impl RuntimeLoader for QueueLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = self
+                .routed
+                .iter()
+                .find(|(model, _)| request.model.model.as_deref() == Some(*model))
+                .map(|(_, provider)| Arc::clone(provider))
+                .or_else(|| {
+                    let mut queue = self.queue.lock().unwrap();
+                    if queue.is_empty() {
+                        None
+                    } else {
+                        Some(queue.remove(0))
+                    }
+                })
+                .unwrap_or_else(|| Arc::new(StaticTextProvider));
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    /// Completes immediately with the text "done".
+    struct StaticTextProvider;
+
+    impl Provider for StaticTextProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "done".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
+    /// Fails every stream with a transport error.
+    struct FailingProvider;
+
+    impl Provider for FailingProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::once(async {
+                Err(qq_provider::ProviderError::Transport("offline".to_owned()))
+            }))
+        }
+    }
+
+    /// Never yields: the run only ends by cancellation.
+    struct HangingProvider;
+
+    impl Provider for HangingProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::pending())
+        }
+    }
+
+    /// Tracks how many of its streams are concurrently active before
+    /// completing with text, to observe the child concurrency cap.
+    struct GaugedTextProvider {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl Provider for GaugedTextProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let active = Arc::clone(&self.active);
+            let peak = Arc::clone(&self.peak);
+            Box::pin(async_stream! {
+                let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(current, Ordering::AcqRel);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                active.fetch_sub(1, Ordering::AcqRel);
+                yield Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "child done".to_owned(),
+                });
+                yield Ok(qq_provider::ProviderEvent::Completed { usage: None });
+            })
+        }
+    }
+
+    /// Requests `spawns` spawn_agent calls in one turn, then completes with
+    /// "done" on the next.
+    struct MultiSpawnProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        spawns: usize,
+        arguments: fn(usize) -> String,
+        turn: StdMutex<usize>,
+    }
+
+    impl Provider for MultiSpawnProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            if current == 0 {
+                let mut events = Vec::with_capacity(self.spawns * 3 + 1);
+                for index in 0..self.spawns {
+                    let id = format!("call_{index}");
+                    events.push(Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "spawn_agent".to_owned(),
+                    }));
+                    events.push(Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: (self.arguments)(index),
+                    }));
+                    events.push(Ok(qq_provider::ProviderEvent::ToolCallCompleted { id }));
+                }
+                events.push(Ok(qq_provider::ProviderEvent::Completed { usage: None }));
+                Box::pin(stream::iter(events))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+    }
+
+    struct SpawnHarness {
+        _directory: TempDir,
+        runtime: SessionRuntime,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        events: SessionEventStream,
+    }
+
+    async fn spawn_harness(
+        routed: Vec<(&'static str, Arc<dyn Provider>)>,
+        queue: Vec<Arc<dyn Provider>>,
+        max_active_runs: usize,
+    ) -> SpawnHarness {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = max_active_runs;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(QueueLoader {
+                routed,
+                queue: StdMutex::new(queue),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        SpawnHarness {
+            _directory: directory,
+            runtime,
+            workspace_id,
+            session_id,
+            events,
+        }
+    }
+
+    async fn submit_prompt_to(
+        runtime: &SessionRuntime,
+        session_id: SessionId,
+        prompt: &str,
+    ) -> RunId {
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: prompt.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        run_id
+    }
+
+    /// Collects events until `run_id` finishes, with a timeout generous
+    /// enough for a parent run that awaits child runs.
+    async fn collect_until_run_finished(
+        events: &mut SessionEventStream,
+        run_id: RunId,
+    ) -> Vec<SessionEventEnvelope> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut observed = Vec::new();
+            while let Some(event) = events.next().await {
+                let event = event.unwrap();
+                let finished = matches!(
+                    &event.event,
+                    SessionEvent::RunFinished { run_id: done, .. } if *done == run_id
+                );
+                observed.push(event);
+                if finished {
+                    break;
+                }
+            }
+            observed
+        })
+        .await
+        .expect("timed out waiting for the run to finish")
+    }
+
+    fn finished_outcome(events: &[SessionEventEnvelope], run_id: RunId) -> Option<RunOutcome> {
+        events.iter().find_map(|event| match &event.event {
+            SessionEvent::RunFinished {
+                run_id: done,
+                outcome,
+                ..
+            } if *done == run_id => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_runs_a_read_only_child_and_returns_its_final_text() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let child_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"Survey the widget inventory","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        // The child attempts a mutation first; read-only mode must deny it
+        // without prompting, and the child then completes with "done".
+        let child: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&child_requests),
+            script: vec![(
+                "edit_file",
+                r#"{"path":"a.txt","old_string":"x","new_string":"y"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        let run_id =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate the survey").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        let child_session = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+            .expect("the spawn call must create a child session");
+        assert_eq!(child_session.model.as_deref(), Some("test/child"));
+        // The task's first line names the child at prompt submission.
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::PromptQueued { session, .. }
+                if session.id == child_session.id
+                    && session.title == "Survey the widget inventory"
+        )));
+        // spawn_agent is read-only: no approval round trip in Ask mode.
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. }))
+        );
+        let child_reqs = child_requests.lock().unwrap();
+        assert!(
+            !child_reqs[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "spawn_agent"),
+            "child sessions must not have spawn_agent declared"
+        );
+        assert!(matches!(
+            child_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content == approval::POLICY_DENIED_RESULT
+        ));
+        drop(child_reqs);
+        let parent_reqs = parent_requests.lock().unwrap();
+        assert!(
+            parent_reqs[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "spawn_agent")
+        );
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: false, .. }] if content == "done"
+        ));
+        drop(parent_reqs);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_sessions_cannot_spawn_and_dispatch_rejects_the_attempt() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&requests),
+            script: vec![("spawn_agent", r#"{"task":"go deeper"}"#.to_owned())],
+            turn: StdMutex::new(0),
+        });
+        let harness = spawn_harness(Vec::new(), vec![provider], 8).await;
+        let created = create_session(
+            &harness.runtime,
+            harness.workspace_id,
+            Some(harness.session_id),
+        )
+        .await;
+        let CommandOutcome::SessionCreated {
+            session_id: child_id,
+        } = created.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let mut events = harness
+            .runtime
+            .subscribe(SubscribeRequest {
+                workspace_id: harness.workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = submit_prompt_to(&harness.runtime, child_id, "try to spawn").await;
+        let observed = collect_until_run_finished(&mut events, run_id).await;
+
+        let child_reqs = requests.lock().unwrap();
+        assert!(
+            !child_reqs[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "spawn_agent"),
+            "the child run must not declare spawn_agent"
+        );
+        assert!(matches!(
+            child_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content == crate::SPAWN_UNAVAILABLE_RESULT
+        ));
+        drop(child_reqs);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+        assert!(
+            !observed.iter().any(|event| matches!(
+                &event.event,
+                SessionEvent::SessionCreated { session } if session.parent_id == Some(child_id)
+            )),
+            "no grandchild session may appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_child_returns_a_tool_error_and_the_parent_continues() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"doomed research","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = spawn_harness(
+            vec![("test/child", Arc::new(FailingProvider))],
+            vec![parent],
+            8,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        // The child run failed, visibly, on its own session.
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id: done, outcome: RunOutcome::Failed { .. }, .. }
+                if *done != run_id
+        )));
+        // The parent saw a tool error and still completed.
+        let parent_reqs = parent_requests.lock().unwrap();
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("the sub-agent run failed") && content.contains("offline")
+        ));
+        drop(parent_reqs);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_parent_run_cancels_its_in_flight_child() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            // No model override: the child must inherit the parent's model.
+            script: vec![("spawn_agent", r#"{"task":"long research"}"#.to_owned())],
+            turn: StdMutex::new(0),
+        });
+        let hanging: Arc<dyn Provider> = Arc::new(HangingProvider);
+        let mut harness = spawn_harness(Vec::new(), vec![parent, hanging], 8).await;
+        let parent_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate forever").await;
+
+        // Wait until the child run is actually executing, then cancel the
+        // parent.
+        let mut observed = Vec::new();
+        let (child_session, child_run) = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let event = harness.events.next().await.unwrap().unwrap();
+                let started = match &event.event {
+                    SessionEvent::RunStarted { session, run_id }
+                        if *run_id != parent_run
+                            && session.parent_id == Some(harness.session_id) =>
+                    {
+                        Some((session.clone(), *run_id))
+                    }
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(started) = started {
+                    break started;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the child run to start");
+        assert_eq!(
+            child_session.model.as_deref(),
+            Some("test/model"),
+            "a child without a model argument inherits the parent's model"
+        );
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: parent_run },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while finished_outcome(&observed, parent_run).is_none()
+                || finished_outcome(&observed, child_run).is_none()
+            {
+                observed.push(harness.events.next().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .expect("timed out waiting for the parent and child to settle");
+        assert!(matches!(
+            finished_outcome(&observed, parent_run),
+            Some(RunOutcome::Cancelled)
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, child_run),
+            Some(RunOutcome::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_children_per_run_queue_behind_the_cap() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(MultiSpawnProvider {
+            requests: Arc::clone(&parent_requests),
+            spawns: MAX_CONCURRENT_CHILDREN_PER_RUN + 1,
+            arguments: |index| format!(r#"{{"task":"task {index}","model":"test/child"}}"#),
+            turn: StdMutex::new(0),
+        });
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let child: Arc<dyn Provider> = Arc::new(GaugedTextProvider {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        });
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "fan out").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::SessionCreated { .. }))
+                .count(),
+            MAX_CONCURRENT_CHILDREN_PER_RUN + 1
+        );
+        assert!(peak.load(Ordering::Acquire) <= MAX_CONCURRENT_CHILDREN_PER_RUN);
+        assert!(peak.load(Ordering::Acquire) >= 1);
+        let parent_reqs = parent_requests.lock().unwrap();
+        let results = parent_reqs[1].messages()[2].content();
+        assert_eq!(results.len(), MAX_CONCURRENT_CHILDREN_PER_RUN + 1);
+        for block in results {
+            assert!(matches!(
+                block,
+                ContentBlock::ToolResult { content, is_error: false, .. }
+                    if content == "child done"
+            ));
+        }
+        drop(parent_reqs);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawns_beyond_the_per_run_budget_return_a_tool_error() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(MultiSpawnProvider {
+            requests: Arc::clone(&parent_requests),
+            spawns: MAX_SPAWNED_CHILDREN_PER_RUN + 1,
+            arguments: |index| format!(r#"{{"task":"task {index}","model":"test/child"}}"#),
+            turn: StdMutex::new(0),
+        });
+        let mut harness = spawn_harness(
+            vec![("test/child", Arc::new(StaticTextProvider))],
+            vec![parent],
+            8,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "fan out wide").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        // Exactly the budget's worth of children were created.
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::SessionCreated { .. }))
+                .count(),
+            MAX_SPAWNED_CHILDREN_PER_RUN
+        );
+        let parent_reqs = parent_requests.lock().unwrap();
+        let results = parent_reqs[1].messages()[2].content();
+        assert_eq!(results.len(), MAX_SPAWNED_CHILDREN_PER_RUN + 1);
+        let errors = results
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { content, is_error: true, .. }
+                        if content.contains("already spawned")
+                )
+            })
+            .count();
+        let successes = results
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { content, is_error: false, .. }
+                        if content == "done"
+                )
+            })
+            .count();
+        assert_eq!(errors, 1);
+        assert_eq!(successes, MAX_SPAWNED_CHILDREN_PER_RUN);
+        drop(parent_reqs);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_parents_awaiting_children_never_deadlock() {
+        // Two parents fill the entire root permit pool and then both await a
+        // child. If children drew from the same pool nothing could ever run
+        // them; the separate child pool must let every run complete.
+        let spawn_script = || -> Arc<dyn Provider> {
+            Arc::new(ScriptedRunProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                script: vec![(
+                    "spawn_agent",
+                    r#"{"task":"shared research","model":"test/child"}"#.to_owned(),
+                )],
+                turn: StdMutex::new(0),
+            })
+        };
+        let mut harness = spawn_harness(
+            vec![("test/child", Arc::new(StaticTextProvider))],
+            vec![spawn_script(), spawn_script()],
+            2,
+        )
+        .await;
+        let created = create_session(&harness.runtime, harness.workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id: second } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let first_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate one").await;
+        let second_run = submit_prompt_to(&harness.runtime, second, "delegate two").await;
+
+        let mut observed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while finished_outcome(&observed, first_run).is_none()
+                || finished_outcome(&observed, second_run).is_none()
+            {
+                observed.push(harness.events.next().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .expect("saturated parents deadlocked instead of completing");
+        assert!(matches!(
+            finished_outcome(&observed, first_run),
+            Some(RunOutcome::Completed)
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, second_run),
+            Some(RunOutcome::Completed)
+        ));
     }
 }

@@ -21,6 +21,10 @@ use tokio::{
 };
 
 pub(crate) const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+/// The sub-agent tool. Not a [`BuiltInTool`]: it is declared only for runs
+/// that may spawn (never for child sessions), and it dispatches to the
+/// session layer rather than to a workspace execution.
+pub(crate) const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_READ_LINES: usize = 2_000;
 const MAX_READ_OFFSET: usize = 100_000;
@@ -342,6 +346,44 @@ impl BuiltInTool {
             }
         }
     }
+}
+
+/// The declaration for [`SPAWN_AGENT_TOOL`]. Kept out of [`specs`] because it
+/// joins the tool list only when the run may spawn: child sessions and
+/// session-less runs never see it.
+pub(crate) fn spawn_agent_spec() -> ToolSpec {
+    ToolSpec::new(
+        SPAWN_AGENT_TOOL,
+        "Delegate one self-contained task to a read-only sub-agent in this workspace and receive \
+         only its final answer. Worth it when the raw evidence would dwarf the distilled answer \
+         and you will not need that evidence verbatim later; several independent questions can be \
+         delegated in parallel. Single reads, searches, and quick lookups are cheaper inline. The \
+         task brief must carry everything the sub-agent needs: it starts with no other context.",
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "A complete, self-contained brief for the sub-agent."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional provider/model route for the sub-agent; defaults to this session's model."
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnAgentArgs {
+    pub(crate) task: String,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
 }
 
 pub(crate) fn specs() -> Vec<ToolSpec> {
