@@ -6,6 +6,7 @@ use reqwest::{
     StatusCode, Url,
     header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
 };
+use tokio::time::Instant;
 
 use crate::{
     ProviderError, limits::ByteCounter, request_auth::RequestAuthorizer, sanitize::sanitize_message,
@@ -21,11 +22,7 @@ const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 const DEFAULT_RETRY_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 
 /// Pre-stream retry settings for [`HttpExchange`].
-///
-/// Stage 1 of the http-retry plan lands the pure policy surface. The execute
-/// attempt loop consumes these helpers in stage 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct RetryPolicy {
     max_attempts: u32,
     base_delay: Duration,
@@ -33,7 +30,6 @@ pub(crate) struct RetryPolicy {
     total_budget: Duration,
 }
 
-#[allow(dead_code)]
 impl RetryPolicy {
     pub(crate) const fn default_policy() -> Self {
         Self {
@@ -45,6 +41,7 @@ impl RetryPolicy {
     }
 
     /// Single attempt, no sleeps. For live canaries and single-shot tests.
+    #[allow(dead_code)]
     pub(crate) const fn disabled() -> Self {
         Self {
             max_attempts: 1,
@@ -54,18 +51,22 @@ impl RetryPolicy {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn max_attempts(self) -> u32 {
         self.max_attempts
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn base_delay(self) -> Duration {
         self.base_delay
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn max_delay(self) -> Duration {
         self.max_delay
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn total_budget(self) -> Duration {
         self.total_budget
     }
@@ -107,7 +108,6 @@ impl RetryPolicy {
 }
 
 /// Pre-stream statuses that may be retried by [`HttpExchange`].
-#[allow(dead_code)]
 pub(crate) fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -121,7 +121,6 @@ pub(crate) fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 /// Parses `Retry-After` delta-seconds. HTTP-date forms are ignored.
-#[allow(dead_code)]
 pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     let seconds = value.parse::<u64>().ok()?;
@@ -129,7 +128,6 @@ pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// Full jitter over `0..=delay` from a uniform 32-bit random value.
-#[allow(dead_code)]
 pub(crate) fn full_jitter(delay: Duration, random: u32) -> Duration {
     if delay.is_zero() {
         return Duration::ZERO;
@@ -138,6 +136,17 @@ pub(crate) fn full_jitter(delay: Duration, random: u32) -> Duration {
     let span = nanos.saturating_add(1);
     let pick = (span * u128::from(random)) >> 32;
     Duration::from_nanos(u64::try_from(pick).unwrap_or(u64::MAX))
+}
+
+fn random_u32() -> u32 {
+    getrandom::u32().unwrap_or_else(|_| {
+        // Fall back to a non-crypto mix of the monotonic clock if the OS RNG is
+        // unavailable. Retry jitter only needs to break synchronized stampedes.
+        let nanos = std::time::Instant::now()
+            .elapsed()
+            .as_nanos() as u64;
+        (nanos ^ (nanos >> 32)) as u32
+    })
 }
 
 pub(crate) struct SafeHeaders {
@@ -236,7 +245,6 @@ pub(crate) struct HttpExchange {
     client: reqwest::Client,
     authorizer: RequestAuthorizer,
     redactions: Arc<[String]>,
-    #[allow(dead_code)]
     retry: RetryPolicy,
 }
 
@@ -292,53 +300,117 @@ impl HttpExchange {
 
     pub(crate) async fn execute(
         &self,
-        mut request: reqwest::Request,
+        request: reqwest::Request,
         wire_limit: usize,
         messages: ExchangeMessages,
     ) -> Result<ExchangeOutcome, ProviderError> {
-        let mut redactions = self.redactions.as_ref().to_vec();
-        redactions.extend(self.authorizer.authorize(&mut request).await?);
-        normalize_redactions(&mut redactions);
-        let redactions: Arc<[String]> = Arc::from(redactions);
+        let started = Instant::now();
+        let mut request = request;
+        let mut attempt = 0u32;
 
-        let response = self
-            .client
-            .execute(request)
-            .await
-            .map_err(|error| transport_error(error, redactions.as_ref()))?;
-        let status = response.status();
-        if !status.is_success() {
+        loop {
+            attempt += 1;
+            // Clone before consuming the request so a later attempt can resend.
+            // Streaming bodies that cannot be cloned stay single-shot.
+            let next_request = if self.retry.has_remaining_attempt(attempt) {
+                request.try_clone()
+            } else {
+                None
+            };
+            let can_retry_after = next_request.is_some();
+
+            let mut redactions = self.redactions.as_ref().to_vec();
+            redactions.extend(self.authorizer.authorize(&mut request).await?);
+            normalize_redactions(&mut redactions);
+            let redactions: Arc<[String]> = Arc::from(redactions);
+
+            let response = match self.client.execute(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let transport = transport_error(error, redactions.as_ref());
+                    let Some(delay) = self.maybe_retry_delay(
+                        can_retry_after,
+                        attempt,
+                        None,
+                        started.elapsed(),
+                    ) else {
+                        return Err(transport);
+                    };
+                    tokio::time::sleep(delay).await;
+                    request = next_request.expect("can_retry_after requires a cloned request");
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                let headers = response.headers().clone();
+                let chunks = response.bytes_stream();
+                let body_redactions = Arc::clone(&redactions);
+                let body = Box::pin(async_stream::try_stream! {
+                    let mut chunks = chunks;
+                    let mut wire_bytes = ByteCounter::new(
+                        wire_limit,
+                        messages.wire_overflow,
+                        messages.wire_limit,
+                    );
+                    while let Some(chunk) = chunks.next().await {
+                        let chunk = chunk
+                            .map_err(|error| transport_error(error, body_redactions.as_ref()))?;
+                        wire_bytes.add(chunk.len())?;
+                        yield chunk;
+                    }
+                });
+
+                return Ok(ExchangeOutcome::Success(HttpResponse {
+                    headers,
+                    redactions,
+                    body,
+                }));
+            }
+
+            let retry_after = retry_after_delay(response.headers());
             let body = read_error_body(response).await;
-            return Ok(ExchangeOutcome::Rejected(HttpRejection {
+            let rejection = HttpRejection {
                 status,
                 body,
                 redactions,
-            }));
-        }
+            };
 
-        let headers = response.headers().clone();
-        let chunks = response.bytes_stream();
-        let body_redactions = Arc::clone(&redactions);
-        let body = Box::pin(async_stream::try_stream! {
-            let mut chunks = chunks;
-            let mut wire_bytes = ByteCounter::new(
-                wire_limit,
-                messages.wire_overflow,
-                messages.wire_limit,
-            );
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk
-                    .map_err(|error| transport_error(error, body_redactions.as_ref()))?;
-                wire_bytes.add(chunk.len())?;
-                yield chunk;
+            if !is_retryable_status(status) {
+                return Ok(ExchangeOutcome::Rejected(rejection));
             }
-        });
 
-        Ok(ExchangeOutcome::Success(HttpResponse {
-            headers,
-            redactions,
-            body,
-        }))
+            let Some(delay) =
+                self.maybe_retry_delay(can_retry_after, attempt, retry_after, started.elapsed())
+            else {
+                return Ok(ExchangeOutcome::Rejected(rejection));
+            };
+
+            tokio::time::sleep(delay).await;
+            request = next_request.expect("can_retry_after requires a cloned request");
+        }
+    }
+
+    fn maybe_retry_delay(
+        &self,
+        can_retry_after: bool,
+        completed_attempts: u32,
+        retry_after: Option<Duration>,
+        elapsed: Duration,
+    ) -> Option<Duration> {
+        if !can_retry_after || !self.retry.has_remaining_attempt(completed_attempts) {
+            return None;
+        }
+        let retry_index = completed_attempts.saturating_sub(1);
+        let delay = full_jitter(
+            self.retry.delay_before_retry(retry_index, retry_after),
+            random_u32(),
+        );
+        if !self.retry.can_afford(elapsed, delay) {
+            return None;
+        }
+        Some(delay)
     }
 }
 
@@ -508,6 +580,7 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
         thread::{self, JoinHandle},
     };
 
@@ -648,7 +721,7 @@ mod tests {
 
     #[test]
     fn exchange_defaults_to_retry_policy_and_accepts_override() {
-        let exchange = exchange(RequestAuthorizer::default(), Vec::new());
+        let exchange = default_exchange(RequestAuthorizer::default(), Vec::new());
         assert_eq!(exchange.retry, RetryPolicy::default_policy());
         let disabled = exchange.with_retry_policy(RetryPolicy::disabled());
         assert_eq!(disabled.retry, RetryPolicy::disabled());
@@ -665,11 +738,35 @@ mod tests {
     }
 
     fn exchange(authorizer: RequestAuthorizer, redactions: Vec<String>) -> HttpExchange {
+        // Keep multi-attempt coverage fast without pausing the runtime clock;
+        // paused time breaks reqwest's connect/request timers.
+        exchange_with_retry(authorizer, redactions, fast_retry_policy())
+    }
+
+    fn exchange_with_retry(
+        authorizer: RequestAuthorizer,
+        redactions: Vec<String>,
+        retry: RetryPolicy,
+    ) -> HttpExchange {
         HttpExchange::new(
             build_direct_client().unwrap(),
             authorizer,
             Arc::from(redactions),
         )
+        .with_retry_policy(retry)
+    }
+
+    fn fast_retry_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            total_budget: Duration::from_secs(1),
+        }
+    }
+
+    fn default_exchange(authorizer: RequestAuthorizer, redactions: Vec<String>) -> HttpExchange {
+        exchange_with_retry(authorizer, redactions, RetryPolicy::default_policy())
     }
 
     #[tokio::test]
@@ -730,10 +827,15 @@ mod tests {
         );
         let request = build_direct_client().unwrap().get(url).build().unwrap();
 
-        let outcome = exchange(RequestAuthorizer::default(), Vec::new())
-            .execute(request, usize::MAX, messages())
-            .await
-            .unwrap();
+        // Disable retries so a single 429 fixture still bounds the body once.
+        let outcome = exchange_with_retry(
+            RequestAuthorizer::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        )
+        .execute(request, usize::MAX, messages())
+        .await
+        .unwrap();
         let ExchangeOutcome::Rejected(rejection) = outcome else {
             panic!("non-success status must produce a rejection");
         };
@@ -952,6 +1054,238 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn exchange_retries_service_unavailable_then_succeeds() {
+        let body = b"ok-after-retry".to_vec();
+        let (url, hits, server) = serve_scripted(vec![
+            ScriptedResponse::http(
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 9\r\n\r\noverloaded",
+            ),
+            ScriptedResponse::http(format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8(body.clone()).unwrap()
+            )),
+        ]);
+        let request = build_direct_client().unwrap().get(&url).build().unwrap();
+
+        let outcome = exchange(RequestAuthorizer::default(), Vec::new())
+            .execute(request, body.len(), messages())
+            .await
+            .unwrap();
+        let ExchangeOutcome::Success(response) = outcome else {
+            panic!("503 then 200 must succeed after retry");
+        };
+        let streamed = response
+            .into_body()
+            .map(|chunk| chunk.unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+
+        assert_eq!(streamed, body);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_does_not_retry_unauthorized() {
+        let (url, hits, server) = serve_scripted(vec![ScriptedResponse::http(
+            "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 8\r\n\r\nrejected",
+        )]);
+        let request = build_direct_client().unwrap().get(&url).build().unwrap();
+
+        let outcome = exchange(RequestAuthorizer::default(), Vec::new())
+            .execute(request, usize::MAX, messages())
+            .await
+            .unwrap();
+        let ExchangeOutcome::Rejected(rejection) = outcome else {
+            panic!("401 must reject without retry");
+        };
+
+        assert_eq!(rejection.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(rejection.body(), b"rejected");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_disabled_policy_never_resends() {
+        let (url, hits, server) = serve_scripted(vec![ScriptedResponse::http(
+            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 9\r\n\r\noverloaded",
+        )]);
+        let request = build_direct_client().unwrap().get(&url).build().unwrap();
+
+        let outcome = exchange_with_retry(
+            RequestAuthorizer::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        )
+        .execute(request, usize::MAX, messages())
+        .await
+        .unwrap();
+        let ExchangeOutcome::Rejected(rejection) = outcome else {
+            panic!("disabled policy must surface the first rejection");
+        };
+
+        assert_eq!(rejection.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_exhausts_retries_and_returns_last_rejection() {
+        let (url, hits, server) = serve_scripted(vec![
+            ScriptedResponse::http(
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 5\r\n\r\nfirst",
+            ),
+            ScriptedResponse::http(
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 6\r\n\r\nsecond",
+            ),
+            ScriptedResponse::http(
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 5\r\n\r\nthird",
+            ),
+        ]);
+        let request = build_direct_client().unwrap().get(&url).build().unwrap();
+
+        let outcome = exchange(RequestAuthorizer::default(), Vec::new())
+            .execute(request, usize::MAX, messages())
+            .await
+            .unwrap();
+        let ExchangeOutcome::Rejected(rejection) = outcome else {
+            panic!("exhausted retries must reject");
+        };
+
+        assert_eq!(rejection.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejection.body(), b"third");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_honors_retry_after_before_success() {
+        let body = b"after-wait".to_vec();
+        let (url, hits, server) = serve_scripted(vec![
+            ScriptedResponse::http(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nConnection: close\r\nContent-Length: 4\r\n\r\nwait",
+            ),
+            ScriptedResponse::http(format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8(body.clone()).unwrap()
+            )),
+        ]);
+        let request = build_direct_client().unwrap().get(&url).build().unwrap();
+
+        // Cap Retry-After via max_delay so the test stays fast while still
+        // exercising the header parse + delay selection path.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            total_budget: Duration::from_secs(1),
+        };
+        let outcome = exchange_with_retry(RequestAuthorizer::default(), Vec::new(), policy)
+            .execute(request, body.len(), messages())
+            .await
+            .unwrap();
+        let ExchangeOutcome::Success(_) = outcome else {
+            panic!("429 with Retry-After then 200 must succeed");
+        };
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_retries_transport_failure_then_succeeds() {
+        let body = b"recovered".to_vec();
+        let (url, hits, server) = serve_scripted(vec![
+            ScriptedResponse::Drop,
+            ScriptedResponse::http(format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8(body.clone()).unwrap()
+            )),
+        ]);
+        let request = build_direct_client().unwrap().get(&url).build().unwrap();
+
+        let outcome = exchange(RequestAuthorizer::default(), Vec::new())
+            .execute(request, body.len(), messages())
+            .await
+            .unwrap();
+        let ExchangeOutcome::Success(response) = outcome else {
+            panic!("transport failure then 200 must succeed after retry");
+        };
+        let streamed = response
+            .into_body()
+            .map(|chunk| chunk.unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+
+        assert_eq!(streamed, body);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_reauthorizes_on_every_retry_attempt() {
+        let secret = "retry-bearer-secret";
+        let authorize_hits = Arc::new(AtomicUsize::new(0));
+        let provider = SharedRequestCredentialProvider::new(CountingBearer {
+            token: secret.to_owned(),
+            hits: Arc::clone(&authorize_hits),
+        });
+        let authorizer = RequestAuthorizer::request_credentials(provider);
+        let body = b"authorized-ok".to_vec();
+        let (url, hits, server) = serve_scripted_authorized(
+            secret,
+            vec![
+                ScriptedResponse::http(
+                    "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 9\r\n\r\noverloaded",
+                ),
+                ScriptedResponse::http(format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    String::from_utf8(body.clone()).unwrap()
+                )),
+            ],
+        );
+        let request = build_direct_client().unwrap().get(&url).build().unwrap();
+
+        let outcome = exchange(authorizer, Vec::new())
+            .execute(request, body.len(), messages())
+            .await
+            .unwrap();
+        let ExchangeOutcome::Success(response) = outcome else {
+            panic!("authorized retry must succeed");
+        };
+
+        assert_eq!(response.redactions(), &[secret.to_owned()]);
+        assert_eq!(authorize_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.join().unwrap();
+    }
+
+    struct CountingBearer {
+        token: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl RequestCredentialProvider for CountingBearer {
+        fn credential(
+            &self,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<RequestCredential, RequestCredentialError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                RequestCredential::bearer(self.token.clone())
+            })
+        }
+    }
+
     fn serve_response(headers: String, body: Vec<u8>) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/response", listener.local_addr().unwrap());
@@ -962,6 +1296,66 @@ mod tests {
             stream.write_all(&body).unwrap();
         });
         (url, server)
+    }
+
+    enum ScriptedResponse {
+        Http(Vec<u8>),
+        Drop,
+    }
+
+    impl ScriptedResponse {
+        fn http(response: impl Into<Vec<u8>>) -> Self {
+            Self::Http(response.into())
+        }
+    }
+
+    fn serve_scripted(
+        responses: Vec<ScriptedResponse>,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        serve_scripted_with_auth(None, responses)
+    }
+
+    fn serve_scripted_authorized(
+        secret: &str,
+        responses: Vec<ScriptedResponse>,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        serve_scripted_with_auth(Some(secret.to_owned()), responses)
+    }
+
+    fn serve_scripted_with_auth(
+        expected_bearer: Option<String>,
+        responses: Vec<ScriptedResponse>,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/response", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let server = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request_head(&mut stream);
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                if let Some(secret) = expected_bearer.as_ref() {
+                    let expected =
+                        format!("authorization: Bearer {secret}\r\n").to_ascii_lowercase();
+                    assert!(
+                        String::from_utf8_lossy(&request)
+                            .to_ascii_lowercase()
+                            .contains(&expected),
+                        "missing bearer authorization on attempt"
+                    );
+                }
+                match response {
+                    ScriptedResponse::Http(bytes) => {
+                        stream.write_all(&bytes).unwrap();
+                    }
+                    ScriptedResponse::Drop => {
+                        drop(stream);
+                    }
+                }
+            }
+        });
+        (url, hits, server)
     }
 
     fn serve_authorized_rejection(secret: &str) -> (String, JoinHandle<()>) {

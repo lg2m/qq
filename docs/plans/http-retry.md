@@ -1,6 +1,6 @@
 # Pre-Stream HTTP Exchange Retry
 
-Status: in progress. Stage 1 complete.
+Status: in progress. Stage 2 complete.
 
 ## Goal
 
@@ -153,12 +153,13 @@ Invariants:
    exponential delay selection, budget remaining checks, full jitter, and
    deterministic unit tests. `HttpExchange` stores the policy and exposes
    `with_retry_policy`; `execute` is still single-shot until stage 2.
-2. **Pre-stream attempt loop.** Teach `HttpExchange::execute` to honor the
-   policy: clone when needed, re-authorize, sleep with full jitter, and return
-   the final outcome. Default policy on; `with_retry_policy` for tests and
+2. **Pre-stream attempt loop. Complete.** `HttpExchange::execute` clones the
+   request when another attempt remains, re-authorizes every send, sleeps with
+   full jitter under the total budget, and returns the last rejection or
+   transport error. Default policy is on; `with_retry_policy` covers tests and
    future canaries. Localhost multi-response tests cover success-after-503,
-   no-retry on 401, transport retry, disabled policy, exhausted attempts, and
-   `Retry-After` capping.
+   no-retry on 401, transport retry, disabled policy, exhausted attempts,
+   `Retry-After` capping, and per-attempt re-authorization.
 3. **Adapter and canary wiring.** Confirm all four HTTP adapters pick up default
    retry with no behavior regressions. Expose `RetryPolicy::disabled()` where
    live canaries or single-attempt fixtures need it. Add one OpenAI-adapter
