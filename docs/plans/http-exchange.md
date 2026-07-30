@@ -1,6 +1,6 @@
 # Deepen HTTP Exchange Execution
 
-Status: in progress. Stages 1 and 2 are complete.
+Status: in progress. Stages 1 through 3 are complete.
 
 ## Goal
 
@@ -181,10 +181,16 @@ all headers generic configuration.
    adapter-owned diagnostic strings and accounting semantics. The direct HTTP
    adapters also use the counter for wire bytes pending ownership by the
    exchange in stage 3.
-3. **Introduce the exchange types.** Implement request-time authorization,
-   execution, status split, bounded rejection, and limited success stream in
-   `http.rs`. Unit-test this seam against a localhost server, including dynamic
-   credential redaction.
+3. **Introduce the exchange types. Complete.** Added `HttpExchange`,
+   `ExchangeOutcome`, `HttpResponse`, `HttpRejection`, and `ExchangeMessages` in
+   `http.rs`. The exchange applies request-time authorization, normalizes static
+   and ephemeral redactions, executes the request, returns bounded non-success
+   bodies, and exposes successful bodies only through a checked wire-limited
+   stream. Localhost tests cover status splitting, narrow metadata, exact and
+   over-limit streaming, bounded rejection bodies, request-time bearer
+   authorization, deterministic redaction normalization, and dynamic credential
+   redaction on body-read failures. The seam is temporarily allowed as dead code
+   in non-test builds until Chat Completions consumes it in stage 4.
 4. **Migrate Chat Completions.** It is the simplest full path with a request
    authorizer. Delete its local send/status code, wire counter, and direct error
    body read after contract tests pass.
