@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "exchange compatibility helpers remain until HTTP adapter migrations finish"
-    )
-)]
-
 use std::{net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use futures_core::Stream;
@@ -81,6 +73,10 @@ impl SafeHeaders {
         self.headers.insert(name, value);
     }
 
+    pub(crate) fn extend_owned(&mut self, headers: HeaderMap) {
+        self.headers.extend(headers);
+    }
+
     pub(crate) fn push_redaction(&mut self, value: String) {
         self.redactions.push(value);
     }
@@ -131,7 +127,6 @@ pub(crate) enum ExchangeOutcome {
 }
 
 pub(crate) struct HttpResponse {
-    status: StatusCode,
     headers: HeaderMap,
     redactions: Arc<[String]>,
     body: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, ProviderError>> + Send>>,
@@ -209,7 +204,6 @@ impl HttpExchange {
         });
 
         Ok(ExchangeOutcome::Success(HttpResponse {
-            status,
             headers,
             redactions,
             body,
@@ -218,10 +212,6 @@ impl HttpExchange {
 }
 
 impl HttpResponse {
-    pub(crate) fn status(&self) -> StatusCode {
-        self.status
-    }
-
     pub(crate) fn headers(&self) -> &HeaderMap {
         &self.headers
     }
@@ -287,10 +277,6 @@ pub(crate) fn transport_error(error: reqwest::Error, redactions: &[String]) -> P
     ))
 }
 
-pub(crate) fn is_event_stream(response: &reqwest::Response) -> bool {
-    is_event_stream_headers(response.headers())
-}
-
 pub(crate) fn is_event_stream_headers(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
@@ -302,7 +288,7 @@ pub(crate) fn is_event_stream_headers(headers: &HeaderMap) -> bool {
         })
 }
 
-pub(crate) async fn read_error_body(response: reqwest::Response) -> Vec<u8> {
+async fn read_error_body(response: reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
     let mut chunks = response.bytes_stream();
 
@@ -447,7 +433,6 @@ mod tests {
             panic!("successful status must produce a successful exchange");
         };
 
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
             "text/event-stream"
@@ -658,7 +643,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(is_event_stream(&response));
+        assert!(is_event_stream_headers(response.headers()));
 
         let streamed = response
             .bytes_stream()

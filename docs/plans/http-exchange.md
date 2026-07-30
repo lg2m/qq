@@ -213,14 +213,19 @@ all headers generic configuration.
    redactions, standard-versus-Codex body shape, provider-specific bounded HTTP
    error decoding, and the Codex exception for an absent content type. Success
    bodies are available only through the exchange's wire-limited stream.
-7. **Consolidate safe header construction.** Migrate one adapter at a time and
-   delete each local universal controlled-header predicate only when its tests
-   pass. Keep protocol-specific secret emptiness semantics explicit at adapter
-   call sites.
-8. **Delete obsolete helpers and duplication.** `read_error_body` should become
-   internal to exchange rejection handling; adapters consume `HttpRejection`.
-   Verify no direct adapter calls `Client::execute`/`send`,
-   `Response::bytes_stream`, or local wire-counter helpers remain.
+7. **Consolidate safe header construction. Complete.** Added `SafeHeaders` to
+   centralize universal and protocol-owned override rejection, case-insensitive
+   duplicate detection, sensitive configured values, and normalized redactions.
+   All four direct HTTP adapters use it while retaining their protocol-specific
+   authentication validation and whitespace semantics.
+8. **Delete obsolete helpers and duplication. In progress.** `read_error_body`
+   is internal to exchange rejection handling; adapters consume
+   `HttpRejection`. Removed the obsolete raw-response SSE helper, unused success
+   status metadata, temporary dead-code allowance, adapter-local universal
+   controlled-header predicates, and adapter-local wire counters. Source checks
+   leave direct `reqwest` execution and raw body streaming only inside the
+   exchange and its tests; Bedrock continues to use its non-HTTP AWS SDK send
+   path.
 
 The exchange and byte-counter steps may land separately. Header consolidation
 should follow exchange migration rather than enlarging the first change with a

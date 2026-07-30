@@ -12,8 +12,8 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, build_client,
-        build_direct_client, transport_error, validate_endpoint,
+        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, SafeHeaders, build_client,
+        build_direct_client, is_request_controlled_header, transport_error, validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -393,47 +393,21 @@ fn build_headers(
             Some((name, value))
         }
     };
-    let auth_name = auth_header.as_ref().map(|(name, _)| name);
-
-    let mut headers = HeaderMap::new();
-    for (name, value) in static_headers {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            ProviderError::Configuration("static header name is invalid".to_owned())
-        })?;
-        if name == AUTHORIZATION
-            || name == X_API_KEY
-            || name == ANTHROPIC_VERSION
-            || auth_name.is_some_and(|auth_name| auth_name == name)
-            || is_request_controlled_header(&name)
-        {
-            return Err(ProviderError::Configuration(format!(
-                "static header `{name}` is controlled by the provider"
-            )));
-        }
-        if headers.contains_key(&name) {
-            return Err(ProviderError::Configuration(format!(
-                "static header `{name}` is duplicated"
-            )));
-        }
-
-        let mut header_value = HeaderValue::from_str(&value).map_err(|_| {
-            ProviderError::Configuration("static header value is invalid".to_owned())
-        })?;
-        header_value.set_sensitive(true);
-        if !value.trim().is_empty() {
-            redactions.push(value);
-        }
-        headers.insert(name, header_value);
-    }
-
-    headers.insert(ANTHROPIC_VERSION, version);
+    let auth_name = auth_header.as_ref().map(|(name, _)| name.clone());
+    let mut headers = SafeHeaders::new(
+        [AUTHORIZATION, X_API_KEY, ANTHROPIC_VERSION]
+            .into_iter()
+            .chain(auth_name),
+    );
+    headers.insert_configured(static_headers, false)?;
+    headers.insert_owned(ANTHROPIC_VERSION, version);
     if let Some((name, value)) = auth_header {
-        headers.insert(name, value);
+        headers.insert_owned(name, value);
     }
-
-    redactions.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    redactions.dedup();
-    Ok((headers, redactions))
+    for redaction in redactions {
+        headers.push_redaction(redaction);
+    }
+    Ok(headers.finish())
 }
 
 fn sensitive_secret_header(secret: &str, name: &str) -> Result<HeaderValue, ProviderError> {
@@ -447,28 +421,6 @@ fn sensitive_secret_header(secret: &str, name: &str) -> Result<HeaderValue, Prov
     })?;
     value.set_sensitive(true);
     Ok(value)
-}
-
-fn is_request_controlled_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "accept"
-            | "connection"
-            | "content-length"
-            | "content-type"
-            | "expect"
-            | "host"
-            | "http2-settings"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "user-agent"
-    )
 }
 
 fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
@@ -1196,6 +1148,35 @@ mod tests {
     }
 
     #[test]
+    fn decodes_displayable_thinking_but_ignores_redacted_thinking() {
+        let started = decode_data(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":""}}"#,
+        )
+        .unwrap();
+        let delta = decode_data(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"checking"}}"#,
+        )
+        .unwrap();
+        let redacted = decode_data(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"redacted_thinking","data":"opaque-secret-data"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(started, DecodedEvent::ThinkingStarted { index: 2 });
+        assert_eq!(
+            delta,
+            DecodedEvent::ThinkingDelta {
+                index: 2,
+                text: "checking".to_owned(),
+            }
+        );
+        assert_eq!(redacted, DecodedEvent::Ignored);
+    }
+
+    #[test]
     fn handles_text_refusal_errors_and_opaque_events() {
         let text = decode_data(
             "content_block_delta",
@@ -1236,7 +1217,13 @@ mod tests {
                 output_tokens: None,
             } if text == "request declined"
         ));
-        assert_eq!(thinking, DecodedEvent::Ignored);
+        assert_eq!(
+            thinking,
+            DecodedEvent::ThinkingDelta {
+                index: 0,
+                text: "private reasoning".to_owned(),
+            }
+        );
         assert_eq!(redacted, DecodedEvent::Ignored);
         assert_eq!(overloaded.kind(), ProviderErrorKind::Unavailable);
         assert_eq!(rate_limited.kind(), ProviderErrorKind::RateLimited);
