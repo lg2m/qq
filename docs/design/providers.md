@@ -30,8 +30,9 @@ adapter.
 The target ownership is:
 
 - `http.rs` owns client policy, globally controlled-header safety, request-time
-  authorization and execution, transport-error sanitization, bounded non-2xx
-  bodies, success response metadata, and a wire-limited response-body stream.
+  authorization and execution, pre-stream retry/backoff for transient transport
+  and overload statuses, transport-error sanitization, bounded non-2xx bodies,
+  success response metadata, and a wire-limited response-body stream.
 - `limits.rs` owns calculated stream budgets and reusable checked byte counters.
 - Each adapter continues to own endpoint and request-body construction,
   protocol-owned/authentication headers, interpretation of non-2xx bodies,
@@ -45,6 +46,18 @@ schemas. This keeps the transport implementation deep without creating a
 "generic provider" abstraction that leaks every protocol distinction into its
 interface. The Responses adapter may, for example, retain its explicit Codex
 exception for a missing SSE content type.
+
+Before a successful response is handed to an adapter, `HttpExchange` may retry
+transient pre-stream failures under a fixed internal policy (default three
+attempts, exponential backoff with full jitter, a total delay budget, and
+`Retry-After` delta-seconds when present). Retryable outcomes are transport
+errors and HTTP `408` / `429` / `500` / `502` / `503` / `504`. Auth and other
+client errors are not retried, and nothing is retried after success headers are
+observed. Live canaries must call each HTTP adapter's `without_retries()` so a
+single probe does not spend multiple attempts. The policy, attempt loop, and
+acceptance tests are recorded in
+[`docs/plans/http-retry.md`](../plans/http-retry.md). Bedrock's AWS SDK
+transport remains outside this path.
 
 Header consolidation follows the same boundary. The HTTP module defines the
 universal request-controlled names and a builder that parses names and values,
@@ -174,7 +187,9 @@ Each live case must:
 4. Require at least one text event and exactly one successful terminal event.
 5. Record whether the marker appeared, but not fail solely for harmless prose
    around it.
-6. Disable automatic inference retries to prevent duplicate spend.
+6. Disable automatic inference retries to prevent duplicate spend. HTTP adapters
+   expose `without_retries()` for this; call it when constructing canary
+   clients so pre-stream transport retry stays off.
 7. Enforce connection, first-token, total-time, event-size, and output limits.
 8. Emit only redacted metadata.
 

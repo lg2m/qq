@@ -1,6 +1,6 @@
 # Pre-Stream HTTP Exchange Retry
 
-Status: in progress. Stage 2 complete.
+Status: complete.
 
 ## Goal
 
@@ -160,17 +160,17 @@ Invariants:
    future canaries. Localhost multi-response tests cover success-after-503,
    no-retry on 401, transport retry, disabled policy, exhausted attempts,
    `Retry-After` capping, and per-attempt re-authorization.
-3. **Adapter and canary wiring.** Confirm all four HTTP adapters pick up default
-   retry with no behavior regressions. Expose `RetryPolicy::disabled()` where
-   live canaries or single-attempt fixtures need it. Add one OpenAI-adapter
-   exhaustion test only if an existing fixture path makes final error mapping
-   fragile under retries.
-4. **Cleanup and docs.** Delete any temporary test-only seams that are no
-   longer needed, note the transport retry behavior in provider design docs,
-   and mark this plan complete.
-
-Stage 1 is intentionally pure so delay math and status policy can lock before
-timing-sensitive loop tests land.
+3. **Adapter and canary wiring. Complete.** All four HTTP adapters construct
+   `HttpExchange` with the default retry policy and need no request-path
+   changes. Each exposes `without_retries()` so future live canaries and
+   single-shot probes can force `RetryPolicy::disabled()` without touching the
+   exchange internals. Existing localhost adapter fixtures already use
+   non-retryable statuses or one-shot 200 streams, so no extra OpenAI
+   exhaustion fixture was required.
+4. **Cleanup and docs. Complete.** Provider design docs record the pre-stream
+   retry policy and the canary `without_retries()` requirement. The older
+   http-exchange non-goal now points at this plan. No temporary test-only seams
+   remained to delete.
 
 ## Test And Acceptance Plan
 

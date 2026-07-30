@@ -41,7 +41,6 @@ impl RetryPolicy {
     }
 
     /// Single attempt, no sleeps. For live canaries and single-shot tests.
-    #[allow(dead_code)]
     pub(crate) const fn disabled() -> Self {
         Self {
             max_attempts: 1,
@@ -284,7 +283,6 @@ impl HttpExchange {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self

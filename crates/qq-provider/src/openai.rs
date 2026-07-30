@@ -12,8 +12,9 @@ use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, SafeHeaders, build_client,
-        build_direct_client, is_request_controlled_header, transport_error, validate_endpoint,
+        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
+        build_client, build_direct_client, is_request_controlled_header, transport_error,
+        validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -143,6 +144,16 @@ impl OpenAi {
             headers,
             request_kind,
         })
+    }
+
+    /// Disables pre-stream HTTP retries for this client.
+    ///
+    /// Live canaries and single-shot probes use this so one overloaded or
+    /// rate-limited response is not spent across multiple attempts.
+    #[must_use]
+    pub fn without_retries(mut self) -> Self {
+        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self
     }
 }
 
@@ -795,6 +806,14 @@ mod tests {
         assert_eq!(provider.endpoint.as_str(), RESPONSES_ENDPOINT);
         assert!(!format!("{bearer:?}").contains("openai-test-secret"));
         assert!(!format!("{header:?}").contains("custom-test-secret"));
+    }
+
+    #[test]
+    fn without_retries_preserves_endpoint_for_canary_clients() {
+        let provider = OpenAi::new("openai-test-secret")
+            .unwrap()
+            .without_retries();
+        assert_eq!(provider.endpoint.as_str(), RESPONSES_ENDPOINT);
     }
 
     #[test]

@@ -12,8 +12,9 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, SafeHeaders, build_client,
-        build_direct_client, is_request_controlled_header, transport_error, validate_endpoint,
+        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
+        build_client, build_direct_client, is_request_controlled_header, transport_error,
+        validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -159,6 +160,16 @@ impl AnthropicMessages {
             endpoint,
             headers,
         })
+    }
+
+    /// Disables pre-stream HTTP retries for this client.
+    ///
+    /// Live canaries and single-shot probes use this so one overloaded or
+    /// rate-limited response is not spent across multiple attempts.
+    #[must_use]
+    pub fn without_retries(mut self) -> Self {
+        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self
     }
 }
 

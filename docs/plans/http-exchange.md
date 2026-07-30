@@ -1,6 +1,6 @@
 # Deepen HTTP Exchange Execution
 
-Status: in progress. Stages 1 through 6 are complete.
+Status: complete. Stages 1 through 8 are complete.
 
 ## Goal
 
@@ -218,7 +218,7 @@ all headers generic configuration.
    duplicate detection, sensitive configured values, and normalized redactions.
    All four direct HTTP adapters use it while retaining their protocol-specific
    authentication validation and whitespace semantics.
-8. **Delete obsolete helpers and duplication. In progress.** `read_error_body`
+8. **Delete obsolete helpers and duplication. Complete.** `read_error_body`
    is internal to exchange rejection handling; adapters consume
    `HttpRejection`. Removed the obsolete raw-response SSE helper, unused success
    status metadata, temporary dead-code allowance, adapter-local universal
@@ -279,7 +279,9 @@ four-way universal controlled-header list.
 
 - A public transport trait or pluggable production transport.
 - Combining protocol adapters or their SSE state machines.
-- Retrying, backoff, telemetry, or live-canary infrastructure.
+- Retrying, backoff, telemetry, or live-canary infrastructure. Pre-stream retry
+  later landed in [`docs/plans/http-retry.md`](http-retry.md); this exchange plan
+  deliberately stopped at the single-shot seam.
 - Changing timeout values, endpoint policy, stream-budget formulas, provider
   error classification, or request wire shapes.
 - Moving Mantle or Bedrock SDK execution into this exchange in the initial
