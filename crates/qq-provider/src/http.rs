@@ -4,7 +4,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use reqwest::{
     StatusCode, Url,
-    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
 };
 
 use crate::{
@@ -15,6 +15,130 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ERROR_BODY_BYTES_LIMIT: usize = 16 * 1_024;
+const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
+const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
+const DEFAULT_RETRY_TOTAL_BUDGET: Duration = Duration::from_secs(15);
+
+/// Pre-stream retry settings for [`HttpExchange`].
+///
+/// Stage 1 of the http-retry plan lands the pure policy surface. The execute
+/// attempt loop consumes these helpers in stage 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct RetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+    total_budget: Duration,
+}
+
+#[allow(dead_code)]
+impl RetryPolicy {
+    pub(crate) const fn default_policy() -> Self {
+        Self {
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            base_delay: DEFAULT_RETRY_BASE_DELAY,
+            max_delay: DEFAULT_RETRY_MAX_DELAY,
+            total_budget: DEFAULT_RETRY_TOTAL_BUDGET,
+        }
+    }
+
+    /// Single attempt, no sleeps. For live canaries and single-shot tests.
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            max_attempts: 1,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            total_budget: Duration::ZERO,
+        }
+    }
+
+    pub(crate) const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    pub(crate) const fn base_delay(self) -> Duration {
+        self.base_delay
+    }
+
+    pub(crate) const fn max_delay(self) -> Duration {
+        self.max_delay
+    }
+
+    pub(crate) const fn total_budget(self) -> Duration {
+        self.total_budget
+    }
+
+    /// Whether another send may run after `completed_attempts` finished tries.
+    pub(crate) const fn has_remaining_attempt(self, completed_attempts: u32) -> bool {
+        completed_attempts < self.max_attempts
+    }
+
+    /// Exponential delay for the retry about to start.
+    ///
+    /// `retry_index` is zero for the first retry after the initial try.
+    pub(crate) fn exponential_delay(self, retry_index: u32) -> Duration {
+        let multiplier = 1u32.checked_shl(retry_index.min(31)).unwrap_or(u32::MAX);
+        self.base_delay
+            .saturating_mul(multiplier)
+            .min(self.max_delay)
+    }
+
+    /// Delay before the next attempt, honoring `Retry-After` when present.
+    pub(crate) fn delay_before_retry(
+        self,
+        retry_index: u32,
+        retry_after: Option<Duration>,
+    ) -> Duration {
+        let exponential = self.exponential_delay(retry_index);
+        match retry_after {
+            Some(retry_after) => exponential.max(retry_after).min(self.max_delay),
+            None => exponential,
+        }
+    }
+
+    /// Returns whether sleeping `delay` still fits inside the total budget.
+    pub(crate) fn can_afford(self, elapsed: Duration, delay: Duration) -> bool {
+        elapsed
+            .checked_add(delay)
+            .is_some_and(|total| total <= self.total_budget)
+    }
+}
+
+/// Pre-stream statuses that may be retried by [`HttpExchange`].
+#[allow(dead_code)]
+pub(crate) fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// Parses `Retry-After` delta-seconds. HTTP-date forms are ignored.
+#[allow(dead_code)]
+pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    let seconds = value.parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+/// Full jitter over `0..=delay` from a uniform 32-bit random value.
+#[allow(dead_code)]
+pub(crate) fn full_jitter(delay: Duration, random: u32) -> Duration {
+    if delay.is_zero() {
+        return Duration::ZERO;
+    }
+    let nanos = delay.as_nanos();
+    let span = nanos.saturating_add(1);
+    let pick = (span * u128::from(random)) >> 32;
+    Duration::from_nanos(u64::try_from(pick).unwrap_or(u64::MAX))
+}
 
 pub(crate) struct SafeHeaders {
     headers: HeaderMap,
@@ -40,9 +164,7 @@ impl SafeHeaders {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                 ProviderError::Configuration("static header name is invalid".to_owned())
             })?;
-            if is_request_controlled_header(&name)
-                || self.protocol_owned.iter().any(|owned| owned == &name)
-            {
+            if is_request_controlled_header(&name) || self.protocol_owned.contains(&name) {
                 return Err(ProviderError::Configuration(format!(
                     "static header `{name}` is controlled by the provider"
                 )));
@@ -114,6 +236,8 @@ pub(crate) struct HttpExchange {
     client: reqwest::Client,
     authorizer: RequestAuthorizer,
     redactions: Arc<[String]>,
+    #[allow(dead_code)]
+    retry: RetryPolicy,
 }
 
 pub(crate) struct ExchangeMessages {
@@ -148,7 +272,14 @@ impl HttpExchange {
             client,
             authorizer,
             redactions,
+            retry: RetryPolicy::default_policy(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     pub(crate) fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
@@ -386,6 +517,142 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn default_retry_policy_matches_documented_constants() {
+        let policy = RetryPolicy::default_policy();
+        assert_eq!(policy.max_attempts(), 3);
+        assert_eq!(policy.base_delay(), Duration::from_millis(250));
+        assert_eq!(policy.max_delay(), Duration::from_secs(4));
+        assert_eq!(policy.total_budget(), Duration::from_secs(15));
+        assert!(policy.has_remaining_attempt(0));
+        assert!(policy.has_remaining_attempt(2));
+        assert!(!policy.has_remaining_attempt(3));
+    }
+
+    #[test]
+    fn disabled_retry_policy_allows_one_attempt() {
+        let policy = RetryPolicy::disabled();
+        assert_eq!(policy.max_attempts(), 1);
+        assert!(policy.has_remaining_attempt(0));
+        assert!(!policy.has_remaining_attempt(1));
+        assert_eq!(policy.exponential_delay(0), Duration::ZERO);
+        assert!(!policy.can_afford(Duration::ZERO, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn retryable_status_classification_matches_policy() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(
+                is_retryable_status(status),
+                "{status} should be retryable pre-stream"
+            );
+        }
+
+        for status in [
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::NOT_IMPLEMENTED,
+        ] {
+            assert!(
+                !is_retryable_status(status),
+                "{status} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds_and_ignores_invalid_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(2)));
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static(" 7 "));
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(7)));
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(retry_after_delay(&headers), None);
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("soon"));
+        assert_eq!(retry_after_delay(&headers), None);
+
+        assert_eq!(retry_after_delay(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn exponential_delays_double_then_cap_at_max_delay() {
+        let policy = RetryPolicy::default_policy();
+        assert_eq!(policy.exponential_delay(0), Duration::from_millis(250));
+        assert_eq!(policy.exponential_delay(1), Duration::from_millis(500));
+        assert_eq!(policy.exponential_delay(2), Duration::from_secs(1));
+        assert_eq!(policy.exponential_delay(3), Duration::from_secs(2));
+        assert_eq!(policy.exponential_delay(4), Duration::from_secs(4));
+        assert_eq!(policy.exponential_delay(5), Duration::from_secs(4));
+        assert_eq!(policy.exponential_delay(31), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn delay_before_retry_honors_retry_after_then_caps() {
+        let policy = RetryPolicy::default_policy();
+        assert_eq!(
+            policy.delay_before_retry(0, None),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            policy.delay_before_retry(0, Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            policy.delay_before_retry(0, Some(Duration::from_millis(100))),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            policy.delay_before_retry(0, Some(Duration::from_secs(30))),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn budget_helper_rejects_unaffordable_sleeps() {
+        let policy = RetryPolicy::default_policy();
+        assert!(policy.can_afford(Duration::ZERO, Duration::from_secs(15)));
+        assert!(!policy.can_afford(Duration::ZERO, Duration::from_secs(15) + Duration::from_nanos(1)));
+        assert!(policy.can_afford(Duration::from_secs(14), Duration::from_secs(1)));
+        assert!(!policy.can_afford(Duration::from_secs(14), Duration::from_secs(1) + Duration::from_nanos(1)));
+        assert!(!policy.can_afford(Duration::from_secs(10), Duration::MAX));
+    }
+
+    #[test]
+    fn full_jitter_spans_zero_through_delay() {
+        let delay = Duration::from_millis(1_000);
+        assert_eq!(full_jitter(delay, 0), Duration::ZERO);
+        assert_eq!(full_jitter(delay, u32::MAX), delay);
+        assert_eq!(full_jitter(Duration::ZERO, u32::MAX), Duration::ZERO);
+
+        let mid = full_jitter(delay, u32::MAX / 2);
+        assert!(mid > Duration::ZERO);
+        assert!(mid < delay);
+    }
+
+    #[test]
+    fn exchange_defaults_to_retry_policy_and_accepts_override() {
+        let exchange = exchange(RequestAuthorizer::default(), Vec::new());
+        assert_eq!(exchange.retry, RetryPolicy::default_policy());
+        let disabled = exchange.with_retry_policy(RetryPolicy::disabled());
+        assert_eq!(disabled.retry, RetryPolicy::disabled());
+    }
 
     const WIRE_OVERFLOW: &str = "test wire size overflowed";
     const WIRE_LIMIT: &str = "test wire size exceeded the limit";
