@@ -11,8 +11,12 @@ use serde_json::{Map, Value};
 use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
-    http::{build_client, is_event_stream, read_error_body, transport_error, validate_endpoint},
+    http::{
+        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, build_client,
+        transport_error, validate_endpoint,
+    },
     limits::{ByteCounter, StreamLimits},
+    request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
 };
@@ -58,11 +62,10 @@ pub(crate) enum GoogleEndpoint {
 
 /// A client for Google GenerateContent-compatible endpoints.
 pub struct GoogleGenerateContent {
-    client: reqwest::Client,
+    exchange: HttpExchange,
     endpoint: reqwest::Url,
     endpoint_kind: GoogleEndpoint,
     headers: HeaderMap,
-    redactions: Arc<[String]>,
 }
 
 impl GoogleGenerateContent {
@@ -87,11 +90,14 @@ impl GoogleGenerateContent {
     ) -> Result<Self, ProviderError> {
         let (headers, redactions) = build_headers(auth, static_headers)?;
         Ok(Self {
-            client,
+            exchange: HttpExchange::new(
+                client,
+                RequestAuthorizer::default(),
+                Arc::from(redactions),
+            ),
             endpoint,
             endpoint_kind,
             headers,
-            redactions: Arc::from(redactions),
         })
     }
 
@@ -135,10 +141,9 @@ impl GoogleGenerateContent {
 
 impl Provider for GoogleGenerateContent {
     fn stream(&self, request: ModelRequest) -> ProviderStream {
-        let client = self.client.clone();
+        let exchange = self.exchange.clone();
         let endpoint = self.request_endpoint(request.model());
         let headers = self.headers.clone();
-        let redactions = Arc::clone(&self.redactions);
 
         Box::pin(try_stream! {
             let endpoint = endpoint?;
@@ -149,37 +154,40 @@ impl Provider for GoogleGenerateContent {
             })?;
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = GenerateContentRequest::new(&request, max_output_tokens)?;
-            let response = client
-                .post(endpoint)
+            let wire_request = exchange
+                .request(reqwest::Method::POST, endpoint)
                 .headers(headers)
                 .header(ACCEPT, "text/event-stream")
                 .json(&body)
-                .send()
-                .await
-                .map_err(|error| transport_error(error, redactions.as_ref()))?;
-
-            let response = if response.status().is_success() {
-                response
-            } else {
-                Err(api_error(response, redactions.as_ref()).await)?
+                .build()
+                .map_err(|error| transport_error(error, exchange.static_redactions()))?;
+            let outcome = exchange
+                .execute(
+                    wire_request,
+                    limits.wire,
+                    ExchangeMessages {
+                        wire_overflow: "Google GenerateContent wire size overflowed",
+                        wire_limit: "Google GenerateContent stream exceeded the configured wire size limit",
+                    },
+                )
+                .await?;
+            let response = match outcome {
+                ExchangeOutcome::Success(response) => response,
+                ExchangeOutcome::Rejected(rejection) => Err(api_error(rejection))?,
             };
-            if !is_event_stream(&response) {
+            if !crate::http::is_event_stream_headers(response.headers()) {
                 Err(ProviderError::Protocol(
                     "Google GenerateContent provider returned a non-SSE response".to_owned(),
                 ))?;
             }
 
-            let mut chunks = response.bytes_stream();
+            let redactions = Arc::<[String]>::from(response.redactions());
+            let mut chunks = response.into_body();
             let mut decoder = sse_decoder(limits.event);
             let mut output_bytes = ByteCounter::new(
                 limits.output,
                 "Google GenerateContent output size overflowed",
                 "Google GenerateContent output exceeded the configured size limit",
-            );
-            let mut wire_bytes = ByteCounter::new(
-                limits.wire,
-                "Google GenerateContent wire size overflowed",
-                "Google GenerateContent stream exceeded the configured wire size limit",
             );
             let mut usage = None;
             let mut reasoning_open = false;
@@ -188,9 +196,7 @@ impl Provider for GoogleGenerateContent {
             let mut tool_call_ordinal = 0_u64;
 
             while let Some(chunk) = chunks.next().await {
-                let chunk = chunk
-                    .map_err(|error| transport_error(error, redactions.as_ref()))?;
-                wire_bytes.add(chunk.len())?;
+                let chunk = chunk?;
 
                 for frame in decoder.push(&chunk)? {
                     for event in decode_event(&frame.data, &mut tool_call_ordinal, redactions.as_ref())? {
@@ -854,19 +860,20 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
     }
 }
 
-async fn api_error(response: reqwest::Response, redactions: &[String]) -> ProviderError {
-    let status = response.status();
+fn api_error(rejection: HttpRejection) -> ProviderError {
+    let status = rejection.status();
     let fallback = status
         .canonical_reason()
         .unwrap_or("Google GenerateContent request failed")
         .to_owned();
-    let body = read_error_body(response).await;
-    let body_text = String::from_utf8_lossy(&body);
-    let message = serde_json::from_slice::<ApiErrorEnvelope>(&body)
+    let body_text = String::from_utf8_lossy(rejection.body());
+    let message = serde_json::from_slice::<ApiErrorEnvelope>(rejection.body())
         .ok()
         .and_then(|envelope| envelope.error.message)
         .or_else(|| (!body_text.trim().is_empty()).then(|| body_text.into_owned()))
-        .map_or(fallback, |message| sanitize_message(&message, redactions));
+        .map_or(fallback, |message| {
+            sanitize_message(&message, rejection.redactions())
+        });
     ProviderError::Api {
         status: status.as_u16(),
         message,

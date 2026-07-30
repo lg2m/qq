@@ -1,6 +1,6 @@
 # Deepen HTTP Exchange Execution
 
-Status: in progress. Stages 1 through 4 are complete.
+Status: in progress. Stages 1 through 6 are complete.
 
 ## Goal
 
@@ -200,13 +200,19 @@ all headers generic configuration.
    Removed the adapter's direct authorization/send/status handling, direct
    error-body read, body-read transport mapping, and local wire counter while
    preserving request shape, redaction, and provider-specific diagnostics.
-5. **Migrate Anthropic and Google.** Google currently uses `send()` and no
-   request-time authorizer; use the default authorizer so both still traverse
-   the same exchange. Preserve their error envelopes and protocol-owned header
-   sets.
-6. **Migrate Responses last.** Preserve built-request authorization, Codex
-   redactions, standard-versus-Codex body shape, and the Codex exception for an
-   absent content type.
+5. **Migrate Anthropic and Google. Complete.** Anthropic Messages and Google
+   GenerateContent now own `HttpExchange` instances and send built requests
+   through `HttpExchange::execute`; Google uses the default authorizer while
+   Anthropic preserves its request-time authorizer path. Both adapters validate
+   success metadata from narrow response headers, consume wire-limited success
+   streams, and decode bounded `HttpRejection` bodies with their existing error
+   envelopes, redactions, protocol-owned headers, and provider-specific wire
+   diagnostics intact.
+6. **Migrate Responses last. Complete.** Responses now owns an `HttpExchange`
+   and preserves request-time authorization, static and ephemeral Codex
+   redactions, standard-versus-Codex body shape, provider-specific bounded HTTP
+   error decoding, and the Codex exception for an absent content type. Success
+   bodies are available only through the exchange's wire-limited stream.
 7. **Consolidate safe header construction.** Migrate one adapter at a time and
    delete each local universal controlled-header predicate only when its tests
    pass. Keep protocol-specific secret emptiness semantics explicit at adapter
