@@ -23,6 +23,7 @@ mod sse;
 pub use compiler::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderRecipe,
 };
+pub use qq_reasoning::ReasoningKind;
 pub use request_auth::{
     RequestCredential, RequestCredentialError, RequestCredentialFuture, RequestCredentialProvider,
     SharedRequestCredentialProvider,
@@ -252,6 +253,9 @@ pub enum Role {
 pub enum ProviderEvent {
     OutputTextDelta { text: String },
     RefusalDelta { text: String },
+    ReasoningStarted { kind: ReasoningKind },
+    ReasoningDelta { kind: ReasoningKind, text: String },
+    ReasoningCompleted { kind: ReasoningKind },
     ToolCallStarted { id: String, name: String },
     ToolCallArgumentsDelta { id: String, json: String },
     ToolCallCompleted { id: String },

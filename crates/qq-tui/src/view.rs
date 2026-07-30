@@ -1022,6 +1022,7 @@ fn status_notice(app: &App, width: usize) -> Vec<Line> {
     {
         let label = match session.activity.map(|(_, activity)| activity) {
             Some(qq_protocol::RunActivity::WaitingForProvider) => "waiting for model",
+            Some(qq_protocol::RunActivity::Reasoning) => "reasoning",
             Some(qq_protocol::RunActivity::GeneratingResponse) => "generating response",
             Some(qq_protocol::RunActivity::PreparingToolCall) => "preparing tool call",
             None => "working",

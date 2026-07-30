@@ -1,0 +1,37 @@
+//! Provider-independent types for displayable model reasoning.
+//!
+//! Reasoning is presentation telemetry, not assistant transcript content.
+//! Only provider-generated summaries and thinking text explicitly exposed by
+//! an API belong here. Encrypted payloads, signatures, and opaque continuation
+//! state must remain private to provider adapters.
+
+#![forbid(unsafe_code)]
+
+use serde::{Deserialize, Serialize};
+
+/// The disclosure level of reasoning text made available to clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningKind {
+    /// A provider-generated summary of otherwise hidden reasoning.
+    Summary,
+    /// Thinking text explicitly exposed by the provider API.
+    ExposedThinking,
+}
+
+/// One lifecycle event for a displayable reasoning block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReasoningEvent {
+    Started { kind: ReasoningKind },
+    Delta { kind: ReasoningKind, text: String },
+    Completed { kind: ReasoningKind },
+}
+
+impl ReasoningEvent {
+    #[must_use]
+    pub const fn kind(&self) -> ReasoningKind {
+        match self {
+            Self::Started { kind } | Self::Delta { kind, .. } | Self::Completed { kind } => *kind,
+        }
+    }
+}

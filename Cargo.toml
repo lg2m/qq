@@ -12,6 +12,7 @@ members = [
   "crates/qq-mcp",
   "crates/qq-provider",
   "crates/qq-protocol",
+  "crates/qq-reasoning",
   "crates/qq-tui",
   "xtask",
 ]
@@ -50,6 +51,7 @@ qq-core = { path = "crates/qq-core" }
 qq-mcp = { path = "crates/qq-mcp" }
 qq-provider = { path = "crates/qq-provider" }
 qq-protocol = { path = "crates/qq-protocol" }
+qq-reasoning = { path = "crates/qq-reasoning" }
 qq-tui = { path = "crates/qq-tui" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustix = { version = "1", default-features = false, features = ["process", "std"] }

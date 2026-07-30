@@ -1,5 +1,5 @@
 [package]
-name = "qq-protocol"
+name = "qq-reasoning"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,4 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-getrandom.workspace = true
-qq-reasoning.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

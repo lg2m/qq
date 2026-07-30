@@ -629,6 +629,12 @@ impl App {
                     session.activity = Some((*run_id, *activity));
                 }
             }
+            // Reasoning has its own display channel. Until that channel is
+            // rendered, these events still update liveness via
+            // RunActivityChanged and must not enter the assistant transcript.
+            SessionEvent::ReasoningStarted { .. }
+            | SessionEvent::ReasoningDelta { .. }
+            | SessionEvent::ReasoningCompleted { .. } => {}
             SessionEvent::AssistantMessageStarted { message } => {
                 // A new turn's message means every earlier turn of the run
                 // has committed; the server finalized those messages inside
