@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -22,7 +22,7 @@ use qq_protocol::{
     RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
     SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
     SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot,
-    ToolCallState, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -123,15 +123,67 @@ pub struct RuntimeLoadError {
     pub message: String,
 }
 
+/// The workspace-configured grants that merge into a session's grant set at
+/// creation: exact tool names (including folded `mcp__<server>__<tool>`
+/// allowlist entries) and word-granularity shell command prefixes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceGrantSeed {
+    pub tools: Vec<String>,
+    pub shell_prefixes: Vec<String>,
+}
+
+impl WorkspaceGrantSeed {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.shell_prefixes.is_empty()
+    }
+}
+
+pub type GrantSeedFuture = Pin<Box<dyn Future<Output = WorkspaceGrantSeed> + Send + 'static>>;
+
+pub type GrantPromotionFuture =
+    Pin<Box<dyn Future<Output = WorkspaceGrantOutcome> + Send + 'static>>;
+
+/// The configuration-facing seam for workspace-lifetime grants, provided at
+/// runtime construction. qq-core stays configuration-agnostic: the embedding
+/// application implements both directions against its config layer.
+pub trait WorkspaceGrantAuthority: Send + Sync + 'static {
+    /// The workspace's effective config grants, resolved when a session is
+    /// created. A failure to resolve should seed nothing rather than error:
+    /// session creation must not depend on a loadable configuration.
+    fn seed_grants(&self, workspace: &Path) -> GrantSeedFuture;
+
+    /// Durably promotes one approval grant into the workspace configuration.
+    /// Failures are data ([`WorkspaceGrantOutcome::Failed`]), never errors:
+    /// a promotion must not fail the approval that requested it.
+    fn promote_grant(&self, workspace: &Path, grant: &ApprovalGrant) -> GrantPromotionFuture;
+}
+
 pub type SessionEventStream =
     Pin<Box<dyn Stream<Item = Result<SessionEventEnvelope, SessionRuntimeError>> + Send + 'static>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionRuntimeOptions {
     pub database_path: PathBuf,
     pub max_active_runs: usize,
     /// How long an approval request may wait for a client before it is denied.
     pub approval_timeout: Duration,
+    /// Where workspace-lifetime grants come from and go to. Absent, sessions
+    /// seed no config grants and approve-for-workspace decisions record only
+    /// their session grant (the promotion reports failure).
+    pub grant_authority: Option<Arc<dyn WorkspaceGrantAuthority>>,
+}
+
+impl std::fmt::Debug for SessionRuntimeOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionRuntimeOptions")
+            .field("database_path", &self.database_path)
+            .field("max_active_runs", &self.max_active_runs)
+            .field("approval_timeout", &self.approval_timeout)
+            .field("grant_authority", &self.grant_authority.is_some())
+            .finish()
+    }
 }
 
 impl SessionRuntimeOptions {
@@ -141,7 +193,14 @@ impl SessionRuntimeOptions {
             database_path,
             max_active_runs: 8,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+            grant_authority: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_grant_authority(mut self, authority: Arc<dyn WorkspaceGrantAuthority>) -> Self {
+        self.grant_authority = Some(authority);
+        self
     }
 }
 
@@ -153,6 +212,7 @@ pub struct SessionRuntime {
 struct SessionRuntimeInner {
     store: Store,
     loader: Arc<dyn RuntimeLoader>,
+    grant_authority: Option<Arc<dyn WorkspaceGrantAuthority>>,
     permits: Arc<Semaphore>,
     schedule: mpsc::Sender<()>,
     cancellations: Mutex<HashMap<RunId, watch::Sender<bool>>>,
@@ -182,6 +242,7 @@ impl SessionRuntime {
         let inner = Arc::new(SessionRuntimeInner {
             store,
             loader,
+            grant_authority: options.grant_authority,
             permits: Arc::new(Semaphore::new(options.max_active_runs)),
             schedule,
             cancellations: Mutex::new(HashMap::new()),
@@ -216,7 +277,25 @@ impl SessionRuntime {
             _ => None,
         };
         let should_schedule = matches!(command, SessionCommand::SubmitPrompt { .. });
-        let applied = self.inner.store.command(command_id, command).await?;
+        // Config grants merge into the session's grant set at creation
+        // (tools.md "Grant Lifetimes"): the workspace's effective grants are
+        // resolved here — the seam may do blocking configuration IO, so it
+        // runs outside the store worker — and copied into `session_grants`
+        // rows inside the CreateSession transaction. Copy-at-creation is
+        // deliberate: the gate consults only the session's own rows
+        // afterwards, so a later config edit affects new sessions only.
+        let seed = match (&command, &self.inner.grant_authority) {
+            (SessionCommand::CreateSession { workspace_id, .. }, Some(authority)) => {
+                let path = self.inner.store.workspace_path(*workspace_id).await?;
+                authority.seed_grants(Path::new(&path)).await
+            }
+            _ => WorkspaceGrantSeed::default(),
+        };
+        let applied = self
+            .inner
+            .store
+            .command_with_seed(command_id, command, seed)
+            .await?;
         self.inner.notify(applied.receipt.committed_through);
 
         if let Some(run_id) = signal_run {
@@ -225,10 +304,39 @@ impl SessionRuntime {
         if let Some(tool_call_id) = signal_approval {
             self.inner.resolve_approval(tool_call_id);
         }
+        if let Some(promotion) = applied.promotion {
+            self.spawn_grant_promotion(promotion);
+        }
         if should_schedule || applied.schedule {
             self.request_schedule();
         }
         Ok(applied.receipt)
+    }
+
+    /// Carries an approve-for-workspace promotion to its durable conclusion
+    /// in the background. The approval's session grant is already committed,
+    /// so nothing here can fail it: whatever the write's fate, it is
+    /// published as a persisted `workspace_grant_promoted` event — the same
+    /// events-out channel every other asynchronous outcome uses.
+    fn spawn_grant_promotion(&self, promotion: PendingGrantPromotion) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            let outcome = match &inner.grant_authority {
+                Some(authority) => {
+                    authority
+                        .promote_grant(Path::new(&promotion.workspace_path), &promotion.grant)
+                        .await
+                }
+                None => WorkspaceGrantOutcome::Failed {
+                    message: "this server has no workspace grant store; the approval covers \
+                              this session only"
+                        .to_owned(),
+                },
+            };
+            if let Ok(event) = inner.store.record_grant_promotion(promotion, outcome).await {
+                inner.notify(event.cursor);
+            }
+        });
     }
 
     pub async fn snapshot(
@@ -1550,14 +1658,59 @@ impl Store {
         .await
     }
 
+    /// Applies one command with no config-grant seed; only CreateSession
+    /// consults the seed, so this shorthand keeps non-seeding tests direct.
+    #[cfg(test)]
     async fn command(
         &self,
         command_id: CommandId,
         command: SessionCommand,
     ) -> Result<AppliedCommand, SessionRuntimeError> {
+        self.command_with_seed(command_id, command, WorkspaceGrantSeed::default())
+            .await
+    }
+
+    async fn command_with_seed(
+        &self,
+        command_id: CommandId,
+        command: SessionCommand,
+        seed: WorkspaceGrantSeed,
+    ) -> Result<AppliedCommand, SessionRuntimeError> {
         let store_id = self.store_id;
         self.call(Priority::Control, move |connection| {
-            execute_command(connection, store_id, command_id, command)
+            execute_command(connection, store_id, command_id, command, &seed)
+        })
+        .await
+    }
+
+    async fn workspace_path(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<String, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            connection
+                .query_row(
+                    "SELECT path FROM workspaces WHERE id = ?1",
+                    [workspace_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::WorkspaceNotFound)
+        })
+        .await
+    }
+
+    /// Persists and publishes the fate of one approve-for-workspace
+    /// promotion, after the fact and outside any command transaction.
+    async fn record_grant_promotion(
+        &self,
+        promotion: PendingGrantPromotion,
+        outcome: WorkspaceGrantOutcome,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        self.call(Priority::Output, move |connection| {
+            record_grant_promotion(connection, store_id, &promotion, outcome)
         })
         .await
     }
@@ -2410,6 +2563,22 @@ struct ClaimedRun {
 struct AppliedCommand {
     receipt: CommandReceipt,
     schedule: bool,
+    /// Set when a first-applied approve-for-workspace decision needs its
+    /// grant promoted into workspace configuration. Idempotent replays never
+    /// set it: retried commands must not re-run the config write.
+    promotion: Option<PendingGrantPromotion>,
+}
+
+/// One approve-for-workspace promotion carried out of the command
+/// transaction. The durable config write happens after the approval commits,
+/// so a promotion failure can never fail the approval that requested it.
+struct PendingGrantPromotion {
+    workspace_id: WorkspaceId,
+    workspace_path: String,
+    session_id: SessionId,
+    run_id: RunId,
+    command_id: CommandId,
+    grant: ApprovalGrant,
 }
 
 fn execute_command(
@@ -2417,6 +2586,7 @@ fn execute_command(
     store_id: StoreId,
     command_id: CommandId,
     command: SessionCommand,
+    seed: &WorkspaceGrantSeed,
 ) -> Result<AppliedCommand, SessionRuntimeError> {
     let request_json =
         serde_json::to_string(&command).map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2437,6 +2607,7 @@ fn execute_command(
         return Ok(AppliedCommand {
             receipt,
             schedule: false,
+            promotion: None,
         });
     }
     let command_count: u32 = connection
@@ -2450,6 +2621,7 @@ fn execute_command(
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let now = now_ms();
+    let mut promotion = None;
     let (receipt, schedule) = match command {
         SessionCommand::ResolveWorkspace { path } => {
             let path = path.trim();
@@ -2557,6 +2729,7 @@ fn execute_command(
                     ],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
+            insert_seed_grants(&transaction, session_id, seed, now)?;
             let summary = load_session_summary(&transaction, session_id)?;
             let event = append_event(
                 &transaction,
@@ -2848,10 +3021,15 @@ fn execute_command(
                     ApprovalDecision::ApproveForSession { .. } => {
                         ApprovalResolution::ApprovedForSession
                     }
+                    ApprovalDecision::ApproveForWorkspace { .. } => {
+                        ApprovalResolution::ApprovedForWorkspace
+                    }
                     ApprovalDecision::Deny => ApprovalResolution::Denied,
                 };
                 match &decision {
-                    ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveForSession { .. } => {
+                    ApprovalDecision::ApproveOnce
+                    | ApprovalDecision::ApproveForSession { .. }
+                    | ApprovalDecision::ApproveForWorkspace { .. } => {
                         transaction
                             .execute(
                                 "UPDATE tool_calls
@@ -2884,7 +3062,13 @@ fn execute_command(
                             .map_err(|_| SessionRuntimeError::Persistence)?;
                     }
                 }
-                if let ApprovalDecision::ApproveForSession { grant } = &decision {
+                // Approve-for-workspace records the same session grant as
+                // approve-for-session — the running session must proceed on
+                // it immediately — and additionally schedules the promotion
+                // below, outside this transaction.
+                if let ApprovalDecision::ApproveForSession { grant }
+                | ApprovalDecision::ApproveForWorkspace { grant } = &decision
+                {
                     let (kind, value) = match grant {
                         ApprovalGrant::Tool { name } => ("tool", name.trim()),
                         ApprovalGrant::ShellPrefix { prefix } => ("shell_prefix", prefix.trim()),
@@ -2910,6 +3094,23 @@ fn execute_command(
                             params![session_id.to_string(), kind, value, now],
                         )
                         .map_err(|_| SessionRuntimeError::Persistence)?;
+                }
+                if let ApprovalDecision::ApproveForWorkspace { grant } = &decision {
+                    let workspace_path: String = transaction
+                        .query_row(
+                            "SELECT path FROM workspaces WHERE id = ?1",
+                            [workspace_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    promotion = Some(PendingGrantPromotion {
+                        workspace_id,
+                        workspace_path,
+                        session_id,
+                        run_id,
+                        command_id,
+                        grant: grant.clone(),
+                    });
                 }
                 let tool_call = load_tool_call(&transaction, tool_call_id)?;
                 let event = append_event(
@@ -3165,7 +3366,11 @@ fn execute_command(
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(AppliedCommand { receipt, schedule })
+    Ok(AppliedCommand {
+        receipt,
+        schedule,
+        promotion,
+    })
 }
 
 fn claim_next_run(
@@ -3759,6 +3964,45 @@ fn record_session_file(
     Ok(())
 }
 
+/// Copies the workspace's effective config grants into the new session's
+/// grant set, inside the CreateSession transaction. From here on the gate
+/// consults only `session_grants`, so config-seeded and approve-for-session
+/// grants are indistinguishable. Malformed or excess entries are skipped
+/// rather than failing creation: the config layer already validated
+/// well-formed grants, and a clamped seed only means more prompting.
+fn insert_seed_grants(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    seed: &WorkspaceGrantSeed,
+    now: u64,
+) -> Result<(), SessionRuntimeError> {
+    let tools = seed.tools.iter().map(|value| ("tool", value));
+    let prefixes = seed
+        .shell_prefixes
+        .iter()
+        .map(|value| ("shell_prefix", value));
+    let mut remaining = MAX_SESSION_GRANTS;
+    for (kind, value) in tools.chain(prefixes) {
+        let value = value.trim();
+        if value.is_empty() || value.len() > MAX_GRANT_BYTES {
+            continue;
+        }
+        if remaining == 0 {
+            break;
+        }
+        remaining -= 1;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO session_grants(
+                     session_id, kind, value, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![session_id.to_string(), kind, value, now],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
 fn load_approval_policy(
     connection: &mut Connection,
     session_id: SessionId,
@@ -3917,9 +4161,9 @@ fn conclude_tool_approval(
         // A client resolution won the race; its transaction already
         // persisted the state change and published the event.
         return match parse_approval_resolution(&resolution)? {
-            ApprovalResolution::ApprovedOnce | ApprovalResolution::ApprovedForSession => {
-                Ok(ConcludedApproval::Approved)
-            }
+            ApprovalResolution::ApprovedOnce
+            | ApprovalResolution::ApprovedForSession
+            | ApprovalResolution::ApprovedForWorkspace => Ok(ConcludedApproval::Approved),
             ApprovalResolution::Denied | ApprovalResolution::DeniedTimeout => {
                 Ok(ConcludedApproval::Denied {
                     message: result.unwrap_or_else(|| approval::USER_DENIED_RESULT.to_owned()),
@@ -3969,6 +4213,44 @@ fn conclude_tool_approval(
         message: approval::TIMEOUT_DENIED_RESULT.to_owned(),
         event: Some(Box::new(event)),
     })
+}
+
+fn record_grant_promotion(
+    connection: &mut Connection,
+    store_id: StoreId,
+    promotion: &PendingGrantPromotion,
+    outcome: WorkspaceGrantOutcome,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let outcome = match outcome {
+        WorkspaceGrantOutcome::Failed { message } => WorkspaceGrantOutcome::Failed {
+            message: truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES),
+        },
+        outcome => outcome,
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    // Only the workspace's event log is touched: the promotion outcome stays
+    // publishable even when the session was deleted in the meantime.
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: promotion.workspace_id,
+            session_id: promotion.session_id,
+            run_id: Some(promotion.run_id),
+            caused_by: Some(promotion.command_id),
+            occurred_at_ms: now_ms(),
+        },
+        SessionEvent::WorkspaceGrantPromoted {
+            grant: promotion.grant.clone(),
+            outcome,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
 }
 
 fn ensure_context_capacity(
@@ -5621,6 +5903,7 @@ const fn approval_resolution_str(resolution: ApprovalResolution) -> &'static str
     match resolution {
         ApprovalResolution::ApprovedOnce => "approved_once",
         ApprovalResolution::ApprovedForSession => "approved_for_session",
+        ApprovalResolution::ApprovedForWorkspace => "approved_for_workspace",
         ApprovalResolution::Denied => "denied",
         ApprovalResolution::DeniedTimeout => "denied_timeout",
     }
@@ -5630,6 +5913,7 @@ fn parse_approval_resolution(value: &str) -> Result<ApprovalResolution, SessionR
     match value {
         "approved_once" => Ok(ApprovalResolution::ApprovedOnce),
         "approved_for_session" => Ok(ApprovalResolution::ApprovedForSession),
+        "approved_for_workspace" => Ok(ApprovalResolution::ApprovedForWorkspace),
         "denied" => Ok(ApprovalResolution::Denied),
         "denied_timeout" => Ok(ApprovalResolution::DeniedTimeout),
         _ => Err(SessionRuntimeError::Persistence),
@@ -6141,10 +6425,20 @@ mod tests {
         mode: ApprovalMode,
         runs: Vec<Vec<(&'static str, String)>>,
     ) -> ScriptedRunsHarness {
+        scripted_runs_harness_with_authority(mode, runs, None).await
+    }
+
+    async fn scripted_runs_harness_with_authority(
+        mode: ApprovalMode,
+        runs: Vec<Vec<(&'static str, String)>>,
+        grant_authority: Option<Arc<dyn WorkspaceGrantAuthority>>,
+    ) -> ScriptedRunsHarness {
         let directory = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.grant_authority = grant_authority;
         let runtime = SessionRuntime::open(
-            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            options,
             Arc::new(ScriptedRunsLoader {
                 requests: Arc::clone(&requests),
                 runs,
@@ -6225,6 +6519,18 @@ mod tests {
         tool_turns: usize,
         approval_timeout: Duration,
     ) -> ApprovalHarness {
+        approval_harness_with_authority(mode, tool, arguments, tool_turns, approval_timeout, None)
+            .await
+    }
+
+    async fn approval_harness_with_authority(
+        mode: ApprovalMode,
+        tool: &'static str,
+        arguments: &'static str,
+        tool_turns: usize,
+        approval_timeout: Duration,
+        grant_authority: Option<Arc<dyn WorkspaceGrantAuthority>>,
+    ) -> ApprovalHarness {
         let directory = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let runtime = SessionRuntime::open(
@@ -6232,6 +6538,7 @@ mod tests {
                 database_path: directory.path().join("sessions.sqlite3"),
                 max_active_runs: 1,
                 approval_timeout,
+                grant_authority,
             },
             Arc::new(ApprovalLoader {
                 requests: Arc::clone(&requests),
@@ -7267,6 +7574,7 @@ mod tests {
                 session_id,
                 prompt: "continue".to_owned(),
             },
+            &WorkspaceGrantSeed::default(),
         )
         .unwrap();
         assert!(matches!(
@@ -7357,6 +7665,7 @@ mod tests {
             store_id,
             CommandId::from_bytes([9; 16]),
             SessionCommand::CompactSession { session_id },
+            &WorkspaceGrantSeed::default(),
         )
         .unwrap();
         assert!(matches!(
@@ -8920,6 +9229,7 @@ mod tests {
                 database_path: directory.path().join("sessions.sqlite3"),
                 max_active_runs: 1,
                 approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+                grant_authority: None,
             },
             Arc::new(CapturingLoader {
                 requests: Arc::clone(&requests),
@@ -9152,6 +9462,7 @@ mod tests {
                 database_path: directory.path().join("sessions.sqlite3"),
                 max_active_runs: 1,
                 approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+                grant_authority: None,
             },
             Arc::new(CapturingLoader {
                 requests: Arc::clone(&requests),
@@ -9533,6 +9844,317 @@ mod tests {
                 outcome: RunOutcome::Completed,
                 ..
             }
+        ));
+    }
+
+    /// Scripted grant authority: hands every session a fixed seed and
+    /// answers promotions with a fixed outcome, recording every request.
+    struct ScriptedGrantAuthority {
+        seed: WorkspaceGrantSeed,
+        outcome: WorkspaceGrantOutcome,
+        seeded: StdMutex<Vec<PathBuf>>,
+        promotions: StdMutex<Vec<(PathBuf, ApprovalGrant)>>,
+    }
+
+    impl ScriptedGrantAuthority {
+        fn new(seed: WorkspaceGrantSeed, outcome: WorkspaceGrantOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                seed,
+                outcome,
+                seeded: StdMutex::new(Vec::new()),
+                promotions: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl WorkspaceGrantAuthority for ScriptedGrantAuthority {
+        fn seed_grants(&self, workspace: &Path) -> GrantSeedFuture {
+            self.seeded.lock().unwrap().push(workspace.to_owned());
+            Box::pin(std::future::ready(self.seed.clone()))
+        }
+
+        fn promote_grant(&self, workspace: &Path, grant: &ApprovalGrant) -> GrantPromotionFuture {
+            self.promotions
+                .lock()
+                .unwrap()
+                .push((workspace.to_owned(), grant.clone()));
+            Box::pin(std::future::ready(self.outcome.clone()))
+        }
+    }
+
+    /// The `workspace_grant_promoted` event for a responded approval. It is
+    /// published by a background task, so it may land before or after the
+    /// run's terminal event: check what was already collected, then poll.
+    async fn grant_promotion_event(
+        observed: &[SessionEventEnvelope],
+        events: &mut SessionEventStream,
+    ) -> SessionEventEnvelope {
+        if let Some(event) = observed
+            .iter()
+            .find(|event| matches!(event.event, SessionEvent::WorkspaceGrantPromoted { .. }))
+        {
+            return event.clone();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.next().await.unwrap().unwrap();
+                if matches!(event.event, SessionEvent::WorkspaceGrantPromoted { .. }) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_grants_seed_new_sessions_and_cover_calls_without_prompting() {
+        let authority = ScriptedGrantAuthority::new(
+            WorkspaceGrantSeed {
+                tools: vec!["mcp__notes__search".to_owned()],
+                shell_prefixes: vec!["cargo test".to_owned()],
+            },
+            WorkspaceGrantOutcome::Failed {
+                message: "unused".to_owned(),
+            },
+        );
+        let mut harness = scripted_runs_harness_with_authority(
+            ApprovalMode::Ask,
+            vec![vec![
+                (
+                    "__test_shell",
+                    r#"{"command":"cargo test -p qq-core"}"#.to_owned(),
+                ),
+                ("mcp__notes__search", "{}".to_owned()),
+            ]],
+            Some(authority.clone()),
+        )
+        .await;
+        submit_prompt(&harness, "run both granted tools").await;
+
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. })),
+            "config-seeded grants must cover both calls without prompting"
+        );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.name == "__test_shell"
+                    && tool_call.state == ToolCallState::Completed
+        )));
+        // The exact-name MCP grant passed the gate; with no registry attached
+        // the dispatch then fails, but the call was never held for approval.
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.name == "mcp__notes__search"
+        )));
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+        let seeded = authority.seeded.lock().unwrap();
+        assert_eq!(seeded.len(), 1, "one session creation resolves one seed");
+        assert_eq!(
+            seeded[0],
+            std::fs::canonicalize(&harness.workspace_path).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_for_workspace_records_the_session_grant_and_promotes_it() {
+        let authority = ScriptedGrantAuthority::new(
+            WorkspaceGrantSeed::default(),
+            WorkspaceGrantOutcome::Written {
+                path: "/w/.qq/config.ron".to_owned(),
+            },
+        );
+        let mut harness = approval_harness_with_authority(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            2,
+            DEFAULT_APPROVAL_TIMEOUT,
+            Some(authority.clone()),
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let command_id = CommandId::generate().unwrap();
+        let command = SessionCommand::RespondToolApproval {
+            run_id: harness.run_id,
+            tool_call_id: tool_call.id,
+            decision: ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        };
+        let receipt = harness
+            .runtime
+            .command(command_id, command.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            CommandOutcome::ToolApprovalResolved {
+                resolution: ApprovalResolution::ApprovedForWorkspace,
+                ..
+            }
+        ));
+
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. })),
+            "the recorded session grant must cover the second call"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    SessionEvent::ToolCallFinished { tool_call }
+                        if tool_call.state == ToolCallState::Completed
+                ))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+
+        let promoted = grant_promotion_event(&observed, &mut harness.events).await;
+        assert_eq!(promoted.caused_by, Some(command_id));
+        assert_eq!(promoted.run_id, Some(harness.run_id));
+        assert!(matches!(
+            &promoted.event,
+            SessionEvent::WorkspaceGrantPromoted {
+                grant: ApprovalGrant::Tool { name },
+                outcome: WorkspaceGrantOutcome::Written { path },
+            } if name == "__test_mutate" && path == "/w/.qq/config.ron"
+        ));
+        {
+            let promotions = authority.promotions.lock().unwrap();
+            assert_eq!(promotions.len(), 1);
+            assert_eq!(
+                promotions[0].0,
+                std::fs::canonicalize(harness._directory.path()).unwrap()
+            );
+        }
+
+        // Retrying the same command replays the durable receipt without
+        // re-running the promotion.
+        let retried = harness.runtime.command(command_id, command).await.unwrap();
+        assert_eq!(retried, receipt);
+        assert_eq!(authority.promotions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_grant_promotion_leaves_the_approval_standing() {
+        let authority = ScriptedGrantAuthority::new(
+            WorkspaceGrantSeed::default(),
+            WorkspaceGrantOutcome::Failed {
+                message: "denied by managed policy".to_owned(),
+            },
+        );
+        let mut harness = approval_harness_with_authority(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+            Some(authority),
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(
+            observed.iter().any(|event| matches!(
+                &event.event,
+                SessionEvent::ToolCallFinished { tool_call }
+                    if tool_call.state == ToolCallState::Completed
+            )),
+            "the approved call must execute despite the failed promotion"
+        );
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+        let promoted = grant_promotion_event(&observed, &mut harness.events).await;
+        assert!(matches!(
+            &promoted.event,
+            SessionEvent::WorkspaceGrantPromoted {
+                outcome: WorkspaceGrantOutcome::Failed { message },
+                ..
+            } if message == "denied by managed policy"
+        ));
+    }
+
+    #[tokio::test]
+    async fn approve_for_workspace_without_an_authority_reports_a_failed_promotion() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let observed = collect_through_finished(&mut harness.events).await;
+        assert!(matches!(
+            &observed.last().unwrap().event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
+        let promoted = grant_promotion_event(&observed, &mut harness.events).await;
+        assert!(matches!(
+            &promoted.event,
+            SessionEvent::WorkspaceGrantPromoted {
+                outcome: WorkspaceGrantOutcome::Failed { message },
+                ..
+            } if message.contains("no workspace grant store")
         ));
     }
 

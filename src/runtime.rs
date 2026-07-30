@@ -2,18 +2,19 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use qq_core::{
-    LoadedRuntime, Runtime, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture,
-    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
-    SessionRuntimeOptions,
+    GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, Runtime, RuntimeConfigError,
+    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
+    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, WorkspaceGrantAuthority,
+    WorkspaceGrantSeed,
 };
 use qq_protocol::{
-    CommandRequest, ModelCatalogRequest, ModelDescriptor, RunFailureKind, SnapshotRequest,
-    SubscribeRequest,
+    ApprovalGrant, CommandRequest, ModelCatalogRequest, ModelDescriptor, RunFailureKind,
+    SnapshotRequest, SubscribeRequest, WorkspaceGrantOutcome,
 };
 use qq_provider::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderError,
@@ -27,7 +28,8 @@ use crate::{
     catalog::{DiscoveredModel, ModelDiscovery},
     config::{
         AwsAuth, BedrockAuth, ConfigError, ConfigLoader, ConfigSnapshot, EndpointMode, HttpAccess,
-        HttpCredential, LoadRequest, ProviderAccess, ProviderApi, ProviderAuth, ProviderConfig,
+        HttpCredential, LoadRequest, PromotionOutcome, ProviderAccess, ProviderApi, ProviderAuth,
+        ProviderConfig, WorkspaceGrant,
     },
     providers,
     server::{AskHandler, AskHandlerError, CommandFuture, ModelsFuture, SnapshotFuture},
@@ -743,6 +745,64 @@ impl RuntimeLoader for RuntimeFactory {
     }
 }
 
+impl WorkspaceGrantAuthority for RuntimeFactory {
+    fn seed_grants(&self, workspace: &Path) -> GrantSeedFuture {
+        let factory = self.clone();
+        let workspace = workspace.to_owned();
+        Box::pin(async move {
+            let seed = tokio::task::spawn_blocking(move || {
+                let load = LoadRequest::from_process_env(&workspace, None).ok()?;
+                let snapshot = factory.load(&load).ok()?;
+                let grants = snapshot.grants();
+                Some(WorkspaceGrantSeed {
+                    tools: grants.tools().to_vec(),
+                    shell_prefixes: grants.shell_prefixes().to_vec(),
+                })
+            })
+            .await;
+            // A configuration that fails to load seeds nothing: the session
+            // is still created, and the next run surfaces the configuration
+            // error through the ordinary run-failure path.
+            seed.ok().flatten().unwrap_or_default()
+        })
+    }
+
+    fn promote_grant(&self, workspace: &Path, grant: &ApprovalGrant) -> GrantPromotionFuture {
+        let factory = self.clone();
+        let workspace = workspace.to_owned();
+        let grant = match grant {
+            ApprovalGrant::Tool { name } => WorkspaceGrant::Tool(name.clone()),
+            ApprovalGrant::ShellPrefix { prefix } => WorkspaceGrant::ShellPrefix(prefix.clone()),
+        };
+        Box::pin(async move {
+            let written = tokio::task::spawn_blocking(move || {
+                factory
+                    .inner
+                    .config
+                    .promote_workspace_grant(&workspace, &grant)
+            })
+            .await;
+            match written {
+                Ok(Ok(promotion)) => {
+                    let path = promotion.path().display().to_string();
+                    match promotion.outcome() {
+                        PromotionOutcome::Added => WorkspaceGrantOutcome::Written { path },
+                        PromotionOutcome::AlreadyPresent => {
+                            WorkspaceGrantOutcome::AlreadyPresent { path }
+                        }
+                    }
+                }
+                Ok(Err(error)) => WorkspaceGrantOutcome::Failed {
+                    message: error.to_string(),
+                },
+                Err(_) => WorkspaceGrantOutcome::Failed {
+                    message: "the workspace grant write stopped unexpectedly".to_owned(),
+                },
+            }
+        })
+    }
+}
+
 fn promote_cached_runtime(
     cache: &mut VecDeque<(RuntimeKey, Arc<Runtime>)>,
     key: &RuntimeKey,
@@ -836,11 +896,13 @@ pub struct RuntimeHandler {
 impl RuntimeHandler {
     pub async fn open(factory: RuntimeFactory) -> Result<Self, RuntimeHandlerError> {
         let database_path = factory.inner.config.session_database_path()?;
-        let durable = SessionRuntime::open(
-            SessionRuntimeOptions::new(database_path),
-            Arc::new(factory.clone()),
-        )
-        .await?;
+        // The factory is both the runtime loader and the workspace grant
+        // authority: config grants seed each new session's grant set, and
+        // approve-for-workspace promotions write back through the loader's
+        // configuration layer.
+        let options = SessionRuntimeOptions::new(database_path)
+            .with_grant_authority(Arc::new(factory.clone()));
+        let durable = SessionRuntime::open(options, Arc::new(factory.clone())).await?;
         Ok(Self { durable, factory })
     }
 }
@@ -1176,6 +1238,72 @@ mod tests {
         let fixture = RuntimeFixture::new();
 
         drop(fixture.factory());
+    }
+
+    #[tokio::test]
+    async fn grant_authority_seeds_effective_grants_and_promotes_new_ones() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Trust state lives under the data directory, which the loader
+            // requires to be private.
+            fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::create_dir_all(fixture.path("work/.qq")).unwrap();
+        fs::write(
+            fixture.path("work/.qq/config.ron"),
+            "(\n    version: 1,\n    model: \"openai/gpt-5.6\",\n    policy: (\n        allow_shell_prefixes: [\"cargo test\"],\n    ),\n)\n",
+        )
+        .unwrap();
+        let workspace = fs::canonicalize(fixture.path("work")).unwrap();
+
+        // Untrusted workspace grant declarations seed nothing: the trust
+        // flow gates them exactly as it gates every sensitive declaration.
+        let seed = WorkspaceGrantAuthority::seed_grants(&factory, &workspace).await;
+        assert!(seed.is_empty());
+
+        let request = LoadRequest::from_process_env(&workspace, None).unwrap();
+        factory.inner.config.grant_pending_trust(&request).unwrap();
+        let seed = WorkspaceGrantAuthority::seed_grants(&factory, &workspace).await;
+        assert_eq!(seed.shell_prefixes, ["cargo test"]);
+
+        // Promotion writes the grant durably and reports the file; repeating
+        // it is idempotent, and the next seed carries the promoted grant.
+        let grant = qq_protocol::ApprovalGrant::Tool {
+            name: "edit_file".to_owned(),
+        };
+        let outcome = WorkspaceGrantAuthority::promote_grant(&factory, &workspace, &grant).await;
+        let WorkspaceGrantOutcome::Written { path } = outcome else {
+            panic!("expected a written promotion, got {outcome:?}")
+        };
+        assert!(path.ends_with("config.ron"), "{path}");
+        assert!(
+            fs::read_to_string(fixture.path("work/.qq/config.ron"))
+                .unwrap()
+                .contains("edit_file")
+        );
+        let outcome = WorkspaceGrantAuthority::promote_grant(&factory, &workspace, &grant).await;
+        assert!(matches!(
+            outcome,
+            WorkspaceGrantOutcome::AlreadyPresent { .. }
+        ));
+        let seed = WorkspaceGrantAuthority::seed_grants(&factory, &workspace).await;
+        assert_eq!(seed.tools, ["edit_file"]);
+        assert_eq!(seed.shell_prefixes, ["cargo test"]);
+
+        // A managed deny refuses the promotion; the failure is data.
+        fs::write(
+            fixture.path("managed/managed.ron"),
+            r#"(version: 1, policy: (deny_tools: ["mcp__executor__execute"]))"#,
+        )
+        .unwrap();
+        let denied = qq_protocol::ApprovalGrant::Tool {
+            name: "mcp__executor__execute".to_owned(),
+        };
+        let outcome = WorkspaceGrantAuthority::promote_grant(&factory, &workspace, &denied).await;
+        assert!(matches!(outcome, WorkspaceGrantOutcome::Failed { .. }));
     }
 
     #[test]

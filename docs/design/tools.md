@@ -442,7 +442,8 @@ Flow: when policy requires approval, the runtime persists and publishes
 `ToolApprovalRequested` and the run stays active but waiting — it holds its
 run permit, other sessions are unaffected, and cancellation still works. A
 client responds with an idempotent `RespondToolApproval` command
-(approve once, approve-and-allowlist for the session, or deny). Denials are
+(approve once, approve-and-allowlist for the session, approve-and-promote
+for the workspace, or deny). Denials are
 returned to the model as tool errors, not run failures, so the agent can take
 another path. Non-interactive automation chooses its policy up front via
 flags; a headless run with `ask` semantics and no attached client fails the

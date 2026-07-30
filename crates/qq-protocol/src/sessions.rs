@@ -145,7 +145,16 @@ pub enum ApprovalMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApprovalDecision {
     ApproveOnce,
-    ApproveForSession { grant: ApprovalGrant },
+    ApproveForSession {
+        grant: ApprovalGrant,
+    },
+    /// Approve like `ApproveForSession` and additionally request that the
+    /// grant be promoted into the workspace configuration. The promotion's
+    /// fate arrives later as a `workspace_grant_promoted` event; a failed
+    /// promotion never fails the approval.
+    ApproveForWorkspace {
+        grant: ApprovalGrant,
+    },
     Deny,
 }
 
@@ -163,8 +172,26 @@ pub enum ApprovalGrant {
 pub enum ApprovalResolution {
     ApprovedOnce,
     ApprovedForSession,
+    /// Approved with a session grant plus a requested promotion into the
+    /// workspace configuration.
+    ApprovedForWorkspace,
     Denied,
     DeniedTimeout,
+}
+
+/// The durable fate of one workspace-lifetime grant promotion, carried by
+/// `workspace_grant_promoted`. Failures are informational: the session grant
+/// recorded by the approval stands regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceGrantOutcome {
+    /// The grant was appended to the workspace configuration file.
+    Written { path: String },
+    /// The configuration file already declared the grant; nothing changed.
+    AlreadyPresent { path: String },
+    /// The grant could not be persisted (managed deny, IO error, or a server
+    /// without a workspace grant store).
+    Failed { message: String },
 }
 
 /// Shell details carried by an approval request so clients can decide in place.
@@ -573,6 +600,15 @@ pub enum SessionEvent {
         tool_call: ToolCallSnapshot,
         resolution: ApprovalResolution,
     },
+    /// The follow-through of an approve-for-workspace decision: the attempt
+    /// to persist the grant into the workspace configuration finished.
+    /// Published after `tool_approval_resolved`, from outside the approval's
+    /// transaction, so a failed write can never fail the approval. A
+    /// `failed` outcome is informational only — the session grant stands.
+    WorkspaceGrantPromoted {
+        grant: ApprovalGrant,
+        outcome: WorkspaceGrantOutcome,
+    },
     ToolCallStarted {
         tool_call: ToolCallSnapshot,
     },
@@ -875,6 +911,100 @@ mod tests {
             serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
             outcome
         );
+    }
+
+    #[test]
+    fn workspace_grant_decisions_and_promotions_round_trip_on_the_wire() {
+        let command = SessionCommand::RespondToolApproval {
+            run_id: id(4),
+            tool_call_id: id(7),
+            decision: ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "mcp__github__create_issue".to_owned(),
+                },
+            },
+        };
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded["decision"]["type"], "approve_for_workspace");
+        assert_eq!(encoded["decision"]["grant"]["type"], "tool");
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            command
+        );
+
+        let resolution = serde_json::to_value(ApprovalResolution::ApprovedForWorkspace).unwrap();
+        assert_eq!(resolution, "approved_for_workspace");
+
+        for (outcome, tag, field, value) in [
+            (
+                WorkspaceGrantOutcome::Written {
+                    path: "/repo/.qq/config.ron".to_owned(),
+                },
+                "written",
+                "path",
+                "/repo/.qq/config.ron",
+            ),
+            (
+                WorkspaceGrantOutcome::AlreadyPresent {
+                    path: "/repo/.qq/config.ron".to_owned(),
+                },
+                "already_present",
+                "path",
+                "/repo/.qq/config.ron",
+            ),
+            (
+                WorkspaceGrantOutcome::Failed {
+                    message: "denied by managed policy".to_owned(),
+                },
+                "failed",
+                "message",
+                "denied by managed policy",
+            ),
+        ] {
+            let event = SessionEvent::WorkspaceGrantPromoted {
+                grant: ApprovalGrant::ShellPrefix {
+                    prefix: "cargo test".to_owned(),
+                },
+                outcome,
+            };
+            let encoded = serde_json::to_value(&event).unwrap();
+            assert_eq!(encoded["type"], "workspace_grant_promoted");
+            assert_eq!(encoded["grant"]["type"], "shell_prefix");
+            assert_eq!(encoded["outcome"]["type"], tag);
+            assert_eq!(encoded["outcome"][field], value);
+            assert_eq!(
+                serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+                event
+            );
+        }
+
+        // Version-3 decision payloads still decode unchanged.
+        for (legacy, expected) in [
+            (
+                serde_json::json!({ "type": "approve_once" }),
+                ApprovalDecision::ApproveOnce,
+            ),
+            (
+                serde_json::json!({
+                    "type": "approve_for_session",
+                    "grant": { "type": "shell_prefix", "prefix": "git status" },
+                }),
+                ApprovalDecision::ApproveForSession {
+                    grant: ApprovalGrant::ShellPrefix {
+                        prefix: "git status".to_owned(),
+                    },
+                },
+            ),
+            (
+                serde_json::json!({ "type": "deny" }),
+                ApprovalDecision::Deny,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ApprovalDecision>(legacy).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use qq_protocol::{
     CommandRequest, EditPreview, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection,
     RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
     SessionStatus, SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot, ToolCallState,
-    WorkspaceId, WorkspaceSnapshot,
+    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -326,6 +326,9 @@ impl App {
                                     ApprovalResolution::ApprovedOnce => "tool call approved",
                                     ApprovalResolution::ApprovedForSession => {
                                         "tool call approved for this session"
+                                    }
+                                    ApprovalResolution::ApprovedForWorkspace => {
+                                        "tool call approved for this workspace"
                                     }
                                     ApprovalResolution::Denied => "tool call denied",
                                     ApprovalResolution::DeniedTimeout => {
@@ -680,6 +683,21 @@ impl App {
                     self.live_tool_output.remove(&tool_call.id);
                 }
                 self.upsert_tool_call(tool_call.clone());
+            }
+            // The follow-through of an approve-for-workspace decision. A
+            // failure is informational: the session grant already stands.
+            SessionEvent::WorkspaceGrantPromoted { outcome, .. } => {
+                self.status = Some(match outcome {
+                    WorkspaceGrantOutcome::Written { path } => {
+                        format!("grant written to {path}")
+                    }
+                    WorkspaceGrantOutcome::AlreadyPresent { path } => {
+                        format!("grant already present in {path}")
+                    }
+                    WorkspaceGrantOutcome::Failed { message } => {
+                        format!("workspace grant not saved: {message}")
+                    }
+                });
             }
             SessionEvent::SessionCompacted {
                 session,
@@ -1755,6 +1773,7 @@ impl App {
         match key.code {
             KeyCode::Char('y' | 'Y') => self.respond_to_approval(ApprovalChoice::Once),
             KeyCode::Char('a' | 'A') => self.respond_to_approval(ApprovalChoice::Session),
+            KeyCode::Char('w' | 'W') => self.respond_to_approval(ApprovalChoice::Workspace),
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 self.respond_to_approval(ApprovalChoice::Deny)
             }
@@ -1771,6 +1790,9 @@ impl App {
         let decision = match choice {
             ApprovalChoice::Once => ApprovalDecision::ApproveOnce,
             ApprovalChoice::Session => ApprovalDecision::ApproveForSession {
+                grant: approval_grant(tool_call),
+            },
+            ApprovalChoice::Workspace => ApprovalDecision::ApproveForWorkspace {
                 grant: approval_grant(tool_call),
             },
             ApprovalChoice::Deny => ApprovalDecision::Deny,
@@ -1964,6 +1986,7 @@ impl App {
 enum ApprovalChoice {
     Once,
     Session,
+    Workspace,
     Deny,
 }
 
@@ -2311,6 +2334,82 @@ mod tests {
                 ..
             } if prefix == "cargo test --workspace"
         ));
+    }
+
+    #[test]
+    fn approve_for_workspace_sends_the_decision_and_surfaces_the_promotion() {
+        let mut app = App::new(TuiOptions::default());
+        let initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        let workspace_id = initial.workspace.id;
+        let store_id = initial.cursor.store_id;
+        app.apply_snapshot(initial);
+        app.upsert_tool_call(ToolCallSnapshot {
+            id: id(8, ToolCallId::from_bytes),
+            session_id,
+            run_id: id(4, RunId::from_bytes),
+            turn_ordinal: 1,
+            call_ordinal: 1,
+            provider_call_id: "call_0".to_owned(),
+            name: "shell".to_owned(),
+            arguments: r#"{"command":"cargo test --workspace"}"#.to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+            display: None,
+        });
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
+            panic!("expected a command")
+        };
+        assert!(matches!(
+            request.command,
+            SessionCommand::RespondToolApproval {
+                decision: ApprovalDecision::ApproveForWorkspace {
+                    grant: ApprovalGrant::ShellPrefix { prefix },
+                },
+                ..
+            } if prefix == "cargo test --workspace"
+        ));
+
+        let envelope = |sequence, outcome| SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence,
+            },
+            session_id,
+            run_id: Some(id(4, RunId::from_bytes)),
+            caused_by: Some(request.command_id),
+            occurred_at_ms: sequence,
+            event: SessionEvent::WorkspaceGrantPromoted {
+                grant: ApprovalGrant::ShellPrefix {
+                    prefix: "cargo test --workspace".to_owned(),
+                },
+                outcome,
+            },
+        };
+        app.apply_live_event(envelope(
+            2,
+            WorkspaceGrantOutcome::Written {
+                path: "/repo/.qq/config.ron".to_owned(),
+            },
+        ));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("grant written to /repo/.qq/config.ron")
+        );
+        app.apply_live_event(envelope(
+            3,
+            WorkspaceGrantOutcome::Failed {
+                message: "denied by managed policy".to_owned(),
+            },
+        ));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("workspace grant not saved: denied by managed policy")
+        );
     }
 
     #[test]
