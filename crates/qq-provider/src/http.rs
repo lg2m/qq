@@ -2,7 +2,7 @@
     not(test),
     allow(
         dead_code,
-        reason = "the exchange seam is consumed beginning in migration stage 4"
+        reason = "exchange compatibility helpers remain until HTTP adapter migrations finish"
     )
 )]
 
@@ -24,6 +24,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ERROR_BODY_BYTES_LIMIT: usize = 16 * 1_024;
 
+#[derive(Clone)]
 pub(crate) struct HttpExchange {
     client: reqwest::Client,
     authorizer: RequestAuthorizer,
@@ -64,6 +65,14 @@ impl HttpExchange {
             authorizer,
             redactions,
         }
+    }
+
+    pub(crate) fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
+        self.client.request(method, url)
+    }
+
+    pub(crate) fn static_redactions(&self) -> &[String] {
+        &self.redactions
     }
 
     pub(crate) async fn execute(
@@ -190,8 +199,11 @@ pub(crate) fn transport_error(error: reqwest::Error, redactions: &[String]) -> P
 }
 
 pub(crate) fn is_event_stream(response: &reqwest::Response) -> bool {
-    response
-        .headers()
+    is_event_stream_headers(response.headers())
+}
+
+pub(crate) fn is_event_stream_headers(headers: &HeaderMap) -> bool {
+    headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {

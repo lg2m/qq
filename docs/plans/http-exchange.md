@@ -1,6 +1,6 @@
 # Deepen HTTP Exchange Execution
 
-Status: in progress. Stages 1 through 3 are complete.
+Status: in progress. Stages 1 through 4 are complete.
 
 ## Goal
 
@@ -189,11 +189,17 @@ all headers generic configuration.
    stream. Localhost tests cover status splitting, narrow metadata, exact and
    over-limit streaming, bounded rejection bodies, request-time bearer
    authorization, deterministic redaction normalization, and dynamic credential
-   redaction on body-read failures. The seam is temporarily allowed as dead code
-   in non-test builds until Chat Completions consumes it in stage 4.
-4. **Migrate Chat Completions.** It is the simplest full path with a request
-   authorizer. Delete its local send/status code, wire counter, and direct error
-   body read after contract tests pass.
+   redaction on body-read failures. A temporary non-test dead-code allowance
+   remains for compatibility helpers until the remaining HTTP adapter
+   migrations finish.
+4. **Migrate Chat Completions. Complete.** Chat Completions now owns an
+   `HttpExchange` and sends built requests through `HttpExchange::execute`.
+   Success metadata remains adapter-validated, while successful body reads use
+   the exchange's wire-limited stream and non-success responses use bounded
+   `HttpRejection` bytes for the existing OpenAI-compatible error decoding.
+   Removed the adapter's direct authorization/send/status handling, direct
+   error-body read, body-read transport mapping, and local wire counter while
+   preserving request shape, redaction, and provider-specific diagnostics.
 5. **Migrate Anthropic and Google.** Google currently uses `send()` and no
    request-time authorizer; use the default authorizer so both still traverse
    the same exchange. Preserve their error envelopes and protocol-owned header
