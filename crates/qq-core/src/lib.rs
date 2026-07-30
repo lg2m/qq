@@ -17,7 +17,8 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
 use qq_protocol::{
-    ApprovalMode, RunActivity, RunCommand, RunEvent, RunFailureKind, TokenUsage, ToolCallId,
+    ApprovalMode, ReasoningKind, RunActivity, RunCommand, RunEvent, RunFailureKind, TokenUsage,
+    ToolCallId,
 };
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
@@ -39,13 +40,15 @@ pub use sessions::{
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
 type RuntimeStream = Pin<Box<dyn Stream<Item = RuntimeEvent> + Send + 'static>>;
 
-const MAX_MODEL_TURNS: u16 = 32;
 const MAX_TOOL_CALLS_PER_TURN: usize = 16;
 const MAX_TOOL_CALLS_PER_RUN: usize = 64;
+// Leave room for the final answer after the last permitted tool call.
+const MAX_MODEL_TURNS: u16 = MAX_TOOL_CALLS_PER_RUN as u16 + 1;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_TOOL_CALL_ID_BYTES: usize = 1_024;
 const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_RUN_MODEL_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RUN_REASONING_BYTES: usize = 1024 * 1024;
 const MAX_PARALLEL_READS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +56,16 @@ enum RuntimeEvent {
     Started,
     ActivityChanged {
         activity: RunActivity,
+    },
+    ReasoningStarted {
+        kind: ReasoningKind,
+    },
+    ReasoningDelta {
+        kind: ReasoningKind,
+        text: String,
+    },
+    ReasoningCompleted {
+        kind: ReasoningKind,
     },
     OutputTextDelta {
         text: String,
@@ -272,6 +285,15 @@ impl Runtime {
                     RuntimeEvent::ActivityChanged { activity } => {
                         yield RunEvent::ActivityChanged { activity };
                     }
+                    RuntimeEvent::ReasoningStarted { kind } => {
+                        yield RunEvent::ReasoningStarted { kind };
+                    }
+                    RuntimeEvent::ReasoningDelta { kind, text } => {
+                        yield RunEvent::ReasoningDelta { kind, text };
+                    }
+                    RuntimeEvent::ReasoningCompleted { kind } => {
+                        yield RunEvent::ReasoningCompleted { kind };
+                    }
                     RuntimeEvent::OutputTextDelta { text } => {
                         yield RunEvent::OutputTextDelta { text };
                     }
@@ -308,6 +330,9 @@ impl Runtime {
                 match event {
                     RuntimeEvent::Started => yield RunEvent::Started,
                     RuntimeEvent::ActivityChanged { activity } => yield RunEvent::ActivityChanged { activity },
+                    RuntimeEvent::ReasoningStarted { kind } => yield RunEvent::ReasoningStarted { kind },
+                    RuntimeEvent::ReasoningDelta { kind, text } => yield RunEvent::ReasoningDelta { kind, text },
+                    RuntimeEvent::ReasoningCompleted { kind } => yield RunEvent::ReasoningCompleted { kind },
                     RuntimeEvent::OutputTextDelta { text } => yield RunEvent::OutputTextDelta { text },
                     RuntimeEvent::RefusalDelta { text } => yield RunEvent::RefusalDelta { text },
                     RuntimeEvent::AssistantTurnCompleted { usage: Some(usage), .. } => {
@@ -454,9 +479,60 @@ impl Runtime {
                 let mut blocks = Vec::<TurnBlock>::new();
                 let mut terminal_usage = None;
                 let mut completed = false;
+                let mut reasoning_bytes = 0_usize;
+                let mut open_reasoning = None;
 
                 while let Some(event) = provider_events.next().await {
                     match event {
+                        Ok(ProviderEvent::ReasoningStarted { kind }) => {
+                            let kind: ReasoningKind = kind.into();
+                            if open_reasoning.is_some() {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: "provider started a reasoning block before completing the previous block".to_owned(),
+                                };
+                                return;
+                            }
+                            open_reasoning = Some(kind);
+                            if activity != RunActivity::Reasoning {
+                                activity = RunActivity::Reasoning;
+                                yield RuntimeEvent::ActivityChanged { activity };
+                            }
+                            yield RuntimeEvent::ReasoningStarted { kind };
+                        }
+                        Ok(ProviderEvent::ReasoningDelta { kind, text }) => {
+                            let kind: ReasoningKind = kind.into();
+                            if open_reasoning != Some(kind) {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: "provider streamed reasoning outside its matching block".to_owned(),
+                                };
+                                return;
+                            }
+                            if reasoning_bytes.saturating_add(text.len()) > MAX_RUN_REASONING_BYTES {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::Policy,
+                                    message: "displayable reasoning exceeded the 1 MiB per-run limit".to_owned(),
+                                };
+                                return;
+                            }
+                            reasoning_bytes += text.len();
+                            if !text.is_empty() {
+                                yield RuntimeEvent::ReasoningDelta { kind, text };
+                            }
+                        }
+                        Ok(ProviderEvent::ReasoningCompleted { kind }) => {
+                            let kind: ReasoningKind = kind.into();
+                            if open_reasoning != Some(kind) {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: "provider completed an unknown reasoning block".to_owned(),
+                                };
+                                return;
+                            }
+                            open_reasoning = None;
+                            yield RuntimeEvent::ReasoningCompleted { kind };
+                        }
                         Ok(ProviderEvent::OutputTextDelta { text }) => {
                             if activity != RunActivity::GeneratingResponse {
                                 activity = RunActivity::GeneratingResponse;
@@ -605,6 +681,13 @@ impl Runtime {
                             call.completed = true;
                         }
                         Ok(ProviderEvent::Completed { usage }) => {
+                            if open_reasoning.is_some() {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: "provider completed the turn with an unfinished reasoning block".to_owned(),
+                                };
+                                return;
+                            }
                             if let Some(call) = pending_calls.iter().find(|call| !call.completed) {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,
@@ -1959,6 +2042,49 @@ mod tests {
             })
         ));
 
+        struct FiniteToolTurns {
+            turn: Mutex<usize>,
+        }
+
+        impl Provider for FiniteToolTurns {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                if current == MAX_TOOL_CALLS_PER_RUN {
+                    return Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]));
+                }
+                let id = format!("call-{current}");
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "unknown".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: "{}".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted { id }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+
+        let runtime = Runtime::new(
+            FiniteToolTurns {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(events.last(), Some(&RunEvent::Completed));
+
         struct EndlessToolTurns {
             turn: Mutex<usize>,
         }
@@ -2001,7 +2127,7 @@ mod tests {
             Some(RunEvent::Failed {
                 kind: RunFailureKind::Policy,
                 message,
-            }) if message.contains("model turns")
+            }) if message.contains("64 calls")
         ));
     }
 

@@ -10,6 +10,7 @@ mod ids;
 mod sessions;
 
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
+pub use qq_reasoning::{ReasoningEvent, ReasoningKind};
 pub use sessions::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandOutcome,
     CommandReceipt, CommandRequest, CursorError, EditPreview, EventCursor, MessageRole,
@@ -50,6 +51,16 @@ pub enum RunEvent {
     Started,
     ActivityChanged {
         activity: RunActivity,
+    },
+    ReasoningStarted {
+        kind: ReasoningKind,
+    },
+    ReasoningDelta {
+        kind: ReasoningKind,
+        text: String,
+    },
+    ReasoningCompleted {
+        kind: ReasoningKind,
     },
     OutputTextDelta {
         text: String,

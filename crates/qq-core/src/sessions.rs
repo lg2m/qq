@@ -18,12 +18,12 @@ use futures_util::StreamExt;
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
     CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole, MessageSnapshot,
-    MessageState, ModelPricing, ModelSelection, RunActivity, RunFailure, RunFailureKind, RunId,
-    RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent, SessionEventEnvelope,
-    SessionId, SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview,
-    SnapshotRequest, StoreId, SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay,
-    ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome, WorkspaceId,
-    WorkspaceSnapshot, WorkspaceSummary,
+    MessageState, ModelPricing, ModelSelection, ReasoningEvent, RunActivity, RunFailure,
+    RunFailureKind, RunId, RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent,
+    SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
+    ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest, TextChannel, TokenUsage,
+    ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome,
+    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -1143,6 +1143,69 @@ async fn execute_run(
                     }
                 }
             }
+            RunInput::Event(Some(RuntimeEvent::ReasoningStarted { kind })) => {
+                if internal {
+                    continue;
+                }
+                match inner
+                    .store
+                    .append_reasoning(&claimed, ReasoningEvent::Started { kind })
+                    .await
+                {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist reasoning", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            RunInput::Event(Some(RuntimeEvent::ReasoningDelta { kind, text })) => {
+                if internal || text.is_empty() {
+                    continue;
+                }
+                match inner
+                    .store
+                    .append_reasoning(&claimed, ReasoningEvent::Delta { kind, text })
+                    .await
+                {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist reasoning", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            RunInput::Event(Some(RuntimeEvent::ReasoningCompleted { kind })) => {
+                if internal {
+                    continue;
+                }
+                match inner
+                    .store
+                    .append_reasoning(&claimed, ReasoningEvent::Completed { kind })
+                    .await
+                {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist reasoning", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             RunInput::Event(Some(RuntimeEvent::AssistantTurnCompleted {
                 turn_ordinal,
                 message,
@@ -2159,6 +2222,19 @@ impl Store {
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
             append_run_activity(connection, store_id, &claimed, activity)
+        })
+        .await
+    }
+
+    async fn append_reasoning(
+        &self,
+        claimed: &ClaimedRun,
+        reasoning: ReasoningEvent,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            append_reasoning(connection, store_id, &claimed, reasoning)
         })
         .await
     }
@@ -4469,6 +4545,59 @@ fn append_run_activity(
             run_id: claimed.run_id,
             activity,
         },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+fn append_reasoning(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    reasoning: ReasoningEvent,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let running = transaction
+        .query_row(
+            "SELECT 1 FROM runs WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
+            params![claimed.run_id.to_string(), claimed.session_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if running.is_none() {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let event = match reasoning {
+        ReasoningEvent::Started { kind } => SessionEvent::ReasoningStarted {
+            run_id: claimed.run_id,
+            kind,
+        },
+        ReasoningEvent::Delta { kind, text } => SessionEvent::ReasoningDelta {
+            run_id: claimed.run_id,
+            kind,
+            text,
+        },
+        ReasoningEvent::Completed { kind } => SessionEvent::ReasoningCompleted {
+            run_id: claimed.run_id,
+            kind,
+        },
+    };
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now_ms(),
+        },
+        event,
     )?;
     transaction
         .commit()

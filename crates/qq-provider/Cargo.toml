@@ -19,6 +19,7 @@ bytes.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 http-body.workspace = true
+qq-reasoning.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

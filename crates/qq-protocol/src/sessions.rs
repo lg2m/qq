@@ -3,7 +3,8 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CommandId, MessageId, RunFailureKind, RunId, SessionId, StoreId, ToolCallId, WorkspaceId,
+    CommandId, MessageId, ReasoningKind, RunFailureKind, RunId, SessionId, StoreId, ToolCallId,
+    WorkspaceId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +354,8 @@ pub enum RunActivity {
     /// The request is being assembled or QQ is waiting for the provider's
     /// first meaningful stream event.
     WaitingForProvider,
+    /// The provider is streaming displayable reasoning or a reasoning summary.
+    Reasoning,
     /// The provider is streaming user-visible assistant text.
     GeneratingResponse,
     /// The provider is constructing one or more tool calls. Arguments may be
@@ -596,6 +599,22 @@ pub enum SessionEvent {
     RunActivityChanged {
         run_id: RunId,
         activity: RunActivity,
+    },
+    /// A displayable reasoning block began. This is not assistant transcript
+    /// content and must not be fed back into model context implicitly.
+    ReasoningStarted {
+        run_id: RunId,
+        kind: ReasoningKind,
+    },
+    /// A bounded chunk of provider-exposed reasoning text.
+    ReasoningDelta {
+        run_id: RunId,
+        kind: ReasoningKind,
+        text: String,
+    },
+    ReasoningCompleted {
+        run_id: RunId,
+        kind: ReasoningKind,
     },
     AssistantMessageStarted {
         message: MessageSnapshot,

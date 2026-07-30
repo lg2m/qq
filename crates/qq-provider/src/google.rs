@@ -182,6 +182,7 @@ impl Provider for GoogleGenerateContent {
                 "Google GenerateContent stream exceeded the configured wire size limit",
             );
             let mut usage = None;
+            let mut reasoning_open = false;
             // Gemini assigns no tool-call ids; a per-stream ordinal keeps the
             // synthesized ids deterministic.
             let mut tool_call_ordinal = 0_u64;
@@ -195,8 +196,27 @@ impl Provider for GoogleGenerateContent {
                     for event in decode_event(&frame.data, &mut tool_call_ordinal, redactions.as_ref())? {
                         match event {
                             DecodedEvent::OutputText(text) => {
+                                if reasoning_open {
+                                    yield ProviderEvent::ReasoningCompleted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                    reasoning_open = false;
+                                }
                                 output_bytes.add(text.len())?;
                                 yield ProviderEvent::OutputTextDelta { text };
+                            }
+                            DecodedEvent::Reasoning(text) => {
+                                if !reasoning_open {
+                                    yield ProviderEvent::ReasoningStarted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                    reasoning_open = true;
+                                }
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::ReasoningDelta {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                    text,
+                                };
                             }
                             DecodedEvent::Usage(event_usage) => {
                                 if usage.replace(event_usage).is_some() {
@@ -206,6 +226,12 @@ impl Provider for GoogleGenerateContent {
                                 }
                             }
                             DecodedEvent::ToolCall { id, name, arguments } => {
+                                if reasoning_open {
+                                    yield ProviderEvent::ReasoningCompleted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                    reasoning_open = false;
+                                }
                                 output_bytes.add(arguments.len())?;
                                 yield ProviderEvent::ToolCallStarted {
                                     id: id.clone(),
@@ -218,6 +244,11 @@ impl Provider for GoogleGenerateContent {
                                 yield ProviderEvent::ToolCallCompleted { id };
                             }
                             DecodedEvent::Completed => {
+                                if reasoning_open {
+                                    yield ProviderEvent::ReasoningCompleted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                }
                                 yield ProviderEvent::Completed { usage };
                                 return;
                             }
@@ -614,6 +645,7 @@ struct WireApiError {
 #[derive(Debug, PartialEq, Eq)]
 enum DecodedEvent {
     OutputText(String),
+    Reasoning(String),
     Usage(ProviderUsage),
     ToolCall {
         id: String,
@@ -701,6 +733,15 @@ fn decode_event(
                 continue;
             }
             if part.thought {
+                if part.thought_signature.is_some() {
+                    return Err(ProviderError::Protocol(
+                        "Google GenerateContent response mixed displayable thought text with opaque continuation state"
+                            .to_owned(),
+                    ));
+                }
+                if let Some(text) = part.text.filter(|text| !text.is_empty()) {
+                    events.push(DecodedEvent::Reasoning(text));
+                }
                 continue;
             }
             if part.thought_signature.is_some() {

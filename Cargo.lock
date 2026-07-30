@@ -2598,6 +2598,7 @@ name = "qq-protocol"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "qq-reasoning",
  "serde",
  "serde_json",
 ]
@@ -2618,11 +2619,19 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http-body 1.1.0",
+ "qq-reasoning",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "qq-reasoning"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

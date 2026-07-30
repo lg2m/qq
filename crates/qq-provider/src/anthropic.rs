@@ -219,6 +219,7 @@ impl Provider for AnthropicMessages {
             // Maps streamed content-block indexes to tool-call ids so argument
             // deltas and block stops can be attributed after the start event.
             let mut tool_calls: HashMap<u64, String> = HashMap::new();
+            let mut reasoning_blocks = std::collections::HashSet::new();
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = chunk
@@ -288,8 +289,38 @@ impl Provider for AnthropicMessages {
                                 }
                             }
                         }
+                        DecodedEvent::ThinkingStarted { index } => {
+                            if !reasoning_blocks.insert(index) {
+                                Err(ProviderError::Protocol(
+                                    "Anthropic-compatible stream reused a thinking content-block index"
+                                        .to_owned(),
+                                ))?;
+                            }
+                            yield ProviderEvent::ReasoningStarted {
+                                kind: crate::ReasoningKind::ExposedThinking,
+                            };
+                        }
+                        DecodedEvent::ThinkingDelta { index, text } => {
+                            if !reasoning_blocks.contains(&index) {
+                                Err(ProviderError::Protocol(
+                                    "Anthropic-compatible stream sent thinking for an unknown block"
+                                        .to_owned(),
+                                ))?;
+                            }
+                            if !text.is_empty() {
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::ReasoningDelta {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                    text,
+                                };
+                            }
+                        }
                         DecodedEvent::BlockStopped { index } => {
-                            if let Some(id) = tool_calls.remove(&index) {
+                            if reasoning_blocks.remove(&index) {
+                                yield ProviderEvent::ReasoningCompleted {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                };
+                            } else if let Some(id) = tool_calls.remove(&index) {
                                 yield ProviderEvent::ToolCallCompleted { id };
                             }
                         }
@@ -628,6 +659,8 @@ enum StreamingEvent {
 enum StartedBlock {
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
+    #[serde(rename = "thinking")]
+    Thinking,
     #[serde(other)]
     Other,
 }
@@ -640,7 +673,7 @@ enum ContentDelta {
     #[serde(rename = "input_json_delta")]
     InputJson { partial_json: String },
     #[serde(rename = "thinking_delta")]
-    Thinking,
+    Thinking { thinking: String },
     #[serde(other)]
     Other,
 }
@@ -700,6 +733,13 @@ enum DecodedEvent {
         refusal: Option<String>,
         output_tokens: Option<u64>,
     },
+    ThinkingStarted {
+        index: u64,
+    },
+    ThinkingDelta {
+        index: u64,
+        text: String,
+    },
     ToolCallStarted {
         index: u64,
         id: String,
@@ -756,13 +796,24 @@ fn decode_event(event: SseEvent, redactions: &[String]) -> Result<DecodedEvent, 
             index,
             json: partial_json,
         }),
+        StreamingEvent::ContentBlockDelta {
+            index,
+            delta: ContentDelta::Thinking { thinking },
+        } => Ok(DecodedEvent::ThinkingDelta {
+            index,
+            text: thinking,
+        }),
+        StreamingEvent::ContentBlockStart {
+            index,
+            content_block: StartedBlock::Thinking,
+        } => Ok(DecodedEvent::ThinkingStarted { index }),
         StreamingEvent::ContentBlockStart {
             index,
             content_block: StartedBlock::ToolUse { id, name },
         } => Ok(DecodedEvent::ToolCallStarted { index, id, name }),
         StreamingEvent::ContentBlockStop { index } => Ok(DecodedEvent::BlockStopped { index }),
         StreamingEvent::ContentBlockDelta {
-            delta: ContentDelta::Thinking | ContentDelta::Other,
+            delta: ContentDelta::Other,
             ..
         }
         | StreamingEvent::ContentBlockStart {

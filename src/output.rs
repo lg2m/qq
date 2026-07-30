@@ -20,7 +20,12 @@ pub async fn render(
 
     while let Some(event) = events.next().await {
         match event {
-            RunEvent::Started | RunEvent::ActivityChanged { .. } => {}
+            RunEvent::Started
+            | RunEvent::ActivityChanged { .. }
+            | RunEvent::ReasoningStarted { .. }
+            | RunEvent::ReasoningDelta { .. }
+            | RunEvent::ReasoningCompleted { .. }
+            | RunEvent::Usage { .. } => {}
             RunEvent::OutputTextDelta { text } | RunEvent::RefusalDelta { text } => {
                 let text = output_text(&text, mode);
                 writer.write_all(text.as_bytes())?;
@@ -30,7 +35,6 @@ pub async fn render(
                     ends_with_newline = text.ends_with('\n');
                 }
             }
-            RunEvent::Usage { .. } => {}
             RunEvent::Completed => {
                 if !wrote_text || !ends_with_newline {
                     writer.write_all(b"\n")?;
@@ -106,6 +110,31 @@ mod tests {
         render(events, &mut output, OutputMode::Raw).await.unwrap();
 
         assert_eq!(output, b"hello\n");
+    }
+
+    #[tokio::test]
+    async fn excludes_reasoning_from_plain_text_output() {
+        let events = stream::iter([
+            RunEvent::ReasoningStarted {
+                kind: qq_protocol::ReasoningKind::Summary,
+            },
+            RunEvent::ReasoningDelta {
+                kind: qq_protocol::ReasoningKind::Summary,
+                text: "private intermediate text".to_owned(),
+            },
+            RunEvent::ReasoningCompleted {
+                kind: qq_protocol::ReasoningKind::Summary,
+            },
+            RunEvent::OutputTextDelta {
+                text: "answer".to_owned(),
+            },
+            RunEvent::Completed,
+        ]);
+        let mut output = Vec::new();
+
+        render(events, &mut output, OutputMode::Raw).await.unwrap();
+
+        assert_eq!(output, b"answer\n");
     }
 
     #[tokio::test]
