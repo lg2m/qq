@@ -12,8 +12,8 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, build_client,
-        build_direct_client, transport_error, validate_endpoint,
+        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, SafeHeaders, build_client,
+        build_direct_client, is_request_controlled_header, transport_error, validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -289,66 +289,16 @@ fn build_headers(
             Some((name, value))
         }
     };
-    let auth_name = auth_header.as_ref().map(|(name, _)| name);
-
-    let mut headers = HeaderMap::new();
-    for (name, value) in static_headers {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            ProviderError::Configuration("static header name is invalid".to_owned())
-        })?;
-        if name == AUTHORIZATION
-            || auth_name.is_some_and(|auth_name| auth_name == name)
-            || is_request_controlled_header(&name)
-        {
-            return Err(ProviderError::Configuration(format!(
-                "static header `{name}` is controlled by the provider"
-            )));
-        }
-        if headers.contains_key(&name) {
-            return Err(ProviderError::Configuration(format!(
-                "static header `{name}` is duplicated"
-            )));
-        }
-
-        let mut header_value = HeaderValue::from_str(&value).map_err(|_| {
-            ProviderError::Configuration("static header value is invalid".to_owned())
-        })?;
-        header_value.set_sensitive(true);
-        if !value.trim().is_empty() {
-            redactions.push(value);
-        }
-        headers.insert(name, header_value);
-    }
-
+    let auth_name = auth_header.as_ref().map(|(name, _)| name.clone());
+    let mut headers = SafeHeaders::new(std::iter::once(AUTHORIZATION).chain(auth_name));
+    headers.insert_configured(static_headers, false)?;
     if let Some((name, value)) = auth_header {
-        headers.insert(name, value);
+        headers.insert_owned(name, value);
     }
-
-    redactions.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    redactions.dedup();
-    Ok((headers, redactions))
-}
-
-fn is_request_controlled_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "accept"
-            | "connection"
-            | "content-length"
-            | "content-type"
-            | "expect"
-            | "host"
-            | "http2-settings"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "user-agent"
-    )
+    for redaction in redactions {
+        headers.push_redaction(redaction);
+    }
+    Ok(headers.finish())
 }
 
 fn sse_decoder(max_event_bytes: usize) -> SseDecoder {

@@ -12,7 +12,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use reqwest::{
     StatusCode, Url,
-    header::{CONTENT_TYPE, HeaderMap},
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 
 use crate::{
@@ -23,6 +23,95 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ERROR_BODY_BYTES_LIMIT: usize = 16 * 1_024;
+
+pub(crate) struct SafeHeaders {
+    headers: HeaderMap,
+    protocol_owned: Vec<HeaderName>,
+    redactions: Vec<String>,
+}
+
+impl SafeHeaders {
+    pub(crate) fn new(protocol_owned: impl IntoIterator<Item = HeaderName>) -> Self {
+        Self {
+            headers: HeaderMap::new(),
+            protocol_owned: protocol_owned.into_iter().collect(),
+            redactions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn insert_configured(
+        &mut self,
+        configured: impl IntoIterator<Item = (String, String)>,
+        redact_whitespace_only: bool,
+    ) -> Result<(), ProviderError> {
+        for (name, value) in configured {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                ProviderError::Configuration("static header name is invalid".to_owned())
+            })?;
+            if is_request_controlled_header(&name)
+                || self.protocol_owned.iter().any(|owned| owned == &name)
+            {
+                return Err(ProviderError::Configuration(format!(
+                    "static header `{name}` is controlled by the provider"
+                )));
+            }
+            if self.headers.contains_key(&name) {
+                return Err(ProviderError::Configuration(format!(
+                    "static header `{name}` is duplicated"
+                )));
+            }
+
+            let mut header_value = HeaderValue::from_str(&value).map_err(|_| {
+                ProviderError::Configuration("static header value is invalid".to_owned())
+            })?;
+            header_value.set_sensitive(true);
+            if if redact_whitespace_only {
+                !value.is_empty()
+            } else {
+                !value.trim().is_empty()
+            } {
+                self.redactions.push(value);
+            }
+            self.headers.insert(name, header_value);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_owned(&mut self, name: HeaderName, value: HeaderValue) {
+        self.headers.insert(name, value);
+    }
+
+    pub(crate) fn push_redaction(&mut self, value: String) {
+        self.redactions.push(value);
+    }
+
+    pub(crate) fn finish(mut self) -> (HeaderMap, Vec<String>) {
+        normalize_redactions(&mut self.redactions);
+        (self.headers, self.redactions)
+    }
+}
+
+pub(crate) fn is_request_controlled_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept"
+            | "connection"
+            | "content-length"
+            | "content-type"
+            | "expect"
+            | "host"
+            | "http2-settings"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "user-agent"
+    )
+}
 
 #[derive(Clone)]
 pub(crate) struct HttpExchange {
