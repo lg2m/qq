@@ -1,8 +1,9 @@
 # Context Compaction
 
-Status: steps 1–2 of the sequencing are implemented (result pruning in
-assembly; `CompactSession` + `/compact` with summary/marker storage);
-steps 3–4 are direction.
+Status: steps 1–3 of the sequencing are implemented (result pruning in
+assembly; `CompactSession` + `/compact` with summary/marker storage;
+auto-compact thresholds replacing the hard budget failure); step 4 is
+direction.
 
 Long sessions outgrow model context. Today the runtime fails the run
 when the assembled context exceeds the session budget; compaction

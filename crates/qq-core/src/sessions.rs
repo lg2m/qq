@@ -39,6 +39,15 @@ const CONTROL_QUEUE_CAPACITY: usize = 256;
 const OUTPUT_QUEUE_CAPACITY: usize = 1024;
 const MAX_PENDING_PROMPTS: u16 = 16;
 const MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+/// Auto-compaction trigger: when a prompt run is about to be claimed and the
+/// session's assembled (pruned) context — including the queued prompt —
+/// exceeds this share of [`MAX_CONTEXT_BYTES`], a compaction run is claimed
+/// first and the prompt runs right after it. ~70% of the session budget. A
+/// second trigger on the model context window (the run's last reported
+/// `context_tokens` against the window) needs the window plumbed into
+/// qq-core; today it lives only in the client-facing model catalog, so the
+/// byte threshold is the sole automatic signal.
+const AUTO_COMPACT_CONTEXT_BYTES: usize = MAX_CONTEXT_BYTES / 10 * 7;
 /// The assembly recency window: the last K model turns keep their tool
 /// results verbatim. Read-only results older than that are replaced by
 /// one-line stubs during context assembly (the stored rows are untouched).
@@ -299,6 +308,9 @@ impl SessionRuntime {
         self.inner.notify(applied.receipt.committed_through);
 
         if let Some(run_id) = signal_run {
+            self.inner.cancel(run_id);
+        }
+        if let Some(run_id) = applied.cascade_cancel {
             self.inner.cancel(run_id);
         }
         if let Some(tool_call_id) = signal_approval {
@@ -664,6 +676,14 @@ async fn execute_run(
 ) {
     if *cancellation.borrow() {
         finish_run(&inner, &claimed, RunOutcome::Cancelled).await;
+        return;
+    }
+    // The claim already spent its one automatic compaction attempt on this
+    // session; an assembly still past the hard budget fails here — before
+    // any model traffic — with the same policy failure the mid-run budget
+    // check produces.
+    if claimed.over_budget {
+        finish_run(&inner, &claimed, context_budget_failure()).await;
         return;
     }
     let mut load = inner.loader.load(RuntimeLoadRequest {
@@ -1472,21 +1492,29 @@ fn internal_failure(message: &str) -> RunOutcome {
 fn persistence_failure(action: &str, error: &SessionRuntimeError) -> RunOutcome {
     match error {
         SessionRuntimeError::OutputTooLarge | SessionRuntimeError::ContextTooLarge => {
-            RunOutcome::Failed {
-                failure: RunFailure {
-                    kind: RunFailureKind::Policy,
-                    message: format!(
-                        "session context reached its {} MiB limit; start a new session to continue",
-                        MAX_CONTEXT_BYTES / (1024 * 1024)
-                    ),
-                },
-            }
+            context_budget_failure()
         }
         error => RunOutcome::Failed {
             failure: RunFailure {
                 kind: RunFailureKind::Server,
                 message: format!("{action}: {error}"),
             },
+        },
+    }
+}
+
+/// The deliberate context-budget policy failure. Since auto-compaction, a
+/// prompt run reaches it only after one compaction attempt could not bring
+/// the assembly back under the budget (or mid-run, when model output alone
+/// pushes past it — never compacted mid-run).
+fn context_budget_failure() -> RunOutcome {
+    RunOutcome::Failed {
+        failure: RunFailure {
+            kind: RunFailureKind::Policy,
+            message: format!(
+                "session context reached its {} MiB limit; start a new session to continue",
+                MAX_CONTEXT_BYTES / (1024 * 1024)
+            ),
         },
     }
 }
@@ -2088,6 +2116,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  assistant_message_id TEXT NOT NULL,
                   status TEXT NOT NULL,
                   kind TEXT NOT NULL DEFAULT 'prompt',
+                  auto_compaction INTEGER NOT NULL DEFAULT 0,
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
                    outcome_json TEXT,
                    usage_json TEXT,
@@ -2150,7 +2179,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             transaction
                 .execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '9')",
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', '10')",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2191,9 +2220,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2218,9 +2248,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2248,9 +2279,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2268,9 +2300,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2287,9 +2320,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2305,9 +2339,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2322,9 +2357,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             create_session_compactions_table(&transaction)?;
             add_runs_kind_column(&transaction)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2337,9 +2373,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .transaction()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             add_runs_context_tokens_column(&transaction)?;
+            add_runs_auto_compaction_column(&transaction)?;
             transaction
                 .execute(
-                    "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2347,7 +2384,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("9") => {}
+        Some("9") => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            add_runs_auto_compaction_column(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+        Some("10") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     let stored = connection
@@ -2513,6 +2565,21 @@ fn add_runs_context_tokens_column(connection: &Connection) -> Result<(), Session
     Ok(())
 }
 
+/// Adds `runs.auto_compaction` for stores created before threshold-triggered
+/// compaction. 1 marks a compaction run the runtime claimed automatically at
+/// a context threshold; 0 (every existing row) is a user-requested run.
+fn add_runs_auto_compaction_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "runs", "auto_compaction")? {
+        connection
+            .execute(
+                "ALTER TABLE runs ADD COLUMN auto_compaction INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
 fn has_column(
     connection: &Connection,
     table: &str,
@@ -2558,11 +2625,20 @@ struct ClaimedRun {
     model: ModelSelection,
     messages: Vec<Message>,
     started: SessionEventEnvelope,
+    /// The prompt's assembled context still exceeded the hard budget when it
+    /// was claimed — after the one auto-compaction attempt the claim path
+    /// guarantees. The run fails immediately with the context policy failure
+    /// instead of reaching the model.
+    over_budget: bool,
 }
 
 struct AppliedCommand {
     receipt: CommandReceipt,
     schedule: bool,
+    /// A second run whose in-memory cancellation should be signalled along
+    /// with the command's own: cancelling the last queued prompt cascades to
+    /// the auto-compaction that was running on its behalf.
+    cascade_cancel: Option<RunId>,
     /// Set when a first-applied approve-for-workspace decision needs its
     /// grant promoted into workspace configuration. Idempotent replays never
     /// set it: retried commands must not re-run the config write.
@@ -2607,6 +2683,7 @@ fn execute_command(
         return Ok(AppliedCommand {
             receipt,
             schedule: false,
+            cascade_cancel: None,
             promotion: None,
         });
     }
@@ -2622,6 +2699,7 @@ fn execute_command(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let now = now_ms();
     let mut promotion = None;
+    let mut cascade_cancel = None;
     let (receipt, schedule) = match command {
         SessionCommand::ResolveWorkspace { path } => {
             let path = path.trim();
@@ -2778,13 +2856,11 @@ fn execute_command(
             if queued >= MAX_PENDING_PROMPTS {
                 return Err(SessionRuntimeError::QueueFull);
             }
-            // The budget measures what the next run would actually send: the
-            // assembled context after summary cutoff and result pruning, not
-            // the raw persisted rows.
-            let context_bytes = assembled_context_bytes(&transaction, session_id)?;
-            if context_bytes.saturating_add(prompt.len()) > MAX_CONTEXT_BYTES {
-                return Err(SessionRuntimeError::ContextTooLarge);
-            }
+            // An over-budget prompt is admitted rather than rejected: claiming
+            // it auto-compacts the session first and re-checks, so the hard
+            // budget fails the run only after one compaction attempt could
+            // not shrink the assembly under it (the last resort, not the
+            // policy).
             let workspace_id = parse_id(&workspace_id)?;
             let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
             let message_id = MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
@@ -2938,15 +3014,33 @@ fn execute_command(
                     },
                 )?;
                 let cursor = if status == "queued" {
-                    finish_queued_run(
+                    let finished = finish_queued_run(
                         &transaction,
                         store_id,
                         workspace_id,
                         session_id,
                         run_id,
                         now,
-                    )?
-                    .cursor
+                    )?;
+                    // Cancelling the session's last queued prompt cascades to
+                    // the auto-compaction running on its behalf: with nothing
+                    // left to run after it, the summarization is pure cost. A
+                    // manual compaction (auto_compaction = 0) is never
+                    // cascaded — the user asked for it directly.
+                    match cascade_auto_compaction_cancel(
+                        &transaction,
+                        store_id,
+                        workspace_id,
+                        session_id,
+                        command_id,
+                        now,
+                    )? {
+                        Some((compaction_run, event)) => {
+                            cascade_cancel = Some(compaction_run);
+                            event.cursor
+                        }
+                        None => finished.cursor,
+                    }
                 } else {
                     requested.cursor
                 };
@@ -3369,6 +3463,7 @@ fn execute_command(
     Ok(AppliedCommand {
         receipt,
         schedule,
+        cascade_cancel,
         promotion,
     })
 }
@@ -3435,6 +3530,51 @@ fn claim_next_run(
     let kind = parse_run_kind(&kind)?;
     let workspace_id: WorkspaceId = parse_id(&workspace)?;
     let now = now_ms();
+    let model = ModelSelection {
+        model,
+        max_output_tokens: max_tokens,
+        organization,
+    };
+    // Threshold trigger: a prompt about to run on an oversized assembly
+    // compacts first; the prompt stays queued and runs right after. This is
+    // evaluated only here — between runs — so a run in flight always
+    // completes on the context it started with. The guard on the session's
+    // most recently finished run yields exactly one automatic attempt per
+    // prompt: straight after a compaction (auto or manual, whatever its
+    // outcome) the prompt proceeds regardless, so a summarizer failure — or
+    // a pathological summary that did not shrink the assembly under the
+    // threshold — can never loop.
+    let mut over_budget = false;
+    if kind == RunKind::Prompt {
+        let assembled = assembled_context_bytes(&transaction, session_id)?;
+        // The queued prompt has not joined the assembly yet (its message row
+        // is still 'queued'); measure what the claimed run would send.
+        let prompt_bytes: u64 = transaction
+            .query_row(
+                "SELECT length(CAST(output AS BLOB)) FROM messages WHERE id = ?1",
+                [user_message_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let total = assembled.saturating_add(usize::try_from(prompt_bytes).unwrap_or(usize::MAX));
+        if total > AUTO_COMPACT_CONTEXT_BYTES {
+            if !last_finished_run_was_compaction(&transaction, session_id)? {
+                return claim_auto_compaction(
+                    transaction,
+                    store_id,
+                    workspace_id,
+                    workspace_path,
+                    session_id,
+                    model,
+                    now,
+                );
+            }
+            // The one attempt already happened; past the hard budget the run
+            // fails with the context policy failure instead of reaching the
+            // model.
+            over_budget = total > MAX_CONTEXT_BYTES;
+        }
+    }
     transaction
         .execute(
             "UPDATE runs SET status = 'running', started_at_ms = ?2 WHERE id = ?1",
@@ -3506,13 +3646,123 @@ fn claim_next_run(
         run_id,
         command_id,
         kind,
-        model: ModelSelection {
-            model,
-            max_output_tokens: max_tokens,
-            organization,
-        },
+        model,
         messages,
         started,
+        over_budget,
+    }))
+}
+
+/// True when the session's most recently finished run — any outcome — was a
+/// compaction. The claim path consults this as its no-thrash guard: crossing
+/// the threshold triggers at most one automatic compaction per prompt, and a
+/// fresh trigger requires the context to grow past the threshold again after
+/// some other run.
+fn last_finished_run_was_compaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<bool, SessionRuntimeError> {
+    let kind: Option<String> = transaction
+        .query_row(
+            "SELECT kind FROM runs
+             WHERE session_id = ?1 AND outcome_json IS NOT NULL
+             ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(kind.as_deref() == Some("compaction"))
+}
+
+/// Claims an automatic compaction run for `session_id` in place of the
+/// queued prompt that crossed the context threshold. The prompt run is left
+/// untouched — still queued, still counted, its user message still pending —
+/// so it is the session's next claim once the compaction settles. The
+/// compaction run is ordinary in every other way: same kind, events, usage
+/// and cost accounting, and internal-run transcript exclusion as a manual
+/// `CompactSession`; `auto_compaction = 1` marks its provenance in the run
+/// row.
+fn claim_auto_compaction(
+    transaction: Transaction<'_>,
+    store_id: StoreId,
+    workspace_id: WorkspaceId,
+    workspace_path: String,
+    session_id: SessionId,
+    model: ModelSelection,
+    now: u64,
+) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
+    let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    // No client command requested this run; a generated id satisfies the
+    // unique command column without joining the commands table.
+    let command_id = CommandId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    // Internal runs persist no message rows; the ids are placeholders
+    // satisfying the runs schema.
+    let user_message_id = MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let assistant_message_id =
+        MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    transaction
+        .execute(
+            "INSERT INTO runs(
+                id, session_id, command_id, user_message_id, assistant_message_id,
+                status, kind, auto_compaction, created_at_ms, started_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'compaction', 1, ?6, ?6)",
+            params![
+                run_id.to_string(),
+                session_id.to_string(),
+                command_id.to_string(),
+                user_message_id.to_string(),
+                assistant_message_id.to_string(),
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    // `queued_prompts` keeps counting the waiting prompt; it runs next.
+    transaction
+        .execute(
+            "UPDATE sessions
+             SET active_run_id = ?2, status = 'running', updated_at_ms = ?3
+             WHERE id = ?1",
+            params![session_id.to_string(), run_id.to_string(), now],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    // The summarization request assembles exactly like a manual compaction:
+    // the queued prompt's message is still pending and therefore excluded.
+    let mut context = load_model_context(&transaction, session_id, u64::MAX)?;
+    context.push(Message::user(compaction_instruction(
+        &transaction,
+        session_id,
+    )?));
+    let summary = load_session_summary(&transaction, session_id)?;
+    let started = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id,
+            session_id,
+            run_id: Some(run_id),
+            caused_by: None,
+            occurred_at_ms: now,
+        },
+        SessionEvent::RunStarted {
+            session: summary,
+            run_id,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(Some(ClaimedRun {
+        workspace_id,
+        workspace: workspace_path,
+        session_id,
+        run_id,
+        command_id,
+        kind: RunKind::Compaction,
+        model,
+        messages: context,
+        started,
+        over_budget: false,
     }))
 }
 
@@ -4308,9 +4558,14 @@ fn complete_compaction(
     if matches!(outcome, RunOutcome::Completed) {
         let now = now_ms();
         let before_bytes = assembled_context_bytes(&transaction, claimed.session_id)?;
+        // The cutoff covers exactly the span the summary replaced: the
+        // messages assembly showed the summarizer. A prompt still queued
+        // behind an auto-compaction has an ordinal but was not summarized —
+        // it must stay after the marker so its run still sends it.
         let cutoff_ordinal: u64 = transaction
             .query_row(
-                "SELECT COALESCE(MAX(ordinal), 0) FROM messages WHERE session_id = ?1",
+                "SELECT COALESCE(MAX(ordinal), 0) FROM messages
+                 WHERE session_id = ?1 AND state IN ('complete', 'interrupted')",
                 [claimed.session_id.to_string()],
                 |row| row.get(0),
             )
@@ -4587,6 +4842,60 @@ fn finish_queued_run(
     )
 }
 
+/// Requests cancellation of the session's active auto-compaction when no
+/// queued prompt remains to run after it. Returns the compaction's run id
+/// (for the in-memory cancellation signal) and the appended
+/// `CancellationRequested` event, or `None` when there is nothing to cascade
+/// to: prompts still queued, a manual compaction, an ordinary prompt run, or
+/// a cancellation already underway.
+fn cascade_auto_compaction_cancel(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    workspace_id: WorkspaceId,
+    session_id: SessionId,
+    command_id: CommandId,
+    now: u64,
+) -> Result<Option<(RunId, SessionEventEnvelope)>, SessionRuntimeError> {
+    let compaction_run = transaction
+        .query_row(
+            "SELECT r.id FROM sessions s JOIN runs r ON r.id = s.active_run_id
+             WHERE s.id = ?1 AND s.queued_prompts = 0
+               AND r.kind = 'compaction' AND r.auto_compaction = 1
+               AND r.outcome_json IS NULL AND r.cancel_requested = 0",
+            [session_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let Some(compaction_run) = compaction_run else {
+        return Ok(None);
+    };
+    let compaction_run: RunId = parse_id(&compaction_run)?;
+    transaction
+        .execute(
+            "UPDATE runs SET cancel_requested = 1 WHERE id = ?1",
+            [compaction_run.to_string()],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let summary = load_session_summary(transaction, session_id)?;
+    let event = append_event(
+        transaction,
+        EventContext {
+            store_id,
+            workspace_id,
+            session_id,
+            run_id: Some(compaction_run),
+            caused_by: Some(command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::CancellationRequested {
+            session: summary,
+            run_id: compaction_run,
+        },
+    )?;
+    Ok(Some((compaction_run, event)))
+}
+
 fn recover_interrupted_runs(
     connection: &mut Connection,
     store_id: StoreId,
@@ -4630,6 +4939,7 @@ fn recover_interrupted_runs(
             kind: RunKind::Prompt,
             model: ModelSelection::default(),
             messages: Vec::new(),
+            over_budget: false,
             started: SessionEventEnvelope {
                 cursor: EventCursor {
                     store_id,
@@ -7129,7 +7439,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "9"
+            "10"
         );
         assert!(
             !connection
@@ -7252,7 +7562,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "9"
+            "10"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -7320,7 +7630,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "9"
+            "10"
         );
         let (display_json, result) = connection
             .query_row(
@@ -7379,7 +7689,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "9"
+            "10"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -7763,7 +8073,9 @@ mod tests {
     async fn collect_through_finished(
         events: &mut SessionEventStream,
     ) -> Vec<SessionEventEnvelope> {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Generous upper bound: the auto-compaction tests stream multi-MiB
+        // outputs concurrently, which can starve lighter tests of CPU.
+        tokio::time::timeout(Duration::from_secs(30), async {
             let mut observed = Vec::new();
             while let Some(event) = events.next().await {
                 let event = event.unwrap();
@@ -7784,7 +8096,7 @@ mod tests {
     async fn collect_through_compacted(
         events: &mut SessionEventStream,
     ) -> Vec<SessionEventEnvelope> {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             let mut observed = Vec::new();
             while let Some(event) = events.next().await {
                 let event = event.unwrap();
@@ -8063,6 +8375,561 @@ mod tests {
             })
             .unwrap();
         assert_eq!(compactions, 2);
+    }
+
+    /// One scripted model load for the auto-compaction tests: what the
+    /// provider streams for that run.
+    #[derive(Clone)]
+    enum AutoCompactScript {
+        /// Streams the text and completes.
+        Text(String),
+        /// Fails the model stream with a transport error.
+        Fail,
+        /// Never yields: the run parks until cancelled.
+        Stall,
+    }
+
+    struct AutoCompactLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        scripts: Vec<AutoCompactScript>,
+        loads: StdMutex<usize>,
+    }
+
+    impl RuntimeLoader for AutoCompactLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let mut loads = self.loads.lock().unwrap();
+            let script = self
+                .scripts
+                .get(*loads)
+                .cloned()
+                .unwrap_or_else(|| AutoCompactScript::Text("done".to_owned()));
+            *loads += 1;
+            drop(loads);
+            let provider = AutoCompactProvider {
+                requests: Arc::clone(&self.requests),
+                script,
+            };
+            Box::pin(async move {
+                Runtime::new(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct AutoCompactProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        script: AutoCompactScript,
+    }
+
+    impl Provider for AutoCompactProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            match &self.script {
+                AutoCompactScript::Text(text) => Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta { text: text.clone() }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ])),
+                AutoCompactScript::Fail => Box::pin(stream::iter([Err(
+                    qq_provider::ProviderError::Transport("scripted model failure".to_owned()),
+                )])),
+                AutoCompactScript::Stall => Box::pin(stream::pending()),
+            }
+        }
+    }
+
+    struct AutoCompactHarness {
+        _directory: TempDir,
+        runtime: SessionRuntime,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        workspace_path: PathBuf,
+        session_id: SessionId,
+        events: SessionEventStream,
+    }
+
+    async fn auto_compact_harness(scripts: Vec<AutoCompactScript>) -> AutoCompactHarness {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(AutoCompactLoader {
+                requests: Arc::clone(&requests),
+                scripts,
+                loads: StdMutex::new(0),
+            }),
+        )
+        .await
+        .unwrap();
+        let workspace_path = directory.path().to_owned();
+        let (workspace_id, _) = resolve_workspace(&runtime, &workspace_path).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        AutoCompactHarness {
+            _directory: directory,
+            runtime,
+            requests,
+            workspace_path,
+            session_id,
+            events,
+        }
+    }
+
+    async fn queue_prompt(
+        runtime: &SessionRuntime,
+        session_id: SessionId,
+        prompt: String,
+    ) -> RunId {
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt { session_id, prompt },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        run_id
+    }
+
+    /// Collects events until `stop` matches (inclusive), with a generous
+    /// timeout: the auto-compaction tests stream multi-MiB outputs.
+    async fn collect_until(
+        events: &mut SessionEventStream,
+        stop: impl Fn(&SessionEvent) -> bool,
+    ) -> Vec<SessionEventEnvelope> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut observed = Vec::new();
+            loop {
+                let event = events.next().await.unwrap().unwrap();
+                let done = stop(&event.event);
+                observed.push(event);
+                if done {
+                    return observed;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn finished_for(run_id: RunId) -> impl Fn(&SessionEvent) -> bool {
+        move |event| matches!(event, SessionEvent::RunFinished { run_id: finished, .. } if *finished == run_id)
+    }
+
+    fn position_of(
+        observed: &[SessionEventEnvelope],
+        predicate: impl Fn(&SessionEvent) -> bool,
+    ) -> usize {
+        observed
+            .iter()
+            .position(|event| predicate(&event.event))
+            .unwrap()
+    }
+
+    /// An output that pushes the assembled context past the auto-compaction
+    /// threshold while staying comfortably under the hard budget.
+    fn over_threshold_output() -> String {
+        "x".repeat(AUTO_COMPACT_CONTEXT_BYTES + 64 * 1024)
+    }
+
+    #[tokio::test]
+    async fn prompts_below_the_context_threshold_never_auto_compact() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("first answer".to_owned()),
+            AutoCompactScript::Text("second answer".to_owned()),
+        ])
+        .await;
+        for prompt in ["one", "two"] {
+            let run_id =
+                queue_prompt(&harness.runtime, harness.session_id, prompt.to_owned()).await;
+            let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+            // Only the prompt itself runs: nothing claims ahead of it and no
+            // compaction commits.
+            assert!(observed.iter().all(|event| match &event.event {
+                SessionEvent::RunStarted {
+                    run_id: started, ..
+                } => *started == run_id,
+                SessionEvent::SessionCompacted { .. } => false,
+                _ => true,
+            }));
+        }
+        assert_eq!(harness.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn crossing_the_byte_threshold_compacts_before_the_queued_prompt() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text(over_threshold_output()),
+            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text("done".to_owned()),
+            AutoCompactScript::Text("done again".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let prompt = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(prompt)).await;
+
+        // The compaction claims first; the prompt stays queued and runs
+        // right after it.
+        let compaction = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunStarted { run_id, .. } if *run_id != prompt => Some(*run_id),
+                _ => None,
+            })
+            .expect("an auto-compaction run must start before the prompt");
+        let compaction_finished = position_of(&observed, |event| {
+            matches!(
+                event,
+                SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                    if *run_id == compaction
+            )
+        });
+        let compacted = position_of(&observed, |event| {
+            matches!(event, SessionEvent::SessionCompacted { .. })
+        });
+        let prompt_started = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == prompt),
+        );
+        let prompt_finished = position_of(&observed, |event| {
+            matches!(
+                event,
+                SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                    if *run_id == prompt
+            )
+        });
+        assert!(compaction_finished < compacted);
+        assert!(compacted < prompt_started);
+        assert!(prompt_started < prompt_finished);
+
+        {
+            // The summarization request ends with the fixed instruction, and
+            // the prompt then runs on the compacted assembly.
+            let requests = harness.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let summarize = request_texts(&requests[1]);
+            assert!(
+                summarize
+                    .last()
+                    .unwrap()
+                    .starts_with("Summarize this conversation")
+            );
+            let after = request_texts(&requests[2]);
+            assert!(after[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
+            assert!(after[0].contains("the summary"));
+            assert_eq!(after[after.len() - 1], "over");
+        }
+
+        // The run row records automatic provenance.
+        let connection = Connection::open(harness.workspace_path.join("sessions.sqlite3")).unwrap();
+        let auto: bool = connection
+            .query_row(
+                "SELECT auto_compaction FROM runs WHERE id = ?1",
+                [compaction.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(auto);
+
+        // No re-trigger: the assembly shrank below the threshold, so the
+        // next prompt runs directly.
+        let third = queue_prompt(&harness.runtime, harness.session_id, "after".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(third)).await;
+        assert!(observed.iter().all(|event| match &event.event {
+            SessionEvent::RunStarted { run_id, .. } => *run_id == third,
+            SessionEvent::SessionCompacted { .. } => false,
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn exceeding_the_hard_budget_compacts_once_and_the_prompt_proceeds() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("x".repeat(MAX_CONTEXT_BYTES - 100 * 1024)),
+            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text("done".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        // Context plus prompt exceeds the hard budget. Submission is
+        // admitted (previously this was rejected outright); the claim
+        // compacts once, re-checks, and the prompt proceeds.
+        let second = queue_prompt(
+            &harness.runtime,
+            harness.session_id,
+            "y".repeat(MAX_PROMPT_BYTES),
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                if *run_id == second
+        )));
+        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_still_over_budget_after_compacting_fails_with_the_policy_outcome() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("x".repeat(MAX_CONTEXT_BYTES - 100 * 1024)),
+            // Pathological summarizer: the summary is as large as the
+            // transcript it replaces, so the retry is still past the budget.
+            AutoCompactScript::Text("s".repeat(MAX_CONTEXT_BYTES - 100 * 1024)),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let second = queue_prompt(
+            &harness.runtime,
+            harness.session_id,
+            "y".repeat(MAX_PROMPT_BYTES),
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        // The one attempt happened...
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        // ...and the prompt then fails with the context policy failure
+        // without reaching the model.
+        let outcome = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished {
+                    run_id, outcome, ..
+                } if *run_id == second => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Policy,
+                    ref message,
+                }
+            } if message.contains("4 MiB limit")
+        ));
+        assert_eq!(harness.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_auto_compaction_does_not_strand_the_queued_prompt() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text(over_threshold_output()),
+            AutoCompactScript::Fail,
+            AutoCompactScript::Text("done".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let second = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        // The summarizer failed and committed nothing...
+        let compaction = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunStarted { run_id, .. } if *run_id != second => Some(*run_id),
+                _ => None,
+            })
+            .unwrap();
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Failed { .. }, .. }
+                if *run_id == compaction
+        )));
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        // ...and the prompt still ran to completion, with no second attempt.
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                if *run_id == second
+        )));
+        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_compaction_that_does_not_shrink_the_assembly_never_loops() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text(over_threshold_output()),
+            // The summary itself stays past the threshold: the guard must
+            // let the prompt proceed after the single attempt.
+            AutoCompactScript::Text(over_threshold_output()),
+            AutoCompactScript::Text("done".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let second = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        let compactions = observed
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::RunStarted { run_id, .. } if *run_id != second
+                )
+            })
+            .count();
+        assert_eq!(compactions, 1, "exactly one automatic attempt per prompt");
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                if *run_id == second
+        )));
+        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_queued_prompt_cancels_the_pending_auto_compaction() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text(over_threshold_output()),
+            AutoCompactScript::Stall,
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let prompt = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let observed = collect_until(
+            &mut harness.events,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id != prompt),
+        )
+        .await;
+        let SessionEvent::RunStarted {
+            run_id: compaction, ..
+        } = observed.last().unwrap().event
+        else {
+            panic!("expected the auto-compaction to start")
+        };
+
+        // Cancelling the only queued prompt cascades to the compaction that
+        // was running on its behalf.
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: prompt },
+            )
+            .await
+            .unwrap();
+        let observed = collect_until(&mut harness.events, finished_for(compaction)).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Cancelled, .. }
+                if *run_id == prompt
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::CancellationRequested { run_id, .. } if *run_id == compaction
+        )));
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        // The compaction settled cancelled and the session ended idle.
+        let session = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished {
+                    run_id,
+                    outcome: RunOutcome::Cancelled,
+                    session,
+                    ..
+                } if *run_id == compaction => Some(session.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.queued_prompts, 0);
+        assert_eq!(session.active_run_id, None);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_prompt_never_cancels_a_manual_compaction() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("hello".to_owned()),
+            AutoCompactScript::Stall,
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "hi".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        // A user-requested compaction claims and parks at the model.
+        let compaction = compact_session(&harness.runtime, harness.session_id).await;
+        collect_until(&mut harness.events, |event| {
+            matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == compaction)
+        })
+        .await;
+
+        // Queue a prompt behind it, then cancel that prompt: the manual
+        // compaction must keep running.
+        let prompt = queue_prompt(&harness.runtime, harness.session_id, "later".to_owned()).await;
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: prompt },
+            )
+            .await
+            .unwrap();
+        let observed = collect_until(&mut harness.events, finished_for(prompt)).await;
+        assert!(!observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::CancellationRequested { run_id, .. } if *run_id == compaction
+        )));
+
+        // Clean up: cancel the parked compaction directly.
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: compaction },
+            )
+            .await
+            .unwrap();
+        let observed = collect_until(&mut harness.events, finished_for(compaction)).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Cancelled, .. }
+                if *run_id == compaction
+        )));
     }
 
     #[tokio::test]
