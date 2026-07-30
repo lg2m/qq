@@ -58,10 +58,13 @@ are size-bounded.
   breadth delegation net-cheaper than inline gathering; the parent's
   conversation keeps its own model.
 - **Bounds.** Depth 1: children cannot spawn. Concurrent children per
-  parent run are capped small (2–4); each child consumes a run permit
-  so global concurrency holds. Child runs are cancelled when the parent
-  run is cancelled or times out. Parallel spawn calls in one turn run
-  concurrently like read-only tools.
+  parent run are capped small (3); child runs draw from their own
+  bounded permit pool, separate from the root pool — parents hold their
+  permit while awaiting children, so a shared pool would deadlock at
+  saturation. Global concurrency stays bounded by the two pools
+  combined. Child runs are cancelled when the parent run is cancelled.
+  Parallel spawn calls in one turn run concurrently like read-only
+  tools, and a run may spawn at most 8 children in total.
 - **Cost and visibility.** Child usage and cost roll up into the parent
   session's displayed totals (children also show their own). The child
   session persists after completion — auditable like any session, and
