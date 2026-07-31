@@ -9,15 +9,16 @@ use tokio::sync::OnceCell;
 
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream,
-    anthropic::{AnthropicAuth, AnthropicMessages},
     bedrock::{
         AwsConfigLoadError, BedrockAuth, load_aws_config, valid_region_label,
         validate_configuration,
     },
     compiler::HttpProtocol,
+    construction::{
+        CompiledHttpProvider, HttpConstructionAuth, HttpConstructionSpec, HttpEndpointKind,
+        construct_http_provider,
+    },
     http::validate_endpoint,
-    openai::{OpenAi, ResponsesAuth},
-    openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
 };
@@ -32,7 +33,7 @@ struct MantleInner {
     region: Option<String>,
     protocol: HttpProtocol,
     auth: BedrockAuth,
-    provider: OnceCell<MantleProvider>,
+    provider: OnceCell<CompiledHttpProvider>,
     #[cfg(test)]
     warm_streams: std::sync::atomic::AtomicUsize,
 }
@@ -65,12 +66,11 @@ impl Mantle {
             (Some(region), BedrockAuth::ApiKey(api_key)) => {
                 let endpoint =
                     mantle_endpoint(region, protocol).map_err(|error| error.to_provider_error())?;
-                let provider = build_provider(
+                let provider = construct_mantle_provider(
                     client.clone(),
                     endpoint,
                     protocol,
-                    Some(api_key.clone()),
-                    RequestAuthorizer::default(),
+                    HttpConstructionAuth::ApiKey(api_key.clone()),
                 )
                 .map_err(|error| error.to_provider_error())?;
                 OnceCell::from(provider)
@@ -120,7 +120,7 @@ impl Provider for Mantle {
 }
 
 impl MantleInner {
-    async fn load_provider(&self) -> Result<MantleProvider, MantleInitError> {
+    async fn load_provider(&self) -> Result<CompiledHttpProvider, MantleInitError> {
         let config = load_aws_config(&self.auth, self.region.as_deref()).await?;
         let region = config
             .sdk_config
@@ -134,12 +134,11 @@ impl MantleInner {
         let endpoint = mantle_endpoint(region, self.protocol)?;
 
         match &self.auth {
-            BedrockAuth::ApiKey(api_key) => build_provider(
+            BedrockAuth::ApiKey(api_key) => construct_mantle_provider(
                 self.client.clone(),
                 endpoint,
                 self.protocol,
-                Some(api_key.clone()),
-                RequestAuthorizer::default(),
+                HttpConstructionAuth::ApiKey(api_key.clone()),
             ),
             BedrockAuth::DefaultChain | BedrockAuth::Profile(_) => {
                 let credentials = config.credentials.ok_or_else(|| {
@@ -147,77 +146,37 @@ impl MantleInner {
                         "AWS credential lease is unavailable".to_owned(),
                     )
                 })?;
-                build_provider(
+                construct_mantle_provider(
                     self.client.clone(),
                     endpoint,
                     self.protocol,
-                    None,
-                    RequestAuthorizer::bedrock_mantle_sigv4(region, credentials),
+                    HttpConstructionAuth::MantleSigV4(RequestAuthorizer::bedrock_mantle_sigv4(
+                        region,
+                        credentials,
+                    )),
                 )
             }
         }
     }
 }
 
-fn build_provider(
+fn construct_mantle_provider(
     client: reqwest::Client,
     endpoint: reqwest::Url,
     protocol: HttpProtocol,
-    api_key: Option<String>,
-    authorizer: RequestAuthorizer,
-) -> Result<MantleProvider, MantleInitError> {
-    let provider = match protocol {
-        HttpProtocol::OpenAiResponses => {
-            MantleProvider::OpenAi(OpenAi::with_client_and_authorizer(
-                client,
-                endpoint,
-                api_key.map_or(ResponsesAuth::NoAuth, ResponsesAuth::Bearer),
-                [],
-                authorizer,
-                false,
-            )?)
-        }
-        HttpProtocol::OpenAiChatCompletions => MantleProvider::OpenAiChatCompletions(
-            OpenAiChatCompletions::with_client_and_authorizer(
-                client,
-                endpoint,
-                api_key.map_or(ChatCompletionsAuth::NoAuth, ChatCompletionsAuth::Bearer),
-                [],
-                authorizer,
-            )?,
-        ),
-        HttpProtocol::AnthropicMessages => {
-            MantleProvider::AnthropicMessages(AnthropicMessages::with_client_and_authorizer(
-                client,
-                endpoint,
-                api_key.map_or(AnthropicAuth::NoAuth, AnthropicAuth::XApiKey),
-                [],
-                authorizer,
-            )?)
-        }
-        HttpProtocol::GoogleGenerateContent => {
-            return Err(MantleInitError::Configuration(
-                "Google GenerateContent is not supported by Amazon Bedrock Mantle".to_owned(),
-            ));
-        }
-    };
-    Ok(provider)
-}
-
-enum MantleProvider {
-    OpenAi(OpenAi),
-    OpenAiChatCompletions(OpenAiChatCompletions),
-    AnthropicMessages(AnthropicMessages),
-}
-
-impl Provider for MantleProvider {
-    fn stream(&self, request: crate::ModelRequest) -> ProviderStream {
-        match self {
-            Self::OpenAi(provider) => provider.stream(request),
-            Self::OpenAiChatCompletions(provider) => provider.stream(request),
-            Self::AnthropicMessages(provider) => provider.stream(request),
-        }
-    }
+    auth: HttpConstructionAuth,
+) -> Result<CompiledHttpProvider, MantleInitError> {
+    construct_http_provider(
+        client,
+        HttpConstructionSpec {
+            protocol,
+            endpoint,
+            endpoint_kind: HttpEndpointKind::Exact,
+            auth,
+            headers: Vec::new(),
+        },
+    )
+    .map_err(MantleInitError::from)
 }
 
 fn mantle_endpoint(region: &str, protocol: HttpProtocol) -> Result<reqwest::Url, MantleInitError> {
@@ -369,18 +328,17 @@ mod tests {
     async fn failed_initialization_is_retryable() {
         let provider = OnceCell::new();
         let first = provider
-            .get_or_try_init(|| async { Err::<MantleProvider, _>("temporary failure") })
+            .get_or_try_init(|| async { Err::<CompiledHttpProvider, _>("temporary failure") })
             .await;
         assert_eq!(first.err(), Some("temporary failure"));
 
         let second = provider
             .get_or_try_init(|| async {
-                build_provider(
+                construct_mantle_provider(
                     build_direct_client().unwrap(),
                     mantle_endpoint("us-east-1", HttpProtocol::OpenAiResponses).unwrap(),
                     HttpProtocol::OpenAiResponses,
-                    Some("mantle-test-secret".to_owned()),
-                    RequestAuthorizer::default(),
+                    HttpConstructionAuth::ApiKey("mantle-test-secret".to_owned()),
                 )
             })
             .await;
@@ -397,12 +355,11 @@ mod tests {
             HttpProtocol::AnthropicMessages,
         ] {
             let (endpoint, server) = serve_unauthorized();
-            let provider = build_provider(
+            let provider = construct_mantle_provider(
                 build_direct_client().unwrap(),
                 endpoint,
                 protocol,
-                Some("mantle-test-secret".to_owned()),
-                RequestAuthorizer::default(),
+                HttpConstructionAuth::ApiKey("mantle-test-secret".to_owned()),
             )
             .unwrap();
 
@@ -487,12 +444,11 @@ mod tests {
 
         for (protocol, body, expected) in cases {
             let (endpoint, server) = serve_ok(body);
-            let provider = build_provider(
+            let provider = construct_mantle_provider(
                 build_direct_client().unwrap(),
                 endpoint,
                 protocol,
-                Some("mantle-test-secret".to_owned()),
-                RequestAuthorizer::default(),
+                HttpConstructionAuth::ApiKey("mantle-test-secret".to_owned()),
             )
             .unwrap();
             let events = provider
@@ -531,12 +487,11 @@ mod tests {
             fixed_time,
         );
         let (endpoint, server) = serve_unauthorized();
-        let provider = build_provider(
+        let provider = construct_mantle_provider(
             build_direct_client().unwrap(),
             endpoint,
             HttpProtocol::OpenAiResponses,
-            None,
-            authorizer,
+            HttpConstructionAuth::MantleSigV4(authorizer),
         )
         .unwrap();
 
