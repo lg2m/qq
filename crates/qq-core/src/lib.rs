@@ -485,7 +485,6 @@ impl Runtime {
                 while let Some(event) = provider_events.next().await {
                     match event {
                         Ok(ProviderEvent::ReasoningStarted { kind }) => {
-                            let kind: ReasoningKind = kind.into();
                             if open_reasoning.is_some() {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,
@@ -501,7 +500,6 @@ impl Runtime {
                             yield RuntimeEvent::ReasoningStarted { kind };
                         }
                         Ok(ProviderEvent::ReasoningDelta { kind, text }) => {
-                            let kind: ReasoningKind = kind.into();
                             if open_reasoning != Some(kind) {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,
@@ -522,7 +520,6 @@ impl Runtime {
                             }
                         }
                         Ok(ProviderEvent::ReasoningCompleted { kind }) => {
-                            let kind: ReasoningKind = kind.into();
                             if open_reasoning != Some(kind) {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,

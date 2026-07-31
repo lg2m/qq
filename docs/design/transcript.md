@@ -60,6 +60,28 @@ applies per contiguous call group, not per run. The header is kept even
 for turns whose text is a single short interim line — consistency beats
 density.
 
+Call groups do not require an assistant message as an anchor. The runtime
+deliberately persists no message row for a call-only turn, so the client renders
+those calls directly after the run's user prompt until a later text turn gives
+the run an assistant-message anchor. Fold/Focus likewise includes the focused
+run's calls; a compressed layout must not turn active work into a generic
+"working" label.
+
+## Long Messages
+
+A completed assistant message is fully reachable through transcript scrolling.
+Render caches and terminal viewports may bound work, but they must not discard
+the beginning of authoritative output. While a message is still streaming, QQ
+may render a bounded tail to keep per-frame work predictable; when it does, it
+shows an explicit omission notice and restores the full message when the turn
+reaches a terminal state.
+
+Completed messages inside the styled-markdown bounds cache their rendered rows.
+Oversized messages use a sparse plain-text row index: only the requested
+terminal viewport is reconstructed, checkpoints are bounded, and the
+authoritative string remains the source. This trades rich markdown styling on
+exceptionally large output for complete access and predictable frame work.
+
 ## Spacing
 
 Rhythm rules, applied in the transcript assembler:

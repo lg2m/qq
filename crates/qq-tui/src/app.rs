@@ -1,4 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Range,
+};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
@@ -145,7 +148,7 @@ pub(crate) struct SessionView {
     /// currently carry it, so reconnects fall back to a generic running label
     /// until the next live activity event arrives.
     pub activity: Option<(RunId, RunActivity)>,
-    loaded_through: u64,
+    pub(crate) loaded_through: u64,
 }
 
 pub(crate) struct ModelPicker {
@@ -1207,7 +1210,12 @@ impl App {
         }
     }
 
-    pub(crate) fn update_transcript_viewport(&mut self, body_rows: usize, height: usize) {
+    pub(crate) fn update_transcript_viewport(
+        &mut self,
+        body_rows: usize,
+        height: usize,
+        preserve_tail_anchor: bool,
+    ) {
         let context = (self.focused, self.layout);
         if self.transcript_viewport.context != Some(context) {
             self.transcript_viewport = TranscriptViewport {
@@ -1218,7 +1226,10 @@ impl App {
             };
             return;
         }
-        if self.transcript_viewport.offset > 0 && self.transcript_viewport.height > 0 {
+        if self.transcript_viewport.offset > 0
+            && self.transcript_viewport.height > 0
+            && !preserve_tail_anchor
+        {
             let top = self
                 .transcript_viewport
                 .body_rows
@@ -1232,6 +1243,15 @@ impl App {
             .transcript_viewport
             .offset
             .min(body_rows.saturating_sub(height));
+    }
+
+    pub(crate) fn transcript_viewport_intersects_or_follows(&self, rows: &Range<usize>) -> bool {
+        self.transcript_viewport.height > 0
+            && self
+                .transcript_viewport
+                .body_rows
+                .saturating_sub(self.transcript_viewport.offset)
+                > rows.start
     }
 
     pub(crate) const fn transcript_scroll_offset(&self) -> usize {
@@ -3922,7 +3942,7 @@ mod tests {
     #[test]
     fn page_keys_scroll_the_transcript_by_one_visible_page() {
         let mut app = App::new(TuiOptions::default());
-        app.update_transcript_viewport(100, 12);
+        app.update_transcript_viewport(100, 12, false);
 
         let (changed, requests) = app.handle_terminal_event(Event::Key(KeyEvent::new(
             KeyCode::PageUp,
@@ -3946,7 +3966,7 @@ mod tests {
     #[test]
     fn mouse_wheel_scrolls_the_transcript_by_three_rows() {
         let mut app = App::new(TuiOptions::default());
-        app.update_transcript_viewport(100, 12);
+        app.update_transcript_viewport(100, 12, false);
 
         let mouse = |kind| {
             Event::Mouse(MouseEvent {
@@ -3972,13 +3992,13 @@ mod tests {
     #[test]
     fn streamed_rows_do_not_move_a_scrolled_transcript() {
         let mut app = App::new(TuiOptions::default());
-        app.update_transcript_viewport(40, 10);
+        app.update_transcript_viewport(40, 10, false);
         app.handle_terminal_event(Event::Key(KeyEvent::new(
             KeyCode::PageUp,
             KeyModifiers::NONE,
         )));
 
-        app.update_transcript_viewport(45, 10);
+        app.update_transcript_viewport(45, 10, false);
 
         assert_eq!(app.transcript_scroll_offset(), 15);
     }
@@ -3987,14 +4007,14 @@ mod tests {
     fn session_and_layout_changes_return_the_transcript_to_the_live_tail() {
         let mut app = App::new(TuiOptions::default());
         app.focused = Some(SessionId::from_bytes([1; 16]));
-        app.update_transcript_viewport(100, 10);
+        app.update_transcript_viewport(100, 10, false);
         app.handle_terminal_event(Event::Key(KeyEvent::new(
             KeyCode::PageUp,
             KeyModifiers::NONE,
         )));
 
         app.focused = Some(SessionId::from_bytes([2; 16]));
-        app.update_transcript_viewport(100, 10);
+        app.update_transcript_viewport(100, 10, false);
 
         assert_eq!(app.transcript_scroll_offset(), 0);
 
@@ -4003,7 +4023,7 @@ mod tests {
             KeyModifiers::NONE,
         )));
         app.layout = app.layout.next();
-        app.update_transcript_viewport(100, 10);
+        app.update_transcript_viewport(100, 10, false);
 
         assert_eq!(app.transcript_scroll_offset(), 0);
     }
@@ -4011,7 +4031,7 @@ mod tests {
     #[test]
     fn scrolling_clamps_at_the_oldest_row_and_the_live_tail() {
         let mut app = App::new(TuiOptions::default());
-        app.update_transcript_viewport(25, 10);
+        app.update_transcript_viewport(25, 10, false);
         let page_up = Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         let page_down = Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
 
@@ -4029,7 +4049,7 @@ mod tests {
     #[test]
     fn transcript_scroll_controls_are_ignored_by_overlays() {
         let mut app = App::new(TuiOptions::default());
-        app.update_transcript_viewport(100, 10);
+        app.update_transcript_viewport(100, 10, false);
         app.model_picker = Some(ModelPicker {
             query: String::new(),
             selected: 0,
