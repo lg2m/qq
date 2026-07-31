@@ -437,6 +437,11 @@ pub struct SessionSummary {
     pub queued_prompts: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Input-token total of the latest measured prompt turn for this
+    /// session. This is session state rather than arbitrary run history:
+    /// compaction and model changes clear it until the next prompt turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd_nanos: Option<u64>,
     pub updated_at_ms: u64,
@@ -455,9 +460,11 @@ pub struct RunSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
     /// Input-token total (fresh input + cache reads + cache writes) of the
-    /// run's final completed model turn: the model context occupancy after
-    /// the run. Distinct from `usage`, which sums every turn for billing.
-    /// Absent on runs persisted before the field existed.
+    /// run's final completed model turn. Distinct from `usage`, which sums
+    /// every turn for billing. An internal compaction run measures its
+    /// pre-compaction request, not the session state after compaction; clients
+    /// use `SessionSummary::context_tokens` for the session meter. Absent on
+    /// runs persisted before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -675,13 +682,21 @@ pub enum SessionEvent {
         before_bytes: u64,
         after_bytes: u64,
     },
-    /// A model turn committed mid-run: the run's context occupancy moved.
-    /// `context_tokens` is the completed turn's input-token total (fresh
-    /// input + cache reads + cache writes) — what the turn's request occupied
-    /// of the model's context window. Deliberately small: no snapshots.
+    /// A measured model turn committed mid-run: the run's per-turn context
+    /// audit value moved. `context_tokens` is the completed turn's input-token
+    /// total (fresh input + cache reads + cache writes). This does not update
+    /// the session meter; clients use `SessionContextUpdated` for that.
     RunContextUpdated {
         run_id: RunId,
         context_tokens: u64,
+    },
+    /// A prompt turn committed against the session's currently selected
+    /// model. `None` explicitly makes occupancy unknown when the provider did
+    /// not report usage. Deliberately small: no snapshots.
+    SessionContextUpdated {
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u64>,
     },
     RunFinished {
         session: SessionSummary,
@@ -689,8 +704,9 @@ pub enum SessionEvent {
         outcome: RunOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
-        /// The final completed model turn's input-token total (context
-        /// occupancy), as opposed to `usage`, which sums every turn.
+        /// The final completed model turn's input-token total for this run,
+        /// as opposed to `usage`, which sums every turn. The accompanying
+        /// session summary owns the current session-meter value.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_tokens: Option<u64>,
     },
@@ -1204,6 +1220,7 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
+                context_tokens: None,
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: Some(RunOutcome::Completed),
@@ -1254,6 +1271,7 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model-b".to_owned()),
+                context_tokens: Some(12_500),
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: None,
@@ -1262,10 +1280,22 @@ mod tests {
         let encoded = serde_json::to_value(&updated).unwrap();
         assert_eq!(encoded["type"], "session_updated");
         assert_eq!(encoded["session"]["model"], "test/model-b");
+        assert_eq!(encoded["session"]["context_tokens"], 12_500);
         assert_eq!(
-            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            serde_json::from_value::<SessionEvent>(encoded.clone()).unwrap(),
             updated
         );
+        let mut legacy = encoded;
+        legacy["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_tokens");
+        let SessionEvent::SessionUpdated { session } =
+            serde_json::from_value::<SessionEvent>(legacy).unwrap()
+        else {
+            panic!("expected session update")
+        };
+        assert_eq!(session.context_tokens, None);
 
         let deleted = SessionEvent::SessionDeleted { session_id };
         let encoded = serde_json::to_value(&deleted).unwrap();
@@ -1291,6 +1321,7 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
+                context_tokens: None,
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: Some(RunOutcome::Completed),
@@ -1312,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn run_context_events_and_fields_round_trip_and_legacy_payloads_decode_to_none() {
+    fn context_events_and_fields_round_trip_and_legacy_payloads_decode_to_none() {
         let updated = SessionEvent::RunContextUpdated {
             run_id: id(4),
             context_tokens: 12_500,
@@ -1325,6 +1356,29 @@ mod tests {
             updated
         );
 
+        let session_updated = SessionEvent::SessionContextUpdated {
+            run_id: id(4),
+            context_tokens: Some(12_500),
+        };
+        let encoded = serde_json::to_value(&session_updated).unwrap();
+        assert_eq!(encoded["type"], "session_context_updated");
+        assert_eq!(encoded["context_tokens"], 12_500);
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            session_updated
+        );
+
+        let unknown = SessionEvent::SessionContextUpdated {
+            run_id: id(4),
+            context_tokens: None,
+        };
+        let encoded = serde_json::to_value(&unknown).unwrap();
+        assert!(encoded.get("context_tokens").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            unknown
+        );
+
         let finished = SessionEvent::RunFinished {
             session: SessionSummary {
                 id: id(3),
@@ -1335,6 +1389,7 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
+                context_tokens: Some(16),
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: Some(RunOutcome::Completed),

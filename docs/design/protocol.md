@@ -43,7 +43,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -55,7 +55,10 @@ run context occupancy (`run_context_updated`,
 `RunSnapshot.context_tokens`); version 4 added workspace-lifetime
 approvals (the `approve_for_workspace` decision, the
 `approved_for_workspace` resolution, and the
-`workspace_grant_promoted` event).
+`workspace_grant_promoted` event); version 5 made context occupancy
+authoritative session state (`SessionSummary.context_tokens` and
+`session_context_updated`) so legacy billing totals and internal compaction
+runs cannot masquerade as the current session context.
 
 Clients and servers must agree on this value.
 
@@ -223,7 +226,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 4,
+  "protocol_version": 5,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -779,7 +782,8 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `tool_call_started` | `tool_call` | Execution began |
 | `tool_call_output_delta` | `tool_call_id`, `chunk` | Incremental output from a running call (shell) |
 | `tool_call_finished` | `tool_call` | Execution ended with result/error |
-| `run_context_updated` | `run_id`, `context_tokens` | A model turn committed; context occupancy moved |
+| `run_context_updated` | `run_id`, `context_tokens` | A measured model turn committed; the run audit value moved |
+| `session_context_updated` | `run_id`, optional `context_tokens` | A current-model prompt turn committed; the session meter moved or became unknown |
 | `cancellation_requested` | `session`, `run_id` | Cancel command accepted for a live run |
 | `run_finished` | `session`, `run_id`, `outcome`, optional `usage`, optional `context_tokens` | Terminal run state |
 | `session_compacted` | `session`, optional `summary`, `before_bytes`, `after_bytes` | Compaction summary + cutoff committed |
@@ -793,7 +797,8 @@ Text channels:
 has already finished when it is published), a bounded excerpt of the summary
 text (optional on the wire), and the assembled context size in bytes before
 and after the compaction so clients can surface the shrink without waiting
-for the next run's usage.
+for the next run's usage. The summary's `context_tokens` is absent because the
+compaction provider usage measured the replaced input, not the new summary.
 
 ### Snapshots embedded in events
 
@@ -812,6 +817,7 @@ round trip:
   "active_run_id": "...",
   "queued_prompts": 0,
   "model": "provider/model",
+  "context_tokens": 12500,
   "estimated_cost_usd_nanos": 1234567,
   "updated_at_ms": 1710000000123,
   "last_outcome": null
@@ -819,6 +825,11 @@ round trip:
 ```
 
 Session status: `idle`, `queued`, `running`.
+
+`context_tokens` is the latest exact prompt-turn input total measured for the
+session. It is absent when unknown. A successful compaction or a model change
+clears it until another prompt turn reports usage; clients must not reconstruct
+it from cumulative run billing.
 
 **`RunSnapshot`**
 
@@ -839,10 +850,17 @@ Run status: `queued`, `running`, `completed`, `cancelled`, `failed`,
 
 `usage` sums every model turn in the run and is the billing figure;
 `context_tokens` is the final completed turn's input-token total (fresh
-input + cache reads + cache writes) — the run's context occupancy.
-`run_context_updated` streams the same figure per committed turn so
-clients can show a live context meter during long runs; it carries no
-snapshots and is absent for runs persisted before version 3.
+input + cache reads + cache writes) for that run. Internal compaction runs
+measure the pre-compaction summarizer request, so this per-run audit field is
+not a substitute for `SessionSummary.context_tokens`.
+`run_context_updated` streams measured per-run audit values and is absent for
+unmeasured turns and runs persisted before version 3.
+`session_context_updated` is the live session-meter event. It is emitted only
+for prompt turns whose model still matches the session's selected model; an
+absent `context_tokens` explicitly clears the meter when that turn was not
+measured. Clients must ignore `run_context_updated` for session occupancy,
+including during replay of pre-version-5 events. Both events carry no
+snapshots.
 
 **`MessageSnapshot`**
 

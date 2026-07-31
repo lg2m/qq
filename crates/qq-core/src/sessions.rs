@@ -1737,6 +1737,7 @@ struct RunAccounting {
     usage: Option<TokenUsage>,
     context_tokens: Option<u64>,
     estimated_cost_usd_nanos: Option<u64>,
+    saw_turn: bool,
 }
 
 struct RunAccountingAccumulator {
@@ -1762,14 +1763,16 @@ impl RunAccountingAccumulator {
         self.saw_turn = true;
         let Some(usage) = usage else {
             self.usage = None;
+            // A newer completed request without usage makes the run's and
+            // session's current occupancy unknown. Retaining an older exact
+            // turn would present stale state as authoritative.
+            self.context_tokens = None;
             self.estimated_cost_usd_nanos = None;
             return;
         };
         // Context occupancy is the latest reported turn's input total, not a
         // sum: every model request re-sends the whole conversation, so the
-        // last request measures what the context window currently holds. A
-        // usage-less turn keeps the previous turn's figure as the best
-        // available estimate.
+        // last measured request describes what the context window held.
         self.context_tokens = Some(turn_context_tokens(usage));
         self.usage = self.usage.and_then(|total| add_usage(total, usage));
         if self.usage.is_none() {
@@ -1789,6 +1792,7 @@ impl RunAccountingAccumulator {
                 .saw_turn
                 .then_some(self.estimated_cost_usd_nanos)
                 .flatten(),
+            saw_turn: self.saw_turn,
         }
     }
 }
@@ -2185,8 +2189,8 @@ impl Store {
     /// in the same transaction so no crash window can leave a committed turn
     /// with a message still marked streaming.
     /// The turn's reported context occupancy (its input-token total) rides
-    /// the same transaction: it updates the run row and publishes
-    /// `RunContextUpdated` so clients track context while the run progresses.
+    /// the same transaction: it updates the run audit row and, when this is a
+    /// prompt for the still-selected model, the authoritative session meter.
     async fn persist_model_turn(
         &self,
         claimed: &ClaimedRun,
@@ -2532,6 +2536,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  max_output_tokens INTEGER,
                  organization TEXT,
                  approval_mode TEXT NOT NULL DEFAULT 'ask',
+                 context_tokens INTEGER,
                  estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
                  cost_known INTEGER NOT NULL DEFAULT 1,
                  created_at_ms INTEGER NOT NULL,
@@ -2828,8 +2833,23 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10") => {}
+        Some("10" | "11") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
+    }
+    if schema_version.as_deref() != Some("11") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_sessions_context_tokens_column(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '11' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     let stored = connection
         .query_row(
@@ -2989,6 +3009,18 @@ fn add_runs_context_tokens_column(connection: &Connection) -> Result<(), Session
     if !has_column(connection, "runs", "context_tokens")? {
         connection
             .execute("ALTER TABLE runs ADD COLUMN context_tokens INTEGER", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+/// Adds authoritative session occupancy without guessing from historical
+/// run billing totals. Existing sessions remain unknown until a prompt turn
+/// reports usage.
+fn add_sessions_context_tokens_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "sessions", "context_tokens")? {
+        connection
+            .execute("ALTER TABLE sessions ADD COLUMN context_tokens INTEGER", [])
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     Ok(())
@@ -3696,14 +3728,17 @@ fn execute_command(
             transaction
                 .execute(
                     "UPDATE sessions
-                     SET model = ?2, max_output_tokens = ?3, organization = ?4,
+                     SET context_tokens = CASE
+                             WHEN model IS ?2 THEN context_tokens ELSE NULL
+                         END,
+                         model = ?2, max_output_tokens = ?3, organization = ?4,
                          updated_at_ms = ?5
                      WHERE id = ?1",
                     params![
                         session_id.to_string(),
-                        model.model,
+                        &model.model,
                         model.max_output_tokens,
-                        model.organization,
+                        &model.organization,
                         now,
                     ],
                 )
@@ -4403,7 +4438,7 @@ fn persist_model_turn(
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let now = now_ms();
-    let mut events = Vec::with_capacity(calls.len());
+    let mut events = Vec::with_capacity(calls.len().saturating_add(2));
     for call in calls {
         transaction
             .execute(
@@ -4437,16 +4472,15 @@ fn persist_model_turn(
             SessionEvent::ToolCallRequested { tool_call },
         )?);
     }
-    // Persist-before-publish like every other event: the run row records the
-    // turn's context occupancy in the same transaction that commits the turn,
-    // and the lightweight update event rides along for live meters.
+    // Persist-before-publish like every other event. A missing provider value
+    // clears the previous turn's audit value instead of leaving stale data.
+    transaction
+        .execute(
+            "UPDATE runs SET context_tokens = ?2 WHERE id = ?1",
+            params![claimed.run_id.to_string(), context_tokens],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
     if let Some(context_tokens) = context_tokens {
-        transaction
-            .execute(
-                "UPDATE runs SET context_tokens = ?2 WHERE id = ?1",
-                params![claimed.run_id.to_string(), context_tokens],
-            )
-            .map_err(|_| SessionRuntimeError::Persistence)?;
         events.push(append_event(
             &transaction,
             EventContext {
@@ -4458,6 +4492,39 @@ fn persist_model_turn(
                 occurred_at_ms: now,
             },
             SessionEvent::RunContextUpdated {
+                run_id: claimed.run_id,
+                context_tokens,
+            },
+        )?);
+    }
+    let session_context_updated = if claimed.kind == RunKind::Prompt {
+        transaction
+            .execute(
+                "UPDATE sessions SET context_tokens = ?2
+                 WHERE id = ?1 AND model IS ?3",
+                params![
+                    claimed.session_id.to_string(),
+                    context_tokens,
+                    &claimed.model.model,
+                ],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            == 1
+    } else {
+        false
+    };
+    if session_context_updated {
+        events.push(append_event(
+            &transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by: Some(claimed.command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::SessionContextUpdated {
                 run_id: claimed.run_id,
                 context_tokens,
             },
@@ -5147,6 +5214,15 @@ fn complete_compaction(
                 params![claimed.session_id.to_string(), COMPACTION_HISTORY_ROWS],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
+        // The compaction request measured the context that was just
+        // replaced, not the summary now occupying the session. Keep the
+        // session unknown until its next prompt turn reports exact usage.
+        transaction
+            .execute(
+                "UPDATE sessions SET context_tokens = NULL WHERE id = ?1",
+                [claimed.session_id.to_string()],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
         events.push(finalize_run(
             &transaction,
             store_id,
@@ -5218,6 +5294,12 @@ fn finalize_run(
         .as_ref()
         .and_then(|accounting| accounting.estimated_cost_usd_nanos)
         .and_then(|cost| i64::try_from(cost).ok());
+    let reported_context_tokens = accounting
+        .as_ref()
+        .and_then(|accounting| accounting.context_tokens);
+    let saw_turn = accounting
+        .as_ref()
+        .is_some_and(|accounting| accounting.saw_turn);
     let (current_cost, current_cost_known) = transaction
         .query_row(
             "SELECT estimated_cost_usd_nanos, cost_known FROM sessions WHERE id = ?1",
@@ -5225,7 +5307,7 @@ fn finalize_run(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let (next_cost, next_cost_known) = if accounting.is_some() {
+    let (next_cost, next_cost_known) = if saw_turn {
         match cost.and_then(|cost| current_cost.checked_add(cost)) {
             Some(cost) if current_cost_known => (cost, true),
             _ => (current_cost, false),
@@ -5233,14 +5315,15 @@ fn finalize_run(
     } else {
         (current_cost, current_cost_known)
     };
-    // COALESCE keeps the last per-turn figure when the terminal accounting
-    // carries none (an unaccounted finish after turns already committed).
+    // Terminal accounting owns the final per-turn figure only when a model
+    // turn completed. No completed turn preserves an earlier committed value;
+    // an unmeasured completed turn explicitly clears it.
     transaction
         .execute(
             "UPDATE runs
              SET status = ?2, outcome_json = ?3, finished_at_ms = ?4,
                  usage_json = ?5, estimated_cost_usd_nanos = ?6,
-                 context_tokens = COALESCE(?7, context_tokens)
+                 context_tokens = CASE WHEN ?8 THEN ?7 ELSE context_tokens END
              WHERE id = ?1 AND outcome_json IS NULL",
             params![
                 claimed.run_id.to_string(),
@@ -5249,9 +5332,8 @@ fn finalize_run(
                 now,
                 usage_json,
                 cost,
-                accounting
-                    .as_ref()
-                    .and_then(|accounting| accounting.context_tokens),
+                reported_context_tokens,
+                saw_turn,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -5270,6 +5352,11 @@ fn finalize_run(
                   status = CASE WHEN queued_prompts > 0 THEN 'queued' ELSE 'idle' END,
                   estimated_cost_usd_nanos = ?4,
                   cost_known = ?5,
+                  context_tokens = CASE
+                      WHEN ?6 AND ?7 AND model IS ?9
+                      THEN ?8
+                      ELSE context_tokens
+                  END,
                   updated_at_ms = ?2
              WHERE id = ?1 AND active_run_id = ?3",
             params![
@@ -5278,6 +5365,10 @@ fn finalize_run(
                 claimed.run_id.to_string(),
                 next_cost,
                 next_cost_known,
+                claimed.kind == RunKind::Prompt,
+                saw_turn,
+                reported_context_tokens,
+                &claimed.model.model,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -5876,7 +5967,7 @@ fn load_session_summary(
     connection
         .query_row(
             "SELECT s.workspace_id, s.parent_id, s.title, s.status, s.active_run_id,
-                     s.queued_prompts, s.model,
+                     s.queued_prompts, s.model, s.context_tokens,
                      CASE WHEN s.cost_known = 1 THEN s.estimated_cost_usd_nanos END,
                      s.updated_at_ms,
                      (SELECT outcome_json FROM runs
@@ -5894,8 +5985,9 @@ fn load_session_summary(
                     row.get::<_, u16>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<u64>>(7)?,
-                    row.get::<_, u64>(8)?,
-                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<u64>>(8)?,
+                    row.get::<_, u64>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -5911,6 +6003,7 @@ fn load_session_summary(
                 active,
                 queued,
                 model,
+                context_tokens,
                 cost,
                 updated,
                 last_outcome,
@@ -5924,6 +6017,7 @@ fn load_session_summary(
                     active_run_id: active.as_deref().map(parse_id).transpose()?,
                     queued_prompts: queued,
                     model,
+                    context_tokens,
                     estimated_cost_usd_nanos: cost,
                     updated_at_ms: updated,
                     last_outcome: last_outcome
@@ -6912,6 +7006,67 @@ mod tests {
         }
     }
 
+    struct PricedHangingLoader;
+
+    impl RuntimeLoader for PricedHangingLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            Box::pin(async {
+                Runtime::new(HangingProvider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: Some(ModelPricing {
+                            input_usd_nanos_per_token: 1_000,
+                            output_usd_nanos_per_token: 2_000,
+                            cache_read_usd_nanos_per_token: Some(100),
+                            cache_write_usd_nanos_per_token: Some(300),
+                            context_tier: None,
+                            provenance: "test".to_owned(),
+                        }),
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct UsageSequenceLoader {
+        usages: StdMutex<Vec<Option<qq_provider::ProviderUsage>>>,
+    }
+
+    impl RuntimeLoader for UsageSequenceLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let usage = self.usages.lock().unwrap().remove(0);
+            Box::pin(async move {
+                Runtime::new(UsageSequenceProvider { usage }, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct UsageSequenceProvider {
+        usage: Option<qq_provider::ProviderUsage>,
+    }
+
+    impl Provider for UsageSequenceProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "answer".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed { usage: self.usage }),
+            ]))
+        }
+    }
+
     struct ChunkingLoader;
 
     impl RuntimeLoader for ChunkingLoader {
@@ -7133,6 +7288,7 @@ mod tests {
                 tool: self.tool,
                 arguments: self.arguments,
                 tool_turns: self.tool_turns,
+                usage: None,
             };
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
@@ -7154,6 +7310,7 @@ mod tests {
         tool: &'static str,
         arguments: &'static str,
         tool_turns: usize,
+        usage: Option<qq_provider::ProviderUsage>,
     }
 
     impl Provider for ApprovalProvider {
@@ -7176,14 +7333,14 @@ mod tests {
                     Ok(qq_provider::ProviderEvent::ToolCallCompleted {
                         id: format!("call_{turn}"),
                     }),
-                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: self.usage }),
                 ]))
             } else {
                 Box::pin(stream::iter([
                     Ok(qq_provider::ProviderEvent::OutputTextDelta {
                         text: "done".to_owned(),
                     }),
-                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: self.usage }),
                 ]))
             }
         }
@@ -7516,6 +7673,12 @@ mod tests {
                 tool: "__test_mutate",
                 arguments: "{}",
                 tool_turns: 1,
+                usage: Some(qq_provider::ProviderUsage {
+                    input_tokens: 7,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 1,
+                }),
             };
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
@@ -7593,7 +7756,22 @@ mod tests {
             panic!("unexpected receipt")
         };
         // The run is now claimed and parked at its tool approval.
-        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let (before_switch, tool_call) =
+            collect_until_approval_requested(&mut harness.events).await;
+        assert!(before_switch.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunContextUpdated {
+                context_tokens: 7,
+                ..
+            }
+        )));
+        assert!(before_switch.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::SessionContextUpdated {
+                context_tokens: Some(7),
+                ..
+            }
+        )));
 
         let receipt = harness
             .runtime
@@ -7622,6 +7800,7 @@ mod tests {
             SessionEvent::SessionUpdated { session }
                 if session.model.as_deref() == Some("test/model-b")
                     && session.active_run_id == Some(run_id)
+                    && session.context_tokens.is_none()
         ));
 
         respond_approval(
@@ -7632,7 +7811,27 @@ mod tests {
         )
         .await
         .unwrap();
-        collect_through_finished(&mut harness.events).await;
+        let finished_old_model = collect_through_finished(&mut harness.events).await;
+        assert!(
+            finished_old_model
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::RunContextUpdated { .. }))
+        );
+        assert!(
+            finished_old_model
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::SessionContextUpdated { .. }))
+        );
+        assert!(finished_old_model.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                session: SessionSummary {
+                    context_tokens: None,
+                    ..
+                },
+                ..
+            }
+        )));
 
         let queued = harness
             .runtime
@@ -7668,6 +7867,17 @@ mod tests {
                 Some("test/model-b".to_owned())
             ]
         );
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.focused.unwrap().summary.context_tokens, Some(7));
 
         // The same validation as CreateSession applies.
         assert_eq!(
@@ -7977,7 +8187,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "10"
+            "11"
         );
         assert!(
             !connection
@@ -8100,7 +8310,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "10"
+            "11"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -8168,7 +8378,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "10"
+            "11"
         );
         let (display_json, result) = connection
             .query_row(
@@ -8227,7 +8437,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "10"
+            "11"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -8245,6 +8455,84 @@ mod tests {
                     .get::<_, u32>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn version_ten_migration_adds_unknown_session_context_without_guessing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version', '10');
+                     CREATE TABLE workspaces (
+                         id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                         next_sequence INTEGER NOT NULL DEFAULT 0
+                     );
+                     INSERT INTO workspaces VALUES ('workspace', '/workspace', 0);
+                     CREATE TABLE sessions (
+                         id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                         parent_id TEXT REFERENCES sessions(id), title TEXT NOT NULL,
+                         status TEXT NOT NULL, active_run_id TEXT,
+                         queued_prompts INTEGER NOT NULL DEFAULT 0, model TEXT,
+                         max_output_tokens INTEGER, organization TEXT,
+                         approval_mode TEXT NOT NULL DEFAULT 'ask',
+                         estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                         cost_known INTEGER NOT NULL DEFAULT 1,
+                         created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+                     );
+                     INSERT INTO sessions VALUES (
+                         'session', 'workspace', NULL, 'Old', 'idle', NULL, 0,
+                         'openai/gpt-test', 100, NULL, 'ask', 0, 1, 1, 1
+                     );",
+                )
+                .unwrap();
+        }
+
+        let (connection, _) = open_database(&path).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "11"
+        );
+        assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT context_tokens FROM sessions WHERE id = 'session'",
+                    [],
+                    |row| row.get::<_, Option<u64>>(0),
+                )
+                .unwrap(),
+            None
+        );
+        connection
+            .execute(
+                "UPDATE sessions SET context_tokens = 12_500 WHERE id = 'session'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let (reopened, _) = open_database(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT context_tokens FROM sessions WHERE id = 'session'",
+                    [],
+                    |row| row.get::<_, Option<u64>>(0),
+                )
+                .unwrap(),
+            Some(12_500)
         );
     }
 
@@ -8787,6 +9075,7 @@ mod tests {
             .unwrap();
         let focused = snapshot.focused.unwrap();
         assert_eq!(focused.messages.len(), 2);
+        assert_eq!(focused.summary.context_tokens, Some(13));
         let cost_before = focused.summary.estimated_cost_usd_nanos.unwrap();
 
         let compaction_run = compact_session(&runtime, session_id).await;
@@ -8811,21 +9100,39 @@ mod tests {
                 output_tokens: 5,
             })
         );
-        let (before_bytes, after_bytes, summary_excerpt) = observed
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                session: SessionSummary {
+                    context_tokens: None,
+                    ..
+                },
+                run_id,
+                context_tokens: Some(13),
+                ..
+            } if *run_id == compaction_run
+        )));
+        let (before_bytes, after_bytes, summary_excerpt, context_tokens) = observed
             .iter()
             .find_map(|event| match &event.event {
                 SessionEvent::SessionCompacted {
+                    session,
                     before_bytes,
                     after_bytes,
                     summary,
-                    ..
-                } => Some((*before_bytes, *after_bytes, summary.clone())),
+                } => Some((
+                    *before_bytes,
+                    *after_bytes,
+                    summary.clone(),
+                    session.context_tokens,
+                )),
                 _ => None,
             })
             .unwrap();
         assert!(before_bytes > 0);
         assert!(after_bytes > 0);
         assert_eq!(summary_excerpt.as_deref(), Some("hello"));
+        assert_eq!(context_tokens, None);
 
         // The transcript is untouched: no new message rows, one more run,
         // cost increased, session idle again.
@@ -8842,6 +9149,8 @@ mod tests {
         assert_eq!(focused.messages.len(), 2);
         assert_eq!(focused.runs.len(), 2);
         assert_eq!(focused.summary.status, SessionStatus::Idle);
+        assert_eq!(focused.summary.context_tokens, None);
+        assert_eq!(focused.runs[1].context_tokens, Some(13));
         assert!(focused.summary.estimated_cost_usd_nanos.unwrap() > cost_before);
     }
 
@@ -9683,15 +9992,34 @@ mod tests {
         assert!(matches!(
             &observed.last().unwrap().event,
             SessionEvent::RunFinished {
+                session: SessionSummary {
+                    context_tokens: Some(13),
+                    ..
+                },
                 usage: Some(TokenUsage {
                     input_tokens: 10,
                     cache_read_input_tokens: 2,
                     cache_write_input_tokens: 1,
                     output_tokens: 5,
                 }),
+                context_tokens: Some(13),
                 ..
             }
         ));
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunContextUpdated {
+                context_tokens: 13,
+                ..
+            }
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::SessionContextUpdated {
+                context_tokens: Some(13),
+                ..
+            }
+        )));
         let snapshot = runtime
             .snapshot(SnapshotRequest {
                 workspace_id,
@@ -9706,6 +10034,7 @@ mod tests {
         assert_eq!(focused.messages[1].output, "hello");
         assert_eq!(focused.summary.status, SessionStatus::Idle);
         assert_eq!(focused.summary.model.as_deref(), Some("test/model"));
+        assert_eq!(focused.summary.context_tokens, Some(13));
         assert_eq!(focused.summary.estimated_cost_usd_nanos, Some(20_500));
         assert_eq!(
             focused.runs[0].usage,
@@ -9716,8 +10045,141 @@ mod tests {
                 output_tokens: 5,
             })
         );
+        assert_eq!(focused.runs[0].context_tokens, Some(13));
         assert_eq!(focused.runs[0].estimated_cost_usd_nanos, Some(20_500));
         assert!(snapshot.cursor.sequence > initial.sequence);
+    }
+
+    #[tokio::test]
+    async fn unmeasured_new_prompt_clears_stale_session_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(UsageSequenceLoader {
+                usages: StdMutex::new(vec![
+                    Some(qq_provider::ProviderUsage {
+                        input_tokens: 40_000,
+                        cache_read_input_tokens: 12_000,
+                        cache_write_input_tokens: 2_400,
+                        output_tokens: 1,
+                    }),
+                    None,
+                ]),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let first_run = queue_prompt(&runtime, session_id, "measured".to_owned()).await;
+        let first = collect_through_finished(&mut events).await;
+        assert!(first.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::SessionContextUpdated {
+                run_id,
+                context_tokens: Some(54_400),
+            } if run_id == first_run
+        )));
+
+        let second_run = queue_prompt(&runtime, session_id, "unmeasured".to_owned()).await;
+        let second = collect_through_finished(&mut events).await;
+        assert!(second.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::SessionContextUpdated {
+                run_id,
+                context_tokens: None,
+            } if run_id == second_run
+        )));
+        assert!(second.iter().all(|event| !matches!(
+            event.event,
+            SessionEvent::RunContextUpdated { run_id, .. } if run_id == second_run
+        )));
+        assert!(second.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                session: SessionSummary {
+                    context_tokens: None,
+                    ..
+                },
+                run_id,
+                usage: None,
+                context_tokens: None,
+                ..
+            } if *run_id == second_run
+        )));
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.summary.context_tokens, None);
+        assert_eq!(focused.runs.len(), 2);
+        assert_eq!(focused.runs[0].context_tokens, Some(54_400));
+        assert_eq!(focused.runs[1].context_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_a_model_turn_preserves_known_session_cost() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(PricedHangingLoader),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let run_id = queue_prompt(&runtime, session_id, "cancel".to_owned()).await;
+        collect_until(&mut events, |event| {
+            matches!(event, SessionEvent::RunStarted { run_id: started, .. } if *started == run_id)
+        })
+        .await;
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id },
+            )
+            .await
+            .unwrap();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                session: SessionSummary {
+                    estimated_cost_usd_nanos: Some(0),
+                    ..
+                },
+                outcome: RunOutcome::Cancelled,
+                ..
+            }
+        )));
     }
 
     #[tokio::test]
@@ -9756,6 +10218,17 @@ mod tests {
             .unwrap();
 
         let observed = collect_through_finished(&mut events).await;
+        let context_updates = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::SessionContextUpdated {
+                    context_tokens: Some(context_tokens),
+                    ..
+                } => Some(*context_tokens),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(context_updates, [4, 6]);
         let requested = observed
             .iter()
             .position(|event| matches!(event.event, SessionEvent::ToolCallRequested { .. }))
@@ -9795,6 +10268,8 @@ mod tests {
                 output_tokens: 3,
             })
         );
+        assert_eq!(focused.runs[0].context_tokens, Some(6));
+        assert_eq!(focused.summary.context_tokens, Some(6));
 
         runtime
             .command(

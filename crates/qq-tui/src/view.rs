@@ -1989,8 +1989,10 @@ fn footer_context(app: &App, width: usize) -> Line {
             let tenths = u128::from(tokens) * 1_000 / u128::from(limit);
             format!(" context: {}.{}% / {limit}", tenths / 10, tenths % 10)
         }
-        // Unknown usage reads as an empty gauge, never as a gap in the UI.
-        Some(_) | None => " context: 0.0%".to_owned(),
+        Some(_) | None => app.focused_context_window().map_or_else(
+            || " context: --".to_owned(),
+            |limit| format!(" context: -- / {limit}"),
+        ),
     };
     let focused = app
         .focused
@@ -3183,6 +3185,7 @@ mod tests {
             active_run_id: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            context_tokens: None,
             estimated_cost_usd_nanos: Some(0),
             updated_at_ms: 1,
             last_outcome: None,
@@ -4911,7 +4914,7 @@ mod tests {
             },
         });
         let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
-        session.latest_input_tokens = Some(64_000);
+        session.summary.context_tokens = Some(64_000);
         session.context_window = Some(128_000);
         let frame = FrameRenderer::default().frame(&mut app, 80, 12);
         let rows = frame_rows(&frame);
@@ -4928,15 +4931,16 @@ mod tests {
     }
 
     #[test]
-    fn footer_placeholders_read_as_zero_rather_than_unavailable() {
+    fn footer_renders_unknown_context_without_inventing_zero_usage() {
         let mut app = app_with_messages(0);
         let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
         session.summary.estimated_cost_usd_nanos = None;
-        session.latest_input_tokens = None;
+        session.summary.context_tokens = None;
+        session.context_window = Some(272_000);
 
         let rows = frame_rows(&[footer_context(&app, 80), footer_workspace(&app, 80)]);
 
-        assert!(rows[0].contains("context: 0.0%"));
+        assert!(rows[0].contains("context: -- / 272000"));
         assert!(rows[1].ends_with("cost: $0.00 "));
         assert!(!rows.iter().any(|row| row.contains("unavailable")));
     }
@@ -5019,6 +5023,7 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("openai/gpt-test".to_owned()),
+                context_tokens: None,
                 estimated_cost_usd_nanos: Some(0),
                 updated_at_ms: u64::from(byte),
                 last_outcome: None,

@@ -802,24 +802,24 @@ mod tests {
     async fn request_credential_kind_mismatch_is_rejected_without_mutating_the_request() {
         let cases = [
             (
-                RequestAuthorizer::request_time_bearer(
-                    SharedRequestCredentialProvider::new(StaticWrongKindCredentials {
+                RequestAuthorizer::request_time_bearer(SharedRequestCredentialProvider::new(
+                    StaticWrongKindCredentials {
                         credential: RequestCredential::codex(
                             "codex-secret",
                             "codex-account",
                             false,
                         )
                         .unwrap(),
-                    }),
-                ),
+                    },
+                )),
                 "codex-secret",
             ),
             (
-                RequestAuthorizer::request_time_codex(
-                    SharedRequestCredentialProvider::new(StaticWrongKindCredentials {
+                RequestAuthorizer::request_time_codex(SharedRequestCredentialProvider::new(
+                    StaticWrongKindCredentials {
                         credential: RequestCredential::bearer("bearer-secret").unwrap(),
-                    }),
-                ),
+                    },
+                )),
                 "bearer-secret",
             ),
         ];

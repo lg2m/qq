@@ -81,8 +81,10 @@ Produced by a dedicated summarization run against the session's model
   and the pruning window are configuration alongside the context
   budget.
 - Protocol: a command to request compaction, an event carrying the
-  updated session state (context size before/after); clients surface
-  the shrink in the footer's context meter.
+  updated session state (context size before/after). The exact token meter
+  becomes unknown after compaction until the next prompt turn measures the
+  summarized context; clients must not display the summarizer request's input
+  as the post-compaction session size.
 
 ## Sequencing
 

@@ -8,7 +8,7 @@ use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
     CommandRequest, EditPreview, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection,
     RunActivity, RunId, RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, TokenUsage, ToolCallSnapshot,
+    SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, ToolCallSnapshot,
     ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
@@ -142,7 +142,6 @@ pub(crate) struct SessionView {
     pub summary: SessionSummary,
     pub messages: Option<Vec<MessageSnapshot>>,
     pub tool_calls: Option<Vec<ToolCallSnapshot>>,
-    pub latest_input_tokens: Option<u64>,
     pub context_window: Option<u32>,
     /// Latest replaceable liveness state for the active run. Snapshots do not
     /// currently carry it, so reconnects fall back to a generic running label
@@ -502,7 +501,6 @@ impl App {
                         summary,
                         messages: None,
                         tool_calls: None,
-                        latest_input_tokens: None,
                         context_window,
                         activity: None,
                         loaded_through: snapshot_sequence,
@@ -561,13 +559,6 @@ impl App {
         );
         let mut tool_calls = snapshot.tool_calls;
         retain_recent_tool_calls(&mut tool_calls);
-        // Context occupancy is the newest run's last-turn figure. Runs
-        // persisted before `context_tokens` existed fall back to their summed
-        // usage: an overestimate, but a present number beats none.
-        let latest_input_tokens = snapshot.runs.iter().rev().find_map(|run| {
-            run.context_tokens
-                .or_else(|| run.usage.map(total_input_tokens))
-        });
         let context_window = model_context_window(&self.models, snapshot.summary.model.as_deref());
         self.sessions.insert(
             snapshot.summary.id,
@@ -575,7 +566,6 @@ impl App {
                 summary: snapshot.summary,
                 messages: Some(messages),
                 tool_calls: Some(tool_calls),
-                latest_input_tokens,
                 context_window,
                 activity: None,
                 loaded_through,
@@ -766,29 +756,24 @@ impl App {
                     ),
                 );
             }
-            SessionEvent::RunContextUpdated { context_tokens, .. } => {
+            // Run-level audit updates are not session state. In particular,
+            // old persisted events may predate the authoritative session
+            // field, so replaying one must not repopulate the meter.
+            SessionEvent::RunContextUpdated { .. } => {}
+            SessionEvent::SessionContextUpdated { context_tokens, .. } => {
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
-                    session.latest_input_tokens = Some(*context_tokens);
+                    session.summary.context_tokens = *context_tokens;
                 }
             }
             SessionEvent::RunFinished {
                 session,
                 run_id,
                 outcome,
-                usage,
-                context_tokens,
+                ..
             } => {
                 self.upsert_summary(session.clone());
                 if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
                     view.activity = None;
-                }
-                // The last turn's figure is the context occupancy; the summed
-                // usage is a legacy fallback only (it overstates multi-turn
-                // runs but beats showing nothing).
-                if let Some(tokens) = (*context_tokens).or_else(|| usage.map(total_input_tokens))
-                    && let Some(session) = self.sessions.get_mut(&envelope.session_id)
-                {
-                    session.latest_input_tokens = Some(tokens);
                 }
                 if let Some(messages) = self
                     .sessions
@@ -840,7 +825,6 @@ impl App {
                 summary,
                 messages: None,
                 tool_calls: None,
-                latest_input_tokens: None,
                 context_window,
                 activity: None,
                 loaded_through: 0,
@@ -2077,7 +2061,12 @@ impl App {
 
     pub(crate) fn focused_context_usage(&self) -> Option<(u64, u32)> {
         let session = self.focused.and_then(|id| self.sessions.get(&id))?;
-        Some((session.latest_input_tokens?, session.context_window?))
+        Some((session.summary.context_tokens?, session.context_window?))
+    }
+
+    pub(crate) fn focused_context_window(&self) -> Option<u32> {
+        let session = self.focused.and_then(|id| self.sessions.get(&id))?;
+        session.context_window
     }
 
     pub fn thread_order(&self) -> Vec<SessionId> {
@@ -2196,13 +2185,6 @@ fn format_bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-const fn total_input_tokens(usage: TokenUsage) -> u64 {
-    usage
-        .input_tokens
-        .saturating_add(usage.cache_read_input_tokens)
-        .saturating_add(usage.cache_write_input_tokens)
-}
-
 fn model_context_window(models: &[ModelOption], model: Option<&str>) -> Option<u32> {
     models
         .iter()
@@ -2289,6 +2271,7 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("openai/gpt-test".to_owned()),
+                context_tokens: None,
                 estimated_cost_usd_nanos: Some(0),
                 updated_at_ms: 1,
                 last_outcome: None,
@@ -2303,6 +2286,7 @@ mod tests {
                     active_run_id: None,
                     queued_prompts: 0,
                     model: Some("openai/gpt-test".to_owned()),
+                    context_tokens: None,
                     estimated_cost_usd_nanos: Some(0),
                     updated_at_ms: 1,
                     last_outcome: None,
@@ -2862,6 +2846,7 @@ mod tests {
             active_run_id: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            context_tokens: None,
             estimated_cost_usd_nanos: Some(0),
             updated_at_ms: 2,
             last_outcome: None,
@@ -2998,6 +2983,7 @@ mod tests {
             active_run_id: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            context_tokens: None,
             estimated_cost_usd_nanos: Some(0),
             updated_at_ms: 0,
             last_outcome: None,
@@ -3147,8 +3133,8 @@ mod tests {
         let mut app = context_meter_app();
         let mut initial = snapshot();
         let session_id = initial.focused.as_ref().unwrap().summary.id;
-        // The snapshot rehydrates the meter from the run's last-turn figure,
-        // not its multi-turn billing sum (12_500 here).
+        // The snapshot rehydrates the meter from session-owned state, not the
+        // run's multi-turn billing sum (12_500 here).
         initial.focused.as_mut().unwrap().runs.push(RunSnapshot {
             id: id(7, RunId::from_bytes),
             session_id,
@@ -3163,7 +3149,8 @@ mod tests {
             context_tokens: Some(9_000),
             estimated_cost_usd_nanos: Some(1),
         });
-        let summary = initial.focused.as_ref().unwrap().summary.clone();
+        initial.focused.as_mut().unwrap().summary.context_tokens = Some(9_000);
+        let mut summary = initial.focused.as_ref().unwrap().summary.clone();
         let workspace_id = initial.workspace.id;
         let store_id = initial.cursor.store_id;
         app.apply_snapshot(initial);
@@ -3181,15 +3168,18 @@ mod tests {
             run_id: Some(id(8, RunId::from_bytes)),
             caused_by: None,
             occurred_at_ms: 2,
-            event: SessionEvent::RunContextUpdated {
+            event: SessionEvent::SessionContextUpdated {
                 run_id: id(8, RunId::from_bytes),
-                context_tokens: 15_000,
+                context_tokens: Some(15_000),
             },
         });
         assert_eq!(app.focused_context_usage(), Some((15_000, 128_000)));
 
         // RunFinished settles the meter on the final turn's figure even
         // though the run's summed usage is larger (24_000 here).
+        summary.context_tokens = Some(18_000);
+        // A persisted pre-v5 run audit event must not transiently repopulate
+        // the authoritative session meter during replay.
         app.apply_live_event(SessionEventEnvelope {
             cursor: EventCursor {
                 store_id,
@@ -3218,32 +3208,137 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_falls_back_to_summed_usage_for_legacy_runs() {
+    fn prompt_start_and_streaming_do_not_recalculate_session_context() {
         let mut app = context_meter_app();
+        app.models[0].context_window = Some(272_000);
+        let mut initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        initial.focused.as_mut().unwrap().summary.context_tokens = Some(54_400);
+        let workspace_id = initial.workspace.id;
+        let store_id = initial.cursor.store_id;
+        let run_id = id(8, RunId::from_bytes);
+        let user_message_id = id(9, MessageId::from_bytes);
+        let assistant_message_id = id(10, MessageId::from_bytes);
+        let mut summary = initial.focused.as_ref().unwrap().summary.clone();
+        app.apply_snapshot(initial);
+        let envelope = |sequence, event| SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence,
+            },
+            session_id,
+            run_id: Some(run_id),
+            caused_by: None,
+            occurred_at_ms: sequence,
+            event,
+        };
+
+        summary.status = SessionStatus::Queued;
+        summary.queued_prompts = 1;
+        app.apply_live_event(envelope(
+            2,
+            SessionEvent::PromptQueued {
+                session: summary.clone(),
+                message: MessageSnapshot {
+                    id: user_message_id,
+                    session_id,
+                    run_id,
+                    turn_ordinal: 0,
+                    role: MessageRole::User,
+                    state: MessageState::Queued,
+                    output: "question".to_owned(),
+                    refusal: String::new(),
+                    created_at_ms: 2,
+                },
+                run: RunSnapshot {
+                    id: run_id,
+                    session_id,
+                    status: RunStatus::Queued,
+                    outcome: None,
+                    usage: None,
+                    context_tokens: None,
+                    estimated_cost_usd_nanos: None,
+                },
+                queue_position: 1,
+            },
+        ));
+        assert_eq!(app.focused_context_usage(), Some((54_400, 272_000)));
+
+        summary.status = SessionStatus::Running;
+        summary.active_run_id = Some(run_id);
+        summary.queued_prompts = 0;
+        app.apply_live_event(envelope(
+            3,
+            SessionEvent::RunStarted {
+                session: summary,
+                run_id,
+            },
+        ));
+        app.apply_live_event(envelope(
+            4,
+            SessionEvent::AssistantMessageStarted {
+                message: MessageSnapshot {
+                    id: assistant_message_id,
+                    session_id,
+                    run_id,
+                    turn_ordinal: 1,
+                    role: MessageRole::Assistant,
+                    state: MessageState::Streaming,
+                    output: "a".to_owned(),
+                    refusal: String::new(),
+                    created_at_ms: 4,
+                },
+            },
+        ));
+        app.apply_live_event(envelope(
+            5,
+            SessionEvent::TextAppended {
+                message_id: assistant_message_id,
+                channel: qq_protocol::TextChannel::Output,
+                text: "nswer".to_owned(),
+            },
+        ));
+        assert_eq!(app.focused_context_usage(), Some((54_400, 272_000)));
+
+        app.apply_live_event(envelope(
+            6,
+            SessionEvent::SessionContextUpdated {
+                run_id,
+                context_tokens: Some(13_600),
+            },
+        ));
+        assert_eq!(app.focused_context_usage(), Some((13_600, 272_000)));
+    }
+
+    #[test]
+    fn legacy_cumulative_usage_is_not_presented_as_context_occupancy() {
+        let mut app = context_meter_app();
+        app.models[0].context_window = Some(272_000);
         let mut initial = snapshot();
         let session_id = initial.focused.as_ref().unwrap().summary.id;
         // A run persisted before context_tokens existed reports only its
-        // summed usage; the overestimate beats an empty meter.
+        // cumulative billing usage. Four model turns around tools can easily
+        // total 20% of the window even when the last request occupied 5%.
         initial.focused.as_mut().unwrap().runs.push(RunSnapshot {
             id: id(7, RunId::from_bytes),
             session_id,
             status: RunStatus::Completed,
             outcome: Some(RunOutcome::Completed),
             usage: Some(TokenUsage {
-                input_tokens: 10_000,
-                cache_read_input_tokens: 2_000,
-                cache_write_input_tokens: 500,
-                output_tokens: 1_000,
+                input_tokens: 40_000,
+                cache_read_input_tokens: 12_000,
+                cache_write_input_tokens: 2_400,
+                output_tokens: 4_000,
             }),
             context_tokens: None,
             estimated_cost_usd_nanos: Some(1),
         });
-        let summary = initial.focused.as_ref().unwrap().summary.clone();
         let workspace_id = initial.workspace.id;
         let store_id = initial.cursor.store_id;
         app.apply_snapshot(initial);
 
-        assert_eq!(app.focused_context_usage(), Some((12_500, 128_000)));
+        assert_eq!(app.focused_context_usage(), None);
 
         app.apply_live_event(SessionEventEnvelope {
             cursor: EventCursor {
@@ -3255,21 +3350,91 @@ mod tests {
             run_id: Some(id(8, RunId::from_bytes)),
             caused_by: None,
             occurred_at_ms: 2,
+            event: SessionEvent::RunContextUpdated {
+                run_id: id(8, RunId::from_bytes),
+                context_tokens: 13_600,
+            },
+        });
+        assert_eq!(app.focused_context_usage(), None);
+
+        app.apply_live_event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 3,
+            },
+            session_id,
+            run_id: Some(id(8, RunId::from_bytes)),
+            caused_by: None,
+            occurred_at_ms: 3,
+            event: SessionEvent::SessionContextUpdated {
+                run_id: id(8, RunId::from_bytes),
+                context_tokens: Some(13_600),
+            },
+        });
+        assert_eq!(app.focused_context_usage(), Some((13_600, 272_000)));
+    }
+
+    #[test]
+    fn compaction_run_usage_does_not_become_session_context() {
+        let mut app = context_meter_app();
+        app.models[0].context_window = Some(272_000);
+        let mut initial = snapshot();
+        let session_id = initial.focused.as_ref().unwrap().summary.id;
+        initial.focused.as_mut().unwrap().summary.context_tokens = Some(54_400);
+        let workspace_id = initial.workspace.id;
+        let store_id = initial.cursor.store_id;
+        app.apply_snapshot(initial);
+        assert_eq!(app.focused_context_usage(), Some((54_400, 272_000)));
+
+        let mut compacted = app.sessions[&session_id].summary.clone();
+        compacted.context_tokens = None;
+        app.apply_live_event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 2,
+            },
+            session_id,
+            run_id: Some(id(8, RunId::from_bytes)),
+            caused_by: None,
+            occurred_at_ms: 2,
             event: SessionEvent::RunFinished {
-                session: summary,
+                session: compacted.clone(),
                 run_id: id(8, RunId::from_bytes),
                 outcome: RunOutcome::Completed,
                 usage: Some(TokenUsage {
-                    input_tokens: 20_000,
-                    cache_read_input_tokens: 3_000,
-                    cache_write_input_tokens: 1_000,
+                    input_tokens: 54_000,
+                    cache_read_input_tokens: 6_000,
+                    cache_write_input_tokens: 0,
                     output_tokens: 2_000,
                 }),
-                context_tokens: None,
+                // This is the compaction request's pre-summary input, not
+                // the session occupancy after the summary replaced it.
+                context_tokens: Some(60_000),
             },
         });
+        assert_eq!(app.focused_context_usage(), None);
 
-        assert_eq!(app.focused_context_usage(), Some((24_000, 128_000)));
+        app.apply_live_event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 3,
+            },
+            session_id,
+            run_id: Some(id(8, RunId::from_bytes)),
+            caused_by: None,
+            occurred_at_ms: 3,
+            event: SessionEvent::SessionCompacted {
+                session: compacted,
+                summary: Some("short summary".to_owned()),
+                before_bytes: 200_000,
+                after_bytes: 1_000,
+            },
+        });
+        assert_eq!(app.focused_context_usage(), None);
+        assert_eq!(app.focused_context_window(), Some(272_000));
     }
 
     #[test]
@@ -3790,6 +3955,7 @@ mod tests {
             active_run_id: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            context_tokens: None,
             estimated_cost_usd_nanos: Some(0),
             updated_at_ms: 2,
             last_outcome: None,
