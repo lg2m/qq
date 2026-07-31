@@ -810,9 +810,7 @@ mod tests {
 
     #[test]
     fn without_retries_preserves_endpoint_for_canary_clients() {
-        let provider = OpenAi::new("openai-test-secret")
-            .unwrap()
-            .without_retries();
+        let provider = OpenAi::new("openai-test-secret").unwrap().without_retries();
         assert_eq!(provider.endpoint.as_str(), RESPONSES_ENDPOINT);
     }
 
