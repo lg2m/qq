@@ -261,14 +261,13 @@ pub enum HttpAuth {
         account_id: String,
         is_fedramp: bool,
     },
-    /// Credentials resolved on each request.
+    /// Bearer credentials resolved on each request.
+    RequestTimeBearer(SharedRequestCredentialProvider),
+    /// Codex credentials resolved on each request.
     ///
-    /// `codex_responses` selects the Codex Responses body shape (omit
-    /// `max_output_tokens`) when the recipe uses OpenAI Responses.
-    RequestTime {
-        credentials: SharedRequestCredentialProvider,
-        codex_responses: bool,
-    },
+    /// This intent is valid only for OpenAI Responses and selects the Codex
+    /// request body shape automatically.
+    RequestTimeCodex(SharedRequestCredentialProvider),
 }
 
 impl fmt::Debug for HttpAuth {
@@ -293,12 +292,13 @@ impl fmt::Debug for HttpAuth {
                 .field("access_token", &"<redacted>")
                 .field("account_id", &"<redacted>")
                 .finish_non_exhaustive(),
-            Self::RequestTime {
-                codex_responses, ..
-            } => formatter
-                .debug_struct("RequestTime")
-                .field("credentials", &"[REDACTED]")
-                .field("codex_responses", codex_responses)
+            Self::RequestTimeBearer(_) => formatter
+                .debug_tuple("RequestTimeBearer")
+                .field(&"[REDACTED]")
+                .finish(),
+            Self::RequestTimeCodex(_) => formatter
+                .debug_tuple("RequestTimeCodex")
+                .field(&"[REDACTED]")
                 .finish(),
         }
     }
@@ -332,13 +332,15 @@ fn responses_auth(
             RequestAuthorizer::default(),
             true,
         )),
-        HttpAuth::RequestTime {
-            credentials,
-            codex_responses,
-        } => Ok((
+        HttpAuth::RequestTimeBearer(credentials) => Ok((
             ResponsesAuth::NoAuth,
             RequestAuthorizer::request_credentials(credentials),
-            codex_responses,
+            false,
+        )),
+        HttpAuth::RequestTimeCodex(credentials) => Ok((
+            ResponsesAuth::NoAuth,
+            RequestAuthorizer::request_credentials(credentials),
+            true,
         )),
     }
 }
@@ -359,9 +361,12 @@ fn chat_completions_auth(
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
-        HttpAuth::RequestTime { credentials, .. } => Ok((
+        HttpAuth::RequestTimeBearer(credentials) => Ok((
             ChatCompletionsAuth::NoAuth,
             RequestAuthorizer::request_credentials(credentials),
+        )),
+        HttpAuth::RequestTimeCodex(_) => Err(ProviderError::Configuration(
+            "request-time Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
     }
 }
@@ -382,9 +387,12 @@ fn anthropic_auth(auth: HttpAuth) -> Result<(AnthropicAuth, RequestAuthorizer), 
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
-        HttpAuth::RequestTime { credentials, .. } => Ok((
+        HttpAuth::RequestTimeBearer(credentials) => Ok((
             AnthropicAuth::NoAuth,
             RequestAuthorizer::request_credentials(credentials),
+        )),
+        HttpAuth::RequestTimeCodex(_) => Err(ProviderError::Configuration(
+            "request-time Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
     }
 }
@@ -398,9 +406,11 @@ fn google_auth(auth: HttpAuth) -> Result<GoogleAuth, ProviderError> {
         HttpAuth::Codex { .. } => Err(ProviderError::Configuration(
             "Codex authentication requires the OpenAI Responses protocol".to_owned(),
         )),
-        HttpAuth::RequestTime { .. } => Err(ProviderError::Configuration(
-            "request-time credentials are not supported by Google GenerateContent".to_owned(),
-        )),
+        HttpAuth::RequestTimeBearer(_) | HttpAuth::RequestTimeCodex(_) => {
+            Err(ProviderError::Configuration(
+                "request-time credentials are not supported by Google GenerateContent".to_owned(),
+            ))
+        }
     }
 }
 
@@ -459,10 +469,9 @@ mod tests {
             .compile(ProviderRecipe::http(HttpProviderRecipe::new(
                 EndpointSpec::exact(format!("{base_url}/backend-api/codex/responses"), true),
                 HttpProtocol::OpenAiResponses,
-                HttpAuth::RequestTime {
-                    credentials: SharedRequestCredentialProvider::new(StaticCodexCredentials),
-                    codex_responses: true,
-                },
+                HttpAuth::RequestTimeCodex(SharedRequestCredentialProvider::new(
+                    StaticCodexCredentials,
+                )),
             )))
             .unwrap();
 
@@ -496,6 +505,49 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("max_output_tokens"));
+    }
+
+    struct StaticBearerCredentials;
+
+    impl crate::RequestCredentialProvider for StaticBearerCredentials {
+        fn credential(&self) -> crate::RequestCredentialFuture<'_> {
+            Box::pin(async { crate::RequestCredential::bearer("request-time-bearer-token") })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_time_bearer_keeps_standard_request_shape() {
+        let server = LoopbackServer::sse("data: {\"type\":\"response.completed\"}\n\n");
+        let provider = ProviderCompiler::new()
+            .unwrap()
+            .compile(ProviderRecipe::http(HttpProviderRecipe::new(
+                EndpointSpec::base(format!("{}/v1", server.base_url), true),
+                HttpProtocol::OpenAiResponses,
+                HttpAuth::RequestTimeBearer(SharedRequestCredentialProvider::new(
+                    StaticBearerCredentials,
+                )),
+            )))
+            .unwrap();
+
+        let events = provider
+            .stream(ModelRequest::new(
+                "gpt-test",
+                vec![Message::user("ping")],
+                128,
+            ))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::Completed { usage: None })
+        ));
+        let request = server.capture();
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer request-time-bearer-token")
+        );
+        assert_eq!(request.json_body()["max_output_tokens"], 128);
     }
 
     struct StaticCodexCredentials;
@@ -581,6 +633,29 @@ mod tests {
             let request = server.capture();
             assert_eq!(request.request_line(), Some(request_line));
             assert_eq!(request.header(auth_header), Some(expected_auth));
+        }
+    }
+
+    #[test]
+    fn rejects_request_time_codex_for_non_responses_protocols() {
+        for protocol in [
+            HttpProtocol::OpenAiChatCompletions,
+            HttpProtocol::AnthropicMessages,
+            HttpProtocol::GoogleGenerateContent,
+        ] {
+            let error = ProviderCompiler::new()
+                .unwrap()
+                .compile(ProviderRecipe::http(HttpProviderRecipe::new(
+                    EndpointSpec::exact("https://example.test/provider", false),
+                    protocol,
+                    HttpAuth::RequestTimeCodex(SharedRequestCredentialProvider::new(
+                        StaticCodexCredentials,
+                    )),
+                )))
+                .err()
+                .expect("request-time Codex must be restricted to Responses");
+
+            assert!(matches!(error, ProviderError::Configuration(_)));
         }
     }
 
