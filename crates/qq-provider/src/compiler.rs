@@ -292,7 +292,7 @@ impl From<HttpAuth> for HttpConstructionAuth {
 mod tests {
     use futures_util::StreamExt;
 
-    use crate::{test_support::LoopbackServer, Message, ModelRequest, ProviderEvent};
+    use crate::{Message, ModelRequest, ProviderEvent, test_support::LoopbackServer};
 
     use super::*;
 
@@ -332,6 +332,61 @@ mod tests {
         assert_eq!(request.request_line(), Some("POST /v1/responses HTTP/1.1"));
         assert_eq!(request.header("authorization"), Some("Bearer test-secret"));
         assert_eq!(request.json_body()["max_output_tokens"], 64);
+    }
+
+    #[tokio::test]
+    async fn static_codex_auth_derives_headers_and_request_shape() {
+        let server = LoopbackServer::sse("data: {\"type\":\"response.completed\"}\n\n");
+        let provider = ProviderCompiler::new()
+            .unwrap()
+            .compile(ProviderRecipe::http(HttpProviderRecipe::new(
+                EndpointSpec::exact(
+                    format!("{}/backend-api/codex/responses", server.base_url),
+                    true,
+                ),
+                HttpProtocol::OpenAiResponses,
+                HttpAuth::Codex {
+                    access_token: "static-codex-access-token".to_owned(),
+                    account_id: "static-workspace-id".to_owned(),
+                    is_fedramp: false,
+                },
+            )))
+            .unwrap();
+
+        let events = provider
+            .stream(ModelRequest::new(
+                "gpt-test",
+                vec![Message::user("ping")],
+                128,
+            ))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            &events[..],
+            [Ok(ProviderEvent::Completed { usage: None })]
+        ));
+        let request = server.capture();
+        assert_eq!(
+            request.request_line(),
+            Some("POST /backend-api/codex/responses HTTP/1.1")
+        );
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer static-codex-access-token")
+        );
+        assert_eq!(
+            request.header("chatgpt-account-id"),
+            Some("static-workspace-id")
+        );
+        assert_eq!(request.header("originator"), Some("qq"));
+        assert!(
+            !request
+                .json_body()
+                .as_object()
+                .unwrap()
+                .contains_key("max_output_tokens")
+        );
     }
 
     #[tokio::test]
@@ -375,10 +430,12 @@ mod tests {
 
         let request_body = request.json_body();
         assert_eq!(request_body["model"], "gpt-test");
-        assert!(!request_body
-            .as_object()
-            .unwrap()
-            .contains_key("max_output_tokens"));
+        assert!(
+            !request_body
+                .as_object()
+                .unwrap()
+                .contains_key("max_output_tokens")
+        );
     }
 
     struct MismatchedBearerCredentials;

@@ -242,10 +242,7 @@ impl From<ProviderError> for MantleInitError {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
         sync::atomic::{AtomicUsize, Ordering},
-        thread::{self, JoinHandle},
         time::{Duration, SystemTime},
     };
 
@@ -255,7 +252,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Message, ModelRequest, ProviderEvent, ProviderUsage, http::build_direct_client};
+    use crate::{
+        Message, ModelRequest, ProviderEvent, ProviderUsage, http::build_direct_client,
+        test_support::LoopbackServer,
+    };
 
     #[test]
     fn uses_canonical_regional_endpoints_for_each_protocol() {
@@ -280,6 +280,24 @@ mod tests {
         }
         assert!(mantle_endpoint("us-east-1/path", HttpProtocol::OpenAiResponses).is_err());
         assert!(mantle_endpoint(&"a".repeat(64), HttpProtocol::OpenAiResponses).is_err());
+    }
+
+    #[test]
+    fn rejects_google_mantle_before_initialization() {
+        let error = Mantle::new(
+            reqwest::Client::new(),
+            Some("us-east-1".to_owned()),
+            HttpProtocol::GoogleGenerateContent,
+            BedrockAuth::ApiKey("mantle-test-secret".to_owned()),
+        )
+        .err()
+        .expect("Google must be rejected before Mantle initialization");
+
+        assert!(matches!(
+            error,
+            ProviderError::Configuration(message)
+                if message == "Google GenerateContent is not supported by Amazon Bedrock Mantle"
+        ));
     }
 
     #[test]
@@ -354,7 +372,8 @@ mod tests {
             HttpProtocol::OpenAiChatCompletions,
             HttpProtocol::AnthropicMessages,
         ] {
-            let (endpoint, server) = serve_unauthorized();
+            let server = LoopbackServer::respond(401, "application/json", "{}");
+            let endpoint = reqwest::Url::parse(&format!("{}/invoke", server.base_url)).unwrap();
             let provider = construct_mantle_provider(
                 build_direct_client().unwrap(),
                 endpoint,
@@ -371,27 +390,20 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
                 .await;
-            let request = server.join().unwrap();
-            let headers = request.split_once("\r\n\r\n").unwrap().0;
+            let request = server.capture();
 
             match protocol {
                 HttpProtocol::OpenAiResponses | HttpProtocol::OpenAiChatCompletions => {
                     assert_eq!(
-                        request_header(headers, "authorization"),
+                        request.header("authorization"),
                         Some("Bearer mantle-test-secret")
                     );
-                    assert_eq!(request_header(headers, "x-api-key"), None);
+                    assert_eq!(request.header("x-api-key"), None);
                 }
                 HttpProtocol::AnthropicMessages => {
-                    assert_eq!(request_header(headers, "authorization"), None);
-                    assert_eq!(
-                        request_header(headers, "x-api-key"),
-                        Some("mantle-test-secret")
-                    );
-                    assert_eq!(
-                        request_header(headers, "anthropic-version"),
-                        Some("2023-06-01")
-                    );
+                    assert_eq!(request.header("authorization"), None);
+                    assert_eq!(request.header("x-api-key"), Some("mantle-test-secret"));
+                    assert_eq!(request.header("anthropic-version"), Some("2023-06-01"));
                 }
                 HttpProtocol::GoogleGenerateContent => unreachable!("test cases are exhaustive"),
             }
@@ -443,7 +455,8 @@ mod tests {
         ];
 
         for (protocol, body, expected) in cases {
-            let (endpoint, server) = serve_ok(body);
+            let server = LoopbackServer::sse(body);
+            let endpoint = reqwest::Url::parse(&format!("{}/invoke", server.base_url)).unwrap();
             let provider = construct_mantle_provider(
                 build_direct_client().unwrap(),
                 endpoint,
@@ -459,7 +472,7 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
                 .await;
-            server.join().unwrap();
+            server.capture();
 
             assert!(matches!(
                 &events[..],
@@ -486,7 +499,8 @@ mod tests {
             SharedCredentialsProvider::new(credentials),
             fixed_time,
         );
-        let (endpoint, server) = serve_unauthorized();
+        let server = LoopbackServer::respond(401, "application/json", "{}");
+        let endpoint = reqwest::Url::parse(&format!("{}/invoke", server.base_url)).unwrap();
         let provider = construct_mantle_provider(
             build_direct_client().unwrap(),
             endpoint,
@@ -503,10 +517,9 @@ mod tests {
             ))
             .collect::<Vec<_>>()
             .await;
-        let request = server.join().unwrap();
-        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
-        let authorization = request_header(headers, "authorization").unwrap();
-        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        let request = server.capture();
+        let authorization = request.header("authorization").unwrap();
+        let body = request.json_body();
 
         assert!(authorization.contains("/us-east-1/bedrock-mantle/aws4_request"));
         assert_eq!(body["model"], "test-model");
@@ -531,84 +544,5 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             future::ProvideCredentials::ready(provider::Result::Ok(self.credentials.clone()))
         }
-    }
-
-    fn serve_unauthorized() -> (reqwest::Url, JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint =
-            reqwest::Url::parse(&format!("http://{}/invoke", listener.local_addr().unwrap()))
-                .unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let request = read_request(&mut stream);
-            stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .unwrap();
-            String::from_utf8(request).unwrap()
-        });
-        (endpoint, server)
-    }
-
-    fn serve_ok(body: &str) -> (reqwest::Url, JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint =
-            reqwest::Url::parse(&format!("http://{}/invoke", listener.local_addr().unwrap()))
-                .unwrap();
-        let body = body.to_owned();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let request = read_request(&mut stream);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8(request).unwrap()
-        });
-        (endpoint, server)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4_096];
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or_default();
-            if request.len() >= body_start + content_length {
-                break;
-            }
-        }
-        request
-    }
-
-    fn request_header<'a>(headers: &'a str, expected_name: &str) -> Option<&'a str> {
-        headers
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case(expected_name))
-            .map(|(_, value)| value.trim())
     }
 }
