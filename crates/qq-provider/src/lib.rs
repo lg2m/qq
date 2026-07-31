@@ -19,6 +19,8 @@ pub mod openai_chat;
 mod request_auth;
 mod sanitize;
 mod sse;
+#[cfg(test)]
+mod test_support;
 
 pub use compiler::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderRecipe,

@@ -406,25 +406,19 @@ fn google_auth(auth: HttpAuth) -> Result<GoogleAuth, ProviderError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread::{self, JoinHandle},
-        time::Duration,
-    };
-
     use futures_util::StreamExt;
 
-    use crate::{Message, ModelRequest, ProviderEvent};
+    use crate::{test_support::LoopbackServer, Message, ModelRequest, ProviderEvent};
 
     use super::*;
 
     #[tokio::test]
     async fn compiles_a_base_endpoint_into_a_streaming_provider() {
-        let (base_url, server) = serve_once(concat!(
+        let server = LoopbackServer::sse(concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fast\"}\n\n",
             "data: {\"type\":\"response.completed\"}\n\n",
         ));
+        let base_url = server.base_url.clone();
         let compiler = ProviderCompiler::new().unwrap();
         let provider = compiler
             .compile(ProviderRecipe::http(HttpProviderRecipe::new(
@@ -450,18 +444,16 @@ mod tests {
                 Ok(ProviderEvent::Completed { usage: None })
             ] if text == "fast"
         ));
-        let request = server.join().unwrap();
-        let head = request.split_once("\r\n\r\n").unwrap().0;
-        assert_eq!(head.lines().next(), Some("POST /v1/responses HTTP/1.1"));
-        assert_eq!(
-            request_header(head, "authorization"),
-            Some("Bearer test-secret")
-        );
+        let request = server.capture();
+        assert_eq!(request.request_line(), Some("POST /v1/responses HTTP/1.1"));
+        assert_eq!(request.header("authorization"), Some("Bearer test-secret"));
+        assert_eq!(request.json_body()["max_output_tokens"], 64);
     }
 
     #[tokio::test]
     async fn request_time_codex_auth_omits_max_output_tokens() {
-        let (base_url, server) = serve_once("data: {\"type\":\"response.completed\"}\n\n");
+        let server = LoopbackServer::sse("data: {\"type\":\"response.completed\"}\n\n");
+        let base_url = server.base_url.clone();
         let compiler = ProviderCompiler::new().unwrap();
         let provider = compiler
             .compile(ProviderRecipe::http(HttpProviderRecipe::new(
@@ -487,26 +479,23 @@ mod tests {
             &events[0],
             Ok(ProviderEvent::Completed { usage: None })
         ));
-        let request = server.join().unwrap();
-        let (head, request_body) = request.split_once("\r\n\r\n").unwrap();
+        let request = server.capture();
         assert_eq!(
-            request_header(head, "authorization"),
+            request.header("authorization"),
             Some("Bearer codex-test-access-token")
         );
         assert_eq!(
-            request_header(head, "chatgpt-account-id"),
+            request.header("chatgpt-account-id"),
             Some("workspace-test-id")
         );
-        assert_eq!(request_header(head, "originator"), Some("qq"));
+        assert_eq!(request.header("originator"), Some("qq"));
 
-        let request_body: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        let request_body = request.json_body();
         assert_eq!(request_body["model"], "gpt-test");
-        assert!(
-            !request_body
-                .as_object()
-                .unwrap()
-                .contains_key("max_output_tokens")
-        );
+        assert!(!request_body
+            .as_object()
+            .unwrap()
+            .contains_key("max_output_tokens"));
     }
 
     struct StaticCodexCredentials;
@@ -520,6 +509,78 @@ mod tests {
                     false,
                 )
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn compiles_chat_anthropic_and_google_through_the_provider_interface() {
+        let cases = [
+            (
+                HttpProtocol::OpenAiChatCompletions,
+                "/v1",
+                "data: {\"choices\":[]}\n\ndata: [DONE]\n\n",
+                "POST /v1/chat/completions HTTP/1.1",
+                "authorization",
+                "chat-secret",
+                "Bearer chat-secret",
+            ),
+            (
+                HttpProtocol::AnthropicMessages,
+                "/v1",
+                concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                ),
+                "POST /v1/messages HTTP/1.1",
+                "x-api-key",
+                "anthropic-secret",
+                "anthropic-secret",
+            ),
+            (
+                HttpProtocol::GoogleGenerateContent,
+                "",
+                "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"index\":0}]}\n\n",
+                "POST /models/test-model:streamGenerateContent?alt=sse HTTP/1.1",
+                "x-goog-api-key",
+                "google-secret",
+                "google-secret",
+            ),
+        ];
+
+        for (protocol, base_path, response, request_line, auth_header, api_key, expected_auth) in
+            cases
+        {
+            let server = LoopbackServer::sse(response);
+            let endpoint = format!("{}{base_path}", server.base_url);
+            let provider = ProviderCompiler::new()
+                .unwrap()
+                .compile(ProviderRecipe::http(HttpProviderRecipe::new(
+                    EndpointSpec::base(endpoint, true),
+                    protocol,
+                    HttpAuth::ApiKey(api_key.to_owned()),
+                )))
+                .unwrap();
+
+            let events = provider
+                .stream(ModelRequest::new(
+                    "test-model",
+                    vec![Message::user("hello")],
+                    64,
+                ))
+                .collect::<Vec<_>>()
+                .await;
+
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Ok(ProviderEvent::Completed { .. }))),
+                "{protocol:?} did not complete: {events:?}"
+            );
+            let request = server.capture();
+            assert_eq!(request.request_line(), Some(request_line));
+            assert_eq!(request.header(auth_header), Some(expected_auth));
         }
     }
 
@@ -553,61 +614,5 @@ mod tests {
             .expect("incompatible recipe must fail");
 
         assert!(matches!(error, ProviderError::Configuration(_)));
-    }
-
-    fn serve_once(body: &str) -> (String, JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let body = body.to_owned();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let request = read_request(&mut stream);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8(request).unwrap()
-        });
-        (base_url, server)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4_096];
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or_default();
-            if request.len() >= body_start + content_length {
-                break;
-            }
-        }
-        request
-    }
-
-    fn request_header<'a>(headers: &'a str, expected_name: &str) -> Option<&'a str> {
-        headers
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case(expected_name))
-            .map(|(_, value)| value.trim())
     }
 }
