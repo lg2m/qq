@@ -1029,6 +1029,7 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
         | SessionRuntimeError::Overloaded => AskHandlerError::Unavailable,
         SessionRuntimeError::InvalidRunLimit
         | SessionRuntimeError::OutputTooLarge
+        | SessionRuntimeError::AccountingUnavailable
         | SessionRuntimeError::Unavailable
         | SessionRuntimeError::Persistence => AskHandlerError::Internal,
     }
