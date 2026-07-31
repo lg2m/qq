@@ -476,6 +476,8 @@ pub(super) struct Document {
     organization: StringField,
     #[serde(default, skip_serializing_if = "StringField::is_missing")]
     model: StringField,
+    #[serde(default, skip_serializing_if = "StringField::is_missing")]
+    worker_model: StringField,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     max_output_tokens: Field<u32>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
@@ -557,6 +559,7 @@ impl Document {
     pub(super) fn has_sensitive_operations(&self) -> bool {
         self.organization.is_present()
             || self.model.is_present()
+            || self.worker_model.is_present()
             || self.providers.is_present()
             || self.mcp.is_present()
             || self.policy.as_ref().is_some_and(PolicyPatch::has_grants)
@@ -582,6 +585,8 @@ impl Document {
             #[serde(skip_serializing_if = "Option::is_none")]
             model: Option<&'a StringField>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            worker_model: Option<&'a StringField>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             providers: Option<&'a Field<UniqueMap<String, ProviderEntryPatch>>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             mcp: Option<&'a Field<UniqueMap<String, McpServerPatch>>>,
@@ -596,6 +601,7 @@ impl Document {
         let projection = SensitiveProjection {
             organization: self.organization.is_present().then_some(&self.organization),
             model: self.model.is_present().then_some(&self.model),
+            worker_model: self.worker_model.is_present().then_some(&self.worker_model),
             providers: present(&self.providers),
             mcp: present(&self.mcp),
             policy_grants: self
@@ -627,6 +633,9 @@ impl Document {
         }
         if self.model.is_present() {
             touched.push(ConfigKey::Model);
+        }
+        if self.worker_model.is_present() {
+            touched.push(ConfigKey::WorkerModel);
         }
         if self.max_output_tokens.is_present() {
             touched.push(ConfigKey::MaxOutputTokens);
@@ -1002,6 +1011,7 @@ const VCS_READ_ONLY_PRESETS: &[&str] = &[
 pub(super) struct MergeState {
     organization: Option<String>,
     model: Option<String>,
+    worker_model: Option<String>,
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
@@ -1068,6 +1078,7 @@ impl MergeState {
             Self {
                 organization: None,
                 model: None,
+                worker_model: None,
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 providers,
                 mcp: BTreeMap::new(),
@@ -1107,6 +1118,9 @@ impl MergeState {
         }
         if apply_optional_string(&document.model, &mut self.model) {
             self.provenance.model = Some(source.clone());
+        }
+        if apply_optional_string(&document.worker_model, &mut self.worker_model) {
+            self.provenance.worker_model = Some(source.clone());
         }
         self.apply_providers(&document.providers, source);
         self.apply_mcp(&document.mcp);
@@ -1411,19 +1425,18 @@ impl MergeState {
 
     pub(super) fn finish(self, reports: Vec<SourceReport>) -> Result<ConfigSnapshot, ConfigError> {
         let model = ModelRoute::parse(self.model.ok_or(ConfigError::ModelRequired)?)?;
-        if !self.providers.contains_key(model.provider()) {
-            return Err(ConfigError::UnknownProvider(model.provider().to_owned()));
+        let worker_model = self.worker_model.map(ModelRoute::parse).transpose()?;
+        for route in std::iter::once(&model).chain(worker_model.as_ref()) {
+            if !self.providers.contains_key(route.provider()) {
+                return Err(ConfigError::UnknownProvider(route.provider().to_owned()));
+            }
+            enforce_policy(&self.policy, route, self.max_output_tokens, &self.providers)?;
         }
-        enforce_policy(
-            &self.policy,
-            &model,
-            self.max_output_tokens,
-            &self.providers,
-        )?;
         let grants = resolve_policy_grants(&self.policy, &self.mcp);
         Ok(ConfigSnapshot {
             organization: self.organization,
             model,
+            worker_model,
             max_output_tokens: self.max_output_tokens,
             providers: self.providers,
             mcp: self.mcp,

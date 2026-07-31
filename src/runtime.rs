@@ -9,8 +9,8 @@ use std::{
 use qq_core::{
     GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, Runtime, RuntimeConfigError,
     RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
-    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, WorkspaceGrantAuthority,
-    WorkspaceGrantSeed,
+    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, WorkerRuntimeLoadFuture,
+    WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 use qq_protocol::{
     ApprovalGrant, CommandRequest, ModelCatalogRequest, ModelDescriptor, RunFailureKind,
@@ -688,6 +688,60 @@ fn aws_profile_configured(profile: &str) -> bool {
 }
 
 impl RuntimeLoader for RuntimeFactory {
+    fn resolve_worker_model(
+        &self,
+        workspace: String,
+        parent: qq_protocol::ModelSelection,
+    ) -> WorkerRuntimeLoadFuture {
+        let factory = self.clone();
+        Box::pin(async move {
+            let build = tokio::task::spawn_blocking(move || {
+                let requested_workspace = PathBuf::from(&workspace);
+                let workspace = std::fs::canonicalize(&requested_workspace).map_err(|_| {
+                    ConfigError::InvalidWorkingDirectory {
+                        path: requested_workspace.clone(),
+                    }
+                })?;
+                if workspace != requested_workspace {
+                    return Err(ConfigError::InvalidWorkingDirectory {
+                        path: requested_workspace,
+                    }
+                    .into());
+                }
+                let mut load = LoadRequest::from_process_env(&workspace, parent.max_output_tokens)?;
+                let mut overrides = load.overrides().clone();
+                if let Some(model) = &parent.model {
+                    overrides = overrides.with_model(model.clone());
+                }
+                if let Some(organization) = &parent.organization {
+                    overrides = overrides.with_organization(organization.clone());
+                }
+                load = load.with_overrides(overrides);
+                let snapshot = factory.load(&load)?;
+                Ok::<_, RuntimeBuildError>(match snapshot.worker_model() {
+                    Some(worker) => qq_protocol::ModelSelection {
+                        model: Some(worker.as_str().to_owned()),
+                        max_output_tokens: Some(snapshot.max_output_tokens()),
+                        organization: snapshot.organization().map(str::to_owned),
+                    },
+                    None => parent,
+                })
+            })
+            .await;
+            match build {
+                Ok(Ok(selection)) => Ok(selection),
+                Ok(Err(error)) => Err(RuntimeLoadError {
+                    kind: error.failure_kind(),
+                    message: error.to_string(),
+                }),
+                Err(_) => Err(RuntimeLoadError {
+                    kind: RunFailureKind::Server,
+                    message: "worker model resolution stopped unexpectedly".to_owned(),
+                }),
+            }
+        })
+    }
+
     fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
         let factory = self.clone();
         Box::pin(async move {
@@ -965,7 +1019,9 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
         | SessionRuntimeError::IdempotencyConflict
         | SessionRuntimeError::CursorStoreMismatch
         | SessionRuntimeError::CursorWorkspaceMismatch
-        | SessionRuntimeError::InvalidPageLimit => AskHandlerError::InvalidRequest,
+        | SessionRuntimeError::InvalidPageLimit) => {
+            AskHandlerError::InvalidRequest(error.to_string())
+        }
         SessionRuntimeError::QueueFull
         | SessionRuntimeError::WorkspaceLimitReached
         | SessionRuntimeError::SessionLimitReached
@@ -1233,6 +1289,75 @@ mod tests {
         let fixture = RuntimeFixture::new();
 
         drop(fixture.factory());
+    }
+
+    #[tokio::test]
+    async fn resolves_configured_worker_model_and_falls_back_to_parent_selection() {
+        let fixture = RuntimeFixture::new();
+        let workspace = fs::canonicalize(fixture.path("work")).unwrap();
+        fs::write(
+            fixture.path("global/config.ron"),
+            r#"(
+                version: 1,
+                model: "custom/default",
+                worker_model: "custom/worker",
+                max_output_tokens: 321,
+                organization: "configured-org",
+                providers: {
+                    "custom": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                    ),
+                },
+            )"#,
+        )
+        .unwrap();
+        let factory = fixture.factory();
+        let parent = qq_protocol::ModelSelection {
+            model: Some("custom/persisted".to_owned()),
+            max_output_tokens: Some(123),
+            organization: Some("parent-org".to_owned()),
+        };
+
+        let resolved = RuntimeLoader::resolve_worker_model(
+            &factory,
+            workspace.display().to_string(),
+            parent.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.model.as_deref(), Some("custom/worker"));
+        assert_eq!(resolved.max_output_tokens, Some(123));
+        assert_eq!(resolved.organization.as_deref(), Some("parent-org"));
+
+        fs::write(
+            fixture.path("global/config.ron"),
+            r#"(
+                version: 1,
+                model: "custom/default",
+                providers: {
+                    "custom": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                    ),
+                },
+            )"#,
+        )
+        .unwrap();
+        let fallback = RuntimeLoader::resolve_worker_model(
+            &factory,
+            workspace.display().to_string(),
+            parent.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fallback, parent);
     }
 
     #[tokio::test]

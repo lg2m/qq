@@ -256,6 +256,7 @@ fn config_command(
                 match field.as_str() {
                     "organization" => snapshot.provenance().organization(),
                     "model" => snapshot.provenance().model(),
+                    "worker_model" => snapshot.provenance().worker_model(),
                     "max_output_tokens" => snapshot.provenance().max_output_tokens(),
                     _ => field
                         .strip_prefix("provider.")
@@ -299,6 +300,12 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
         snapshot.organization().unwrap_or("<none>")
     );
     println!("model: {}", snapshot.model().as_str());
+    println!(
+        "worker_model: {}",
+        snapshot
+            .worker_model()
+            .map_or("<none>", config::ModelRoute::as_str)
+    );
     println!("max_output_tokens: {}", snapshot.max_output_tokens());
     println!("providers:");
     for (name, provider) in snapshot.providers() {

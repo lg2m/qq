@@ -136,6 +136,109 @@ fn loads_target_syntax_and_splits_model_on_only_the_first_slash() {
 }
 
 #[test]
+fn worker_model_layers_clears_and_tracks_provenance_independently() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, worker_model: "anthropic/global-worker")"#,
+    );
+
+    let inherited = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(
+        inherited.worker_model().map(ModelRoute::as_str),
+        Some("anthropic/global-worker")
+    );
+    assert_eq!(
+        inherited.provenance().worker_model().unwrap().kind(),
+        SourceKind::Global
+    );
+    assert_eq!(
+        inherited.model().as_str(),
+        "openai/test-model",
+        "worker selection must not replace the primary model"
+    );
+
+    let overridden = tree
+        .loader()
+        .load(
+            &tree
+                .request()
+                .with_explicit_content(r#"(version: 1, worker_model: "openai/inline-worker")"#),
+        )
+        .unwrap();
+    assert_eq!(
+        overridden.worker_model().map(ModelRoute::as_str),
+        Some("openai/inline-worker")
+    );
+    assert_eq!(
+        overridden.provenance().worker_model().unwrap().kind(),
+        SourceKind::Inline
+    );
+
+    let serialized = ron::ser::to_string(
+        &document::Document::parse(
+            r#"(version: 1, worker_model: "openai/serialized-worker")"#,
+            &SourceIdentity::virtual_source(SourceKind::Inline, "serialization test"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(serialized.contains("worker_model"));
+    assert!(serialized.contains("openai/serialized-worker"));
+
+    let cleared = tree
+        .loader()
+        .load(
+            &tree
+                .request()
+                .with_explicit_content(r#"(version: 1, worker_model: Clear)"#),
+        )
+        .unwrap();
+    assert_eq!(cleared.worker_model(), None);
+    assert_eq!(
+        cleared.provenance().worker_model().unwrap().kind(),
+        SourceKind::Inline,
+        "an explicit clear must retain the source that cleared the value"
+    );
+}
+
+#[test]
+fn worker_model_uses_primary_model_route_validation_and_policy() {
+    let tree = TempTree::new();
+
+    let malformed = tree
+        .request()
+        .with_explicit_content(r#"(version: 1, worker_model: "missing-provider-separator")"#);
+    assert!(matches!(
+        tree.loader().load(&malformed),
+        Err(ConfigError::InvalidModelRoute(route)) if route == "missing-provider-separator"
+    ));
+
+    let unknown = tree
+        .request()
+        .with_explicit_content(r#"(version: 1, worker_model: "unknown/worker")"#);
+    assert!(matches!(
+        tree.loader().load(&unknown),
+        Err(ConfigError::UnknownProvider(provider)) if provider == "unknown"
+    ));
+
+    tree.write(
+        "managed/managed.ron",
+        r#"(version: 1, policy: (allowed_providers: ["openai"]))"#,
+    );
+    let denied = tree
+        .request()
+        .with_explicit_content(r#"(version: 1, worker_model: "anthropic/worker")"#);
+    assert!(matches!(
+        tree.loader().load(&denied),
+        Err(ConfigError::PolicyViolation {
+            rule: "allowed_providers",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn applies_every_layer_in_documented_order() {
     let tree = TempTree::new();
     fs::create_dir_all(tree.path("work/child/deeper")).unwrap();

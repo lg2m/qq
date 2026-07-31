@@ -116,6 +116,8 @@ than referring to it.";
 
 pub type RuntimeLoadFuture =
     Pin<Box<dyn Future<Output = Result<LoadedRuntime, RuntimeLoadError>> + Send + 'static>>;
+pub type WorkerRuntimeLoadFuture =
+    Pin<Box<dyn Future<Output = Result<ModelSelection, RuntimeLoadError>> + Send + 'static>>;
 
 #[derive(Clone)]
 pub struct LoadedRuntime {
@@ -125,6 +127,18 @@ pub struct LoadedRuntime {
 
 pub trait RuntimeLoader: Send + Sync + 'static {
     fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture;
+
+    /// Resolves the application-configured worker route against the same
+    /// workspace configuration and policy used by ordinary runtime loading.
+    /// `parent` is returned unchanged when no worker route is configured.
+    fn resolve_worker_model(
+        &self,
+        workspace: String,
+        parent: ModelSelection,
+    ) -> WorkerRuntimeLoadFuture {
+        let _ = workspace;
+        Box::pin(std::future::ready(Ok(parent)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9934,6 +9948,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_replays_without_entering_transcript_or_model_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(ReasoningLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let after_creation = created.committed_through;
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: after_creation,
+            })
+            .unwrap();
+
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "first prompt".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let observed = collect_through_finished(&mut events).await;
+        let reasoning = observed
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                SessionEvent::ReasoningStarted { kind, .. } => Some(("started", *kind, None)),
+                SessionEvent::ReasoningDelta { kind, text, .. } => {
+                    Some(("delta", *kind, Some(text.as_str())))
+                }
+                SessionEvent::ReasoningCompleted { kind, .. } => Some(("completed", *kind, None)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasoning,
+            vec![
+                ("started", qq_provider::ReasoningKind::Summary, None),
+                (
+                    "delta",
+                    qq_provider::ReasoningKind::Summary,
+                    Some("private rationale")
+                ),
+                ("completed", qq_provider::ReasoningKind::Summary, None),
+            ]
+        );
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let messages = snapshot.focused.unwrap().messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].output, "first prompt");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].output, "answer");
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.output.contains("private rationale"))
+        );
+
+        // A fresh subscription reads the same reasoning transitions from the
+        // durable event log, in the same positions as the live subscriber.
+        let mut replay = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: after_creation,
+            })
+            .unwrap();
+        let replayed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut replayed = Vec::new();
+            for _ in 0..observed.len() {
+                replayed.push(replay.next().await.unwrap().unwrap());
+            }
+            replayed
+        })
+        .await
+        .unwrap();
+        assert_eq!(replayed, observed);
+
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "second prompt".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        collect_through_finished(&mut events).await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let next_context = request_texts(&requests[1]);
+        assert!(next_context.iter().any(|text| text == "answer"));
+        assert!(next_context.iter().any(|text| text == "second prompt"));
+        assert!(
+            next_context
+                .iter()
+                .all(|text| !text.contains("private rationale"))
+        );
+    }
+
+    #[tokio::test]
     async fn streams_committed_run_events_and_snapshots_the_result() {
         let (directory, runtime) = test_runtime().await;
         let (workspace_id, initial) = resolve_workspace(&runtime, directory.path()).await;
@@ -12788,6 +12925,78 @@ mod tests {
         }
     }
 
+    struct ResolvingLoader {
+        parent: Arc<dyn Provider>,
+        child: Arc<dyn Provider>,
+        worker: Option<ModelSelection>,
+        resolutions: Arc<AtomicUsize>,
+        loads: Arc<StdMutex<Vec<ModelSelection>>>,
+    }
+
+    impl RuntimeLoader for ResolvingLoader {
+        fn resolve_worker_model(
+            &self,
+            _workspace: String,
+            parent: ModelSelection,
+        ) -> WorkerRuntimeLoadFuture {
+            self.resolutions.fetch_add(1, Ordering::AcqRel);
+            let selection = self.worker.clone().unwrap_or(parent);
+            Box::pin(std::future::ready(Ok(selection)))
+        }
+
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            self.loads.lock().unwrap().push(request.model.clone());
+            let provider = if request.model.model.as_deref() == Some("test/model") {
+                Arc::clone(&self.parent)
+            } else {
+                Arc::clone(&self.child)
+            };
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct RejectingWorkerLoader {
+        parent: Arc<dyn Provider>,
+    }
+
+    impl RuntimeLoader for RejectingWorkerLoader {
+        fn resolve_worker_model(
+            &self,
+            _workspace: String,
+            _parent: ModelSelection,
+        ) -> WorkerRuntimeLoadFuture {
+            Box::pin(std::future::ready(Err(RuntimeLoadError {
+                kind: RunFailureKind::Policy,
+                message: "configured worker route is denied".to_owned(),
+            })))
+        }
+
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = Arc::clone(&self.parent);
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
     /// Completes immediately with the text "done".
     struct StaticTextProvider;
 
@@ -12897,23 +13106,14 @@ mod tests {
         events: SessionEventStream,
     }
 
-    async fn spawn_harness(
-        routed: Vec<(&'static str, Arc<dyn Provider>)>,
-        queue: Vec<Arc<dyn Provider>>,
+    async fn spawn_harness_with_loader(
+        loader: Arc<dyn RuntimeLoader>,
         max_active_runs: usize,
     ) -> SpawnHarness {
         let directory = tempfile::tempdir().unwrap();
         let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
         options.max_active_runs = max_active_runs;
-        let runtime = SessionRuntime::open(
-            options,
-            Arc::new(QueueLoader {
-                routed,
-                queue: StdMutex::new(queue),
-            }),
-        )
-        .await
-        .unwrap();
+        let runtime = SessionRuntime::open(options, loader).await.unwrap();
         let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
         let created = create_session(&runtime, workspace_id, None).await;
         let CommandOutcome::SessionCreated { session_id } = created.outcome else {
@@ -12932,6 +13132,21 @@ mod tests {
             session_id,
             events,
         }
+    }
+
+    async fn spawn_harness(
+        routed: Vec<(&'static str, Arc<dyn Provider>)>,
+        queue: Vec<Arc<dyn Provider>>,
+        max_active_runs: usize,
+    ) -> SpawnHarness {
+        spawn_harness_with_loader(
+            Arc::new(QueueLoader {
+                routed,
+                queue: StdMutex::new(queue),
+            }),
+            max_active_runs,
+        )
+        .await
     }
 
     async fn submit_prompt_to(
