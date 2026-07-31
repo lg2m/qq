@@ -888,7 +888,7 @@ mod tests {
     async fn exchange_authorizes_immediately_before_send_and_normalizes_redactions() {
         let secret = "dynamic-bearer-secret";
         let provider = SharedRequestCredentialProvider::new(StaticBearer(secret.to_owned()));
-        let authorizer = RequestAuthorizer::request_credentials(provider);
+        let authorizer = RequestAuthorizer::request_time_bearer(provider);
         let (url, server) = serve_authorized_rejection(secret);
         let request = build_direct_client().unwrap().get(url).build().unwrap();
 
@@ -915,7 +915,7 @@ mod tests {
     async fn exchange_body_read_errors_redact_dynamic_credentials() {
         let secret = "dynamic-body-read-secret";
         let provider = SharedRequestCredentialProvider::new(StaticBearer(secret.to_owned()));
-        let authorizer = RequestAuthorizer::request_credentials(provider);
+        let authorizer = RequestAuthorizer::request_time_bearer(provider);
         let (url, server) = serve_authorized_malformed_body(secret);
         let request = build_direct_client()
             .unwrap()
@@ -1236,7 +1236,7 @@ mod tests {
             token: secret.to_owned(),
             hits: Arc::clone(&authorize_hits),
         });
-        let authorizer = RequestAuthorizer::request_credentials(provider);
+        let authorizer = RequestAuthorizer::request_time_bearer(provider);
         let body = b"authorized-ok".to_vec();
         let (url, hits, server) = serve_scripted_authorized(
             secret,

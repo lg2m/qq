@@ -146,10 +146,19 @@ const CREDENTIAL_LOAD_RUNTIME_FAILURE_MESSAGE: &str =
 static CREDENTIAL_LOAD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(CREDENTIAL_LOAD_CONCURRENCY)));
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestCredentialKindExpected {
+    Bearer,
+    Codex,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RequestAuthorizer {
     sigv4: Option<Arc<SigV4Authorizer>>,
-    credentials: Option<SharedRequestCredentialProvider>,
+    credentials: Option<(
+        SharedRequestCredentialProvider,
+        RequestCredentialKindExpected,
+    )>,
 }
 
 impl RequestAuthorizer {
@@ -163,10 +172,21 @@ impl RequestAuthorizer {
         }
     }
 
-    pub(crate) fn request_credentials(credentials: SharedRequestCredentialProvider) -> Self {
+    pub(crate) fn request_time_bearer(credentials: SharedRequestCredentialProvider) -> Self {
+        Self::request_credentials(credentials, RequestCredentialKindExpected::Bearer)
+    }
+
+    pub(crate) fn request_time_codex(credentials: SharedRequestCredentialProvider) -> Self {
+        Self::request_credentials(credentials, RequestCredentialKindExpected::Codex)
+    }
+
+    fn request_credentials(
+        credentials: SharedRequestCredentialProvider,
+        expected: RequestCredentialKindExpected,
+    ) -> Self {
         Self {
             sigv4: None,
-            credentials: Some(credentials),
+            credentials: Some((credentials, expected)),
         }
     }
 
@@ -194,7 +214,7 @@ impl RequestAuthorizer {
         if let Some(authorizer) = &self.sigv4 {
             authorizer.sign(request).await?;
         }
-        let Some(provider) = &self.credentials else {
+        let Some((provider, expected)) = &self.credentials else {
             return Ok(Vec::new());
         };
         let credential = provider
@@ -202,7 +222,7 @@ impl RequestAuthorizer {
             .credential()
             .await
             .map_err(request_credential_error)?;
-        apply_request_credential(request, credential)
+        apply_request_credential(request, credential, *expected)
     }
 }
 
@@ -226,7 +246,23 @@ fn request_credential_error(error: RequestCredentialError) -> ProviderError {
 fn apply_request_credential(
     request: &mut reqwest::Request,
     credential: RequestCredential,
+    expected: RequestCredentialKindExpected,
 ) -> Result<Vec<String>, ProviderError> {
+    if !matches!(
+        (&credential.kind, expected),
+        (
+            RequestCredentialKind::Bearer(_),
+            RequestCredentialKindExpected::Bearer
+        ) | (
+            RequestCredentialKind::Codex { .. },
+            RequestCredentialKindExpected::Codex
+        )
+    ) {
+        return Err(ProviderError::Configuration(
+            "request credential kind did not match configured authorization intent".to_owned(),
+        ));
+    }
+
     let mut redactions = Vec::new();
     match credential.kind {
         RequestCredentialKind::Bearer(token) => {
@@ -732,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_credentials_are_resolved_for_every_request() {
-        let authorizer = RequestAuthorizer::request_credentials(
+        let authorizer = RequestAuthorizer::request_time_bearer(
             SharedRequestCredentialProvider::new(RotatingRequestCredentials {
                 calls: AtomicUsize::new(0),
             }),
@@ -749,6 +785,58 @@ mod tests {
         assert_eq!(first_redactions, ["token-0"]);
         assert_eq!(second_redactions, ["token-1"]);
         assert!(first.headers()[AUTHORIZATION].is_sensitive());
+    }
+
+    struct StaticWrongKindCredentials {
+        credential: RequestCredential,
+    }
+
+    impl RequestCredentialProvider for StaticWrongKindCredentials {
+        fn credential(&self) -> RequestCredentialFuture<'_> {
+            let credential = self.credential.clone();
+            Box::pin(async move { Ok(credential) })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_credential_kind_mismatch_is_rejected_without_mutating_the_request() {
+        let cases = [
+            (
+                RequestAuthorizer::request_time_bearer(
+                    SharedRequestCredentialProvider::new(StaticWrongKindCredentials {
+                        credential: RequestCredential::codex(
+                            "codex-secret",
+                            "codex-account",
+                            false,
+                        )
+                        .unwrap(),
+                    }),
+                ),
+                "codex-secret",
+            ),
+            (
+                RequestAuthorizer::request_time_codex(
+                    SharedRequestCredentialProvider::new(StaticWrongKindCredentials {
+                        credential: RequestCredential::bearer("bearer-secret").unwrap(),
+                    }),
+                ),
+                "bearer-secret",
+            ),
+        ];
+
+        for (authorizer, secret) in cases {
+            let mut request = reqwest::Client::new()
+                .get("https://example.test")
+                .build()
+                .unwrap();
+            let error = authorizer.authorize(&mut request).await.unwrap_err();
+
+            assert!(matches!(error, ProviderError::Configuration(_)));
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains(secret));
+            assert!(request.headers().get(AUTHORIZATION).is_none());
+            assert!(request.headers().get("chatgpt-account-id").is_none());
+        }
     }
 
     #[tokio::test]

@@ -334,12 +334,12 @@ fn responses_auth(
         )),
         HttpAuth::RequestTimeBearer(credentials) => Ok((
             ResponsesAuth::NoAuth,
-            RequestAuthorizer::request_credentials(credentials),
+            RequestAuthorizer::request_time_bearer(credentials),
             false,
         )),
         HttpAuth::RequestTimeCodex(credentials) => Ok((
             ResponsesAuth::NoAuth,
-            RequestAuthorizer::request_credentials(credentials),
+            RequestAuthorizer::request_time_codex(credentials),
             true,
         )),
     }
@@ -363,7 +363,7 @@ fn chat_completions_auth(
         )),
         HttpAuth::RequestTimeBearer(credentials) => Ok((
             ChatCompletionsAuth::NoAuth,
-            RequestAuthorizer::request_credentials(credentials),
+            RequestAuthorizer::request_time_bearer(credentials),
         )),
         HttpAuth::RequestTimeCodex(_) => Err(ProviderError::Configuration(
             "request-time Codex authentication requires the OpenAI Responses protocol".to_owned(),
@@ -389,7 +389,7 @@ fn anthropic_auth(auth: HttpAuth) -> Result<(AnthropicAuth, RequestAuthorizer), 
         )),
         HttpAuth::RequestTimeBearer(credentials) => Ok((
             AnthropicAuth::NoAuth,
-            RequestAuthorizer::request_credentials(credentials),
+            RequestAuthorizer::request_time_bearer(credentials),
         )),
         HttpAuth::RequestTimeCodex(_) => Err(ProviderError::Configuration(
             "request-time Codex authentication requires the OpenAI Responses protocol".to_owned(),
@@ -505,6 +505,61 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("max_output_tokens"));
+    }
+
+    struct MismatchedBearerCredentials;
+
+    impl crate::RequestCredentialProvider for MismatchedBearerCredentials {
+        fn credential(&self) -> crate::RequestCredentialFuture<'_> {
+            Box::pin(async {
+                crate::RequestCredential::codex("wrong-codex-token", "wrong-account", false)
+            })
+        }
+    }
+
+    struct MismatchedCodexCredentials;
+
+    impl crate::RequestCredentialProvider for MismatchedCodexCredentials {
+        fn credential(&self) -> crate::RequestCredentialFuture<'_> {
+            Box::pin(async { crate::RequestCredential::bearer("wrong-bearer-token") })
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_request_time_credential_kind_mismatch_before_network_io() {
+        let cases = [
+            HttpAuth::RequestTimeBearer(SharedRequestCredentialProvider::new(
+                MismatchedBearerCredentials,
+            )),
+            HttpAuth::RequestTimeCodex(SharedRequestCredentialProvider::new(
+                MismatchedCodexCredentials,
+            )),
+        ];
+
+        for auth in cases {
+            let provider = ProviderCompiler::new()
+                .unwrap()
+                .compile(ProviderRecipe::http(HttpProviderRecipe::new(
+                    EndpointSpec::exact("http://127.0.0.1:1/v1/responses", true),
+                    HttpProtocol::OpenAiResponses,
+                    auth,
+                )))
+                .unwrap();
+            let events = provider
+                .stream(ModelRequest::new(
+                    "gpt-test",
+                    vec![Message::user("ping")],
+                    64,
+                ))
+                .collect::<Vec<_>>()
+                .await;
+
+            assert!(matches!(
+                events.as_slice(),
+                [Err(ProviderError::Configuration(message))]
+                    if message == "request credential kind did not match configured authorization intent"
+            ));
+        }
     }
 
     struct StaticBearerCredentials;

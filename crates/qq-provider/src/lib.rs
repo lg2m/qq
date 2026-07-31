@@ -10,6 +10,9 @@ use thiserror::Error;
 pub mod anthropic;
 pub mod bedrock;
 pub mod compiler;
+// Phase 4 introduces this factory before phase 5 routes the compiler through it.
+#[allow(dead_code)]
+mod construction;
 pub mod google;
 mod http;
 mod limits;

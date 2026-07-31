@@ -1376,7 +1376,7 @@ mod tests {
             reqwest::Url::parse(&endpoint).unwrap(),
             ChatCompletionsAuth::NoAuth,
             [],
-            RequestAuthorizer::request_credentials(credentials),
+            RequestAuthorizer::request_time_bearer(credentials),
         )
         .unwrap();
 
