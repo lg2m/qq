@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     io::Write,
+    ops::Range,
     sync::OnceLock,
 };
 
@@ -30,9 +31,17 @@ use crate::{
 
 const MAX_RENDER_WIDTH: u16 = 320;
 const MAX_RENDER_HEIGHT: u16 = 160;
-const MAX_MARKDOWN_BYTES: usize = 32 * 1024;
+const MAX_LIVE_MARKDOWN_BYTES: usize = 32 * 1024;
 const MAX_VISIBLE_MESSAGES: usize = 64;
-const MAX_CACHED_MARKDOWN_ROWS: usize = MAX_RENDER_HEIGHT as usize;
+const MAX_LIVE_MARKDOWN_ROWS: usize = MAX_RENDER_HEIGHT as usize;
+/// Completed messages at or below these bounds retain full markdown styling.
+/// Larger messages use a sparse plain-text row index so scrolling stays
+/// complete without caching every rendered row.
+const MAX_FULL_MARKDOWN_BYTES: usize = 64 * 1024;
+const MAX_FULL_MARKDOWN_ROWS: usize = 4 * 1024;
+const PLAIN_TEXT_CHECKPOINT_ROWS: usize = 1024;
+const MAX_PLAIN_TEXT_CHECKPOINTS: usize = 4 * 1024;
+const MAX_PLAIN_TEXT_ROW_BYTES: usize = 4 * 1024;
 /// Runs with more than this many quiet tool calls fold into one summary row.
 const TOOL_FOLD_THRESHOLD: usize = 3;
 /// Emitted by qq-core tools when a result was cut short; excluded from counts.
@@ -232,11 +241,340 @@ pub(crate) struct FrameRenderer {
     previous: Vec<Line>,
     size: Option<(u16, u16)>,
     markdown: HashMap<MessageId, CachedMarkdown>,
+    live_message_ranges: HashMap<MessageId, Range<usize>>,
+    preserve_tail_anchor: bool,
 }
 
 struct CachedMarkdown {
     width: usize,
-    lines: Vec<Line>,
+    output_bytes: usize,
+    refusal_bytes: usize,
+    loaded_through: u64,
+    body: CachedMessageBody,
+}
+
+enum CachedMessageBody {
+    Markdown(Vec<Line>),
+    Plain(PlainTextIndex),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlainTextCheckpoint {
+    row: usize,
+    byte: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MessageText<'a> {
+    output: &'a str,
+    refusal: &'a str,
+}
+
+impl<'a> MessageText<'a> {
+    const SEPARATOR: &'static str = "\n\n";
+
+    fn new(message: &'a MessageSnapshot) -> Self {
+        Self {
+            output: &message.output,
+            refusal: &message.refusal,
+        }
+    }
+
+    const fn has_separator(self) -> bool {
+        !self.output.is_empty() && !self.refusal.is_empty()
+    }
+
+    fn len(self) -> usize {
+        self.output.len()
+            + self.refusal.len()
+            + usize::from(self.has_separator()) * Self::SEPARATOR.len()
+    }
+
+    fn as_cow(self) -> Cow<'a, str> {
+        if self.refusal.is_empty() {
+            return Cow::Borrowed(self.output);
+        }
+        if self.output.is_empty() {
+            return Cow::Borrowed(self.refusal);
+        }
+        Cow::Owned(format!(
+            "{}{}{}",
+            self.output,
+            Self::SEPARATOR,
+            self.refusal
+        ))
+    }
+
+    fn next_char(self, byte: usize) -> Option<(char, usize)> {
+        if byte < self.output.len() {
+            let character = self.output[byte..].chars().next()?;
+            return Some((character, byte + character.len_utf8()));
+        }
+        let refusal_start =
+            self.output.len() + usize::from(self.has_separator()) * Self::SEPARATOR.len();
+        if byte < refusal_start {
+            return Some(('\n', byte + 1));
+        }
+        if byte < self.len() {
+            let local = byte - refusal_start;
+            let character = self.refusal[local..].chars().next()?;
+            return Some((character, byte + character.len_utf8()));
+        }
+        None
+    }
+
+    fn is_char_boundary(self, byte: usize) -> bool {
+        if byte <= self.output.len() {
+            return self.output.is_char_boundary(byte);
+        }
+        let refusal_start =
+            self.output.len() + usize::from(self.has_separator()) * Self::SEPARATOR.len();
+        if byte <= refusal_start {
+            return true;
+        }
+        let local = byte - refusal_start;
+        local <= self.refusal.len() && self.refusal.is_char_boundary(local)
+    }
+
+    fn collect_range(self, range: Range<usize>, sanitize: bool) -> String {
+        let mut collected = String::with_capacity(range.len());
+        let mut byte = range.start.min(self.len());
+        let end = range.end.min(self.len());
+        while byte < end {
+            let Some((character, next)) = self.next_char(byte) else {
+                break;
+            };
+            if !sanitize {
+                collected.push(character);
+            } else if let Some(character) = terminal_safe_character(character) {
+                collected.push(character);
+            }
+            byte = next;
+        }
+        collected
+    }
+
+    fn bounded_tail(self, max_bytes: usize) -> Cow<'a, str> {
+        if self.len() <= max_bytes {
+            return self.as_cow();
+        }
+        let mut start = self.len() - max_bytes;
+        while !self.is_char_boundary(start) {
+            start += 1;
+        }
+        Cow::Owned(self.collect_range(start..self.len(), false))
+    }
+}
+
+/// Sparse row index for oversized completed messages. It stores one byte
+/// checkpoint per bounded group of visual rows and reconstructs only the
+/// requested viewport. Checkpoints are compacted as the message grows, so the
+/// source is scanned once while retained memory stays predictable.
+struct PlainTextIndex {
+    content_width: usize,
+    rows: usize,
+    checkpoints: Vec<PlainTextCheckpoint>,
+}
+
+impl PlainTextIndex {
+    fn new(source: MessageText<'_>, content_width: usize) -> Self {
+        let content_width = content_width.max(1);
+        let mut checkpoints = vec![PlainTextCheckpoint { row: 0, byte: 0 }];
+        let mut checkpoint_rows = PLAIN_TEXT_CHECKPOINT_ROWS;
+        let mut rows = 0;
+        let mut byte = 0;
+        while let Some((_, next)) = next_plain_text_row(source, byte, content_width) {
+            rows += 1;
+            byte = next;
+            if checkpoints.len() >= MAX_PLAIN_TEXT_CHECKPOINTS {
+                checkpoint_rows = checkpoint_rows.saturating_mul(2);
+                checkpoints.retain(|checkpoint| checkpoint.row % checkpoint_rows == 0);
+            }
+            if rows % checkpoint_rows == 0 && byte < source.len() {
+                checkpoints.push(PlainTextCheckpoint { row: rows, byte });
+            }
+        }
+        Self {
+            content_width,
+            rows,
+            checkpoints,
+        }
+    }
+
+    fn render(
+        &self,
+        source: MessageText<'_>,
+        rows: Range<usize>,
+        prefix: &'static str,
+        prefix_style: Style,
+        width: usize,
+    ) -> Vec<Line> {
+        let rows = rows.start.min(self.rows)..rows.end.min(self.rows);
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let checkpoint = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.row <= rows.start)
+            .saturating_sub(1);
+        let checkpoint = self.checkpoints[checkpoint];
+        let mut current_row = checkpoint.row;
+        let mut byte = checkpoint.byte;
+        let mut rendered = Vec::with_capacity(rows.len());
+        while let Some((range, next)) = next_plain_text_row(source, byte, self.content_width) {
+            if current_row >= rows.end {
+                break;
+            }
+            if current_row >= rows.start {
+                let safe = source.collect_range(range, true);
+                let mut line = Line::styled(prefix, prefix_style);
+                line.push(safe, normal());
+                rendered.push(truncate_line(line, width));
+            }
+            current_row += 1;
+            byte = next;
+        }
+        rendered
+    }
+}
+
+enum BodySegment<'a> {
+    Owned(Vec<Line>),
+    Cached(&'a [Line]),
+    Plain {
+        index: &'a PlainTextIndex,
+        message_id: MessageId,
+        prefix: &'static str,
+        prefix_style: Style,
+        width: usize,
+    },
+}
+
+impl BodySegment<'_> {
+    fn rows(&self) -> usize {
+        match self {
+            Self::Owned(lines) => lines.len(),
+            Self::Cached(lines) => lines.len(),
+            Self::Plain { index, .. } => index.rows,
+        }
+    }
+}
+
+#[derive(Default)]
+struct VirtualBody<'a> {
+    segments: Vec<BodySegment<'a>>,
+    rows: usize,
+    preserve_tail_anchor: bool,
+    live_message_ranges: Vec<(MessageId, Range<usize>)>,
+}
+
+impl<'a> VirtualBody<'a> {
+    fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    fn push_line(&mut self, line: Line) {
+        self.extend_owned(vec![line]);
+    }
+
+    fn extend_owned(&mut self, mut lines: Vec<Line>) {
+        if lines.is_empty() {
+            return;
+        }
+        self.rows += lines.len();
+        if let Some(BodySegment::Owned(current)) = self.segments.last_mut() {
+            current.append(&mut lines);
+        } else {
+            self.segments.push(BodySegment::Owned(lines));
+        }
+    }
+
+    fn extend_cached(&mut self, lines: &'a [Line]) {
+        if lines.is_empty() {
+            return;
+        }
+        self.rows += lines.len();
+        self.segments.push(BodySegment::Cached(lines));
+    }
+
+    fn extend_plain(
+        &mut self,
+        index: &'a PlainTextIndex,
+        message_id: MessageId,
+        prefix: &'static str,
+        prefix_style: Style,
+        width: usize,
+    ) {
+        if index.rows == 0 {
+            return;
+        }
+        self.rows += index.rows;
+        self.segments.push(BodySegment::Plain {
+            index,
+            message_id,
+            prefix,
+            prefix_style,
+            width,
+        });
+    }
+
+    fn extend_virtual(&mut self, mut other: VirtualBody<'a>) {
+        let row_offset = self.rows;
+        for (_, range) in &mut other.live_message_ranges {
+            range.start += row_offset;
+            range.end += row_offset;
+        }
+        self.rows += other.rows;
+        self.preserve_tail_anchor |= other.preserve_tail_anchor;
+        self.live_message_ranges
+            .append(&mut other.live_message_ranges);
+        self.segments.append(&mut other.segments);
+    }
+
+    fn viewport(&self, app: &App, height: usize, offset: usize) -> Vec<Line> {
+        let offset = offset.min(self.rows.saturating_sub(height));
+        let end = self.rows.saturating_sub(offset);
+        let start = end.saturating_sub(height);
+        let mut rendered = Vec::with_capacity(height.min(self.rows));
+        let mut segment_start = 0;
+        for segment in &self.segments {
+            let segment_end = segment_start + segment.rows();
+            let local_start = start.saturating_sub(segment_start).min(segment.rows());
+            let local_end = end.saturating_sub(segment_start).min(segment.rows());
+            if local_start < local_end {
+                match segment {
+                    BodySegment::Owned(lines) => {
+                        rendered.extend_from_slice(&lines[local_start..local_end]);
+                    }
+                    BodySegment::Cached(lines) => {
+                        rendered.extend_from_slice(&lines[local_start..local_end]);
+                    }
+                    BodySegment::Plain {
+                        index,
+                        message_id,
+                        prefix,
+                        prefix_style,
+                        width,
+                    } => {
+                        let message = find_message(app, *message_id)
+                            .expect("virtual transcript message remains loaded");
+                        rendered.extend(index.render(
+                            MessageText::new(message),
+                            local_start..local_end,
+                            prefix,
+                            *prefix_style,
+                            *width,
+                        ));
+                    }
+                }
+            }
+            if segment_end >= end {
+                break;
+            }
+            segment_start = segment_end;
+        }
+        fit_height(rendered, height)
+    }
 }
 
 impl FrameRenderer {
@@ -278,7 +616,7 @@ impl FrameRenderer {
     }
 
     fn frame(&mut self, app: &mut App, width: usize, height: usize) -> Vec<Line> {
-        self.prune_markdown(app);
+        self.preserve_tail_anchor = false;
         if width < 32 || height < 9 {
             return fit_height(
                 vec![
@@ -308,23 +646,26 @@ impl FrameRenderer {
         let overlay = app.model_picker.is_some()
             || app.session_picker.is_some()
             || app.pending_approval().is_some();
-        let body = if app.model_picker.is_some() {
-            model_picker(app, width, body_height)
-        } else if app.session_picker.is_some() {
-            session_picker(app, width, body_height)
-        } else if app.pending_approval().is_some() {
-            approval_prompt(app, width, body_height)
+        let mut body = if overlay {
+            self.prune_markdown(app);
+            if app.model_picker.is_some() {
+                model_picker(app, width, body_height)
+            } else if app.session_picker.is_some() {
+                session_picker(app, width, body_height)
+            } else {
+                approval_prompt(app, width, body_height)
+            }
         } else {
-            match app.layout {
+            let body = match app.layout {
                 Layout::Threadline => self.threadline(app, width),
                 Layout::FoldFocus => self.fold_focus(app, width),
-            }
-        };
-        let mut body = if overlay {
-            body
-        } else {
-            app.update_transcript_viewport(body.len(), body_height);
-            transcript_viewport(body, body_height, app.transcript_scroll_offset())
+            };
+            app.update_transcript_viewport(body.rows, body_height, body.preserve_tail_anchor);
+            let live_message_ranges = body.live_message_ranges.clone();
+            let viewport = body.viewport(app, body_height, app.transcript_scroll_offset());
+            drop(body);
+            self.live_message_ranges = live_message_ranges.into_iter().collect();
+            viewport
         };
         if !overlay {
             overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
@@ -344,127 +685,346 @@ impl FrameRenderer {
         {
             app.focused
                 .and_then(|session_id| app.sessions.get(&session_id))
-                .and_then(|session| session.messages.as_ref())
-                .map(|messages| {
+                .and_then(|session| {
+                    session
+                        .messages
+                        .as_ref()
+                        .map(|messages| (session, messages))
+                })
+                .map(|(session, messages)| {
                     let limit = match app.layout {
                         Layout::Threadline => MAX_VISIBLE_MESSAGES,
                         Layout::FoldFocus => 2,
                     };
-                    messages
+                    let mut visible = messages
                         .iter()
                         .rev()
                         .take(limit)
                         .map(|message| message.id)
-                        .collect::<HashSet<_>>()
+                        .collect::<HashSet<_>>();
+                    if app.layout == Layout::FoldFocus
+                        && let Some(active_run_id) = session.summary.active_run_id
+                        && let Some(message) = messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.run_id == active_run_id)
+                    {
+                        visible.insert(message.id);
+                    }
+                    visible
                 })
         } else {
             None
         };
         match visible {
-            Some(visible) => self.markdown.retain(|id, _| visible.contains(id)),
-            None => self.markdown.clear(),
+            Some(visible) => {
+                self.markdown.retain(|id, _| visible.contains(id));
+                self.live_message_ranges
+                    .retain(|id, _| visible.contains(id));
+            }
+            None => {
+                self.markdown.clear();
+                // An overlay temporarily hides the transcript but must not
+                // erase its live-row anchors. A completion received behind the
+                // overlay still needs to preserve the user's prior viewport
+                // when the transcript becomes visible again.
+            }
         }
     }
 
-    fn threadline(&mut self, app: &App, width: usize) -> Vec<Line> {
-        let mut lines = vec![section(
-            "THREADLINE",
-            "conversation with child work in one chronology",
-        )];
-        lines.push(Line::default());
-        lines.extend(self.transcript(app, width));
+    fn prepare_markdown(&mut self, app: &App, width: usize, limit: usize) {
+        self.prune_markdown(app);
+        let Some(session) = app
+            .focused
+            .and_then(|session_id| app.sessions.get(&session_id))
+        else {
+            return;
+        };
+        let Some(messages) = session.messages.as_ref() else {
+            return;
+        };
+        for message in messages.iter().rev().take(limit) {
+            if message_is_terminal(message) {
+                if self
+                    .live_message_ranges
+                    .remove(&message.id)
+                    .is_some_and(|range| app.transcript_viewport_intersects_or_follows(&range))
+                {
+                    self.preserve_tail_anchor = true;
+                }
+                self.cache_message(message, width, session.loaded_through);
+            } else {
+                self.markdown.remove(&message.id);
+            }
+        }
+        if app.layout == Layout::FoldFocus
+            && let Some(active_run_id) = session.summary.active_run_id
+            && let Some(message) = messages
+                .iter()
+                .rev()
+                .find(|message| message.run_id == active_run_id)
+            && !messages
+                .iter()
+                .rev()
+                .take(limit)
+                .any(|visible| visible.id == message.id)
+        {
+            if message_is_terminal(message) {
+                if self
+                    .live_message_ranges
+                    .remove(&message.id)
+                    .is_some_and(|range| app.transcript_viewport_intersects_or_follows(&range))
+                {
+                    self.preserve_tail_anchor = true;
+                }
+                self.cache_message(message, width, session.loaded_through);
+            } else {
+                self.markdown.remove(&message.id);
+            }
+        }
+    }
+
+    fn cache_message(&mut self, message: &MessageSnapshot, width: usize, loaded_through: u64) {
+        if self.markdown.get(&message.id).is_some_and(|cached| {
+            cached.width == width
+                && cached.output_bytes == message.output.len()
+                && cached.refusal_bytes == message.refusal.len()
+                && cached.loaded_through == loaded_through
+        }) {
+            return;
+        }
+        let source = MessageText::new(message);
+        let content_width = width.saturating_sub(3).max(1);
+        let (prefix, prefix_style, _, _) = message_presentation(message.role);
+        let body = if source.len() <= MAX_FULL_MARKDOWN_BYTES {
+            let content = source.as_cow();
+            let lines = markdown_lines(&content, content_width, true);
+            if lines.len() <= MAX_FULL_MARKDOWN_ROWS {
+                CachedMessageBody::Markdown(indent_lines(lines, prefix, prefix_style, width))
+            } else {
+                CachedMessageBody::Plain(PlainTextIndex::new(source, content_width))
+            }
+        } else {
+            CachedMessageBody::Plain(PlainTextIndex::new(source, content_width))
+        };
+        if !self.markdown.contains_key(&message.id)
+            && self.markdown.len() >= MAX_VISIBLE_MESSAGES
+            && let Some(stale) = self.markdown.keys().next().copied()
+        {
+            self.markdown.remove(&stale);
+        }
+        self.markdown.insert(
+            message.id,
+            CachedMarkdown {
+                width,
+                output_bytes: message.output.len(),
+                refusal_bytes: message.refusal.len(),
+                loaded_through,
+                body,
+            },
+        );
+    }
+
+    fn threadline<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
+        let transcript = self.transcript(app, width);
+        let mut body = VirtualBody::default();
+        body.extend_owned(vec![
+            section(
+                "THREADLINE",
+                "conversation with child work in one chronology",
+            ),
+            Line::default(),
+        ]);
+        body.extend_virtual(transcript);
         if let Some(focused) = app.focused {
             let children = child_sessions(app, focused);
             if !children.is_empty() {
-                lines.push(Line::default());
-                lines.push(Line::styled("  +-- related sessions", muted().bold()));
+                body.push_line(Line::default());
+                body.push_line(Line::styled("  +-- related sessions", muted().bold()));
                 for child in children {
-                    lines.push(session_line(app, child, width, "     "));
+                    body.push_line(session_line(app, child, width, "     "));
                 }
             }
         }
-        lines
+        body
     }
 
-    fn fold_focus(&mut self, app: &App, width: usize) -> Vec<Line> {
+    fn fold_focus<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
         let content_width = width.min(96);
-        let mut lines = vec![section(
-            "FOLD / FOCUS",
-            "history and parallel work compressed around now",
-        )];
-        lines.push(Line::default());
-        let Some(session_id) = app.focused else {
-            lines.push(Line::styled("  Alt-N creates the first session.", muted()));
-            return lines;
+        self.prepare_markdown(app, content_width, 2);
+        let mut body = VirtualBody {
+            preserve_tail_anchor: std::mem::take(&mut self.preserve_tail_anchor),
+            ..VirtualBody::default()
         };
-        let Some(messages) = app
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.messages.as_ref())
-        else {
-            lines.push(Line::styled(
+        body.extend_owned(vec![
+            section(
+                "FOLD / FOCUS",
+                "history and parallel work compressed around now",
+            ),
+            Line::default(),
+        ]);
+        let Some(session_id) = app.focused else {
+            body.push_line(Line::styled("  Alt-N creates the first session.", muted()));
+            return body;
+        };
+        let Some(session) = app.sessions.get(&session_id) else {
+            body.push_line(Line::styled(
                 "  Loading session history...",
                 muted().italic(),
             ));
-            return lines;
+            return body;
         };
-        if messages.len() > 2 {
-            lines.push(Line::styled(
-                format!("  > {} earlier messages folded", messages.len() - 2),
+        let Some(messages) = session.messages.as_ref() else {
+            body.push_line(Line::styled(
+                "  Loading session history...",
+                muted().italic(),
+            ));
+            return body;
+        };
+        let start = messages.len().saturating_sub(2);
+        let mut selected = (start..messages.len()).collect::<Vec<_>>();
+        if let Some(active_run_id) = session.summary.active_run_id
+            && let Some(active_index) = messages
+                .iter()
+                .rposition(|message| message.run_id == active_run_id)
+            && selected.binary_search(&active_index).is_err()
+        {
+            selected.push(active_index);
+            selected.sort_unstable();
+        }
+        let folded = messages.len().saturating_sub(selected.len());
+        if folded > 0 {
+            body.push_line(Line::styled(
+                format!("  > {folded} messages folded"),
                 accent(),
             ));
-            lines.push(Line::default());
+            body.push_line(Line::default());
         }
-        for message in messages.iter().skip(messages.len().saturating_sub(2)) {
-            lines.extend(self.render_message(message, content_width));
-            lines.push(Line::default());
-        }
+        let mut focused = VirtualBody::default();
+        self.append_message_indices(
+            &mut focused,
+            app,
+            messages,
+            session.tool_calls.as_deref().unwrap_or_default(),
+            selected,
+            content_width,
+        );
+        body.extend_virtual(focused);
         for prompt in app.pending_prompts(session_id) {
             let mut line = Line::styled("  YOU / PENDING  ", warning().bold());
             line.push(
                 preview(prompt, content_width.saturating_sub(18)),
                 muted().italic(),
             );
-            lines.push(line);
+            body.push_line(line);
         }
         for child in child_sessions(app, session_id) {
-            lines.push(session_line(app, child, content_width, "  > "));
+            body.push_line(session_line(app, child, content_width, "  > "));
         }
-        lines
+        body
     }
 
-    fn transcript(&mut self, app: &App, width: usize) -> Vec<Line> {
+    fn transcript<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
+        self.prepare_markdown(app, width, MAX_VISIBLE_MESSAGES);
+        let mut body = VirtualBody {
+            preserve_tail_anchor: std::mem::take(&mut self.preserve_tail_anchor),
+            ..VirtualBody::default()
+        };
         let Some(session_id) = app.focused else {
-            return vec![Line::styled("  Alt-N creates the first session.", muted())];
+            body.push_line(Line::styled("  Alt-N creates the first session.", muted()));
+            return body;
         };
         let Some(session) = app.sessions.get(&session_id) else {
-            return vec![Line::styled(
+            body.push_line(Line::styled(
                 "  Loading session history...",
                 muted().italic(),
-            )];
+            ));
+            return body;
         };
         let Some(messages) = session.messages.as_ref() else {
-            return vec![Line::styled(
+            body.push_line(Line::styled(
                 "  Loading session history...",
                 muted().italic(),
-            )];
+            ));
+            return body;
         };
-        let tool_calls = session.tool_calls.as_deref().unwrap_or_default();
-        let mut lines = Vec::new();
         let hidden = messages.len().saturating_sub(MAX_VISIBLE_MESSAGES);
         if hidden > 0 {
-            lines.push(Line::styled(
+            body.push_line(Line::styled(
                 format!("  {hidden} earlier messages outside the viewport"),
                 muted(),
             ));
         }
-        for (index, message) in messages.iter().enumerate().skip(hidden) {
-            if !lines.is_empty() {
-                lines.push(Line::default());
+        self.append_messages(
+            &mut body,
+            app,
+            messages,
+            session.tool_calls.as_deref().unwrap_or_default(),
+            hidden,
+            width,
+        );
+        for prompt in app.pending_prompts(session_id) {
+            // A pending prompt is a YOU boundary: the same two blank lines
+            // that precede any user turn.
+            if !body.is_empty() {
+                body.push_line(Line::default());
+                body.push_line(Line::default());
+            }
+            let mut line = Line::styled(" ▌ ", warning());
+            line.push("YOU  pending", warning().bold());
+            body.push_line(line);
+            body.extend_owned(indent_lines(
+                pending_markdown_lines(prompt, width.saturating_sub(3)),
+                " ▌ ",
+                warning(),
+                width,
+            ));
+        }
+        if body.is_empty() {
+            body.push_line(Line::styled(
+                "  Ask QQ to begin this session.",
+                muted().italic(),
+            ));
+        }
+        body
+    }
+
+    fn append_messages<'a>(
+        &'a self,
+        body: &mut VirtualBody<'a>,
+        app: &App,
+        messages: &[MessageSnapshot],
+        tool_calls: &[ToolCallSnapshot],
+        start: usize,
+        width: usize,
+    ) {
+        self.append_message_indices(
+            body,
+            app,
+            messages,
+            tool_calls,
+            start..messages.len(),
+            width,
+        );
+    }
+
+    fn append_message_indices<'a>(
+        &'a self,
+        body: &mut VirtualBody<'a>,
+        app: &App,
+        messages: &[MessageSnapshot],
+        tool_calls: &[ToolCallSnapshot],
+        indices: impl IntoIterator<Item = usize>,
+        width: usize,
+    ) {
+        for index in indices {
+            let message = &messages[index];
+            if !body.is_empty() {
+                body.push_line(Line::default());
                 // A user prompt starts a new turn; extra spacing keeps
                 // prompt/response boundaries scannable.
                 if message.role == MessageRole::User {
-                    lines.push(Line::default());
+                    body.push_line(Line::default());
                 }
             }
             if message.role == MessageRole::Assistant {
@@ -503,19 +1063,19 @@ impl FrameRenderer {
                     0
                 };
                 if head > 0 {
-                    lines.extend(render_tool_calls(
+                    body.extend_owned(render_tool_calls(
                         &run_calls[..head],
                         &app.live_tool_output,
                         app.tool_detail,
                         app.animation_tick,
                         width,
                     ));
-                    lines.push(Line::default());
+                    body.push_line(Line::default());
                 }
-                lines.extend(self.render_message(message, width));
+                self.append_message(body, message, width);
                 if run_calls.len() > head {
-                    lines.push(Line::default());
-                    lines.extend(render_tool_calls(
+                    body.push_line(Line::default());
+                    body.extend_owned(render_tool_calls(
                         &run_calls[head..],
                         &app.live_tool_output,
                         app.tool_detail,
@@ -524,41 +1084,93 @@ impl FrameRenderer {
                     ));
                 }
             } else {
-                lines.extend(self.render_message(message, width));
+                self.append_message(body, message, width);
+                let has_assistant_message = messages.iter().any(|candidate| {
+                    candidate.role == MessageRole::Assistant && candidate.run_id == message.run_id
+                });
+                if !has_assistant_message {
+                    let mut orphan_calls = tool_calls
+                        .iter()
+                        .filter(|tool_call| tool_call.run_id == message.run_id)
+                        .collect::<Vec<_>>();
+                    orphan_calls
+                        .sort_by_key(|tool_call| (tool_call.turn_ordinal, tool_call.call_ordinal));
+                    if !orphan_calls.is_empty() {
+                        body.push_line(Line::default());
+                        body.extend_owned(render_tool_calls(
+                            &orphan_calls,
+                            &app.live_tool_output,
+                            app.tool_detail,
+                            app.animation_tick,
+                            width,
+                        ));
+                    }
+                }
             }
         }
-        for prompt in app.pending_prompts(session_id) {
-            // A pending prompt is a YOU boundary: the same two blank lines
-            // that precede any user turn.
-            if !lines.is_empty() {
-                lines.push(Line::default());
-                lines.push(Line::default());
-            }
-            let mut line = Line::styled(" ▌ ", warning());
-            line.push("YOU  pending", warning().bold());
-            lines.push(line);
-            lines.extend(indent_lines(
-                bounded_markdown_lines(prompt, width.saturating_sub(3), false),
-                " ▌ ",
-                warning(),
-                width,
-            ));
-        }
-        if lines.is_empty() {
-            lines.push(Line::styled(
-                "  Ask QQ to begin this session.",
-                muted().italic(),
-            ));
-        }
-        lines
     }
 
+    fn append_message<'a>(
+        &'a self,
+        body: &mut VirtualBody<'a>,
+        message: &MessageSnapshot,
+        width: usize,
+    ) {
+        let (prefix, prefix_style, role, role_style) = message_presentation(message.role);
+        let mut header = Line::styled(prefix, prefix_style);
+        header.push(role, role_style);
+        if !matches!(message.state, MessageState::Complete) {
+            header.push(
+                format!("  {}", message_state_label(message.state)),
+                status_style(message.state),
+            );
+        }
+        body.push_line(truncate_line(header, width));
+        let content_start = body.rows;
+        if message_is_terminal(message) {
+            let cached = self
+                .markdown
+                .get(&message.id)
+                .expect("terminal visible message was prepared");
+            match &cached.body {
+                CachedMessageBody::Markdown(lines) => {
+                    if lines.is_empty() {
+                        body.push_line(message_ellipsis(prefix, prefix_style));
+                    } else {
+                        body.extend_cached(lines);
+                    }
+                }
+                CachedMessageBody::Plain(index) => {
+                    if index.rows == 0 {
+                        body.push_line(message_ellipsis(prefix, prefix_style));
+                    } else {
+                        body.extend_plain(index, message.id, prefix, prefix_style, width);
+                    }
+                }
+            }
+        } else {
+            // Still streaming: rendered every frame, so skip tree-sitter and
+            // keep panels plain and the per-frame work bounded until the
+            // message reaches a terminal state. Any hidden live prefix becomes
+            // reachable through the sparse completed-message index.
+            let lines =
+                live_markdown_lines(MessageText::new(message), width.saturating_sub(3).max(1));
+            if lines.is_empty() {
+                body.push_line(message_ellipsis(prefix, prefix_style));
+            } else {
+                body.extend_owned(indent_lines(lines, prefix, prefix_style, width));
+            }
+            body.live_message_ranges
+                .push((message.id, content_start..body.rows));
+        }
+    }
+
+    #[cfg(test)]
     fn render_message(&mut self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
-        // User turns carry an accent bar so prompt boundaries stand out.
-        let (prefix, prefix_style, role, role_style) = match message.role {
-            MessageRole::User => (" ▌ ", accent(), "YOU", accent().bold()),
-            MessageRole::Assistant => ("   ", muted(), "QQ", normal().bold()),
-        };
+        if message_is_terminal(message) {
+            self.cache_message(message, width, 0);
+        }
+        let (prefix, prefix_style, role, role_style) = message_presentation(message.role);
         let mut header = Line::styled(prefix, prefix_style);
         header.push(role, role_style);
         if !matches!(message.state, MessageState::Complete) {
@@ -568,50 +1180,27 @@ impl FrameRenderer {
             );
         }
         let mut lines = vec![truncate_line(header, width)];
-        let content_width = width.saturating_sub(3).max(1);
-        let terminal = matches!(
-            message.state,
-            MessageState::Complete
-                | MessageState::Cancelled
-                | MessageState::Failed
-                | MessageState::Interrupted
-        );
-        let body = if terminal {
-            if let Some(cached) = self
-                .markdown
-                .get(&message.id)
-                .filter(|cached| cached.width == content_width)
-            {
-                cached.lines.clone()
-            } else {
-                let content = message_content(message);
-                let lines = bounded_markdown_lines(&content, content_width, true);
-                if !self.markdown.contains_key(&message.id)
-                    && self.markdown.len() >= MAX_VISIBLE_MESSAGES
-                    && let Some(stale) = self.markdown.keys().next().copied()
-                {
-                    self.markdown.remove(&stale);
-                }
-                self.markdown.insert(
-                    message.id,
-                    CachedMarkdown {
-                        width: content_width,
-                        lines: lines.clone(),
-                    },
-                );
-                lines
+        if message_is_terminal(message) {
+            match &self.markdown.get(&message.id).expect("message cached").body {
+                CachedMessageBody::Markdown(body) => lines.extend_from_slice(body),
+                CachedMessageBody::Plain(index) => lines.extend(index.render(
+                    MessageText::new(message),
+                    0..index.rows,
+                    prefix,
+                    prefix_style,
+                    width,
+                )),
             }
         } else {
-            // Still streaming: rendered every frame, so skip tree-sitter and
-            // keep panels plain until the message reaches a terminal state.
-            bounded_markdown_lines(&message_content(message), content_width, false)
-        };
-        if body.is_empty() {
-            let mut ellipsis = Line::styled(prefix, prefix_style);
-            ellipsis.push("...", muted());
-            lines.push(ellipsis);
-        } else {
-            lines.extend(indent_lines(body, prefix, prefix_style, width));
+            lines.extend(indent_lines(
+                live_markdown_lines(MessageText::new(message), width.saturating_sub(3).max(1)),
+                prefix,
+                prefix_style,
+                width,
+            ));
+        }
+        if lines.len() == 1 {
+            lines.push(message_ellipsis(prefix, prefix_style));
         }
         lines
     }
@@ -952,18 +1541,35 @@ const fn tool_state_label(state: ToolCallState) -> &'static str {
     }
 }
 
-fn message_content(message: &MessageSnapshot) -> Cow<'_, str> {
-    if message.refusal.is_empty() {
-        return Cow::Borrowed(bounded_tail(&message.output, MAX_MARKDOWN_BYTES));
-    }
-    if message.output.is_empty() {
-        return Cow::Borrowed(bounded_tail(&message.refusal, MAX_MARKDOWN_BYTES));
-    }
+fn find_message(app: &App, message_id: MessageId) -> Option<&MessageSnapshot> {
+    app.sessions
+        .values()
+        .filter_map(|session| session.messages.as_ref())
+        .flatten()
+        .find(|message| message.id == message_id)
+}
 
-    let refusal = bounded_tail(&message.refusal, MAX_MARKDOWN_BYTES.saturating_sub(2));
-    let output_bytes = MAX_MARKDOWN_BYTES.saturating_sub(refusal.len() + 2);
-    let output = bounded_tail(&message.output, output_bytes);
-    Cow::Owned(format!("{output}\n\n{refusal}"))
+const fn message_is_terminal(message: &MessageSnapshot) -> bool {
+    matches!(
+        message.state,
+        MessageState::Complete
+            | MessageState::Cancelled
+            | MessageState::Failed
+            | MessageState::Interrupted
+    )
+}
+
+fn message_presentation(role: MessageRole) -> (&'static str, Style, &'static str, Style) {
+    match role {
+        MessageRole::User => (" ▌ ", accent(), "YOU", accent().bold()),
+        MessageRole::Assistant => ("   ", muted(), "QQ", normal().bold()),
+    }
+}
+
+fn message_ellipsis(prefix: &'static str, prefix_style: Style) -> Line {
+    let mut ellipsis = Line::styled(prefix, prefix_style);
+    ellipsis.push("...", muted());
+    ellipsis
 }
 
 fn header(app: &App, width: usize) -> Line {
@@ -2227,11 +2833,50 @@ fn code_panel_row(content: Line, width: usize) -> Line {
     row
 }
 
-fn bounded_markdown_lines(source: &str, width: usize, highlight: bool) -> Vec<Line> {
-    let mut lines = markdown_lines(bounded_tail(source, MAX_MARKDOWN_BYTES), width, highlight);
-    let excess = lines.len().saturating_sub(MAX_CACHED_MARKDOWN_ROWS);
+fn live_markdown_lines(source: MessageText<'_>, width: usize) -> Vec<Line> {
+    let source_was_truncated = source.len() > MAX_LIVE_MARKDOWN_BYTES;
+    let tail = source.bounded_tail(MAX_LIVE_MARKDOWN_BYTES);
+    let mut lines = markdown_lines(&tail, width, false);
+    let reserved_marker = usize::from(source_was_truncated || lines.len() > MAX_LIVE_MARKDOWN_ROWS);
+    let excess = lines
+        .len()
+        .saturating_sub(MAX_LIVE_MARKDOWN_ROWS.saturating_sub(reserved_marker));
     if excess > 0 {
         lines.drain(..excess);
+    }
+    if reserved_marker > 0 {
+        lines.insert(
+            0,
+            truncate_line(
+                Line::styled(
+                    "... earlier output remains available when this message completes",
+                    muted().italic(),
+                ),
+                width,
+            ),
+        );
+    }
+    lines
+}
+
+fn pending_markdown_lines(source: &str, width: usize) -> Vec<Line> {
+    let source_was_truncated = source.len() > MAX_LIVE_MARKDOWN_BYTES;
+    let mut lines = markdown_lines(bounded_tail(source, MAX_LIVE_MARKDOWN_BYTES), width, false);
+    let reserved_marker = usize::from(source_was_truncated || lines.len() > MAX_LIVE_MARKDOWN_ROWS);
+    let excess = lines
+        .len()
+        .saturating_sub(MAX_LIVE_MARKDOWN_ROWS.saturating_sub(reserved_marker));
+    if excess > 0 {
+        lines.drain(..excess);
+    }
+    if reserved_marker > 0 {
+        lines.insert(
+            0,
+            truncate_line(
+                Line::styled("... earlier pending prompt omitted", muted().italic()),
+                width,
+            ),
+        );
     }
     lines
 }
@@ -2372,7 +3017,7 @@ fn truncate_line(line: Line, width: usize) -> Line {
         return Line::styled(".".repeat(width), muted());
     }
     let mut output = Line::default();
-    let mut used = 0;
+    let mut used = 0_usize;
     let content_width = width - 3;
     for span in line.spans {
         let mut text = String::new();
@@ -2400,6 +3045,7 @@ fn selection_viewport(lines: Vec<Line>, height: usize, selected_row: usize) -> V
     lines.into_iter().skip(start).take(height).collect()
 }
 
+#[cfg(test)]
 fn transcript_viewport(mut lines: Vec<Line>, height: usize, offset: usize) -> Vec<Line> {
     let offset = offset.min(lines.len().saturating_sub(height));
     let end = lines.len().saturating_sub(offset);
@@ -2428,6 +3074,36 @@ fn preview(text: &str, width: usize) -> String {
                 .collect::<String>()
         )
     }
+}
+
+fn next_plain_text_row(
+    source: MessageText<'_>,
+    start: usize,
+    width: usize,
+) -> Option<(Range<usize>, usize)> {
+    if start >= source.len() {
+        return None;
+    }
+    let width = width.max(1);
+    let mut used = 0_usize;
+    let mut byte = start;
+    while let Some((character, next)) = source.next_char(byte) {
+        if byte > start && next.saturating_sub(start) > MAX_PLAIN_TEXT_ROW_BYTES {
+            return Some((start..byte, byte));
+        }
+        if character == '\n' {
+            return Some((start..byte, next));
+        }
+        let character_width = terminal_safe_character(character)
+            .and_then(UnicodeWidthChar::width)
+            .unwrap_or_default();
+        if used > 0 && used.saturating_add(character_width) > width {
+            return Some((start..byte, byte));
+        }
+        used = used.saturating_add(character_width);
+        byte = next;
+    }
+    Some((start..source.len(), source.len()))
 }
 
 fn bounded_tail(text: &str, max_bytes: usize) -> &str {
@@ -2552,6 +3228,18 @@ mod tests {
             .iter()
             .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
             .collect()
+    }
+
+    fn transcript_lines(app: &App, width: usize) -> Vec<Line> {
+        let mut renderer = FrameRenderer::default();
+        let body = renderer.transcript(app, width);
+        body.viewport(app, body.rows, 0)
+    }
+
+    fn fold_focus_lines(app: &App, width: usize) -> Vec<Line> {
+        let mut renderer = FrameRenderer::default();
+        let body = renderer.fold_focus(app, width);
+        body.viewport(app, body.rows, 0)
     }
 
     #[test]
@@ -2941,6 +3629,33 @@ mod tests {
     }
 
     #[test]
+    fn live_message_rendering_is_bounded_without_hiding_completed_output() {
+        let mut renderer = FrameRenderer::default();
+        let mut message = completed_message(
+            1,
+            format!(
+                "BEGIN-LIVE-MESSAGE\n{}\nEND-LIVE-MESSAGE",
+                "streaming row\n".repeat(MAX_LIVE_MARKDOWN_ROWS * 4)
+            ),
+        );
+        message.state = MessageState::Streaming;
+
+        let live = renderer.render_message(&message, 40);
+        let live_text = frame_text(&live);
+
+        assert!(live.len() <= MAX_LIVE_MARKDOWN_ROWS + 1);
+        assert!(live_text.contains("earlier output remains"));
+        assert!(!live_text.contains("BEGIN-LIVE-MESSAGE"));
+        assert!(live_text.contains("END-LIVE-MESSAGE"));
+
+        message.state = MessageState::Complete;
+        let complete = renderer.render_message(&message, 40);
+        let complete_text = frame_text(&complete);
+        assert!(complete_text.contains("BEGIN-LIVE-MESSAGE"));
+        assert!(complete_text.contains("END-LIVE-MESSAGE"));
+    }
+
+    #[test]
     fn headings_get_a_blank_line_above_and_lists_stay_tight() {
         let rows = frame_rows(&markdown_lines(
             "intro\n# Title\n- alpha\n- beta",
@@ -3009,6 +3724,134 @@ mod tests {
     }
 
     #[test]
+    fn call_only_run_renders_before_its_first_assistant_message() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        session.messages.as_mut().unwrap()[0].role = MessageRole::User;
+        session.tool_calls = Some(vec![tool_call_snapshot(
+            7,
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+            ToolCallState::Running,
+            None,
+            false,
+        )]);
+
+        let rows = frame_rows(&transcript_lines(&app, 100));
+
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("read_file note.txt") && row.contains("running"))
+        );
+    }
+
+    #[test]
+    fn fold_focus_renders_the_current_runs_tool_activity() {
+        let mut app = app_with_messages(1);
+        app.layout = Layout::FoldFocus;
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        session.summary.status = SessionStatus::Running;
+        session.summary.active_run_id = Some(RunId::from_bytes([2; 16]));
+        session.tool_calls = Some(vec![tool_call_snapshot(
+            7,
+            "read_file",
+            r#"{"path":"note.txt"}"#,
+            ToolCallState::Running,
+            None,
+            false,
+        )]);
+
+        let rows = frame_rows(&fold_focus_lines(&app, 100));
+
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("read_file note.txt") && row.contains("running"))
+        );
+    }
+
+    #[test]
+    fn fold_focus_keeps_active_work_visible_ahead_of_queued_prompts() {
+        let mut app = app_with_messages(4);
+        app.layout = Layout::FoldFocus;
+        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        session.summary.status = SessionStatus::Running;
+        let active_run_id = RunId::from_bytes([2; 16]);
+        session.summary.active_run_id = Some(active_run_id);
+        let messages = session.messages.as_mut().unwrap();
+        messages[0].run_id = RunId::from_bytes([9; 16]);
+        messages[0].output = "folded history".to_owned();
+        messages[1].run_id = active_run_id;
+        messages[1].output = "active model turn".to_owned();
+        messages[2].run_id = RunId::from_bytes([3; 16]);
+        messages[2].role = MessageRole::User;
+        messages[2].state = MessageState::Queued;
+        messages[2].output = "queued prompt one".to_owned();
+        messages[3].run_id = RunId::from_bytes([4; 16]);
+        messages[3].role = MessageRole::User;
+        messages[3].state = MessageState::Queued;
+        messages[3].output = "queued prompt two".to_owned();
+        session.tool_calls = Some(vec![tool_call_snapshot(
+            7,
+            "read_file",
+            r#"{"path":"active.rs"}"#,
+            ToolCallState::Running,
+            None,
+            false,
+        )]);
+
+        let rows = frame_rows(&fold_focus_lines(&app, 100));
+        let text = rows.join("\n");
+
+        assert!(text.contains("active model turn"));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("read_file active.rs") && row.contains("running"))
+        );
+        assert!(text.contains("queued prompt one"));
+        assert!(text.contains("queued prompt two"));
+        assert!(!text.contains("folded history"));
+    }
+
+    #[test]
+    fn fold_focus_keeps_tool_calls_between_their_model_turns() {
+        let mut app = app_with_messages(3);
+        app.layout = Layout::FoldFocus;
+        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        let messages = session.messages.as_mut().unwrap();
+        messages[0].role = MessageRole::User;
+        messages[1].turn_ordinal = 1;
+        messages[2].turn_ordinal = 2;
+        let mut first = tool_call_snapshot(
+            7,
+            "read_file",
+            r#"{"path":"first.rs"}"#,
+            ToolCallState::Completed,
+            Some("first\n"),
+            false,
+        );
+        first.turn_ordinal = 1;
+        let mut second = tool_call_snapshot(
+            8,
+            "read_file",
+            r#"{"path":"second.rs"}"#,
+            ToolCallState::Completed,
+            Some("second\n"),
+            false,
+        );
+        second.turn_ordinal = 2;
+        session.tool_calls = Some(vec![second, first]);
+
+        let rows = frame_rows(&fold_focus_lines(&app, 100));
+        let position = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
+
+        assert!(position("row 1") < position("first.rs"));
+        assert!(position("first.rs") < position("row 2"));
+        assert!(position("row 2") < position("second.rs"));
+    }
+
+    #[test]
     fn transcript_spacing_separates_blocks_and_doubles_before_prompts() {
         let mut app = app_with_messages(3);
         let session_id = app.focused.unwrap();
@@ -3025,7 +3868,7 @@ mod tests {
             false,
         )]);
 
-        let rows = frame_rows(&FrameRenderer::default().transcript(&app, 80));
+        let rows = frame_rows(&transcript_lines(&app, 80));
 
         assert_eq!(
             rows,
@@ -3072,7 +3915,7 @@ mod tests {
             call(3, 1, "read_file", r#"{"path":"a.rs"}"#, "a\n"),
         ]);
 
-        let rows = frame_rows(&FrameRenderer::default().transcript(&app, 80));
+        let rows = frame_rows(&transcript_lines(&app, 80));
 
         // The call-only turn 1 renders before the run's first message (turn
         // 2), so the transcript reads in execution order.
@@ -3116,7 +3959,7 @@ mod tests {
             .collect::<Vec<_>>();
         session.tool_calls = Some(calls);
 
-        let rows = frame_rows(&FrameRenderer::default().transcript(&app, 80));
+        let rows = frame_rows(&transcript_lines(&app, 80));
 
         // The call-only turns 2 and 3 merge into turn 1's contiguous call
         // group, and the four quiet calls fold as one, not per turn.
@@ -3668,14 +4511,24 @@ mod tests {
     }
 
     #[test]
-    fn panel_rows_emit_the_surface_background_to_the_terminal() {
+    fn panel_rows_carry_the_surface_background_through_output() {
         let row = code_panel_row(Line::styled("x", normal()), 8);
+        assert!(
+            row.spans
+                .iter()
+                .all(|span| span.style.background == Some(SURFACE_COLOR))
+        );
         let mut rendered = Vec::new();
 
         write_line(&mut rendered, &row).unwrap();
 
         let rendered = String::from_utf8(rendered).unwrap();
-        assert!(rendered.contains("48;2;38;40;48"));
+        assert!(rendered.contains('x'));
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert!(rendered.contains("\u{1b}[48;2;38;40;48m"));
+        } else {
+            assert!(!rendered.contains("\u{1b}[48;2;38;40;48m"));
+        }
     }
 
     #[test]
@@ -3693,7 +4546,7 @@ mod tests {
         renderer.render_message(&message, 40);
         renderer.render_message(&message, 80);
         assert_eq!(renderer.markdown.len(), 1);
-        assert_eq!(renderer.markdown[&message.id].width, 77);
+        assert_eq!(renderer.markdown[&message.id].width, 80);
 
         for byte in 2..=u8::try_from(MAX_VISIBLE_MESSAGES + 8).unwrap() {
             renderer.render_message(&completed_message(byte, byte.to_string()), 80);
@@ -3702,32 +4555,344 @@ mod tests {
     }
 
     #[test]
-    fn completed_markdown_uses_a_bounded_tail() {
+    fn authoritative_snapshot_generation_invalidates_same_length_cached_output() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        app.sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .messages
+            .as_mut()
+            .unwrap()[0]
+            .output = "old".to_owned();
         let mut renderer = FrameRenderer::default();
-        let output = format!("START-MARKER{}END-MARKER", "x".repeat(MAX_MARKDOWN_BYTES));
-        let message = completed_message(1, output);
-        renderer.render_message(&message, 80);
+        let initial = renderer.transcript(&app, 80);
+        assert!(frame_text(&initial.viewport(&app, initial.rows, 0)).contains("old"));
+        drop(initial);
 
-        let cached = &renderer.markdown[&message.id].lines;
-        let text = cached
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        session.messages.as_mut().unwrap()[0].output = "new".to_owned();
+        session.loaded_through += 1;
+        let refreshed = renderer.transcript(&app, 80);
+        let text = frame_text(&refreshed.viewport(&app, refreshed.rows, 0));
+
+        assert!(text.contains("new"));
+        assert!(!text.contains("old"));
+    }
+
+    #[test]
+    fn completed_markdown_preserves_the_beginning_and_end_of_long_messages() {
+        let mut renderer = FrameRenderer::default();
+        let output = (1..=10)
+            .map(|phase| {
+                format!(
+                    "## Phase {phase}\n{}{}\n",
+                    if phase == 1 {
+                        "BEGIN-FIRST-PHASE\n"
+                    } else {
+                        ""
+                    },
+                    (0..80)
+                        .map(|step| format!(
+                            "- phase {phase} step {step}: verify the complete output"
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+            .collect::<String>()
+            + "\nEND-FINAL-PHASE";
+        let message = completed_message(1, output);
+        let rendered = renderer.render_message(&message, 80);
+
+        let text = rendered
             .iter()
             .flat_map(|line| &line.spans)
             .map(|span| span.text.as_str())
             .collect::<String>();
-        assert!(!text.contains("START-MARKER"));
-        assert!(text.contains("END-MARKER"));
-        assert!(cached.len() <= MAX_CACHED_MARKDOWN_ROWS);
+        assert!(text.contains("BEGIN-FIRST-PHASE"));
+        assert!(text.contains("phase 5 step 40"));
+        assert!(text.contains("END-FINAL-PHASE"));
     }
 
     #[test]
-    fn combined_output_and_refusal_respect_the_markdown_limit() {
-        let mut message = completed_message(1, "o".repeat(MAX_MARKDOWN_BYTES));
-        message.refusal = format!("{}END", "r".repeat(MAX_MARKDOWN_BYTES));
+    fn oversized_completed_messages_use_a_sparse_full_history_index() {
+        let mut app = app_with_messages(1);
+        let message = &mut app
+            .sessions
+            .get_mut(&app.focused.unwrap())
+            .unwrap()
+            .messages
+            .as_mut()
+            .unwrap()[0];
+        message.output = std::iter::once("BEGIN-SPARSE".to_owned())
+            .chain((0..12_000).map(|row| format!("ROW-{row:05} 😀")))
+            .chain(std::iter::once("END-SPARSE".to_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message.output.len() > MAX_FULL_MARKDOWN_BYTES);
 
-        let content = message_content(&message);
+        let mut renderer = FrameRenderer::default();
+        let body = renderer.transcript(&app, 80);
+        let (index, message_id, prefix, prefix_style, width) = body
+            .segments
+            .iter()
+            .find_map(|segment| match segment {
+                BodySegment::Plain {
+                    index,
+                    message_id,
+                    prefix,
+                    prefix_style,
+                    width,
+                } => Some((*index, *message_id, *prefix, *prefix_style, *width)),
+                BodySegment::Owned(_) | BodySegment::Cached(_) => None,
+            })
+            .expect("oversized message uses sparse rendering");
+        assert!(index.checkpoints.len() <= MAX_PLAIN_TEXT_CHECKPOINTS + 1);
 
-        assert!(content.len() <= MAX_MARKDOWN_BYTES);
-        assert!(content.ends_with("END"));
+        let top = frame_text(&body.viewport(&app, 20, body.rows.saturating_sub(20)));
+        let tail = frame_text(&body.viewport(&app, 20, 0));
+        assert!(top.contains("BEGIN-SPARSE"));
+        assert!(tail.contains("END-SPARSE"));
+
+        let source = MessageText::new(find_message(&app, message_id).unwrap());
+        let middle = frame_text(&index.render(source, 6_000..6_006, prefix, prefix_style, width));
+        assert!(middle.contains("ROW-05999"));
+        assert!(middle.contains('😀'));
+    }
+
+    #[test]
+    fn combined_output_and_refusal_preserve_both_channels() {
+        let mut app = app_with_messages(1);
+        let message = &mut app
+            .sessions
+            .get_mut(&app.focused.unwrap())
+            .unwrap()
+            .messages
+            .as_mut()
+            .unwrap()[0];
+        message.output = "OUTPUT-BEGIN".to_owned() + &"o".repeat(40 * 1024);
+        message.refusal = "REFUSAL-BEGIN".to_owned() + &"r".repeat(40 * 1024) + "REFUSAL-END";
+
+        let mut renderer = FrameRenderer::default();
+        let body = renderer.transcript(&app, 80);
+        let top = frame_text(&body.viewport(&app, 20, body.rows.saturating_sub(20)));
+        let tail = frame_text(&body.viewport(&app, 20, 0));
+
+        assert!(top.contains("OUTPUT-BEGIN"));
+        assert!(tail.contains("REFUSAL-END"));
+    }
+
+    #[test]
+    fn completing_a_long_live_message_preserves_a_scrolled_tail_anchor() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        let message = &mut session.messages.as_mut().unwrap()[0];
+        message.state = MessageState::Streaming;
+        message.output = (0..2_000)
+            .map(|row| format!("LIVE-ROW-{row:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut renderer = FrameRenderer::default();
+        renderer.frame(&mut app, 80, 24);
+        app.handle_terminal_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        let live_offset = app.transcript_scroll_offset();
+        assert!(live_offset > 0);
+
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        session.messages.as_mut().unwrap()[0].state = MessageState::Complete;
+        session.loaded_through += 1;
+        renderer.frame(&mut app, 80, 24);
+
+        assert_eq!(app.transcript_scroll_offset(), live_offset);
+    }
+
+    #[test]
+    fn completion_behind_an_overlay_preserves_the_scrolled_live_tail() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        let message = &mut session.messages.as_mut().unwrap()[0];
+        message.state = MessageState::Streaming;
+        message.output = (0..2_000)
+            .map(|row| format!("LIVE-ROW-{row:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut renderer = FrameRenderer::default();
+        renderer.frame(&mut app, 80, 24);
+        app.handle_terminal_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        let live_offset = app.transcript_scroll_offset();
+        app.model_picker = Some(crate::app::ModelPicker {
+            query: String::new(),
+            selected: 0,
+        });
+        renderer.frame(&mut app, 80, 24);
+
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        session.messages.as_mut().unwrap()[0].state = MessageState::Complete;
+        session.loaded_through += 1;
+        renderer.frame(&mut app, 80, 24);
+        app.model_picker = None;
+        renderer.frame(&mut app, 80, 24);
+
+        assert_eq!(app.transcript_scroll_offset(), live_offset);
+    }
+
+    #[test]
+    fn completing_a_live_message_does_not_move_an_older_history_viewport() {
+        let mut app = app_with_messages(2);
+        let session_id = app.focused.unwrap();
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        let messages = session.messages.as_mut().unwrap();
+        messages[0].output = (0..200)
+            .map(|row| format!("HISTORY-ROW-{row:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        messages[1].state = MessageState::Streaming;
+        messages[1].output = (0..2_000)
+            .map(|row| format!("LIVE-ROW-{row:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut renderer = FrameRenderer::default();
+        renderer.frame(&mut app, 80, 24);
+        let page_up = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        while app.handle_terminal_event(page_up.clone()).0 {}
+        let before = renderer.frame(&mut app, 80, 24);
+        assert!(frame_text(&before).contains("HISTORY-ROW-0000"));
+        let history_offset = app.transcript_scroll_offset();
+
+        let session = app.sessions.get_mut(&session_id).unwrap();
+        session.messages.as_mut().unwrap()[1].state = MessageState::Complete;
+        session.loaded_through += 1;
+        let after = renderer.frame(&mut app, 80, 24);
+
+        assert!(frame_text(&after).contains("HISTORY-ROW-0000"));
+        assert!(app.transcript_scroll_offset() > history_offset);
+    }
+
+    #[test]
+    fn sparse_rows_have_a_byte_ceiling_for_zero_width_text() {
+        let message = completed_message(
+            1,
+            format!(
+                "a{}",
+                "\u{0301}".repeat(MAX_FULL_MARKDOWN_BYTES / '\u{0301}'.len_utf8() + 1)
+            ),
+        );
+        let source = MessageText::new(&message);
+        let mut byte = 0;
+        let mut rows = 0;
+        while let Some((range, next)) = next_plain_text_row(source, byte, 80) {
+            assert!(range.len() <= MAX_PLAIN_TEXT_ROW_BYTES);
+            assert!(next > byte);
+            rows += 1;
+            byte = next;
+        }
+        assert!(rows > 1);
+
+        let index = PlainTextIndex::new(source, 80);
+        let rendered = index.render(source, 0..1, "   ", muted(), 83);
+        let emitted_bytes = rendered[0]
+            .spans
+            .iter()
+            .map(|span| span.text.len())
+            .sum::<usize>();
+        assert!(emitted_bytes <= MAX_PLAIN_TEXT_ROW_BYTES + 3);
+    }
+
+    #[test]
+    #[ignore = "manual rendering benchmark; run in release mode with --ignored --nocapture"]
+    fn completed_transcript_render_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        let mut worst_case = app_with_messages(1);
+        let message = &mut worst_case
+            .sessions
+            .get_mut(&worst_case.focused.unwrap())
+            .unwrap()
+            .messages
+            .as_mut()
+            .unwrap()[0];
+        message.output = "output row\n".repeat(700_000);
+        message.refusal = "refusal row\n".repeat(600_000);
+
+        let mut renderer = FrameRenderer::default();
+        let started = Instant::now();
+        let rows = {
+            let body = renderer.transcript(&worst_case, 120);
+            black_box(body.rows)
+        };
+        let completion = started.elapsed();
+
+        let iterations = 1_000_u32;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            let body = renderer.transcript(&worst_case, 120);
+            black_box(body.viewport(&worst_case, 40, 0));
+        }
+        let viewport = started.elapsed() / iterations;
+
+        let mut snapshot = app_with_messages(MAX_VISIBLE_MESSAGES as u8);
+        for message in snapshot
+            .sessions
+            .get_mut(&snapshot.focused.unwrap())
+            .unwrap()
+            .messages
+            .as_mut()
+            .unwrap()
+        {
+            message.output = "snapshot row\n".repeat(12_000);
+        }
+        let mut snapshot_renderer = FrameRenderer::default();
+        let started = Instant::now();
+        let snapshot_rows = {
+            let body = snapshot_renderer.transcript(&snapshot, 120);
+            black_box(body.rows)
+        };
+        let initial_snapshot = started.elapsed();
+
+        let mut zero_width = app_with_messages(1);
+        zero_width
+            .sessions
+            .get_mut(&zero_width.focused.unwrap())
+            .unwrap()
+            .messages
+            .as_mut()
+            .unwrap()[0]
+            .output = format!("a{}", "\u{0301}".repeat(512 * 1024));
+        let mut zero_width_renderer = FrameRenderer::default();
+        let started = Instant::now();
+        let zero_width_rows = {
+            let body = zero_width_renderer.transcript(&zero_width, 120);
+            let viewport = body.viewport(&zero_width, 40, 0);
+            black_box(viewport);
+            black_box(body.rows)
+        };
+        let zero_width_completion = started.elapsed();
+
+        println!(
+            "worst_completion={completion:?} rows={rows}; \
+             steady_viewport={viewport:?}; \
+             initial_64_message_snapshot={initial_snapshot:?} rows={snapshot_rows}; \
+             zero_width_completion={zero_width_completion:?} rows={zero_width_rows}"
+        );
     }
 
     #[test]
@@ -3996,5 +5161,38 @@ mod tests {
         assert!(frame_text(&tail).contains("row 9"));
         assert!(!frame_text(&scrolled).contains("row 9"));
         assert!(frame_text(&scrolled).contains("row 6"));
+    }
+
+    #[test]
+    fn page_up_reaches_the_beginning_of_a_long_completed_message() {
+        let mut app = app_with_messages(1);
+        let session_id = app.focused.unwrap();
+        app.sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .messages
+            .as_mut()
+            .unwrap()[0]
+            .output = format!(
+            "BEGIN-LONG-MESSAGE\n{}\nEND-LONG-MESSAGE",
+            (0..400)
+                .map(|row| format!("long response row {row}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let mut renderer = FrameRenderer::default();
+        let tail = renderer.frame(&mut app, 80, 12);
+
+        for _ in 0..100 {
+            app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+                KeyCode::PageUp,
+                KeyModifiers::NONE,
+            )));
+        }
+        let top = renderer.frame(&mut app, 80, 12);
+
+        assert!(frame_text(&tail).contains("END-LONG-MESSAGE"));
+        assert!(!frame_text(&tail).contains("BEGIN-LONG-MESSAGE"));
+        assert!(frame_text(&top).contains("BEGIN-LONG-MESSAGE"));
     }
 }
