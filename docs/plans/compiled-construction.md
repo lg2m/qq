@@ -1,6 +1,11 @@
 # Compiled Provider Construction
 
-Status: proposed.
+Status: completed.
+
+Implemented across phases 1–9 in commits `61314ab`, `09f193b`, `da1f2bc`,
+`c4c4ff6`, `d80d786`, `73da499`, and `a5a3759`. Follow-up test-surface work may
+add broader matrix and composition coverage, but the construction architecture
+and cleanup described here are complete.
 
 ## Goal
 
