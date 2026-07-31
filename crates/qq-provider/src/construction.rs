@@ -8,7 +8,7 @@ use crate::{
     Provider, ProviderError, ProviderStream, SharedRequestCredentialProvider,
     anthropic::{AnthropicAuth, AnthropicMessages},
     google::{GoogleAuth, GoogleEndpoint, GoogleGenerateContent},
-    openai::{OpenAi, ResponsesAuth},
+    openai::{OpenAi, ResponsesAuth, ResponsesConstructionAuth},
     openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
     request_auth::RequestAuthorizer,
 };
@@ -73,16 +73,9 @@ pub(crate) fn construct_http_provider(
 ) -> Result<CompiledHttpProvider, ProviderError> {
     match spec.protocol {
         crate::compiler::HttpProtocol::OpenAiResponses => {
-            let (auth, authorizer, codex_request_shape) = responses_auth(spec.auth)?;
+            let auth = responses_auth(spec.auth)?;
             Ok(CompiledHttpProvider::OpenAiResponses(
-                OpenAi::with_client_and_authorizer(
-                    client,
-                    spec.endpoint,
-                    auth,
-                    spec.headers,
-                    authorizer,
-                    codex_request_shape,
-                )?,
+                OpenAi::with_client_and_auth(client, spec.endpoint, auth, spec.headers)?,
             ))
         }
         crate::compiler::HttpProtocol::OpenAiChatCompletions => {
@@ -128,48 +121,34 @@ pub(crate) fn construct_http_provider(
     }
 }
 
-fn responses_auth(
-    auth: HttpConstructionAuth,
-) -> Result<(ResponsesAuth, RequestAuthorizer, bool), ProviderError> {
+fn responses_auth(auth: HttpConstructionAuth) -> Result<ResponsesConstructionAuth, ProviderError> {
     match auth {
         HttpConstructionAuth::NoAuth => {
-            Ok((ResponsesAuth::NoAuth, RequestAuthorizer::default(), false))
+            Ok(ResponsesConstructionAuth::Static(ResponsesAuth::NoAuth))
         }
-        HttpConstructionAuth::ApiKey(secret) | HttpConstructionAuth::Bearer(secret) => Ok((
-            ResponsesAuth::Bearer(secret),
-            RequestAuthorizer::default(),
-            false,
-        )),
-        HttpConstructionAuth::Header(name, secret) => Ok((
+        HttpConstructionAuth::ApiKey(secret) | HttpConstructionAuth::Bearer(secret) => Ok(
+            ResponsesConstructionAuth::Static(ResponsesAuth::Bearer(secret)),
+        ),
+        HttpConstructionAuth::Header(name, secret) => Ok(ResponsesConstructionAuth::Static(
             ResponsesAuth::Header(name, secret),
-            RequestAuthorizer::default(),
-            false,
         )),
         HttpConstructionAuth::Codex {
             access_token,
             account_id,
             is_fedramp,
-        } => Ok((
-            ResponsesAuth::Codex {
-                access_token,
-                account_id,
-                is_fedramp,
-            },
-            RequestAuthorizer::default(),
-            true,
-        )),
-        HttpConstructionAuth::RequestTimeBearer(credentials) => Ok((
-            ResponsesAuth::NoAuth,
-            RequestAuthorizer::request_time_bearer(credentials),
-            false,
-        )),
-        HttpConstructionAuth::RequestTimeCodex(credentials) => Ok((
-            ResponsesAuth::NoAuth,
-            RequestAuthorizer::request_time_codex(credentials),
-            true,
-        )),
+        } => Ok(ResponsesConstructionAuth::Static(ResponsesAuth::Codex {
+            access_token,
+            account_id,
+            is_fedramp,
+        })),
+        HttpConstructionAuth::RequestTimeBearer(credentials) => {
+            Ok(ResponsesConstructionAuth::RequestTimeBearer(credentials))
+        }
+        HttpConstructionAuth::RequestTimeCodex(credentials) => {
+            Ok(ResponsesConstructionAuth::RequestTimeCodex(credentials))
+        }
         HttpConstructionAuth::MantleSigV4(authorizer) => {
-            Ok((ResponsesAuth::NoAuth, authorizer, false))
+            Ok(ResponsesConstructionAuth::StandardAuthorizer(authorizer))
         }
     }
 }

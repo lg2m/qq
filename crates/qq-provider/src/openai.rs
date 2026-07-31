@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role, ToolSpec,
+    ProviderStream, ProviderUsage, Role, SharedRequestCredentialProvider, ToolSpec,
     http::{
         ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
         build_client, build_direct_client, is_request_controlled_header, transport_error,
@@ -65,6 +65,15 @@ enum ResponsesRequestKind {
     Codex,
 }
 
+/// Coherent static or request-time construction inputs for a compiled
+/// Responses adapter.
+pub(crate) enum ResponsesConstructionAuth {
+    Static(ResponsesAuth),
+    RequestTimeBearer(SharedRequestCredentialProvider),
+    RequestTimeCodex(SharedRequestCredentialProvider),
+    StandardAuthorizer(RequestAuthorizer),
+}
+
 /// A client for OpenAI-compatible Responses endpoints.
 pub struct OpenAi {
     exchange: HttpExchange,
@@ -109,32 +118,44 @@ impl OpenAi {
         auth: ResponsesAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, ProviderError> {
-        let codex_request_shape = matches!(&auth, ResponsesAuth::Codex { .. });
-        Self::with_client_and_authorizer(
+        Self::with_client_and_auth(
             client,
             endpoint,
-            auth,
+            ResponsesConstructionAuth::Static(auth),
             static_headers,
-            RequestAuthorizer::default(),
-            codex_request_shape,
         )
     }
 
-    pub(crate) fn with_client_and_authorizer(
+    pub(crate) fn with_client_and_auth(
         client: reqwest::Client,
         endpoint: reqwest::Url,
-        auth: ResponsesAuth,
+        auth: ResponsesConstructionAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
-        authorizer: RequestAuthorizer,
-        codex_request_shape: bool,
     ) -> Result<Self, ProviderError> {
-        // Codex rejects standard Responses fields such as max_output_tokens.
-        // Request-time Codex auth keeps secrets out of ResponsesAuth, so the
-        // compiler must pass the body shape explicitly.
-        let request_kind = if codex_request_shape || matches!(&auth, ResponsesAuth::Codex { .. }) {
-            ResponsesRequestKind::Codex
-        } else {
-            ResponsesRequestKind::Standard
+        let (auth, authorizer, request_kind) = match auth {
+            ResponsesConstructionAuth::Static(auth) => {
+                let request_kind = if matches!(&auth, ResponsesAuth::Codex { .. }) {
+                    ResponsesRequestKind::Codex
+                } else {
+                    ResponsesRequestKind::Standard
+                };
+                (auth, RequestAuthorizer::default(), request_kind)
+            }
+            ResponsesConstructionAuth::RequestTimeBearer(credentials) => (
+                ResponsesAuth::NoAuth,
+                RequestAuthorizer::request_time_bearer(credentials),
+                ResponsesRequestKind::Standard,
+            ),
+            ResponsesConstructionAuth::RequestTimeCodex(credentials) => (
+                ResponsesAuth::NoAuth,
+                RequestAuthorizer::request_time_codex(credentials),
+                ResponsesRequestKind::Codex,
+            ),
+            ResponsesConstructionAuth::StandardAuthorizer(authorizer) => (
+                ResponsesAuth::NoAuth,
+                authorizer,
+                ResponsesRequestKind::Standard,
+            ),
         };
         let (headers, redactions) = build_headers(auth, static_headers)?;
 
