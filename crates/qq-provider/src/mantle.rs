@@ -290,8 +290,7 @@ mod tests {
             HttpProtocol::GoogleGenerateContent,
             BedrockAuth::ApiKey("mantle-test-secret".to_owned()),
         )
-        .err()
-        .expect("Google must be rejected before Mantle initialization");
+        .expect_err("Google must be rejected before Mantle initialization");
 
         assert!(matches!(
             error,

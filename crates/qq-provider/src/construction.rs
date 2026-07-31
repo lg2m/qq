@@ -148,7 +148,7 @@ fn responses_auth(auth: HttpConstructionAuth) -> Result<ResponsesConstructionAut
             Ok(ResponsesConstructionAuth::RequestTimeCodex(credentials))
         }
         HttpConstructionAuth::MantleSigV4(authorizer) => {
-            Ok(ResponsesConstructionAuth::StandardAuthorizer(authorizer))
+            Ok(ResponsesConstructionAuth::MantleSigV4(authorizer))
         }
     }
 }

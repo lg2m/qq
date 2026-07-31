@@ -83,15 +83,6 @@ impl OpenAiChatCompletions {
         } else {
             build_client()?
         };
-        Self::with_client(client, endpoint, auth, static_headers)
-    }
-
-    pub(crate) fn with_client(
-        client: reqwest::Client,
-        endpoint: reqwest::Url,
-        auth: ChatCompletionsAuth,
-        static_headers: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self, ProviderError> {
         Self::with_client_and_authorizer(
             client,
             endpoint,

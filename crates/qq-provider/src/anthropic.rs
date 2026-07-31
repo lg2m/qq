@@ -108,16 +108,6 @@ impl AnthropicMessages {
         } else {
             build_client()?
         };
-        Self::with_client_and_version(client, endpoint, auth, static_headers, anthropic_version)
-    }
-
-    pub(crate) fn with_client_and_version(
-        client: reqwest::Client,
-        endpoint: reqwest::Url,
-        auth: AnthropicAuth,
-        static_headers: impl IntoIterator<Item = (String, String)>,
-        anthropic_version: &str,
-    ) -> Result<Self, ProviderError> {
         Self::with_client_authorizer_and_version(
             client,
             endpoint,

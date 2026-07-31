@@ -71,7 +71,7 @@ pub(crate) enum ResponsesConstructionAuth {
     Static(ResponsesAuth),
     RequestTimeBearer(SharedRequestCredentialProvider),
     RequestTimeCodex(SharedRequestCredentialProvider),
-    StandardAuthorizer(RequestAuthorizer),
+    MantleSigV4(RequestAuthorizer),
 }
 
 /// A client for OpenAI-compatible Responses endpoints.
@@ -109,15 +109,6 @@ impl OpenAi {
         } else {
             build_client()?
         };
-        Self::with_client(client, endpoint, auth, static_headers)
-    }
-
-    pub(crate) fn with_client(
-        client: reqwest::Client,
-        endpoint: reqwest::Url,
-        auth: ResponsesAuth,
-        static_headers: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self, ProviderError> {
         Self::with_client_and_auth(
             client,
             endpoint,
@@ -151,7 +142,7 @@ impl OpenAi {
                 RequestAuthorizer::request_time_codex(credentials),
                 ResponsesRequestKind::Codex,
             ),
-            ResponsesConstructionAuth::StandardAuthorizer(authorizer) => (
+            ResponsesConstructionAuth::MantleSigV4(authorizer) => (
                 ResponsesAuth::NoAuth,
                 authorizer,
                 ResponsesRequestKind::Standard,
