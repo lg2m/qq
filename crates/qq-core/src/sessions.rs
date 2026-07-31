@@ -16,14 +16,14 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use qq_protocol::{
-    ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole, MessageSnapshot,
-    MessageState, ModelPricing, ModelSelection, ReasoningEvent, RunActivity, RunFailure,
-    RunFailureKind, RunId, RunOutcome, RunSnapshot, RunStatus, SessionCommand, SessionEvent,
-    SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
-    ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest, TextChannel, TokenUsage,
-    ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome,
-    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId,
+    CommandOutcome, CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole,
+    MessageSnapshot, MessageState, ModelPricing, ModelSelection, ReasoningEvent, RunActivity,
+    RunFailure, RunFailureKind, RunId, RunOutcome, RunSnapshot, RunStatus, SessionAccounting,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
+    SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest, TextChannel,
+    TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
+    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -711,6 +711,37 @@ async fn spawn_child_run(
             return spawn_error("model must not be empty when provided");
         }
         selection.model = Some(model);
+    } else {
+        selection = match inner
+            .loader
+            .resolve_worker_model(parent.workspace.clone(), selection)
+            .await
+        {
+            Ok(selection) => selection,
+            Err(error) => {
+                return spawn_error(format!(
+                    "the sub-agent model could not be resolved: {}",
+                    truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
+                ));
+            }
+        };
+    }
+    // Validate and construct the selected runtime before creating durable
+    // child state. A bad explicit/configured route must leave no orphan
+    // session (and this runtime will be reused from the loader cache when the
+    // queued child is claimed).
+    if let Err(error) = inner
+        .loader
+        .load(RuntimeLoadRequest {
+            workspace: parent.workspace.clone(),
+            model: selection.clone(),
+        })
+        .await
+    {
+        return spawn_error(format!(
+            "the sub-agent model could not be loaded: {}",
+            truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
+        ));
     }
     // Wait for a child slot before creating anything: spawn calls queued
     // behind the concurrency cap must not pile up sessions they cannot run.
@@ -1735,7 +1766,11 @@ async fn finish_run_accounted(
     accounting: Option<RunAccounting>,
 ) {
     match inner.store.finish_run(claimed, outcome, accounting).await {
-        Ok(event) => inner.notify(event.cursor),
+        Ok(events) => {
+            for event in events {
+                inner.notify(event.cursor);
+            }
+        }
         Err(_) => {
             inner.failed.send_replace(true);
         }
@@ -1928,6 +1963,8 @@ pub enum SessionRuntimeError {
     CursorStoreMismatch,
     #[error("event cursor belongs to another workspace")]
     CursorWorkspaceMismatch,
+    #[error("session accounting is unavailable")]
+    AccountingUnavailable,
     #[error("session runtime is overloaded")]
     Overloaded,
     #[error("session runtime is unavailable")]
@@ -2390,7 +2427,7 @@ impl Store {
         claimed: &ClaimedRun,
         outcome: RunOutcome,
         accounting: Option<RunAccounting>,
-    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
@@ -5136,21 +5173,64 @@ fn ensure_context_capacity(
     Ok(())
 }
 
+fn append_parent_session_update(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    workspace_id: WorkspaceId,
+    child_session_id: SessionId,
+    caused_by: CommandId,
+    occurred_at_ms: u64,
+    events: &mut Vec<SessionEventEnvelope>,
+) -> Result<(), SessionRuntimeError> {
+    let Some(parent_id) = session_parent(transaction, child_session_id)? else {
+        return Ok(());
+    };
+    let session = load_session_summary(transaction, parent_id)?;
+    events.push(append_event(
+        transaction,
+        EventContext {
+            store_id,
+            workspace_id,
+            session_id: parent_id,
+            run_id: None,
+            caused_by: Some(caused_by),
+            occurred_at_ms,
+        },
+        SessionEvent::SessionUpdated { session },
+    )?);
+    Ok(())
+}
+
 fn complete_run(
     connection: &mut Connection,
     store_id: StoreId,
     claimed: &ClaimedRun,
     outcome: RunOutcome,
     accounting: Option<RunAccounting>,
-) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let event = finalize_run(&transaction, store_id, claimed, outcome, accounting)?;
+    let mut events = vec![finalize_run(
+        &transaction,
+        store_id,
+        claimed,
+        outcome,
+        accounting,
+    )?];
+    append_parent_session_update(
+        &transaction,
+        store_id,
+        claimed.workspace_id,
+        claimed.session_id,
+        claimed.command_id,
+        now_ms(),
+        &mut events,
+    )?;
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(event)
+    Ok(events)
 }
 
 /// Commits a compaction: the summary row and cutoff marker persist in the
@@ -5271,6 +5351,15 @@ fn complete_compaction(
             accounting,
         )?);
     }
+    append_parent_session_update(
+        &transaction,
+        store_id,
+        claimed.workspace_id,
+        claimed.session_id,
+        claimed.command_id,
+        now_ms(),
+        &mut events,
+    )?;
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -5974,10 +6063,138 @@ fn append_event(
     Ok(envelope)
 }
 
+fn session_parent(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Option<SessionId>, SessionRuntimeError> {
+    connection
+        .query_row(
+            "SELECT parent_id FROM sessions WHERE id = ?1",
+            [session_id.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::SessionNotFound)?
+        .as_deref()
+        .map(parse_id)
+        .transpose()
+}
+
+#[derive(Default)]
+struct AccountingAggregate {
+    usage: TokenUsage,
+    usage_known: bool,
+    saw_usage: bool,
+    cost: Option<u64>,
+}
+
+impl AccountingAggregate {
+    fn known_zero() -> Self {
+        Self {
+            usage_known: true,
+            saw_usage: true,
+            cost: Some(0),
+            ..Self::default()
+        }
+    }
+
+    fn add(&mut self, usage: TokenUsage, cost: Option<u64>) -> Result<(), SessionRuntimeError> {
+        self.usage =
+            add_usage(self.usage, usage).ok_or(SessionRuntimeError::AccountingUnavailable)?;
+        self.saw_usage = true;
+        self.cost = match (self.cost, cost) {
+            (Some(total), Some(cost)) => Some(
+                total
+                    .checked_add(cost)
+                    .ok_or(SessionRuntimeError::AccountingUnavailable)?,
+            ),
+            _ => None,
+        };
+        Ok(())
+    }
+
+    fn mark_unknown(&mut self) {
+        self.usage_known = false;
+        self.cost = None;
+    }
+
+    fn total(self) -> AccountingTotal {
+        AccountingTotal {
+            usage: (self.saw_usage && self.usage_known).then_some(self.usage),
+            estimated_cost_usd_nanos: self.cost,
+        }
+    }
+}
+
+fn load_session_accounting(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<SessionAccounting, SessionRuntimeError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos
+             FROM runs r
+             JOIN sessions owner ON owner.id = r.session_id
+             WHERE owner.id = ?1 OR owner.parent_id = ?1
+             ORDER BY r.rowid",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let rows = statement
+        .query_map([session_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<u64>>(3)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+
+    let session_id = session_id.to_string();
+    let mut direct = AccountingAggregate::known_zero();
+    let mut inclusive = AccountingAggregate::known_zero();
+    for row in rows {
+        let (owner_id, status, encoded_usage, cost) =
+            row.map_err(|_| SessionRuntimeError::Persistence)?;
+        let Some(encoded_usage) = encoded_usage else {
+            if matches!(
+                status.as_str(),
+                "completed" | "cancelled" | "failed" | "interrupted"
+            ) {
+                inclusive.mark_unknown();
+                if owner_id == session_id {
+                    direct.mark_unknown();
+                }
+            }
+            continue;
+        };
+        let usage = match serde_json::from_str::<TokenUsage>(&encoded_usage) {
+            Ok(usage) => usage,
+            Err(_) => {
+                inclusive.mark_unknown();
+                if owner_id == session_id {
+                    direct.mark_unknown();
+                }
+                continue;
+            }
+        };
+        inclusive.add(usage, cost)?;
+        if owner_id == session_id {
+            direct.add(usage, cost)?;
+        }
+    }
+    Ok(SessionAccounting {
+        direct: direct.total(),
+        inclusive: inclusive.total(),
+    })
+}
+
 fn load_session_summary(
     connection: &Connection,
     session_id: SessionId,
 ) -> Result<SessionSummary, SessionRuntimeError> {
+    let accounting = load_session_accounting(connection, session_id)?;
     connection
         .query_row(
             "SELECT s.workspace_id, s.parent_id, s.title, s.status, s.active_run_id,
@@ -6032,6 +6249,7 @@ fn load_session_summary(
                     queued_prompts: queued,
                     model,
                     context_tokens,
+                    accounting: Some(accounting),
                     estimated_cost_usd_nanos: cost,
                     updated_at_ms: updated,
                     last_outcome: last_outcome
@@ -6693,8 +6911,9 @@ fn validate_model_selection(model: &ModelSelection) -> Result<(), SessionRuntime
 /// cursors promise a gapless `previous + 1` sequence to subscribers (and the
 /// sequence counter lives on the workspace row, so deletion could never
 /// regress it), which means deleting event rows would break every replay
-/// that spans the deletion. Replaying the kept events is harmless: the
-/// trailing `SessionDeleted` converges any client on the deleted state.
+/// that spans the deletion. Replaying the kept events is harmless:
+/// `SessionDeleted` removes the child, and a following parent
+/// `SessionUpdated` refreshes the live inclusive projection when needed.
 fn delete_idle_session(
     transaction: &Transaction<'_>,
     store_id: StoreId,
@@ -6715,6 +6934,7 @@ fn delete_idle_session(
     if active_run.is_some() {
         return Err(SessionRuntimeError::SessionActive);
     }
+    let parent_id = session_parent(transaction, session_id)?;
     let session = session_id.to_string();
     // Children survive their parent as root sessions.
     for statement in [
@@ -6732,7 +6952,7 @@ fn delete_idle_session(
             .execute(statement, [&session])
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    append_event(
+    let deleted = append_event(
         transaction,
         EventContext {
             store_id,
@@ -6743,6 +6963,22 @@ fn delete_idle_session(
             occurred_at_ms: now,
         },
         SessionEvent::SessionDeleted { session_id },
+    )?;
+    let Some(parent_id) = parent_id else {
+        return Ok(deleted);
+    };
+    let session = load_session_summary(transaction, parent_id)?;
+    append_event(
+        transaction,
+        EventContext {
+            store_id,
+            workspace_id,
+            session_id: parent_id,
+            run_id: None,
+            caused_by: Some(command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::SessionUpdated { session },
     )
 }
 
@@ -6968,6 +7204,359 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn usage(input_tokens: u64, output_tokens: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens,
+        }
+    }
+
+    #[test]
+    fn accounting_aggregate_sums_known_usage_and_cost() {
+        let mut aggregate = AccountingAggregate::known_zero();
+        aggregate.add(usage(3, 5), Some(11)).unwrap();
+        aggregate.add(usage(7, 13), Some(17)).unwrap();
+
+        assert_eq!(
+            aggregate.total(),
+            AccountingTotal {
+                usage: Some(usage(10, 18)),
+                estimated_cost_usd_nanos: Some(28),
+            }
+        );
+    }
+
+    #[test]
+    fn accounting_aggregate_keeps_unknown_cost_distinct_from_zero() {
+        let mut aggregate = AccountingAggregate::known_zero();
+        aggregate.add(usage(3, 5), Some(11)).unwrap();
+        aggregate.add(usage(7, 13), None).unwrap();
+        aggregate.add(usage(1, 2), Some(17)).unwrap();
+
+        let total = aggregate.total();
+        assert_eq!(total.usage, Some(usage(11, 20)));
+        assert_eq!(total.estimated_cost_usd_nanos, None);
+    }
+
+    #[test]
+    fn accounting_aggregate_keeps_zero_usage_cost_unknown() {
+        let mut aggregate = AccountingAggregate::known_zero();
+        aggregate.add(usage(0, 0), None).unwrap();
+
+        assert_eq!(
+            aggregate.total(),
+            AccountingTotal {
+                usage: Some(usage(0, 0)),
+                estimated_cost_usd_nanos: None,
+            }
+        );
+    }
+
+    #[test]
+    fn accounting_aggregate_rejects_usage_and_cost_overflow() {
+        let mut usage_overflow = AccountingAggregate::known_zero();
+        usage_overflow.add(usage(u64::MAX, 0), Some(0)).unwrap();
+        assert!(matches!(
+            usage_overflow.add(usage(1, 0), Some(0)),
+            Err(SessionRuntimeError::AccountingUnavailable)
+        ));
+
+        let mut cost_overflow = AccountingAggregate::known_zero();
+        cost_overflow.add(usage(1, 0), Some(u64::MAX)).unwrap();
+        assert!(matches!(
+            cost_overflow.add(usage(1, 0), Some(1)),
+            Err(SessionRuntimeError::AccountingUnavailable)
+        ));
+    }
+
+    fn insert_accounting_session(
+        connection: &Connection,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        parent_id: Option<SessionId>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                     id, workspace_id, parent_id, title, status,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, 'accounting test', 'idle', 1, 1)",
+                params![
+                    session_id.to_string(),
+                    workspace_id.to_string(),
+                    parent_id.map(|id| id.to_string()),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_accounting_run(
+        connection: &Connection,
+        session_id: SessionId,
+        status: &str,
+        usage: Option<TokenUsage>,
+        cost: Option<u64>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO runs(
+                     id, session_id, command_id, user_message_id,
+                     assistant_message_id, status, outcome_json, usage_json,
+                     estimated_cost_usd_nanos, created_at_ms, finished_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, 1, 2)",
+                params![
+                    RunId::generate().unwrap().to_string(),
+                    session_id.to_string(),
+                    CommandId::generate().unwrap().to_string(),
+                    MessageId::generate().unwrap().to_string(),
+                    MessageId::generate().unwrap().to_string(),
+                    status,
+                    usage.map(|usage| serde_json::to_string(&usage).unwrap()),
+                    cost,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn store_accounting_projects_direct_and_immediate_child_runs_after_restart_and_pruning() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let parent_id = SessionId::generate().unwrap();
+        let first_child_id = SessionId::generate().unwrap();
+        let second_child_id = SessionId::generate().unwrap();
+        let grandchild_id = SessionId::generate().unwrap();
+        {
+            let (connection, _) = open_database(&database_path).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO workspaces(id, path) VALUES (?1, '/accounting-test')",
+                    [workspace_id.to_string()],
+                )
+                .unwrap();
+            insert_accounting_session(&connection, workspace_id, parent_id, None);
+            insert_accounting_session(&connection, workspace_id, first_child_id, Some(parent_id));
+            insert_accounting_session(&connection, workspace_id, second_child_id, Some(parent_id));
+            insert_accounting_session(
+                &connection,
+                workspace_id,
+                grandchild_id,
+                Some(first_child_id),
+            );
+            insert_accounting_run(
+                &connection,
+                parent_id,
+                "completed",
+                Some(usage(2, 3)),
+                Some(5),
+            );
+            insert_accounting_run(
+                &connection,
+                first_child_id,
+                "failed",
+                Some(usage(7, 11)),
+                Some(13),
+            );
+            insert_accounting_run(
+                &connection,
+                second_child_id,
+                "cancelled",
+                Some(usage(17, 19)),
+                None,
+            );
+            insert_accounting_run(
+                &connection,
+                grandchild_id,
+                "completed",
+                Some(usage(23, 29)),
+                Some(31),
+            );
+        }
+
+        let (connection, _) = open_database(&database_path).unwrap();
+        let parent = load_session_accounting(&connection, parent_id).unwrap();
+        assert_eq!(
+            parent.direct,
+            AccountingTotal {
+                usage: Some(usage(2, 3)),
+                estimated_cost_usd_nanos: Some(5),
+            }
+        );
+        assert_eq!(parent.inclusive.usage, Some(usage(26, 33)));
+        assert_eq!(parent.inclusive.estimated_cost_usd_nanos, None);
+
+        let first_child = load_session_accounting(&connection, first_child_id).unwrap();
+        assert_eq!(first_child.direct.usage, Some(usage(7, 11)));
+        assert_eq!(first_child.inclusive.usage, Some(usage(30, 40)));
+        assert_eq!(first_child.inclusive.estimated_cost_usd_nanos, Some(44));
+
+        connection
+            .execute(
+                "DELETE FROM runs WHERE session_id = ?1",
+                [second_child_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM sessions WHERE id = ?1",
+                [second_child_id.to_string()],
+            )
+            .unwrap();
+        let pruned = load_session_accounting(&connection, parent_id).unwrap();
+        assert_eq!(pruned.inclusive.usage, Some(usage(9, 14)));
+        assert_eq!(pruned.inclusive.estimated_cost_usd_nanos, Some(18));
+    }
+
+    #[test]
+    fn store_accounting_marks_terminal_missing_usage_unknown_but_ignores_active_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let (connection, _) = open_database(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/unknown-accounting-test')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        insert_accounting_session(&connection, workspace_id, session_id, None);
+        insert_accounting_run(
+            &connection,
+            session_id,
+            "completed",
+            Some(usage(2, 3)),
+            Some(5),
+        );
+        insert_accounting_run(&connection, session_id, "running", None, None);
+        assert_eq!(
+            load_session_accounting(&connection, session_id)
+                .unwrap()
+                .direct,
+            AccountingTotal {
+                usage: Some(usage(2, 3)),
+                estimated_cost_usd_nanos: Some(5),
+            }
+        );
+
+        insert_accounting_run(&connection, session_id, "failed", None, None);
+        assert_eq!(
+            load_session_accounting(&connection, session_id)
+                .unwrap()
+                .direct,
+            AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: None,
+            }
+        );
+    }
+
+    #[test]
+    fn store_accounting_marks_malformed_persisted_usage_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let (connection, _) = open_database(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/malformed-accounting-test')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        insert_accounting_session(&connection, workspace_id, session_id, None);
+        insert_accounting_run(
+            &connection,
+            session_id,
+            "completed",
+            Some(usage(2, 3)),
+            Some(5),
+        );
+        connection
+            .execute(
+                "UPDATE runs SET usage_json = '{not-json' WHERE session_id = ?1",
+                [session_id.to_string()],
+            )
+            .unwrap();
+
+        let summary = load_session_summary(&connection, session_id).unwrap();
+        assert_eq!(
+            summary.accounting.unwrap().direct,
+            AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: None,
+            }
+        );
+    }
+
+    #[test]
+    fn deleting_child_persists_deleted_then_refreshed_parent_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let parent_id = SessionId::generate().unwrap();
+        let child_id = SessionId::generate().unwrap();
+        let command_id = CommandId::generate().unwrap();
+        let (mut connection, store_id) = open_database(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/delete-accounting-test')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        insert_accounting_session(&connection, workspace_id, parent_id, None);
+        insert_accounting_session(&connection, workspace_id, child_id, Some(parent_id));
+        insert_accounting_run(
+            &connection,
+            child_id,
+            "completed",
+            Some(usage(7, 11)),
+            Some(13),
+        );
+        assert_eq!(
+            load_session_accounting(&connection, parent_id)
+                .unwrap()
+                .inclusive
+                .usage,
+            Some(usage(7, 11))
+        );
+
+        let transaction = connection.transaction().unwrap();
+        let committed_through = delete_idle_session(
+            &transaction,
+            store_id,
+            workspace_id,
+            child_id,
+            command_id,
+            17,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let events = read_events(&mut connection, workspace_id, 0, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].event,
+            SessionEvent::SessionDeleted { session_id } if session_id == child_id
+        ));
+        let SessionEvent::SessionUpdated { session } = &events[1].event else {
+            panic!("expected refreshed parent projection");
+        };
+        assert_eq!(events[1].session_id, parent_id);
+        assert_eq!(events[1].cursor.sequence, events[0].cursor.sequence + 1);
+        assert_eq!(committed_through.cursor, events[1].cursor);
+        assert_eq!(
+            session.accounting.unwrap().inclusive,
+            AccountingTotal {
+                usage: Some(usage(0, 0)),
+                estimated_cost_usd_nanos: Some(0),
+            }
+        );
+    }
 
     struct ScriptedLoader;
 
@@ -13284,6 +13873,184 @@ mod tests {
             [ContentBlock::ToolResult { content, is_error: false, .. }] if content == "done"
         ));
         drop(parent_reqs);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_worker_model_wins_and_preserves_parent_selection_fields() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"configured worker research"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let loads = Arc::new(StdMutex::new(Vec::new()));
+        let worker = ModelSelection {
+            model: Some("test/worker".to_owned()),
+            max_output_tokens: Some(123),
+            organization: Some("worker-org".to_owned()),
+        };
+        let mut harness = spawn_harness_with_loader(
+            Arc::new(ResolvingLoader {
+                parent,
+                child: Arc::new(StaticTextProvider),
+                worker: Some(worker.clone()),
+                resolutions: Arc::clone(&resolutions),
+                loads: Arc::clone(&loads),
+            }),
+            8,
+        )
+        .await;
+
+        let run_id = submit_prompt_to(
+            &harness.runtime,
+            harness.session_id,
+            "use configured worker",
+        )
+        .await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let child = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    Some(session)
+                }
+                _ => None,
+            })
+            .expect("the configured worker must create a child");
+
+        assert_eq!(child.model.as_deref(), Some("test/worker"));
+        assert_eq!(resolutions.load(Ordering::Acquire), 1);
+        assert!(
+            loads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|load| **load == worker)
+                .count()
+                >= 2,
+            "the same complete selection must be preflighted and used by the child run"
+        );
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_spawn_model_bypasses_configured_worker_resolution() {
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"specialized research","model":"test/explicit"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let loads = Arc::new(StdMutex::new(Vec::new()));
+        let mut harness = spawn_harness_with_loader(
+            Arc::new(ResolvingLoader {
+                parent,
+                child: Arc::new(StaticTextProvider),
+                worker: Some(ModelSelection {
+                    model: Some("test/worker".to_owned()),
+                    max_output_tokens: Some(111),
+                    organization: Some("worker-org".to_owned()),
+                }),
+                resolutions: Arc::clone(&resolutions),
+                loads,
+            }),
+            8,
+        )
+        .await;
+
+        let run_id =
+            submit_prompt_to(&harness.runtime, harness.session_id, "override worker").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let child = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    Some(session)
+                }
+                _ => None,
+            })
+            .expect("the explicit model must create a child");
+
+        assert_eq!(child.model.as_deref(), Some("test/explicit"));
+        assert_eq!(resolutions.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_resolution_failure_creates_no_child_state_and_parent_continues() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"research denied route"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness =
+            spawn_harness_with_loader(Arc::new(RejectingWorkerLoader { parent }), 8).await;
+
+        let run_id = submit_prompt_to(
+            &harness.runtime,
+            harness.session_id,
+            "try configured worker",
+        )
+        .await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        assert!(
+            observed.iter().all(|event| !matches!(
+                &event.event,
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(harness.session_id)
+            )),
+            "resolution failure must not emit a child creation"
+        );
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 32,
+                message_limit: 32,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .all(|session| session.parent_id.is_none())
+        );
+
+        let requests = requests.lock().unwrap();
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("configured worker route is denied")
+        ));
         assert!(matches!(
             finished_outcome(&observed, run_id),
             Some(RunOutcome::Completed)

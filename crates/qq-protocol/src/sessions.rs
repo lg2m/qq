@@ -86,6 +86,29 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
+/// Usage and estimated cost derived from the durable runs owned by a session.
+/// A missing usage or cost means the aggregate is unavailable or unknown; it
+/// is never interchangeable with a known zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountingTotal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd_nanos: Option<u64>,
+}
+
+/// Direct accounting covers runs owned by this session. Inclusive accounting
+/// adds runs owned directly by its immediate children. Both are explicit so
+/// consumers never need to join the session tree or guess which total a field
+/// represents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAccounting {
+    pub direct: AccountingTotal,
+    pub inclusive: AccountingTotal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelPricing {
@@ -442,6 +465,12 @@ pub struct SessionSummary {
     /// compaction and model changes clear it until the next prompt turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
+    /// Structured durable accounting. Absent on payloads written before
+    /// inclusive accounting was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<SessionAccounting>,
+    /// Compatibility alias for `accounting.direct.estimated_cost_usd_nanos`.
+    /// New consumers should choose direct or inclusive accounting explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd_nanos: Option<u64>,
     pub updated_at_ms: u64,
@@ -1221,6 +1250,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
                 context_tokens: None,
+                accounting: None,
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: Some(RunOutcome::Completed),
@@ -1272,6 +1302,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model-b".to_owned()),
                 context_tokens: Some(12_500),
+                accounting: None,
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: None,
@@ -1322,6 +1353,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
                 context_tokens: None,
+                accounting: None,
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: Some(RunOutcome::Completed),
@@ -1339,6 +1371,56 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SessionEvent>(encoded).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn session_summary_accounting_is_additive_and_legacy_cost_stays_direct() {
+        let legacy = serde_json::json!({
+            "id": id::<SessionId>(3),
+            "workspace_id": id::<WorkspaceId>(2),
+            "title": "legacy",
+            "status": "idle",
+            "queued_prompts": 0,
+            "estimated_cost_usd_nanos": 7,
+            "updated_at_ms": 11
+        });
+        let decoded: SessionSummary = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.accounting, None);
+        assert_eq!(decoded.estimated_cost_usd_nanos, Some(7));
+
+        let current = SessionSummary {
+            accounting: Some(SessionAccounting {
+                direct: AccountingTotal {
+                    usage: Some(TokenUsage {
+                        input_tokens: 1,
+                        cache_read_input_tokens: 2,
+                        cache_write_input_tokens: 3,
+                        output_tokens: 4,
+                    }),
+                    estimated_cost_usd_nanos: Some(7),
+                },
+                inclusive: AccountingTotal {
+                    usage: Some(TokenUsage {
+                        input_tokens: 11,
+                        cache_read_input_tokens: 12,
+                        cache_write_input_tokens: 13,
+                        output_tokens: 14,
+                    }),
+                    estimated_cost_usd_nanos: Some(17),
+                },
+            }),
+            ..decoded
+        };
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["estimated_cost_usd_nanos"], 7);
+        assert_eq!(
+            encoded["accounting"]["inclusive"]["estimated_cost_usd_nanos"],
+            17
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionSummary>(encoded).unwrap(),
+            current
         );
     }
 
@@ -1390,6 +1472,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
                 context_tokens: Some(16),
+                accounting: None,
                 estimated_cost_usd_nanos: None,
                 updated_at_ms: 11,
                 last_outcome: Some(RunOutcome::Completed),

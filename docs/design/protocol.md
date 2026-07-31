@@ -58,7 +58,8 @@ approvals (the `approve_for_workspace` decision, the
 `workspace_grant_promoted` event); version 5 made context occupancy
 authoritative session state (`SessionSummary.context_tokens` and
 `session_context_updated`) so legacy billing totals and internal compaction
-runs cannot masquerade as the current session context.
+runs cannot masquerade as the current session context, and added explicit
+direct and inclusive session accounting totals.
 
 Clients and servers must agree on this value.
 

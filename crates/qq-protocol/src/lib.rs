@@ -12,14 +12,14 @@ mod sessions;
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
 pub use qq_reasoning::{ReasoningEvent, ReasoningKind};
 pub use sessions::{
-    ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandOutcome,
-    CommandReceipt, CommandRequest, CursorError, EditPreview, EventCursor, MessageRole,
-    MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
+    AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution,
+    CommandOutcome, CommandReceipt, CommandRequest, CursorError, EditPreview, EventCursor,
+    MessageRole, MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
     ModelPricingTier, ModelSelection, RunActivity, RunFailure, RunOutcome, RunSnapshot, RunStatus,
-    SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot, SessionStatus,
-    SessionSummary, ShellCommandPreview, SnapshotRequest, SubscribeRequest, TextChannel,
-    TokenUsage, ToolCallDisplay, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome,
-    WorkspaceSnapshot, WorkspaceSummary,
+    SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot,
+    SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, SubscribeRequest,
+    TextChannel, TokenUsage, ToolCallDisplay, ToolCallSnapshot, ToolCallState,
+    WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
 };
 
 pub const PROTOCOL_VERSION: u16 = 5;

@@ -2017,11 +2017,15 @@ fn footer_workspace(app: &App, width: usize) -> Line {
     } else {
         format!("cwd: {}", app.workspace_path)
     };
-    // An unknown cost reads as zero spend, never as a gap in the UI.
+    // Parent rows deliberately display inclusive accounting. Child rows use
+    // the same field, whose inclusive total currently equals direct because
+    // delegation depth is capped at one. Unknown cost remains unknown until
+    // this final formatting boundary.
     let cost = app
         .focused
         .and_then(|id| app.sessions.get(&id))
-        .and_then(|session| session.summary.estimated_cost_usd_nanos)
+        .and_then(|session| session.summary.accounting)
+        .and_then(|accounting| accounting.inclusive.estimated_cost_usd_nanos)
         .unwrap_or(0);
     let cost = format!("cost: {} ", format_cost(cost));
     align_sides(
@@ -3151,9 +3155,9 @@ fn write_line(output: &mut impl Write, line: &Line) -> io::Result<()> {
 mod tests {
     use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
     use qq_protocol::{
-        EventCursor, ModelSelection, RunId, SessionEvent, SessionEventEnvelope, SessionId,
-        SessionSnapshot, SessionStatus, SessionSummary, StoreId, WorkspaceId, WorkspaceSnapshot,
-        WorkspaceSummary,
+        AccountingTotal, EventCursor, ModelSelection, RunId, SessionAccounting, SessionEvent,
+        SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SessionSummary, StoreId,
+        WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
     };
 
     use super::*;
@@ -3186,6 +3190,7 @@ mod tests {
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
             context_tokens: None,
+            accounting: None,
             estimated_cost_usd_nanos: Some(0),
             updated_at_ms: 1,
             last_outcome: None,
@@ -4946,6 +4951,27 @@ mod tests {
     }
 
     #[test]
+    fn footer_displays_inclusive_accounting_cost() {
+        let mut app = app_with_messages(0);
+        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        session.summary.estimated_cost_usd_nanos = Some(100_000_000);
+        session.summary.accounting = Some(SessionAccounting {
+            direct: AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: Some(100_000_000),
+            },
+            inclusive: AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: Some(250_000_000),
+            },
+        });
+
+        let rows = frame_rows(&[footer_workspace(&app, 80)]);
+
+        assert!(rows[0].ends_with("cost: $0.25 "));
+    }
+
+    #[test]
     fn header_only_qualifies_local_when_the_connection_has_a_problem() {
         let mut app = app_with_messages(0);
         for (connection, expected) in [
@@ -5024,6 +5050,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("openai/gpt-test".to_owned()),
                 context_tokens: None,
+                accounting: None,
                 estimated_cost_usd_nanos: Some(0),
                 updated_at_ms: u64::from(byte),
                 last_outcome: None,
