@@ -141,9 +141,7 @@ fn random_u32() -> u32 {
     getrandom::u32().unwrap_or_else(|_| {
         // Fall back to a non-crypto mix of the monotonic clock if the OS RNG is
         // unavailable. Retry jitter only needs to break synchronized stampedes.
-        let nanos = std::time::Instant::now()
-            .elapsed()
-            .as_nanos() as u64;
+        let nanos = std::time::Instant::now().elapsed().as_nanos() as u64;
         (nanos ^ (nanos >> 32)) as u32
     })
 }
@@ -326,12 +324,9 @@ impl HttpExchange {
                 Ok(response) => response,
                 Err(error) => {
                     let transport = transport_error(error, redactions.as_ref());
-                    let Some(delay) = self.maybe_retry_delay(
-                        can_retry_after,
-                        attempt,
-                        None,
-                        started.elapsed(),
-                    ) else {
+                    let Some(delay) =
+                        self.maybe_retry_delay(can_retry_after, attempt, None, started.elapsed())
+                    else {
                         return Err(transport);
                     };
                     tokio::time::sleep(delay).await;
@@ -637,10 +632,7 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY,
             StatusCode::NOT_IMPLEMENTED,
         ] {
-            assert!(
-                !is_retryable_status(status),
-                "{status} must not be retried"
-            );
+            assert!(!is_retryable_status(status), "{status} must not be retried");
         }
     }
 
@@ -653,7 +645,10 @@ mod tests {
         headers.insert(RETRY_AFTER, HeaderValue::from_static(" 7 "));
         assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(7)));
 
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
         assert_eq!(retry_after_delay(&headers), None);
 
         headers.insert(RETRY_AFTER, HeaderValue::from_static("soon"));
@@ -699,9 +694,15 @@ mod tests {
     fn budget_helper_rejects_unaffordable_sleeps() {
         let policy = RetryPolicy::default_policy();
         assert!(policy.can_afford(Duration::ZERO, Duration::from_secs(15)));
-        assert!(!policy.can_afford(Duration::ZERO, Duration::from_secs(15) + Duration::from_nanos(1)));
+        assert!(!policy.can_afford(
+            Duration::ZERO,
+            Duration::from_secs(15) + Duration::from_nanos(1)
+        ));
         assert!(policy.can_afford(Duration::from_secs(14), Duration::from_secs(1)));
-        assert!(!policy.can_afford(Duration::from_secs(14), Duration::from_secs(1) + Duration::from_nanos(1)));
+        assert!(!policy.can_afford(
+            Duration::from_secs(14),
+            Duration::from_secs(1) + Duration::from_nanos(1)
+        ));
         assert!(!policy.can_afford(Duration::from_secs(10), Duration::MAX));
     }
 
