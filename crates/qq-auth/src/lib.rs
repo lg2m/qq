@@ -10,11 +10,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+#[cfg(not(windows))]
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use directories::ProjectDirs;
@@ -52,6 +54,7 @@ const REQUEST_CREDENTIAL_CONCURRENCY: usize = 4;
 const REQUEST_CREDENTIAL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_CREDENTIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(65);
 
+#[cfg(not(windows))]
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Secret bytes whose formatted representations never reveal their contents.
@@ -1644,6 +1647,7 @@ fn validate_regular_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(),
     Ok(())
 }
 
+#[cfg(unix)]
 fn verify_open_directory(path: &Path, file: &File) -> Result<(), AuthError> {
     let open_metadata = file.metadata().map_err(|source| AuthError::Io {
         operation: "inspect",
@@ -1896,6 +1900,7 @@ fn ensure_atomic_replacement_supported(path: &Path) -> Result<(), AuthError> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn temporary_path(parent: &Path, destination: &Path) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1940,16 +1945,30 @@ pub trait KeyringBackend: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(any(test, windows)),
-    allow(
-        dead_code,
-        reason = "non-Windows production builds only construct the unavailable backend error"
-    )
-)]
 pub(crate) enum WindowsProtectedError {
+    #[cfg_attr(
+        all(windows, not(test)),
+        allow(
+            dead_code,
+            reason = "the production Windows backend cannot be unavailable"
+        )
+    )]
     Unavailable,
+    #[cfg_attr(
+        all(not(windows), not(test)),
+        allow(
+            dead_code,
+            reason = "the non-Windows production backend only reports unavailability"
+        )
+    )]
     Missing,
+    #[cfg_attr(
+        all(not(windows), not(test)),
+        allow(
+            dead_code,
+            reason = "the non-Windows production backend only reports unavailability"
+        )
+    )]
     Failure,
 }
 
