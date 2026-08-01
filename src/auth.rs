@@ -19,6 +19,7 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::SecretRef;
@@ -33,7 +34,9 @@ pub const KEYRING_SERVICE: &str = "dev.qq";
 pub const MAX_CREDENTIAL_NAME_LEN: usize = 128;
 pub const MAX_STATE_BYTES: usize = 1024 * 1024;
 
-const STATE_VERSION: u32 = 1;
+const INDEX_STATE_VERSION: u32 = 2;
+const LEGACY_INDEX_STATE_VERSION: u32 = 1;
+const FALLBACK_STATE_VERSION: u32 = 1;
 const MAX_KIND_LEN: usize = 128;
 const MAX_ENDPOINT_LEN: usize = 4096;
 const INDEX_FILE_NAME: &str = "credentials.ron";
@@ -41,6 +44,8 @@ const FALLBACK_FILE_NAME: &str = "auth.ron";
 const LOCK_FILE_NAME: &str = "auth.lock";
 const CODEX_LOCK_FILE_NAME: &str = "openai-codex.lock";
 const XAI_LOCK_FILE_NAME: &str = "xai.lock";
+const WINDOWS_CREDENTIAL_DIRECTORY_NAME: &str = "windows-credentials";
+const WINDOWS_PROTECTED_MAGIC: &[u8] = b"QQDPAPI\x01";
 const REQUEST_CREDENTIAL_CONCURRENCY: usize = 4;
 const REQUEST_CREDENTIAL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_CREDENTIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(65);
@@ -83,6 +88,7 @@ impl fmt::Display for Secret {
 pub enum CredentialBackend {
     Keyring,
     File,
+    WindowsProtectedFile,
 }
 
 impl fmt::Display for CredentialBackend {
@@ -90,6 +96,7 @@ impl fmt::Display for CredentialBackend {
         match self {
             Self::Keyring => formatter.write_str("OS keyring"),
             Self::File => formatter.write_str("plaintext auth file"),
+            Self::WindowsProtectedFile => formatter.write_str("Windows user-protected file"),
         }
     }
 }
@@ -112,6 +119,7 @@ pub struct CredentialPaths {
     lock_file: PathBuf,
     codex_lock_file: PathBuf,
     xai_lock_file: PathBuf,
+    windows_credential_dir: PathBuf,
 }
 
 impl CredentialPaths {
@@ -124,6 +132,7 @@ impl CredentialPaths {
             lock_file: data_dir.join(LOCK_FILE_NAME),
             codex_lock_file: data_dir.join(CODEX_LOCK_FILE_NAME),
             xai_lock_file: data_dir.join(XAI_LOCK_FILE_NAME),
+            windows_credential_dir: data_dir.join(WINDOWS_CREDENTIAL_DIRECTORY_NAME),
             data_dir,
         }
     }
@@ -156,6 +165,11 @@ impl CredentialPaths {
     #[must_use]
     pub fn xai_lock_file(&self) -> &Path {
         &self.xai_lock_file
+    }
+
+    #[must_use]
+    pub fn windows_credential_dir(&self) -> &Path {
+        &self.windows_credential_dir
     }
 }
 
@@ -226,6 +240,18 @@ pub enum AuthError {
         name: String,
     },
 
+    #[error("Windows credential protection is unavailable while attempting to {operation} credential `{name}`")]
+    WindowsProtectionUnavailable {
+        operation: &'static str,
+        name: String,
+    },
+
+    #[error("Windows credential protection failed while attempting to {operation} credential `{name}`")]
+    WindowsProtectionFailure {
+        operation: &'static str,
+        name: String,
+    },
+
     #[error("credential state at `{path}` is corrupt")]
     CorruptState { path: PathBuf },
 
@@ -269,6 +295,7 @@ pub enum AuthError {
 pub struct CredentialStore {
     paths: CredentialPaths,
     keyring: Arc<dyn KeyringBackend>,
+    windows_protected: Arc<dyn WindowsProtectedBackend>,
     codex_client: Arc<dyn codex::CodexTokenClient>,
     codex_refresh: Arc<Mutex<()>>,
     xai_client: Arc<dyn xai::XaiTokenClient>,
@@ -288,7 +315,8 @@ impl CredentialStore {
     /// Constructs a store rooted at explicit paths while retaining the real OS keyring.
     #[must_use]
     pub fn with_paths(paths: CredentialPaths) -> Self {
-        Self::with_backend(paths, Arc::new(SystemKeyring))
+        let windows_protected = Arc::new(SystemWindowsProtected::new(paths.clone()));
+        Self::with_backends(paths, Arc::new(SystemKeyring), windows_protected)
     }
 
     #[must_use]
@@ -366,6 +394,7 @@ impl CredentialStore {
             match record.backend {
                 CredentialBackend::Keyring => match self.keyring.set(name, secret) {
                     Ok(()) => return Ok(CredentialBackend::Keyring),
+                    Err(KeyringError::TooLarge) => {}
                     Err(KeyringError::Unavailable) if allow_file_fallback => {}
                     Err(KeyringError::Unavailable) => {
                         return Err(AuthError::FileFallbackNotAllowed {
@@ -392,6 +421,12 @@ impl CredentialStore {
                     return Ok(CredentialBackend::File);
                 }
                 CredentialBackend::File => {}
+                CredentialBackend::WindowsProtectedFile => {
+                    self.windows_protected
+                        .set(name, secret)
+                        .map_err(|error| windows_protected_auth_error(error, "store", name))?;
+                    return Ok(CredentialBackend::WindowsProtectedFile);
+                }
             }
         }
 
@@ -412,6 +447,20 @@ impl CredentialStore {
         } else {
             None
         };
+
+        if old_record
+            .as_ref()
+            .is_some_and(|record| record.backend == CredentialBackend::WindowsProtectedFile)
+        {
+            return self.set_windows_protected(
+                &mut index,
+                old_record.as_ref(),
+                name,
+                secret,
+                kind,
+                endpoint,
+            );
+        }
 
         match self.keyring.set(name, secret) {
             Ok(()) => {
@@ -450,6 +499,14 @@ impl CredentialStore {
                 }
                 self.set_fallback(&mut index, name, secret, kind, endpoint)
             }
+            Err(KeyringError::TooLarge) => self.set_windows_protected(
+                &mut index,
+                old_record.as_ref(),
+                name,
+                secret,
+                kind,
+                endpoint,
+            ),
             Err(KeyringError::Missing | KeyringError::Failure) => Err(AuthError::KeyringFailure {
                 operation: "store",
                 name: name.to_owned(),
@@ -501,6 +558,12 @@ impl CredentialStore {
                         name: name.to_owned(),
                     });
                 }
+                Err(KeyringError::TooLarge) => {
+                    return Err(AuthError::KeyringFailure {
+                        operation: "remove",
+                        name: name.to_owned(),
+                    });
+                }
             },
             CredentialBackend::File => {
                 let mut fallback = self.load_fallback()?;
@@ -508,6 +571,10 @@ impl CredentialStore {
                     self.save_fallback(&fallback)?;
                 }
             }
+            CredentialBackend::WindowsProtectedFile => match self.windows_protected.remove(name) {
+                Ok(()) | Err(WindowsProtectedError::Missing) => {}
+                Err(error) => return Err(windows_protected_auth_error(error, "remove", name)),
+            },
         }
 
         index.remove(name);
@@ -516,9 +583,19 @@ impl CredentialStore {
     }
 
     pub(crate) fn with_backend(paths: CredentialPaths, keyring: Arc<dyn KeyringBackend>) -> Self {
+        let windows_protected = Arc::new(SystemWindowsProtected::new(paths.clone()));
+        Self::with_backends(paths, keyring, windows_protected)
+    }
+
+    pub(crate) fn with_backends(
+        paths: CredentialPaths,
+        keyring: Arc<dyn KeyringBackend>,
+        windows_protected: Arc<dyn WindowsProtectedBackend>,
+    ) -> Self {
         Self {
             paths,
             keyring,
+            windows_protected,
             codex_client: Arc::new(codex::SystemCodexTokenClient),
             codex_refresh: Arc::new(Mutex::new(())),
             xai_client: Arc::new(xai::SystemXaiTokenClient),
@@ -580,20 +657,31 @@ impl CredentialStore {
 
         match record.backend {
             CredentialBackend::Keyring => {
-                self.keyring
-                    .set(name, secret)
-                    .map_err(|error| match error {
+                match self.keyring.set(name, secret) {
+                    Ok(()) => {}
+                    Err(KeyringError::TooLarge) => {
+                        return self.set_windows_protected(
+                            &mut index,
+                            Some(&record),
+                            name,
+                            secret,
+                            Some(kind),
+                            Some(endpoint),
+                        );
+                    }
+                    Err(error) => return Err(match error {
                         KeyringError::Unavailable => AuthError::KeyringUnavailable {
                             operation: "refresh",
                             name: name.to_owned(),
                         },
-                        KeyringError::Missing | KeyringError::Failure => {
+                        KeyringError::Missing | KeyringError::Failure | KeyringError::TooLarge => {
                             AuthError::KeyringFailure {
                                 operation: "refresh",
                                 name: name.to_owned(),
                             }
                         }
-                    })?
+                    }),
+                }
             }
             CredentialBackend::File => {
                 let mut fallback = self.load_fallback()?;
@@ -605,6 +693,11 @@ impl CredentialStore {
                 }
                 fallback.upsert(name, secret);
                 self.save_fallback(&fallback)?;
+            }
+            CredentialBackend::WindowsProtectedFile => {
+                self.windows_protected
+                    .set(name, secret)
+                    .map_err(|error| windows_protected_auth_error(error, "refresh", name))?;
             }
         }
         index.upsert(CredentialRecord {
@@ -666,6 +759,12 @@ impl CredentialStore {
                         name: name.to_owned(),
                     });
                 }
+                Err(KeyringError::TooLarge) => {
+                    return Err(AuthError::KeyringFailure {
+                        operation: "read",
+                        name: name.to_owned(),
+                    });
+                }
             },
             CredentialBackend::File => {
                 let fallback = self.load_fallback()?;
@@ -676,6 +775,16 @@ impl CredentialStore {
                         backend: CredentialBackend::File,
                     })?
             }
+            CredentialBackend::WindowsProtectedFile => self
+                .windows_protected
+                .get(name)
+                .map_err(|error| match error {
+                    WindowsProtectedError::Missing => AuthError::StoredCredentialMissing {
+                        name: name.to_owned(),
+                        backend: CredentialBackend::WindowsProtectedFile,
+                    },
+                    other => windows_protected_auth_error(other, "read", name),
+                })?,
         };
         Ok(Secret::from_secret_bytes(bytes))
     }
@@ -691,7 +800,7 @@ impl CredentialStore {
         #[cfg(not(unix))]
         {
             let _ = (index, name, secret, kind, endpoint);
-            return Err(AuthError::PlaintextFallbackUnsupported);
+            Err(AuthError::PlaintextFallbackUnsupported)
         }
 
         #[cfg(unix)]
@@ -715,6 +824,133 @@ impl CredentialStore {
             }
             Ok(CredentialBackend::File)
         }
+    }
+
+    fn set_windows_protected(
+        &self,
+        index: &mut IndexState,
+        old_record: Option<&CredentialRecord>,
+        name: &str,
+        secret: &[u8],
+        kind: Option<String>,
+        endpoint: Option<String>,
+    ) -> Result<CredentialBackend, AuthError> {
+        let old_secret = match old_record.map(|record| record.backend) {
+            Some(CredentialBackend::Keyring) => match self.keyring.get(name) {
+                Ok(secret) => Some(secret),
+                Err(KeyringError::Missing) => None,
+                Err(KeyringError::Unavailable) => {
+                    return Err(AuthError::KeyringUnavailable {
+                        operation: "migrate",
+                        name: name.to_owned(),
+                    });
+                }
+                Err(KeyringError::TooLarge | KeyringError::Failure) => {
+                    return Err(AuthError::KeyringFailure {
+                        operation: "migrate",
+                        name: name.to_owned(),
+                    });
+                }
+            },
+            Some(CredentialBackend::WindowsProtectedFile) => Some(
+                self.windows_protected
+                    .get(name)
+                    .map_err(|error| windows_protected_auth_error(error, "read", name))?,
+            ),
+            _ => None,
+        };
+        let old_fallback = if old_record
+            .is_some_and(|record| record.backend == CredentialBackend::File)
+        {
+            Some(self.load_fallback()?)
+        } else {
+            None
+        };
+
+        self.windows_protected
+            .set(name, secret)
+            .map_err(|error| windows_protected_auth_error(error, "store", name))?;
+
+        if old_record.is_some_and(|record| record.backend == CredentialBackend::Keyring) {
+            match self.keyring.remove(name) {
+                Ok(()) | Err(KeyringError::Missing) => {}
+                Err(error) => {
+                    let _ = self.windows_protected.remove(name);
+                    return Err(match error {
+                        KeyringError::Unavailable => AuthError::KeyringUnavailable {
+                            operation: "migrate",
+                            name: name.to_owned(),
+                        },
+                        _ => AuthError::KeyringFailure {
+                            operation: "migrate",
+                            name: name.to_owned(),
+                        },
+                    });
+                }
+            }
+        }
+
+        if let Some(mut fallback) = old_fallback.clone() {
+            fallback.remove(name);
+            if let Err(error) = self.save_fallback(&fallback) {
+                let _ = self.windows_protected.remove(name);
+                return Err(error);
+            }
+        }
+
+        let original_index = index.clone();
+        index.upsert(CredentialRecord {
+            name: name.to_owned(),
+            backend: CredentialBackend::WindowsProtectedFile,
+            kind,
+            endpoint,
+        });
+        if let Err(error) = self.save_index(index) {
+            let mut rollback_failed = false;
+            match old_record.map(|record| record.backend) {
+                Some(CredentialBackend::Keyring) => {
+                    if let Some(old_secret) = old_secret.as_deref()
+                        && self.keyring.set(name, old_secret).is_err()
+                    {
+                        rollback_failed = true;
+                    }
+                    if self.windows_protected.remove(name).is_err() {
+                        rollback_failed = true;
+                    }
+                }
+                Some(CredentialBackend::WindowsProtectedFile) => {
+                    if let Some(old_secret) = old_secret.as_deref()
+                        && self.windows_protected.set(name, old_secret).is_err()
+                    {
+                        rollback_failed = true;
+                    }
+                }
+                Some(CredentialBackend::File) => {
+                    if let Some(old_fallback) = old_fallback.as_ref()
+                        && self.save_fallback(old_fallback).is_err()
+                    {
+                        rollback_failed = true;
+                    }
+                    if self.windows_protected.remove(name).is_err() {
+                        rollback_failed = true;
+                    }
+                }
+                None => {
+                    if !matches!(
+                        self.windows_protected.remove(name),
+                        Ok(()) | Err(WindowsProtectedError::Missing)
+                    ) {
+                        rollback_failed = true;
+                    }
+                }
+            }
+            *index = original_index;
+            if rollback_failed {
+                return Err(AuthError::StateRollbackFailed);
+            }
+            return Err(error);
+        }
+        Ok(CredentialBackend::WindowsProtectedFile)
     }
 
     fn lock_state(&self) -> Result<StateLock, AuthError> {
@@ -793,6 +1029,7 @@ impl CredentialStore {
 
     fn save_index(&self, state: &IndexState) -> Result<(), AuthError> {
         let mut state = state.clone();
+        state.version = INDEX_STATE_VERSION;
         state.sort();
         let bytes = serialize_state(&state, self.paths.index_file())?;
         atomic_write(self.paths.index_file(), &bytes)
@@ -1039,7 +1276,7 @@ struct IndexState {
 impl Default for IndexState {
     fn default() -> Self {
         Self {
-            version: STATE_VERSION,
+            version: INDEX_STATE_VERSION,
             records: Vec::new(),
         }
     }
@@ -1047,7 +1284,10 @@ impl Default for IndexState {
 
 impl IndexState {
     fn validate(&self, path: &Path) -> Result<(), AuthError> {
-        if self.version != STATE_VERSION {
+        if !matches!(
+            self.version,
+            LEGACY_INDEX_STATE_VERSION | INDEX_STATE_VERSION
+        ) {
             return Err(AuthError::UnsupportedStateVersion {
                 path: path.to_owned(),
                 version: self.version,
@@ -1115,7 +1355,7 @@ struct FallbackState {
 impl Default for FallbackState {
     fn default() -> Self {
         Self {
-            version: STATE_VERSION,
+            version: FALLBACK_STATE_VERSION,
             records: Vec::new(),
         }
     }
@@ -1123,7 +1363,7 @@ impl Default for FallbackState {
 
 impl FallbackState {
     fn validate(&self, path: &Path) -> Result<(), AuthError> {
-        if self.version != STATE_VERSION {
+        if self.version != FALLBACK_STATE_VERSION {
             return Err(AuthError::UnsupportedStateVersion {
                 path: path.to_owned(),
                 version: self.version,
@@ -1481,6 +1721,54 @@ fn set_private_file_permissions(path: &Path, file: &File) -> Result<(), AuthErro
     Ok(())
 }
 
+#[cfg(windows)]
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(AuthError::StateTooLarge {
+            path: path.to_owned(),
+            limit: MAX_STATE_BYTES,
+        });
+    }
+    let parent = path.parent().ok_or_else(|| AuthError::Io {
+        operation: "locate parent of",
+        path: path.to_owned(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"),
+    })?;
+    ensure_data_directory(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        validate_regular_metadata(path, &metadata)?;
+    }
+    let mut file = atomic_write_file::AtomicWriteFile::open(path).map_err(|source| {
+        AuthError::Io {
+            operation: "create temporary replacement for",
+            path: path.to_owned(),
+            source,
+        }
+    })?;
+    file.write_all(bytes).map_err(|source| AuthError::Io {
+        operation: "write temporary replacement for",
+        path: path.to_owned(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| AuthError::Io {
+        operation: "synchronize temporary replacement for",
+        path: path.to_owned(),
+        source,
+    })?;
+    file.commit().map_err(|source| AuthError::Io {
+        operation: "replace",
+        path: path.to_owned(),
+        source,
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|source| AuthError::Io {
+        operation: "inspect",
+        path: path.to_owned(),
+        source,
+    })?;
+    validate_regular_metadata(path, &metadata)
+}
+
+#[cfg(not(windows))]
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
     if bytes.len() > MAX_STATE_BYTES {
         return Err(AuthError::StateTooLarge {
@@ -1591,13 +1879,13 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
 }
 
 fn ensure_atomic_replacement_supported(path: &Path) -> Result<(), AuthError> {
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     if path.exists() {
         return Err(AuthError::AtomicReplacementUnsupported {
             path: path.to_owned(),
         });
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _ = path;
     Ok(())
 }
@@ -1633,6 +1921,7 @@ struct CodexStateLock<'a> {
 pub(crate) enum KeyringError {
     Unavailable,
     Missing,
+    TooLarge,
     Failure,
 }
 
@@ -1640,6 +1929,127 @@ pub(crate) trait KeyringBackend: Send + Sync {
     fn get(&self, name: &str) -> Result<Vec<u8>, KeyringError>;
     fn set(&self, name: &str, secret: &[u8]) -> Result<(), KeyringError>;
     fn remove(&self, name: &str) -> Result<(), KeyringError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowsProtectedError {
+    Unavailable,
+    Missing,
+    Failure,
+}
+
+pub(crate) trait WindowsProtectedBackend: Send + Sync {
+    fn get(&self, name: &str) -> Result<Vec<u8>, WindowsProtectedError>;
+    fn set(&self, name: &str, secret: &[u8]) -> Result<(), WindowsProtectedError>;
+    fn remove(&self, name: &str) -> Result<(), WindowsProtectedError>;
+}
+
+fn windows_protected_auth_error(
+    error: WindowsProtectedError,
+    operation: &'static str,
+    name: &str,
+) -> AuthError {
+    match error {
+        WindowsProtectedError::Unavailable => AuthError::WindowsProtectionUnavailable {
+            operation,
+            name: name.to_owned(),
+        },
+        WindowsProtectedError::Missing | WindowsProtectedError::Failure => {
+            AuthError::WindowsProtectionFailure {
+                operation,
+                name: name.to_owned(),
+            }
+        }
+    }
+}
+
+struct SystemWindowsProtected {
+    paths: CredentialPaths,
+}
+
+impl SystemWindowsProtected {
+    fn new(paths: CredentialPaths) -> Self {
+        Self { paths }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let digest = Sha256::digest(name.as_bytes());
+        self.paths
+            .windows_credential_dir()
+            .join(format!("{}.bin", URL_SAFE_NO_PAD.encode(digest)))
+    }
+}
+
+#[cfg(windows)]
+impl WindowsProtectedBackend for SystemWindowsProtected {
+    fn get(&self, name: &str) -> Result<Vec<u8>, WindowsProtectedError> {
+        let path = self.path(name);
+        let bytes = read_state_file(&path)
+            .map_err(|_| WindowsProtectedError::Failure)?
+            .ok_or(WindowsProtectedError::Missing)?;
+        let encrypted = bytes
+            .strip_prefix(WINDOWS_PROTECTED_MAGIC)
+            .ok_or(WindowsProtectedError::Failure)?;
+        let entropy = windows_protected_entropy(name);
+        windows_dpapi::decrypt_data(encrypted, windows_dpapi::Scope::User, Some(&entropy))
+            .map_err(|_| WindowsProtectedError::Failure)
+    }
+
+    fn set(&self, name: &str, secret: &[u8]) -> Result<(), WindowsProtectedError> {
+        if secret.len() > MAX_STATE_BYTES {
+            return Err(WindowsProtectedError::Failure);
+        }
+        let entropy = windows_protected_entropy(name);
+        let encrypted = windows_dpapi::encrypt_data(
+            secret,
+            windows_dpapi::Scope::User,
+            Some(&entropy),
+        )
+        .map_err(|_| WindowsProtectedError::Failure)?;
+        let mut bytes = Vec::with_capacity(WINDOWS_PROTECTED_MAGIC.len() + encrypted.len());
+        bytes.extend_from_slice(WINDOWS_PROTECTED_MAGIC);
+        bytes.extend_from_slice(&encrypted);
+        atomic_write(&self.path(name), &bytes).map_err(|_| WindowsProtectedError::Failure)
+    }
+
+    fn remove(&self, name: &str) -> Result<(), WindowsProtectedError> {
+        let path = self.path(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => validate_regular_metadata(&path, &metadata)
+                .map_err(|_| WindowsProtectedError::Failure)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(WindowsProtectedError::Missing);
+            }
+            Err(_) => return Err(WindowsProtectedError::Failure),
+        }
+        fs::remove_file(path).map_err(|_| WindowsProtectedError::Failure)
+    }
+}
+
+#[cfg(not(windows))]
+impl WindowsProtectedBackend for SystemWindowsProtected {
+    fn get(&self, _name: &str) -> Result<Vec<u8>, WindowsProtectedError> {
+        Err(WindowsProtectedError::Unavailable)
+    }
+
+    fn set(&self, _name: &str, _secret: &[u8]) -> Result<(), WindowsProtectedError> {
+        Err(WindowsProtectedError::Unavailable)
+    }
+
+    fn remove(&self, _name: &str) -> Result<(), WindowsProtectedError> {
+        Err(WindowsProtectedError::Unavailable)
+    }
+}
+
+#[cfg(windows)]
+fn windows_protected_entropy(name: &str) -> Vec<u8> {
+    let mut entropy = Vec::with_capacity(KEYRING_SERVICE.len() + 1 + name.len());
+    entropy.extend_from_slice(KEYRING_SERVICE.as_bytes());
+    entropy.push(0);
+    entropy.extend_from_slice(name.as_bytes());
+    entropy
 }
 
 struct SystemKeyring;
@@ -1664,6 +2074,8 @@ impl KeyringBackend for SystemKeyring {
 fn classify_keyring_error(error: keyring::Error) -> KeyringError {
     match error {
         keyring::Error::NoEntry => KeyringError::Missing,
+        #[cfg(windows)]
+        keyring::Error::TooLong(attribute, _) if attribute == "secret" => KeyringError::TooLarge,
         keyring::Error::NoDefaultStore
         | keyring::Error::NoStorageAccess(_)
         | keyring::Error::PlatformFailure(_)

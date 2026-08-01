@@ -6,7 +6,7 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{
-        Arc, Barrier, Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -29,6 +29,7 @@ enum FakeMode {
 #[derive(Default)]
 struct FakeKeyring {
     mode: Mutex<FakeMode>,
+    max_secret_len: Mutex<Option<usize>>,
     values: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
@@ -43,6 +44,10 @@ impl FakeKeyring {
 
     fn value(&self, name: &str) -> Option<Vec<u8>> {
         self.values.lock().unwrap().get(name).cloned()
+    }
+
+    fn set_max_secret_len(&self, limit: usize) {
+        *self.max_secret_len.lock().unwrap() = Some(limit);
     }
 
     fn check_mode(&self) -> Result<(), KeyringError> {
@@ -62,6 +67,14 @@ impl KeyringBackend for FakeKeyring {
 
     fn set(&self, name: &str, secret: &[u8]) -> Result<(), KeyringError> {
         self.check_mode()?;
+        if self
+            .max_secret_len
+            .lock()
+            .unwrap()
+            .is_some_and(|limit| secret.len() > limit)
+        {
+            return Err(KeyringError::TooLarge);
+        }
         self.values
             .lock()
             .unwrap()
@@ -77,6 +90,56 @@ impl KeyringBackend for FakeKeyring {
             .remove(name)
             .map(|_| ())
             .ok_or(KeyringError::Missing)
+    }
+}
+
+#[derive(Default)]
+struct FakeWindowsProtected {
+    mode: Mutex<FakeMode>,
+    values: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+impl FakeWindowsProtected {
+    fn set_mode(&self, mode: FakeMode) {
+        *self.mode.lock().unwrap() = mode;
+    }
+
+    fn value(&self, name: &str) -> Option<Vec<u8>> {
+        self.values.lock().unwrap().get(name).cloned()
+    }
+
+    fn check_mode(&self) -> Result<(), WindowsProtectedError> {
+        match *self.mode.lock().unwrap() {
+            FakeMode::Available => Ok(()),
+            FakeMode::Unavailable => Err(WindowsProtectedError::Unavailable),
+            FakeMode::Failure => Err(WindowsProtectedError::Failure),
+        }
+    }
+}
+
+impl WindowsProtectedBackend for FakeWindowsProtected {
+    fn get(&self, name: &str) -> Result<Vec<u8>, WindowsProtectedError> {
+        self.check_mode()?;
+        self.value(name).ok_or(WindowsProtectedError::Missing)
+    }
+
+    fn set(&self, name: &str, secret: &[u8]) -> Result<(), WindowsProtectedError> {
+        self.check_mode()?;
+        self.values
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), secret.to_vec());
+        Ok(())
+    }
+
+    fn remove(&self, name: &str) -> Result<(), WindowsProtectedError> {
+        self.check_mode()?;
+        self.values
+            .lock()
+            .unwrap()
+            .remove(name)
+            .map(|_| ())
+            .ok_or(WindowsProtectedError::Missing)
     }
 }
 
@@ -176,11 +239,25 @@ impl Drop for TestDirectory {
 }
 
 fn test_store() -> (CredentialStore, Arc<FakeKeyring>, TestDirectory) {
+    let (store, keyring, _protected, directory) = test_store_with_protected();
+    (store, keyring, directory)
+}
+
+fn test_store_with_protected() -> (
+    CredentialStore,
+    Arc<FakeKeyring>,
+    Arc<FakeWindowsProtected>,
+    TestDirectory,
+) {
     let directory = TestDirectory::new();
     let keyring = Arc::new(FakeKeyring::default());
-    let store =
-        CredentialStore::with_backend(CredentialPaths::new(directory.path()), keyring.clone());
-    (store, keyring, directory)
+    let protected = Arc::new(FakeWindowsProtected::default());
+    let store = CredentialStore::with_backends(
+        CredentialPaths::new(directory.path()),
+        keyring.clone(),
+        protected.clone(),
+    );
+    (store, keyring, protected, directory)
 }
 
 fn jwt(payload: serde_json::Value) -> String {
@@ -335,6 +412,133 @@ fn keyring_failures_do_not_trigger_an_allowed_fallback() {
 
     assert!(matches!(error, AuthError::KeyringFailure { .. }));
     assert!(!store.paths().fallback_file().exists());
+}
+
+#[test]
+fn oversized_keyring_secrets_use_windows_protection_without_plaintext_permission() {
+    let (store, keyring, protected, _directory) = test_store_with_protected();
+    keyring.set_max_secret_len(16);
+
+    assert_eq!(
+        store.set("small", b"small-secret", false).unwrap(),
+        CredentialBackend::Keyring
+    );
+    let oversized = vec![b'x'; 32];
+    assert_eq!(
+        store.set("large", &oversized, false).unwrap(),
+        CredentialBackend::WindowsProtectedFile
+    );
+
+    assert_eq!(keyring.value("small").unwrap(), b"small-secret");
+    assert!(keyring.value("large").is_none());
+    assert_eq!(protected.value("large").unwrap(), oversized);
+    assert_eq!(
+        store
+            .resolve(&SecretRef::Stored("large".to_owned()))
+            .unwrap()
+            .expose_secret_bytes(),
+        oversized
+    );
+    assert_eq!(
+        store.status("large").unwrap().unwrap().backend,
+        CredentialBackend::WindowsProtectedFile
+    );
+}
+
+#[test]
+fn growing_keyring_secret_migrates_and_removes_the_old_entry() {
+    let (store, keyring, protected, _directory) = test_store_with_protected();
+    keyring.set_max_secret_len(16);
+    store.set("openai", b"old-secret", false).unwrap();
+
+    let replacement = vec![b'n'; 32];
+    assert_eq!(
+        store.set("openai", &replacement, false).unwrap(),
+        CredentialBackend::WindowsProtectedFile
+    );
+
+    assert!(keyring.value("openai").is_none());
+    assert_eq!(protected.value("openai").unwrap(), replacement);
+    assert_eq!(
+        store
+            .resolve(&SecretRef::Stored("openai".to_owned()))
+            .unwrap()
+            .expose_secret_bytes(),
+        replacement
+    );
+}
+
+#[test]
+fn windows_protection_failure_preserves_the_existing_keyring_credential() {
+    let (store, keyring, protected, _directory) = test_store_with_protected();
+    keyring.set_max_secret_len(16);
+    store.set("openai", b"old-secret", false).unwrap();
+    protected.set_mode(FakeMode::Failure);
+
+    let error = store.set("openai", vec![b'n'; 32], false).unwrap_err();
+
+    assert!(matches!(error, AuthError::WindowsProtectionFailure { .. }));
+    assert_eq!(keyring.value("openai").unwrap(), b"old-secret");
+    assert_eq!(
+        store.status("openai").unwrap().unwrap().backend,
+        CredentialBackend::Keyring
+    );
+}
+
+#[test]
+fn removing_windows_protected_credential_removes_secret_and_metadata() {
+    let (store, keyring, protected, _directory) = test_store_with_protected();
+    keyring.set_max_secret_len(4);
+    store.set("openai", b"oversized", false).unwrap();
+
+    assert!(store.remove("openai").unwrap());
+    assert!(protected.value("openai").is_none());
+    assert!(store.status("openai").unwrap().is_none());
+}
+
+#[test]
+fn version_one_index_is_upgraded_on_the_next_write() {
+    let (store, _keyring, _protected, _directory) = test_store_with_protected();
+    write_private(store.paths().index_file(), b"(version:1,records:[])\n");
+
+    store.set("openai", b"secret", false).unwrap();
+
+    let persisted = fs::read_to_string(store.paths().index_file()).unwrap();
+    assert!(persisted.contains("version: 2"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_dpapi_round_trip_replaces_and_removes_oversized_secret() {
+    let directory = TestDirectory::new();
+    let paths = CredentialPaths::new(directory.path());
+    let store = CredentialStore::with_paths(paths.clone());
+    let first = vec![b'a'; 4_300];
+    let second = vec![b'b'; 4_400];
+
+    assert_eq!(
+        store.set("openai-codex/default", &first, false).unwrap(),
+        CredentialBackend::WindowsProtectedFile
+    );
+    assert_eq!(
+        store.set("openai-codex/default", &second, false).unwrap(),
+        CredentialBackend::WindowsProtectedFile
+    );
+    drop(store);
+    let store = CredentialStore::with_paths(paths);
+    assert_eq!(
+        store
+            .resolve(&SecretRef::Stored("openai-codex/default".to_owned()))
+            .unwrap()
+            .expose_secret_bytes(),
+        second
+    );
+    let protected_path = SystemWindowsProtected::new(CredentialPaths::new(directory.path()))
+        .path("openai-codex/default");
+    let ciphertext = fs::read(&protected_path).unwrap();
+    assert!(!ciphertext.windows(second.len()).any(|window| window == second));
+    assert!(store.remove("openai-codex/default").unwrap());
+    assert!(!protected_path.exists());
 }
 
 #[cfg(unix)]
@@ -579,6 +783,64 @@ fn codex_login_uses_pkce_rejects_wrong_state_and_stores_tokens() {
 }
 
 #[test]
+fn codex_login_routes_a_realistic_oversized_bundle_to_windows_protection() {
+    let (mut store, keyring, protected, _directory) = test_store_with_protected();
+    keyring.set_max_secret_len(2_560);
+    let id_token = jwt(serde_json::json!({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "workspace-test-id",
+            "chatgpt_account_is_fedramp": false
+        },
+        "padding": "x".repeat(1_400)
+    }));
+    let access_token = "a".repeat(1_750);
+    let refresh_token = "r".repeat(200);
+    store.codex_client = Arc::new(FakeCodexTokenClient::new(
+        codex::ExchangedTokens {
+            id_token,
+            access_token: access_token.clone(),
+            refresh_token,
+        },
+        codex::RefreshedTokens::default(),
+    ));
+    let login = CodexLogin::start_for_test(
+        0,
+        "known-state",
+        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let authorization = reqwest::Url::parse(login.authorization_url()).unwrap();
+    let redirect_uri = authorization
+        .query_pairs()
+        .find(|(name, _)| name == "redirect_uri")
+        .unwrap()
+        .1;
+    let port = reqwest::Url::parse(&redirect_uri).unwrap().port().unwrap();
+
+    let completion_store = store.clone();
+    let completion = thread::spawn(move || login.complete(&completion_store, "default", false));
+    let response = callback(port, "code=authorization-code&state=known-state");
+    assert!(response.starts_with("HTTP/1.1 200"));
+
+    assert_eq!(
+        completion.join().unwrap().unwrap(),
+        CredentialBackend::WindowsProtectedFile
+    );
+    assert!(protected.value("openai-codex/default").unwrap().len() > 2_560);
+    assert!(keyring.value("openai-codex/default").is_none());
+    assert_eq!(
+        store
+            .resolve_codex("default")
+            .unwrap()
+            .access_token()
+            .expose_secret_str()
+            .unwrap(),
+        access_token
+    );
+}
+
+#[test]
 fn codex_resolution_refreshes_an_expired_access_token_once() {
     let (mut store, _keyring, _directory) = test_store();
     let expires_at = SystemTime::now()
@@ -779,10 +1041,10 @@ fn corrupt_unknown_and_unsupported_index_state_is_rejected() {
         AuthError::CorruptState { .. }
     ));
 
-    write_private(store.paths().index_file(), "(version: 2, records: [])");
+    write_private(store.paths().index_file(), "(version: 3, records: [])");
     assert!(matches!(
         store.list().unwrap_err(),
-        AuthError::UnsupportedStateVersion { version: 2, .. }
+        AuthError::UnsupportedStateVersion { version: 3, .. }
     ));
 }
 
@@ -894,7 +1156,7 @@ fn insecure_existing_state_permissions_are_rejected() {
 fn file_lock_serializes_concurrent_updates() {
     let (store, keyring, _directory) = test_store();
     keyring.set_mode(FakeMode::Unavailable);
-    let barrier = Arc::new(Barrier::new(9));
+    let barrier = Arc::new(std::sync::Barrier::new(9));
     let mut threads = Vec::new();
 
     for index in 0..8 {
