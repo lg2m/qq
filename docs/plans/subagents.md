@@ -5,9 +5,11 @@ sessions, depth/concurrency/budget caps, cancellation propagation, and
 the step-3 prompt guidance in the versioned base prompt). Phase A is
 implemented: configured `worker_model` resolution follows explicit tool
 argument, configured worker, then persisted parent selection precedence and
-persists the resolved selection on each child. Phase B—durable inclusive
-parent/child accounting—remains unimplemented and must not be implemented as
-a special case in the TUI or as an in-memory-only shortcut.
+persists the resolved selection on each child. Phase B is implemented: session
+snapshots and durable events derive checked direct and immediate-child
+inclusive usage/cost from persisted runs, and the TUI consumes that projection
+without client-side aggregation. Dedicated headless/ATIF export remains part
+of the future benchmark/export work; those interfaces do not yet exist.
 
 Main-session context is premium real estate: every byte of gathered
 evidence is re-sent on every later turn, crowds out reasoning, and ages
@@ -236,9 +238,10 @@ start with write-only denormalized counters.
   `usage`/`cost_usd` fields. During a compatibility window, old fields may map
   to direct totals while new consumers choose inclusive totals deliberately.
 - Make the store projection the only source used by session snapshots,
-  durable `SessionUpdated` payloads, TUI session/detail displays, headless
-  output, and future ATIF conversion. Clients format values; they do not join
-  children or calculate cost.
+  durable `SessionUpdated` payloads, and TUI session/detail displays. The
+  planned headless output and future ATIF conversion must consume the same
+  projection when those interfaces are implemented. Clients format values;
+  they do not join children or calculate cost.
 - When durable child accounting changes, publish an updated parent projection
   as well as the child's update. Establish deterministic child-before-parent
   event ordering after the accounting transaction commits. Event consumers
@@ -269,15 +272,19 @@ not introduce a third accounting implementation.
   order, and snapshot reload yields the same values even if events are missed.
 - Protocol compatibility tests cover old persisted events/snapshots and the
   additive direct/inclusive representation.
-- TUI and headless tests prove both parent inclusive and child direct totals
-  are labeled consistently; neither client performs its own aggregation.
+- TUI tests prove parent inclusive and depth-one child direct totals are
+  formatted from the structured projection and unknown cost is not displayed
+  as zero. Planned headless tests must establish the same contract when that
+  interface is implemented; neither client may perform its own aggregation.
 - End-to-end tests run parallel `spawn_agent` calls with distinct costs and
   assert: each child reports only itself, the parent reports parent plus each
   child exactly once, and the same values survive process restart.
 
-Phase B is complete when every interface obtains identical inclusive totals
-from durable state, unknown cost cannot be mistaken for zero, and restart,
-cancellation, retries, and pruning cannot cause accounting drift.
+Phase B is complete for the current session protocol and TUI when every
+current interface obtains identical inclusive totals from durable state,
+unknown cost cannot be mistaken for zero, and restart, cancellation, retries,
+and pruning cannot cause accounting drift. Future headless/ATIF interfaces
+must consume this projection rather than redefine completion.
 
 ## Sequencing
 
@@ -285,8 +292,9 @@ cancellation, retries, and pruning cannot cause accounting drift.
    return, depth/concurrency caps, and cancellation propagation.
 2. **Complete:** Phase A worker-model configuration, typed resolution, policy
    validation, and durable child model selection.
-3. **Phase B:** store-level direct/inclusive accounting projection, protocol
-   representation, parent refresh events, and all client integrations.
+3. **Complete:** Phase B store-level direct/inclusive accounting projection,
+   protocol representation, parent refresh events, and current TUI client
+   integration. Future headless/ATIF exporters must consume this projection.
 4. **Complete:** agent-instruction guidance (the delegation formula) in the
    versioned base prompt.
 5. **Later:** mutating children with explicit approval semantics; parallel
