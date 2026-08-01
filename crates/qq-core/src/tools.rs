@@ -358,7 +358,10 @@ pub(crate) fn spawn_agent_spec() -> ToolSpec {
          only its final answer. Worth it when the raw evidence would dwarf the distilled answer \
          and you will not need that evidence verbatim later; several independent questions can be \
          delegated in parallel. Single reads, searches, and quick lookups are cheaper inline. The \
-         task brief must carry everything the sub-agent needs: it starts with no other context.",
+         task brief must carry everything the sub-agent needs: it starts with no other context. \
+         Omit model by default so QQ uses its configured worker model or the current session's \
+         selected model. Set model only when the user explicitly requests an exact provider/model \
+         route; never guess, translate, or invent a route.",
         json!({
             "type": "object",
             "properties": {
@@ -369,7 +372,7 @@ pub(crate) fn spawn_agent_spec() -> ToolSpec {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional provider/model route for the sub-agent; defaults to this session's model."
+                    "description": "Exact provider/model override. Omit by default to use QQ's configured worker model or this session's selected model. Set only when the user explicitly requests this exact route; never guess or translate providers."
                 }
             },
             "required": ["task"],
@@ -1997,6 +2000,25 @@ mod tests {
             fs::read_to_string(directory.path().join("list.txt")).unwrap(),
             "entry\nentry\nentry\n"
         );
+    }
+
+    #[test]
+    fn spawn_agent_model_override_is_explicit_and_omitted_by_default() {
+        let spec = spawn_agent_spec();
+        assert!(spec.description().contains("Omit model by default"));
+        assert!(
+            spec.description()
+                .contains("never guess, translate, or invent a route")
+        );
+        let schema = spec.input_schema();
+        assert_eq!(schema["required"], json!(["task"]));
+        let model = schema["properties"]["model"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(model.contains("Omit by default"));
+        assert!(model.contains("configured worker model"));
+        assert!(model.contains("this session's selected model"));
+        assert!(model.contains("never guess or translate providers"));
     }
 
     #[test]

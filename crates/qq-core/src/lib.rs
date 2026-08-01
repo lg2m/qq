@@ -974,7 +974,7 @@ impl Runtime {
     }
 }
 
-/// Version 4 of the base agent prompt. The text is versioned in code, not
+/// Version 5 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
 fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSpec]) -> String {
     let mut tool_names = String::new();
@@ -998,6 +998,10 @@ fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSp
         "\n\nDelegation:\n\
          - spawn_agent runs a one-shot read-only sub-agent in this workspace from a \
          self-contained task brief and returns only its final answer.\n\
+         - Omit spawn_agent's model argument by default. QQ then uses the configured worker \
+         model or this session's persisted selected model, including its authenticated provider. \
+         Set model only when the user explicitly requests an exact provider/model route; never \
+         guess, translate, or invent one.\n\
          - Delegate when all three hold: the raw evidence would dwarf the distilled answer, \
          you will not need that evidence verbatim later, and the task needs no mid-flight \
          steering.\n\
@@ -2624,5 +2628,9 @@ mod tests {
         assert!(with.contains("Delegation:"));
         assert!(with.contains("independent questions"));
         assert!(with.contains("read-only sub-agent"));
+        assert!(with.contains("Omit spawn_agent's model argument by default"));
+        assert!(with.contains("configured worker model"));
+        assert!(with.contains("persisted selected model"));
+        assert!(with.contains("never guess, translate, or invent one"));
     }
 }
