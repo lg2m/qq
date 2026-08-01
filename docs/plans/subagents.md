@@ -10,6 +10,9 @@ snapshots and durable events derive checked direct and immediate-child
 inclusive usage/cost from persisted runs, and the TUI consumes that projection
 without client-side aggregation. Dedicated headless/ATIF export remains part
 of the future benchmark/export work; those interfaces do not yet exist.
+Phase C is pending: spawn-time validation that a child's resolved route is
+authenticated and present in the served model list before any durable state
+is created.
 
 Main-session context is premium real estate: every byte of gathered
 evidence is re-sent on every later turn, crowds out reasoning, and ages
@@ -286,6 +289,79 @@ unknown cost cannot be mistaken for zero, and restart, cancellation, retries,
 and pruning cannot cause accounting drift. Future headless/ATIF interfaces
 must consume this projection rather than redefine completion.
 
+### Phase C — Spawn-Time Authenticated-Model Validation
+
+#### Contract
+
+Invariant: `spawn_agent` must never create a child on a model that is not,
+at the moment of the spawn call, in the authenticated model list — the same
+list `POST /v1/models` serves and the pickers display. A spawn that would
+fail later because its provider is unauthenticated or its model id is
+unknown must fail at the tool call instead, with no durable state created.
+
+Today the guarantee is partial. Config finalize validates the `worker_model`
+route syntax and provider existence, and runtime loading rejects unknown
+providers and missing static API keys before child creation. Two gaps
+remain:
+
+1. An unknown **model id** on a known provider is not rejected anywhere.
+   `prepare_provider` falls back to the provider's default API and sends the
+   raw string to the wire, so a typo'd explicit `model` argument produces a
+   child session that fails only when the provider rejects the request.
+2. Request-time-auth providers (OpenAI Codex, xAi) resolve credentials only
+   when the first request is sent, so a child can be created on a provider
+   that is not authenticated right now and fail mid-run.
+
+Close both with one validation choke point that every resolution source
+passes through — the explicit `model` argument, the configured
+`worker_model`, and the parent-selection fallback alike (parent
+authentication can lapse between the parent's load and the spawn):
+
+1. The route parses as `provider/model` (`ModelRoute::parse`).
+2. The provider is configured, passes allow/deny policy, and is
+   authenticated now (`provider_authenticated` — the same check that gates
+   the served model list). For request-time-auth providers this verifies a
+   resolvable profile or token at spawn time; expiry mid-run remains an
+   ordinary run failure, not a spawn-time gap.
+3. The model id appears in that provider's model list: the builtin catalog
+   union cached discovery. For a catalog-less custom provider the id must be
+   explicitly configured. The default-API fallback for unknown ids does not
+   apply on the spawn path.
+
+#### Architecture
+
+- Perform the check in the resolver used by `SessionSubagentSpawner`
+  (`resolve_worker_model` and the explicit-argument path feeding
+  `spawn_child_run` in `crates/qq-core/src/sessions.rs`), before the atomic
+  child-creation transaction and alongside the existing `loader.load`
+  validation. Core must not learn provider-auth details; the loader
+  interface answers "is this route spawnable" the same way it already
+  answers "load this route".
+- Model an `UnknownModel { provider, model }` error distinct from
+  `UnknownProvider`; unknown model ids currently have no error variant
+  anywhere in the config or runtime layers.
+- A rejection returns a bounded error tool result to the parent naming the
+  failed check, listing the provider's available models when the list is
+  small. It never fails the parent run and never creates a child.
+
+#### Verification and acceptance
+
+- Unit tests cover each failed check: malformed route, unknown provider,
+  policy-denied provider, unauthenticated provider (both static-key and
+  request-time-profile access types), unknown model id on a known provider,
+  and a catalog-less custom provider with and without an explicitly
+  configured id.
+- Session tests prove a rejected spawn creates no child session, prompt,
+  run, or event.
+- Valid spawns on authenticated providers are byte-for-byte unchanged.
+- The check consumes the cached discovery list; a spawn must not incur a
+  network round trip when the cache is warm, and falls back to the builtin
+  catalog plus configured models when discovery is unavailable.
+
+Phase C is complete when no argument or configuration can create a child
+session whose model would be rejected by the served model list, and every
+rejection is observable only as a tool error in the parent transcript.
+
 ## Sequencing
 
 1. **Complete:** `spawn_agent` tool: child creation, read-only mode, result
@@ -297,5 +373,8 @@ must consume this projection rather than redefine completion.
    integration. Future headless/ATIF exporters must consume this projection.
 4. **Complete:** agent-instruction guidance (the delegation formula) in the
    versioned base prompt.
-5. **Later:** mutating children with explicit approval semantics; parallel
+5. **Next:** Phase C spawn-time authenticated-model validation — one choke
+   point for every resolution source, the `UnknownModel` error variant, and
+   no durable state on rejection.
+6. **Later:** mutating children with explicit approval semantics; parallel
    fan-out helpers.
