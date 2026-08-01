@@ -3,8 +3,7 @@
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use async_stream::try_stream;
-use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,10 +11,10 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
-        build_client, build_direct_client, is_request_controlled_header, transport_error,
-        validate_endpoint,
+        ExchangeMessages, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders, build_client,
+        build_direct_client, is_request_controlled_header, validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -24,6 +23,15 @@ use crate::{
 };
 
 const CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+
+const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
+    messages: ExchangeMessages {
+        wire_overflow: "OpenAI-compatible wire size overflowed",
+        wire_limit: "OpenAI-compatible stream exceeded the configured wire size limit",
+    },
+    non_sse_response: "OpenAI-compatible provider returned a non-SSE response",
+    content_type_gate: ContentTypeGate::Strict,
+};
 
 /// Authentication applied by an OpenAI-compatible Chat Completions client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,37 +120,19 @@ impl Provider for OpenAiChatCompletions {
         Box::pin(try_stream! {
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = ChatCompletionsRequest::from(&request);
-            let wire_request = exchange
-                .request(reqwest::Method::POST, endpoint)
-                .headers(headers)
-                .header(ACCEPT, "text/event-stream")
-                .json(&body)
-                .build()
-                .map_err(|error| transport_error(error, exchange.static_redactions()))?;
-            let outcome = exchange
-                .execute(
-                    wire_request,
-                    limits.wire,
-                    ExchangeMessages {
-                        wire_overflow: "OpenAI-compatible wire size overflowed",
-                        wire_limit: "OpenAI-compatible stream exceeded the configured wire size limit",
-                    },
-                )
-                .await?;
-            let response = match outcome {
-                ExchangeOutcome::Success(response) => response,
-                ExchangeOutcome::Rejected(rejection) => Err(api_error(rejection))?,
-            };
+            let mut sse = sse_exchange(
+                &exchange,
+                endpoint,
+                headers,
+                &body,
+                sse_decoder(limits.event),
+                limits.wire,
+                SSE_SPEC,
+            )
+            .await
+            .map_err(|error| error.into_provider_error(api_error))?;
 
-            if !crate::http::is_event_stream_headers(response.headers()) {
-                Err(ProviderError::Protocol(
-                    "OpenAI-compatible provider returned a non-SSE response".to_owned(),
-                ))?;
-            }
-
-            let redactions = Arc::<[String]>::from(response.redactions());
-            let mut chunks = response.into_body();
-            let mut decoder = sse_decoder(limits.event);
+            let redactions = Arc::clone(sse.redactions());
             let mut output_bytes = ByteCounter::new(
                 limits.output,
                 "OpenAI-compatible output size overflowed",
@@ -154,70 +144,66 @@ impl Provider for OpenAiChatCompletions {
             // first fragment. Ordered so completion drains in index order.
             let mut tool_calls: BTreeMap<u64, String> = BTreeMap::new();
 
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk?;
+            while let Some(event) = sse.next_event().await? {
+                let data = event.data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    yield ProviderEvent::Completed { usage };
+                    return;
+                }
 
-                for event in decoder.push(&chunk)? {
-                    let data = event.data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if data == "[DONE]" {
-                        yield ProviderEvent::Completed { usage };
-                        return;
-                    }
-
-                    let decoded = decode_event(data, redactions.as_ref())?;
-                    if let Some(chunk_usage) = decoded.usage
-                        && usage.replace(chunk_usage).is_some()
-                    {
-                        Err(ProviderError::Protocol(
-                            "OpenAI-compatible stream reported usage more than once".to_owned(),
-                        ))?;
-                    }
-                    for delta in decoded.deltas {
-                        match delta {
-                            DecodedDelta::OutputText(text) => {
-                                output_bytes.add(text.len())?;
-                                yield ProviderEvent::OutputTextDelta { text };
+                let decoded = decode_event(data, redactions.as_ref())?;
+                if let Some(chunk_usage) = decoded.usage
+                    && usage.replace(chunk_usage).is_some()
+                {
+                    Err(ProviderError::Protocol(
+                        "OpenAI-compatible stream reported usage more than once".to_owned(),
+                    ))?;
+                }
+                for delta in decoded.deltas {
+                    match delta {
+                        DecodedDelta::OutputText(text) => {
+                            output_bytes.add(text.len())?;
+                            yield ProviderEvent::OutputTextDelta { text };
+                        }
+                        DecodedDelta::Refusal(text) => {
+                            output_bytes.add(text.len())?;
+                            yield ProviderEvent::RefusalDelta { text };
+                        }
+                        DecodedDelta::ToolCallStarted { index, id, name } => {
+                            if tool_calls.insert(index, id.clone()).is_some() {
+                                Err(ProviderError::Protocol(
+                                    "OpenAI-compatible stream reused a tool-call index"
+                                        .to_owned(),
+                                ))?;
                             }
-                            DecodedDelta::Refusal(text) => {
-                                output_bytes.add(text.len())?;
-                                yield ProviderEvent::RefusalDelta { text };
-                            }
-                            DecodedDelta::ToolCallStarted { index, id, name } => {
-                                if tool_calls.insert(index, id.clone()).is_some() {
+                            yield ProviderEvent::ToolCallStarted { id, name };
+                        }
+                        DecodedDelta::ToolCallArguments { index, json } => {
+                            match tool_calls.get(&index) {
+                                Some(id) => {
+                                    output_bytes.add(json.len())?;
+                                    yield ProviderEvent::ToolCallArgumentsDelta {
+                                        id: id.clone(),
+                                        json,
+                                    };
+                                }
+                                None => {
                                     Err(ProviderError::Protocol(
-                                        "OpenAI-compatible stream reused a tool-call index"
+                                        "OpenAI-compatible stream sent arguments for an unknown tool call"
                                             .to_owned(),
                                     ))?;
                                 }
-                                yield ProviderEvent::ToolCallStarted { id, name };
                             }
-                            DecodedDelta::ToolCallArguments { index, json } => {
-                                match tool_calls.get(&index) {
-                                    Some(id) => {
-                                        output_bytes.add(json.len())?;
-                                        yield ProviderEvent::ToolCallArgumentsDelta {
-                                            id: id.clone(),
-                                            json,
-                                        };
-                                    }
-                                    None => {
-                                        Err(ProviderError::Protocol(
-                                            "OpenAI-compatible stream sent arguments for an unknown tool call"
-                                                .to_owned(),
-                                        ))?;
-                                    }
-                                }
-                            }
-                            DecodedDelta::ToolCallsFinished => {
-                                for (_, id) in std::mem::take(&mut tool_calls) {
-                                    yield ProviderEvent::ToolCallCompleted { id };
-                                }
-                            }
-                            DecodedDelta::TerminalError(error) => Err(error)?,
                         }
+                        DecodedDelta::ToolCallsFinished => {
+                            for (_, id) in std::mem::take(&mut tool_calls) {
+                                yield ProviderEvent::ToolCallCompleted { id };
+                            }
+                        }
+                        DecodedDelta::TerminalError(error) => Err(error)?,
                     }
                 }
             }
@@ -715,6 +701,7 @@ fn api_error(rejection: HttpRejection) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
     use serde_json::json;
 
     use crate::test_support::LoopbackServer;
