@@ -24,6 +24,10 @@ cargo run -- auth login openai-codex
 QQ_MODEL=openai-codex/MODEL cargo run -- ask "Reply with pong"
 ```
 
+On Windows, credentials that exceed Credential Manager's per-entry limit are
+stored in a DPAPI-encrypted file bound to the current Windows user and machine.
+Moving that file to another account or computer requires signing in again.
+
 To use xAI, set `XAI_API_KEY` or sign in with OAuth. OAuth credentials are
 refreshed and stored under the selected profile:
 
