@@ -12,6 +12,7 @@ use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, SharedRequestCredentialProvider, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
+    exchange::ContentTypeGate,
     http::{
         ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
         build_client, build_direct_client, is_request_controlled_header, transport_error,
@@ -339,11 +340,11 @@ fn build_headers(
 }
 
 fn accepts_responses_stream(headers: &HeaderMap, request_kind: ResponsesRequestKind) -> bool {
-    if crate::http::is_event_stream_headers(headers) {
-        return true;
-    }
-    matches!(request_kind, ResponsesRequestKind::Codex)
-        && headers.get(reqwest::header::CONTENT_TYPE).is_none()
+    let gate = match request_kind {
+        ResponsesRequestKind::Standard => ContentTypeGate::Strict,
+        ResponsesRequestKind::Codex => ContentTypeGate::AllowMissingContentType,
+    };
+    gate.accepts(headers)
 }
 
 fn sse_decoder(max_event_bytes: usize) -> SseDecoder {

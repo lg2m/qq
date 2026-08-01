@@ -12,6 +12,7 @@ pub mod bedrock;
 pub mod compiler;
 mod construction;
 mod credentials;
+mod exchange;
 pub mod google;
 mod http;
 mod limits;
