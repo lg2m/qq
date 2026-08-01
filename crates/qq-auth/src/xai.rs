@@ -14,10 +14,9 @@ use super::{
     AuthError, CredentialBackend, CredentialStore, Secret, resolve_provider_credential,
     validate_credential_name,
 };
-use crate::{config::SecretRef, providers::XAI_CREDENTIAL_ENDPOINT};
 use qq_provider::{
     RequestCredential, RequestCredentialError, RequestCredentialFuture, RequestCredentialProvider,
-    SharedRequestCredentialProvider,
+    SecretRef, SharedRequestCredentialProvider, XAI_CREDENTIAL_ENDPOINT,
 };
 
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -397,7 +396,7 @@ impl StoredXaiCredential {
 }
 
 impl CredentialStore {
-    pub(crate) fn xai_request_credentials(
+    pub fn xai_request_credentials(
         &self,
         profile: &str,
         explicit: Option<SecretRef>,
@@ -409,7 +408,7 @@ impl CredentialStore {
         })
     }
 
-    pub(crate) fn resolve_xai(
+    pub fn resolve_xai(
         &self,
         profile: &str,
         explicit: Option<&SecretRef>,

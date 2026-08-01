@@ -766,33 +766,34 @@ fn tui_config_layers_defaults_global_and_root_to_current_projects() {
 
     let snapshot = tree
         .loader()
-        .load_tui(&tree.path("work/child/deeper"))
+        .load_tui(
+            &tree.path("work/child/deeper"),
+            &tui_defaults(),
+            accept_tui_binding,
+        )
         .unwrap();
 
+    assert_eq!(snapshot.settings().initial_layout(), TuiLayout::FoldFocus);
     assert_eq!(
-        snapshot.settings().initial_layout(),
-        qq_tui::Layout::FoldFocus
-    );
-    assert_eq!(
-        binding_labels(snapshot.settings(), qq_tui::Action::SelectThreadline),
+        binding_labels(snapshot.settings(), TuiAction::SelectThreadline),
         ["F3"]
     );
     assert_eq!(
-        binding_labels(snapshot.settings(), qq_tui::Action::NextLayout),
+        binding_labels(snapshot.settings(), TuiAction::NextLayout),
         ["Ctrl-K"]
     );
     assert_eq!(snapshot.provenance().layout().kind(), SourceKind::Project);
     assert!(
         snapshot
             .provenance()
-            .binding(qq_tui::Action::PreviousLayout)
+            .binding(TuiAction::PreviousLayout)
             .kind()
             == SourceKind::Compiled
     );
     assert!(
         snapshot
             .provenance()
-            .binding(qq_tui::Action::NextLayout)
+            .binding(TuiAction::NextLayout)
             .path()
             .unwrap()
             .ends_with("work/child/.qq/tui.ron")
@@ -800,25 +801,33 @@ fn tui_config_layers_defaults_global_and_root_to_current_projects() {
 }
 
 #[test]
-fn tui_config_rejects_invalid_and_colliding_bindings() {
+fn tui_config_preserves_surface_bindings_for_root_validation() {
     let tree = TempTree::new();
     tree.write(
         "work/.qq/tui.ron",
         r#"(version: 1, bindings: (next_layout: ["n"]))"#,
     );
-    assert!(matches!(
-        tree.loader().load_tui(&tree.path("work")),
-        Err(ConfigError::Parse { .. })
-    ));
+    let snapshot = tree
+        .loader()
+        .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
+        .unwrap();
+    assert_eq!(
+        binding_labels(snapshot.settings(), TuiAction::NextLayout),
+        ["n"]
+    );
 
     tree.write(
         "work/.qq/tui.ron",
         r#"(version: 1, bindings: (select_fold_focus: ["F1"]))"#,
     );
-    assert!(matches!(
-        tree.loader().load_tui(&tree.path("work")),
-        Err(ConfigError::InvalidTuiSettings { .. })
-    ));
+    let snapshot = tree
+        .loader()
+        .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
+        .unwrap();
+    assert_eq!(
+        binding_labels(snapshot.settings(), TuiAction::SelectFoldFocus),
+        ["F1"]
+    );
 }
 
 #[test]
@@ -829,18 +838,42 @@ fn tui_config_allows_disabling_an_action() {
         r#"(version: 1, bindings: (cancel_run: []))"#,
     );
 
-    let snapshot = tree.loader().load_tui(&tree.path("work")).unwrap();
+    let snapshot = tree
+        .loader()
+        .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
+        .unwrap();
 
-    assert!(binding_labels(snapshot.settings(), qq_tui::Action::CancelRun).is_empty());
+    assert!(binding_labels(snapshot.settings(), TuiAction::CancelRun).is_empty());
 }
 
-fn binding_labels(settings: &qq_tui::Settings, action: qq_tui::Action) -> Vec<String> {
+fn binding_labels(settings: &TuiConfigSettings, action: TuiAction) -> Vec<String> {
     settings
         .bindings()
         .iter()
         .find(|(candidate, _)| *candidate == action)
-        .map(|(_, bindings)| bindings.iter().map(ToString::to_string).collect())
+        .map(|(_, bindings)| bindings.clone())
         .unwrap_or_default()
+}
+
+fn accept_tui_binding(_binding: &str) -> Result<(), std::convert::Infallible> {
+    Ok(())
+}
+
+fn tui_defaults() -> TuiConfigDefaults {
+    TuiConfigDefaults::new(
+        TuiLayout::Threadline,
+        [
+            (TuiAction::SelectThreadline, vec!["F1".to_owned()]),
+            (TuiAction::SelectFoldFocus, vec!["F2".to_owned()]),
+            (TuiAction::NextLayout, vec!["Ctrl-N".to_owned()]),
+            (TuiAction::PreviousLayout, vec!["Ctrl-P".to_owned()]),
+            (TuiAction::ToggleNavigator, vec!["Ctrl-T".to_owned()]),
+            (TuiAction::CreateRootSession, vec!["Alt-N".to_owned()]),
+            (TuiAction::CreateChildSession, vec!["Alt-C".to_owned()]),
+            (TuiAction::CancelRun, vec!["Ctrl-X".to_owned()]),
+        ],
+    )
+    .unwrap()
 }
 
 #[test]

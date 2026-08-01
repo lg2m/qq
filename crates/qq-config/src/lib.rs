@@ -1,8 +1,6 @@
 //! Layered application configuration loading and validation.
 
-// The public snapshot API is staged here until the explicitly out-of-scope CLI
-// and provider construction are migrated to consume it.
-#![allow(dead_code)]
+#![forbid(unsafe_code)]
 
 use std::{
     collections::BTreeMap,
@@ -17,11 +15,16 @@ use thiserror::Error;
 mod document;
 mod loader;
 mod managed;
+mod models;
 mod promote;
+mod providers;
 mod remote;
 mod tui;
 
-pub use tui::{TuiConfigSnapshot, TuiSourceReport};
+pub use qq_provider::{SecretLiteral, SecretRef, XAI_CREDENTIAL_ENDPOINT};
+pub use tui::{
+    TuiAction, TuiConfigDefaults, TuiConfigSettings, TuiConfigSnapshot, TuiLayout, TuiSourceReport,
+};
 
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -293,11 +296,21 @@ impl ConfigLoader {
         loader::load(self, request)
     }
 
-    pub fn load_tui(&self, cwd: &Path) -> Result<TuiConfigSnapshot, ConfigError> {
-        tui::load(self, cwd)
+    pub fn load_tui<Validate, ValidationError>(
+        &self,
+        cwd: &Path,
+        defaults: &TuiConfigDefaults,
+        validate_binding: Validate,
+    ) -> Result<TuiConfigSnapshot, ConfigError>
+    where
+        Validate: Fn(&str) -> Result<(), ValidationError>,
+        ValidationError: fmt::Display,
+    {
+        tui::load(self, cwd, defaults, &validate_binding)
     }
 
-    pub(crate) fn session_database_path(&self) -> Result<PathBuf, ConfigError> {
+    /// Resolves the durable session database owned by the configured user data directory.
+    pub fn session_database_path(&self) -> Result<PathBuf, ConfigError> {
         loader::ensure_data_directory(self.paths.data_dir())?;
         Ok(self.paths.data_dir().join("sessions.sqlite3"))
     }
@@ -356,46 +369,6 @@ impl ConfigLoader {
 
 pub fn load(request: &LoadRequest) -> Result<ConfigSnapshot, ConfigError> {
     ConfigLoader::system()?.load(request)
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SecretLiteral(String);
-
-impl SecretLiteral {
-    #[must_use]
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SecretLiteral {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("<redacted>")
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SecretRef {
-    Env(String),
-    Stored(String),
-    Value(SecretLiteral),
-}
-
-impl fmt::Debug for SecretRef {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Env(name) => formatter.debug_tuple("Env").field(name).finish(),
-            Self::Stored(name) => formatter.debug_tuple("Stored").field(name).finish(),
-            Self::Value(_) => formatter.write_str("Value(<redacted>)"),
-        }
-    }
-}
-
-impl SecretRef {
-    fn is_literal(&self) -> bool {
-        matches!(self, Self::Value(_))
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,7 +611,33 @@ pub struct ModelMetadata {
     input: Vec<InputModality>,
     context_window: Option<u32>,
     max_output_tokens: Option<u32>,
-    pricing: Option<qq_protocol::ModelPricing>,
+    pricing: Option<ModelPricing>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricing {
+    pub input_usd_nanos_per_token: u64,
+    pub output_usd_nanos_per_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tier: Option<ModelPricingTier>,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricingTier {
+    pub above_input_tokens: u64,
+    pub input_usd_nanos_per_token: u64,
+    pub output_usd_nanos_per_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_usd_nanos_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_usd_nanos_per_token: Option<u64>,
 }
 
 impl ModelMetadata {
@@ -678,7 +677,7 @@ impl ModelMetadata {
     }
 
     #[must_use]
-    pub const fn pricing(&self) -> Option<&qq_protocol::ModelPricing> {
+    pub const fn pricing(&self) -> Option<&ModelPricing> {
         self.pricing.as_ref()
     }
 
@@ -689,7 +688,7 @@ impl ModelMetadata {
         reasoning: bool,
         context_window: u32,
         max_output_tokens: u32,
-        pricing: Option<qq_protocol::ModelPricing>,
+        pricing: Option<ModelPricing>,
     ) -> Self {
         Self {
             canonical_id: Some(canonical_id.to_owned()),
@@ -753,7 +752,8 @@ pub struct HttpAccess {
 }
 
 impl HttpAccess {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         endpoint: impl Into<String>,
         endpoint_mode: EndpointMode,
         api: ProviderApi,
@@ -828,7 +828,8 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         kind: ProviderKind,
         access: Option<ProviderAccess>,
         usage: UsageType,
@@ -840,18 +841,6 @@ impl ProviderConfig {
             usage,
             models,
         }
-    }
-
-    pub(crate) fn replace(
-        &mut self,
-        kind: ProviderKind,
-        access: Option<ProviderAccess>,
-        usage: UsageType,
-    ) {
-        self.kind = kind;
-        self.access = access;
-        self.usage = usage;
-        self.models.clear();
     }
 
     pub(crate) fn models_mut(&mut self) -> &mut BTreeMap<String, ModelMetadata> {

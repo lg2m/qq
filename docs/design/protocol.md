@@ -7,15 +7,18 @@ clients and a QQ server. It is the contract for the TUI, future remote
 clients, and any automation that talks to `qq serve`.
 
 The protocol is transport-neutral in the `qq-protocol` crate: shared types do
-not depend on an HTTP client or server framework. The root package maps those
-types onto HTTP routes and SSE frames.
+not depend on an HTTP client or server framework. `qq-server` maps those types
+onto HTTP routes and SSE frames, while `qq-client` performs the inverse mapping.
 
 Canonical source of truth for schemas and tags:
 
 - `crates/qq-protocol/src/lib.rs`
 - `crates/qq-protocol/src/sessions.rs`
 - `crates/qq-protocol/src/ids.rs`
-- route wiring in `src/server.rs` and `src/client.rs`
+- shared request and event limits in `crates/qq-protocol/src/limits.rs`
+- local connection capability in `crates/qq-protocol/src/local.rs`
+- route wiring in `crates/qq-server/src/lib.rs`
+- client decoding in `crates/qq-client/src/lib.rs`
 
 Related documents:
 
@@ -90,7 +93,8 @@ real bottleneck.
 
 The server generates a random bearer token at startup and writes it, with the
 bind address and process metadata, to a private per-user file (`server.ron`).
-Clients discover the running instance from that metadata and attach:
+The binary discovers the running instance through `qq-server` and passes a
+redacted `LocalServerConnection` capability to `qq-client`, which attaches with:
 
 ```http
 Authorization: Bearer <token>

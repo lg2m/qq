@@ -3,10 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    config::{
-        AwsAuth, BedrockAuth, EndpointMode, HttpAccess, HttpCredential, ProviderAccess,
-        ProviderApi, ProviderConfig, ProviderKind, UsageType,
-    },
+    AwsAuth, BedrockAuth, EndpointMode, HttpAccess, HttpCredential, ProviderAccess, ProviderApi,
+    ProviderConfig, ProviderKind, UsageType,
     models::{BuiltinCatalog, builtin_models},
 };
 
@@ -17,7 +15,7 @@ pub(crate) const ANTHROPIC_CREDENTIAL_ENDPOINT: &str = "https://api.anthropic.co
 pub(crate) const GOOGLE_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub(crate) const GOOGLE_CREDENTIAL_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
 pub(crate) const XAI_ENDPOINT: &str = "https://api.x.ai/v1";
-pub(crate) const XAI_CREDENTIAL_ENDPOINT: &str = "https://api.x.ai";
+const CODEX_RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 pub(crate) fn builtin(kind: ProviderKind) -> ProviderConfig {
     let (access, usage, catalog) = match kind {
@@ -38,7 +36,7 @@ pub(crate) fn builtin(kind: ProviderKind) -> ProviderConfig {
         ),
         ProviderKind::OpenAiCodex => (
             Some(http(
-                crate::auth::CODEX_RESPONSES_ENDPOINT,
+                CODEX_RESPONSES_ENDPOINT,
                 EndpointMode::Exact,
                 ProviderApi::OpenAiResponses,
                 HttpCredential::OpenAiCodex { profile: None },

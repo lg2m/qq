@@ -3,23 +3,22 @@
 use std::{
     error::Error,
     io::{self, IsTerminal, Read},
+    path::Path,
     process::ExitCode,
     sync::Arc,
 };
 
+use qq_auth as auth;
+use qq_client as client;
+use qq_config as config;
 use qq_protocol::{RunCommand, RunEvent};
+use qq_server as server;
 
-mod auth;
 mod catalog;
 mod cli;
-mod client;
-mod config;
 mod mcp;
-mod models;
 mod output;
-mod providers;
 mod runtime;
-mod server;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -110,7 +109,7 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     let config_factory = factory.clone();
     let (snapshot, tui, models) = tokio::task::spawn_blocking(move || {
         let snapshot = config_factory.load(&request)?;
-        let tui = config::ConfigLoader::system()?.load_tui(request.cwd())?;
+        let (_, tui) = load_tui_config(&config::ConfigLoader::system()?, request.cwd())?;
         let models = config_factory.configured_model_options(&snapshot);
         Ok::<_, runtime::RuntimeBuildError>((snapshot, tui, models))
     })
@@ -120,7 +119,7 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         .map(Into::into)
         .collect::<Vec<qq_tui::ModelOption>>();
     let mut embedded = None;
-    let (connection, create_initial_session) = if let Some(connection) = client::discover().await? {
+    let (connection, create_initial_session) = if let Some(connection) = server::discover().await? {
         (connection, false)
     } else {
         let handler = Arc::new(runtime::RuntimeHandler::open(factory).await?);
@@ -150,11 +149,12 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         configured_model,
         model.clone(),
         create_initial_session,
+        || async { server::discover().await.ok().flatten() },
     )?;
     let result = qq_tui::run(
         tui_client,
         qq_tui::TuiOptions {
-            settings: tui.settings().clone(),
+            settings: tui,
             model: model.unwrap_or_default(),
             models,
         },
@@ -216,26 +216,28 @@ fn config_command(
                 }
                 Err(error) => return Err(error.into()),
             }
-            print_tui_sources(loader.load_tui(request.cwd())?.source_reports());
+            let (tui, _) = load_tui_config(&loader, request.cwd())?;
+            print_tui_sources(tui.source_reports());
         }
         cli::ConfigCommand::Check => {
             let request = overrides.load_request()?;
             loader.load(&request)?;
-            loader.load_tui(request.cwd())?;
+            load_tui_config(&loader, request.cwd())?;
             println!("configuration is valid");
         }
         cli::ConfigCommand::Show => {
             let request = overrides.load_request()?;
             let snapshot = loader.load(&request)?;
             print_snapshot(&snapshot);
-            print_tui_snapshot(&loader.load_tui(request.cwd())?);
+            let (_, settings) = load_tui_config(&loader, request.cwd())?;
+            print_tui_snapshot(&settings);
         }
         cli::ConfigCommand::Explain { field } => {
             let request = overrides.load_request()?;
             let source = if field == "tui.layout" {
                 Some(
-                    loader
-                        .load_tui(request.cwd())?
+                    load_tui_config(&loader, request.cwd())?
+                        .0
                         .provenance()
                         .layout()
                         .clone(),
@@ -245,8 +247,8 @@ fn config_command(
                 .and_then(parse_tui_action)
             {
                 Some(
-                    loader
-                        .load_tui(request.cwd())?
+                    load_tui_config(&loader, request.cwd())?
+                        .0
                         .provenance()
                         .binding(action)
                         .clone(),
@@ -340,27 +342,108 @@ fn join_or_none(values: &[String]) -> String {
     }
 }
 
-fn print_tui_snapshot(snapshot: &config::TuiConfigSnapshot) {
-    println!("tui:");
-    println!("  layout: {:?}", snapshot.settings().initial_layout());
-    println!("  bindings:");
+fn load_tui_config(
+    loader: &config::ConfigLoader,
+    cwd: &Path,
+) -> Result<(config::TuiConfigSnapshot, qq_tui::Settings), config::ConfigError> {
+    let defaults = qq_tui::Settings::default();
+    let defaults = config::TuiConfigDefaults::new(
+        config_layout(defaults.initial_layout()),
+        defaults.bindings().iter().map(|(action, bindings)| {
+            (
+                config_action(*action),
+                bindings.iter().map(ToString::to_string).collect(),
+            )
+        }),
+    )?;
+    let snapshot = loader.load_tui(cwd, &defaults, |binding| {
+        binding.parse::<qq_tui::KeyChord>().map(|_| ())
+    })?;
+    let mut builder = qq_tui::SettingsBuilder::default()
+        .initial_layout(tui_layout(snapshot.settings().initial_layout()));
     for (action, bindings) in snapshot.settings().bindings() {
+        let bindings = bindings
+            .iter()
+            .map(|binding| {
+                binding
+                    .parse::<qq_tui::KeyChord>()
+                    .map_err(|error| config::ConfigError::Parse {
+                        origin: snapshot.provenance().binding(*action).clone(),
+                        message: error.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        builder = builder.bindings(tui_action(*action), bindings);
+    }
+    let settings = builder
+        .build()
+        .map_err(|error| config::ConfigError::InvalidTuiSettings {
+            message: error.to_string(),
+        })?;
+    Ok((snapshot, settings))
+}
+
+fn print_tui_snapshot(settings: &qq_tui::Settings) {
+    println!("tui:");
+    println!("  layout: {:?}", settings.initial_layout());
+    println!("  bindings:");
+    for (action, bindings) in settings.bindings() {
         let labels: Vec<_> = bindings.iter().map(ToString::to_string).collect();
         println!("    {}: {}", tui_action_name(*action), labels.join(", "));
     }
 }
 
-fn parse_tui_action(value: &str) -> Option<qq_tui::Action> {
+fn parse_tui_action(value: &str) -> Option<config::TuiAction> {
     match value {
-        "select_threadline" => Some(qq_tui::Action::SelectThreadline),
-        "select_fold_focus" => Some(qq_tui::Action::SelectFoldFocus),
-        "next_layout" => Some(qq_tui::Action::NextLayout),
-        "previous_layout" => Some(qq_tui::Action::PreviousLayout),
-        "toggle_navigator" => Some(qq_tui::Action::ToggleNavigator),
-        "create_root_session" => Some(qq_tui::Action::CreateRootSession),
-        "create_child_session" => Some(qq_tui::Action::CreateChildSession),
-        "cancel_run" => Some(qq_tui::Action::CancelRun),
+        "select_threadline" => Some(config::TuiAction::SelectThreadline),
+        "select_fold_focus" => Some(config::TuiAction::SelectFoldFocus),
+        "next_layout" => Some(config::TuiAction::NextLayout),
+        "previous_layout" => Some(config::TuiAction::PreviousLayout),
+        "toggle_navigator" => Some(config::TuiAction::ToggleNavigator),
+        "create_root_session" => Some(config::TuiAction::CreateRootSession),
+        "create_child_session" => Some(config::TuiAction::CreateChildSession),
+        "cancel_run" => Some(config::TuiAction::CancelRun),
         _ => None,
+    }
+}
+
+fn config_layout(layout: qq_tui::Layout) -> config::TuiLayout {
+    match layout {
+        qq_tui::Layout::Threadline => config::TuiLayout::Threadline,
+        qq_tui::Layout::FoldFocus => config::TuiLayout::FoldFocus,
+    }
+}
+
+fn tui_layout(layout: config::TuiLayout) -> qq_tui::Layout {
+    match layout {
+        config::TuiLayout::Threadline => qq_tui::Layout::Threadline,
+        config::TuiLayout::FoldFocus => qq_tui::Layout::FoldFocus,
+    }
+}
+
+fn config_action(action: qq_tui::Action) -> config::TuiAction {
+    match action {
+        qq_tui::Action::SelectThreadline => config::TuiAction::SelectThreadline,
+        qq_tui::Action::SelectFoldFocus => config::TuiAction::SelectFoldFocus,
+        qq_tui::Action::NextLayout => config::TuiAction::NextLayout,
+        qq_tui::Action::PreviousLayout => config::TuiAction::PreviousLayout,
+        qq_tui::Action::ToggleNavigator => config::TuiAction::ToggleNavigator,
+        qq_tui::Action::CreateRootSession => config::TuiAction::CreateRootSession,
+        qq_tui::Action::CreateChildSession => config::TuiAction::CreateChildSession,
+        qq_tui::Action::CancelRun => config::TuiAction::CancelRun,
+    }
+}
+
+fn tui_action(action: config::TuiAction) -> qq_tui::Action {
+    match action {
+        config::TuiAction::SelectThreadline => qq_tui::Action::SelectThreadline,
+        config::TuiAction::SelectFoldFocus => qq_tui::Action::SelectFoldFocus,
+        config::TuiAction::NextLayout => qq_tui::Action::NextLayout,
+        config::TuiAction::PreviousLayout => qq_tui::Action::PreviousLayout,
+        config::TuiAction::ToggleNavigator => qq_tui::Action::ToggleNavigator,
+        config::TuiAction::CreateRootSession => qq_tui::Action::CreateRootSession,
+        config::TuiAction::CreateChildSession => qq_tui::Action::CreateChildSession,
+        config::TuiAction::CancelRun => qq_tui::Action::CancelRun,
     }
 }
 
@@ -577,5 +660,60 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn root_tui_adapter_preserves_binding_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global");
+        let data = directory.path().join("data");
+        let managed = directory.path().join("managed");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".qq")).unwrap();
+        let loader = config::ConfigLoader::new(config::ConfigPaths::new(global, data, managed));
+        let path = workspace.join(".qq/tui.ron");
+
+        std::fs::write(&path, r#"(version: 1, bindings: (next_layout: ["n"]))"#).unwrap();
+        assert!(matches!(
+            load_tui_config(&loader, &workspace),
+            Err(config::ConfigError::Parse { .. })
+        ));
+
+        std::fs::write(
+            path,
+            r#"(version: 1, bindings: (select_fold_focus: ["F1"]))"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_tui_config(&loader, &workspace),
+            Err(config::ConfigError::InvalidTuiSettings { .. })
+        ));
+    }
+
+    #[test]
+    fn root_tui_adapter_rejects_an_invalid_overridden_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global");
+        let data = directory.path().join("data");
+        let managed = directory.path().join("managed");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(workspace.join(".qq")).unwrap();
+        std::fs::write(
+            global.join("tui.ron"),
+            r#"(version: 1, bindings: (next_layout: ["n"]))"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(".qq/tui.ron"),
+            r#"(version: 1, bindings: (next_layout: ["Ctrl-N"]))"#,
+        )
+        .unwrap();
+        let loader = config::ConfigLoader::new(config::ConfigPaths::new(global, data, managed));
+
+        assert!(matches!(
+            load_tui_config(&loader, &workspace),
+            Err(config::ConfigError::Parse { .. })
+        ));
     }
 }

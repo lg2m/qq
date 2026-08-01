@@ -1,6 +1,6 @@
 //! Credential storage and secret resolution.
 
-#![allow(dead_code)]
+#![forbid(unsafe_code)]
 
 use std::{
     collections::BTreeSet,
@@ -19,16 +19,17 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::config::SecretRef;
+use qq_provider::SecretRef;
 
 mod codex;
 mod xai;
 
-pub(crate) use codex::{CodexLogin, RESPONSES_ENDPOINT as CODEX_RESPONSES_ENDPOINT};
-pub(crate) use xai::XaiLogin;
+pub use codex::CodexLogin;
+pub use xai::XaiLogin;
 
 pub const KEYRING_SERVICE: &str = "dev.qq";
 pub const MAX_CREDENTIAL_NAME_LEN: usize = 128;
@@ -45,6 +46,7 @@ const LOCK_FILE_NAME: &str = "auth.lock";
 const CODEX_LOCK_FILE_NAME: &str = "openai-codex.lock";
 const XAI_LOCK_FILE_NAME: &str = "xai.lock";
 const WINDOWS_CREDENTIAL_DIRECTORY_NAME: &str = "windows-credentials";
+#[cfg(windows)]
 const WINDOWS_PROTECTED_MAGIC: &[u8] = b"QQDPAPI\x01";
 const REQUEST_CREDENTIAL_CONCURRENCY: usize = 4;
 const REQUEST_CREDENTIAL_CAPACITY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -240,13 +242,17 @@ pub enum AuthError {
         name: String,
     },
 
-    #[error("Windows credential protection is unavailable while attempting to {operation} credential `{name}`")]
+    #[error(
+        "Windows credential protection is unavailable while attempting to {operation} credential `{name}`"
+    )]
     WindowsProtectionUnavailable {
         operation: &'static str,
         name: String,
     },
 
-    #[error("Windows credential protection failed while attempting to {operation} credential `{name}`")]
+    #[error(
+        "Windows credential protection failed while attempting to {operation} credential `{name}`"
+    )]
     WindowsProtectionFailure {
         operation: &'static str,
         name: String,
@@ -582,7 +588,8 @@ impl CredentialStore {
         Ok(true)
     }
 
-    pub(crate) fn with_backend(paths: CredentialPaths, keyring: Arc<dyn KeyringBackend>) -> Self {
+    #[doc(hidden)]
+    pub fn with_backend(paths: CredentialPaths, keyring: Arc<dyn KeyringBackend>) -> Self {
         let windows_protected = Arc::new(SystemWindowsProtected::new(paths.clone()));
         Self::with_backends(paths, keyring, windows_protected)
     }
@@ -656,20 +663,20 @@ impl CredentialStore {
         }
 
         match record.backend {
-            CredentialBackend::Keyring => {
-                match self.keyring.set(name, secret) {
-                    Ok(()) => {}
-                    Err(KeyringError::TooLarge) => {
-                        return self.set_windows_protected(
-                            &mut index,
-                            Some(&record),
-                            name,
-                            secret,
-                            Some(kind),
-                            Some(endpoint),
-                        );
-                    }
-                    Err(error) => return Err(match error {
+            CredentialBackend::Keyring => match self.keyring.set(name, secret) {
+                Ok(()) => {}
+                Err(KeyringError::TooLarge) => {
+                    return self.set_windows_protected(
+                        &mut index,
+                        Some(&record),
+                        name,
+                        secret,
+                        Some(kind),
+                        Some(endpoint),
+                    );
+                }
+                Err(error) => {
+                    return Err(match error {
                         KeyringError::Unavailable => AuthError::KeyringUnavailable {
                             operation: "refresh",
                             name: name.to_owned(),
@@ -680,9 +687,9 @@ impl CredentialStore {
                                 name: name.to_owned(),
                             }
                         }
-                    }),
+                    });
                 }
-            }
+            },
             CredentialBackend::File => {
                 let mut fallback = self.load_fallback()?;
                 if !fallback.contains(name) {
@@ -775,16 +782,17 @@ impl CredentialStore {
                         backend: CredentialBackend::File,
                     })?
             }
-            CredentialBackend::WindowsProtectedFile => self
-                .windows_protected
-                .get(name)
-                .map_err(|error| match error {
-                    WindowsProtectedError::Missing => AuthError::StoredCredentialMissing {
-                        name: name.to_owned(),
-                        backend: CredentialBackend::WindowsProtectedFile,
-                    },
-                    other => windows_protected_auth_error(other, "read", name),
-                })?,
+            CredentialBackend::WindowsProtectedFile => {
+                self.windows_protected
+                    .get(name)
+                    .map_err(|error| match error {
+                        WindowsProtectedError::Missing => AuthError::StoredCredentialMissing {
+                            name: name.to_owned(),
+                            backend: CredentialBackend::WindowsProtectedFile,
+                        },
+                        other => windows_protected_auth_error(other, "read", name),
+                    })?
+            }
         };
         Ok(Secret::from_secret_bytes(bytes))
     }
@@ -859,13 +867,12 @@ impl CredentialStore {
             ),
             _ => None,
         };
-        let old_fallback = if old_record
-            .is_some_and(|record| record.backend == CredentialBackend::File)
-        {
-            Some(self.load_fallback()?)
-        } else {
-            None
-        };
+        let old_fallback =
+            if old_record.is_some_and(|record| record.backend == CredentialBackend::File) {
+                Some(self.load_fallback()?)
+            } else {
+                None
+            };
 
         self.windows_protected
             .set(name, secret)
@@ -1738,13 +1745,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         validate_regular_metadata(path, &metadata)?;
     }
-    let mut file = atomic_write_file::AtomicWriteFile::open(path).map_err(|source| {
-        AuthError::Io {
+    let mut file =
+        atomic_write_file::AtomicWriteFile::open(path).map_err(|source| AuthError::Io {
             operation: "create temporary replacement for",
             path: path.to_owned(),
             source,
-        }
-    })?;
+        })?;
     file.write_all(bytes).map_err(|source| AuthError::Io {
         operation: "write temporary replacement for",
         path: path.to_owned(),
@@ -1918,20 +1924,29 @@ struct CodexStateLock<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KeyringError {
+#[doc(hidden)]
+pub enum KeyringError {
     Unavailable,
     Missing,
     TooLarge,
     Failure,
 }
 
-pub(crate) trait KeyringBackend: Send + Sync {
+#[doc(hidden)]
+pub trait KeyringBackend: Send + Sync {
     fn get(&self, name: &str) -> Result<Vec<u8>, KeyringError>;
     fn set(&self, name: &str, secret: &[u8]) -> Result<(), KeyringError>;
     fn remove(&self, name: &str) -> Result<(), KeyringError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(test, windows)),
+    allow(
+        dead_code,
+        reason = "non-Windows production builds only construct the unavailable backend error"
+    )
+)]
 pub(crate) enum WindowsProtectedError {
     Unavailable,
     Missing,
@@ -1964,14 +1979,21 @@ fn windows_protected_auth_error(
 }
 
 struct SystemWindowsProtected {
+    #[cfg(windows)]
     paths: CredentialPaths,
 }
 
 impl SystemWindowsProtected {
     fn new(paths: CredentialPaths) -> Self {
-        Self { paths }
+        #[cfg(not(windows))]
+        let _ = paths;
+        Self {
+            #[cfg(windows)]
+            paths,
+        }
     }
 
+    #[cfg(windows)]
     fn path(&self, name: &str) -> PathBuf {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -2002,12 +2024,9 @@ impl WindowsProtectedBackend for SystemWindowsProtected {
             return Err(WindowsProtectedError::Failure);
         }
         let entropy = windows_protected_entropy(name);
-        let encrypted = windows_dpapi::encrypt_data(
-            secret,
-            windows_dpapi::Scope::User,
-            Some(&entropy),
-        )
-        .map_err(|_| WindowsProtectedError::Failure)?;
+        let encrypted =
+            windows_dpapi::encrypt_data(secret, windows_dpapi::Scope::User, Some(&entropy))
+                .map_err(|_| WindowsProtectedError::Failure)?;
         let mut bytes = Vec::with_capacity(WINDOWS_PROTECTED_MAGIC.len() + encrypted.len());
         bytes.extend_from_slice(WINDOWS_PROTECTED_MAGIC);
         bytes.extend_from_slice(&encrypted);
@@ -2085,5 +2104,4 @@ fn classify_keyring_error(error: keyring::Error) -> KeyringError {
 }
 
 #[cfg(test)]
-#[path = "auth/tests.rs"]
 mod tests;

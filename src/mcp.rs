@@ -12,15 +12,13 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
+use qq_auth::CredentialStore;
+use qq_config::{ConfigSnapshot, McpServerConfig, McpTransport};
 use qq_core::{McpCallFuture, McpRegistry, McpSpecsFuture};
 use qq_mcp::{McpManager, McpServerSettings, McpTransportSettings};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    auth::CredentialStore,
-    config::{ConfigSnapshot, McpServerConfig, McpTransport},
-    runtime::RuntimeBuildError,
-};
+use crate::runtime::RuntimeBuildError;
 
 const MAX_CACHED_REGISTRIES: usize = 8;
 

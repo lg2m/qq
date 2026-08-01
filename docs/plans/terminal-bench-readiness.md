@@ -5,7 +5,7 @@ Status: proposed.
 This plan turns QQ into a trustworthy autonomous terminal harness before
 optimizing it against Terminal-Bench. It covers the failures found in the
 session, context, streaming, headless, tool, provider, and sub-agent paths
-without changing the existing crate graph or creating a second agent runtime.
+without adding further crates or creating a second agent runtime.
 
 The public benchmark is an evaluation target, not the product architecture.
 Every improvement in this plan must also make ordinary local, server, and
@@ -92,14 +92,21 @@ Existing plans remain authoritative for their narrower scopes:
 Do not add storage, benchmark, terminal, telemetry, or agent-framework crates.
 The existing crates already have the correct ownership:
 
-- The root package remains the composition root and owns CLI modes,
-  configuration resolution, the server adapter, and benchmark integration.
+- The root package remains the composition root and owns CLI modes, translation
+  between config and runtime settings, server lifecycle, and benchmark
+  integration.
+- `qq-config` owns layered configuration and built-in provider/model presets.
+- `qq-auth` owns provider OAuth, credential storage, and secret resolution.
 - `qq-core` owns the agent loop, session semantics, context assembly, tools,
   persistence, cancellation, and scheduling.
 - `qq-provider` owns provider-neutral generation inputs and concrete protocol,
   authentication, transport, framing, retry, and prompt-cache behavior.
 - `qq-protocol` owns versioned externally visible commands, events, snapshots,
   identifiers, and run metadata.
+- `qq-server` owns HTTP/SSE route wiring, local-instance metadata, and bearer
+  authentication.
+- `qq-client` owns authenticated HTTP/SSE requests, bounded decoding,
+  reconnect, and replay.
 - `qq-tui` projects protocol state and renders it; it does not acquire runtime
   responsibilities.
 - `xtask` owns repository evaluation automation and generated-result handling.

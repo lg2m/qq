@@ -2,9 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use qq_protocol::{ModelPricing, ModelPricingTier};
-
-use crate::config::{ModelMetadata, ProviderApi};
+use crate::{ModelMetadata, ModelPricing, ModelPricingTier, ProviderApi};
 
 const PROVENANCE: &str = "models.dev/api.json@2026-07-22";
 const OPENAI_API: u16 = 1 << 0;

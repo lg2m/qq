@@ -6,6 +6,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use qq_auth::{AuthError, CredentialStore, Secret, resolve_provider_credential};
+use qq_config::{
+    AwsAuth, BedrockAuth, ConfigError, ConfigLoader, ConfigSnapshot, EndpointMode, HttpAccess,
+    HttpCredential, LoadRequest, PromotionOutcome, ProviderAccess, ProviderApi, ProviderAuth,
+    ProviderConfig, WorkspaceGrant,
+};
 use qq_core::{
     GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, Runtime, RuntimeConfigError,
     RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
@@ -20,20 +26,11 @@ use qq_provider::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderError,
     ProviderRecipe, bedrock::BedrockAuth as ProviderBedrockAuth,
 };
+use qq_server::{AskHandler, AskHandlerError, CommandFuture, ModelsFuture, SnapshotFuture};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{
-    auth::{AuthError, CredentialStore, Secret, resolve_provider_credential},
-    catalog::{DiscoveredModel, ModelDiscovery},
-    config::{
-        AwsAuth, BedrockAuth, ConfigError, ConfigLoader, ConfigSnapshot, EndpointMode, HttpAccess,
-        HttpCredential, LoadRequest, PromotionOutcome, ProviderAccess, ProviderApi, ProviderAuth,
-        ProviderConfig, WorkspaceGrant,
-    },
-    providers,
-    server::{AskHandler, AskHandlerError, CommandFuture, ModelsFuture, SnapshotFuture},
-};
+use crate::catalog::{DiscoveredModel, ModelDiscovery};
 
 const MAX_CACHED_RUNTIMES: usize = 16;
 const MAX_MODEL_OPTIONS: usize = 4_096;
@@ -258,7 +255,7 @@ impl RuntimeFactory {
                     .inner
                     .credentials
                     .resolve_with_endpoint(
-                        &crate::config::SecretRef::Stored(format!(
+                        &qq_config::SecretRef::Stored(format!(
                             "openai-codex/{}",
                             profile.as_deref().unwrap_or("default")
                         )),
@@ -273,7 +270,7 @@ impl RuntimeFactory {
                         api_key.as_ref(),
                         &stored,
                         "XAI_API_KEY",
-                        Some(providers::XAI_CREDENTIAL_ENDPOINT),
+                        Some(qq_config::XAI_CREDENTIAL_ENDPOINT),
                     )
                     .is_ok()
                 }
@@ -444,7 +441,7 @@ impl RuntimeFactory {
                     Some(reference) => {
                         ResolvedAuth::Bearer(self.inner.credentials.resolve_with_endpoint(
                             reference,
-                            Some(providers::XAI_CREDENTIAL_ENDPOINT),
+                            Some(qq_config::XAI_CREDENTIAL_ENDPOINT),
                         )?)
                     }
                     None => ResolvedAuth::NoAuth,
@@ -774,7 +771,8 @@ impl RuntimeLoader for RuntimeFactory {
                     .get(snapshot.model().provider())
                     .and_then(|provider| provider.models().get(snapshot.model().model()))
                     .and_then(|metadata| metadata.pricing())
-                    .cloned();
+                    .cloned()
+                    .map(protocol_model_pricing);
                 let spawn_model_routes = factory
                     .configured_model_options(&snapshot)
                     .into_iter()
@@ -1054,6 +1052,25 @@ pub enum RuntimeHandlerError {
     Sessions(#[from] SessionRuntimeError),
 }
 
+fn protocol_model_pricing(pricing: qq_config::ModelPricing) -> qq_protocol::ModelPricing {
+    qq_protocol::ModelPricing {
+        input_usd_nanos_per_token: pricing.input_usd_nanos_per_token,
+        output_usd_nanos_per_token: pricing.output_usd_nanos_per_token,
+        cache_read_usd_nanos_per_token: pricing.cache_read_usd_nanos_per_token,
+        cache_write_usd_nanos_per_token: pricing.cache_write_usd_nanos_per_token,
+        context_tier: pricing
+            .context_tier
+            .map(|tier| qq_protocol::ModelPricingTier {
+                above_input_tokens: tier.above_input_tokens,
+                input_usd_nanos_per_token: tier.input_usd_nanos_per_token,
+                output_usd_nanos_per_token: tier.output_usd_nanos_per_token,
+                cache_read_usd_nanos_per_token: tier.cache_read_usd_nanos_per_token,
+                cache_write_usd_nanos_per_token: tier.cache_write_usd_nanos_per_token,
+            }),
+        provenance: pricing.provenance,
+    }
+}
+
 fn provider_api_name(api: ProviderApi) -> &'static str {
     match api {
         ProviderApi::OpenAiResponses => "openai_responses",
@@ -1201,11 +1218,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        auth::{CredentialPaths, KeyringBackend, KeyringError},
-        config::{ConfigPaths, RuntimeOverrides},
-    };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use qq_auth::{CredentialPaths, KeyringBackend, KeyringError};
+    use qq_config::{ConfigPaths, RuntimeOverrides};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1301,6 +1316,42 @@ mod tests {
         let fixture = RuntimeFixture::new();
 
         drop(fixture.factory());
+    }
+
+    #[test]
+    fn protocol_pricing_adapter_preserves_every_field() {
+        let pricing = qq_config::ModelPricing {
+            input_usd_nanos_per_token: 1,
+            output_usd_nanos_per_token: 2,
+            cache_read_usd_nanos_per_token: Some(3),
+            cache_write_usd_nanos_per_token: Some(4),
+            context_tier: Some(qq_config::ModelPricingTier {
+                above_input_tokens: 5,
+                input_usd_nanos_per_token: 6,
+                output_usd_nanos_per_token: 7,
+                cache_read_usd_nanos_per_token: Some(8),
+                cache_write_usd_nanos_per_token: Some(9),
+            }),
+            provenance: "test catalog".to_owned(),
+        };
+
+        assert_eq!(
+            protocol_model_pricing(pricing),
+            qq_protocol::ModelPricing {
+                input_usd_nanos_per_token: 1,
+                output_usd_nanos_per_token: 2,
+                cache_read_usd_nanos_per_token: Some(3),
+                cache_write_usd_nanos_per_token: Some(4),
+                context_tier: Some(qq_protocol::ModelPricingTier {
+                    above_input_tokens: 5,
+                    input_usd_nanos_per_token: 6,
+                    output_usd_nanos_per_token: 7,
+                    cache_read_usd_nanos_per_token: Some(8),
+                    cache_write_usd_nanos_per_token: Some(9),
+                }),
+                provenance: "test catalog".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]

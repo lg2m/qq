@@ -3,12 +3,11 @@
 #![forbid(unsafe_code)]
 
 mod app;
-mod client;
 mod composer;
 mod settings;
 mod terminal;
 mod view;
 
 pub use app::{ModelOption, TuiError, TuiOptions, run};
-pub use client::{ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState};
+pub use qq_client::{ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState};
 pub use settings::{Action, KeyChord, Layout, Settings, SettingsBuilder, SettingsError};
