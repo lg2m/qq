@@ -896,10 +896,7 @@ mod tests {
             request.request_line(),
             Some("POST /models/gemini-test:streamGenerateContent?alt=sse HTTP/1.1")
         );
-        assert_eq!(
-            request.header("x-goog-api-key"),
-            Some("google-test-secret")
-        );
+        assert_eq!(request.header("x-goog-api-key"), Some("google-test-secret"));
         assert_eq!(
             request.json_body(),
             serde_json::json!({
