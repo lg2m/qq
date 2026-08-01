@@ -1,9 +1,6 @@
 //! Authenticated, single-instance HTTP and SSE server adapter.
 
-#![allow(
-    dead_code,
-    reason = "root lifecycle composition is intentionally outside this adapter-only change"
-)]
+#![forbid(unsafe_code)]
 
 use std::{
     convert::Infallible,
@@ -32,9 +29,11 @@ use directories::ProjectDirs;
 use futures_util::StreamExt;
 use qq_core::{RunStream, SessionEventStream};
 use qq_protocol::{
-    AskRequest, CommandReceipt, CommandRequest, ModelCatalogRequest, ModelDescriptor,
-    PROTOCOL_VERSION, ServerInfo, SessionCommand, SnapshotRequest, SubscribeRequest, WorkspaceId,
-    WorkspaceSnapshot,
+    AskRequest, CommandReceipt, CommandRequest, LocalConnectionError, LocalServerConnection,
+    MAX_EVENT_BYTES, MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES,
+    MAX_WORKSPACE_BYTES, ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION, ServerInfo,
+    SessionCommand, SnapshotRequest, SubscribeRequest, WorkspaceId, WorkspaceSnapshot,
+    validate_ask_request,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,18 +48,13 @@ const METADATA_FILE_NAME: &str = "server.ron";
 const LOCK_FILE_NAME: &str = "server.lock";
 const DEFAULT_BIND_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const MAX_METADATA_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_PROMPT_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_WORKSPACE_BYTES: usize = 4096;
-pub(crate) const MAX_MODEL_BYTES: usize = 512;
-pub(crate) const MAX_ORGANIZATION_BYTES: usize = 512;
-pub(crate) const SESSION_ID_HEX_BYTES: usize = 32;
-pub(crate) const MAX_EVENT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_HEALTH_BYTES: usize = 16 * 1024;
 const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_RETRIES: usize = 8;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(25);
+const DISCOVERY_RETRIES: usize = 3;
+const DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 const TOKEN_BYTES: usize = 32;
 const TOKEN_HEX_BYTES: usize = TOKEN_BYTES * 2;
 const MAX_CONCURRENT_SESSION_REQUESTS: usize = 64;
@@ -208,103 +202,19 @@ impl ServerOptions {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct BearerToken(String);
+pub type ServerConnection = LocalServerConnection;
 
-impl BearerToken {
-    fn generate() -> Result<Self, ServerError> {
-        let mut random = [0_u8; TOKEN_BYTES];
-        getrandom::fill(&mut random).map_err(|_| ServerError::RandomnessUnavailable)?;
+fn generate_bearer_token() -> Result<String, ServerError> {
+    let mut random = [0_u8; TOKEN_BYTES];
+    getrandom::fill(&mut random).map_err(|_| ServerError::RandomnessUnavailable)?;
 
-        let mut encoded = String::with_capacity(TOKEN_HEX_BYTES);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in random {
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        Ok(Self(encoded))
+    let mut encoded = String::with_capacity(TOKEN_HEX_BYTES);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in random {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-
-    fn parse(encoded: String) -> Result<Self, ServerError> {
-        if encoded.len() != TOKEN_HEX_BYTES
-            || !encoded
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            return Err(ServerError::MetadataCorrupt);
-        }
-        Ok(Self(encoded))
-    }
-
-    fn expose(&self) -> &str {
-        &self.0
-    }
-
-    fn matches(&self, candidate: &[u8]) -> bool {
-        constant_time_eq(candidate, self.0.as_bytes())
-    }
-}
-
-impl fmt::Debug for BearerToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("BearerToken([REDACTED])")
-    }
-}
-
-impl fmt::Display for BearerToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("[REDACTED]")
-    }
-}
-
-/// Authenticated coordinates for a running local server.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ServerConnection {
-    address: SocketAddr,
-    token: BearerToken,
-    server_info: ServerInfo,
-}
-
-impl ServerConnection {
-    #[must_use]
-    pub fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    #[must_use]
-    pub fn server_info(&self) -> &ServerInfo {
-        &self.server_info
-    }
-
-    pub(crate) fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request.bearer_auth(self.token.expose())
-    }
-
-    pub(crate) fn endpoint(&self, path: &str) -> String {
-        format!("http://{}{}", self.address, path)
-    }
-}
-
-impl fmt::Debug for ServerConnection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ServerConnection")
-            .field("address", &self.address)
-            .field("token", &self.token)
-            .field("server_info", &self.server_info)
-            .finish()
-    }
-}
-
-impl fmt::Display for ServerConnection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} (pid {}, protocol {}, token {})",
-            self.address, self.server_info.pid, self.server_info.protocol_version, self.token
-        )
-    }
+    Ok(encoded)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -322,11 +232,11 @@ impl MetadataFile {
     fn new(connection: &ServerConnection) -> Self {
         Self {
             format_version: METADATA_FORMAT_VERSION,
-            address: connection.address.to_string(),
-            pid: connection.server_info.pid,
-            protocol_version: connection.server_info.protocol_version,
-            version: connection.server_info.version.clone(),
-            token: connection.token.expose().to_owned(),
+            address: connection.address().to_string(),
+            pid: connection.server_info().pid,
+            protocol_version: connection.server_info().protocol_version,
+            version: connection.server_info().version.clone(),
+            token: connection.expose_bearer_token().to_owned(),
         }
     }
 
@@ -354,24 +264,28 @@ impl MetadataFile {
             return Err(ServerError::MetadataCorrupt);
         }
 
-        Ok(ServerConnection {
+        LocalServerConnection::new(
             address,
-            token: BearerToken::parse(self.token)?,
-            server_info: ServerInfo {
+            self.token,
+            ServerInfo {
                 protocol_version: self.protocol_version,
                 version: self.version,
                 pid: self.pid,
             },
-        })
+        )
+        .map_err(map_connection_error)
     }
 
     fn belongs_to(&self, connection: &ServerConnection) -> bool {
         self.format_version == METADATA_FORMAT_VERSION
-            && self.address == connection.address.to_string()
-            && self.pid == connection.server_info.pid
-            && self.protocol_version == connection.server_info.protocol_version
-            && self.version == connection.server_info.version
-            && constant_time_eq(self.token.as_bytes(), connection.token.expose().as_bytes())
+            && self.address == connection.address().to_string()
+            && self.pid == connection.server_info().pid
+            && self.protocol_version == connection.server_info().protocol_version
+            && self.version == connection.server_info().version
+            && constant_time_eq(
+                self.token.as_bytes(),
+                connection.expose_bearer_token().as_bytes(),
+            )
     }
 }
 
@@ -497,15 +411,16 @@ pub async fn start(
         address: options.bind_address,
         source,
     })?;
-    let connection = ServerConnection {
+    let connection = ServerConnection::new(
         address,
-        token: BearerToken::generate()?,
-        server_info: ServerInfo {
+        generate_bearer_token()?,
+        ServerInfo {
             protocol_version: PROTOCOL_VERSION,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
         },
-    };
+    )
+    .map_err(map_connection_error)?;
     let metadata = MetadataFile::new(&connection);
     write_metadata_atomically(&options.paths, &metadata)?;
 
@@ -580,25 +495,29 @@ async fn authenticate(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !authorized(request.headers(), &state.connection.token) {
+    if !authorized(request.headers(), &state.connection) {
         return api_error(StatusCode::UNAUTHORIZED, "authentication required");
     }
     next.run(request).await
 }
 
-fn authorized(headers: &HeaderMap, token: &BearerToken) -> bool {
+fn authorized(headers: &HeaderMap, connection: &ServerConnection) -> bool {
     let candidate = headers
         .get(AUTHORIZATION)
         .map(|value| value.as_bytes())
         .and_then(|value| value.strip_prefix(b"Bearer "))
         .unwrap_or_default();
-    token.matches(candidate)
+    connection.matches_bearer_token(candidate)
 }
 
 async fn health(State(state): State<AppState>) -> Json<ServerInfo> {
-    Json(state.connection.server_info.clone())
+    Json(state.connection.server_info().clone())
 }
 
+#[allow(
+    dead_code,
+    reason = "the behavior-neutral extraction keeps the legacy one-shot handler unmounted"
+)]
 async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Response {
     let body = match body {
         Ok(body) => body,
@@ -608,8 +527,8 @@ async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>)
         Ok(request) => request,
         Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
     };
-    if let Err(message) = validate_ask_request(&request) {
-        return api_error(StatusCode::BAD_REQUEST, message);
+    if let Err(error) = validate_ask_request(&request) {
+        return api_error(StatusCode::BAD_REQUEST, &error.to_string());
     }
 
     let events = match state.handler.ask(request).await {
@@ -910,48 +829,6 @@ fn handler_error_response(error: AskHandlerError) -> Response {
     }
 }
 
-pub(crate) fn validate_ask_request(request: &AskRequest) -> Result<(), &'static str> {
-    if request.prompt.trim().is_empty() {
-        return Err("prompt must not be empty");
-    }
-    if request.prompt.len() > MAX_PROMPT_BYTES {
-        return Err("prompt is too large");
-    }
-    if request.session_id.as_ref().is_some_and(|session_id| {
-        session_id.len() != SESSION_ID_HEX_BYTES
-            || !session_id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
-        return Err("session ID is invalid");
-    }
-    let workspace = request
-        .workspace
-        .to_str()
-        .ok_or("workspace path must be valid UTF-8")?;
-    if workspace.is_empty() {
-        return Err("workspace path must not be empty");
-    }
-    if workspace.len() > MAX_WORKSPACE_BYTES {
-        return Err("workspace path is too large");
-    }
-    if request
-        .model
-        .as_ref()
-        .is_some_and(|model| model.len() > MAX_MODEL_BYTES)
-    {
-        return Err("model is too large");
-    }
-    if request
-        .organization
-        .as_ref()
-        .is_some_and(|organization| organization.len() > MAX_ORGANIZATION_BYTES)
-    {
-        return Err("organization is too large");
-    }
-    Ok(())
-}
-
 #[derive(Serialize)]
 struct ApiErrorBody<'a> {
     error: &'a str,
@@ -982,6 +859,17 @@ fn valid_process_version(version: &str) -> bool {
     !version.is_empty()
         && version.len() <= 256
         && version.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn map_connection_error(error: LocalConnectionError) -> ServerError {
+    match error {
+        LocalConnectionError::ProtocolMismatch { expected, found } => {
+            ServerError::ProtocolMismatch { expected, found }
+        }
+        LocalConnectionError::InvalidAddress
+        | LocalConnectionError::InvalidToken
+        | LocalConnectionError::InvalidServerInfo => ServerError::MetadataCorrupt,
+    }
 }
 
 struct InstanceGuard {
@@ -1018,12 +906,51 @@ impl Drop for InstanceGuard {
     }
 }
 
-pub(crate) fn read_connection(
-    paths: &ServerPaths,
-) -> Result<Option<ServerConnection>, ServerError> {
+fn read_connection(paths: &ServerPaths) -> Result<Option<ServerConnection>, ServerError> {
     read_metadata_file(paths)?
         .map(MetadataFile::into_connection)
         .transpose()
+}
+
+/// Discovers and probes the current user's running QQ server.
+pub async fn discover() -> Result<Option<ServerConnection>, ServerError> {
+    discover_with_paths(&ServerPaths::for_user()?).await
+}
+
+async fn discover_with_paths(paths: &ServerPaths) -> Result<Option<ServerConnection>, ServerError> {
+    let client = probe_client().map_err(|()| ServerError::ExistingServerUnavailable)?;
+
+    for attempt in 0..DISCOVERY_RETRIES {
+        let Some(connection) = connection_for_discovery(read_connection(paths))? else {
+            return Ok(None);
+        };
+        match probe_health(&client, &connection).await {
+            Ok(info) if info == *connection.server_info() => return Ok(Some(connection)),
+            Ok(_) | Err(HealthProbeError::Unavailable) => {}
+            Err(HealthProbeError::ProtocolMismatch { found }) => {
+                return Err(ServerError::ProtocolMismatch {
+                    expected: PROTOCOL_VERSION,
+                    found,
+                });
+            }
+        }
+        if attempt + 1 < DISCOVERY_RETRIES {
+            tokio::time::sleep(DISCOVERY_RETRY_DELAY).await;
+        }
+    }
+
+    Ok(None)
+}
+
+fn connection_for_discovery(
+    connection: Result<Option<ServerConnection>, ServerError>,
+) -> Result<Option<ServerConnection>, ServerError> {
+    match connection {
+        Err(ServerError::StateIo { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        connection => connection,
+    }
 }
 
 fn read_metadata_file(paths: &ServerPaths) -> Result<Option<MetadataFile>, ServerError> {
@@ -1102,7 +1029,7 @@ async fn find_existing_server(paths: &ServerPaths) -> Result<ServerConnection, S
     for attempt in 0..STARTUP_RETRIES {
         match read_connection(paths) {
             Ok(Some(connection)) => match probe_health(&client, &connection).await {
-                Ok(info) if info == connection.server_info => return Ok(connection),
+                Ok(info) if info == *connection.server_info() => return Ok(connection),
                 Ok(_) | Err(HealthProbeError::Unavailable) => {}
                 Err(HealthProbeError::ProtocolMismatch { found }) => {
                     meaningful_error = Some(ServerError::ProtocolMismatch {
@@ -1126,7 +1053,7 @@ async fn find_existing_server(paths: &ServerPaths) -> Result<ServerConnection, S
     Err(meaningful_error.unwrap_or(ServerError::ExistingServerUnavailable))
 }
 
-pub(crate) fn probe_client() -> Result<reqwest::Client, ()> {
+fn probe_client() -> Result<reqwest::Client, ()> {
     reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
         .no_proxy()
@@ -1135,17 +1062,18 @@ pub(crate) fn probe_client() -> Result<reqwest::Client, ()> {
         .map_err(|_| ())
 }
 
-pub(crate) enum HealthProbeError {
+enum HealthProbeError {
     Unavailable,
     ProtocolMismatch { found: u16 },
 }
 
-pub(crate) async fn probe_health(
+async fn probe_health(
     client: &reqwest::Client,
     connection: &ServerConnection,
 ) -> Result<ServerInfo, HealthProbeError> {
-    let response = connection
-        .authorize(client.get(connection.endpoint("/v1/health")))
+    let response = client
+        .get(connection.endpoint("/v1/health"))
+        .bearer_auth(connection.expose_bearer_token())
         .timeout(PROBE_TIMEOUT)
         .send()
         .await
@@ -1175,10 +1103,7 @@ pub(crate) async fn probe_health(
     Ok(info)
 }
 
-pub(crate) async fn read_response_bounded(
-    response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>, ()> {
+async fn read_response_bounded(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, ()> {
     let mut body = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = body.next().await {
@@ -1456,7 +1381,6 @@ mod tests {
 
     use futures_util::stream as futures_stream;
     use qq_protocol::RunEvent;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -1511,127 +1435,11 @@ mod tests {
         AskRequest::new(prompt, PathBuf::from("/test/workspace"))
     }
 
-    struct CatalogHandler;
-
-    impl AskHandler for CatalogHandler {
-        fn models(&self, request: ModelCatalogRequest) -> ModelsFuture {
-            Box::pin(async move {
-                Ok(vec![ModelDescriptor {
-                    provider: "openai".to_owned(),
-                    model: "gpt-test".to_owned(),
-                    name: Some("GPT Test".to_owned()),
-                    context_window: Some(128_000),
-                    selection: request.selection,
-                }])
-            })
-        }
-    }
-
     async fn start_test_server(paths: ServerPaths, handler: Arc<dyn AskHandler>) -> ServerHandle {
         match start(handler, ServerOptions::new(paths)).await.unwrap() {
             StartOutcome::Started(handle) => handle,
             StartOutcome::Existing(_) => panic!("test unexpectedly found an existing server"),
         }
-    }
-
-    #[tokio::test]
-    async fn model_catalog_is_authenticated_and_round_trips() {
-        let directory = TestDirectory::new();
-        let server = start_test_server(directory.paths(), Arc::new(CatalogHandler)).await;
-        let client = crate::client::SessionClient::new(server.connection().clone()).unwrap();
-        let selection = qq_protocol::ModelSelection {
-            model: Some("openai/gpt-test".to_owned()),
-            max_output_tokens: Some(100),
-            organization: None,
-        };
-        let models = client
-            .models(ModelCatalogRequest {
-                workspace: "/test/workspace".to_owned(),
-                selection: selection.clone(),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].selection, selection);
-        assert_eq!(models[0].context_window, Some(128_000));
-        server.shutdown().await.unwrap();
-    }
-
-    struct CommandEchoHandler {
-        commands: Arc<Mutex<Vec<CommandRequest>>>,
-    }
-
-    impl AskHandler for CommandEchoHandler {
-        fn command(&self, request: CommandRequest) -> crate::server::CommandFuture {
-            self.commands.lock().unwrap().push(request.clone());
-            Box::pin(async move {
-                Ok(CommandReceipt {
-                    command_id: request.command_id,
-                    committed_through: qq_protocol::EventCursor {
-                        store_id: qq_protocol::StoreId::from_bytes([1; 16]),
-                        workspace_id: qq_protocol::WorkspaceId::from_bytes([2; 16]),
-                        sequence: 1,
-                    },
-                    outcome: qq_protocol::CommandOutcome::SessionDeleted {
-                        session_id: qq_protocol::SessionId::from_bytes([3; 16]),
-                    },
-                })
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn session_management_commands_reach_their_routes_and_only_theirs() {
-        let directory = TestDirectory::new();
-        let commands = Arc::new(Mutex::new(Vec::new()));
-        let server = start_test_server(
-            directory.paths(),
-            Arc::new(CommandEchoHandler {
-                commands: Arc::clone(&commands),
-            }),
-        )
-        .await;
-        let client = crate::client::SessionClient::new(server.connection().clone()).unwrap();
-        let session_id = qq_protocol::SessionId::from_bytes([3; 16]);
-        let workspace_id = qq_protocol::WorkspaceId::from_bytes([2; 16]);
-
-        for command in [
-            SessionCommand::SetSessionModel {
-                session_id,
-                model: qq_protocol::ModelSelection {
-                    model: Some("test/model".to_owned()),
-                    max_output_tokens: Some(256),
-                    organization: None,
-                },
-            },
-            SessionCommand::DeleteSession { session_id },
-            SessionCommand::PruneSessions { workspace_id },
-            SessionCommand::CompactSession { session_id },
-        ] {
-            let command_id = qq_protocol::CommandId::from_bytes([9; 16]);
-            let receipt = client.command(command_id, command.clone()).await.unwrap();
-            assert_eq!(receipt.command_id, command_id);
-            assert_eq!(commands.lock().unwrap().last().unwrap().command, command);
-        }
-
-        // A command posted to another command's route is rejected before the
-        // handler sees it.
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = server
-            .connection()
-            .authorize(http.post(server.connection().endpoint("/v1/sessions/model")))
-            .json(&CommandRequest {
-                command_id: qq_protocol::CommandId::from_bytes([9; 16]),
-                command: SessionCommand::DeleteSession { session_id },
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(commands.lock().unwrap().len(), 4);
-
-        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1653,9 +1461,9 @@ mod tests {
             .unwrap();
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
-        let response = server
-            .connection()
-            .authorize(http.get(&health_url))
+        let response = http
+            .get(&health_url)
+            .bearer_auth(server.connection().expose_bearer_token())
             .send()
             .await
             .unwrap();
@@ -1664,9 +1472,9 @@ mod tests {
             response.json::<ServerInfo>().await.unwrap(),
             *server.connection().server_info()
         );
-        let unsupported = server
-            .connection()
-            .authorize(http.post(&health_url))
+        let unsupported = http
+            .post(&health_url)
+            .bearer_auth(server.connection().expose_bearer_token())
             .send()
             .await
             .unwrap();
@@ -1687,15 +1495,12 @@ mod tests {
         let directory = TestDirectory::new();
         let (handler, requests) = fake_handler(vec![RunEvent::Completed]);
         let server = start_test_server(directory.paths(), handler).await;
-        let response = server
-            .connection()
-            .authorize(
-                reqwest::Client::builder()
-                    .no_proxy()
-                    .build()
-                    .unwrap()
-                    .post(server.connection().endpoint("/v1/ask")),
-            )
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(server.connection().endpoint("/v1/ask"))
+            .bearer_auth(server.connection().expose_bearer_token())
             .json(&test_request("say hello"))
             .send()
             .await
@@ -1719,7 +1524,10 @@ mod tests {
             "0123456789abcdef0123456789abcdeg",
         ] {
             request.session_id = Some(invalid.to_owned());
-            assert_eq!(validate_ask_request(&request), Err("session ID is invalid"));
+            assert_eq!(
+                validate_ask_request(&request),
+                Err(qq_protocol::AskValidationError::InvalidSessionId)
+            );
         }
     }
 
@@ -1771,6 +1579,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovers_the_running_server_connection() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let server = start_test_server(paths.clone(), handler).await;
+
+        assert_eq!(
+            discover_with_paths(&paths).await.unwrap(),
+            Some(server.connection().clone())
+        );
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn discovery_treats_removed_metadata_as_no_server() {
+        let result = connection_for_discovery(Err(ServerError::StateIo {
+            action: "open metadata in",
+            source: io::Error::from(io::ErrorKind::NotFound),
+        }))
+        .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
     async fn replaces_stale_metadata_when_the_lock_is_available() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
@@ -1778,22 +1612,22 @@ mod tests {
         let stale_listener = TcpListener::bind(DEFAULT_BIND_ADDRESS).await.unwrap();
         let stale_address = stale_listener.local_addr().unwrap();
         drop(stale_listener);
-        let stale = ServerConnection {
-            address: stale_address,
-            token: BearerToken("b".repeat(TOKEN_HEX_BYTES)),
-            server_info: ServerInfo {
+        let stale = ServerConnection::new(
+            stale_address,
+            "b".repeat(TOKEN_HEX_BYTES),
+            ServerInfo {
                 protocol_version: PROTOCOL_VERSION,
                 version: "stale".to_owned(),
                 pid: 42,
             },
-        };
+        )
+        .unwrap();
         write_metadata_atomically(&paths, &MetadataFile::new(&stale)).unwrap();
-        assert!(
-            crate::client::discover_with_paths(&paths)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let probe = probe_client().unwrap();
+        assert!(matches!(
+            probe_health(&probe, &stale).await,
+            Err(HealthProbeError::Unavailable)
+        ));
         let (handler, _) = fake_handler(vec![RunEvent::Completed]);
 
         let server = start_test_server(paths.clone(), handler).await;
@@ -1822,28 +1656,24 @@ mod tests {
         metadata.format_version = METADATA_FORMAT_VERSION + 1;
         metadata.protocol_version = PROTOCOL_VERSION;
         write_metadata_atomically(&paths, &metadata).unwrap();
-        assert_eq!(
-            crate::client::discover_with_paths(&paths)
-                .await
-                .unwrap_err(),
-            crate::client::ClientError::MetadataVersionMismatch {
-                expected: METADATA_FORMAT_VERSION,
-                found: METADATA_FORMAT_VERSION + 1,
-            }
-        );
+        assert!(matches!(
+            read_connection(&paths),
+            Err(ServerError::MetadataVersionMismatch {
+                expected,
+                found,
+            }) if expected == METADATA_FORMAT_VERSION && found == METADATA_FORMAT_VERSION + 1
+        ));
         metadata.format_version = METADATA_FORMAT_VERSION;
         metadata.protocol_version = PROTOCOL_VERSION + 1;
         write_metadata_atomically(&paths, &metadata).unwrap();
 
-        assert_eq!(
-            crate::client::discover_with_paths(&paths)
-                .await
-                .unwrap_err(),
-            crate::client::ClientError::ProtocolMismatch {
-                expected: PROTOCOL_VERSION,
-                found: PROTOCOL_VERSION + 1,
-            }
-        );
+        assert!(matches!(
+            read_connection(&paths),
+            Err(ServerError::ProtocolMismatch {
+                expected,
+                found,
+            }) if expected == PROTOCOL_VERSION && found == PROTOCOL_VERSION + 1
+        ));
         let (handler, _) = fake_handler(vec![RunEvent::Completed]);
         let error = start(handler, ServerOptions::new(paths)).await.unwrap_err();
         assert!(matches!(
@@ -1862,22 +1692,12 @@ mod tests {
         let (handler, _) = fake_handler(vec![RunEvent::Completed]);
         let server = start_test_server(paths.clone(), handler).await;
         assert!(paths.metadata_file().is_file());
-        assert!(
-            crate::client::discover_with_paths(&paths)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(read_connection(&paths).unwrap().is_some());
 
         server.shutdown().await.unwrap();
 
         assert!(!paths.metadata_file().exists());
-        assert!(
-            crate::client::discover_with_paths(&paths)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(read_connection(&paths).unwrap().is_none());
         let lock = open_private_lock_file(paths.lock_file()).unwrap();
         lock.try_lock().unwrap();
     }
@@ -1888,15 +1708,16 @@ mod tests {
         let paths = directory.paths();
         let (handler, _) = fake_handler(vec![RunEvent::Completed]);
         let server = start_test_server(paths.clone(), handler).await;
-        let replacement = ServerConnection {
-            address: "127.0.0.1:10".parse().unwrap(),
-            token: BearerToken("d".repeat(TOKEN_HEX_BYTES)),
-            server_info: ServerInfo {
+        let replacement = ServerConnection::new(
+            "127.0.0.1:10".parse().unwrap(),
+            "d".repeat(TOKEN_HEX_BYTES),
+            ServerInfo {
                 protocol_version: PROTOCOL_VERSION,
                 version: "replacement".to_owned(),
                 pid: 43,
             },
-        };
+        )
+        .unwrap();
         write_metadata_atomically(&paths, &MetadataFile::new(&replacement)).unwrap();
 
         server.shutdown().await.unwrap();
@@ -1904,58 +1725,23 @@ mod tests {
         assert_eq!(read_connection(&paths).unwrap().unwrap(), replacement);
     }
 
-    #[tokio::test]
-    async fn client_bounds_non_success_response_bodies() {
-        let listener = TcpListener::bind(DEFAULT_BIND_ADDRESS).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let raw_server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = socket.read(&mut request).await;
-            let body = vec![b'x'; MAX_ERROR_BODY_FOR_TEST];
-            let headers = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
-            let _ = socket.write_all(headers).await;
-            let _ = socket.write_all(&body).await;
-        });
-        let connection = ServerConnection {
-            address,
-            token: BearerToken("e".repeat(TOKEN_HEX_BYTES)),
-            server_info: ServerInfo {
-                protocol_version: PROTOCOL_VERSION,
-                version: "test".to_owned(),
-                pid: 1,
-            },
-        };
-
-        let error = match crate::client::ask(&connection, test_request("hello")).await {
-            Ok(_) => panic!("oversized error response should fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error, crate::client::ClientError::ErrorResponseTooLarge);
-        raw_server.await.unwrap();
-    }
-
-    const MAX_ERROR_BODY_FOR_TEST: usize = 32 * 1024;
-
     #[test]
     fn connection_and_metadata_formatting_redact_tokens() {
         let token = "f".repeat(TOKEN_HEX_BYTES);
-        let connection = ServerConnection {
-            address: "127.0.0.1:1234".parse().unwrap(),
-            token: BearerToken(token.clone()),
-            server_info: ServerInfo {
+        let connection = ServerConnection::new(
+            "127.0.0.1:1234".parse().unwrap(),
+            token.clone(),
+            ServerInfo {
                 protocol_version: PROTOCOL_VERSION,
                 version: "test".to_owned(),
                 pid: 1,
             },
-        };
+        )
+        .unwrap();
         let metadata = MetadataFile::new(&connection);
 
         assert!(!format!("{connection:?}").contains(&token));
         assert!(!connection.to_string().contains(&token));
-        assert!(!format!("{:?}", connection.token).contains(&token));
-        assert!(!connection.token.to_string().contains(&token));
         assert!(!format!("{metadata:?}").contains(&token));
         assert!(!metadata.to_string().contains(&token));
     }

@@ -5,6 +5,7 @@ pub(super) struct MdmConfiguration {
     pub(super) content: String,
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 impl MdmConfiguration {
     pub(super) fn new(origin: impl Into<String>, content: impl Into<String>) -> Self {
         Self {

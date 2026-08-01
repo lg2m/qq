@@ -1,6 +1,5 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, fmt, path::Path};
 
-use qq_tui::{Action, KeyChord, Layout, Settings, SettingsBuilder};
 use ron::{Options, extensions::Extensions};
 use serde::Deserialize;
 
@@ -9,10 +8,88 @@ use super::{
     loader::{canonical_working_directory, discover_file, project_directories, read_candidate},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TuiAction {
+    SelectThreadline,
+    SelectFoldFocus,
+    NextLayout,
+    PreviousLayout,
+    ToggleNavigator,
+    CreateRootSession,
+    CreateChildSession,
+    CancelRun,
+}
+
+impl TuiAction {
+    const ALL: [Self; 8] = [
+        Self::SelectThreadline,
+        Self::SelectFoldFocus,
+        Self::NextLayout,
+        Self::PreviousLayout,
+        Self::ToggleNavigator,
+        Self::CreateRootSession,
+        Self::CreateChildSession,
+        Self::CancelRun,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuiLayout {
+    Threadline,
+    FoldFocus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuiConfigSettings {
+    initial_layout: TuiLayout,
+    bindings: Vec<(TuiAction, Vec<String>)>,
+}
+
+impl TuiConfigSettings {
+    #[must_use]
+    pub const fn initial_layout(&self) -> TuiLayout {
+        self.initial_layout
+    }
+
+    #[must_use]
+    pub fn bindings(&self) -> &[(TuiAction, Vec<String>)] {
+        &self.bindings
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuiConfigDefaults(TuiConfigSettings);
+
+impl TuiConfigDefaults {
+    pub fn new(
+        initial_layout: TuiLayout,
+        bindings: impl IntoIterator<Item = (TuiAction, Vec<String>)>,
+    ) -> Result<Self, ConfigError> {
+        let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
+        if TuiAction::ALL
+            .iter()
+            .any(|action| !bindings.contains_key(action))
+        {
+            return Err(ConfigError::InvalidTuiSettings {
+                message: "compiled TUI defaults must contain every action".to_owned(),
+            });
+        }
+        Ok(Self(TuiConfigSettings {
+            initial_layout,
+            bindings: bindings.into_iter().collect(),
+        }))
+    }
+
+    #[must_use]
+    pub const fn settings(&self) -> &TuiConfigSettings {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TuiConfigKey {
     Layout,
-    Binding(Action),
+    Binding(TuiAction),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,7 +113,7 @@ impl TuiSourceReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfigProvenance {
     layout: SourceIdentity,
-    bindings: BTreeMap<Action, SourceIdentity>,
+    bindings: BTreeMap<TuiAction, SourceIdentity>,
 }
 
 impl TuiConfigProvenance {
@@ -46,7 +123,7 @@ impl TuiConfigProvenance {
     }
 
     #[must_use]
-    pub fn binding(&self, action: Action) -> &SourceIdentity {
+    pub fn binding(&self, action: TuiAction) -> &SourceIdentity {
         self.bindings
             .get(&action)
             .expect("every TUI action has a compiled default")
@@ -55,14 +132,14 @@ impl TuiConfigProvenance {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfigSnapshot {
-    settings: Settings,
+    settings: TuiConfigSettings,
     reports: Vec<TuiSourceReport>,
     provenance: TuiConfigProvenance,
 }
 
 impl TuiConfigSnapshot {
     #[must_use]
-    pub const fn settings(&self) -> &Settings {
+    pub const fn settings(&self) -> &TuiConfigSettings {
         &self.settings
     }
 
@@ -83,7 +160,7 @@ enum ConfigLayout {
     FoldFocus,
 }
 
-impl From<ConfigLayout> for Layout {
+impl From<ConfigLayout> for TuiLayout {
     fn from(value: ConfigLayout) -> Self {
         match value {
             ConfigLayout::Threadline => Self::Threadline,
@@ -106,22 +183,28 @@ struct BindingsDocument {
 }
 
 impl BindingsDocument {
-    fn entries(&self) -> [(Action, Option<&[String]>); 8] {
+    fn entries(&self) -> [(TuiAction, Option<&[String]>); 8] {
         [
-            (Action::SelectThreadline, self.select_threadline.as_deref()),
-            (Action::SelectFoldFocus, self.select_fold_focus.as_deref()),
-            (Action::NextLayout, self.next_layout.as_deref()),
-            (Action::PreviousLayout, self.previous_layout.as_deref()),
-            (Action::ToggleNavigator, self.toggle_navigator.as_deref()),
             (
-                Action::CreateRootSession,
+                TuiAction::SelectThreadline,
+                self.select_threadline.as_deref(),
+            ),
+            (
+                TuiAction::SelectFoldFocus,
+                self.select_fold_focus.as_deref(),
+            ),
+            (TuiAction::NextLayout, self.next_layout.as_deref()),
+            (TuiAction::PreviousLayout, self.previous_layout.as_deref()),
+            (TuiAction::ToggleNavigator, self.toggle_navigator.as_deref()),
+            (
+                TuiAction::CreateRootSession,
                 self.create_root_session.as_deref(),
             ),
             (
-                Action::CreateChildSession,
+                TuiAction::CreateChildSession,
                 self.create_child_session.as_deref(),
             ),
-            (Action::CancelRun, self.cancel_run.as_deref()),
+            (TuiAction::CancelRun, self.cancel_run.as_deref()),
         ]
     }
 }
@@ -135,7 +218,15 @@ struct Document {
 }
 
 impl Document {
-    fn parse(content: &str, source: &SourceIdentity) -> Result<Self, ConfigError> {
+    fn parse<Validate, ValidationError>(
+        content: &str,
+        source: &SourceIdentity,
+        validate_binding: &Validate,
+    ) -> Result<Self, ConfigError>
+    where
+        Validate: Fn(&str) -> Result<(), ValidationError>,
+        ValidationError: fmt::Display,
+    {
         let options = Options::default().with_default_extension(Extensions::IMPLICIT_SOME);
         let document: Self = options
             .from_str(content)
@@ -154,12 +245,10 @@ impl Document {
                 continue;
             };
             for value in values {
-                value
-                    .parse::<KeyChord>()
-                    .map_err(|error| ConfigError::Parse {
-                        origin: source.clone(),
-                        message: error.to_string(),
-                    })?;
+                validate_binding(value).map_err(|error| ConfigError::Parse {
+                    origin: source.clone(),
+                    message: error.to_string(),
+                })?;
             }
         }
         Ok(document)
@@ -180,16 +269,20 @@ impl Document {
     }
 }
 
-pub(super) fn load(loader: &ConfigLoader, cwd: &Path) -> Result<TuiConfigSnapshot, ConfigError> {
+pub(super) fn load<Validate, ValidationError>(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    defaults: &TuiConfigDefaults,
+    validate_binding: &Validate,
+) -> Result<TuiConfigSnapshot, ConfigError>
+where
+    Validate: Fn(&str) -> Result<(), ValidationError>,
+    ValidationError: fmt::Display,
+{
     let cwd = canonical_working_directory(cwd)?;
-    let defaults = Settings::default();
     let compiled = SourceIdentity::virtual_source(SourceKind::Compiled, "compiled TUI defaults");
-    let mut layout = defaults.initial_layout();
-    let mut bindings: BTreeMap<_, _> = defaults
-        .bindings()
-        .iter()
-        .map(|(action, chords)| (*action, chords.clone()))
-        .collect();
+    let mut layout = defaults.settings().initial_layout();
+    let mut bindings: BTreeMap<_, _> = defaults.settings().bindings().iter().cloned().collect();
     let mut provenance = TuiConfigProvenance {
         layout: compiled.clone(),
         bindings: bindings
@@ -222,7 +315,7 @@ pub(super) fn load(loader: &ConfigLoader, cwd: &Path) -> Result<TuiConfigSnapsho
 
     for candidate in candidates {
         let (source, content) = read_candidate(&candidate)?;
-        let document = Document::parse(&content, &source)?;
+        let document = Document::parse(&content, &source, validate_binding)?;
         if let Some(incoming) = document.layout {
             layout = incoming.into();
             provenance.layout = source.clone();
@@ -231,15 +324,7 @@ pub(super) fn load(loader: &ConfigLoader, cwd: &Path) -> Result<TuiConfigSnapsho
             let Some(values) = values else {
                 continue;
             };
-            let chords = values
-                .iter()
-                .map(|value| value.parse::<KeyChord>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| ConfigError::Parse {
-                    origin: source.clone(),
-                    message: error.to_string(),
-                })?;
-            bindings.insert(action, chords);
+            bindings.insert(action, values.to_vec());
             provenance.bindings.insert(action, source.clone());
         }
         reports.push(TuiSourceReport {
@@ -248,15 +333,10 @@ pub(super) fn load(loader: &ConfigLoader, cwd: &Path) -> Result<TuiConfigSnapsho
         });
     }
 
-    let mut builder = SettingsBuilder::default().initial_layout(layout);
-    for (action, chords) in bindings {
-        builder = builder.bindings(action, chords);
-    }
-    let settings = builder
-        .build()
-        .map_err(|error| ConfigError::InvalidTuiSettings {
-            message: error.to_string(),
-        })?;
+    let settings = TuiConfigSettings {
+        initial_layout: layout,
+        bindings: bindings.into_iter().collect(),
+    };
     Ok(TuiConfigSnapshot {
         settings,
         reports,

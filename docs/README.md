@@ -8,9 +8,7 @@ Two kinds of documents live here, with different lifecycles.
   describing the system as built.
   - `product.md` — product intent, priorities, interaction modes, scope.
   - `architecture.md` — system shape, crate layout, protocol, persistence.
-  - `protocol.md` — HTTP/SSE wire protocol specification (empty
-    placeholder; the routes sketched in `architecture.md` govern until
-    it is written).
+  - `protocol.md` — HTTP/SSE wire protocol specification and route contract.
   - `providers.md` — provider validation standard: matrix, test layers,
     live canaries, credential policy.
   - `tools.md` — tool execution and security: the tool loop, built-in

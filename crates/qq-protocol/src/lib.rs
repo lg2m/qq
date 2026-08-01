@@ -7,9 +7,16 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 mod ids;
+mod limits;
+mod local;
 mod sessions;
 
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
+pub use limits::{
+    AskValidationError, MAX_EVENT_BYTES, MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES,
+    MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES, validate_ask_request,
+};
+pub use local::{LocalConnectionError, LocalServerConnection};
 pub use qq_reasoning::{ReasoningEvent, ReasoningKind};
 pub use sessions::{
     AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution,

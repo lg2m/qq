@@ -2567,9 +2567,6 @@ checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 name = "qq"
 version = "0.1.0"
 dependencies = [
- "async-stream",
- "atomic-write-file",
- "axum",
  "base64 0.22.1",
  "clap",
  "directories",
@@ -2577,23 +2574,79 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hmac 0.12.1",
- "keyring",
- "objc2-core-foundation",
+ "qq-auth",
+ "qq-client",
+ "qq-config",
  "qq-core",
  "qq-mcp",
  "qq-protocol",
  "qq-provider",
+ "qq-server",
  "qq-tui",
  "reqwest",
  "ron",
  "rpassword",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "webbrowser",
+]
+
+[[package]]
+name = "qq-auth"
+version = "0.1.0"
+dependencies = [
+ "atomic-write-file",
+ "base64 0.22.1",
+ "directories",
+ "getrandom 0.3.4",
+ "keyring",
+ "qq-provider",
+ "reqwest",
+ "ron",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "webbrowser",
  "windows-dpapi",
+]
+
+[[package]]
+name = "qq-client"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "futures-core",
+ "futures-util",
+ "qq-protocol",
+ "qq-server",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "qq-config"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "objc2-core-foundation",
+ "qq-provider",
+ "reqwest",
+ "ron",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
  "winreg",
 ]
 
@@ -2640,6 +2693,7 @@ dependencies = [
  "qq-reasoning",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -2675,12 +2729,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "qq-server"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "directories",
+ "futures-util",
+ "getrandom 0.3.4",
+ "qq-core",
+ "qq-protocol",
+ "reqwest",
+ "ron",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "qq-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
  "futures-util",
  "pulldown-cmark",
+ "qq-client",
  "qq-protocol",
  "serde_json",
  "thiserror 2.0.19",

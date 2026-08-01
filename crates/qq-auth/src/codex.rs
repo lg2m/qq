@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{AuthError, CredentialBackend, CredentialStore, Secret, validate_credential_name};
-use crate::config::SecretRef;
+use qq_provider::SecretRef;
 use qq_provider::{
     RequestCredential, RequestCredentialError, RequestCredentialFuture, RequestCredentialProvider,
     SharedRequestCredentialProvider,
@@ -22,7 +22,6 @@ use qq_provider::{
 
 pub(super) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const CREDENTIAL_ENDPOINT: &str = "https://chatgpt.com";
-pub(crate) const RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 const ISSUER: &str = "https://auth.openai.com";
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -701,38 +700,36 @@ fn decode_jwt_payload<T: DeserializeOwned>(token: &str) -> Option<T> {
 }
 
 /// Runtime-only Codex bearer material.
-pub(crate) struct CodexCredential {
+#[doc(hidden)]
+pub struct CodexCredential {
     access_token: Secret,
     account_id: String,
     is_fedramp: bool,
 }
 
 impl CodexCredential {
-    pub(crate) const fn access_token(&self) -> &Secret {
+    pub const fn access_token(&self) -> &Secret {
         &self.access_token
     }
 
-    pub(crate) fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &str {
         &self.account_id
     }
 
-    pub(crate) const fn is_fedramp(&self) -> bool {
+    pub const fn is_fedramp(&self) -> bool {
         self.is_fedramp
     }
 }
 
 impl CredentialStore {
-    pub(crate) fn codex_request_credentials(
-        &self,
-        profile: &str,
-    ) -> SharedRequestCredentialProvider {
+    pub fn codex_request_credentials(&self, profile: &str) -> SharedRequestCredentialProvider {
         SharedRequestCredentialProvider::new(CodexRequestCredentials {
             store: self.clone(),
             profile: profile.to_owned(),
         })
     }
 
-    pub(crate) fn resolve_codex(&self, profile: &str) -> Result<CodexCredential, AuthError> {
+    pub fn resolve_codex(&self, profile: &str) -> Result<CodexCredential, AuthError> {
         let name = credential_name(profile)?;
         let now = unix_time()?;
         let credential = self.load_codex(&name)?;

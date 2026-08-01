@@ -544,7 +544,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::config::{ConfigLoader, LoadRequest, managed};
+    use crate::{ConfigLoader, LoadRequest, managed};
 
     use super::*;
 

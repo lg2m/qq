@@ -9,17 +9,14 @@ use std::{
 };
 
 use hmac::{Hmac, Mac};
+use qq_auth::{CredentialStore, Secret, resolve_provider_credential};
+use qq_config::{
+    EndpointMode, HttpAccess, HttpCredential, ProviderApi, ProviderAuth, ProviderConfig,
+    ProviderKind,
+};
 use reqwest::{Url, blocking::RequestBuilder, header::AUTHORIZATION};
 use sha2::Sha256;
 use thiserror::Error;
-
-use crate::{
-    auth::{CredentialStore, Secret, resolve_provider_credential},
-    config::{
-        EndpointMode, HttpAccess, HttpCredential, ProviderApi, ProviderAuth, ProviderConfig,
-        ProviderKind,
-    },
-};
 
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DISCOVERED_MODELS: usize = 4_096;
@@ -85,9 +82,9 @@ impl ModelDiscovery {
         credentials: &CredentialStore,
     ) -> Option<Vec<DiscoveredModel>> {
         let access = match provider.access()? {
-            crate::config::ProviderAccess::Http(access) => access,
-            crate::config::ProviderAccess::AmazonBedrock { .. }
-            | crate::config::ProviderAccess::AmazonBedrockMantle { .. } => return None,
+            qq_config::ProviderAccess::Http(access) => access,
+            qq_config::ProviderAccess::AmazonBedrock { .. }
+            | qq_config::ProviderAccess::AmazonBedrockMantle { .. } => return None,
         };
         let _fetch = self.fetch_gate.lock().ok()?;
         let auth = resolve_auth(access, credentials)?;
@@ -487,10 +484,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        auth::CredentialPaths,
-        config::{ProviderAccess, SecretRef},
-    };
+    use qq_auth::CredentialPaths;
+    use qq_config::{ProviderAccess, SecretRef};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -527,7 +522,7 @@ mod tests {
                 HttpCredential::Configured(ProviderAuth::Bearer(reference)),
                 BTreeMap::new(),
             ))),
-            crate::config::UsageType::Unknown,
+            qq_config::UsageType::Unknown,
             BTreeMap::new(),
         );
         let path = std::env::temp_dir().join(format!(

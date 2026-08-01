@@ -11,6 +11,7 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod compiler;
 mod construction;
+mod credentials;
 pub mod google;
 mod http;
 mod limits;
@@ -26,11 +27,15 @@ mod test_support;
 pub use compiler::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderRecipe,
 };
+pub use credentials::{SecretLiteral, SecretRef};
 pub use qq_reasoning::ReasoningKind;
 pub use request_auth::{
     RequestCredential, RequestCredentialError, RequestCredentialFuture, RequestCredentialProvider,
     SharedRequestCredentialProvider,
 };
+
+/// Canonical credential audience for the built-in xAI deployment.
+pub const XAI_CREDENTIAL_ENDPOINT: &str = "https://api.x.ai";
 
 /// A stream of semantic model events from a configured provider.
 pub type ProviderStream =

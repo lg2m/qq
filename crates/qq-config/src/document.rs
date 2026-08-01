@@ -15,9 +15,9 @@ use super::{
     AwsAuth, BedrockAuth, ConfigError, ConfigKey, ConfigProvenance, ConfigSnapshot, Connection,
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MCP_CALL_TIMEOUT_SECONDS, DEFAULT_MCP_MAX_CONCURRENT_CALLS,
     EffectivePolicy, HttpAccess, HttpCredential, InputModality, MAX_MCP_CALL_TIMEOUT_SECONDS,
-    MAX_MCP_MAX_CONCURRENT_CALLS, McpServerConfig, McpTransport, ModelMetadata, ModelRoute,
-    PolicyGrants, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind, RuntimeOverrides,
-    SecretRef, SourceIdentity, SourceKind, SourceReport, WorkspaceGrant,
+    MAX_MCP_MAX_CONCURRENT_CALLS, McpServerConfig, McpTransport, ModelMetadata, ModelPricing,
+    ModelRoute, PolicyGrants, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind,
+    RuntimeOverrides, SecretRef, SourceIdentity, SourceKind, SourceReport, WorkspaceGrant,
 };
 
 pub(super) fn deserialize_unique_btree_map<'de, D, K, V>(
@@ -240,7 +240,7 @@ struct ModelPatch {
     #[serde(skip_serializing_if = "Field::is_missing")]
     max_output_tokens: Field<u32>,
     #[serde(skip_serializing_if = "Field::is_missing")]
-    pricing: Field<qq_protocol::ModelPricing>,
+    pricing: Field<ModelPricing>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

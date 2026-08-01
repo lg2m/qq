@@ -13,10 +13,16 @@ records the initial direction, not a license to pre-build deferred features.
 
 ## Repository Map
 
-- `src/`: binary, CLI, configuration, runtime composition, client, and server.
+- `src/`: binary, CLI, runtime composition, and authenticated model discovery.
+- `crates/qq-auth/`: provider OAuth flows and credential storage.
+- `crates/qq-client/`: HTTP/SSE client, reconnect/replay, and TUI client port.
+- `crates/qq-config/`: layered configuration, policy, and provider presets.
 - `crates/qq-core/`: agent runtime, sessions, tools, and persistence behavior.
+- `crates/qq-mcp/`: MCP client transport and tool discovery.
 - `crates/qq-provider/`: provider-neutral model API and provider adapters.
 - `crates/qq-protocol/`: shared commands, events, identifiers, and wire types.
+- `crates/qq-reasoning/`: shared reasoning event vocabulary.
+- `crates/qq-server/`: HTTP/SSE server and local-instance discovery.
 - `crates/qq-tui/`: terminal UI and client-side state.
 - `xtask/`: repository automation; invoke it with `cargo xtask`.
 

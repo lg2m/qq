@@ -129,9 +129,9 @@ applied by the loader.
 
 #### Architecture
 
-- Extend `src/config/document.rs` with an optional `worker_model` field in the
+- Extend `crates/qq-config/src/document.rs` with an optional `worker_model` field in the
   same layers, merge/provenance machinery, documentation, and serialization
-  path as the primary model. Extend `ConfigSnapshot` in `src/config.rs` with
+  path as the primary model. Extend `ConfigSnapshot` in `crates/qq-config/src/lib.rs` with
   the validated typed value. Missing and explicitly cleared values must have
   normal layered-config semantics; do not encode fallback by copying `model`
   into the snapshot.
@@ -156,7 +156,7 @@ applied by the loader.
 - Preserve the explicit selected route on the child even when it equals the
   parent. This keeps audit/resume behavior independent from future defaults.
 
-Likely touch points are `src/config/document.rs`, `src/config.rs`,
+Likely touch points are `crates/qq-config/src/document.rs`, `crates/qq-config/src/lib.rs`,
 `src/runtime.rs`, application construction in `src/main.rs`, and
 `SessionSubagentSpawner`/child creation in `crates/qq-core/src/sessions.rs`.
 Protocol changes are unnecessary unless model resolution is moved behind a

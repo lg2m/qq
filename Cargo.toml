@@ -8,11 +8,15 @@ publish = false
 
 [workspace]
 members = [
+  "crates/qq-auth",
+  "crates/qq-client",
+  "crates/qq-config",
   "crates/qq-core",
   "crates/qq-mcp",
   "crates/qq-provider",
   "crates/qq-protocol",
   "crates/qq-reasoning",
+  "crates/qq-server",
   "crates/qq-tui",
   "xtask",
 ]
@@ -48,11 +52,15 @@ getrandom = "0.3"
 hmac = "0.12"
 http-body = "1"
 keyring = "4"
+qq-auth = { path = "crates/qq-auth" }
+qq-client = { path = "crates/qq-client" }
+qq-config = { path = "crates/qq-config" }
 qq-core = { path = "crates/qq-core" }
 qq-mcp = { path = "crates/qq-mcp" }
 qq-provider = { path = "crates/qq-provider" }
 qq-protocol = { path = "crates/qq-protocol" }
 qq-reasoning = { path = "crates/qq-reasoning" }
+qq-server = { path = "crates/qq-server" }
 qq-tui = { path = "crates/qq-tui" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
@@ -72,35 +80,30 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 webbrowser = "1"
 
 [dependencies]
-async-stream.workspace = true
-axum.workspace = true
-base64.workspace = true
 clap.workspace = true
 directories.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
-keyring.workspace = true
+qq-auth.workspace = true
+qq-client.workspace = true
+qq-config.workspace = true
 qq-core.workspace = true
 qq-mcp.workspace = true
 qq-provider.workspace = true
 qq-protocol.workspace = true
+qq-server.workspace = true
 qq-tui.workspace = true
 reqwest.workspace = true
-ron.workspace = true
 rpassword.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 webbrowser.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFPreferences", "CFPropertyList", "CFString"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-atomic-write-file.workspace = true
-winreg = "0.56"
-windows-dpapi = "0.2"
+[dev-dependencies]
+base64.workspace = true
+ron.workspace = true
+tempfile.workspace = true

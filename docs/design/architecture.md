@@ -54,23 +54,43 @@ continue when a client disconnects.
 QQ is a Cargo workspace whose root package builds the `qq` binary. Library
 crates live under `crates/`, while repository automation lives in `xtask/`.
 
-The initial workspace is:
+The workspace is:
 
 ```text
 Cargo.toml
 src/
   main.rs
   cli.rs
-  config.rs
-  server.rs
+  catalog.rs
+  mcp.rs
+  output.rs
+  runtime.rs
 crates/
+  qq-auth/
+    Cargo.toml
+    src/lib.rs
+  qq-client/
+    Cargo.toml
+    src/lib.rs
+  qq-config/
+    Cargo.toml
+    src/lib.rs
   qq-core/
+    Cargo.toml
+    src/lib.rs
+  qq-mcp/
     Cargo.toml
     src/lib.rs
   qq-provider/
     Cargo.toml
     src/lib.rs
   qq-protocol/
+    Cargo.toml
+    src/lib.rs
+  qq-reasoning/
+    Cargo.toml
+    src/lib.rs
+  qq-server/
     Cargo.toml
     src/lib.rs
   qq-tui/
@@ -82,33 +102,61 @@ xtask/
 ```
 
 - The root `qq` package is the executable and composition root. It owns process
-  startup, top-level CLI dispatch, configuration loading, and the HTTP/SSE
-  server adapter.
+  startup, top-level CLI dispatch, runtime construction, authenticated model
+  discovery, and translation between crate-specific settings. It contains no
+  provider, HTTP/SSE, credential-store, or configuration-file implementation.
+- `qq-auth` contains provider-side OAuth flows, credential storage, keyring
+  integration, and resolution of provider-neutral secret references.
+- `qq-client` contains the authenticated HTTP/SSE client, bounded decoding,
+  reconnect/replay behavior, and the session client port used by the TUI.
+- `qq-config` contains layered configuration, built-in provider/model presets,
+  managed policy, remote organization documents, and config provenance. It
+  returns config-owned TUI values; the root translates them into `qq-tui`
+  settings.
 - `qq-core` contains the agent loop, session behavior, tool integration, and
   persistence behavior. It consumes the command and event vocabulary from
   `qq-protocol` and exposes a small interface that hides orchestration details
   from clients.
 - `qq-provider` contains the provider-neutral model interface and concrete
-  model-provider adapters.
+  model-provider adapters. It also owns the provider-neutral secret-reference
+  vocabulary shared by config and auth.
 - `qq-protocol` contains shared identifiers, commands, events, and versioned
-  wire types. It does not depend on an HTTP client or server framework.
+  wire types, plus the redacted local-server connection capability shared by
+  the server and client adapters. It does not depend on an HTTP client or
+  server framework.
+- `qq-server` contains the Axum adapter, HTTP/SSE route wiring, bearer-token
+  authentication, and private local-instance discovery metadata.
 - `qq-tui` contains terminal rendering, input handling, and client-side state.
-  It communicates through the protocol and does not depend directly on
-  `qq-core`.
+  It communicates through `qq-client` and the protocol and does not depend
+  directly on `qq-core` or application configuration.
 - `xtask` contains repository maintenance tasks and is not shipped as part of
   QQ.
 
-The dependency graph points toward `qq-protocol` and `qq-provider`: `qq-core`
-depends on both, `qq-tui` depends on `qq-protocol`, and the root package wires
-the modules together. Application configuration types must not become a shared
-dependency imported throughout the workspace; the root translates external
-configuration into each module's settings.
+The direct workspace dependency graph is:
+
+```text
+qq (composition root)
+qq-server    -> qq-core, qq-protocol
+qq-tui       -> qq-client, qq-protocol
+qq-client    -> qq-protocol
+qq-config    -> qq-provider
+qq-auth      -> qq-provider
+qq-core      -> qq-provider, qq-protocol
+qq-mcp       -> qq-provider
+qq-provider  -> qq-reasoning
+qq-protocol  -> qq-reasoning
+```
+
+Dependencies point toward `qq-protocol` and `qq-provider`; `qq-client` and
+`qq-server` do not depend on one another, and neither `qq-config` nor `qq-auth`
+depends on the other. The root package wires them together. Application
+configuration types must not become a shared dependency imported throughout
+the workspace; the root translates external configuration into each crate's
+settings.
 
 Do not create additional placeholder crates for storage, tools, individual
-providers, the server, plugins, web, or mobile. A module should become a crate
-only when a measured build concern or multiple real consumers justify the
-seam. In particular, extract a shared client only when both the TUI and direct
-CLI commands need the same HTTP/SSE behavior.
+providers, plugins, web, or mobile. A module should become a crate only when a
+measured build concern or multiple real consumers justify the seam.
 
 ## Runtime
 
@@ -319,5 +367,6 @@ following yet:
 - Multi-user tenancy.
 - Multi-agent editing orchestration.
 
-The HTTP/SSE server is designed to permit future clients, but future client
-code must not shape the initial crate graph before it exists.
+The HTTP/SSE server and client crates are designed to permit future surfaces,
+but future client code must not add placeholder crates or speculative
+extension points before it exists.

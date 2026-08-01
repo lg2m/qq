@@ -536,7 +536,11 @@ fn windows_dpapi_round_trip_replaces_and_removes_oversized_secret() {
     let protected_path = SystemWindowsProtected::new(CredentialPaths::new(directory.path()))
         .path("openai-codex/default");
     let ciphertext = fs::read(&protected_path).unwrap();
-    assert!(!ciphertext.windows(second.len()).any(|window| window == second));
+    assert!(
+        !ciphertext
+            .windows(second.len())
+            .any(|window| window == second)
+    );
     assert!(store.remove("openai-codex/default").unwrap());
     assert!(!protected_path.exists());
 }
