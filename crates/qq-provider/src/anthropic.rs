@@ -912,14 +912,9 @@ fn api_error(rejection: HttpRejection) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread::{self, JoinHandle},
-        time::Duration,
-    };
-
     use serde_json::json;
+
+    use crate::test_support::LoopbackServer;
 
     use super::*;
 
@@ -1333,9 +1328,9 @@ mod tests {
             b"event: message_stop\ndata: {\"type\":\"message_".to_vec(),
             b"stop\"}\r\r".to_vec(),
         ];
-        let path = "/custom/messages?api-version=42";
-        let (endpoint, server) =
-            serve_once(path, "200 OK", "text/event-stream; charset=utf-8", chunks);
+        let server =
+            LoopbackServer::respond_chunks(200, Some("text/event-stream; charset=utf-8"), chunks);
+        let endpoint = format!("{}/custom/messages?api-version=42", server.base_url);
         let provider = AnthropicMessages::with_endpoint(
             &endpoint,
             AnthropicAuth::XApiKey("custom-test-secret".to_owned()),
@@ -1373,29 +1368,23 @@ mod tests {
             }
         );
 
-        let request = String::from_utf8(server.join().unwrap()).unwrap();
-        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let request = server.capture();
         assert_eq!(
-            head.lines().next(),
+            request.request_line(),
             Some("POST /custom/messages?api-version=42 HTTP/1.1")
         );
-        assert_eq!(request_header(head, "accept"), Some("text/event-stream"));
+        assert_eq!(request.header("accept"), Some("text/event-stream"));
+        assert_eq!(request.header("content-type"), Some("application/json"));
+        assert_eq!(request.header("x-api-key"), Some("custom-test-secret"));
         assert_eq!(
-            request_header(head, "content-type"),
-            Some("application/json")
-        );
-        assert_eq!(
-            request_header(head, "x-api-key"),
-            Some("custom-test-secret")
-        );
-        assert_eq!(
-            request_header(head, "anthropic-version"),
+            request.header("anthropic-version"),
             Some(DEFAULT_ANTHROPIC_VERSION)
         );
-        assert_eq!(request_header(head, "x-client"), Some("qq-tests"));
-        assert_eq!(request_header(head, "authorization"), None);
+        assert_eq!(request.header("x-client"), Some("qq-tests"));
+        assert_eq!(request.header("authorization"), None);
+        let body = request.json_body();
         assert_eq!(
-            serde_json::from_str::<Value>(body).unwrap(),
+            body,
             json!({
                 "model": "claude-test",
                 "messages": [
@@ -1406,7 +1395,7 @@ mod tests {
                 "stream": true
             })
         );
-        assert!(!body.contains("system"));
+        assert!(!body.as_object().unwrap().contains_key("system"));
     }
 
     #[tokio::test]
@@ -1415,12 +1404,8 @@ mod tests {
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
-        let (endpoint, server) = serve_once(
-            "/v1/messages",
-            "200 OK",
-            "text/event-stream",
-            vec![body.as_bytes().to_vec()],
-        );
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/messages", server.base_url);
         let provider =
             AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
         let request = ModelRequest::new(
@@ -1460,10 +1445,8 @@ mod tests {
             Ok(ProviderEvent::Completed { usage: None })
         ));
 
-        let request = String::from_utf8(server.join().unwrap()).unwrap();
-        let body = request.split_once("\r\n\r\n").unwrap().1;
         assert_eq!(
-            serde_json::from_str::<Value>(body).unwrap(),
+            server.capture().json_body(),
             json!({
                 "model": "claude-test",
                 "messages": [
@@ -1523,12 +1506,8 @@ mod tests {
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
-        let (endpoint, server) = serve_once(
-            "/v1/messages",
-            "200 OK",
-            "text/event-stream",
-            vec![body.as_bytes().to_vec()],
-        );
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/messages", server.base_url);
         let provider =
             AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
         let events = provider
@@ -1563,7 +1542,7 @@ mod tests {
                 ProviderEvent::Completed { usage: None },
             ]
         );
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
@@ -1572,12 +1551,8 @@ mod tests {
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
         );
-        let (endpoint, server) = serve_once(
-            "/v1/messages",
-            "200 OK",
-            "text/event-stream",
-            vec![body.as_bytes().to_vec()],
-        );
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/messages", server.base_url);
         let provider =
             AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
         let error = provider
@@ -1588,7 +1563,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ProviderError::Protocol(_)));
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
@@ -1598,12 +1573,8 @@ mod tests {
             "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
             "\"message\":\"stream-auth-secret static-test-secret overloaded\"}}\n\n",
         );
-        let (endpoint, server) = serve_once(
-            "/v1/messages",
-            "200 OK",
-            "text/event-stream",
-            vec![body.as_bytes().to_vec()],
-        );
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/messages", server.base_url);
         let provider = AnthropicMessages::with_endpoint(
             &endpoint,
             AnthropicAuth::Bearer("stream-auth-secret".to_owned()),
@@ -1626,18 +1597,14 @@ mod tests {
         let rendered = format!("{error:?} {error}");
         assert!(!rendered.contains("stream-auth-secret"));
         assert!(!rendered.contains("static-test-secret"));
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
     async fn returns_typed_401_without_exposing_response_body_secrets() {
-        let body = br#"{"type":"error","error":{"type":"authentication_error","message":"invalid test-api-secret\nstatic-test-secret credential"},"request_id":"req_test"}"#;
-        let (endpoint, server) = serve_once(
-            "/v1/messages",
-            "401 Unauthorized",
-            "application/json",
-            vec![body.to_vec()],
-        );
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid test-api-secret\nstatic-test-secret credential"},"request_id":"req_test"}"#;
+        let server = LoopbackServer::respond(401, "application/json", body);
+        let endpoint = format!("{}/v1/messages", server.base_url);
         let provider = AnthropicMessages::with_endpoint(
             &endpoint,
             AnthropicAuth::XApiKey("test-api-secret".to_owned()),
@@ -1662,19 +1629,14 @@ mod tests {
         assert!(!rendered.contains("static-test-secret"));
         assert!(!rendered.contains('\n'));
 
-        let request = String::from_utf8(server.join().unwrap()).unwrap();
-        let head = request.split_once("\r\n\r\n").unwrap().0;
-        assert_eq!(request_header(head, "x-api-key"), Some("test-api-secret"));
+        let request = server.capture();
+        assert_eq!(request.header("x-api-key"), Some("test-api-secret"));
     }
 
     #[tokio::test]
     async fn rejects_non_sse_success_responses() {
-        let (endpoint, server) = serve_once(
-            "/v1/messages",
-            "200 OK",
-            "application/json",
-            vec![b"{}".to_vec()],
-        );
+        let server = LoopbackServer::respond(200, "application/json", "{}");
+        let endpoint = format!("{}/v1/messages", server.base_url);
         let provider =
             AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
         let error = provider
@@ -1685,7 +1647,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ProviderError::Protocol(_)));
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
@@ -1695,12 +1657,8 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,",
             "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
         );
-        let (endpoint, server) = serve_once(
-            "/v1/messages",
-            "200 OK",
-            "text/event-stream",
-            vec![body.as_bytes().to_vec()],
-        );
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/messages", server.base_url);
         let provider =
             AnthropicMessages::with_endpoint(&endpoint, AnthropicAuth::NoAuth, [], true).unwrap();
         let events = provider.stream(test_request()).collect::<Vec<_>>().await;
@@ -1710,7 +1668,7 @@ mod tests {
             Ok(ProviderEvent::OutputTextDelta { text }) if text == "partial"
         ));
         assert!(matches!(&events[1], Err(ProviderError::Protocol(_))));
-        server.join().unwrap();
+        server.capture();
     }
 
     fn decode_data(name: &str, data: &str) -> Result<DecodedEvent, ProviderError> {
@@ -1725,77 +1683,5 @@ mod tests {
 
     fn test_request() -> ModelRequest {
         ModelRequest::new("claude-test", vec![Message::user("ping")], 128)
-    }
-
-    fn serve_once(
-        path: &str,
-        status: &str,
-        content_type: &str,
-        chunks: Vec<Vec<u8>>,
-    ) -> (String, JoinHandle<Vec<u8>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}{path}", listener.local_addr().unwrap());
-        let status = status.to_owned();
-        let content_type = content_type.to_owned();
-        let content_length = chunks.iter().map(Vec::len).sum::<usize>();
-
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let request = read_request(&mut stream);
-            let headers = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
-            );
-            stream.write_all(headers.as_bytes()).unwrap();
-            for chunk in chunks {
-                stream.write_all(&chunk).unwrap();
-                stream.flush().unwrap();
-                thread::sleep(Duration::from_millis(1));
-            }
-            request
-        });
-
-        (endpoint, server)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4_096];
-
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
-
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or_default();
-            if request.len() >= body_start + content_length {
-                break;
-            }
-        }
-
-        request
-    }
-
-    fn request_header<'a>(headers: &'a str, expected_name: &str) -> Option<&'a str> {
-        headers
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case(expected_name))
-            .map(|(_, value)| value.trim())
     }
 }
