@@ -54,14 +54,31 @@ impl LoopbackServer {
         Self::respond(200, "text/event-stream", body)
     }
 
+    /// Serves an SSE response whose body arrives as the given wire chunks,
+    /// flushed one at a time — for byte-boundary and UTF-8 frame-splitting
+    /// tests. Chunks may split multi-byte characters.
+    pub(crate) fn sse_chunks(chunks: Vec<Vec<u8>>) -> Self {
+        Self::respond_chunks(200, Some("text/event-stream"), chunks)
+    }
+
     pub(crate) fn respond(
         status: u16,
         content_type: &'static str,
         body: impl Into<String>,
     ) -> Self {
+        Self::respond_chunks(status, Some(content_type), vec![body.into().into_bytes()])
+    }
+
+    /// The general form: arbitrary status, optional `Content-Type` (omitted
+    /// entirely when `None`, so missing-header behavior is testable), and a
+    /// scripted body written chunk by chunk.
+    pub(crate) fn respond_chunks(
+        status: u16,
+        content_type: Option<&'static str>,
+        chunks: Vec<Vec<u8>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener must bind");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let body = body.into();
         let request = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("loopback request must connect");
             stream
@@ -73,13 +90,23 @@ impl LoopbackServer {
                 401 => "Unauthorized",
                 _ => "Test Response",
             };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+            let content_type_header = content_type
+                .map(|value| format!("Content-Type: {value}\r\n"))
+                .unwrap_or_default();
+            let content_length = chunks.iter().map(Vec::len).sum::<usize>();
+            let head = format!(
+                "HTTP/1.1 {status} {reason}\r\n{content_type_header}Content-Length: {content_length}\r\nConnection: close\r\n\r\n"
             );
             stream
-                .write_all(response.as_bytes())
-                .expect("loopback response must be written");
+                .write_all(head.as_bytes())
+                .expect("loopback response head must be written");
+            for chunk in chunks {
+                stream
+                    .write_all(&chunk)
+                    .expect("loopback response chunk must be written");
+                stream.flush().expect("loopback response chunk must flush");
+                thread::sleep(Duration::from_millis(1));
+            }
             CapturedRequest {
                 wire: String::from_utf8(request).expect("captured request must be UTF-8"),
             }
@@ -117,4 +144,107 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         }
     }
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Raw TCP client so assertions run against the exact wire bytes the
+    /// harness emits, independent of any HTTP client's normalization.
+    fn raw_exchange(base_url: &str, body: &str) -> (String, String) {
+        let authority = base_url
+            .strip_prefix("http://")
+            .expect("loopback base URL must be plain HTTP");
+        let mut stream = TcpStream::connect(authority).expect("loopback connect must succeed");
+        let request = format!(
+            "POST /probe HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("probe request must be written");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("probe response must be readable");
+        let response = String::from_utf8(response).expect("harness responses are UTF-8 in tests");
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .expect("harness response must contain a head/body separator");
+        (head.to_owned(), body.to_owned())
+    }
+
+    fn head_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+
+    #[test]
+    fn sse_chunks_reassemble_in_order_even_when_split_mid_utf8() {
+        let heart = "❤".as_bytes();
+        let server = LoopbackServer::sse_chunks(vec![
+            b"data: {\"text\":\"".to_vec(),
+            heart[..1].to_vec(),
+            heart[1..].to_vec(),
+            b"\"}\n\n".to_vec(),
+        ]);
+
+        let (head, body) = raw_exchange(&server.base_url, "{}");
+
+        assert!(head.starts_with("HTTP/1.1 200"), "unexpected head: {head}");
+        assert_eq!(head_header(&head, "content-type"), Some("text/event-stream"));
+        assert_eq!(
+            head_header(&head, "content-length"),
+            Some("data: {\"text\":\"❤\"}\n\n".len().to_string().as_str())
+        );
+        assert_eq!(body, "data: {\"text\":\"❤\"}\n\n");
+    }
+
+    #[test]
+    fn respond_chunks_supports_arbitrary_status_and_content_type() {
+        let server = LoopbackServer::respond_chunks(
+            429,
+            Some("application/json; charset=utf-8"),
+            vec![b"{\"error\":\"slow down\"}".to_vec()],
+        );
+
+        let (head, body) = raw_exchange(&server.base_url, "{}");
+
+        assert!(head.starts_with("HTTP/1.1 429"), "unexpected head: {head}");
+        assert_eq!(
+            head_header(&head, "content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(body, "{\"error\":\"slow down\"}");
+    }
+
+    #[test]
+    fn respond_chunks_can_omit_the_content_type_header() {
+        let server = LoopbackServer::respond_chunks(200, None, vec![b"data: [DONE]\n\n".to_vec()]);
+
+        let (head, body) = raw_exchange(&server.base_url, "{}");
+
+        assert_eq!(head_header(&head, "content-type"), None);
+        assert_eq!(body, "data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn capture_exposes_request_line_headers_and_json_body() {
+        let server = LoopbackServer::respond(200, "application/json", "{}");
+
+        let (_, _) = raw_exchange(&server.base_url, "{\"model\":\"test-model\"}");
+        let request = server.capture();
+
+        assert_eq!(request.request_line(), Some("POST /probe HTTP/1.1"));
+        assert_eq!(
+            request.header("content-type"),
+            Some("application/json")
+        );
+        assert_eq!(request.header("x-absent"), None);
+        assert_eq!(request.json_body()["model"], "test-model");
+    }
 }
