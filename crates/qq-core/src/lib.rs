@@ -11,6 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use async_stream::stream;
@@ -228,6 +229,71 @@ enum TurnBlock {
     ToolCall(usize),
 }
 
+/// Turn-level retry for transient provider failures.
+///
+/// A model turn whose provider stream fails with a transient error
+/// (`Unavailable`, `RateLimited`, `Transport`) — or ends without a terminal
+/// event — is re-issued with exponential backoff instead of failing the run,
+/// but only while nothing user-visible has streamed, so a retry can never
+/// duplicate output. Non-transient failures (authentication, configuration,
+/// invalid requests, protocol violations) always fail fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnRetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl Default for TurnRetryPolicy {
+    /// Eight attempts with 1 s → 60 s exponential backoff (about two minutes
+    /// of waiting in total), sized to ride out provider overload blips
+    /// without surrendering the run.
+    fn default() -> Self {
+        Self {
+            max_attempts: 8,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+impl TurnRetryPolicy {
+    /// Fails the run on the first provider error of any kind.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            max_attempts: 1,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
+    }
+
+    fn delay(&self, completed_attempts: u32) -> Duration {
+        let exponent = completed_attempts.saturating_sub(1).min(31);
+        self.base_delay
+            .saturating_mul(1_u32 << exponent)
+            .min(self.max_delay)
+    }
+}
+
+const fn is_transient_provider_failure(kind: ProviderErrorKind) -> bool {
+    matches!(
+        kind,
+        ProviderErrorKind::Unavailable
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Transport
+    )
+}
+
+/// Appends the attempt count to a terminal failure message when retries ran.
+fn attempts_message(message: String, attempts: u32) -> String {
+    if attempts > 1 {
+        format!("{message} (gave up after {attempts} attempts with backoff)")
+    } else {
+        message
+    }
+}
+
 /// Runs protocol commands against a configured model provider.
 #[derive(Clone)]
 pub struct Runtime {
@@ -236,6 +302,7 @@ pub struct Runtime {
     max_output_tokens: u32,
     mcp: Option<Arc<dyn McpRegistry>>,
     spawn_model_routes: Arc<[String]>,
+    turn_retry: TurnRetryPolicy,
 }
 
 impl Runtime {
@@ -267,7 +334,15 @@ impl Runtime {
             max_output_tokens,
             mcp: None,
             spawn_model_routes: Arc::from([]),
+            turn_retry: TurnRetryPolicy::default(),
         })
+    }
+
+    /// Overrides the transient-failure retry policy applied to model turns.
+    #[must_use]
+    pub fn with_turn_retry_policy(mut self, policy: TurnRetryPolicy) -> Self {
+        self.turn_retry = policy;
+        self
     }
 
     /// Attaches a registry of configuration-declared MCP servers. Its cached
@@ -446,6 +521,7 @@ impl Runtime {
         let max_output_tokens = self.max_output_tokens;
         let mcp = self.mcp.clone();
         let spawn_model_routes = Arc::clone(&self.spawn_model_routes);
+        let turn_retry = self.turn_retry;
         Box::pin(stream! {
             let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
             yield RuntimeEvent::Started;
@@ -501,6 +577,12 @@ impl Runtime {
                 // this run stopped — budget exhaustion is never a failure.
                 let final_turn = total_tool_calls >= MAX_TOOL_CALLS_PER_RUN
                     || turn_ordinal == MAX_MODEL_TURNS;
+                // Transient provider failures (overload, rate limits, dropped
+                // connections) re-issue this turn with backoff instead of
+                // failing the run — but only while nothing user-visible has
+                // streamed, so a retry can never duplicate output.
+                let mut attempt = 1_u32;
+                let (blocks, pending_calls, terminal_usage) = 'turn: loop {
                 let request =
                     ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens);
                 let request = if final_turn {
@@ -511,7 +593,9 @@ impl Runtime {
                         .with_system(Arc::clone(&system))
                 };
                 let mut activity = RunActivity::WaitingForProvider;
-                yield RuntimeEvent::ActivityChanged { activity };
+                if attempt == 1 {
+                    yield RuntimeEvent::ActivityChanged { activity };
+                }
                 let mut provider_events = provider.stream(request);
                 let mut pending_calls = Vec::<PendingToolCall>::new();
                 let mut calls_by_provider_id = HashMap::<String, usize>::new();
@@ -520,6 +604,7 @@ impl Runtime {
                 let mut completed = false;
                 let mut reasoning_bytes = 0_usize;
                 let mut open_reasoning = None;
+                let mut turn_streamed = false;
 
                 while let Some(event) = provider_events.next().await {
                     match event {
@@ -532,6 +617,7 @@ impl Runtime {
                                 return;
                             }
                             open_reasoning = Some(kind);
+                            turn_streamed = true;
                             if activity != RunActivity::Reasoning {
                                 activity = RunActivity::Reasoning;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -570,6 +656,7 @@ impl Runtime {
                             yield RuntimeEvent::ReasoningCompleted { kind };
                         }
                         Ok(ProviderEvent::OutputTextDelta { text }) => {
+                            turn_streamed = true;
                             if activity != RunActivity::GeneratingResponse {
                                 activity = RunActivity::GeneratingResponse;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -586,6 +673,7 @@ impl Runtime {
                             yield RuntimeEvent::OutputTextDelta { text };
                         }
                         Ok(ProviderEvent::RefusalDelta { text }) => {
+                            turn_streamed = true;
                             if activity != RunActivity::GeneratingResponse {
                                 activity = RunActivity::GeneratingResponse;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -602,6 +690,7 @@ impl Runtime {
                             yield RuntimeEvent::RefusalDelta { text };
                         }
                         Ok(ProviderEvent::ToolCallStarted { id, name }) => {
+                            turn_streamed = true;
                             if activity != RunActivity::PreparingToolCall {
                                 activity = RunActivity::PreparingToolCall;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -742,9 +831,18 @@ impl Runtime {
                             break;
                         }
                         Err(error) => {
+                            if is_transient_provider_failure(error.kind())
+                                && !turn_streamed
+                                && attempt < turn_retry.max_attempts
+                            {
+                                let delay = turn_retry.delay(attempt);
+                                attempt += 1;
+                                tokio::time::sleep(delay).await;
+                                continue 'turn;
+                            }
                             yield RuntimeEvent::Failed {
                                 kind: run_failure_kind(error.kind()),
-                                message: error.to_string(),
+                                message: attempts_message(error.to_string(), attempt),
                             };
                             return;
                         }
@@ -752,12 +850,26 @@ impl Runtime {
                 }
 
                 if !completed {
+                    // A stream that ends without a terminal event is the same
+                    // transient class as a dropped connection.
+                    if !turn_streamed && attempt < turn_retry.max_attempts {
+                        let delay = turn_retry.delay(attempt);
+                        attempt += 1;
+                        tokio::time::sleep(delay).await;
+                        continue 'turn;
+                    }
                     yield RuntimeEvent::Failed {
                         kind: RunFailureKind::ProviderProtocol,
-                        message: "provider stream ended without a terminal event".to_owned(),
+                        message: attempts_message(
+                            "provider stream ended without a terminal event".to_owned(),
+                            attempt,
+                        ),
                     };
                     return;
                 }
+
+                break 'turn (blocks, pending_calls, terminal_usage);
+                };
 
                 let assistant_content = blocks
                     .into_iter()
@@ -2267,7 +2379,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn turns_provider_errors_into_failed_events() {
         let runtime = Runtime::new(
             ScriptedProvider {
@@ -2291,6 +2403,230 @@ mod tests {
                 kind: RunFailureKind::ProviderTransport,
                 message,
             }) if message.contains("offline")
+        ));
+    }
+
+    fn overloaded() -> ProviderError {
+        ProviderError::Api {
+            status: 503,
+            message: "provider overloaded".to_owned(),
+        }
+    }
+
+    /// Fails the first `failed_attempts` streams (with an error, or an empty
+    /// stream when `failure` returns `None`), then streams text to completion.
+    struct RecoveringProvider {
+        calls: Arc<std::sync::atomic::AtomicU32>,
+        failed_attempts: u32,
+        failure: fn() -> Option<ProviderError>,
+    }
+
+    impl Provider for RecoveringProvider {
+        fn stream(&self, _: ModelRequest) -> ProviderStream {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call < self.failed_attempts {
+                return match (self.failure)() {
+                    Some(error) => Box::pin(stream::once(async move { Err(error) })),
+                    None => Box::pin(stream::iter(Vec::new())),
+                };
+            }
+            Box::pin(stream::iter([
+                Ok(ProviderEvent::OutputTextDelta {
+                    text: "recovered".to_owned(),
+                }),
+                Ok(ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_transient_provider_failures_and_completes() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runtime = Runtime::new(
+            RecoveringProvider {
+                calls: Arc::clone(&calls),
+                failed_attempts: 2,
+                failure: || Some(overloaded()),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunEvent::Failed { .. })),
+            "transient failures must not fail the run: {events:?}"
+        );
+        assert!(events.contains(&RunEvent::OutputTextDelta {
+            text: "recovered".to_owned()
+        }));
+        assert_eq!(events.last(), Some(&RunEvent::Completed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_a_stream_that_ends_without_a_terminal_event() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runtime = Runtime::new(
+            RecoveringProvider {
+                calls: Arc::clone(&calls),
+                failed_attempts: 1,
+                failure: || None,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(events.last(), Some(&RunEvent::Completed));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_non_transient_provider_failures() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runtime = Runtime::new(
+            RecoveringProvider {
+                calls: Arc::clone(&calls),
+                failed_attempts: u32::MAX,
+                failure: || {
+                    Some(ProviderError::Api {
+                        status: 401,
+                        message: "invalid key".to_owned(),
+                    })
+                },
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderAuthentication,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_exhausting_transient_retry_attempts() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runtime = Runtime::new(
+            RecoveringProvider {
+                calls: Arc::clone(&calls),
+                failed_attempts: u32::MAX,
+                failure: || Some(overloaded()),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderUnavailable,
+                message,
+            }) if message.contains("8 attempts")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn does_not_retry_after_visible_output_has_streamed() {
+        struct MidStreamFailureProvider {
+            calls: Arc<std::sync::atomic::AtomicU32>,
+        }
+
+        impl Provider for MidStreamFailureProvider {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "partial".to_owned(),
+                    }),
+                    Err(overloaded()),
+                ]))
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runtime = Runtime::new(
+            MidStreamFailureProvider {
+                calls: Arc::clone(&calls),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderUnavailable,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_retry_policy_fails_on_the_first_transient_error() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runtime = Runtime::new(
+            RecoveringProvider {
+                calls: Arc::clone(&calls),
+                failed_attempts: u32::MAX,
+                failure: || Some(overloaded()),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_turn_retry_policy(TurnRetryPolicy::disabled());
+
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderUnavailable,
+                ..
+            })
         ));
     }
 
