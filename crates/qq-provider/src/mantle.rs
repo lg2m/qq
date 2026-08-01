@@ -288,7 +288,7 @@ mod tests {
             reqwest::Client::new(),
             Some("us-east-1".to_owned()),
             HttpProtocol::GoogleGenerateContent,
-            BedrockAuth::ApiKey("mantle-test-secret".to_owned()),
+            BedrockAuth::ApiKey("mantle-test-secret".into()),
         )
         .expect_err("Google must be rejected before Mantle initialization");
 
@@ -305,7 +305,7 @@ mod tests {
             reqwest::Client::new(),
             Some("us-east-1".to_owned()),
             HttpProtocol::OpenAiResponses,
-            BedrockAuth::ApiKey("mantle-test-secret".to_owned()),
+            BedrockAuth::ApiKey("mantle-test-secret".into()),
         )
         .unwrap();
 
@@ -327,7 +327,7 @@ mod tests {
             reqwest::Client::new(),
             Some("us-east-1".to_owned()),
             HttpProtocol::OpenAiResponses,
-            BedrockAuth::ApiKey("mantle-test-secret".to_owned()),
+            BedrockAuth::ApiKey("mantle-test-secret".into()),
         )
         .unwrap();
 
@@ -355,7 +355,7 @@ mod tests {
                     build_direct_client().unwrap(),
                     mantle_endpoint("us-east-1", HttpProtocol::OpenAiResponses).unwrap(),
                     HttpProtocol::OpenAiResponses,
-                    HttpConstructionAuth::ApiKey("mantle-test-secret".to_owned()),
+                    HttpConstructionAuth::ApiKey("mantle-test-secret".into()),
                 )
             })
             .await;
@@ -377,7 +377,7 @@ mod tests {
                 build_direct_client().unwrap(),
                 endpoint,
                 protocol,
-                HttpConstructionAuth::ApiKey("mantle-test-secret".to_owned()),
+                HttpConstructionAuth::ApiKey("mantle-test-secret".into()),
             )
             .unwrap();
 
@@ -460,7 +460,7 @@ mod tests {
                 build_direct_client().unwrap(),
                 endpoint,
                 protocol,
-                HttpConstructionAuth::ApiKey("mantle-test-secret".to_owned()),
+                HttpConstructionAuth::ApiKey("mantle-test-secret".into()),
             )
             .unwrap();
             let events = provider

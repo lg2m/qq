@@ -1,6 +1,6 @@
 //! OpenAI Responses API adapter.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, SharedRequestCredentialProvider, ToolSpec,
+    credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     http::{
         ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
         build_client, build_direct_client, is_request_controlled_header, transport_error,
@@ -25,38 +26,16 @@ use crate::{
 const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 
 /// Authentication applied by an OpenAI-compatible Responses client.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResponsesAuth {
     NoAuth,
-    Bearer(String),
-    Header(String, String),
+    Bearer(SecretLiteral),
+    Header(String, SecretLiteral),
     Codex {
-        access_token: String,
-        account_id: String,
+        access_token: SecretLiteral,
+        account_id: SecretLiteral,
         is_fedramp: bool,
     },
-}
-
-impl fmt::Debug for ResponsesAuth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoAuth => formatter.write_str("NoAuth"),
-            Self::Bearer(_) => formatter
-                .debug_tuple("Bearer")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Header(name, _) => formatter
-                .debug_tuple("Header")
-                .field(name)
-                .field(&"<redacted>")
-                .finish(),
-            Self::Codex { .. } => formatter
-                .debug_struct("Codex")
-                .field("access_token", &"<redacted>")
-                .field("account_id", &"<redacted>")
-                .finish_non_exhaustive(),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,7 +66,7 @@ impl OpenAi {
     pub fn new(api_key: &str) -> Result<Self, ProviderError> {
         Self::with_endpoint(
             RESPONSES_ENDPOINT,
-            ResponsesAuth::Bearer(api_key.to_owned()),
+            ResponsesAuth::Bearer(api_key.into()),
             [],
             false,
         )
@@ -296,26 +275,11 @@ fn build_headers(
     match auth {
         ResponsesAuth::NoAuth => {}
         ResponsesAuth::Bearer(secret) => {
-            if secret.is_empty() {
-                return Err(ProviderError::Configuration(
-                    "Bearer secret must not be empty".to_owned(),
-                ));
-            }
-            let mut value = HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| {
-                ProviderError::Configuration(
-                    "Bearer secret is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            value.set_sensitive(true);
-            redactions.push(secret);
+            let value = sensitive_bearer_value(&secret, "Bearer secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             auth_headers.insert(AUTHORIZATION, value);
         }
         ResponsesAuth::Header(name, secret) => {
-            if secret.is_empty() {
-                return Err(ProviderError::Configuration(
-                    "authentication header secret must not be empty".to_owned(),
-                ));
-            }
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                 ProviderError::Configuration("authentication header name is invalid".to_owned())
             })?;
@@ -324,13 +288,8 @@ fn build_headers(
                     "authentication header is controlled by the HTTP client".to_owned(),
                 ));
             }
-            let mut value = HeaderValue::from_str(&secret).map_err(|_| {
-                ProviderError::Configuration(
-                    "authentication secret is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            value.set_sensitive(true);
-            redactions.push(secret);
+            let value = sensitive_header_value(&secret, "authentication header secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             auth_headers.insert(name, value);
         }
         ResponsesAuth::Codex {
@@ -338,33 +297,11 @@ fn build_headers(
             account_id,
             is_fedramp,
         } => {
-            if access_token.is_empty() {
-                return Err(ProviderError::Configuration(
-                    "Codex access token must not be empty".to_owned(),
-                ));
-            }
-            if account_id.is_empty() {
-                return Err(ProviderError::Configuration(
-                    "Codex account ID must not be empty".to_owned(),
-                ));
-            }
+            let authorization = sensitive_bearer_value(&access_token, "Codex access token")?;
+            let account_id_header = sensitive_header_value(&account_id, "Codex account ID")?;
 
-            let mut authorization = HeaderValue::from_str(&format!("Bearer {access_token}"))
-                .map_err(|_| {
-                    ProviderError::Configuration(
-                        "Codex access token is not a valid HTTP header value".to_owned(),
-                    )
-                })?;
-            authorization.set_sensitive(true);
-            let mut account_id_header = HeaderValue::from_str(&account_id).map_err(|_| {
-                ProviderError::Configuration(
-                    "Codex account ID is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            account_id_header.set_sensitive(true);
-
-            redactions.push(access_token);
-            redactions.push(account_id);
+            redactions.push(access_token.expose_secret().to_owned());
+            redactions.push(account_id.expose_secret().to_owned());
             auth_headers.insert(AUTHORIZATION, authorization);
             auth_headers.insert(
                 HeaderName::from_static("chatgpt-account-id"),
@@ -805,8 +742,8 @@ mod tests {
     #[test]
     fn default_constructor_uses_openai_endpoint_and_redacts_auth_debug() {
         let provider = OpenAi::new("openai-test-secret").unwrap();
-        let bearer = ResponsesAuth::Bearer("openai-test-secret".to_owned());
-        let header = ResponsesAuth::Header("x-api-key".to_owned(), "custom-test-secret".to_owned());
+        let bearer = ResponsesAuth::Bearer("openai-test-secret".into());
+        let header = ResponsesAuth::Header("x-api-key".to_owned(), "custom-test-secret".into());
 
         assert_eq!(provider.endpoint.as_str(), RESPONSES_ENDPOINT);
         assert!(!format!("{bearer:?}").contains("openai-test-secret"));
@@ -871,7 +808,7 @@ mod tests {
 
         let error = OpenAi::with_endpoint(
             "https://example.com/v1/responses",
-            ResponsesAuth::Header("x-api-key".to_owned(), "secret".to_owned()),
+            ResponsesAuth::Header("x-api-key".to_owned(), "secret".into()),
             [("x-api-key".to_owned(), "override".to_owned())],
             false,
         )
@@ -902,13 +839,28 @@ mod tests {
     #[test]
     fn preserves_nonempty_auth_secrets_without_trimming() {
         let (headers, redactions) = build_headers(
-            ResponsesAuth::Header("x-api-key".to_owned(), " ".to_owned()),
+            ResponsesAuth::Header("x-api-key".to_owned(), " padded secret ".into()),
             [],
         )
         .unwrap();
 
-        assert_eq!(headers["x-api-key"], " ");
-        assert_eq!(redactions, [" "]);
+        assert_eq!(headers["x-api-key"], " padded secret ");
+        assert_eq!(redactions, [" padded secret "]);
+    }
+
+    #[test]
+    fn rejects_blank_auth_secrets() {
+        let error = build_headers(
+            ResponsesAuth::Header("x-api-key".to_owned(), " ".into()),
+            [],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::Configuration(message)
+                if message == "authentication header secret must not be empty"
+        ));
     }
 
     #[test]
@@ -1186,7 +1138,7 @@ mod tests {
         let endpoint = format!("{}/custom/responses?api-version=42", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
-            ResponsesAuth::Header("x-api-key".to_owned(), "custom-test-secret".to_owned()),
+            ResponsesAuth::Header("x-api-key".to_owned(), "custom-test-secret".into()),
             [("x-client".to_owned(), "qq-tests".to_owned())],
             true,
         )
@@ -1240,8 +1192,8 @@ mod tests {
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Codex {
-                access_token: "codex-test-access-token".to_owned(),
-                account_id: "workspace-test-id".to_owned(),
+                access_token: "codex-test-access-token".into(),
+                account_id: "workspace-test-id".into(),
                 is_fedramp: true,
             },
             [],
@@ -1298,8 +1250,8 @@ mod tests {
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Codex {
-                access_token: "codex-test-access-token".to_owned(),
-                account_id: "workspace-test-id".to_owned(),
+                access_token: "codex-test-access-token".into(),
+                account_id: "workspace-test-id".into(),
                 is_fedramp: false,
             },
             [],
@@ -1450,7 +1402,7 @@ mod tests {
         let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
-            ResponsesAuth::Bearer("test-key".to_owned()),
+            ResponsesAuth::Bearer("test-key".into()),
             [],
             true,
         )
@@ -1485,7 +1437,7 @@ mod tests {
         let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
-            ResponsesAuth::Bearer("auth-test-secret".to_owned()),
+            ResponsesAuth::Bearer("auth-test-secret".into()),
             [("x-tenant".to_owned(), "tenant-test-secret".to_owned())],
             true,
         )

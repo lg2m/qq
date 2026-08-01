@@ -31,7 +31,7 @@ pub async fn assert_401_classifies_as_authentication(
     let provider = compile_http(
         format!("{}{base_path}", server.base_url),
         protocol,
-        HttpAuth::ApiKey("interface-test-secret".to_owned()),
+        HttpAuth::ApiKey("interface-test-secret".into()),
     );
 
     let events = provider
@@ -66,7 +66,7 @@ pub async fn assert_output_limit_ends_the_stream(protocol: HttpProtocol, sse_bod
     let provider = compile_http(
         server.base_url.clone(),
         protocol,
-        HttpAuth::ApiKey("interface-test-secret".to_owned()),
+        HttpAuth::ApiKey("interface-test-secret".into()),
     );
 
     // max_output_tokens = 1 clamps the output budget to its 64 KiB floor.

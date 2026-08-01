@@ -7,6 +7,7 @@
 use crate::{
     Provider, ProviderError, ProviderStream, SharedRequestCredentialProvider,
     anthropic::{AnthropicAuth, AnthropicMessages},
+    credentials::SecretLiteral,
     google::{GoogleAuth, GoogleEndpoint, GoogleGenerateContent},
     openai::{OpenAi, ResponsesAuth, ResponsesConstructionAuth},
     openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
@@ -24,12 +25,12 @@ pub(crate) enum HttpEndpointKind {
 /// Coherent authorization intent accepted by compiled HTTP construction.
 pub(crate) enum HttpConstructionAuth {
     NoAuth,
-    ApiKey(String),
-    Bearer(String),
-    Header(String, String),
+    ApiKey(SecretLiteral),
+    Bearer(SecretLiteral),
+    Header(String, SecretLiteral),
     Codex {
-        access_token: String,
-        account_id: String,
+        access_token: SecretLiteral,
+        account_id: SecretLiteral,
         is_fedramp: bool,
     },
     RequestTimeBearer(SharedRequestCredentialProvider),
@@ -277,10 +278,7 @@ mod tests {
         ] {
             construct_http_provider(
                 reqwest::Client::new(),
-                spec(
-                    protocol,
-                    HttpConstructionAuth::ApiKey("test-secret".to_owned()),
-                ),
+                spec(protocol, HttpConstructionAuth::ApiKey("test-secret".into())),
             )
             .unwrap();
         }
@@ -290,12 +288,12 @@ mod tests {
     fn constructs_every_supported_direct_auth_intent_without_network_io() {
         let cases = [
             HttpConstructionAuth::NoAuth,
-            HttpConstructionAuth::ApiKey("test-api-key".to_owned()),
-            HttpConstructionAuth::Bearer("test-bearer".to_owned()),
-            HttpConstructionAuth::Header("x-test-key".to_owned(), "test-value".to_owned()),
+            HttpConstructionAuth::ApiKey("test-api-key".into()),
+            HttpConstructionAuth::Bearer("test-bearer".into()),
+            HttpConstructionAuth::Header("x-test-key".to_owned(), "test-value".into()),
             HttpConstructionAuth::Codex {
-                access_token: "test-codex".to_owned(),
-                account_id: "test-account".to_owned(),
+                access_token: "test-codex".into(),
+                account_id: "test-account".into(),
                 is_fedramp: false,
             },
             HttpConstructionAuth::RequestTimeBearer(SharedRequestCredentialProvider::new(
@@ -333,8 +331,8 @@ mod tests {
                 spec(
                     protocol,
                     HttpConstructionAuth::Codex {
-                        access_token: "codex-secret".to_owned(),
-                        account_id: "account-secret".to_owned(),
+                        access_token: "codex-secret".into(),
+                        account_id: "account-secret".into(),
                         is_fedramp: false,
                     },
                 ),

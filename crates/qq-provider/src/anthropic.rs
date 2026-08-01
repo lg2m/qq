@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
+    credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     http::{
         ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
         build_client, build_direct_client, is_request_controlled_header, transport_error,
@@ -28,33 +29,12 @@ const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
 
 /// Authentication applied by an Anthropic-compatible Messages client.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnthropicAuth {
     NoAuth,
-    XApiKey(String),
-    Bearer(String),
-    Header(String, String),
-}
-
-impl fmt::Debug for AnthropicAuth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoAuth => formatter.write_str("NoAuth"),
-            Self::XApiKey(_) => formatter
-                .debug_tuple("XApiKey")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Bearer(_) => formatter
-                .debug_tuple("Bearer")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Header(name, _) => formatter
-                .debug_tuple("Header")
-                .field(name)
-                .field(&"<redacted>")
-                .finish(),
-        }
-    }
+    XApiKey(SecretLiteral),
+    Bearer(SecretLiteral),
+    Header(String, SecretLiteral),
 }
 
 /// A client for Anthropic-compatible Messages endpoints.
@@ -69,7 +49,7 @@ impl AnthropicMessages {
     pub fn new(api_key: &str) -> Result<Self, ProviderError> {
         Self::with_endpoint(
             MESSAGES_ENDPOINT,
-            AnthropicAuth::XApiKey(api_key.to_owned()),
+            AnthropicAuth::XApiKey(api_key.into()),
             [],
             false,
         )
@@ -351,31 +331,16 @@ fn build_headers(
     let auth_header = match auth {
         AnthropicAuth::NoAuth => None,
         AnthropicAuth::XApiKey(secret) => {
-            let value = sensitive_secret_header(&secret, "x-api-key")?;
-            redactions.push(secret);
+            let value = sensitive_header_value(&secret, "x-api-key secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((X_API_KEY, value))
         }
         AnthropicAuth::Bearer(secret) => {
-            if secret.trim().is_empty() {
-                return Err(ProviderError::Configuration(
-                    "Bearer secret must not be empty".to_owned(),
-                ));
-            }
-            let mut value = HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| {
-                ProviderError::Configuration(
-                    "Bearer secret is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            value.set_sensitive(true);
-            redactions.push(secret);
+            let value = sensitive_bearer_value(&secret, "Bearer secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((AUTHORIZATION, value))
         }
         AnthropicAuth::Header(name, secret) => {
-            if secret.trim().is_empty() {
-                return Err(ProviderError::Configuration(
-                    "authentication header secret must not be empty".to_owned(),
-                ));
-            }
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                 ProviderError::Configuration("authentication header name is invalid".to_owned())
             })?;
@@ -384,13 +349,8 @@ fn build_headers(
                     "authentication header is controlled by the provider".to_owned(),
                 ));
             }
-            let mut value = HeaderValue::from_str(&secret).map_err(|_| {
-                ProviderError::Configuration(
-                    "authentication secret is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            value.set_sensitive(true);
-            redactions.push(secret);
+            let value = sensitive_header_value(&secret, "authentication header secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((name, value))
         }
     };
@@ -409,19 +369,6 @@ fn build_headers(
         headers.push_redaction(redaction);
     }
     Ok(headers.finish())
-}
-
-fn sensitive_secret_header(secret: &str, name: &str) -> Result<HeaderValue, ProviderError> {
-    if secret.trim().is_empty() {
-        return Err(ProviderError::Configuration(format!(
-            "{name} secret must not be empty"
-        )));
-    }
-    let mut value = HeaderValue::from_str(secret).map_err(|_| {
-        ProviderError::Configuration(format!("{name} secret is not a valid HTTP header value"))
-    })?;
-    value.set_sensitive(true);
-    Ok(value)
 }
 
 fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
@@ -922,12 +869,9 @@ mod tests {
     fn default_constructor_uses_anthropic_endpoint_and_redacts_auth_debug() {
         let provider = AnthropicMessages::new("anthropic-test-secret").unwrap();
         let auth_values = [
-            AnthropicAuth::XApiKey("anthropic-test-secret".to_owned()),
-            AnthropicAuth::Bearer("anthropic-test-secret".to_owned()),
-            AnthropicAuth::Header(
-                "x-custom-auth".to_owned(),
-                "anthropic-test-secret".to_owned(),
-            ),
+            AnthropicAuth::XApiKey("anthropic-test-secret".into()),
+            AnthropicAuth::Bearer("anthropic-test-secret".into()),
+            AnthropicAuth::Header("x-custom-auth".to_owned(), "anthropic-test-secret".into()),
         ];
 
         assert_eq!(provider.endpoint.as_str(), MESSAGES_ENDPOINT);
@@ -996,7 +940,7 @@ mod tests {
 
         for (auth, headers) in [
             (
-                AnthropicAuth::Header("x-custom-auth".to_owned(), "secret".to_owned()),
+                AnthropicAuth::Header("x-custom-auth".to_owned(), "secret".into()),
                 vec![("x-custom-auth".to_owned(), "override".to_owned())],
             ),
             (
@@ -1027,10 +971,10 @@ mod tests {
         }
 
         for auth in [
-            AnthropicAuth::XApiKey(String::new()),
-            AnthropicAuth::Bearer(String::new()),
-            AnthropicAuth::Header("anthropic-version".to_owned(), "secret".to_owned()),
-            AnthropicAuth::Header("x-auth".to_owned(), String::new()),
+            AnthropicAuth::XApiKey("".into()),
+            AnthropicAuth::Bearer("".into()),
+            AnthropicAuth::Header("anthropic-version".to_owned(), "secret".into()),
+            AnthropicAuth::Header("x-auth".to_owned(), "".into()),
         ] {
             let error = AnthropicMessages::with_endpoint(
                 "https://example.com/v1/messages",
@@ -1333,7 +1277,7 @@ mod tests {
         let endpoint = format!("{}/custom/messages?api-version=42", server.base_url);
         let provider = AnthropicMessages::with_endpoint(
             &endpoint,
-            AnthropicAuth::XApiKey("custom-test-secret".to_owned()),
+            AnthropicAuth::XApiKey("custom-test-secret".into()),
             [("x-client".to_owned(), "qq-tests".to_owned())],
             true,
         )
@@ -1577,7 +1521,7 @@ mod tests {
         let endpoint = format!("{}/v1/messages", server.base_url);
         let provider = AnthropicMessages::with_endpoint(
             &endpoint,
-            AnthropicAuth::Bearer("stream-auth-secret".to_owned()),
+            AnthropicAuth::Bearer("stream-auth-secret".into()),
             [(
                 "x-client-secret".to_owned(),
                 "static-test-secret".to_owned(),
@@ -1607,7 +1551,7 @@ mod tests {
         let endpoint = format!("{}/v1/messages", server.base_url);
         let provider = AnthropicMessages::with_endpoint(
             &endpoint,
-            AnthropicAuth::XApiKey("test-api-secret".to_owned()),
+            AnthropicAuth::XApiKey("test-api-secret".into()),
             [(
                 "x-client-secret".to_owned(),
                 "static-test-secret".to_owned(),

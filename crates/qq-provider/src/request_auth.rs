@@ -18,7 +18,7 @@ use aws_sigv4::{
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
-use crate::{ProviderError, ProviderErrorKind};
+use crate::{ProviderError, ProviderErrorKind, credentials::SecretLiteral};
 
 pub type RequestCredentialFuture<'a> =
     Pin<Box<dyn Future<Output = Result<RequestCredential, RequestCredentialError>> + Send + 'a>>;
@@ -57,18 +57,18 @@ pub struct RequestCredential {
 
 #[derive(Clone)]
 enum RequestCredentialKind {
-    Bearer(String),
+    Bearer(SecretLiteral),
     Codex {
-        access_token: String,
-        account_id: String,
+        access_token: SecretLiteral,
+        account_id: SecretLiteral,
         is_fedramp: bool,
     },
 }
 
 impl RequestCredential {
     pub fn bearer(token: impl Into<String>) -> Result<Self, RequestCredentialError> {
-        let token = token.into();
-        validate_credential_value(&token)?;
+        let token = SecretLiteral::new(token);
+        validate_credential_value(token.expose_secret())?;
         Ok(Self {
             kind: RequestCredentialKind::Bearer(token),
         })
@@ -79,10 +79,10 @@ impl RequestCredential {
         account_id: impl Into<String>,
         is_fedramp: bool,
     ) -> Result<Self, RequestCredentialError> {
-        let access_token = access_token.into();
-        let account_id = account_id.into();
-        validate_credential_value(&access_token)?;
-        validate_credential_value(&account_id)?;
+        let access_token = SecretLiteral::new(access_token);
+        let account_id = SecretLiteral::new(account_id);
+        validate_credential_value(access_token.expose_secret())?;
+        validate_credential_value(account_id.expose_secret())?;
         Ok(Self {
             kind: RequestCredentialKind::Codex {
                 access_token,
@@ -266,19 +266,22 @@ fn apply_request_credential(
     let mut redactions = Vec::new();
     match credential.kind {
         RequestCredentialKind::Bearer(token) => {
+            let token = token.expose_secret();
             insert_sensitive_header(request, AUTHORIZATION, &format!("Bearer {token}"))?;
-            redactions.push(token);
+            redactions.push(token.to_owned());
         }
         RequestCredentialKind::Codex {
             access_token,
             account_id,
             is_fedramp,
         } => {
+            let access_token = access_token.expose_secret();
+            let account_id = account_id.expose_secret();
             insert_sensitive_header(request, AUTHORIZATION, &format!("Bearer {access_token}"))?;
             insert_sensitive_header(
                 request,
                 HeaderName::from_static("chatgpt-account-id"),
-                &account_id,
+                account_id,
             )?;
             request.headers_mut().insert(
                 HeaderName::from_static("originator"),
@@ -294,8 +297,8 @@ fn apply_request_credential(
                     .headers_mut()
                     .remove(HeaderName::from_static("x-openai-fedramp"));
             }
-            redactions.push(access_token);
-            redactions.push(account_id);
+            redactions.push(access_token.to_owned());
+            redactions.push(account_id.to_owned());
         }
     }
     Ok(redactions)

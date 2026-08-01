@@ -1,16 +1,17 @@
 //! Google Gemini GenerateContent API adapter.
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
+    credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     http::{
         ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
         build_client, is_request_controlled_header, transport_error, validate_endpoint,
@@ -25,33 +26,12 @@ const GENERATIVE_AI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/
 const X_GOOG_API_KEY: HeaderName = HeaderName::from_static("x-goog-api-key");
 
 /// Authentication applied by a Google GenerateContent-compatible client.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoogleAuth {
     NoAuth,
-    XGoogApiKey(String),
-    Bearer(String),
-    Header(String, String),
-}
-
-impl fmt::Debug for GoogleAuth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoAuth => formatter.write_str("NoAuth"),
-            Self::XGoogApiKey(_) => formatter
-                .debug_tuple("XGoogApiKey")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Bearer(_) => formatter
-                .debug_tuple("Bearer")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Header(name, _) => formatter
-                .debug_tuple("Header")
-                .field(name)
-                .field(&"<redacted>")
-                .finish(),
-        }
-    }
+    XGoogApiKey(SecretLiteral),
+    Bearer(SecretLiteral),
+    Header(String, SecretLiteral),
 }
 
 #[derive(Clone, Copy)]
@@ -76,7 +56,7 @@ impl GoogleGenerateContent {
             build_client()?,
             endpoint,
             GoogleEndpoint::Base,
-            GoogleAuth::XGoogApiKey(api_key.to_owned()),
+            GoogleAuth::XGoogApiKey(api_key.into()),
             [],
         )
     }
@@ -288,23 +268,13 @@ fn build_headers(
     let auth_header = match auth {
         GoogleAuth::NoAuth => None,
         GoogleAuth::XGoogApiKey(secret) => {
-            let value = sensitive_secret_header(&secret, "x-goog-api-key")?;
-            redactions.push(secret);
+            let value = sensitive_header_value(&secret, "x-goog-api-key secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((X_GOOG_API_KEY, value))
         }
         GoogleAuth::Bearer(secret) => {
-            if secret.trim().is_empty() {
-                return Err(ProviderError::Configuration(
-                    "Bearer secret must not be empty".to_owned(),
-                ));
-            }
-            let mut value = HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| {
-                ProviderError::Configuration(
-                    "Bearer secret is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            value.set_sensitive(true);
-            redactions.push(secret);
+            let value = sensitive_bearer_value(&secret, "Bearer secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((AUTHORIZATION, value))
         }
         GoogleAuth::Header(name, secret) => {
@@ -316,8 +286,8 @@ fn build_headers(
                     "authentication header is controlled by the provider".to_owned(),
                 ));
             }
-            let value = sensitive_secret_header(&secret, "authentication header")?;
-            redactions.push(secret);
+            let value = sensitive_header_value(&secret, "authentication header secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((name, value))
         }
     };
@@ -332,19 +302,6 @@ fn build_headers(
         headers.push_redaction(redaction);
     }
     Ok(headers.finish())
-}
-
-fn sensitive_secret_header(secret: &str, name: &str) -> Result<HeaderValue, ProviderError> {
-    if secret.trim().is_empty() {
-        return Err(ProviderError::Configuration(format!(
-            "{name} secret must not be empty"
-        )));
-    }
-    let mut value = HeaderValue::from_str(secret).map_err(|_| {
-        ProviderError::Configuration(format!("{name} secret is not a valid HTTP header value"))
-    })?;
-    value.set_sensitive(true);
-    Ok(value)
 }
 
 fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
@@ -862,7 +819,7 @@ mod tests {
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&base_url, true).unwrap(),
             GoogleEndpoint::Base,
-            GoogleAuth::XGoogApiKey("google-test-secret".to_owned()),
+            GoogleAuth::XGoogApiKey("google-test-secret".into()),
             [],
         )
         .unwrap();
@@ -1303,7 +1260,7 @@ mod tests {
                 crate::http::build_direct_client().unwrap(),
                 endpoint,
                 GoogleEndpoint::Base,
-                GoogleAuth::XGoogApiKey("secret".to_owned()),
+                GoogleAuth::XGoogApiKey("secret".into()),
                 [("x-goog-api-key".to_owned(), "override".to_owned())],
             )
             .is_err()
@@ -1323,7 +1280,7 @@ mod tests {
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
             GoogleEndpoint::Exact,
-            GoogleAuth::XGoogApiKey(secret.to_owned()),
+            GoogleAuth::XGoogApiKey(secret.into()),
             [],
         )
         .unwrap();

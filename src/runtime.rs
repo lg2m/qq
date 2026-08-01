@@ -544,7 +544,7 @@ impl RuntimeFactory {
                     &key_auth,
                     std::iter::empty::<(&str, &str)>(),
                 );
-                (ProviderBedrockAuth::ApiKey(api_key), key)
+                (ProviderBedrockAuth::ApiKey(api_key.into()), key)
             }
         };
 
@@ -617,7 +617,7 @@ impl RuntimeFactory {
                     &key_auth,
                     std::iter::empty::<(&str, &str)>(),
                 );
-                (ProviderBedrockAuth::ApiKey(api_key), key)
+                (ProviderBedrockAuth::ApiKey(api_key.into()), key)
             }
         };
 
@@ -916,12 +916,11 @@ impl ResolvedAuth {
     fn into_http(self) -> Result<HttpAuth, AuthError> {
         match self {
             Self::NoAuth => Ok(HttpAuth::NoAuth),
-            Self::ApiKey(secret) => Ok(HttpAuth::ApiKey(secret.expose_secret_str()?.to_owned())),
-            Self::Bearer(secret) => Ok(HttpAuth::Bearer(secret.expose_secret_str()?.to_owned())),
-            Self::Header(name, secret) => Ok(HttpAuth::Header(
-                name,
-                secret.expose_secret_str()?.to_owned(),
-            )),
+            Self::ApiKey(secret) => Ok(HttpAuth::ApiKey(secret.expose_secret_str()?.into())),
+            Self::Bearer(secret) => Ok(HttpAuth::Bearer(secret.expose_secret_str()?.into())),
+            Self::Header(name, secret) => {
+                Ok(HttpAuth::Header(name, secret.expose_secret_str()?.into()))
+            }
         }
     }
 
