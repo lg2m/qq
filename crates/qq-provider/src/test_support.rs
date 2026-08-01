@@ -1,4 +1,7 @@
 //! Shared loopback HTTP fixtures for provider interface tests.
+//!
+//! Compiled for unit tests and, behind the `test-support` feature, for this
+//! package's own integration tests. Not part of the crate's public API.
 
 use std::{
     io::{Read, Write},
@@ -7,16 +10,16 @@ use std::{
     time::Duration,
 };
 
-pub(crate) struct CapturedRequest {
+pub struct CapturedRequest {
     wire: String,
 }
 
 impl CapturedRequest {
-    pub(crate) fn request_line(&self) -> Option<&str> {
+    pub fn request_line(&self) -> Option<&str> {
         self.head().lines().next()
     }
 
-    pub(crate) fn header(&self, expected_name: &str) -> Option<&str> {
+    pub fn header(&self, expected_name: &str) -> Option<&str> {
         self.head()
             .lines()
             .skip(1)
@@ -25,7 +28,7 @@ impl CapturedRequest {
             .map(|(_, value)| value.trim())
     }
 
-    pub(crate) fn json_body(&self) -> serde_json::Value {
+    pub fn json_body(&self) -> serde_json::Value {
         serde_json::from_str(self.body()).expect("captured request body must be JSON")
     }
 
@@ -44,35 +47,31 @@ impl CapturedRequest {
     }
 }
 
-pub(crate) struct LoopbackServer {
-    pub(crate) base_url: String,
+pub struct LoopbackServer {
+    pub base_url: String,
     request: JoinHandle<CapturedRequest>,
 }
 
 impl LoopbackServer {
-    pub(crate) fn sse(body: impl Into<String>) -> Self {
+    pub fn sse(body: impl Into<String>) -> Self {
         Self::respond(200, "text/event-stream", body)
     }
 
     /// Serves an SSE response whose body arrives as the given wire chunks,
     /// flushed one at a time — for byte-boundary and UTF-8 frame-splitting
     /// tests. Chunks may split multi-byte characters.
-    pub(crate) fn sse_chunks(chunks: Vec<Vec<u8>>) -> Self {
+    pub fn sse_chunks(chunks: Vec<Vec<u8>>) -> Self {
         Self::respond_chunks(200, Some("text/event-stream"), chunks)
     }
 
-    pub(crate) fn respond(
-        status: u16,
-        content_type: &'static str,
-        body: impl Into<String>,
-    ) -> Self {
+    pub fn respond(status: u16, content_type: &'static str, body: impl Into<String>) -> Self {
         Self::respond_chunks(status, Some(content_type), vec![body.into().into_bytes()])
     }
 
     /// The general form: arbitrary status, optional `Content-Type` (omitted
     /// entirely when `None`, so missing-header behavior is testable), and a
     /// scripted body written chunk by chunk.
-    pub(crate) fn respond_chunks(
+    pub fn respond_chunks(
         status: u16,
         content_type: Option<&'static str>,
         chunks: Vec<Vec<u8>>,
@@ -114,7 +113,7 @@ impl LoopbackServer {
         Self { base_url, request }
     }
 
-    pub(crate) fn capture(self) -> CapturedRequest {
+    pub fn capture(self) -> CapturedRequest {
         self.request.join().expect("loopback server must not panic")
     }
 }
@@ -196,7 +195,10 @@ mod tests {
         let (head, body) = raw_exchange(&server.base_url, "{}");
 
         assert!(head.starts_with("HTTP/1.1 200"), "unexpected head: {head}");
-        assert_eq!(head_header(&head, "content-type"), Some("text/event-stream"));
+        assert_eq!(
+            head_header(&head, "content-type"),
+            Some("text/event-stream")
+        );
         assert_eq!(
             head_header(&head, "content-length"),
             Some("data: {\"text\":\"❤\"}\n\n".len().to_string().as_str())
@@ -240,10 +242,7 @@ mod tests {
         let request = server.capture();
 
         assert_eq!(request.request_line(), Some("POST /probe HTTP/1.1"));
-        assert_eq!(
-            request.header("content-type"),
-            Some("application/json")
-        );
+        assert_eq!(request.header("content-type"), Some("application/json"));
         assert_eq!(request.header("x-absent"), None);
         assert_eq!(request.json_body()["model"], "test-model");
     }

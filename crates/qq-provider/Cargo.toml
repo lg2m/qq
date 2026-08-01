@@ -27,7 +27,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[features]
+# Exposes the loopback test harness (`test_support`) to this package's own
+# integration tests via the self dev-dependency below. Not a public API.
+test-support = []
+
 [dev-dependencies]
+qq-provider = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
