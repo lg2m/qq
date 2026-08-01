@@ -705,11 +705,10 @@ async fn spawn_child_run(
         ));
     }
     let mut selection = parent.model.clone();
-    if let Some(model) = model {
+    if let Some(model) = model.and_then(|model| {
         let model = model.trim().to_owned();
-        if model.is_empty() {
-            return spawn_error("model must not be empty when provided");
-        }
+        (!model.is_empty()).then_some(model)
+    }) {
         selection.model = Some(model);
     } else {
         selection = match inner
@@ -13533,6 +13532,11 @@ mod tests {
 
     impl RuntimeLoader for QueueLoader {
         fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let spawn_model_routes = self
+                .routed
+                .iter()
+                .map(|(model, _)| (*model).to_owned())
+                .collect::<Vec<_>>();
             let provider = self
                 .routed
                 .iter()
@@ -13550,7 +13554,7 @@ mod tests {
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
+                        runtime: Arc::new(runtime.with_spawn_model_routes(spawn_model_routes)),
                         pricing: None,
                     })
                     .map_err(|error| RuntimeLoadError {
@@ -13582,6 +13586,10 @@ mod tests {
 
         fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             self.loads.lock().unwrap().push(request.model.clone());
+            let mut spawn_model_routes = vec!["test/explicit".to_owned()];
+            if let Some(worker) = self.worker.as_ref().and_then(|worker| worker.model.clone()) {
+                spawn_model_routes.push(worker);
+            }
             let provider = if request.model.model.as_deref() == Some("test/model") {
                 Arc::clone(&self.parent)
             } else {
@@ -13590,7 +13598,7 @@ mod tests {
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
+                        runtime: Arc::new(runtime.with_spawn_model_routes(spawn_model_routes)),
                         pricing: None,
                     })
                     .map_err(|error| RuntimeLoadError {
@@ -13754,7 +13762,10 @@ mod tests {
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
+                        runtime: Arc::new(runtime.with_spawn_model_routes(vec![
+                            "test/child-first".to_owned(),
+                            "test/child-second".to_owned(),
+                        ])),
                         pricing: Some(ModelPricing {
                             input_usd_nanos_per_token: 1,
                             output_usd_nanos_per_token: 1,

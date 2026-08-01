@@ -775,7 +775,18 @@ impl RuntimeLoader for RuntimeFactory {
                     .and_then(|provider| provider.models().get(snapshot.model().model()))
                     .and_then(|metadata| metadata.pricing())
                     .cloned();
-                let runtime = factory.runtime_for_snapshot(&snapshot)?;
+                let spawn_model_routes = factory
+                    .configured_model_options(&snapshot)
+                    .into_iter()
+                    .filter_map(|model| model.selection.model)
+                    .collect();
+                let runtime = Arc::new(
+                    factory
+                        .runtime_for_snapshot(&snapshot)?
+                        .as_ref()
+                        .clone()
+                        .with_spawn_model_routes(spawn_model_routes),
+                );
                 Ok::<_, RuntimeBuildError>(LoadedRuntime { runtime, pricing })
             })
             .await;

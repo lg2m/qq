@@ -351,7 +351,25 @@ impl BuiltInTool {
 /// The declaration for [`SPAWN_AGENT_TOOL`]. Kept out of [`specs`] because it
 /// joins the tool list only when the run may spawn: child sessions and
 /// session-less runs never see it.
-pub(crate) fn spawn_agent_spec() -> ToolSpec {
+pub(crate) fn spawn_agent_spec(model_routes: &[String]) -> ToolSpec {
+    let mut properties = serde_json::Map::from_iter([(
+        "task".to_owned(),
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "A complete, self-contained brief for the sub-agent."
+        }),
+    )]);
+    if !model_routes.is_empty() {
+        properties.insert(
+            "model".to_owned(),
+            json!({
+                "type": "string",
+                "enum": model_routes,
+                "description": "Exact authenticated provider/model override. Omit by default to use QQ's configured worker model or this session's selected model. Set only when the user explicitly requests one of these exact routes; never guess or translate providers."
+            }),
+        );
+    }
     ToolSpec::new(
         SPAWN_AGENT_TOOL,
         "Delegate one self-contained task to a read-only sub-agent in this workspace and receive \
@@ -361,23 +379,16 @@ pub(crate) fn spawn_agent_spec() -> ToolSpec {
          task brief must carry everything the sub-agent needs: it starts with no other context. \
          Omit model by default so QQ uses its configured worker model or the current session's \
          selected model. Set model only when the user explicitly requests an exact provider/model \
-         route; never guess, translate, or invent a route.",
-        json!({
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "A complete, self-contained brief for the sub-agent."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Exact provider/model override. Omit by default to use QQ's configured worker model or this session's selected model. Set only when the user explicitly requests this exact route; never guess or translate providers."
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        }),
+         route listed by this tool; never guess, translate, or invent a route.",
+        serde_json::Value::Object(serde_json::Map::from_iter([
+            ("type".to_owned(), json!("object")),
+            (
+                "properties".to_owned(),
+                serde_json::Value::Object(properties),
+            ),
+            ("required".to_owned(), json!(["task"])),
+            ("additionalProperties".to_owned(), json!(false)),
+        ])),
     )
 }
 
@@ -2004,7 +2015,11 @@ mod tests {
 
     #[test]
     fn spawn_agent_model_override_is_explicit_and_omitted_by_default() {
-        let spec = spawn_agent_spec();
+        let routes = [
+            "anthropic/claude-test".to_owned(),
+            "openai-codex/gpt-test".to_owned(),
+        ];
+        let spec = spawn_agent_spec(&routes);
         assert!(spec.description().contains("Omit model by default"));
         assert!(
             spec.description()
@@ -2012,6 +2027,7 @@ mod tests {
         );
         let schema = spec.input_schema();
         assert_eq!(schema["required"], json!(["task"]));
+        assert_eq!(schema["properties"]["model"]["enum"], json!(routes));
         let model = schema["properties"]["model"]["description"]
             .as_str()
             .unwrap();
@@ -2019,6 +2035,14 @@ mod tests {
         assert!(model.contains("configured worker model"));
         assert!(model.contains("this session's selected model"));
         assert!(model.contains("never guess or translate providers"));
+    }
+
+    #[test]
+    fn spawn_agent_hides_model_override_without_authenticated_routes() {
+        let spec = spawn_agent_spec(&[]);
+        let schema = spec.input_schema();
+        assert!(schema["properties"].get("model").is_none());
+        assert_eq!(schema["required"], json!(["task"]));
     }
 
     #[test]

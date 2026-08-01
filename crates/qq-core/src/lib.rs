@@ -235,6 +235,7 @@ pub struct Runtime {
     model: Arc<str>,
     max_output_tokens: u32,
     mcp: Option<Arc<dyn McpRegistry>>,
+    spawn_model_routes: Arc<[String]>,
 }
 
 impl Runtime {
@@ -265,6 +266,7 @@ impl Runtime {
             model,
             max_output_tokens,
             mcp: None,
+            spawn_model_routes: Arc::from([]),
         })
     }
 
@@ -274,6 +276,18 @@ impl Runtime {
     #[must_use]
     pub fn with_mcp_registry(mut self, registry: Arc<dyn McpRegistry>) -> Self {
         self.mcp = Some(registry);
+        self
+    }
+
+    /// Restricts model-visible sub-agent overrides to authenticated canonical
+    /// routes supplied by the embedding application. Omission still resolves
+    /// through the configured worker model and persisted parent selection.
+    #[must_use]
+    pub fn with_spawn_model_routes(mut self, mut routes: Vec<String>) -> Self {
+        routes.sort();
+        routes.dedup();
+        routes.retain(|route| !route.trim().is_empty());
+        self.spawn_model_routes = routes.into();
         self
     }
 
@@ -431,6 +445,7 @@ impl Runtime {
         let model = Arc::clone(&self.model);
         let max_output_tokens = self.max_output_tokens;
         let mcp = self.mcp.clone();
+        let spawn_model_routes = Arc::clone(&self.spawn_model_routes);
         Box::pin(stream! {
             let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
             yield RuntimeEvent::Started;
@@ -462,7 +477,7 @@ impl Runtime {
             // The sub-agent tool is declared only when this run may spawn:
             // depth is one, so child runs (spawner-less) never see it.
             if spawner.is_some() {
-                tool_specs.push(tools::spawn_agent_spec());
+                tool_specs.push(tools::spawn_agent_spec(&spawn_model_routes));
             }
             if let Some(registry) = &mcp {
                 for spec in registry.tool_specs().await {
@@ -847,6 +862,7 @@ impl Runtime {
                     let cancelled = Arc::clone(&cancelled);
                     let mcp = mcp.clone();
                     let spawner = spawner.clone();
+                    let spawn_model_routes = Arc::clone(&spawn_model_routes);
                     async move {
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
@@ -869,11 +885,28 @@ impl Runtime {
                                                 true,
                                             )
                                         }
-                                        Ok(arguments) => {
-                                            let outcome = spawner
-                                                .spawn(arguments.task, arguments.model)
-                                                .await;
-                                            tools::bounded_result(outcome.content, outcome.is_error)
+                                        Ok(mut arguments) => {
+                                            arguments.model = arguments.model.and_then(|model| {
+                                                let model = model.trim().to_owned();
+                                                (!model.is_empty()).then_some(model)
+                                            });
+                                            if arguments.model.as_ref().is_some_and(|model| {
+                                                !spawn_model_routes.iter().any(|route| route == model)
+                                            }) {
+                                                tools::bounded_result(
+                                                    "model must be omitted or exactly match an authenticated route listed by this tool"
+                                                        .to_owned(),
+                                                    true,
+                                                )
+                                            } else {
+                                                let outcome = spawner
+                                                    .spawn(arguments.task, arguments.model)
+                                                    .await;
+                                                tools::bounded_result(
+                                                    outcome.content,
+                                                    outcome.is_error,
+                                                )
+                                            }
                                         }
                                         Err(error) => tools::bounded_result(
                                             format!("invalid arguments: {error}"),
@@ -2556,6 +2589,7 @@ mod tests {
     /// Scripts one `spawn_agent` call on the first turn, then completes.
     struct SpawnCallProvider {
         turn: Mutex<usize>,
+        model: Option<&'static str>,
     }
 
     impl Provider for SpawnCallProvider {
@@ -2572,7 +2606,10 @@ mod tests {
                     }),
                     Ok(ProviderEvent::ToolCallArgumentsDelta {
                         id: "call_0".to_owned(),
-                        json: r#"{"task":"count the widgets"}"#.to_owned(),
+                        json: self.model.map_or_else(
+                            || r#"{"task":"count the widgets"}"#.to_owned(),
+                            |model| format!(r#"{{"task":"count the widgets","model":"{model}"}}"#),
+                        ),
                     }),
                     Ok(ProviderEvent::ToolCallCompleted {
                         id: "call_0".to_owned(),
@@ -2626,6 +2663,7 @@ mod tests {
             CapturingSpawnProvider {
                 inner: SpawnCallProvider {
                     turn: Mutex::new(0),
+                    model: None,
                 },
                 requests: Arc::clone(&requests),
             },
@@ -2679,6 +2717,7 @@ mod tests {
         let runtime = Runtime::new(
             SpawnCallProvider {
                 turn: Mutex::new(0),
+                model: None,
             },
             "gpt-test",
             256,
@@ -2716,6 +2755,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn spawn_model_overrides_are_normalized_and_restricted_to_advertised_routes() {
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        let cases = [
+            (None, None, false),
+            (Some(""), None, false),
+            (Some("   "), None, false),
+            (
+                Some("openai-codex/gpt-test"),
+                Some("openai-codex/gpt-test"),
+                false,
+            ),
+            (Some("openai/gpt-guessed"), None, true),
+        ];
+        for (requested, expected, rejected) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let tasks = Arc::new(Mutex::new(Vec::new()));
+            let spawner = Arc::new(StubSpawner {
+                outcome: SpawnAgentOutcome {
+                    content: "child answer".to_owned(),
+                    is_error: false,
+                },
+                tasks: Arc::clone(&tasks),
+            });
+            let runtime = Runtime::new(
+                SpawnCallProvider {
+                    turn: Mutex::new(0),
+                    model: requested,
+                },
+                "gpt-test",
+                256,
+            )
+            .unwrap()
+            .with_spawn_model_routes(vec!["openai-codex/gpt-test".to_owned()]);
+
+            let events = runtime
+                .run_loop_with_spawner(
+                    vec![Message::user("go")],
+                    directory.path().to_owned(),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AllowAllGate),
+                    Arc::new(tools::FileState::default()),
+                    Some(spawner),
+                )
+                .collect::<Vec<_>>()
+                .await;
+
+            let result = events.iter().find_map(|event| match event {
+                RuntimeEvent::ToolCallFinished {
+                    result, is_error, ..
+                } => Some((result, *is_error)),
+                _ => None,
+            });
+            if rejected {
+                let (result, is_error) = result.expect("rejected call returns a tool result");
+                assert!(is_error);
+                assert!(result.contains("authenticated route listed by this tool"));
+                assert!(tasks.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    tasks.lock().unwrap().as_slice(),
+                    &[("count the widgets".to_owned(), expected.map(str::to_owned))]
+                );
+            }
+        }
+    }
+
     #[test]
     fn agent_prompt_teaches_delegation_only_when_spawn_agent_is_declared() {
         let workspace = std::path::Path::new("/tmp/qq-prompt-test");
@@ -2724,7 +2837,7 @@ mod tests {
         assert!(!without.contains("Delegation:"));
 
         let mut specs = tools::specs();
-        specs.push(tools::spawn_agent_spec());
+        specs.push(tools::spawn_agent_spec(&[]));
         let with = agent_system_prompt(workspace, &specs);
         assert!(with.contains("spawn_agent"));
         assert!(with.contains("Delegation:"));
