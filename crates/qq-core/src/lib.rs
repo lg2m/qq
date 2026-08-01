@@ -41,9 +41,20 @@ pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
 type RuntimeStream = Pin<Box<dyn Stream<Item = RuntimeEvent> + Send + 'static>>;
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 16;
-const MAX_TOOL_CALLS_PER_RUN: usize = 64;
-// Leave room for the final answer after the last permitted tool call.
+// A runaway-loop backstop, not a work limiter: routine agentic tasks
+// must finish well below it. Exhaustion settles the run with a
+// tool-free final turn, never a failure, so the session always
+// continues from where the run stopped.
+const MAX_TOOL_CALLS_PER_RUN: usize = 256;
+// Leave room for the reserved final answer after the last permitted
+// tool call.
 const MAX_MODEL_TURNS: u16 = MAX_TOOL_CALLS_PER_RUN as u16 + 1;
+// Appended to the system prompt on the reserved final turn so the
+// model closes the run in a resumable state instead of attempting
+// more work.
+const TOOL_BUDGET_NOTICE: &str = "This run has used its entire tool budget, so no tools are \
+available for this reply. Summarize what was accomplished, what remains, and the exact next \
+step. The session keeps this full history: the next prompt resumes where this run stopped.";
 const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_TOOL_CALL_ID_BYTES: usize = 1_024;
 const MAX_TOOL_NAME_BYTES: usize = 128;
@@ -468,9 +479,22 @@ impl Runtime {
             let mut total_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
             for turn_ordinal in 1..=MAX_MODEL_TURNS {
-                let request = ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens)
-                    .with_tools(tool_specs.clone())
-                    .with_system(Arc::clone(&system));
+                // Once the tool budget is spent (or only the reserved turn
+                // remains), the model gets one tool-free turn to settle.
+                // The run then completes normally, so every committed turn
+                // stays valid context and a follow-up prompt resumes where
+                // this run stopped — budget exhaustion is never a failure.
+                let final_turn = total_tool_calls >= MAX_TOOL_CALLS_PER_RUN
+                    || turn_ordinal == MAX_MODEL_TURNS;
+                let request =
+                    ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens);
+                let request = if final_turn {
+                    request.with_system(format!("{system}\n\n{TOOL_BUDGET_NOTICE}"))
+                } else {
+                    request
+                        .with_tools(tool_specs.clone())
+                        .with_system(Arc::clone(&system))
+                };
                 let mut activity = RunActivity::WaitingForProvider;
                 yield RuntimeEvent::ActivityChanged { activity };
                 let mut provider_events = provider.stream(request);
@@ -588,10 +612,13 @@ impl Runtime {
                                 };
                                 return;
                             }
-                            if total_tool_calls >= MAX_TOOL_CALLS_PER_RUN {
+                            // The per-run budget is enforced at the top of the
+                            // turn, where it settles gracefully; a call arriving
+                            // on the reserved tool-free turn is a provider bug.
+                            if final_turn {
                                 yield RuntimeEvent::Failed {
-                                    kind: RunFailureKind::Policy,
-                                    message: format!("tool loop exceeded {MAX_TOOL_CALLS_PER_RUN} calls in one run"),
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: "provider requested a tool on the reserved final turn, which declares none".to_owned(),
                                 };
                                 return;
                             }
@@ -2052,23 +2079,28 @@ mod tests {
             })
         ));
 
-        struct TooManyAcrossTurns {
-            turn: Mutex<usize>,
+        struct RespectsFinalTurn {
+            turn: Arc<Mutex<usize>>,
         }
 
-        impl Provider for TooManyAcrossTurns {
-            fn stream(&self, _: ModelRequest) -> ProviderStream {
+        impl Provider for RespectsFinalTurn {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
                 let mut turn = self.turn.lock().unwrap();
                 let current = *turn;
                 *turn += 1;
                 drop(turn);
-                let count = if current < MAX_TOOL_CALLS_PER_RUN / MAX_TOOL_CALLS_PER_TURN {
-                    MAX_TOOL_CALLS_PER_TURN
-                } else {
-                    1
-                };
-                let mut events = Vec::with_capacity(count * 3 + 1);
-                for index in 0..count {
+                // The reserved final turn declares no tools; a conforming
+                // provider answers with text and completes.
+                if request.tools().is_empty() {
+                    return Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "stopping point recorded".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]));
+                }
+                let mut events = Vec::with_capacity(MAX_TOOL_CALLS_PER_TURN * 3 + 1);
+                for index in 0..MAX_TOOL_CALLS_PER_TURN {
                     let id = format!("call-{current}-{index}");
                     events.push(Ok(ProviderEvent::ToolCallStarted {
                         id: id.clone(),
@@ -2085,9 +2117,13 @@ mod tests {
             }
         }
 
+        // A model that would consume tools forever settles gracefully:
+        // exhausting the budget triggers one tool-free final turn and the
+        // run completes, leaving the session resumable instead of failed.
+        let turns = Arc::new(Mutex::new(0));
         let runtime = Runtime::new(
-            TooManyAcrossTurns {
-                turn: Mutex::new(0),
+            RespectsFinalTurn {
+                turn: Arc::clone(&turns),
             },
             "gpt-test",
             256,
@@ -2097,13 +2133,15 @@ mod tests {
             .run(RunCommand::new("hello"))
             .collect::<Vec<_>>()
             .await;
-        assert!(matches!(
-            events.last(),
-            Some(RunEvent::Failed {
-                kind: RunFailureKind::Policy,
-                ..
-            })
-        ));
+        assert_eq!(events.last(), Some(&RunEvent::Completed));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::OutputTextDelta { text } if text == "stopping point recorded"
+        )));
+        assert_eq!(
+            *turns.lock().unwrap(),
+            MAX_TOOL_CALLS_PER_RUN / MAX_TOOL_CALLS_PER_TURN + 1
+        );
 
         struct FiniteToolTurns {
             turn: Mutex<usize>,
@@ -2185,12 +2223,14 @@ mod tests {
             .run(RunCommand::new("hello"))
             .collect::<Vec<_>>()
             .await;
+        // A provider that emits a tool call on the reserved tool-free
+        // final turn is violating the request, not the run policy.
         assert!(matches!(
             events.last(),
             Some(RunEvent::Failed {
-                kind: RunFailureKind::Policy,
+                kind: RunFailureKind::ProviderProtocol,
                 message,
-            }) if message.contains("64 calls")
+            }) if message.contains("reserved final turn")
         ));
     }
 
