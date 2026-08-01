@@ -843,15 +843,10 @@ fn api_error(rejection: HttpRejection) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread::{self, JoinHandle},
-        time::Duration,
-    };
-
     use futures_util::StreamExt;
     use serde_json::json;
+
+    use crate::test_support::LoopbackServer;
 
     use super::*;
 
@@ -861,7 +856,8 @@ mod tests {
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]},\"index\":0}]}\n\n",
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":20,\"cachedContentTokenCount\":6,\"candidatesTokenCount\":7,\"thoughtsTokenCount\":3}}\n\n",
         );
-        let (base_url, server) = serve_once(200, "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let base_url = server.base_url.clone();
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&base_url, true).unwrap(),
@@ -895,20 +891,17 @@ mod tests {
                 }),
             ] if first == "Hel" && second == "lo"
         ));
-        let request = server.join().unwrap();
-        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let request = server.capture();
         assert_eq!(
-            head.lines().next(),
+            request.request_line(),
             Some("POST /models/gemini-test:streamGenerateContent?alt=sse HTTP/1.1")
         );
         assert_eq!(
-            request_header(head, "x-goog-api-key"),
+            request.header("x-goog-api-key"),
             Some("google-test-secret")
         );
-        assert!(!head.contains("google-test-secret?"));
-        let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(
-            body,
+            request.json_body(),
             serde_json::json!({
                 "contents": [
                     {"role": "user", "parts": [{"text": "hello"}]},
@@ -940,7 +933,8 @@ mod tests {
     #[tokio::test]
     async fn sends_tool_declarations_and_tool_history_parts() {
         let body = "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"index\":0}]}\n\n";
-        let (endpoint, server) = serve_once(200, "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let endpoint = server.base_url.clone();
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
@@ -997,10 +991,8 @@ mod tests {
             &events[..],
             [Ok(ProviderEvent::Completed { usage: None })]
         ));
-        let request = server.join().unwrap();
-        let body = request.split_once("\r\n\r\n").unwrap().1;
         assert_eq!(
-            serde_json::from_str::<Value>(body).unwrap(),
+            server.capture().json_body(),
             serde_json::json!({
                 "contents": [
                     {"role": "user", "parts": [{"text": "read the config"}]},
@@ -1036,7 +1028,8 @@ mod tests {
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"checking\"}]},\"index\":0}]}\n\n",
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\" constraints\"},{\"text\":\"answer\"}]},\"finishReason\":\"STOP\",\"index\":0}]}\n\n",
         );
-        let (endpoint, server) = serve_once(200, "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let endpoint = server.base_url.clone();
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
@@ -1057,7 +1050,7 @@ mod tests {
             .into_iter()
             .map(Result::unwrap)
             .collect::<Vec<_>>();
-        server.join().unwrap();
+        server.capture();
 
         assert_eq!(
             events,
@@ -1093,7 +1086,8 @@ mod tests {
             "{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"b.rs\"}}}",
             "]},\"finishReason\":\"STOP\",\"index\":0}]}\n\n",
         );
-        let (endpoint, server) = serve_once(200, "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let endpoint = server.base_url.clone();
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
@@ -1113,7 +1107,7 @@ mod tests {
             .into_iter()
             .map(Result::unwrap)
             .collect::<Vec<_>>();
-        server.join().unwrap();
+        server.capture();
 
         assert_eq!(
             events,
@@ -1322,11 +1316,12 @@ mod tests {
     #[tokio::test]
     async fn redacts_api_keys_from_http_errors() {
         let secret = "google-secret-value";
-        let (endpoint, server) = serve_once(
+        let server = LoopbackServer::respond(
             403,
             "application/json",
-            &format!(r#"{{"error":{{"message":"bad key {secret}"}}}}"#),
+            format!(r#"{{"error":{{"message":"bad key {secret}"}}}}"#),
         );
+        let endpoint = server.base_url.clone();
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
@@ -1346,7 +1341,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap_err();
-        server.join().unwrap();
+        server.capture();
 
         assert!(!error.to_string().contains(secret));
         assert!(error.to_string().contains("[REDACTED]"));
@@ -1354,11 +1349,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_incomplete_and_non_sse_responses() {
-        let (endpoint, incomplete_server) = serve_once(
-            200,
-            "text/event-stream",
+        let incomplete_server = LoopbackServer::sse(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"index\":0}]}\n\n",
         );
+        let endpoint = incomplete_server.base_url.clone();
         let incomplete = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
@@ -1374,7 +1368,7 @@ mod tests {
         ))
         .collect::<Vec<_>>()
         .await;
-        incomplete_server.join().unwrap();
+        incomplete_server.capture();
         assert!(matches!(
             &incomplete[..],
             [
@@ -1383,7 +1377,8 @@ mod tests {
             ] if text == "partial"
         ));
 
-        let (endpoint, non_sse_server) = serve_once(200, "application/json", "{}");
+        let non_sse_server = LoopbackServer::respond(200, "application/json", "{}");
+        let endpoint = non_sse_server.base_url.clone();
         let error = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
@@ -1401,7 +1396,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap_err();
-        non_sse_server.join().unwrap();
+        non_sse_server.capture();
         assert!(matches!(error, ProviderError::Protocol(_)));
     }
 
@@ -1417,62 +1412,5 @@ mod tests {
         assert!(matches!(output.add(5), Err(ProviderError::Protocol(_))));
         let mut wire = ByteCounter::new(4, "wire overflow", "wire limit");
         assert!(matches!(wire.add(5), Err(ProviderError::Protocol(_))));
-    }
-
-    fn serve_once(status: u16, content_type: &str, body: &str) -> (String, JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let content_type = content_type.to_owned();
-        let body = body.to_owned();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let request = read_request(&mut stream);
-            let response = format!(
-                "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8(request).unwrap()
-        });
-        (endpoint, server)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4_096];
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or_default();
-            if request.len() >= body_start + content_length {
-                break;
-            }
-        }
-        request
-    }
-
-    fn request_header<'a>(headers: &'a str, expected_name: &str) -> Option<&'a str> {
-        headers
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case(expected_name))
-            .map(|(_, value)| value.trim())
     }
 }
