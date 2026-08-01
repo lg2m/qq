@@ -1,16 +1,17 @@
 //! OpenAI-compatible Chat Completions API adapter.
 
-use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
+    credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     http::{
         ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
         build_client, build_direct_client, is_request_controlled_header, transport_error,
@@ -25,28 +26,11 @@ use crate::{
 const CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
 /// Authentication applied by an OpenAI-compatible Chat Completions client.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatCompletionsAuth {
     NoAuth,
-    Bearer(String),
-    Header(String, String),
-}
-
-impl fmt::Debug for ChatCompletionsAuth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoAuth => formatter.write_str("NoAuth"),
-            Self::Bearer(_) => formatter
-                .debug_tuple("Bearer")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Header(name, _) => formatter
-                .debug_tuple("Header")
-                .field(name)
-                .field(&"<redacted>")
-                .finish(),
-        }
-    }
+    Bearer(SecretLiteral),
+    Header(String, SecretLiteral),
 }
 
 /// A client for OpenAI-compatible Chat Completions endpoints.
@@ -61,7 +45,7 @@ impl OpenAiChatCompletions {
     pub fn new(api_key: &str) -> Result<Self, ProviderError> {
         Self::with_endpoint(
             CHAT_COMPLETIONS_ENDPOINT,
-            ChatCompletionsAuth::Bearer(api_key.to_owned()),
+            ChatCompletionsAuth::Bearer(api_key.into()),
             [],
             false,
         )
@@ -253,26 +237,11 @@ fn build_headers(
     let auth_header = match auth {
         ChatCompletionsAuth::NoAuth => None,
         ChatCompletionsAuth::Bearer(secret) => {
-            if secret.trim().is_empty() {
-                return Err(ProviderError::Configuration(
-                    "Bearer secret must not be empty".to_owned(),
-                ));
-            }
-            let mut value = HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| {
-                ProviderError::Configuration(
-                    "Bearer secret is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            value.set_sensitive(true);
-            redactions.push(secret);
+            let value = sensitive_bearer_value(&secret, "Bearer secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((AUTHORIZATION, value))
         }
         ChatCompletionsAuth::Header(name, secret) => {
-            if secret.trim().is_empty() {
-                return Err(ProviderError::Configuration(
-                    "authentication header secret must not be empty".to_owned(),
-                ));
-            }
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                 ProviderError::Configuration("authentication header name is invalid".to_owned())
             })?;
@@ -281,13 +250,8 @@ fn build_headers(
                     "authentication header is controlled by the HTTP client".to_owned(),
                 ));
             }
-            let mut value = HeaderValue::from_str(&secret).map_err(|_| {
-                ProviderError::Configuration(
-                    "authentication secret is not a valid HTTP header value".to_owned(),
-                )
-            })?;
-            value.set_sensitive(true);
-            redactions.push(secret);
+            let value = sensitive_header_value(&secret, "authentication header secret")?;
+            redactions.push(secret.expose_secret().to_owned());
             Some((name, value))
         }
     };
@@ -760,7 +724,7 @@ mod tests {
     #[test]
     fn default_constructor_uses_openai_endpoint_and_redacts_auth_debug() {
         let provider = OpenAiChatCompletions::new("openai-test-secret").unwrap();
-        let auth = ChatCompletionsAuth::Bearer("openai-test-secret".to_owned());
+        let auth = ChatCompletionsAuth::Bearer("openai-test-secret".into());
 
         assert_eq!(provider.endpoint.as_str(), CHAT_COMPLETIONS_ENDPOINT);
         assert!(!format!("{auth:?}").contains("openai-test-secret"));
@@ -831,7 +795,7 @@ mod tests {
 
         let error = OpenAiChatCompletions::with_endpoint(
             "https://example.com/v1/chat/completions",
-            ChatCompletionsAuth::Header("x-api-key".to_owned(), "secret".to_owned()),
+            ChatCompletionsAuth::Header("x-api-key".to_owned(), "secret".into()),
             [("x-api-key".to_owned(), "override".to_owned())],
             false,
         )
@@ -862,7 +826,7 @@ mod tests {
     #[test]
     fn configured_headers_are_sensitive_and_redactions_are_normalized() {
         let (headers, redactions) = build_headers(
-            ChatCompletionsAuth::Header("x-auth".to_owned(), "long-test-secret".to_owned()),
+            ChatCompletionsAuth::Header("x-auth".to_owned(), "long-test-secret".into()),
             [
                 ("x-first".to_owned(), "test-secret".to_owned()),
                 ("x-second".to_owned(), "long-test-secret".to_owned()),
@@ -871,7 +835,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(headers.values().all(HeaderValue::is_sensitive));
+        assert!(
+            headers
+                .values()
+                .all(reqwest::header::HeaderValue::is_sensitive)
+        );
         assert_eq!(redactions, ["long-test-secret", "test-secret", "alpha"]);
         assert_eq!(
             sanitize_message("long-test-secret test-secret alpha", &redactions),
@@ -1053,7 +1021,7 @@ mod tests {
         let endpoint = format!("{}/custom/chat/completions?api-version=42", server.base_url);
         let provider = OpenAiChatCompletions::with_endpoint(
             &endpoint,
-            ChatCompletionsAuth::Header("x-api-key".to_owned(), "custom-test-secret".to_owned()),
+            ChatCompletionsAuth::Header("x-api-key".to_owned(), "custom-test-secret".into()),
             [("x-client".to_owned(), "qq-tests".to_owned())],
             true,
         )
@@ -1293,7 +1261,7 @@ mod tests {
         let endpoint = format!("{}/v1/chat/completions", server.base_url);
         let provider = OpenAiChatCompletions::with_endpoint(
             &endpoint,
-            ChatCompletionsAuth::Bearer("test-api-secret".to_owned()),
+            ChatCompletionsAuth::Bearer("test-api-secret".into()),
             [],
             true,
         )

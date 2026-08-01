@@ -50,7 +50,7 @@ fn openai_recipe() -> ProviderRecipe {
     ProviderRecipe::http(HttpProviderRecipe::new(
         EndpointSpec::exact("https://api.openai.com/v1/responses", false),
         HttpProtocol::OpenAiResponses,
-        HttpAuth::ApiKey("benchmark-key".to_owned()),
+        HttpAuth::ApiKey("benchmark-key".into()),
     ))
 }
 
@@ -58,7 +58,7 @@ fn google_recipe() -> ProviderRecipe {
     ProviderRecipe::http(HttpProviderRecipe::new(
         EndpointSpec::base("https://generativelanguage.googleapis.com/v1beta", false),
         HttpProtocol::GoogleGenerateContent,
-        HttpAuth::ApiKey("benchmark-key".to_owned()),
+        HttpAuth::ApiKey("benchmark-key".into()),
     ))
 }
 
@@ -75,7 +75,7 @@ fn benchmark_mantle_warm_dispatch(compiler: &ProviderCompiler, iterations: u64) 
         .compile(ProviderRecipe::amazon_bedrock_mantle(
             Some("us-east-1".to_owned()),
             HttpProtocol::OpenAiResponses,
-            BedrockAuth::ApiKey("benchmark-key".to_owned()),
+            BedrockAuth::ApiKey("benchmark-key".into()),
         ))
         .expect("Mantle recipe must compile");
     let request = ModelRequest::new("benchmark-model", Vec::new(), 64);

@@ -1,6 +1,6 @@
 //! Provider recipe compilation.
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
     Provider, ProviderError, SharedRequestCredentialProvider,
@@ -8,6 +8,7 @@ use crate::{
     construction::{
         HttpConstructionAuth, HttpConstructionSpec, HttpEndpointKind, construct_http_provider,
     },
+    credentials::SecretLiteral,
     http::{build_client, build_direct_client, validate_endpoint},
     mantle::Mantle,
 };
@@ -212,15 +213,15 @@ impl HttpProtocol {
 }
 
 /// Protocol-independent HTTP authentication intent.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HttpAuth {
     NoAuth,
-    ApiKey(String),
-    Bearer(String),
-    Header(String, String),
+    ApiKey(SecretLiteral),
+    Bearer(SecretLiteral),
+    Header(String, SecretLiteral),
     Codex {
-        access_token: String,
-        account_id: String,
+        access_token: SecretLiteral,
+        account_id: SecretLiteral,
         is_fedramp: bool,
     },
     /// Bearer credentials resolved on each request.
@@ -230,40 +231,6 @@ pub enum HttpAuth {
     /// This intent is valid only for OpenAI Responses and selects the Codex
     /// request body shape automatically.
     RequestTimeCodex(SharedRequestCredentialProvider),
-}
-
-impl fmt::Debug for HttpAuth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoAuth => formatter.write_str("NoAuth"),
-            Self::ApiKey(_) => formatter
-                .debug_tuple("ApiKey")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Bearer(_) => formatter
-                .debug_tuple("Bearer")
-                .field(&"<redacted>")
-                .finish(),
-            Self::Header(name, _) => formatter
-                .debug_tuple("Header")
-                .field(name)
-                .field(&"<redacted>")
-                .finish(),
-            Self::Codex { .. } => formatter
-                .debug_struct("Codex")
-                .field("access_token", &"<redacted>")
-                .field("account_id", &"<redacted>")
-                .finish_non_exhaustive(),
-            Self::RequestTimeBearer(_) => formatter
-                .debug_tuple("RequestTimeBearer")
-                .field(&"[REDACTED]")
-                .finish(),
-            Self::RequestTimeCodex(_) => formatter
-                .debug_tuple("RequestTimeCodex")
-                .field(&"[REDACTED]")
-                .finish(),
-        }
-    }
 }
 
 impl From<HttpAuth> for HttpConstructionAuth {
@@ -308,7 +275,7 @@ mod tests {
             .compile(ProviderRecipe::http(HttpProviderRecipe::new(
                 EndpointSpec::base(format!("{base_url}/v1"), true),
                 HttpProtocol::OpenAiResponses,
-                HttpAuth::ApiKey("test-secret".to_owned()),
+                HttpAuth::ApiKey("test-secret".into()),
             )))
             .unwrap();
 
@@ -346,8 +313,8 @@ mod tests {
                 ),
                 HttpProtocol::OpenAiResponses,
                 HttpAuth::Codex {
-                    access_token: "static-codex-access-token".to_owned(),
-                    account_id: "static-workspace-id".to_owned(),
+                    access_token: "static-codex-access-token".into(),
+                    account_id: "static-workspace-id".into(),
                     is_fedramp: false,
                 },
             )))
@@ -597,7 +564,7 @@ mod tests {
                 .compile(ProviderRecipe::http(HttpProviderRecipe::new(
                     EndpointSpec::base(endpoint, true),
                     protocol,
-                    HttpAuth::ApiKey(api_key.to_owned()),
+                    HttpAuth::ApiKey(api_key.into()),
                 )))
                 .unwrap();
 
@@ -666,8 +633,8 @@ mod tests {
                 EndpointSpec::exact("https://example.test/v1/chat/completions", false),
                 HttpProtocol::OpenAiChatCompletions,
                 HttpAuth::Codex {
-                    access_token: "test-access-token".to_owned(),
-                    account_id: "test-account".to_owned(),
+                    access_token: "test-access-token".into(),
+                    account_id: "test-account".into(),
                     is_fedramp: false,
                 },
             )))

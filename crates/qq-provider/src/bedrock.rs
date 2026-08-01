@@ -52,6 +52,7 @@ use tokio::sync::{OnceCell, Semaphore};
 use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role,
+    credentials::SecretLiteral,
     limits::{ByteCounter, StreamLimits},
     request_auth::AwsCredentialLease,
     sanitize::sanitize_message,
@@ -73,27 +74,14 @@ static DIRECT_AWS_HTTP_CLIENT: LazyLock<SharedHttpClient> = LazyLock::new(|| {
 });
 
 /// Authentication used by Amazon Bedrock Runtime.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BedrockAuth {
     /// Uses the standard AWS credential and region provider chains.
     DefaultChain,
     /// Uses one named AWS profile.
     Profile(String),
     /// Uses an Amazon Bedrock API key as an HTTP bearer token.
-    ApiKey(String),
-}
-
-impl fmt::Debug for BedrockAuth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DefaultChain => formatter.write_str("DefaultChain"),
-            Self::Profile(profile) => formatter.debug_tuple("Profile").field(profile).finish(),
-            Self::ApiKey(_) => formatter
-                .debug_tuple("ApiKey")
-                .field(&"<redacted>")
-                .finish(),
-        }
-    }
+    ApiKey(SecretLiteral),
 }
 
 /// A client for Amazon Bedrock's `ConverseStream` API.
@@ -125,7 +113,7 @@ impl Bedrock {
     pub fn new(auth: BedrockAuth, region: Option<String>) -> Result<Self, ProviderError> {
         validate_configuration(&auth, region.as_deref())?;
         let redactions: Arc<[String]> = match &auth {
-            BedrockAuth::ApiKey(secret) => Arc::from([secret.clone()]),
+            BedrockAuth::ApiKey(secret) => Arc::from([secret.expose_secret().to_owned()]),
             BedrockAuth::DefaultChain | BedrockAuth::Profile(_) => Arc::from([]),
         };
         Ok(Self {
@@ -288,7 +276,7 @@ pub(crate) fn validate_configuration(
                 "AWS profile name must not be empty or contain control characters".to_owned(),
             ));
         }
-        BedrockAuth::ApiKey(secret) if invalid_configuration_value(secret) => {
+        BedrockAuth::ApiKey(secret) if invalid_configuration_value(secret.expose_secret()) => {
             return Err(ProviderError::Configuration(
                 "Amazon Bedrock API key must not be empty or contain control characters".to_owned(),
             ));
@@ -334,7 +322,7 @@ async fn load_client(
         Err(error) => return Err(error),
     };
     let api_key = match auth {
-        BedrockAuth::ApiKey(secret) => Some(secret),
+        BedrockAuth::ApiKey(secret) => Some(secret.expose_secret().to_owned()),
         BedrockAuth::DefaultChain | BedrockAuth::Profile(_) => None,
     };
     Ok(Client::from_conf(service_config(
@@ -1091,7 +1079,7 @@ mod tests {
 
     #[test]
     fn constructor_is_network_free_and_debug_redacts_api_keys() {
-        let auth = BedrockAuth::ApiKey("bedrock-test-secret".to_owned());
+        let auth = BedrockAuth::ApiKey("bedrock-test-secret".into());
         let provider = Bedrock::new(auth.clone(), Some("us-east-1".to_owned())).unwrap();
         let default_provider = Bedrock::new(BedrockAuth::DefaultChain, None).unwrap();
 
@@ -1310,7 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn api_key_configuration_has_no_credential_lease() {
         let config = load_aws_config_with_profile_files(
-            &BedrockAuth::ApiKey("test-key".to_owned()),
+            &BedrockAuth::ApiKey("test-key".into()),
             Some("us-east-1"),
             None,
             Arc::new(Semaphore::new(AWS_CONFIG_BUILD_CONCURRENCY)),
@@ -1325,13 +1313,13 @@ mod tests {
     #[test]
     fn rejects_invalid_auth_and_region_values() {
         for (auth, region) in [
-            (BedrockAuth::ApiKey(String::new()), None),
-            (BedrockAuth::ApiKey("\r\n".to_owned()), None),
+            (BedrockAuth::ApiKey("".into()), None),
+            (BedrockAuth::ApiKey("\r\n".into()), None),
             (BedrockAuth::Profile(" ".to_owned()), None),
             (BedrockAuth::DefaultChain, Some(String::new())),
             (BedrockAuth::DefaultChain, Some("bad\nregion".to_owned())),
             (
-                BedrockAuth::ApiKey("bedrock-test-secret".to_owned()),
+                BedrockAuth::ApiKey("bedrock-test-secret".into()),
                 Some("attacker.example?x=".to_owned()),
             ),
         ] {
