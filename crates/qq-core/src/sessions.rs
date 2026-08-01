@@ -9908,7 +9908,11 @@ mod tests {
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
                     .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
+                        // Failure-path tests assert on the first error; turn
+                        // retry is covered in lib.rs.
+                        runtime: Arc::new(
+                            runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
+                        ),
                         pricing: None,
                     })
                     .map_err(|error| RuntimeLoadError {
@@ -13554,7 +13558,13 @@ mod tests {
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime.with_spawn_model_routes(spawn_model_routes)),
+                        runtime: Arc::new(
+                            runtime
+                                .with_spawn_model_routes(spawn_model_routes)
+                                // Failure-path tests assert on the first
+                                // error; turn retry is covered in lib.rs.
+                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
+                        ),
                         pricing: None,
                     })
                     .map_err(|error| RuntimeLoadError {
@@ -13598,7 +13608,13 @@ mod tests {
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime.with_spawn_model_routes(spawn_model_routes)),
+                        runtime: Arc::new(
+                            runtime
+                                .with_spawn_model_routes(spawn_model_routes)
+                                // Failure-path tests assert on the first
+                                // error; turn retry is covered in lib.rs.
+                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
+                        ),
                         pricing: None,
                     })
                     .map_err(|error| RuntimeLoadError {
