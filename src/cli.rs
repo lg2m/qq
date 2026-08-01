@@ -1,6 +1,6 @@
 //! Command-line parsing and dispatch.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -42,6 +42,22 @@ pub enum Command {
         /// Loopback address to bind. Port 0 selects an available port.
         #[arg(long, default_value = "127.0.0.1:0")]
         bind: SocketAddr,
+        /// Serve the bundled browser workbench.
+        #[arg(long)]
+        web: bool,
+        /// Browser-visible HTTPS origin supplied by the reverse proxy.
+        #[arg(long, requires = "web", value_name = "ORIGIN")]
+        web_origin: Option<String>,
+        /// Workspace exposed to paired browsers. Repeat to expose more than one.
+        #[arg(long, requires = "web", value_name = "PATH")]
+        workspace: Vec<PathBuf>,
+    },
+
+    /// Create a one-time pairing URL for the running web server.
+    Pair {
+        /// Open the pairing URL in the local default browser.
+        #[arg(long)]
+        open: bool,
     },
 
     /// Inspect and validate effective configuration.
@@ -177,7 +193,39 @@ mod tests {
         assert!(Cli::try_parse_from(["qq"]).unwrap().command.is_none());
         assert!(matches!(
             Cli::try_parse_from(["qq", "serve"]).unwrap().command,
-            Some(Command::Serve { bind }) if bind == "127.0.0.1:0".parse().unwrap()
+            Some(Command::Serve { bind, .. }) if bind == "127.0.0.1:0".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn parses_web_server_and_pairing_options() {
+        let cli = Cli::try_parse_from([
+            "qq",
+            "serve",
+            "--web",
+            "--web-origin",
+            "https://qq.example.test",
+            "--workspace",
+            "first",
+            "--workspace",
+            "second",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve {
+                web: true,
+                web_origin: Some(origin),
+                workspace,
+                ..
+            }) if origin == "https://qq.example.test" && workspace.len() == 2
+        ));
+        assert!(Cli::try_parse_from(["qq", "serve", "--workspace", "first"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["qq", "pair", "--open"])
+                .unwrap()
+                .command,
+            Some(Command::Pair { open: true })
         ));
     }
 

@@ -17,23 +17,23 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path as AxumPath, Request, State, rejection::BytesRejection},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, StatusCode, Uri, header, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Response, sse::Event, sse::KeepAlive, sse::Sse},
     routing::{get, post},
 };
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use qq_core::{RunStream, SessionEventStream};
+use qq_core::{RunStream, SessionEventStream, WorkspaceAccess};
 use qq_protocol::{
     AskRequest, CommandReceipt, CommandRequest, LocalConnectionError, LocalServerConnection,
     MAX_EVENT_BYTES, MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES,
     MAX_WORKSPACE_BYTES, ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION, ServerInfo,
-    SessionCommand, SnapshotRequest, SubscribeRequest, WorkspaceId, WorkspaceSnapshot,
-    validate_ask_request,
+    SessionCommand, SessionPage, SessionPageRequest, SnapshotRequest, SubscribeRequest,
+    TranscriptPage, TranscriptPageRequest, WorkspaceId, WorkspaceSnapshot, validate_ask_request,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -43,6 +43,11 @@ use tokio::{
     task::JoinHandle,
 };
 
+mod web;
+
+pub use web::WebOptions;
+use web::{AuthenticatedRequest, PairError, WebState};
+
 const METADATA_FORMAT_VERSION: u16 = 1;
 const METADATA_FILE_NAME: &str = "server.ron";
 const LOCK_FILE_NAME: &str = "server.lock";
@@ -50,6 +55,7 @@ const DEFAULT_BIND_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LO
 const MAX_METADATA_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_HEALTH_BYTES: usize = 16 * 1024;
 const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PAGE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_RETRIES: usize = 8;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -70,6 +76,10 @@ pub type SnapshotFuture =
     Pin<Box<dyn Future<Output = Result<WorkspaceSnapshot, AskHandlerError>> + Send + 'static>>;
 pub type ModelsFuture =
     Pin<Box<dyn Future<Output = Result<Vec<ModelDescriptor>, AskHandlerError>> + Send + 'static>>;
+pub type SessionPageFuture =
+    Pin<Box<dyn Future<Output = Result<SessionPage, AskHandlerError>> + Send + 'static>>;
+pub type TranscriptPageFuture =
+    Pin<Box<dyn Future<Output = Result<TranscriptPage, AskHandlerError>> + Send + 'static>>;
 
 /// Root-supplied application seam for handling one request.
 pub trait AskHandler: Send + Sync + 'static {
@@ -77,19 +87,39 @@ pub trait AskHandler: Send + Sync + 'static {
         Box::pin(async { Err(AskHandlerError::Unavailable) })
     }
 
-    fn command(&self, _request: CommandRequest) -> CommandFuture {
+    fn command(&self, _access: WorkspaceAccess, _request: CommandRequest) -> CommandFuture {
         Box::pin(async { Err(AskHandlerError::Unavailable) })
     }
 
-    fn snapshot(&self, _request: SnapshotRequest) -> SnapshotFuture {
+    fn snapshot(&self, _access: WorkspaceAccess, _request: SnapshotRequest) -> SnapshotFuture {
         Box::pin(async { Err(AskHandlerError::Unavailable) })
     }
 
-    fn models(&self, _request: ModelCatalogRequest) -> ModelsFuture {
+    fn models(&self, _access: WorkspaceAccess, _request: ModelCatalogRequest) -> ModelsFuture {
         Box::pin(async { Err(AskHandlerError::Unavailable) })
     }
 
-    fn subscribe(&self, _request: SubscribeRequest) -> Result<SessionEventStream, AskHandlerError> {
+    fn session_page(
+        &self,
+        _access: WorkspaceAccess,
+        _request: SessionPageRequest,
+    ) -> SessionPageFuture {
+        Box::pin(async { Err(AskHandlerError::Unavailable) })
+    }
+
+    fn transcript_page(
+        &self,
+        _access: WorkspaceAccess,
+        _request: TranscriptPageRequest,
+    ) -> TranscriptPageFuture {
+        Box::pin(async { Err(AskHandlerError::Unavailable) })
+    }
+
+    fn subscribe(
+        &self,
+        _access: WorkspaceAccess,
+        _request: SubscribeRequest,
+    ) -> Result<SessionEventStream, AskHandlerError> {
         Err(AskHandlerError::Unavailable)
     }
 }
@@ -109,6 +139,8 @@ where
 pub enum AskHandlerError {
     #[error("{0}")]
     InvalidRequest(String),
+    #[error("workspace access denied")]
+    Forbidden,
     #[error("request service is unavailable")]
     Unavailable,
     #[error("request failed")]
@@ -167,6 +199,7 @@ impl ServerPaths {
 pub struct ServerOptions {
     paths: ServerPaths,
     bind_address: SocketAddr,
+    web: Option<WebOptions>,
 }
 
 impl ServerOptions {
@@ -176,6 +209,7 @@ impl ServerOptions {
         Self {
             paths,
             bind_address: DEFAULT_BIND_ADDRESS,
+            web: None,
         }
     }
 
@@ -188,6 +222,12 @@ impl ServerOptions {
     #[must_use]
     pub fn with_bind_address(mut self, bind_address: SocketAddr) -> Self {
         self.bind_address = bind_address;
+        self
+    }
+
+    #[must_use]
+    pub fn with_web(mut self, web: WebOptions) -> Self {
+        self.web = Some(web);
         self
     }
 
@@ -325,12 +365,18 @@ pub struct ServerHandle {
     connection: ServerConnection,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), ServerError>>>,
+    pairing_url: Option<String>,
 }
 
 impl ServerHandle {
     #[must_use]
     pub fn connection(&self) -> &ServerConnection {
         &self.connection
+    }
+
+    #[must_use]
+    pub fn pairing_url(&self) -> Option<&str> {
+        self.pairing_url.as_deref()
     }
 
     /// Requests graceful shutdown and waits for metadata and lock cleanup.
@@ -421,10 +467,16 @@ pub async fn start(
         },
     )
     .map_err(map_connection_error)?;
+    let (web, pairing_url) = match options.web.clone() {
+        Some(options) => {
+            let (web, url) = WebState::new(options, format!("http://{address}"))?;
+            (Some(web), Some(url))
+        }
+        None => (None, None),
+    };
     let metadata = MetadataFile::new(&connection);
     write_metadata_atomically(&options.paths, &metadata)?;
-
-    let app = router(handler, connection.clone());
+    let app = router(handler, connection.clone(), web);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let mut guard = InstanceGuard {
         _lock: lock,
@@ -447,6 +499,7 @@ pub async fn start(
         connection,
         shutdown: Some(shutdown_sender),
         task: Some(task),
+        pairing_url,
     }))
 }
 
@@ -456,19 +509,27 @@ struct AppState {
     connection: ServerConnection,
     session_requests: Arc<Semaphore>,
     subscriptions: Arc<Semaphore>,
+    web: Option<Arc<WebState>>,
 }
 
-fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router {
+fn router(
+    handler: Arc<dyn AskHandler>,
+    connection: ServerConnection,
+    web: Option<Arc<WebState>>,
+) -> Router {
     let state = AppState {
         handler,
         connection,
         session_requests: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_REQUESTS)),
         subscriptions: Arc::new(Semaphore::new(MAX_CONCURRENT_SUBSCRIPTIONS)),
+        web,
     };
-    Router::new()
+    let api = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/workspaces/snapshot", post(workspace_snapshot))
+        .route("/v1/workspaces/sessions", post(workspace_sessions))
+        .route("/v1/sessions/transcript", post(session_transcript))
         .route("/v1/models", post(models))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/prompts", post(submit_prompt))
@@ -483,21 +544,47 @@ fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router 
             "/v1/workspaces/{workspace_id}/events",
             get(workspace_events),
         )
+        .route("/v1/web/bootstrap", get(web_bootstrap))
+        .route("/v1/web/logout", post(web_logout))
+        .route("/v1/web/pairings", post(create_web_pairing))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .method_not_allowed_fallback(method_not_allowed)
-        .fallback(not_found)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
+    let app = if state.web.is_some() {
+        Router::new()
+            .route("/v1/web/pair", post(web_pair))
+            .merge(api)
+            .fallback(web_fallback)
+    } else {
+        api.fallback(not_found)
+    };
+    app.method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
 }
 
 async fn authenticate(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !authorized(request.headers(), &state.connection) {
+    let authenticated = if authorized(request.headers(), &state.connection) {
+        Some(AuthenticatedRequest::native())
+    } else {
+        state
+            .web
+            .as_ref()
+            .and_then(|web| web.authenticate(request.headers()))
+    };
+    let Some(authenticated) = authenticated else {
         return api_error(StatusCode::UNAUTHORIZED, "authentication required");
+    };
+    if authenticated.web_session.is_some()
+        && !state.web.as_ref().is_some_and(|web| {
+            web.authorize_browser_request(request.method(), request.headers(), &authenticated)
+        })
+    {
+        return api_error(StatusCode::FORBIDDEN, "browser request rejected");
     }
+    request.extensions_mut().insert(authenticated);
     next.run(request).await
 }
 
@@ -508,6 +595,106 @@ fn authorized(headers: &HeaderMap, connection: &ServerConnection) -> bool {
         .and_then(|value| value.strip_prefix(b"Bearer "))
         .unwrap_or_default();
     connection.matches_bearer_token(candidate)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairRequest {
+    secret: String,
+}
+
+#[derive(Serialize)]
+struct PairingUrl {
+    url: String,
+}
+
+async fn web_pair(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let Some(web) = &state.web else {
+        return api_error(StatusCode::NOT_FOUND, "not found");
+    };
+    if !web.origin_matches(&headers) {
+        return api_error(StatusCode::FORBIDDEN, "browser origin rejected");
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
+    };
+    let request = match serde_json::from_slice::<PairRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
+    };
+    match web.pair(&request.secret) {
+        Ok((session_id, bootstrap)) => {
+            let mut response = Json(bootstrap).into_response();
+            response
+                .headers_mut()
+                .insert(header::SET_COOKIE, web::session_cookie(&session_id));
+            response
+        }
+        Err(PairError::Invalid) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "pairing link is invalid or expired",
+        ),
+        Err(PairError::Unavailable) => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "pairing is unavailable")
+        }
+    }
+}
+
+async fn web_bootstrap(
+    State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
+) -> Response {
+    let Some(web) = &state.web else {
+        return api_error(StatusCode::NOT_FOUND, "not found");
+    };
+    match web.bootstrap_for(&authenticated) {
+        Some(bootstrap) => Json(bootstrap).into_response(),
+        None => api_error(StatusCode::FORBIDDEN, "browser session required"),
+    }
+}
+
+async fn web_logout(
+    State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
+) -> Response {
+    let Some(web) = &state.web else {
+        return api_error(StatusCode::NOT_FOUND, "not found");
+    };
+    web.logout(&authenticated);
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, web::expired_cookie());
+    response
+}
+
+async fn create_web_pairing(
+    State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
+) -> Response {
+    if authenticated.web_session.is_some() {
+        return api_error(StatusCode::FORBIDDEN, "native client required");
+    }
+    let Some(web) = &state.web else {
+        return api_error(StatusCode::NOT_FOUND, "web interface is disabled");
+    };
+    match web.issue_pairing() {
+        Ok(url) => Json(PairingUrl { url }).into_response(),
+        Err(_) => api_error(StatusCode::SERVICE_UNAVAILABLE, "pairing is unavailable"),
+    }
+}
+
+async fn web_fallback(uri: Uri) -> Response {
+    if uri.path().starts_with("/v1/") {
+        api_error(StatusCode::NOT_FOUND, "not found")
+    } else {
+        web::asset_response(uri.path())
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Json<ServerInfo> {
@@ -535,6 +722,9 @@ async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>)
         Ok(events) => events,
         Err(AskHandlerError::InvalidRequest(message)) => {
             return api_error(StatusCode::BAD_REQUEST, &message);
+        }
+        Err(AskHandlerError::Forbidden) => {
+            return api_error(StatusCode::FORBIDDEN, "workspace access denied");
         }
         Err(AskHandlerError::Unavailable) => {
             return api_error(
@@ -569,101 +759,141 @@ async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>)
 
 async fn resolve_workspace(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::ResolveWorkspace { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::ResolveWorkspace { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn create_session(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::CreateSession { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::CreateSession { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn submit_prompt(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::SubmitPrompt { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::SubmitPrompt { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn cancel_run(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::CancelRun { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::CancelRun { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn respond_tool_approval(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::RespondToolApproval { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::RespondToolApproval { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn set_approval_mode(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::SetApprovalMode { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::SetApprovalMode { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn set_session_model(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::SetSessionModel { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::SetSessionModel { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn delete_session(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::DeleteSession { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::DeleteSession { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn prune_sessions(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::PruneSessions { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::PruneSessions { .. }),
+        authenticated.access,
+    )
     .await
 }
 
 async fn compact_session(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    session_command(state, body, |command| {
-        matches!(command, SessionCommand::CompactSession { .. })
-    })
+    session_command(
+        state,
+        body,
+        |command| matches!(command, SessionCommand::CompactSession { .. }),
+        authenticated.access,
+    )
     .await
 }
 
@@ -671,6 +901,7 @@ async fn session_command(
     state: AppState,
     body: Result<Bytes, BytesRejection>,
     expected: impl FnOnce(&SessionCommand) -> bool,
+    access: WorkspaceAccess,
 ) -> Response {
     let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
         return api_error(
@@ -686,7 +917,7 @@ async fn session_command(
         Ok(request) if expected(&request.command) => request,
         Ok(_) | Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
     };
-    match state.handler.command(request).await {
+    match state.handler.command(access, request).await {
         Ok(receipt) => Json(receipt).into_response(),
         Err(error) => handler_error_response(error),
     }
@@ -694,6 +925,7 @@ async fn session_command(
 
 async fn workspace_snapshot(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
@@ -710,13 +942,80 @@ async fn workspace_snapshot(
         Ok(request) => request,
         Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
     };
-    match state.handler.snapshot(request).await {
+    match state.handler.snapshot(authenticated.access, request).await {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => handler_error_response(error),
     }
 }
 
-async fn models(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Response {
+async fn workspace_sessions(
+    State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    bounded_query(state, body, move |state, body| async move {
+        let request = serde_json::from_slice::<SessionPageRequest>(&body)
+            .map_err(|_| AskHandlerError::InvalidRequest("invalid request".to_owned()))?;
+        state
+            .handler
+            .session_page(authenticated.access, request)
+            .await
+    })
+    .await
+}
+
+async fn session_transcript(
+    State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    bounded_query(state, body, move |state, body| async move {
+        let request = serde_json::from_slice::<TranscriptPageRequest>(&body)
+            .map_err(|_| AskHandlerError::InvalidRequest("invalid request".to_owned()))?;
+        state
+            .handler
+            .transcript_page(authenticated.access, request)
+            .await
+    })
+    .await
+}
+
+async fn bounded_query<T, Fut>(
+    state: AppState,
+    body: Result<Bytes, BytesRejection>,
+    query: impl FnOnce(AppState, Bytes) -> Fut,
+) -> Response
+where
+    T: Serialize,
+    Fut: Future<Output = Result<T, AskHandlerError>>,
+{
+    let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many requests are active",
+        );
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
+    };
+    match query(state, body).await {
+        Ok(value)
+            if serde_json::to_vec(&value)
+                .is_ok_and(|encoded| encoded.len() <= MAX_PAGE_RESPONSE_BYTES) =>
+        {
+            Json(value).into_response()
+        }
+        Ok(_) => api_error(StatusCode::PAYLOAD_TOO_LARGE, "response is too large"),
+        Err(error) => handler_error_response(error),
+    }
+}
+
+async fn models(
+    State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
     let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -746,7 +1045,14 @@ async fn models(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         }
         Ok(_) | Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
     };
-    match state.handler.models(request).await {
+    if !state
+        .web
+        .as_ref()
+        .is_none_or(|web| web.permits_model_path(&authenticated.access, &request.workspace))
+    {
+        return api_error(StatusCode::FORBIDDEN, "workspace access denied");
+    }
+    match state.handler.models(authenticated.access, request).await {
         Ok(models)
             if serde_json::to_vec(&models)
                 .is_ok_and(|encoded| encoded.len() <= MAX_MODEL_CATALOG_BYTES) =>
@@ -760,6 +1066,7 @@ async fn models(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
 
 async fn workspace_events(
     State(state): State<AppState>,
+    Extension(authenticated): Extension<AuthenticatedRequest>,
     AxumPath(workspace_id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -781,10 +1088,13 @@ async fn workspace_events(
             "too many event subscriptions are active",
         );
     };
-    let events = match state.handler.subscribe(SubscribeRequest {
-        workspace_id,
-        after,
-    }) {
+    let events = match state.handler.subscribe(
+        authenticated.access,
+        SubscribeRequest {
+            workspace_id,
+            after,
+        },
+    ) {
         Ok(events) => events,
         Err(error) => return handler_error_response(error),
     };
@@ -821,6 +1131,7 @@ async fn workspace_events(
 fn handler_error_response(error: AskHandlerError) -> Response {
     match error {
         AskHandlerError::InvalidRequest(message) => api_error(StatusCode::BAD_REQUEST, &message),
+        AskHandlerError::Forbidden => api_error(StatusCode::FORBIDDEN, "workspace access denied"),
         AskHandlerError::Unavailable => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "request service is unavailable",
@@ -1333,6 +1644,10 @@ pub enum ServerError {
     StateDirectoryUnavailable,
     #[error("non-loopback server bind address is not supported: {0}")]
     NonLoopbackBind(SocketAddr),
+    #[error("invalid web configuration: {0}")]
+    InvalidWebConfiguration(String),
+    #[error("web authentication state is unavailable")]
+    WebState,
     #[error("server state path is not a private regular file or directory: {0}")]
     InsecureStatePath(PathBuf),
     #[error("server state path has insecure permissions (expected {expected:o}): {path}")]
@@ -1409,6 +1724,7 @@ mod tests {
             ServerPaths::new(self.root.join("state"))
         }
 
+        #[cfg(unix)]
         fn child_paths(&self, name: &str) -> ServerPaths {
             ServerPaths::new(self.root.join(name))
         }
@@ -1486,6 +1802,130 @@ mod tests {
             .unwrap();
         assert_eq!(missing_route.status(), StatusCode::NOT_FOUND);
         assert!(requests.lock().unwrap().is_empty());
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_pairing_is_one_time_and_browser_mutations_require_csrf() {
+        let directory = TestDirectory::new();
+        let (handler, requests) = fake_handler(vec![RunEvent::Completed]);
+        let workspace = qq_protocol::WorkspaceSummary {
+            id: WorkspaceId::from_bytes([7; 16]),
+            path: directory.root.to_string_lossy().into_owned(),
+        };
+        let options = ServerOptions::new(directory.paths())
+            .with_web(WebOptions::new(vec![workspace.clone()]));
+        let server = match start(handler, options).await.unwrap() {
+            StartOutcome::Started(server) => server,
+            StartOutcome::Existing(_) => panic!("test unexpectedly found an existing server"),
+        };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let origin = format!("http://{}", server.connection().address());
+        let pairing_url = server.pairing_url().unwrap();
+        let secret = pairing_url.split("#pair=").nth(1).unwrap();
+
+        let index = http.get(&origin).send().await.unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        assert!(index.headers().contains_key("content-security-policy"));
+
+        let paired = http
+            .post(format!("{origin}/v1/web/pair"))
+            .header(header::ORIGIN, &origin)
+            .json(&serde_json::json!({ "secret": secret }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), StatusCode::OK);
+        let cookie = paired
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let bootstrap = paired.json::<serde_json::Value>().await.unwrap();
+        let csrf = bootstrap["csrf_token"].as_str().unwrap();
+        assert_eq!(bootstrap["workspaces"][0]["id"], workspace.id.to_string());
+
+        let reused = http
+            .post(format!("{origin}/v1/web/pair"))
+            .header(header::ORIGIN, &origin)
+            .json(&serde_json::json!({ "secret": secret }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+
+        let current = http
+            .get(format!("{origin}/v1/web/bootstrap"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+
+        let missing_csrf = http
+            .post(format!("{origin}/v1/web/logout"))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, &origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+        let logout = http
+            .post(format!("{origin}/v1/web/logout"))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, &origin)
+            .header("x-qq-csrf", csrf)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+
+        let expired = http
+            .get(format!("{origin}/v1/web/bootstrap"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+        assert!(requests.lock().unwrap().is_empty());
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_clients_can_issue_additional_web_pairings() {
+        let directory = TestDirectory::new();
+        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let workspace = qq_protocol::WorkspaceSummary {
+            id: WorkspaceId::from_bytes([8; 16]),
+            path: directory.root.to_string_lossy().into_owned(),
+        };
+        let options =
+            ServerOptions::new(directory.paths()).with_web(WebOptions::new(vec![workspace]));
+        let server = match start(handler, options).await.unwrap() {
+            StartOutcome::Started(server) => server,
+            StartOutcome::Existing(_) => panic!("test unexpectedly found an existing server"),
+        };
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(server.connection().endpoint("/v1/web/pairings"))
+            .bearer_auth(server.connection().expose_bearer_token())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert!(body["url"].as_str().unwrap().contains("/#pair="));
 
         server.shutdown().await.unwrap();
     }
@@ -1756,6 +2196,20 @@ mod tests {
         let error = start(handler, options).await.unwrap_err();
 
         assert!(matches!(error, ServerError::NonLoopbackBind(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_web_configuration_leaves_no_discovery_metadata() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let options = ServerOptions::new(paths.clone()).with_web(WebOptions::new(Vec::new()));
+
+        let error = start(handler, options).await.unwrap_err();
+
+        assert!(matches!(error, ServerError::InvalidWebConfiguration(_)));
+        assert!(!paths.metadata_file().exists());
+        assert!(read_connection(&paths).unwrap().is_none());
     }
 
     #[cfg(unix)]

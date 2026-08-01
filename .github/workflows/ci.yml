@@ -14,11 +14,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       # rustup resolves the pinned toolchain and components from
       # rust-toolchain.toml on first cargo invocation.
       - uses: Swatinem/rust-cache@v2
       - name: Formatting
         run: cargo fmt --all --check
+      - name: Web checks
+        working-directory: web
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm test
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
@@ -30,6 +41,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - uses: Swatinem/rust-cache@v2
         with:
           key: release

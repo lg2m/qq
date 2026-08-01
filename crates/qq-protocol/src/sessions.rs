@@ -582,6 +582,46 @@ pub struct SnapshotRequest {
     pub message_limit: u16,
 }
 
+/// Bounded, stable pagination through a workspace's durable sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPageRequest {
+    pub workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_session_id: Option<SessionId>,
+    pub limit: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_session_id: Option<SessionId>,
+}
+
+/// Bounded pagination through complete runs in one durable transcript.
+/// A page never splits a run, so messages and tool calls can be rendered in
+/// their original turn order without client-side joins across pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptPageRequest {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_run_id: Option<RunId>,
+    pub run_limit: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptPage {
+    pub runs: Vec<RunSnapshot>,
+    pub messages: Vec<MessageSnapshot>,
+    pub tool_calls: Vec<ToolCallSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_run_id: Option<RunId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubscribeRequest {
@@ -806,6 +846,39 @@ mod tests {
             envelope
         );
         assert_eq!(envelope.cursor.to_string().parse(), Ok(envelope.cursor));
+    }
+
+    #[test]
+    fn pagination_requests_have_stable_cursor_shapes() {
+        let session_request = SessionPageRequest {
+            workspace_id: id(2),
+            before_session_id: Some(id(3)),
+            limit: 40,
+        };
+        let transcript_request = TranscriptPageRequest {
+            session_id: id(3),
+            before_run_id: Some(id(4)),
+            run_limit: 12,
+        };
+
+        let session_json = serde_json::to_value(session_request).unwrap();
+        assert_eq!(session_json["limit"], 40);
+        assert_eq!(
+            session_json["before_session_id"],
+            id::<SessionId>(3).to_string()
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionPageRequest>(session_json).unwrap(),
+            session_request
+        );
+
+        let transcript_json = serde_json::to_value(transcript_request).unwrap();
+        assert_eq!(transcript_json["run_limit"], 12);
+        assert_eq!(transcript_json["before_run_id"], id::<RunId>(4).to_string());
+        assert_eq!(
+            serde_json::from_value::<TranscriptPageRequest>(transcript_json).unwrap(),
+            transcript_request
+        );
     }
 
     #[test]

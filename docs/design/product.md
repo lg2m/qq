@@ -75,6 +75,19 @@ active controller with additional read-only observers.
 The server owns model requests, tools, history, scheduling, and event replay.
 Clients render state and submit commands but do not become the source of truth.
 
+### Browser Workbench
+
+`qq serve --web` serves a responsive React client from the QQ binary. It
+supports workspace and session navigation, Markdown transcripts, live SSE
+streaming, model and approval-mode selection, tool approval, cancellation,
+compaction, and bounded history pagination. Closing the page does not cancel
+server-owned work.
+
+Browser access is opt-in. Server startup defines the workspace allowlist, and a
+local native client issues short-lived one-time pairing URLs. Paired browsers
+use scoped cookies and CSRF protection rather than receiving the native server
+bearer token. Remote access terminates HTTPS at a loopback reverse proxy.
+
 ### Comprehensive CLI
 
 QQ will grow a comprehensive CLI for direct conversations, one-shot agent
@@ -148,6 +161,7 @@ The initial implementation and its supporting specifications should cover:
 - `qq` TUI startup from the current directory.
 - `qq serve` process lifecycle and configuration.
 - Versioned HTTP commands and resumable SSE events.
+- Opt-in, self-hosted browser workbench with scoped pairing.
 - SQLite session and event persistence.
 - One model integration.
 - Minimal file, search, patch, and shell tools.
@@ -156,27 +170,23 @@ The initial implementation and its supporting specifications should cover:
 
 ## Explicit Non-Goals
 
-Do not create these products or scaffolds during the initial Rust work:
+Do not create these products or scaffolds during the initial work:
 
-- Web or React frontend.
 - Mobile application.
-- JavaScript or TypeScript workspace.
 - Hosted SaaS or multi-user system.
 - Distributed execution workers.
 - Plugin ecosystem.
 - Broad provider matrix.
 - Autonomous multi-agent editing.
 
-Future web and mobile clients are expected, but the HTTP/SSE protocol is the
-only preparation they need now.
+Mobile clients remain deferred; they should reuse the HTTP/SSE protocol rather
+than introduce a parallel runtime.
 
 ## Open Decisions
 
 These choices should be resolved by focused designs or small benchmarks rather
 than assumptions:
 
-- Authentication for a server exposed on a Tailscale address (loopback
-  bearer-token auth is settled; the remote story is not).
 - Session control when several clients are attached to one session.
 - Concrete startup, latency, memory, and binary-size targets.
 

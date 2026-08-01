@@ -28,6 +28,37 @@ On Windows, credentials that exceed Credential Manager's per-entry limit are
 stored in a DPAPI-encrypted file bound to the current Windows user and machine.
 Moving that file to another account or computer requires signing in again.
 
+## Browser Workbench
+
+Run the self-hosted React workbench from the same `qq` binary. The current
+directory is exposed when no `--workspace` is supplied:
+
+```sh
+cargo run -- serve --web
+```
+
+Source builds compile and embed the frontend automatically and require Node.js
+24 with npm; the default Nix development shell includes both.
+
+Open the one-time pairing URL printed at startup. Later browser sessions can be
+paired from a local terminal with `cargo run -- pair --open`. Repeat
+`--workspace PATH` to expose an explicit set of server-local workspaces.
+
+The server continues to bind only to loopback. For access from another device,
+put an HTTPS reverse proxy such as Tailscale Serve or Caddy in front of it and
+tell QQ the exact browser-visible origin:
+
+```sh
+cargo run -- serve --web \
+  --web-origin https://qq.example.ts.net \
+  --workspace /srv/project
+```
+
+Pairing links are short-lived and one-time. The browser receives an HttpOnly,
+Secure, SameSite cookie and is limited to the workspaces named at server
+startup; mutating requests also require an exact-origin CSRF token. The native
+bearer token is never sent to browser JavaScript.
+
 To use xAI, set `XAI_API_KEY` or sign in with OAuth. OAuth credentials are
 refreshed and stored under the selected profile:
 

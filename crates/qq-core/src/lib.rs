@@ -34,7 +34,8 @@ pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpTo
 pub use sessions::{
     GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, RuntimeLoadError, RuntimeLoadFuture,
     RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
-    SessionRuntimeOptions, WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    SessionRuntimeOptions, WorkerRuntimeLoadFuture, WorkspaceAccess, WorkspaceGrantAuthority,
+    WorkspaceGrantSeed,
 };
 
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;

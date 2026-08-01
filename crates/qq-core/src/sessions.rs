@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -20,10 +20,11 @@ use qq_protocol::{
     CommandOutcome, CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole,
     MessageSnapshot, MessageState, ModelPricing, ModelSelection, ReasoningEvent, RunActivity,
     RunFailure, RunFailureKind, RunId, RunOutcome, RunSnapshot, RunStatus, SessionAccounting,
-    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
-    SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest, TextChannel,
-    TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
-    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionPage, SessionPageRequest,
+    SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
+    SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot,
+    ToolCallState, TranscriptPage, TranscriptPageRequest, WorkspaceGrantOutcome, WorkspaceId,
+    WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -68,6 +69,8 @@ const MAX_REPLAY_EVENTS: u16 = 128;
 const MAX_SNAPSHOT_SESSIONS: u16 = 512;
 const MAX_SNAPSHOT_MESSAGES: u16 = 256;
 const MAX_SNAPSHOT_TOOL_CALLS: usize = 4_096;
+const MAX_SESSION_PAGE_SIZE: u16 = 100;
+const MAX_TRANSCRIPT_PAGE_RUNS: u16 = 20;
 const MAX_TEXT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_WORKSPACES: u32 = 1024;
@@ -193,6 +196,45 @@ pub trait WorkspaceGrantAuthority: Send + Sync + 'static {
 pub type SessionEventStream =
     Pin<Box<dyn Stream<Item = Result<SessionEventEnvelope, SessionRuntimeError>> + Send + 'static>>;
 
+/// Workspace capabilities attached to one client request. Local clients use
+/// `all`; browser sessions receive an immutable, explicitly configured set.
+#[derive(Clone, Debug)]
+pub struct WorkspaceAccess {
+    allowed: Option<Arc<HashSet<WorkspaceId>>>,
+}
+
+impl WorkspaceAccess {
+    #[must_use]
+    pub const fn all() -> Self {
+        Self { allowed: None }
+    }
+
+    #[must_use]
+    pub fn only(workspaces: impl IntoIterator<Item = WorkspaceId>) -> Self {
+        Self {
+            allowed: Some(Arc::new(workspaces.into_iter().collect())),
+        }
+    }
+
+    #[must_use]
+    pub fn permits(&self, workspace_id: WorkspaceId) -> bool {
+        self.allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(&workspace_id))
+    }
+
+    #[must_use]
+    pub const fn is_restricted(&self) -> bool {
+        self.allowed.is_some()
+    }
+}
+
+impl Default for WorkspaceAccess {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionRuntimeOptions {
     pub database_path: PathBuf,
@@ -306,9 +348,20 @@ impl SessionRuntime {
         command_id: CommandId,
         command: SessionCommand,
     ) -> Result<CommandReceipt, SessionRuntimeError> {
+        self.command_with_access(command_id, command, WorkspaceAccess::all())
+            .await
+    }
+
+    pub async fn command_with_access(
+        &self,
+        command_id: CommandId,
+        command: SessionCommand,
+        access: WorkspaceAccess,
+    ) -> Result<CommandReceipt, SessionRuntimeError> {
         if *self.inner.failed.borrow() {
             return Err(SessionRuntimeError::Unavailable);
         }
+        self.inner.store.authorize_command(&command, access).await?;
         let signal_run = match command {
             SessionCommand::CancelRun { run_id } => Some(run_id),
             _ => None,
@@ -387,6 +440,15 @@ impl SessionRuntime {
         &self,
         request: SnapshotRequest,
     ) -> Result<WorkspaceSnapshot, SessionRuntimeError> {
+        self.snapshot_with_access(request, &WorkspaceAccess::all())
+            .await
+    }
+
+    pub async fn snapshot_with_access(
+        &self,
+        request: SnapshotRequest,
+        access: &WorkspaceAccess,
+    ) -> Result<WorkspaceSnapshot, SessionRuntimeError> {
         if *self.inner.failed.borrow() {
             return Err(SessionRuntimeError::Unavailable);
         }
@@ -397,15 +459,80 @@ impl SessionRuntime {
         {
             return Err(SessionRuntimeError::InvalidPageLimit);
         }
+        if !access.permits(request.workspace_id) {
+            return Err(SessionRuntimeError::AccessDenied);
+        }
         self.inner.store.snapshot(request).await
+    }
+
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, SessionRuntimeError> {
+        self.session_page_with_access(request, &WorkspaceAccess::all())
+            .await
+    }
+
+    pub async fn session_page_with_access(
+        &self,
+        request: SessionPageRequest,
+        access: &WorkspaceAccess,
+    ) -> Result<SessionPage, SessionRuntimeError> {
+        if *self.inner.failed.borrow() {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        if request.limit == 0 || request.limit > MAX_SESSION_PAGE_SIZE {
+            return Err(SessionRuntimeError::InvalidPageLimit);
+        }
+        if !access.permits(request.workspace_id) {
+            return Err(SessionRuntimeError::AccessDenied);
+        }
+        self.inner.store.session_page(request).await
+    }
+
+    pub async fn transcript_page(
+        &self,
+        request: TranscriptPageRequest,
+    ) -> Result<TranscriptPage, SessionRuntimeError> {
+        self.transcript_page_with_access(request, WorkspaceAccess::all())
+            .await
+    }
+
+    pub async fn transcript_page_with_access(
+        &self,
+        request: TranscriptPageRequest,
+        access: WorkspaceAccess,
+    ) -> Result<TranscriptPage, SessionRuntimeError> {
+        if *self.inner.failed.borrow() {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        if request.run_limit == 0 || request.run_limit > MAX_TRANSCRIPT_PAGE_RUNS {
+            return Err(SessionRuntimeError::InvalidPageLimit);
+        }
+        self.inner
+            .store
+            .authorize_session(request.session_id, access)
+            .await?;
+        self.inner.store.transcript_page(request).await
     }
 
     pub fn subscribe(
         &self,
         request: SubscribeRequest,
     ) -> Result<SessionEventStream, SessionRuntimeError> {
+        self.subscribe_with_access(request, &WorkspaceAccess::all())
+    }
+
+    pub fn subscribe_with_access(
+        &self,
+        request: SubscribeRequest,
+        access: &WorkspaceAccess,
+    ) -> Result<SessionEventStream, SessionRuntimeError> {
         if *self.inner.failed.borrow() {
             return Err(SessionRuntimeError::Unavailable);
+        }
+        if !access.permits(request.workspace_id) {
+            return Err(SessionRuntimeError::AccessDenied);
         }
         if request.after.store_id != self.inner.store.store_id() {
             return Err(SessionRuntimeError::CursorStoreMismatch);
@@ -1916,6 +2043,8 @@ pub enum SessionRuntimeError {
     InvalidRunLimit,
     #[error("page limits must be greater than zero")]
     InvalidPageLimit,
+    #[error("the client is not allowed to access that workspace")]
+    AccessDenied,
     #[error("workspace path must not be empty")]
     EmptyWorkspace,
     #[error("workspace path must identify an existing directory")]
@@ -2143,6 +2272,109 @@ impl Store {
         let store_id = self.store_id;
         self.call(Priority::Control, move |connection| {
             load_snapshot(connection, store_id, request)
+        })
+        .await
+    }
+
+    async fn authorize_command(
+        &self,
+        command: &SessionCommand,
+        access: WorkspaceAccess,
+    ) -> Result<(), SessionRuntimeError> {
+        if !access.is_restricted() {
+            return Ok(());
+        }
+        let command = command.clone();
+        self.call(Priority::Control, move |connection| {
+            let workspace_id = match command {
+                SessionCommand::ResolveWorkspace { .. } => {
+                    return Err(SessionRuntimeError::AccessDenied);
+                }
+                SessionCommand::CreateSession { workspace_id, .. }
+                | SessionCommand::PruneSessions { workspace_id } => workspace_id,
+                SessionCommand::SubmitPrompt { session_id, .. }
+                | SessionCommand::SetApprovalMode { session_id, .. }
+                | SessionCommand::SetSessionModel { session_id, .. }
+                | SessionCommand::DeleteSession { session_id }
+                | SessionCommand::CompactSession { session_id } => connection
+                    .query_row(
+                        "SELECT workspace_id FROM sessions WHERE id = ?1",
+                        [session_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|_| SessionRuntimeError::Persistence)?
+                    .map(|id| parse_id(&id))
+                    .transpose()?
+                    .ok_or(SessionRuntimeError::SessionNotFound)?,
+                SessionCommand::CancelRun { run_id }
+                | SessionCommand::RespondToolApproval { run_id, .. } => connection
+                    .query_row(
+                        "SELECT s.workspace_id FROM runs r
+                         JOIN sessions s ON s.id = r.session_id WHERE r.id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|_| SessionRuntimeError::Persistence)?
+                    .map(|id| parse_id(&id))
+                    .transpose()?
+                    .ok_or(SessionRuntimeError::RunNotFound)?,
+            };
+            if access.permits(workspace_id) {
+                Ok(())
+            } else {
+                Err(SessionRuntimeError::AccessDenied)
+            }
+        })
+        .await
+    }
+
+    async fn authorize_session(
+        &self,
+        session_id: SessionId,
+        access: WorkspaceAccess,
+    ) -> Result<(), SessionRuntimeError> {
+        if !access.is_restricted() {
+            return Ok(());
+        }
+        self.call(Priority::Control, move |connection| {
+            let workspace_id = connection
+                .query_row(
+                    "SELECT workspace_id FROM sessions WHERE id = ?1",
+                    [session_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .map(|id| parse_id(&id))
+                .transpose()?
+                .ok_or(SessionRuntimeError::SessionNotFound)?;
+            if access.permits(workspace_id) {
+                Ok(())
+            } else {
+                Err(SessionRuntimeError::AccessDenied)
+            }
+        })
+        .await
+    }
+
+    async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            load_session_page(connection, request)
+        })
+        .await
+    }
+
+    async fn transcript_page(
+        &self,
+        request: TranscriptPageRequest,
+    ) -> Result<TranscriptPage, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            load_transcript_page(connection, request)
         })
         .await
     }
@@ -5831,6 +6063,200 @@ fn outcome_states(outcome: &RunOutcome) -> (&'static str, &'static str) {
         RunOutcome::Interrupted => ("interrupted", "interrupted"),
         RunOutcome::Failed { .. } => ("failed", "failed"),
     }
+}
+
+fn load_session_page(
+    connection: &mut Connection,
+    request: SessionPageRequest,
+) -> Result<SessionPage, SessionRuntimeError> {
+    ensure_workspace(connection, request.workspace_id)?;
+    let before = request
+        .before_session_id
+        .map(|session_id| {
+            connection
+                .query_row(
+                    "SELECT updated_at_ms, rowid FROM sessions
+                     WHERE id = ?1 AND workspace_id = ?2",
+                    params![session_id.to_string(), request.workspace_id.to_string()],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::SessionNotFound)
+        })
+        .transpose()?;
+    let mut statement = match before {
+        Some(_) => connection.prepare(
+            "SELECT id FROM sessions
+             WHERE workspace_id = ?1
+               AND (updated_at_ms < ?2 OR (updated_at_ms = ?2 AND rowid < ?3))
+             ORDER BY updated_at_ms DESC, rowid DESC LIMIT ?4",
+        ),
+        None => connection.prepare(
+            "SELECT id FROM sessions WHERE workspace_id = ?1
+             ORDER BY updated_at_ms DESC, rowid DESC LIMIT ?2",
+        ),
+    }
+    .map_err(|_| SessionRuntimeError::Persistence)?;
+    let requested = u64::from(request.limit) + 1;
+    let rows = match before {
+        Some((updated_at_ms, rowid)) => statement
+            .query_map(
+                params![
+                    request.workspace_id.to_string(),
+                    updated_at_ms,
+                    rowid,
+                    requested
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?,
+        None => statement
+            .query_map(
+                params![request.workspace_id.to_string(), requested],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?,
+    };
+    drop(statement);
+
+    let has_older = rows.len() > usize::from(request.limit);
+    let mut sessions = Vec::with_capacity(rows.len().min(usize::from(request.limit)));
+    for id in rows.into_iter().take(usize::from(request.limit)) {
+        sessions.push(load_session_summary(connection, parse_id(&id)?)?);
+    }
+    let next_before_session_id = has_older.then(|| sessions.last().expect("non-empty page").id);
+    Ok(SessionPage {
+        sessions,
+        next_before_session_id,
+    })
+}
+
+fn load_transcript_page(
+    connection: &mut Connection,
+    request: TranscriptPageRequest,
+) -> Result<TranscriptPage, SessionRuntimeError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sessions WHERE id = ?1",
+            [request.session_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::SessionNotFound)?;
+    let before = request
+        .before_run_id
+        .map(|run_id| {
+            connection
+                .query_row(
+                    "SELECT created_at_ms, rowid FROM runs
+                     WHERE id = ?1 AND session_id = ?2",
+                    params![run_id.to_string(), request.session_id.to_string()],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::RunNotFound)
+        })
+        .transpose()?;
+    let mut statement = match before {
+        Some(_) => connection.prepare(
+            "SELECT id FROM runs
+             WHERE session_id = ?1
+               AND (created_at_ms < ?2 OR (created_at_ms = ?2 AND rowid < ?3))
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT ?4",
+        ),
+        None => connection.prepare(
+            "SELECT id FROM runs WHERE session_id = ?1
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT ?2",
+        ),
+    }
+    .map_err(|_| SessionRuntimeError::Persistence)?;
+    let requested = u64::from(request.run_limit) + 1;
+    let rows = match before {
+        Some((created_at_ms, rowid)) => statement
+            .query_map(
+                params![
+                    request.session_id.to_string(),
+                    created_at_ms,
+                    rowid,
+                    requested
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?,
+        None => statement
+            .query_map(params![request.session_id.to_string(), requested], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?,
+    };
+    drop(statement);
+
+    let has_older = rows.len() > usize::from(request.run_limit);
+    let mut run_ids = rows
+        .into_iter()
+        .take(usize::from(request.run_limit))
+        .map(|id| parse_id::<RunId>(&id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_before_run_id = has_older.then(|| *run_ids.last().expect("non-empty page"));
+    run_ids.reverse();
+
+    let mut runs = Vec::with_capacity(run_ids.len());
+    let mut messages = Vec::new();
+    let mut tool_calls = Vec::new();
+    for run_id in run_ids {
+        runs.push(load_run(connection, run_id)?);
+
+        let mut statement = connection
+            .prepare(
+                "SELECT id FROM messages
+                 WHERE run_id = ?1 AND NOT (role = 'assistant' AND state = 'queued')
+                 ORDER BY ordinal",
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let ids = statement
+            .query_map([run_id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        drop(statement);
+        for id in ids {
+            messages.push(load_message(connection, parse_id(&id)?)?);
+        }
+
+        let mut statement = connection
+            .prepare(
+                "SELECT id FROM tool_calls WHERE run_id = ?1
+                 ORDER BY turn_ordinal, call_ordinal",
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let ids = statement
+            .query_map([run_id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        drop(statement);
+        for id in ids {
+            tool_calls.push(load_tool_call(connection, parse_id(&id)?)?);
+        }
+    }
+
+    Ok(TranscriptPage {
+        runs,
+        messages,
+        tool_calls,
+        next_before_run_id,
+    })
 }
 
 fn load_snapshot(

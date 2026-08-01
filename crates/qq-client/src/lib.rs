@@ -10,7 +10,8 @@ use futures_util::StreamExt;
 use qq_protocol::{
     AskRequest, AskValidationError, CommandId, CommandReceipt, CommandRequest, EventCursor,
     LocalServerConnection, MAX_EVENT_BYTES, MAX_REQUEST_BYTES, ModelCatalogRequest,
-    ModelDescriptor, RunEvent, SessionCommand, SessionEventEnvelope, SnapshotRequest, WorkspaceId,
+    ModelDescriptor, RunEvent, SessionCommand, SessionEventEnvelope, SessionPage,
+    SessionPageRequest, SnapshotRequest, TranscriptPage, TranscriptPageRequest, WorkspaceId,
     WorkspaceSnapshot, validate_ask_request,
 };
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
@@ -93,6 +94,22 @@ impl SessionClient {
         request: SnapshotRequest,
     ) -> Result<WorkspaceSnapshot, ClientError> {
         self.post_json("/v1/workspaces/snapshot", &request, MAX_SNAPSHOT_BYTES)
+            .await
+    }
+
+    pub async fn session_page(
+        &self,
+        request: SessionPageRequest,
+    ) -> Result<SessionPage, ClientError> {
+        self.post_json("/v1/workspaces/sessions", &request, MAX_SNAPSHOT_BYTES)
+            .await
+    }
+
+    pub async fn transcript_page(
+        &self,
+        request: TranscriptPageRequest,
+    ) -> Result<TranscriptPage, ClientError> {
+        self.post_json("/v1/sessions/transcript", &request, MAX_SNAPSHOT_BYTES)
             .await
     }
 
@@ -608,6 +625,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use qq_core::WorkspaceAccess;
     use qq_protocol::{
         CommandOutcome, EventCursor, ModelSelection, PROTOCOL_VERSION, ServerInfo, SessionId,
         StoreId,
@@ -624,7 +642,7 @@ mod tests {
     struct CatalogHandler;
 
     impl AskHandler for CatalogHandler {
-        fn models(&self, request: ModelCatalogRequest) -> ModelsFuture {
+        fn models(&self, _access: WorkspaceAccess, request: ModelCatalogRequest) -> ModelsFuture {
             Box::pin(async move {
                 Ok(vec![ModelDescriptor {
                     provider: "openai".to_owned(),
@@ -642,7 +660,7 @@ mod tests {
     }
 
     impl AskHandler for CommandEchoHandler {
-        fn command(&self, request: CommandRequest) -> CommandFuture {
+        fn command(&self, _access: WorkspaceAccess, request: CommandRequest) -> CommandFuture {
             self.commands.lock().unwrap().push(request.clone());
             Box::pin(async move {
                 Ok(CommandReceipt {

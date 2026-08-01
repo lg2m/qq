@@ -719,7 +719,7 @@ fn read_file(
         return ToolExecutionResult::error(format!("could not read file: {error}"));
     }
     let update = (bytes.len() as u64 <= MAX_READ_SCAN_BYTES).then(|| FileStateUpdate {
-        path: path.to_string_lossy().into_owned(),
+        path: portable_relative_path(&path),
         hash: content_hash(&bytes),
     });
     let reader = BufReader::new(Cursor::new(bytes.as_slice())).take(MAX_READ_SCAN_BYTES);
@@ -810,7 +810,7 @@ fn edit_file(
     if !workspace.root.is_file(&path) {
         return ToolExecutionResult::error("path is not a file");
     }
-    let key = path.to_string_lossy().into_owned();
+    let key = portable_relative_path(&path);
     let Some(recorded) = file_state.recorded(&key) else {
         return ToolExecutionResult::error(format!(
             "{} has not been read in this session; call read_file on it first, then retry the edit",
@@ -899,7 +899,7 @@ fn write_file(
         Ok(path) => path,
         Err(error) => return ToolExecutionResult::error(error),
     };
-    let key = path.to_string_lossy().into_owned();
+    let key = portable_relative_path(&path);
 
     let guard = workspace
         .apply_lock
@@ -1241,7 +1241,7 @@ fn search(
             continue;
         }
         files += 1;
-        let relative = path.to_string_lossy();
+        let relative = portable_relative_path(&path);
         if path
             .file_name()
             .is_some_and(|name| name.to_string_lossy().contains(&arguments.query))
@@ -1551,12 +1551,11 @@ fn shell_result(capture: BoundedCapture, status: std::process::ExitStatus) -> To
                 status
                     .signal()
                     .map(|signal| format!("command was terminated by signal {signal}"))
+                    .unwrap_or_else(|| "command was terminated without an exit code".to_owned())
             };
             #[cfg(not(unix))]
-            let detail: Option<String> = None;
-            content.push_str(
-                &detail.unwrap_or_else(|| "command was terminated without an exit code".to_owned()),
-            );
+            let detail = "command was terminated without an exit code".to_owned();
+            content.push_str(&detail);
             ToolExecutionResult::error(content)
         }
     }
@@ -1683,6 +1682,13 @@ fn contained_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, Str
         return Err("path escapes the workspace".to_owned());
     }
     Ok(canonical)
+}
+
+fn portable_relative_path(path: &Path) -> String {
+    path.iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The size of `byte` once serde_json escapes it inside a JSON string.

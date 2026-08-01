@@ -143,27 +143,31 @@ impl Drop for TerminalGuard {
 
 fn enable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
     // Kitty keyboard progressive enhancement lets compatible terminals report
-    // modified keys such as Shift-Enter. Unsupported terminals ignore the CSI.
-    // Always push/pop rather than probing: the support query blocks on stdin
-    // and races the async event loop.
-    execute!(
+    // modified keys such as Shift-Enter. Always push/pop rather than probing:
+    // the support query blocks on stdin and races the async event loop. The
+    // legacy Windows console reports the command as unsupported rather than
+    // emitting a CSI, but bracketed paste and mouse capture remain usable.
+    match execute!(
         output,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        ),
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )
+        )
+    ) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {}
+        Err(error) => return Err(error),
+    }
+    execute!(output, EnableBracketedPaste, EnableMouseCapture)
 }
 
 fn disable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
-    execute!(
-        output,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        PopKeyboardEnhancementFlags
-    )
+    execute!(output, DisableMouseCapture, DisableBracketedPaste)?;
+    match execute!(output, PopKeyboardEnhancementFlags) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -184,7 +188,7 @@ async fn shutdown_signal() -> io::Result<()> {
     tokio::signal::ctrl_c().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 
@@ -198,7 +202,7 @@ mod tests {
 
         let entered = String::from_utf8(entered).unwrap();
         let restored = String::from_utf8(restored).unwrap();
-        // Kitty keyboard protocol: DISAMBIGUATE | REPORT_EVENT_TYPES => 3
+        // Kitty keyboard protocol: DISAMBIGUATE | REPORT_EVENT_TYPES => 3.
         assert!(entered.contains("\x1b[>3u"));
         assert!(entered.contains("\x1b[?1000h"));
         assert!(entered.contains("\x1b[?2004h"));

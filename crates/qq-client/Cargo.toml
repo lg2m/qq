@@ -18,5 +18,6 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+qq-core.workspace = true
 qq-server.workspace = true
 tempfile.workspace = true

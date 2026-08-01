@@ -41,7 +41,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     match cli.command {
         Some(cli::Command::Ask { prompt }) => ask(prompt, &overrides).await?,
-        Some(cli::Command::Serve { bind }) => serve(bind).await?,
+        Some(cli::Command::Serve {
+            bind,
+            web,
+            web_origin,
+            workspace,
+        }) => serve(bind, web, web_origin, workspace).await?,
+        Some(cli::Command::Pair { open }) => pair(open).await?,
         Some(cli::Command::Config { command }) => config_command(command, &overrides)?,
         Some(cli::Command::Auth { command }) => {
             run_blocking_command(move || auth_command(command)).await?
@@ -83,19 +89,65 @@ async fn ask(prompt: String, overrides: &CliOverrides) -> Result<(), Box<dyn Err
     render_events(runtime.run_in_workspace(RunCommand::new(prompt), workspace)).await
 }
 
-async fn serve(bind: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {
-    let handler =
-        Arc::new(runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?);
-    let options = server::ServerOptions::for_user()?.with_bind_address(bind);
-    match server::start(handler, options).await? {
+async fn serve(
+    bind: std::net::SocketAddr,
+    web: bool,
+    web_origin: Option<String>,
+    mut workspace: Vec<std::path::PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let handler = runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?;
+    let mut options = server::ServerOptions::for_user()?.with_bind_address(bind);
+    if web {
+        if workspace.is_empty() {
+            workspace.push(std::env::current_dir()?);
+        }
+        let workspaces = handler.expose_web_workspaces(workspace).await?;
+        let mut web = server::WebOptions::new(workspaces);
+        if let Some(origin) = web_origin {
+            web = web.with_origin(origin);
+        }
+        options = options.with_web(web);
+    }
+    match server::start(Arc::new(handler), options).await? {
         server::StartOutcome::Existing(connection) => {
             println!("qq server already running at {}", connection.address());
         }
         server::StartOutcome::Started(server) => {
             println!("qq server listening at {}", server.connection().address());
+            if let Some(url) = server.pairing_url() {
+                println!("pair a browser with:\n{url}");
+            }
             tokio::signal::ctrl_c().await?;
             server.shutdown().await?;
         }
+    }
+    Ok(())
+}
+
+async fn pair(open: bool) -> Result<(), Box<dyn Error>> {
+    let connection = server::discover()
+        .await?
+        .ok_or("qq server is not running")?;
+    let response = reqwest::Client::new()
+        .post(connection.endpoint("/v1/web/pairings"))
+        .bearer_auth(connection.expose_bearer_token())
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "could not create a pairing URL (server returned {})",
+            response.status()
+        )
+        .into());
+    }
+    let body: serde_json::Value = response.json().await?;
+    let url = body
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("server returned an invalid pairing response")?;
+    println!("{url}");
+    if open && webbrowser::open(url).is_err() {
+        eprintln!("The browser could not be opened automatically.");
     }
     Ok(())
 }

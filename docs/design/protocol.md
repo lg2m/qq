@@ -3,8 +3,8 @@
 ## Purpose
 
 This document specifies the versioned HTTP/SSE wire protocol between QQ
-clients and a QQ server. It is the contract for the TUI, future remote
-clients, and any automation that talks to `qq serve`.
+clients and a QQ server. It is the contract for the TUI, bundled browser
+workbench, future remote clients, and automation that talks to `qq serve`.
 
 The protocol is transport-neutral in the `qq-protocol` crate: shared types do
 not depend on an HTTP client or server framework. `qq-server` maps those types
@@ -81,7 +81,7 @@ Clients and servers must agree on this value.
 | Commands | `POST` with `Content-Type: application/json` |
 | Snapshots / catalog | `POST` with JSON request and JSON response |
 | Live history | `GET` Server-Sent Events (`text/event-stream`) |
-| Auth | `Authorization: Bearer <token>` on every request |
+| Auth | Native bearer token, or a paired browser session where allowed |
 | Body limit | 1 MiB request bodies |
 | Keep-alive | SSE comment/`keep-alive` every 15 seconds while idle |
 
@@ -109,6 +109,14 @@ Missing or incorrect credentials receive `401` with:
 Token comparison is constant-time. Metadata and tokens must never be logged in
 full by clients or servers.
 
+With `qq serve --web`, `POST /v1/web/pair` exchanges a short-lived, one-time
+fragment secret for an HttpOnly, Secure, SameSite browser cookie. The fragment
+keeps the secret out of HTTP requests and proxy logs until JavaScript submits
+it. Browser sessions receive a CSRF token from bootstrap; every non-GET browser
+request must send it in `X-QQ-CSRF` and carry an `Origin` exactly equal to the
+configured browser origin. Browser sessions are restricted to the workspace
+allowlist fixed at server startup and never receive the native bearer token.
+
 ### Error Responses
 
 Failed HTTP requests return JSON:
@@ -123,6 +131,7 @@ Common status codes:
 | --- | --- |
 | `400` | Malformed body, wrong command for the route, invalid cursor/id |
 | `401` | Missing or invalid bearer token |
+| `403` | Browser origin/CSRF rejection or workspace access denied |
 | `404` | Unknown path |
 | `405` | Wrong HTTP method |
 | `413` | Body exceeds the 1 MiB limit |
@@ -200,13 +209,16 @@ Rules:
 
 ## HTTP Routes
 
-All routes require authentication. Command routes accept a `CommandRequest`
-and return a `CommandReceipt` unless noted.
+All API routes require authentication except the one-time pairing exchange.
+Command routes accept a `CommandRequest` and return a `CommandReceipt` unless
+noted.
 
 ```text
 GET  /v1/health
 POST /v1/workspaces/resolve
 POST /v1/workspaces/snapshot
+POST /v1/workspaces/sessions
+POST /v1/sessions/transcript
 POST /v1/models
 POST /v1/sessions
 POST /v1/sessions/prompts
@@ -218,6 +230,10 @@ POST /v1/sessions/compact
 POST /v1/runs/cancel
 POST /v1/tools/approvals
 GET  /v1/workspaces/{workspace_id}/events
+POST /v1/web/pair
+GET  /v1/web/bootstrap
+POST /v1/web/logout
+POST /v1/web/pairings
 ```
 
 Each command route accepts only its matching `SessionCommand` variant. Sending
@@ -664,6 +680,50 @@ Response `WorkspaceSnapshot`:
 Snapshots are the catch-up mechanism after connect or cursor loss. Live SSE
 then advances the client from `cursor`.
 
+### `POST /v1/workspaces/sessions`
+
+Returns a bounded page of session summaries, newest first. `before_session_id`
+is an opaque cursor into the same workspace ordering.
+
+```json
+{
+  "workspace_id": "...",
+  "before_session_id": null,
+  "limit": 40
+}
+```
+
+The response contains `sessions` and an optional `next_before_session_id`.
+The runtime accepts `limit` values in `1..=100`.
+
+### `POST /v1/sessions/transcript`
+
+Returns whole runs from a durable transcript so a page never splits a run's
+messages and tool calls. Rows in the response are chronological.
+
+```json
+{
+  "session_id": "...",
+  "before_run_id": null,
+  "run_limit": 12
+}
+```
+
+The response contains `runs`, `messages`, `tool_calls`, and an optional
+`next_before_run_id`. The runtime accepts `run_limit` values in `1..=20`.
+
+### Browser bootstrap and pairing routes
+
+- `POST /v1/web/pair` is public but requires the exact configured `Origin` and
+  consumes a one-time pairing secret.
+- `GET /v1/web/bootstrap` returns server information, the CSRF token, and the
+  paired browser's workspace allowlist.
+- `POST /v1/web/logout` invalidates the current browser session.
+- `POST /v1/web/pairings` requires native bearer authentication and creates a
+  new one-time pairing URL.
+
+Non-API paths serve the embedded browser application when web mode is enabled.
+
 ### `POST /v1/models`
 
 Model catalog lookup for a workspace and selection hint.
@@ -1050,12 +1110,15 @@ Current server/client bounds that affect interoperability:
 | HTTP request body | 1 MiB |
 | SSE event JSON | 1 MiB |
 | Snapshot response (client read limit) | 8 MiB |
+| Paginated query response | 8 MiB |
 | Model catalog response | 2 MiB |
 | Health response | 16 KiB |
 | Workspace path field | 4 KiB |
 | Model id field | 512 bytes |
 | Organization field | 512 bytes |
 | Snapshot `session_limit` | 1..=512 |
+| Session page `limit` | 1..=100 |
+| Transcript page `run_limit` | 1..=20 |
 | Bootstrap snapshot used by the shipped TUI client | 512 sessions / 256 messages |
 
 Field-level validation rejects empty prompts/paths where applicable and

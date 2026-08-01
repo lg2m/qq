@@ -32,5 +32,10 @@ target
 /result
 /result-*
 
+# Web dependencies and generated bundles
+/web/node_modules/
+/web/dist/
+/web/*.tsbuildinfo
+
 .opencode
 .claude

@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -16,11 +17,12 @@ use qq_core::{
     GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, Runtime, RuntimeConfigError,
     RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
     SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, WorkerRuntimeLoadFuture,
-    WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    WorkspaceAccess, WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 use qq_protocol::{
-    ApprovalGrant, CommandRequest, ModelCatalogRequest, ModelDescriptor, RunFailureKind,
-    SnapshotRequest, SubscribeRequest, WorkspaceGrantOutcome,
+    ApprovalGrant, CommandId, CommandOutcome, CommandRequest, ModelCatalogRequest, ModelDescriptor,
+    RunFailureKind, SessionCommand, SessionPageRequest, SnapshotRequest, SubscribeRequest,
+    TranscriptPageRequest, WorkspaceGrantOutcome, WorkspaceSummary,
 };
 use qq_provider::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderError,
@@ -963,30 +965,73 @@ impl RuntimeHandler {
         let durable = SessionRuntime::open(options, Arc::new(factory.clone())).await?;
         Ok(Self { durable, factory })
     }
+
+    pub async fn expose_web_workspaces(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<WorkspaceSummary>, RuntimeHandlerError> {
+        let mut workspaces = Vec::with_capacity(paths.len());
+        for path in paths {
+            let canonical =
+                fs::canonicalize(&path).map_err(|source| RuntimeHandlerError::WebWorkspace {
+                    path: path.clone(),
+                    source,
+                })?;
+            if !canonical.is_dir() {
+                return Err(RuntimeHandlerError::WebWorkspaceNotDirectory(canonical));
+            }
+            let path = canonical
+                .to_str()
+                .ok_or_else(|| RuntimeHandlerError::WebWorkspaceNotUnicode(canonical.clone()))?
+                .to_owned();
+            let command_id =
+                CommandId::generate().map_err(|_| RuntimeHandlerError::RandomnessUnavailable)?;
+            let receipt = self
+                .durable
+                .command(
+                    command_id,
+                    SessionCommand::ResolveWorkspace { path: path.clone() },
+                )
+                .await?;
+            let CommandOutcome::WorkspaceResolved { workspace_id } = receipt.outcome else {
+                return Err(RuntimeHandlerError::UnexpectedWorkspaceOutcome);
+            };
+            if !workspaces
+                .iter()
+                .any(|workspace: &WorkspaceSummary| workspace.id == workspace_id)
+            {
+                workspaces.push(WorkspaceSummary {
+                    id: workspace_id,
+                    path,
+                });
+            }
+        }
+        Ok(workspaces)
+    }
 }
 
 impl AskHandler for RuntimeHandler {
-    fn command(&self, request: CommandRequest) -> CommandFuture {
+    fn command(&self, access: WorkspaceAccess, request: CommandRequest) -> CommandFuture {
         let runtime = self.durable.clone();
         Box::pin(async move {
             runtime
-                .command(request.command_id, request.command)
+                .command_with_access(request.command_id, request.command, access)
                 .await
                 .map_err(map_session_runtime_error)
         })
     }
 
-    fn snapshot(&self, request: SnapshotRequest) -> SnapshotFuture {
+    fn snapshot(&self, access: WorkspaceAccess, request: SnapshotRequest) -> SnapshotFuture {
         let runtime = self.durable.clone();
         Box::pin(async move {
             runtime
-                .snapshot(request)
+                .snapshot_with_access(request, &access)
                 .await
                 .map_err(map_session_runtime_error)
         })
     }
 
-    fn models(&self, request: ModelCatalogRequest) -> ModelsFuture {
+    fn models(&self, _access: WorkspaceAccess, request: ModelCatalogRequest) -> ModelsFuture {
         let factory = self.factory.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || factory.models_for(&request))
@@ -1001,15 +1046,48 @@ impl AskHandler for RuntimeHandler {
         })
     }
 
-    fn subscribe(&self, request: SubscribeRequest) -> Result<SessionEventStream, AskHandlerError> {
+    fn session_page(
+        &self,
+        access: WorkspaceAccess,
+        request: SessionPageRequest,
+    ) -> qq_server::SessionPageFuture {
+        let runtime = self.durable.clone();
+        Box::pin(async move {
+            runtime
+                .session_page_with_access(request, &access)
+                .await
+                .map_err(map_session_runtime_error)
+        })
+    }
+
+    fn transcript_page(
+        &self,
+        access: WorkspaceAccess,
+        request: TranscriptPageRequest,
+    ) -> qq_server::TranscriptPageFuture {
+        let runtime = self.durable.clone();
+        Box::pin(async move {
+            runtime
+                .transcript_page_with_access(request, access)
+                .await
+                .map_err(map_session_runtime_error)
+        })
+    }
+
+    fn subscribe(
+        &self,
+        access: WorkspaceAccess,
+        request: SubscribeRequest,
+    ) -> Result<SessionEventStream, AskHandlerError> {
         self.durable
-            .subscribe(request)
+            .subscribe_with_access(request, &access)
             .map_err(map_session_runtime_error)
     }
 }
 
 fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
     match error {
+        SessionRuntimeError::AccessDenied => AskHandlerError::Forbidden,
         error @ (SessionRuntimeError::EmptyWorkspace
         | SessionRuntimeError::InvalidWorkspace
         | SessionRuntimeError::EmptyPrompt
@@ -1050,6 +1128,20 @@ pub enum RuntimeHandlerError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Sessions(#[from] SessionRuntimeError),
+    #[error("could not resolve web workspace {path}")]
+    WebWorkspace {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("web workspace is not a directory: {0}")]
+    WebWorkspaceNotDirectory(PathBuf),
+    #[error("web workspace path is not valid Unicode: {0}")]
+    WebWorkspaceNotUnicode(PathBuf),
+    #[error("secure randomness is unavailable")]
+    RandomnessUnavailable,
+    #[error("workspace resolution returned an unexpected outcome")]
+    UnexpectedWorkspaceOutcome,
 }
 
 fn protocol_model_pricing(pricing: qq_config::ModelPricing) -> qq_protocol::ModelPricing {

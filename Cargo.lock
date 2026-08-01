@@ -2623,6 +2623,7 @@ dependencies = [
  "async-stream",
  "futures-core",
  "futures-util",
+ "qq-core",
  "qq-protocol",
  "qq-server",
  "reqwest",

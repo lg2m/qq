@@ -20,7 +20,7 @@ faster system that loses history or corrupts a workspace is not useful.
 QQ ships as one Rust binary named `qq`.
 
 ```text
-TUI / CLI client
+TUI / CLI / browser client
        |
        | HTTP commands + SSE events
        v
@@ -36,8 +36,11 @@ The binary has multiple process modes:
 - `qq` opens the TUI scoped to the current working directory. By default it
   starts a local server runtime in the same process and communicates with it
   through the same HTTP/SSE interface used by remote clients.
-- `qq serve [ARGS]` runs the server without a TUI. It is suitable for a
-  persistent process on a desktop or home server.
+- `qq serve [ARGS]` runs the server without a TUI. With `--web`, it also serves
+  the bundled browser workbench for explicitly exposed workspaces. It is
+  suitable for a persistent process on a desktop or home server.
+- `qq pair` asks a running web-enabled server for a short-lived, one-time
+  browser pairing URL without exposing the native bearer token.
 - `qq ask PROMPT` is the initial direct, automation-oriented path. It streams
   one model response to stdout through the same core runtime that the server
   will use.
@@ -125,7 +128,8 @@ xtask/
   the server and client adapters. It does not depend on an HTTP client or
   server framework.
 - `qq-server` contains the Axum adapter, HTTP/SSE route wiring, bearer-token
-  authentication, and private local-instance discovery metadata.
+  and browser-pairing authentication, the embedded web asset build, and
+  private local-instance discovery metadata.
 - `qq-tui` contains terminal rendering, input handling, and client-side state.
   It communicates through `qq-client` and the protocol and does not depend
   directly on `qq-core` or application configuration.
@@ -332,15 +336,16 @@ the initial version.
 
 ## Local And Remote Networking
 
-The server binds to loopback by default. Binding to a Tailscale address or
-another non-loopback interface must be explicit. Tailscale supplies encrypted
-private networking and device-level access controls, but remote command
-execution still needs an application authentication and authorization decision
-before it is enabled broadly.
+The server binds to loopback. Remote browser access is provided by an HTTPS
+reverse proxy such as Tailscale Serve or Caddy, with the browser-visible origin
+declared explicitly to QQ. Tailscale supplies encrypted private networking and
+device-level access controls, but QQ still requires one-time browser pairing,
+an HttpOnly session cookie, exact-origin CSRF validation, and a server-startup
+workspace allowlist.
 
-The same HTTP/SSE protocol serves local TUI clients, remote TUI clients, and
-future browser or mobile clients. Protocol replay means moving between devices
-does not require transferring in-memory client state.
+The same HTTP/SSE protocol serves local TUI clients and the bundled browser
+workbench. Protocol replay means moving between clients does not require
+transferring in-memory client state.
 
 ## Performance Discipline
 
@@ -355,12 +360,9 @@ must be supported by a benchmark and must not make routine development hostile.
 
 ## Intentionally Deferred
 
-The initial repository is pure Rust. Do not create or scaffold any of the
-following yet:
+Do not create or scaffold any of the following yet:
 
-- React or other web frontend.
 - Native or cross-platform mobile application.
-- JavaScript/TypeScript packages or package workspace.
 - Separate server executable.
 - Distributed workers or cloud control plane.
 - Plugin marketplace or public extension interface.
