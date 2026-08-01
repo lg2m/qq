@@ -7670,6 +7670,53 @@ mod tests {
         }
     }
 
+    struct ReasoningLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl RuntimeLoader for ReasoningLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                Runtime::new(ReasoningProvider { requests }, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct ReasoningProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for ReasoningProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::ReasoningStarted {
+                    kind: qq_provider::ReasoningKind::Summary,
+                }),
+                Ok(qq_provider::ProviderEvent::ReasoningDelta {
+                    kind: qq_provider::ReasoningKind::Summary,
+                    text: "private rationale".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::ReasoningCompleted {
+                    kind: qq_provider::ReasoningKind::Summary,
+                }),
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "answer".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
     struct ChunkingLoader;
 
     impl RuntimeLoader for ChunkingLoader {

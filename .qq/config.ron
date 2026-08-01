@@ -1,6 +1,16 @@
 (
+    policy: (
+        allow_tools: [
+            "edit_file",
+        ],
+        allow_shell_prefixes: [
+            "git status --short && git diff --stat",
+            "cargo fmt --all && cargo check --workspace",
+            "cargo fmt --all -- --check && cargo check --workspace",
+        ],
+    ),
     version: 1,
-    model: "bedrock-mantle/anthropic.claude-sonnet-5",
+    model: "openai-codex/gpt-5.6-luna",
     providers: {
         "bedrock": AmazonBedrock(
             region: "us-east-1",
@@ -15,11 +25,12 @@
     mcp: {
         "executor": Http(
             url: "https://executor.sh/lg2m/mcp",
-            // optional bearer if the endport requires one:
-            // bearer: Env("EXECUTOR_TOKEN"),
-            // or: bearer: Stored("executor/default"),
-            allow: ["execute", "skills", "resume"],
-            eager: true, // connect at startup instead of first use
-        )
+            allow: [
+                "execute",
+                "skills",
+                "resume",
+            ],
+            eager: true,
+        ),
     },
 )

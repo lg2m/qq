@@ -1168,6 +1168,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maps_reasoning_lifecycle_without_joining_answer_text() {
+        struct ReasoningProvider;
+
+        impl Provider for ReasoningProvider {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ReasoningStarted {
+                        kind: qq_provider::ReasoningKind::Summary,
+                    }),
+                    Ok(ProviderEvent::ReasoningDelta {
+                        kind: qq_provider::ReasoningKind::Summary,
+                        text: "checking constraints".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ReasoningCompleted {
+                        kind: qq_provider::ReasoningKind::Summary,
+                    }),
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "answer".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+
+        let events = Runtime::new(ReasoningProvider, "gpt-test", 256)
+            .unwrap()
+            .run(RunCommand::new("solve it"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            events,
+            vec![
+                RunEvent::Started,
+                RunEvent::ActivityChanged {
+                    activity: RunActivity::WaitingForProvider,
+                },
+                RunEvent::ActivityChanged {
+                    activity: RunActivity::Reasoning,
+                },
+                RunEvent::ReasoningStarted {
+                    kind: ReasoningKind::Summary,
+                },
+                RunEvent::ReasoningDelta {
+                    kind: ReasoningKind::Summary,
+                    text: "checking constraints".to_owned(),
+                },
+                RunEvent::ReasoningCompleted {
+                    kind: ReasoningKind::Summary,
+                },
+                RunEvent::ActivityChanged {
+                    activity: RunActivity::GeneratingResponse,
+                },
+                RunEvent::OutputTextDelta {
+                    text: "answer".to_owned(),
+                },
+                RunEvent::Completed,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn passes_multi_turn_context_to_the_provider() {
         let captured = Arc::new(Mutex::new(None));
         let runtime = Runtime::new(

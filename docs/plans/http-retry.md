@@ -1,6 +1,6 @@
 # Pre-Stream HTTP Exchange Retry
 
-Status: complete.
+Status: completed.
 
 ## Goal
 

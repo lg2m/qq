@@ -1666,7 +1666,36 @@ impl App {
     }
 
     fn create_session(&mut self, parent_id: Option<SessionId>) -> (bool, Vec<ClientRequest>) {
-        self.create_session_with_model(parent_id, self.model.clone())
+        let model = self.model_for_new_session();
+        self.create_session_with_model(parent_id, model)
+    }
+
+    /// Choose the model for an implicit create (`/new` and create shortcuts).
+    /// An explicit/configured client default wins. If none is available (for
+    /// example while reattaching before model discovery completes), inherit
+    /// the focused session's route.
+    fn model_for_new_session(&self) -> ModelSelection {
+        if self.model.model.as_deref().is_some_and(valid_model_route) {
+            return self.model.clone();
+        }
+
+        let Some(route) = self
+            .focused
+            .and_then(|session_id| self.sessions.get(&session_id))
+            .and_then(|session| session.summary.model.as_deref())
+            .filter(|route| valid_model_route(route))
+        else {
+            return self.model.clone();
+        };
+
+        self.models
+            .iter()
+            .find(|option| option.selection.model.as_deref() == Some(route))
+            .map(|option| option.selection.clone())
+            .unwrap_or_else(|| ModelSelection {
+                model: Some(route.to_owned()),
+                ..ModelSelection::default()
+            })
     }
 
     fn create_session_with_model(
@@ -2183,6 +2212,12 @@ fn format_bytes(bytes: u64) -> String {
         }
     }
     format!("{bytes} B")
+}
+
+fn valid_model_route(route: &str) -> bool {
+    route
+        .split_once('/')
+        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
 }
 
 fn model_context_window(models: &[ModelOption], model: Option<&str>) -> Option<u32> {
@@ -3689,10 +3724,30 @@ mod tests {
     }
 
     #[test]
-    fn session_shortcuts_require_a_selected_model() {
+    fn new_inherits_the_focused_session_model_when_no_default_is_loaded() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
         app.model = ModelSelection::default();
+        app.composer.text = "/new".to_owned();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            &requests[0],
+            ClientRequest::Command(CommandRequest {
+                command: SessionCommand::CreateSession { model, .. },
+                ..
+            }) if model.model.as_deref() == Some("openai/gpt-test")
+        ));
+    }
+
+    #[test]
+    fn create_without_a_default_or_focused_session_still_requires_a_model() {
+        let mut initial = snapshot();
+        initial.sessions.clear();
+        initial.focused = None;
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(initial);
 
         let (_, requests) = app.handle_action(Action::CreateRootSession);
 
