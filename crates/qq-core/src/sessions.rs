@@ -13600,6 +13600,131 @@ mod tests {
         }
     }
 
+    struct AccountingTextProvider {
+        usage: qq_provider::ProviderUsage,
+    }
+
+    impl Provider for AccountingTextProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "done".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed {
+                    usage: Some(self.usage),
+                }),
+            ]))
+        }
+    }
+
+    struct AccountingSpawnProvider {
+        turn: StdMutex<usize>,
+    }
+
+    impl Provider for AccountingSpawnProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            if current == 0 {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: "first".to_owned(),
+                        name: "spawn_agent".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: "first".to_owned(),
+                        json: r#"{"task":"first","model":"test/child-first"}"#.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: "first".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: "second".to_owned(),
+                        name: "spawn_agent".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: "second".to_owned(),
+                        json: r#"{"task":"second","model":"test/child-second"}"#.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: "second".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed {
+                        usage: Some(qq_provider::ProviderUsage {
+                            input_tokens: 2,
+                            cache_read_input_tokens: 0,
+                            cache_write_input_tokens: 0,
+                            output_tokens: 3,
+                        }),
+                    }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed {
+                        usage: Some(qq_provider::ProviderUsage {
+                            input_tokens: 5,
+                            cache_read_input_tokens: 0,
+                            cache_write_input_tokens: 0,
+                            output_tokens: 7,
+                        }),
+                    }),
+                ]))
+            }
+        }
+    }
+
+    struct AccountingSpawnLoader;
+
+    impl RuntimeLoader for AccountingSpawnLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider: Arc<dyn Provider> = match request.model.model.as_deref() {
+                Some("test/model") => Arc::new(AccountingSpawnProvider {
+                    turn: StdMutex::new(0),
+                }),
+                Some("test/child-first") => Arc::new(AccountingTextProvider {
+                    usage: qq_provider::ProviderUsage {
+                        input_tokens: 11,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 13,
+                    },
+                }),
+                Some("test/child-second") => Arc::new(AccountingTextProvider {
+                    usage: qq_provider::ProviderUsage {
+                        input_tokens: 17,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 19,
+                    },
+                }),
+                other => panic!("unexpected accounting test model: {other:?}"),
+            };
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: Some(ModelPricing {
+                            input_usd_nanos_per_token: 1,
+                            output_usd_nanos_per_token: 1,
+                            cache_read_usd_nanos_per_token: Some(1),
+                            cache_write_usd_nanos_per_token: Some(1),
+                            context_tier: None,
+                            provenance: "accounting-test".to_owned(),
+                        }),
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
     /// Fails every stream with a transport error.
     struct FailingProvider;
 
@@ -13877,6 +14002,123 @@ mod tests {
             finished_outcome(&observed, run_id),
             Some(RunOutcome::Completed)
         ));
+    }
+
+    #[tokio::test]
+    async fn parallel_spawn_accounting_is_ordered_exact_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let mut options = SessionRuntimeOptions::new(database_path.clone());
+        options.max_active_runs = 4;
+        let runtime = SessionRuntime::open(options, Arc::new(AccountingSpawnLoader))
+            .await
+            .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: parent_id,
+        } = created.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let parent_run = submit_prompt_to(&runtime, parent_id, "delegate twice").await;
+        let observed = collect_until_run_finished(&mut events, parent_run).await;
+        let child_ids = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(parent_id) =>
+                {
+                    Some(session.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_ids.len(), 2);
+
+        for child_id in &child_ids {
+            let child_finished = observed
+                .iter()
+                .position(|event| {
+                    event.session_id == *child_id
+                        && matches!(event.event, SessionEvent::RunFinished { .. })
+                })
+                .expect("child must finish");
+            let parent_refreshed = &observed[child_finished + 1];
+            assert_eq!(parent_refreshed.session_id, parent_id);
+            assert!(matches!(
+                parent_refreshed.event,
+                SessionEvent::SessionUpdated { .. }
+            ));
+        }
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(parent_id),
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let parent = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == parent_id)
+            .unwrap();
+        let accounting = parent.accounting.unwrap();
+        assert_eq!(accounting.direct.usage, Some(usage(7, 10)));
+        assert_eq!(accounting.direct.estimated_cost_usd_nanos, Some(17));
+        assert_eq!(accounting.inclusive.usage, Some(usage(35, 42)));
+        assert_eq!(accounting.inclusive.estimated_cost_usd_nanos, Some(77));
+        let child_costs = child_ids
+            .iter()
+            .map(|child_id| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == *child_id)
+                    .unwrap()
+                    .accounting
+                    .unwrap()
+            })
+            .map(|accounting| {
+                assert_eq!(accounting.direct, accounting.inclusive);
+                accounting.direct.estimated_cost_usd_nanos.unwrap()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(child_costs, std::collections::BTreeSet::from([24, 36]));
+
+        drop(events);
+        drop(runtime);
+        let reopened = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(AccountingSpawnLoader),
+        )
+        .await
+        .unwrap();
+        let reloaded = reopened
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(parent_id),
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let reloaded_parent = reloaded
+            .sessions
+            .iter()
+            .find(|session| session.id == parent_id)
+            .unwrap();
+        assert_eq!(reloaded_parent.accounting, parent.accounting);
     }
 
     #[tokio::test]

@@ -2019,15 +2019,22 @@ fn footer_workspace(app: &App, width: usize) -> Line {
     };
     // Parent rows deliberately display inclusive accounting. Child rows use
     // the same field, whose inclusive total currently equals direct because
-    // delegation depth is capped at one. Unknown cost remains unknown until
-    // this final formatting boundary.
+    // delegation depth is capped at one. Unknown cost stays visibly unknown
+    // at this final formatting boundary. Legacy payloads without structured
+    // accounting fall back to the compatibility direct-cost alias.
     let cost = app
         .focused
         .and_then(|id| app.sessions.get(&id))
-        .and_then(|session| session.summary.accounting)
-        .and_then(|accounting| accounting.inclusive.estimated_cost_usd_nanos)
-        .unwrap_or(0);
-    let cost = format!("cost: {} ", format_cost(cost));
+        .and_then(|session| {
+            session
+                .summary
+                .accounting
+                .map(|accounting| accounting.inclusive.estimated_cost_usd_nanos)
+                .unwrap_or(session.summary.estimated_cost_usd_nanos)
+        })
+        .map(format_cost)
+        .unwrap_or_else(|| "--".to_owned());
+    let cost = format!("cost: {cost} ");
     align_sides(
         Line::styled(format!(" {workspace}"), muted()),
         Line::styled(cost, accent()),
@@ -4936,18 +4943,39 @@ mod tests {
     }
 
     #[test]
-    fn footer_renders_unknown_context_without_inventing_zero_usage() {
+    fn footer_renders_unknown_context_and_cost_without_inventing_zero_usage() {
         let mut app = app_with_messages(0);
         let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
-        session.summary.estimated_cost_usd_nanos = None;
+        session.summary.estimated_cost_usd_nanos = Some(100_000_000);
+        session.summary.accounting = Some(SessionAccounting {
+            direct: AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: Some(100_000_000),
+            },
+            inclusive: AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: None,
+            },
+        });
         session.summary.context_tokens = None;
         session.context_window = Some(272_000);
 
         let rows = frame_rows(&[footer_context(&app, 80), footer_workspace(&app, 80)]);
 
         assert!(rows[0].contains("context: -- / 272000"));
-        assert!(rows[1].ends_with("cost: $0.00 "));
-        assert!(!rows.iter().any(|row| row.contains("unavailable")));
+        assert!(rows[1].ends_with("cost: -- "));
+    }
+
+    #[test]
+    fn footer_uses_legacy_direct_cost_when_structured_accounting_is_absent() {
+        let mut app = app_with_messages(0);
+        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        session.summary.accounting = None;
+        session.summary.estimated_cost_usd_nanos = Some(100_000_000);
+
+        let rows = frame_rows(&[footer_workspace(&app, 80)]);
+
+        assert!(rows[0].ends_with("cost: $0.10 "));
     }
 
     #[test]
