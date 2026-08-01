@@ -25,7 +25,7 @@ use qq_tui::{
     ClientFailure as TuiClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState,
 };
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc};
 
@@ -515,6 +515,7 @@ async fn recover_tui_client(
         ClientError::InvalidCursor
             | ClientError::EventTooLarge
             | ClientError::ServerResponse { status: 400 }
+            | ClientError::ServerMessage { status: 400, .. }
     ) && let Ok((workspace_id, snapshot)) = bootstrap_tui(current, workspace, model).await
     {
         return Some((current.clone(), workspace_id, snapshot));
@@ -812,7 +813,7 @@ impl SessionClient {
             .send()
             .await
             .map_err(|_| ClientError::Unavailable)?;
-        check_success(response.status().as_u16())?;
+        let status = response.status().as_u16();
         if response
             .content_length()
             .is_some_and(|length| length > response_limit as u64)
@@ -822,6 +823,9 @@ impl SessionClient {
         let bytes = read_response_bounded(response, response_limit)
             .await
             .map_err(|()| ClientError::ResponseTooLarge)?;
+        if !(200..300).contains(&status) {
+            return Err(server_response_error(status, &bytes));
+        }
         serde_json::from_slice(&bytes).map_err(|_| ClientError::MalformedEvent)
     }
 }
@@ -846,6 +850,23 @@ fn check_success(status: u16) -> Result<(), ClientError> {
     } else {
         Err(ClientError::ServerResponse { status })
     }
+}
+
+#[derive(Deserialize)]
+struct ApiErrorBody {
+    error: String,
+}
+
+fn server_response_error(status: u16, body: &[u8]) -> ClientError {
+    serde_json::from_slice::<ApiErrorBody>(body)
+        .ok()
+        .filter(|body| !body.error.trim().is_empty())
+        .map_or(ClientError::ServerResponse { status }, |body| {
+            ClientError::ServerMessage {
+                status,
+                message: body.error,
+            }
+        })
 }
 
 /// Discovers and probes the current user's running QQ server.
@@ -922,14 +943,14 @@ pub async fn ask(
         {
             return Err(ClientError::ErrorResponseTooLarge);
         }
-        tokio::time::timeout(
+        let bytes = tokio::time::timeout(
             ERROR_RESPONSE_TIMEOUT,
             read_response_bounded(response, MAX_ERROR_BODY_BYTES),
         )
         .await
         .map_err(|_| ClientError::ErrorResponseUnavailable)?
         .map_err(|()| ClientError::ErrorResponseTooLarge)?;
-        return Err(ClientError::ServerResponse { status });
+        return Err(server_response_error(status, &bytes));
     }
     if !is_event_stream(response.headers().get(CONTENT_TYPE)) {
         return Err(ClientError::UnexpectedContentType);
@@ -1188,6 +1209,8 @@ pub enum ClientError {
     InvalidCursor,
     #[error("local server returned HTTP status {status}")]
     ServerResponse { status: u16 },
+    #[error("local server rejected the request ({status}): {message}")]
+    ServerMessage { status: u16, message: String },
     #[error("local server error response exceeds the size limit")]
     ErrorResponseTooLarge,
     #[error("local server error response did not finish in time")]

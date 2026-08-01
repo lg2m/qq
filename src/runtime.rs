@@ -985,7 +985,7 @@ impl AskHandler for RuntimeHandler {
                 .map_err(|_| AskHandlerError::Internal)?
                 .map_err(|error| match error.failure_kind() {
                     RunFailureKind::Configuration | RunFailureKind::Policy => {
-                        AskHandlerError::InvalidRequest
+                        AskHandlerError::InvalidRequest(error.to_string())
                     }
                     _ => AskHandlerError::Internal,
                 })
@@ -1001,7 +1001,7 @@ impl AskHandler for RuntimeHandler {
 
 fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
     match error {
-        SessionRuntimeError::EmptyWorkspace
+        error @ (SessionRuntimeError::EmptyWorkspace
         | SessionRuntimeError::InvalidWorkspace
         | SessionRuntimeError::EmptyPrompt
         | SessionRuntimeError::PromptTooLarge

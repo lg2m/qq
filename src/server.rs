@@ -111,10 +111,10 @@ where
 }
 
 /// Sanitized failures a root handler may return before streaming starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AskHandlerError {
-    #[error("request was rejected")]
-    InvalidRequest,
+    #[error("{0}")]
+    InvalidRequest(String),
     #[error("request service is unavailable")]
     Unavailable,
     #[error("request failed")]
@@ -614,8 +614,8 @@ async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>)
 
     let events = match state.handler.ask(request).await {
         Ok(events) => events,
-        Err(AskHandlerError::InvalidRequest) => {
-            return api_error(StatusCode::BAD_REQUEST, "request was rejected");
+        Err(AskHandlerError::InvalidRequest(message)) => {
+            return api_error(StatusCode::BAD_REQUEST, &message);
         }
         Err(AskHandlerError::Unavailable) => {
             return api_error(
@@ -901,9 +901,7 @@ async fn workspace_events(
 
 fn handler_error_response(error: AskHandlerError) -> Response {
     match error {
-        AskHandlerError::InvalidRequest => {
-            api_error(StatusCode::BAD_REQUEST, "request was rejected")
-        }
+        AskHandlerError::InvalidRequest(message) => api_error(StatusCode::BAD_REQUEST, &message),
         AskHandlerError::Unavailable => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "request service is unavailable",
@@ -955,11 +953,11 @@ pub(crate) fn validate_ask_request(request: &AskRequest) -> Result<(), &'static 
 }
 
 #[derive(Serialize)]
-struct ApiErrorBody {
-    error: &'static str,
+struct ApiErrorBody<'a> {
+    error: &'a str,
 }
 
-fn api_error(status: StatusCode, error: &'static str) -> Response {
+fn api_error(status: StatusCode, error: &str) -> Response {
     (status, Json(ApiErrorBody { error })).into_response()
 }
 

@@ -1,6 +1,6 @@
 # Deepen HTTP Exchange Execution
 
-Status: complete. Stages 1 through 8 are complete.
+Status: completed.
 
 ## Goal
 
