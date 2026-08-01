@@ -797,17 +797,10 @@ fn api_error(rejection: HttpRejection) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread::{self, JoinHandle},
-        time::Duration,
-    };
-
     use serde_json::json;
 
     use super::*;
-    use crate::Message;
+    use crate::{Message, test_support::LoopbackServer};
 
     #[test]
     fn default_constructor_uses_openai_endpoint_and_redacts_auth_debug() {
@@ -971,7 +964,8 @@ mod tests {
     #[tokio::test]
     async fn sends_tool_declarations_and_tool_history_items() {
         let body = "data: {\"type\":\"response.completed\"}\n\n";
-        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
         let request = ModelRequest::new(
             "gpt-test",
@@ -1010,10 +1004,8 @@ mod tests {
             Ok(ProviderEvent::Completed { usage: None })
         ));
 
-        let request = server.join().unwrap();
-        let request_body = request.split_once("\r\n\r\n").unwrap().1;
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(request_body).unwrap(),
+            server.capture().json_body(),
             json!({
                 "model": "gpt-test",
                 "input": [
@@ -1190,8 +1182,8 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens\":9}}}\n\n",
         );
-        let path = "/custom/responses?api-version=42";
-        let (endpoint, server) = serve_once(path, "200 OK", "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/custom/responses?api-version=42", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Header("x-api-key".to_owned(), "custom-test-secret".to_owned()),
@@ -1224,21 +1216,17 @@ mod tests {
             }
         );
 
-        let request = server.join().unwrap();
-        let (head, request_body) = request.split_once("\r\n\r\n").unwrap();
+        let request = server.capture();
         assert_eq!(
-            head.lines().next(),
+            request.request_line(),
             Some("POST /custom/responses?api-version=42 HTTP/1.1")
         );
-        assert_eq!(request_header(head, "accept"), Some("text/event-stream"));
-        assert_eq!(
-            request_header(head, "x-api-key"),
-            Some("custom-test-secret")
-        );
-        assert_eq!(request_header(head, "x-client"), Some("qq-tests"));
-        assert_eq!(request_header(head, "authorization"), None);
+        assert_eq!(request.header("accept"), Some("text/event-stream"));
+        assert_eq!(request.header("x-api-key"), Some("custom-test-secret"));
+        assert_eq!(request.header("x-client"), Some("qq-tests"));
+        assert_eq!(request.header("authorization"), None);
 
-        let request_body: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        let request_body = request.json_body();
         assert_eq!(request_body["model"], "gpt-test");
         assert_eq!(request_body["input"][0]["content"], "ping");
         assert_eq!(request_body["store"], false);
@@ -1247,12 +1235,8 @@ mod tests {
     #[tokio::test]
     async fn codex_auth_adds_backend_headers_and_omits_max_output_tokens() {
         let body = "data: {\"type\":\"response.completed\"}\n\n";
-        let (endpoint, server) = serve_once(
-            "/backend-api/codex/responses",
-            "200 OK",
-            "text/event-stream",
-            body,
-        );
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/backend-api/codex/responses", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Codex {
@@ -1278,20 +1262,19 @@ mod tests {
             &events[0],
             Ok(ProviderEvent::Completed { usage: None })
         ));
-        let request = server.join().unwrap();
-        let (head, request_body) = request.split_once("\r\n\r\n").unwrap();
+        let request = server.capture();
         assert_eq!(
-            request_header(head, "authorization"),
+            request.header("authorization"),
             Some("Bearer codex-test-access-token")
         );
         assert_eq!(
-            request_header(head, "chatgpt-account-id"),
+            request.header("chatgpt-account-id"),
             Some("workspace-test-id")
         );
-        assert_eq!(request_header(head, "x-openai-fedramp"), Some("true"));
-        assert_eq!(request_header(head, "originator"), Some("qq"));
+        assert_eq!(request.header("x-openai-fedramp"), Some("true"));
+        assert_eq!(request.header("originator"), Some("qq"));
 
-        let request_body: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        let request_body = request.json_body();
         assert_eq!(request_body["model"], "gpt-test");
         assert!(
             !request_body
@@ -1310,7 +1293,8 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n",
             "data: {\"type\":\"response.completed\"}\n\n",
         );
-        let (endpoint, server) = serve_once("/backend-api/codex/responses", "200 OK", "", body);
+        let server = LoopbackServer::respond_chunks(200, None, vec![body.as_bytes().to_vec()]);
+        let endpoint = format!("{}/backend-api/codex/responses", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Codex {
@@ -1344,13 +1328,14 @@ mod tests {
                 ProviderEvent::Completed { usage: None },
             ]
         );
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
     async fn standard_responses_still_require_event_stream_content_type() {
         let body = "data: {\"type\":\"response.completed\"}\n\n";
-        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "", body);
+        let server = LoopbackServer::respond_chunks(200, None, vec![body.as_bytes().to_vec()]);
+        let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
 
         let events = provider
@@ -1367,7 +1352,7 @@ mod tests {
             [Err(ProviderError::Protocol(message))]
                 if message == "OpenAI returned a non-SSE response"
         ));
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
@@ -1392,7 +1377,8 @@ mod tests {
             "\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n\n",
             "data: {\"type\":\"response.completed\"}\n\n",
         );
-        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
         let events = provider
             .stream(ModelRequest::new(
@@ -1430,7 +1416,7 @@ mod tests {
                 ProviderEvent::Completed { usage: None },
             ]
         );
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
@@ -1439,7 +1425,8 @@ mod tests {
             "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_9\",",
             "\"delta\":\"{}\"}\n\n",
         );
-        let (endpoint, server) = serve_once("/v1/responses", "200 OK", "text/event-stream", body);
+        let server = LoopbackServer::sse(body);
+        let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(&endpoint, ResponsesAuth::NoAuth, [], true).unwrap();
         let error = provider
             .stream(ModelRequest::new(
@@ -1453,18 +1440,14 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ProviderError::Protocol(_)));
-        server.join().unwrap();
+        server.capture();
     }
 
     #[tokio::test]
     async fn preserves_openai_api_errors() {
         let body = r#"{"error":{"message":"invalid key"}}"#;
-        let (endpoint, server) = serve_once(
-            "/v1/responses",
-            "401 Unauthorized",
-            "application/json",
-            body,
-        );
+        let server = LoopbackServer::respond(401, "application/json", body);
+        let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Bearer("test-key".to_owned()),
@@ -1491,23 +1474,15 @@ mod tests {
             } if message == "invalid key"
         ));
         assert_eq!(error.kind(), crate::ProviderErrorKind::Authentication);
-        let request = server.join().unwrap();
-        let head = request.split_once("\r\n\r\n").unwrap().0;
-        assert_eq!(
-            request_header(head, "authorization"),
-            Some("Bearer test-key")
-        );
+        let request = server.capture();
+        assert_eq!(request.header("authorization"), Some("Bearer test-key"));
     }
 
     #[tokio::test]
     async fn redacts_known_values_echoed_in_an_error_body() {
         let body = r#"{"error":{"message":"invalid auth-test-secret and tenant-test-secret"}}"#;
-        let (endpoint, server) = serve_once(
-            "/v1/responses",
-            "401 Unauthorized",
-            "application/json",
-            body,
-        );
+        let server = LoopbackServer::respond(401, "application/json", body);
+        let endpoint = format!("{}/v1/responses", server.base_url);
         let provider = OpenAi::with_endpoint(
             &endpoint,
             ResponsesAuth::Bearer("auth-test-secret".to_owned()),
@@ -1530,81 +1505,6 @@ mod tests {
         assert!(!rendered.contains("auth-test-secret"));
         assert!(!rendered.contains("tenant-test-secret"));
         assert!(rendered.contains("[REDACTED]"));
-        server.join().unwrap();
-    }
-
-    fn serve_once(
-        path: &str,
-        status: &str,
-        content_type: &str,
-        body: &str,
-    ) -> (String, JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}{path}", listener.local_addr().unwrap());
-        let status = status.to_owned();
-        let content_type = content_type.to_owned();
-        let body = body.to_owned();
-
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let request = read_request(&mut stream);
-            // Empty content_type omits the header so Codex's live missing
-            // Content-Type behavior can be regression-tested.
-            let content_type_header = if content_type.is_empty() {
-                String::new()
-            } else {
-                format!("Content-Type: {content_type}\r\n")
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\n{content_type_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8(request).unwrap()
-        });
-
-        (endpoint, server)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
-        let mut buffer = [0; 4_096];
-
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..read]);
-
-            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                continue;
-            };
-            let body_start = header_end + 4;
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or_default();
-            if request.len() >= body_start + content_length {
-                break;
-            }
-        }
-
-        request
-    }
-
-    fn request_header<'a>(headers: &'a str, expected_name: &str) -> Option<&'a str> {
-        headers
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.eq_ignore_ascii_case(expected_name))
-            .map(|(_, value)| value.trim())
+        server.capture();
     }
 }
