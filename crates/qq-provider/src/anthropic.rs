@@ -20,7 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, SseEvent, Utf8ErrorMessage},
-    support::{self, ToolCallLedger, value_as_status},
+    support::{self, ToolCallLedger, UsageOnce, value_as_status},
 };
 
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -179,7 +179,9 @@ impl Provider for AnthropicMessages {
                 "Anthropic-compatible output size overflowed",
                 "Anthropic-compatible output exceeded the configured size limit",
             );
-            let mut usage = None;
+            let mut usage = UsageOnce::new(
+                "Anthropic-compatible stream reported starting usage more than once",
+            );
             // Maps streamed content-block indexes to tool-call ids so argument
             // deltas and block stops can be attributed after the start event.
             let mut tool_calls = ToolCallLedger::new(
@@ -198,12 +200,8 @@ impl Provider for AnthropicMessages {
                         yield ProviderEvent::OutputTextDelta { text };
                     }
                     DecodedEvent::MessageStart(start) => {
-                        if let Some(start) = start
-                            && usage.replace(start).is_some()
-                        {
-                            Err(ProviderError::Protocol(
-                                "Anthropic-compatible stream reported starting usage more than once".to_owned(),
-                            ))?;
+                        if let Some(start) = start {
+                            usage.set(start)?;
                         }
                     }
                     DecodedEvent::MessageDelta { refusal, output_tokens } => {
@@ -212,7 +210,7 @@ impl Provider for AnthropicMessages {
                             yield ProviderEvent::RefusalDelta { text };
                         }
                         if let Some(output_tokens) = output_tokens {
-                            let current = usage.as_mut().ok_or_else(|| {
+                            let current = usage.stored_mut().ok_or_else(|| {
                                 ProviderError::Protocol(
                                     "Anthropic-compatible stream reported output usage before starting usage".to_owned(),
                                 )
@@ -270,7 +268,7 @@ impl Provider for AnthropicMessages {
                         }
                     }
                     DecodedEvent::Completed => {
-                        yield ProviderEvent::Completed { usage };
+                        yield ProviderEvent::Completed { usage: usage.finish() };
                         return;
                     }
                     DecodedEvent::Ignored => {}

@@ -20,7 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
-    support::{self, status_error_kind},
+    support::{self, UsageOnce, status_error_kind, subtract_cached_input_tokens},
 };
 
 const GENERATIVE_AI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -172,7 +172,9 @@ impl Provider for GoogleGenerateContent {
                 "Google GenerateContent output size overflowed",
                 "Google GenerateContent output exceeded the configured size limit",
             );
-            let mut usage = None;
+            let mut usage = UsageOnce::new(
+                "Google GenerateContent stream reported usage more than once",
+            );
             let mut reasoning_open = false;
             // Gemini assigns no tool-call ids; a per-stream ordinal keeps the
             // synthesized ids deterministic.
@@ -205,11 +207,7 @@ impl Provider for GoogleGenerateContent {
                             };
                         }
                         DecodedEvent::Usage(event_usage) => {
-                            if usage.replace(event_usage).is_some() {
-                                Err(ProviderError::Protocol(
-                                    "Google GenerateContent stream reported usage more than once".to_owned(),
-                                ))?;
-                            }
+                            usage.set(event_usage)?;
                         }
                         DecodedEvent::ToolCall { id, name, arguments } => {
                             if reasoning_open {
@@ -235,7 +233,7 @@ impl Provider for GoogleGenerateContent {
                                     kind: crate::ReasoningKind::ExposedThinking,
                                 };
                             }
-                            yield ProviderEvent::Completed { usage };
+                            yield ProviderEvent::Completed { usage: usage.finish() };
                             return;
                         }
                     }
@@ -712,12 +710,11 @@ fn decode_event(
 }
 
 fn provider_usage(usage: UsageMetadata) -> Result<ProviderUsage, ProviderError> {
-    let input_tokens = usage
-        .prompt_token_count
-        .checked_sub(usage.cached_content_token_count)
-        .ok_or_else(|| {
-            ProviderError::Protocol("Google cached input tokens exceeded prompt tokens".to_owned())
-        })?;
+    let input_tokens = subtract_cached_input_tokens(
+        usage.prompt_token_count,
+        usage.cached_content_token_count,
+        "Google cached input tokens exceeded prompt tokens",
+    )?;
     let output_tokens = usage
         .candidates_token_count
         .checked_add(usage.thoughts_token_count)

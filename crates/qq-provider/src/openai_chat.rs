@@ -20,7 +20,10 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
-    support::{self, ToolCallLedger, status_error_kind, value_as_status},
+    support::{
+        self, ToolCallLedger, UsageOnce, status_error_kind, subtract_cached_input_tokens,
+        value_as_status,
+    },
 };
 
 const CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
@@ -139,7 +142,9 @@ impl Provider for OpenAiChatCompletions {
                 "OpenAI-compatible output size overflowed",
                 "OpenAI-compatible output exceeded the configured size limit",
             );
-            let mut usage = None;
+            let mut usage = UsageOnce::new(
+                "OpenAI-compatible stream reported usage more than once",
+            );
             // Maps streamed tool-call array indexes to call ids so argument
             // fragments and the finish reason can be attributed after the
             // first fragment.
@@ -154,17 +159,13 @@ impl Provider for OpenAiChatCompletions {
                     continue;
                 }
                 if data == "[DONE]" {
-                    yield ProviderEvent::Completed { usage };
+                    yield ProviderEvent::Completed { usage: usage.finish() };
                     return;
                 }
 
                 let decoded = decode_event(data, redactions.as_ref())?;
-                if let Some(chunk_usage) = decoded.usage
-                    && usage.replace(chunk_usage).is_some()
-                {
-                    Err(ProviderError::Protocol(
-                        "OpenAI-compatible stream reported usage more than once".to_owned(),
-                    ))?;
+                if let Some(chunk_usage) = decoded.usage {
+                    usage.set(chunk_usage)?;
                 }
                 for delta in decoded.deltas {
                     match delta {
@@ -585,11 +586,11 @@ fn provider_usage(usage: ChatUsage) -> Result<ProviderUsage, ProviderError> {
     let cached = usage
         .prompt_tokens_details
         .map_or(0, |details| details.cached_tokens);
-    let input_tokens = usage.prompt_tokens.checked_sub(cached).ok_or_else(|| {
-        ProviderError::Protocol(
-            "OpenAI-compatible cached input tokens exceeded prompt tokens".to_owned(),
-        )
-    })?;
+    let input_tokens = subtract_cached_input_tokens(
+        usage.prompt_tokens,
+        cached,
+        "OpenAI-compatible cached input tokens exceeded prompt tokens",
+    )?;
     Ok(ProviderUsage {
         input_tokens,
         cache_read_input_tokens: cached,

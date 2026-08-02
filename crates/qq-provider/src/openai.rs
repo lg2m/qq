@@ -660,9 +660,11 @@ fn provider_usage(usage: ResponsesUsage) -> Result<ProviderUsage, ProviderError>
     let cached = usage
         .input_tokens_details
         .map_or(0, |details| details.cached_tokens);
-    let input_tokens = usage.input_tokens.checked_sub(cached).ok_or_else(|| {
-        ProviderError::Protocol("OpenAI cached input tokens exceeded total input tokens".to_owned())
-    })?;
+    let input_tokens = support::subtract_cached_input_tokens(
+        usage.input_tokens,
+        cached,
+        "OpenAI cached input tokens exceeded total input tokens",
+    )?;
     Ok(ProviderUsage {
         input_tokens,
         cache_read_input_tokens: cached,

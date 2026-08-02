@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::{ProviderError, ProviderErrorKind, http::HttpRejection, sanitize::sanitize_message};
+use crate::{
+    ProviderError, ProviderErrorKind, ProviderUsage, http::HttpRejection,
+    sanitize::sanitize_message,
+};
 
 /// Interprets a rejected HTTP exchange against the adapter's error envelope.
 ///
@@ -104,4 +107,53 @@ impl<K: Ord> ToolCallLedger<K> {
     pub(crate) fn drain(&mut self) -> impl Iterator<Item = String> {
         std::mem::take(&mut self.calls).into_values()
     }
+}
+
+/// A set-once slot for the usage a stream reports.
+pub(crate) struct UsageOnce {
+    usage: Option<ProviderUsage>,
+    duplicate: &'static str,
+}
+
+impl UsageOnce {
+    /// Creates an empty slot with the protocol's duplicate-report error.
+    pub(crate) fn new(duplicate: &'static str) -> Self {
+        Self {
+            usage: None,
+            duplicate,
+        }
+    }
+
+    /// Stores the reported usage, rejecting a second report.
+    pub(crate) fn set(&mut self, usage: ProviderUsage) -> Result<(), ProviderError> {
+        if self.usage.replace(usage).is_some() {
+            return Err(ProviderError::Protocol(self.duplicate.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// The stored usage, for protocols that update it cumulatively.
+    pub(crate) fn stored_mut(&mut self) -> Option<&mut ProviderUsage> {
+        self.usage.as_mut()
+    }
+
+    /// Consumes the slot when the stream completes.
+    pub(crate) fn finish(self) -> Option<ProviderUsage> {
+        self.usage
+    }
+}
+
+/// Subtracts provider-reported cached tokens from the total input tokens.
+///
+/// Providers report cache reads inside the prompt/input total; the neutral
+/// model carries them separately, so an underflowing report is a protocol
+/// error rather than a silent wrap.
+pub(crate) fn subtract_cached_input_tokens(
+    total: u64,
+    cached: u64,
+    underflow: &'static str,
+) -> Result<u64, ProviderError> {
+    total
+        .checked_sub(cached)
+        .ok_or_else(|| ProviderError::Protocol(underflow.to_owned()))
 }
