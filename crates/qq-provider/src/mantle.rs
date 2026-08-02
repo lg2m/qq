@@ -9,7 +9,7 @@ use tokio::sync::OnceCell;
 
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream,
-    bedrock::{
+    aws::{
         AwsConfigLoadError, BedrockAuth, load_aws_config, valid_region_label,
         validate_configuration,
     },

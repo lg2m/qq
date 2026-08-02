@@ -8,6 +8,7 @@ use futures_core::Stream;
 use thiserror::Error;
 
 pub mod anthropic;
+mod aws;
 pub mod bedrock;
 pub mod compiler;
 mod construction;
