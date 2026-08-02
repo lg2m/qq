@@ -1,6 +1,6 @@
 //! OpenAI Responses API adapter.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_stream::try_stream;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
@@ -20,7 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
-    support,
+    support::{self, ToolCallLedger},
 };
 
 const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -178,7 +178,10 @@ impl Provider for OpenAi {
             // Maps streamed function-call item ids to call ids so argument
             // deltas and item completions can be attributed after the added
             // event; the call id is what round-trips into function_call_output.
-            let mut tool_calls: HashMap<String, String> = HashMap::new();
+            let mut tool_calls = ToolCallLedger::new(
+                "OpenAI-compatible stream reused a function-call item id",
+                "OpenAI-compatible stream sent arguments for an unknown function call",
+            );
             while let Some(event) = sse.next_event().await? {
                 let data = event.data;
                 if data == "[DONE]" || data.trim().is_empty() {
@@ -195,30 +198,13 @@ impl Provider for OpenAi {
                         yield ProviderEvent::RefusalDelta { text };
                     }
                     DecodedEvent::ToolCallStarted { item_id, call_id, name } => {
-                        if tool_calls.insert(item_id, call_id.clone()).is_some() {
-                            Err(ProviderError::Protocol(
-                                "OpenAI-compatible stream reused a function-call item id"
-                                    .to_owned(),
-                            ))?;
-                        }
+                        tool_calls.insert(item_id, call_id.clone())?;
                         yield ProviderEvent::ToolCallStarted { id: call_id, name };
                     }
                     DecodedEvent::ToolCallArguments { item_id, json } => {
-                        match tool_calls.get(&item_id) {
-                            Some(call_id) => {
-                                output_bytes.add(json.len())?;
-                                yield ProviderEvent::ToolCallArgumentsDelta {
-                                    id: call_id.clone(),
-                                    json,
-                                };
-                            }
-                            None => {
-                                Err(ProviderError::Protocol(
-                                    "OpenAI-compatible stream sent arguments for an unknown function call"
-                                        .to_owned(),
-                                ))?;
-                            }
-                        }
+                        let id = tool_calls.get(&item_id)?.to_owned();
+                        output_bytes.add(json.len())?;
+                        yield ProviderEvent::ToolCallArgumentsDelta { id, json };
                     }
                     DecodedEvent::ToolCallDone { item_id } => {
                         if let Some(call_id) = tool_calls.remove(&item_id) {

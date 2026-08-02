@@ -1,6 +1,6 @@
 //! OpenAI-compatible Chat Completions API adapter.
 
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use async_stream::try_stream;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName};
@@ -20,7 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
-    support::{self, status_error_kind, value_as_status},
+    support::{self, ToolCallLedger, status_error_kind, value_as_status},
 };
 
 const CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
@@ -142,8 +142,11 @@ impl Provider for OpenAiChatCompletions {
             let mut usage = None;
             // Maps streamed tool-call array indexes to call ids so argument
             // fragments and the finish reason can be attributed after the
-            // first fragment. Ordered so completion drains in index order.
-            let mut tool_calls: BTreeMap<u64, String> = BTreeMap::new();
+            // first fragment.
+            let mut tool_calls = ToolCallLedger::new(
+                "OpenAI-compatible stream reused a tool-call index",
+                "OpenAI-compatible stream sent arguments for an unknown tool call",
+            );
 
             while let Some(event) = sse.next_event().await? {
                 let data = event.data.trim();
@@ -174,33 +177,16 @@ impl Provider for OpenAiChatCompletions {
                             yield ProviderEvent::RefusalDelta { text };
                         }
                         DecodedDelta::ToolCallStarted { index, id, name } => {
-                            if tool_calls.insert(index, id.clone()).is_some() {
-                                Err(ProviderError::Protocol(
-                                    "OpenAI-compatible stream reused a tool-call index"
-                                        .to_owned(),
-                                ))?;
-                            }
+                            tool_calls.insert(index, id.clone())?;
                             yield ProviderEvent::ToolCallStarted { id, name };
                         }
                         DecodedDelta::ToolCallArguments { index, json } => {
-                            match tool_calls.get(&index) {
-                                Some(id) => {
-                                    output_bytes.add(json.len())?;
-                                    yield ProviderEvent::ToolCallArgumentsDelta {
-                                        id: id.clone(),
-                                        json,
-                                    };
-                                }
-                                None => {
-                                    Err(ProviderError::Protocol(
-                                        "OpenAI-compatible stream sent arguments for an unknown tool call"
-                                            .to_owned(),
-                                    ))?;
-                                }
-                            }
+                            let id = tool_calls.get(&index)?.to_owned();
+                            output_bytes.add(json.len())?;
+                            yield ProviderEvent::ToolCallArgumentsDelta { id, json };
                         }
                         DecodedDelta::ToolCallsFinished => {
-                            for (_, id) in std::mem::take(&mut tool_calls) {
+                            for id in tool_calls.drain() {
                                 yield ProviderEvent::ToolCallCompleted { id };
                             }
                         }

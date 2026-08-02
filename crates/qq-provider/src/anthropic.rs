@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_stream::try_stream;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
@@ -20,7 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, SseEvent, Utf8ErrorMessage},
-    support::{self, value_as_status},
+    support::{self, ToolCallLedger, value_as_status},
 };
 
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -182,7 +182,10 @@ impl Provider for AnthropicMessages {
             let mut usage = None;
             // Maps streamed content-block indexes to tool-call ids so argument
             // deltas and block stops can be attributed after the start event.
-            let mut tool_calls: HashMap<u64, String> = HashMap::new();
+            let mut tool_calls = ToolCallLedger::new(
+                "Anthropic-compatible stream reused a tool content-block index",
+                "Anthropic-compatible stream sent arguments for an unknown tool call",
+            );
             let mut reasoning_blocks = std::collections::HashSet::new();
 
             while let Some(event) = sse.next_event().await? {
@@ -223,30 +226,13 @@ impl Provider for AnthropicMessages {
                         }
                     }
                     DecodedEvent::ToolCallStarted { index, id, name } => {
-                        if tool_calls.insert(index, id.clone()).is_some() {
-                            Err(ProviderError::Protocol(
-                                "Anthropic-compatible stream reused a tool content-block index"
-                                    .to_owned(),
-                            ))?;
-                        }
+                        tool_calls.insert(index, id.clone())?;
                         yield ProviderEvent::ToolCallStarted { id, name };
                     }
                     DecodedEvent::ToolCallArguments { index, json } => {
-                        match tool_calls.get(&index) {
-                            Some(id) => {
-                                output_bytes.add(json.len())?;
-                                yield ProviderEvent::ToolCallArgumentsDelta {
-                                    id: id.clone(),
-                                    json,
-                                };
-                            }
-                            None => {
-                                Err(ProviderError::Protocol(
-                                    "Anthropic-compatible stream sent arguments for an unknown tool call"
-                                        .to_owned(),
-                                ))?;
-                            }
-                        }
+                        let id = tool_calls.get(&index)?.to_owned();
+                        output_bytes.add(json.len())?;
+                        yield ProviderEvent::ToolCallArgumentsDelta { id, json };
                     }
                     DecodedEvent::ThinkingStarted { index } => {
                         if !reasoning_blocks.insert(index) {

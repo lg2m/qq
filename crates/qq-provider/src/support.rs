@@ -4,6 +4,8 @@
 //! was repeated in at least two adapter files. Wire schemas, stream state
 //! machines, and protocol-owned headers stay in the adapters.
 
+use std::collections::BTreeMap;
+
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -53,4 +55,53 @@ pub(crate) fn value_as_status(value: &Value) -> Option<u16> {
         .as_u64()
         .and_then(|status| u16::try_from(status).ok())
         .or_else(|| value.as_str()?.parse().ok())
+}
+
+/// Attributes streamed tool-call fragments and stops to their call ids.
+///
+/// Keyed by whatever the protocol streams — a function-call item id, a
+/// tool-call array index, or a content-block index. Backed by an ordered map
+/// so [`ToolCallLedger::drain`] completes calls in key order (Chat
+/// Completions drains open calls when the choice finishes with `tool_calls`).
+pub(crate) struct ToolCallLedger<K> {
+    calls: BTreeMap<K, String>,
+    reused_key: &'static str,
+    unknown_key: &'static str,
+}
+
+impl<K: Ord> ToolCallLedger<K> {
+    /// Creates an empty ledger with the protocol's attribution errors.
+    pub(crate) fn new(reused_key: &'static str, unknown_key: &'static str) -> Self {
+        Self {
+            calls: BTreeMap::new(),
+            reused_key,
+            unknown_key,
+        }
+    }
+
+    /// Records a started call, rejecting a key the stream already used.
+    pub(crate) fn insert(&mut self, key: K, id: String) -> Result<(), ProviderError> {
+        if self.calls.insert(key, id).is_some() {
+            return Err(ProviderError::Protocol(self.reused_key.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Resolves the call id an argument fragment belongs to.
+    pub(crate) fn get(&self, key: &K) -> Result<&str, ProviderError> {
+        self.calls
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| ProviderError::Protocol(self.unknown_key.to_owned()))
+    }
+
+    /// Closes the call the stopped key started, if any.
+    pub(crate) fn remove(&mut self, key: &K) -> Option<String> {
+        self.calls.remove(key)
+    }
+
+    /// Completes every open call in key order.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = String> {
+        std::mem::take(&mut self.calls).into_values()
+    }
 }
