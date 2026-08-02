@@ -118,6 +118,8 @@ pub type RuntimeLoadFuture =
     Pin<Box<dyn Future<Output = Result<LoadedRuntime, RuntimeLoadError>> + Send + 'static>>;
 pub type WorkerRuntimeLoadFuture =
     Pin<Box<dyn Future<Output = Result<ModelSelection, RuntimeLoadError>> + Send + 'static>>;
+pub type SpawnModelValidationFuture =
+    Pin<Box<dyn Future<Output = Result<(), RuntimeLoadError>> + Send + 'static>>;
 
 #[derive(Clone)]
 pub struct LoadedRuntime {
@@ -138,6 +140,25 @@ pub trait RuntimeLoader: Send + Sync + 'static {
     ) -> WorkerRuntimeLoadFuture {
         let _ = workspace;
         Box::pin(std::future::ready(Ok(parent)))
+    }
+
+    /// Confirms a resolved child route is spawnable right now: the route
+    /// parses, its provider is configured, policy-allowed, and authenticated
+    /// at this moment, and the model id appears in the provider's served
+    /// model list. Every spawn resolution source — the explicit tool
+    /// argument, the configured worker route, and the parent-selection
+    /// fallback — passes through this check before any durable child state
+    /// is created. Core stays ignorant of provider-auth details; the loader
+    /// answers "is this route spawnable" the same way it answers "load this
+    /// route". The default accepts everything, for embeddings without an
+    /// authenticated catalog.
+    fn validate_spawn_model(
+        &self,
+        workspace: String,
+        selection: ModelSelection,
+    ) -> SpawnModelValidationFuture {
+        let _ = (workspace, selection);
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -724,6 +745,19 @@ async fn spawn_child_run(
                 ));
             }
         };
+    }
+    // The spawn-time choke point: every resolved route — explicit argument,
+    // configured worker, or parent fallback — must be authenticated and in
+    // the served model list right now, before any durable child state exists.
+    if let Err(error) = inner
+        .loader
+        .validate_spawn_model(parent.workspace.clone(), selection.clone())
+        .await
+    {
+        return spawn_error(format!(
+            "the sub-agent model was rejected: {}",
+            truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
+        ));
     }
     // Validate and construct the selected runtime before creating durable
     // child state. A bad explicit/configured route must leave no orphan
@@ -13657,6 +13691,64 @@ mod tests {
         }
     }
 
+    /// Records every spawn-time validation and either accepts or rejects
+    /// it; loads route the parent model to `parent` and everything else to
+    /// `child`.
+    struct ValidatingLoader {
+        parent: Arc<dyn Provider>,
+        child: Arc<dyn Provider>,
+        worker: Option<ModelSelection>,
+        rejection: Option<RuntimeLoadError>,
+        validations: Arc<StdMutex<Vec<ModelSelection>>>,
+        loads: Arc<StdMutex<Vec<ModelSelection>>>,
+    }
+
+    impl RuntimeLoader for ValidatingLoader {
+        fn resolve_worker_model(
+            &self,
+            _workspace: String,
+            parent: ModelSelection,
+        ) -> WorkerRuntimeLoadFuture {
+            let selection = self.worker.clone().unwrap_or(parent);
+            Box::pin(std::future::ready(Ok(selection)))
+        }
+
+        fn validate_spawn_model(
+            &self,
+            _workspace: String,
+            selection: ModelSelection,
+        ) -> SpawnModelValidationFuture {
+            self.validations.lock().unwrap().push(selection);
+            let result = match &self.rejection {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            };
+            Box::pin(std::future::ready(result))
+        }
+
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            self.loads.lock().unwrap().push(request.model.clone());
+            let provider = if request.model.model.as_deref() == Some("test/model") {
+                Arc::clone(&self.parent)
+            } else {
+                Arc::clone(&self.child)
+            };
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(
+                            runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
+                        ),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
     /// Completes immediately with the text "done".
     struct StaticTextProvider;
 
@@ -14367,6 +14459,219 @@ mod tests {
             [ContentBlock::ToolResult { content, is_error: true, .. }]
                 if content.contains("configured worker route is denied")
         ));
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_spawn_validation_creates_no_child_state_and_names_the_check() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"research","model":"test/ghost"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let validations = Arc::new(StdMutex::new(Vec::new()));
+        let loads = Arc::new(StdMutex::new(Vec::new()));
+        let mut harness = spawn_harness_with_loader(
+            Arc::new(ValidatingLoader {
+                parent,
+                child: Arc::new(StaticTextProvider),
+                worker: None,
+                rejection: Some(RuntimeLoadError {
+                    kind: RunFailureKind::Configuration,
+                    message: "model \"ghost\" is not in provider \"test\"'s authenticated \
+                              model list; available routes: test/child"
+                        .to_owned(),
+                }),
+                validations: Arc::clone(&validations),
+                loads: Arc::clone(&loads),
+            }),
+            8,
+        )
+        .await;
+
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "spawn a ghost").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        // The explicit argument passed through the spawn-time choke point...
+        assert_eq!(
+            validations
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|selection| selection.model.clone())
+                .collect::<Vec<_>>(),
+            [Some("test/ghost".to_owned())]
+        );
+        // ...was rejected before any child runtime load...
+        assert_eq!(
+            loads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|selection| selection.model.clone())
+                .collect::<Vec<_>>(),
+            [Some("test/model".to_owned())],
+            "a rejected route must never reach runtime loading"
+        );
+        // ...and created no durable child state: no session, no prompt, no
+        // run.
+        assert!(observed.iter().all(|event| !matches!(
+            &event.event,
+            SessionEvent::SessionCreated { session }
+                if session.parent_id == Some(harness.session_id)
+        )));
+        assert!(observed.iter().all(|event| !matches!(
+            &event.event,
+            SessionEvent::PromptQueued { session, .. } if session.id != harness.session_id
+        )));
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 32,
+                message_limit: 32,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .all(|session| session.parent_id.is_none())
+        );
+        // The parent sees a bounded tool error naming the failed check and
+        // continues to completion.
+        let parent_reqs = requests.lock().unwrap();
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("the sub-agent model was rejected")
+                    && content.contains("authenticated model list")
+                    && content.contains("available routes: test/child")
+        ));
+        drop(parent_reqs);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_validation_covers_worker_and_parent_fallback_routes() {
+        for worker in [
+            Some(ModelSelection {
+                model: Some("test/worker".to_owned()),
+                max_output_tokens: Some(64),
+                organization: None,
+            }),
+            None,
+        ] {
+            let expected = worker
+                .as_ref()
+                .and_then(|worker| worker.model.clone())
+                .unwrap_or_else(|| "test/model".to_owned());
+            let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                script: vec![("spawn_agent", r#"{"task":"survey"}"#.to_owned())],
+                turn: StdMutex::new(0),
+            });
+            let validations = Arc::new(StdMutex::new(Vec::new()));
+            let mut harness = spawn_harness_with_loader(
+                Arc::new(ValidatingLoader {
+                    parent,
+                    child: Arc::new(StaticTextProvider),
+                    worker,
+                    rejection: None,
+                    validations: Arc::clone(&validations),
+                    loads: Arc::new(StdMutex::new(Vec::new())),
+                }),
+                8,
+            )
+            .await;
+
+            let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+            let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+            // The resolved route — configured worker or parent fallback —
+            // passed through the same spawn-time choke point the explicit
+            // argument uses, and the child was created on it.
+            assert_eq!(
+                validations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|selection| selection.model.clone())
+                    .collect::<Vec<_>>(),
+                [Some(expected.clone())]
+            );
+            let child = observed
+                .iter()
+                .find_map(|event| match &event.event {
+                    SessionEvent::SessionCreated { session }
+                        if session.parent_id == Some(harness.session_id) =>
+                    {
+                        Some(session.clone())
+                    }
+                    _ => None,
+                })
+                .expect("an accepted route must create the child");
+            assert_eq!(child.model.as_deref(), Some(expected.as_str()));
+            assert!(matches!(
+                finished_outcome(&observed, run_id),
+                Some(RunOutcome::Completed)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_route_outside_the_advertised_list_spawns_when_validation_accepts() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"survey","model":"test/discovered"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        // QueueLoader advertises only "test/child" in the schema route list;
+        // "test/discovered" must still spawn because enforcement lives at
+        // the spawn-time choke point (the served model list), not in the
+        // schema enum.
+        let child: Arc<dyn Provider> = Arc::new(StaticTextProvider);
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+
+        let run_id =
+            submit_prompt_to(&harness.runtime, harness.session_id, "spawn discovered").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        let child = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+            .expect("a validated route outside the advertised list must spawn");
+        assert_eq!(child.model.as_deref(), Some("test/discovered"));
+        let parent_reqs = requests.lock().unwrap();
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: false, .. }] if content == "done"
+        ));
+        drop(parent_reqs);
         assert!(matches!(
             finished_outcome(&observed, run_id),
             Some(RunOutcome::Completed)

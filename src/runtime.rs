@@ -1,7 +1,7 @@
 //! Application configuration to model-runtime composition.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -15,8 +15,8 @@ use qq_config::{
 use qq_core::{
     GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, Runtime, RuntimeConfigError,
     RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
-    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, WorkerRuntimeLoadFuture,
-    WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
+    WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 use qq_protocol::{
     ApprovalGrant, CommandRequest, ModelCatalogRequest, ModelDescriptor, RunFailureKind,
@@ -295,6 +295,134 @@ impl RuntimeFactory {
             },
             None => false,
         }
+    }
+
+    /// Loads the workspace configuration with `selection` applied as
+    /// overrides, exactly as ordinary runtime loading would: the same
+    /// canonical-workspace requirement, layering, and policy validation.
+    fn snapshot_for_selection(
+        &self,
+        workspace: &str,
+        selection: &qq_protocol::ModelSelection,
+    ) -> Result<ConfigSnapshot, RuntimeBuildError> {
+        let requested_workspace = PathBuf::from(workspace);
+        let workspace = std::fs::canonicalize(&requested_workspace).map_err(|_| {
+            ConfigError::InvalidWorkingDirectory {
+                path: requested_workspace.clone(),
+            }
+        })?;
+        if workspace != requested_workspace {
+            return Err(ConfigError::InvalidWorkingDirectory {
+                path: requested_workspace,
+            }
+            .into());
+        }
+        let mut load = LoadRequest::from_process_env(&workspace, selection.max_output_tokens)?;
+        let mut overrides = load.overrides().clone();
+        if let Some(model) = &selection.model {
+            overrides = overrides.with_model(model.clone());
+        }
+        if let Some(organization) = &selection.organization {
+            overrides = overrides.with_organization(organization.clone());
+        }
+        load = load.with_overrides(overrides);
+        self.load(&load)
+    }
+
+    /// The spawn-time model gate: accepts exactly the routes the served
+    /// model list (`POST /v1/models` and the pickers) would show right now.
+    /// Route syntax, provider existence, and provider policy were already
+    /// rejected by the configuration load that produced `snapshot`; this
+    /// adds the authentication check that gates the served list and the
+    /// model-id membership check against the builtin catalog union the
+    /// cached discovery list. The default-API fallback for unknown model
+    /// ids never applies on this path.
+    fn validate_spawn_snapshot(&self, snapshot: &ConfigSnapshot) -> Result<(), RuntimeBuildError> {
+        let provider_id = snapshot.model().provider();
+        let model_id = snapshot.model().model();
+        let provider = snapshot
+            .providers()
+            .get(provider_id)
+            .ok_or_else(|| RuntimeBuildError::UnknownProvider(provider_id.to_owned()))?;
+        if !self.provider_authenticated(provider_id, provider) {
+            return Err(RuntimeBuildError::UnauthenticatedProvider(
+                provider_id.to_owned(),
+            ));
+        }
+        if provider.models().contains_key(model_id) {
+            return Ok(());
+        }
+        // The discovery cache keeps this equal to the served list without a
+        // network round trip while the cache is warm; when discovery is
+        // unavailable the builtin catalog and configured ids above are the
+        // whole list.
+        if self
+            .inner
+            .discovery
+            .discover(provider_id, provider, &self.inner.credentials)
+            .is_some_and(|models| models.iter().any(|model| model.id == model_id))
+        {
+            return Ok(());
+        }
+        Err(RuntimeBuildError::UnknownModel {
+            provider: provider_id.to_owned(),
+            model: model_id.to_owned(),
+        })
+    }
+
+    /// The blocking body of [`RuntimeLoader::validate_spawn_model`]: load
+    /// (route syntax, provider existence, policy), then gate on the served
+    /// model list, naming the failed check and listing the provider's
+    /// routes when the list is small.
+    fn validate_spawn_selection(
+        &self,
+        workspace: &str,
+        selection: &qq_protocol::ModelSelection,
+    ) -> Result<(), RuntimeLoadError> {
+        let snapshot = self
+            .snapshot_for_selection(workspace, selection)
+            .map_err(|error| RuntimeLoadError {
+                kind: error.failure_kind(),
+                message: error.to_string(),
+            })?;
+        self.validate_spawn_snapshot(&snapshot).map_err(|error| {
+            let mut message = error.to_string();
+            if matches!(error, RuntimeBuildError::UnknownModel { .. })
+                && let Some(routes) = self.served_route_hint(&snapshot)
+            {
+                message.push_str("; available routes: ");
+                message.push_str(&routes);
+            }
+            RuntimeLoadError {
+                kind: error.failure_kind(),
+                message,
+            }
+        })
+    }
+
+    /// A short listing of the selected provider's served routes for
+    /// rejection messages, omitted when the list is large or empty.
+    fn served_route_hint(&self, snapshot: &ConfigSnapshot) -> Option<String> {
+        const MAX_LISTED_ROUTES: usize = 12;
+        let provider_id = snapshot.model().provider();
+        let provider = snapshot.providers().get(provider_id)?;
+        let mut ids: BTreeSet<String> = provider.models().keys().cloned().collect();
+        if let Some(discovered) =
+            self.inner
+                .discovery
+                .discover(provider_id, provider, &self.inner.credentials)
+        {
+            ids.extend(discovered.into_iter().map(|model| model.id));
+        }
+        if ids.is_empty() || ids.len() > MAX_LISTED_ROUTES {
+            return None;
+        }
+        Some(
+            ids.into_iter()
+                .map(|id| format!("{provider_id}/{id}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 
     pub fn runtime_for(&self, request: &LoadRequest) -> Result<Arc<Runtime>, RuntimeBuildError> {
@@ -693,28 +821,7 @@ impl RuntimeLoader for RuntimeFactory {
         let factory = self.clone();
         Box::pin(async move {
             let build = tokio::task::spawn_blocking(move || {
-                let requested_workspace = PathBuf::from(&workspace);
-                let workspace = std::fs::canonicalize(&requested_workspace).map_err(|_| {
-                    ConfigError::InvalidWorkingDirectory {
-                        path: requested_workspace.clone(),
-                    }
-                })?;
-                if workspace != requested_workspace {
-                    return Err(ConfigError::InvalidWorkingDirectory {
-                        path: requested_workspace,
-                    }
-                    .into());
-                }
-                let mut load = LoadRequest::from_process_env(&workspace, parent.max_output_tokens)?;
-                let mut overrides = load.overrides().clone();
-                if let Some(model) = &parent.model {
-                    overrides = overrides.with_model(model.clone());
-                }
-                if let Some(organization) = &parent.organization {
-                    overrides = overrides.with_organization(organization.clone());
-                }
-                load = load.with_overrides(overrides);
-                let snapshot = factory.load(&load)?;
+                let snapshot = factory.snapshot_for_selection(&workspace, &parent)?;
                 Ok::<_, RuntimeBuildError>(match snapshot.worker_model() {
                     Some(worker) => qq_protocol::ModelSelection {
                         model: Some(worker.as_str().to_owned()),
@@ -734,6 +841,27 @@ impl RuntimeLoader for RuntimeFactory {
                 Err(_) => Err(RuntimeLoadError {
                     kind: RunFailureKind::Server,
                     message: "worker model resolution stopped unexpectedly".to_owned(),
+                }),
+            }
+        })
+    }
+
+    fn validate_spawn_model(
+        &self,
+        workspace: String,
+        selection: qq_protocol::ModelSelection,
+    ) -> SpawnModelValidationFuture {
+        let factory = self.clone();
+        Box::pin(async move {
+            let build = tokio::task::spawn_blocking(move || {
+                factory.validate_spawn_selection(&workspace, &selection)
+            })
+            .await;
+            match build {
+                Ok(result) => result,
+                Err(_) => Err(RuntimeLoadError {
+                    kind: RunFailureKind::Server,
+                    message: "spawn model validation stopped unexpectedly".to_owned(),
                 }),
             }
         })
@@ -1165,6 +1293,10 @@ pub enum RuntimeBuildError {
     Runtime(#[from] RuntimeConfigError),
     #[error("configured provider does not exist: {0}")]
     UnknownProvider(String),
+    #[error("model {model:?} is not in provider {provider:?}'s authenticated model list")]
+    UnknownModel { provider: String, model: String },
+    #[error("provider {0:?} is not authenticated; connect it before spawning on it")]
+    UnauthenticatedProvider(String),
     #[error("provider {0:?} is missing its connection configuration")]
     IncompleteProvider(String),
     #[error("provider {provider:?} uses an API that is not available yet: {api:?}")]
@@ -1200,7 +1332,8 @@ impl RuntimeBuildError {
                 qq_provider::ProviderErrorKind::Response => RunFailureKind::ProviderResponse,
                 qq_provider::ProviderErrorKind::Protocol => RunFailureKind::ProviderProtocol,
             },
-            Self::Mcp(_) => RunFailureKind::Configuration,
+            Self::Mcp(_) | Self::UnknownModel { .. } => RunFailureKind::Configuration,
+            Self::UnauthenticatedProvider(_) => RunFailureKind::Authentication,
             Self::Runtime(_)
             | Self::UnknownProvider(_)
             | Self::IncompleteProvider(_)
@@ -1427,6 +1560,323 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fallback, parent);
+    }
+
+    async fn validate_route(
+        factory: &RuntimeFactory,
+        workspace: &Path,
+        route: &str,
+    ) -> Result<(), RuntimeLoadError> {
+        RuntimeLoader::validate_spawn_model(
+            factory,
+            workspace.display().to_string(),
+            qq_protocol::ModelSelection {
+                model: Some(route.to_owned()),
+                max_output_tokens: Some(128),
+                organization: None,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn spawn_validation_names_each_failed_check() {
+        let fixture = RuntimeFixture::new();
+        let workspace = fs::canonicalize(fixture.path("work")).unwrap();
+        fs::write(
+            fixture.path("global/config.ron"),
+            r#"(
+                version: 1,
+                model: "custom/known",
+                providers: {
+                    "custom": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                        models: {"known": (name: "Known model")},
+                    ),
+                    "bare": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                    ),
+                },
+            )"#,
+        )
+        .unwrap();
+        let factory = fixture.factory();
+
+        // A malformed route fails the syntax check.
+        let error = validate_route(&factory, &workspace, "not-a-route")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, RunFailureKind::Configuration);
+        assert!(
+            error.message.contains("provider/model syntax"),
+            "{}",
+            error.message
+        );
+
+        // An unknown provider fails the provider check.
+        let error = validate_route(&factory, &workspace, "ghost/model")
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("unknown or disabled provider"),
+            "{}",
+            error.message
+        );
+
+        // An unknown model id on a known provider is rejected — never
+        // defaulted to the provider's API — and the rejection lists the
+        // served routes while they are few.
+        let error = validate_route(&factory, &workspace, "custom/typo")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, RunFailureKind::Configuration);
+        assert!(
+            error
+                .message
+                .contains(r#"model "typo" is not in provider "custom"'s authenticated model list"#),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("available routes: custom/known"),
+            "{}",
+            error.message
+        );
+
+        // A catalog-less custom provider serves nothing without an
+        // explicitly configured id...
+        let error = validate_route(&factory, &workspace, "bare/anything")
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("authenticated model list"),
+            "{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("available routes"),
+            "{}",
+            error.message
+        );
+
+        // ...while an explicitly configured id passes.
+        validate_route(&factory, &workspace, "custom/known")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_validation_requires_provider_authentication_at_spawn_time() {
+        let fixture = RuntimeFixture::new();
+        let workspace = fs::canonicalize(fixture.path("work")).unwrap();
+        let credentials = CredentialStore::with_backend(
+            CredentialPaths::new(fixture.path("data")),
+            Arc::new(MemoryKeyring::default()),
+        );
+        fs::write(
+            fixture.path("global/config.ron"),
+            r#"(
+                version: 1,
+                model: "openai/gpt-5.6",
+                providers: {
+                    "openai-codex": OpenAiCodex(
+                        profile: "work",
+                        models: {"gpt-test": (name: "Codex test")},
+                    ),
+                    "xai": XAi(profile: "work"),
+                },
+            )"#,
+        )
+        .unwrap();
+        let factory = fixture.factory_with_credentials(credentials.clone());
+
+        // A missing static key rejects the spawn even though the model id
+        // is in the builtin catalog.
+        let error = validate_route(&factory, &workspace, "openai/gpt-5.6")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            RunFailureKind::Authentication,
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("not authenticated"),
+            "{}",
+            error.message
+        );
+
+        // Request-time-auth providers must have resolvable credentials at
+        // spawn time, not merely at first request.
+        let error = validate_route(&factory, &workspace, "openai-codex/gpt-test")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, RunFailureKind::Authentication);
+        let error = validate_route(&factory, &workspace, "xai/grok-4.5")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, RunFailureKind::Authentication);
+
+        // Adding the static key makes the builtin-catalog route spawnable
+        // without any discovery round trip.
+        credentials
+            .set("openai/default", "test-secret", false)
+            .unwrap();
+        validate_route(&factory, &workspace, "openai/gpt-5.6")
+            .await
+            .unwrap();
+
+        // A stored Codex profile becomes resolvable and the configured
+        // model id passes.
+        let id_payload = serde_json::to_vec(&serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "workspace-test-id",
+                "chatgpt_account_is_fedramp": false
+            }
+        }))
+        .unwrap();
+        let id_token = format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(id_payload));
+        let refreshed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stored = serde_json::json!({
+            "version": 1,
+            "id_token": id_token,
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "account_id": "workspace-test-id",
+            "is_fedramp": false,
+            "refreshed_at": refreshed_at
+        });
+        credentials
+            .set_with_metadata(
+                "openai-codex/work",
+                serde_json::to_vec(&stored).unwrap(),
+                false,
+                Some("openai-codex"),
+                Some("https://chatgpt.com"),
+            )
+            .unwrap();
+        validate_route(&factory, &workspace, "openai-codex/gpt-test")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_validation_rejects_policy_denied_providers() {
+        let fixture = RuntimeFixture::new();
+        let workspace = fs::canonicalize(fixture.path("work")).unwrap();
+        fs::write(
+            fixture.path("global/config.ron"),
+            r#"(
+                version: 1,
+                model: "allowed/model",
+                providers: {
+                    "allowed": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                        models: {"model": (name: "Allowed model")},
+                    ),
+                    "denied": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                        models: {"model": (name: "Denied model")},
+                    ),
+                },
+            )"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.path("managed/managed.ron"),
+            r#"(version: 1, policy: (denied_providers: ["denied"]))"#,
+        )
+        .unwrap();
+        let factory = fixture.factory();
+
+        let error = validate_route(&factory, &workspace, "denied/model")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, RunFailureKind::Policy);
+        assert!(error.message.contains("denied"), "{}", error.message);
+
+        validate_route(&factory, &workspace, "allowed/model")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_validation_accepts_discovered_models_from_a_warm_cache_without_network() {
+        use std::io::{Read as _, Write as _};
+
+        let fixture = RuntimeFixture::new();
+        let workspace = fs::canonicalize(fixture.path("work")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..length]).unwrap();
+            assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+            let body = r#"{"data":[{"id":"live-model","display_name":"Live model"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        fs::write(
+            fixture.path("global/config.ron"),
+            format!(
+                r#"(
+                    version: 1,
+                    model: "custom/configured",
+                    providers: {{
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://{address}/v1",
+                                api: OpenAiResponses,
+                                auth: NoAuth,
+                            ),
+                            models: {{"configured": (name: "Configured model")}},
+                        ),
+                    }},
+                )"#
+            ),
+        )
+        .unwrap();
+        let factory = fixture.factory();
+
+        // The first validation faults the discovery list into the cache and
+        // accepts the discovered id — exactly what the served model list
+        // would show.
+        validate_route(&factory, &workspace, "custom/live-model")
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        // The endpoint is gone: a second validation can only succeed from
+        // the warm cache, proving no network round trip is required.
+        validate_route(&factory, &workspace, "custom/live-model")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
