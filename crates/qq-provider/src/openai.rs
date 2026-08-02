@@ -20,6 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
+    support,
 };
 
 const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -695,24 +696,11 @@ fn openai_error_kind(code: Option<&str>) -> ProviderErrorKind {
 }
 
 fn api_error(rejection: HttpRejection) -> ProviderError {
-    let status = rejection.status();
-    let fallback = status
-        .canonical_reason()
-        .unwrap_or("OpenAI request failed")
-        .to_owned();
-    let body = String::from_utf8_lossy(rejection.body());
-    let message = serde_json::from_str::<ApiErrorEnvelope>(&body)
-        .ok()
-        .and_then(|envelope| envelope.error.message)
-        .or_else(|| (!body.trim().is_empty()).then(|| body.into_owned()))
-        .map_or(fallback, |message| {
-            sanitize_message(&message, rejection.redactions())
-        });
-
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
-    }
+    support::api_error(
+        rejection,
+        "OpenAI request failed",
+        |envelope: ApiErrorEnvelope| envelope.error.message,
+    )
 }
 
 #[cfg(test)]

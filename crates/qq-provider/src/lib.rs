@@ -22,6 +22,7 @@ pub mod openai_chat;
 mod request_auth;
 mod sanitize;
 mod sse;
+mod support;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;

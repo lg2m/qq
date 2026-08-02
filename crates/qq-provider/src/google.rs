@@ -20,6 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
+    support::{self, status_error_kind},
 };
 
 const GENERATIVE_AI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -744,16 +745,6 @@ fn wire_api_error(error: WireApiError, redactions: &[String]) -> ProviderError {
     ProviderError::ResponseFailed { kind, message }
 }
 
-fn status_error_kind(status: u16) -> ProviderErrorKind {
-    match status {
-        400 | 404 | 409 | 422 => ProviderErrorKind::InvalidRequest,
-        401 | 403 => ProviderErrorKind::Authentication,
-        429 => ProviderErrorKind::RateLimited,
-        500..=599 => ProviderErrorKind::Unavailable,
-        _ => ProviderErrorKind::Response,
-    }
-}
-
 fn named_error_kind(name: &str) -> ProviderErrorKind {
     match name {
         "UNAUTHENTICATED" | "PERMISSION_DENIED" => ProviderErrorKind::Authentication,
@@ -767,23 +758,11 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
 }
 
 fn api_error(rejection: HttpRejection) -> ProviderError {
-    let status = rejection.status();
-    let fallback = status
-        .canonical_reason()
-        .unwrap_or("Google GenerateContent request failed")
-        .to_owned();
-    let body_text = String::from_utf8_lossy(rejection.body());
-    let message = serde_json::from_slice::<ApiErrorEnvelope>(rejection.body())
-        .ok()
-        .and_then(|envelope| envelope.error.message)
-        .or_else(|| (!body_text.trim().is_empty()).then(|| body_text.into_owned()))
-        .map_or(fallback, |message| {
-            sanitize_message(&message, rejection.redactions())
-        });
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
-    }
+    support::api_error(
+        rejection,
+        "Google GenerateContent request failed",
+        |envelope: ApiErrorEnvelope| envelope.error.message,
+    )
 }
 
 #[cfg(test)]

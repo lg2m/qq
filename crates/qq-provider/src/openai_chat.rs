@@ -20,6 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
+    support::{self, status_error_kind, value_as_status},
 };
 
 const CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
@@ -644,23 +645,6 @@ fn wire_error_kind(error: &WireApiError) -> ProviderErrorKind {
     ProviderErrorKind::Response
 }
 
-fn value_as_status(value: &Value) -> Option<u16> {
-    value
-        .as_u64()
-        .and_then(|status| u16::try_from(status).ok())
-        .or_else(|| value.as_str()?.parse().ok())
-}
-
-fn status_error_kind(status: u16) -> ProviderErrorKind {
-    match status {
-        400 | 404 | 409 | 422 => ProviderErrorKind::InvalidRequest,
-        401 | 403 => ProviderErrorKind::Authentication,
-        429 => ProviderErrorKind::RateLimited,
-        500..=599 => ProviderErrorKind::Unavailable,
-        _ => ProviderErrorKind::Response,
-    }
-}
-
 fn named_error_kind(name: &str) -> ProviderErrorKind {
     match name.to_ascii_lowercase().as_str() {
         "invalid_api_key" | "authentication_error" | "permission_error" => {
@@ -679,24 +663,11 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
 }
 
 fn api_error(rejection: HttpRejection) -> ProviderError {
-    let status = rejection.status();
-    let fallback = status
-        .canonical_reason()
-        .unwrap_or("OpenAI-compatible request failed")
-        .to_owned();
-    let body_text = String::from_utf8_lossy(rejection.body());
-    let message = serde_json::from_slice::<ApiErrorEnvelope>(rejection.body())
-        .ok()
-        .and_then(|envelope| envelope.error.message)
-        .or_else(|| (!body_text.trim().is_empty()).then(|| body_text.into_owned()))
-        .map_or(fallback, |message| {
-            sanitize_message(&message, rejection.redactions())
-        });
-
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
-    }
+    support::api_error(
+        rejection,
+        "OpenAI-compatible request failed",
+        |envelope: ApiErrorEnvelope| envelope.error.message,
+    )
 }
 
 #[cfg(test)]

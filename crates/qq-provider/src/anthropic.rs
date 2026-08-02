@@ -20,6 +20,7 @@ use crate::{
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, SseEvent, Utf8ErrorMessage},
+    support::{self, value_as_status},
 };
 
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -787,20 +788,11 @@ fn wire_error_kind(error: &WireApiError) -> ProviderErrorKind {
     ProviderErrorKind::Response
 }
 
-fn value_as_status(value: &Value) -> Option<u16> {
-    value
-        .as_u64()
-        .and_then(|status| u16::try_from(status).ok())
-        .or_else(|| value.as_str()?.parse().ok())
-}
-
 fn status_error_kind(status: u16) -> ProviderErrorKind {
+    // Anthropic additionally classifies 413 (request too large) as invalid.
     match status {
-        400 | 404 | 409 | 413 | 422 => ProviderErrorKind::InvalidRequest,
-        401 | 403 => ProviderErrorKind::Authentication,
-        429 => ProviderErrorKind::RateLimited,
-        500..=599 => ProviderErrorKind::Unavailable,
-        _ => ProviderErrorKind::Response,
+        413 => ProviderErrorKind::InvalidRequest,
+        status => support::status_error_kind(status),
     }
 }
 
@@ -823,24 +815,11 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
 }
 
 fn api_error(rejection: HttpRejection) -> ProviderError {
-    let status = rejection.status();
-    let fallback = status
-        .canonical_reason()
-        .unwrap_or("Anthropic-compatible request failed")
-        .to_owned();
-    let body_text = String::from_utf8_lossy(rejection.body());
-    let message = serde_json::from_slice::<ApiErrorEnvelope>(rejection.body())
-        .ok()
-        .and_then(|envelope| envelope.error.message)
-        .or_else(|| (!body_text.trim().is_empty()).then(|| body_text.into_owned()))
-        .map_or(fallback, |message| {
-            sanitize_message(&message, rejection.redactions())
-        });
-
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
-    }
+    support::api_error(
+        rejection,
+        "Anthropic-compatible request failed",
+        |envelope: ApiErrorEnvelope| envelope.error.message,
+    )
 }
 
 #[cfg(test)]
