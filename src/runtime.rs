@@ -962,6 +962,13 @@ impl RuntimeHandler {
         let durable = SessionRuntime::open(options, Arc::new(factory.clone())).await?;
         Ok(Self { durable, factory })
     }
+
+    /// The durable session runtime this handler serves. Headless `qq run`
+    /// drives it directly through the same command/snapshot/subscribe
+    /// interface the server exposes over HTTP.
+    pub fn sessions(&self) -> &SessionRuntime {
+        &self.durable
+    }
 }
 
 impl AskHandler for RuntimeHandler {

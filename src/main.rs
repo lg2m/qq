@@ -16,6 +16,7 @@ use qq_server as server;
 
 mod catalog;
 mod cli;
+mod headless;
 mod mcp;
 mod output;
 mod runtime;
@@ -23,7 +24,7 @@ mod runtime;
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -31,7 +32,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<ExitCode, Box<dyn Error>> {
     let cli = cli::Cli::parse();
     let overrides = CliOverrides {
         model: cli.model,
@@ -41,6 +42,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     match cli.command {
         Some(cli::Command::Ask { prompt }) => ask(prompt, &overrides).await?,
+        Some(cli::Command::Run(args)) => return Ok(headless_run(args, &overrides).await),
         Some(cli::Command::Serve { bind }) => serve(bind).await?,
         Some(cli::Command::Config { command }) => config_command(command, &overrides)?,
         Some(cli::Command::Auth { command }) => {
@@ -51,7 +53,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         None => interactive(&overrides).await?,
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -63,7 +65,22 @@ struct CliOverrides {
 
 impl CliOverrides {
     fn load_request(&self) -> Result<config::LoadRequest, config::ConfigError> {
-        let request = config::LoadRequest::from_current_process(self.max_output_tokens)?;
+        self.apply(config::LoadRequest::from_current_process(
+            self.max_output_tokens,
+        )?)
+    }
+
+    fn load_request_in(&self, cwd: &Path) -> Result<config::LoadRequest, config::ConfigError> {
+        self.apply(config::LoadRequest::from_process_env(
+            cwd,
+            self.max_output_tokens,
+        )?)
+    }
+
+    fn apply(
+        &self,
+        request: config::LoadRequest,
+    ) -> Result<config::LoadRequest, config::ConfigError> {
         let mut values = request.overrides().clone();
         if let Some(model) = &self.model {
             values = values.with_model(model.clone());
@@ -81,6 +98,125 @@ async fn ask(prompt: String, overrides: &CliOverrides) -> Result<(), Box<dyn Err
     let workspace = std::env::current_dir()?;
     let runtime = tokio::task::spawn_blocking(move || factory.runtime_for(&load)).await??;
     render_events(runtime.run_in_workspace(RunCommand::new(prompt), workspace)).await
+}
+
+/// Runs one autonomous headless task through the durable session runtime and
+/// maps every failure to a distinguishable exit code: 0 success, 1 task or
+/// model failure, 2 invalid configuration, 3 timeout or budget exhaustion,
+/// 4 harness or persistence failure, 130 interrupted.
+async fn headless_run(args: cli::RunArgs, overrides: &CliOverrides) -> ExitCode {
+    match prepare_headless(args, overrides).await {
+        Ok((sessions, options)) => {
+            let interrupt = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+            let mut stdout = io::stdout().lock();
+            let mut stderr = io::stderr().lock();
+            headless::run(&sessions, options, interrupt, &mut stdout, &mut stderr)
+                .await
+                .exit_code()
+        }
+        Err((status, message)) => {
+            eprintln!("error: {message}");
+            status.exit_code()
+        }
+    }
+}
+
+type HeadlessSetupError = (headless::HeadlessStatus, String);
+
+/// Resolves configuration for a headless run. Every rejection happens here,
+/// before a session exists or the prompt is submitted.
+async fn prepare_headless(
+    args: cli::RunArgs,
+    overrides: &CliOverrides,
+) -> Result<(qq_core::SessionRuntime, headless::HeadlessOptions), HeadlessSetupError> {
+    let invalid = |message: String| (headless::HeadlessStatus::InvalidConfiguration, message);
+    let harness = |message: String| (headless::HeadlessStatus::HarnessFailure, message);
+
+    let workspace = match args.workspace {
+        Some(path) => path,
+        None => std::env::current_dir().map_err(|error| {
+            invalid(format!(
+                "could not determine the current directory: {error}"
+            ))
+        })?,
+    };
+    let workspace = std::fs::canonicalize(&workspace).map_err(|error| {
+        invalid(format!(
+            "could not resolve the workspace directory {}: {error}",
+            workspace.display()
+        ))
+    })?;
+
+    let max_cost_usd_nanos = match args.max_cost_usd {
+        None => None,
+        // The value is validated finite and positive; the saturating cast
+        // cannot lose a sign or wrap.
+        Some(value) if value.is_finite() && value > 0.0 => Some((value * 1e9).round() as u64),
+        Some(value) => {
+            return Err(invalid(format!(
+                "--max-cost-usd must be a positive dollar amount, got {value}"
+            )));
+        }
+    };
+
+    let factory = runtime::RuntimeFactory::system().map_err(|error| invalid(error.to_string()))?;
+    let load = overrides
+        .load_request_in(&workspace)
+        .map_err(|error| invalid(error.to_string()))?;
+    let config_factory = factory.clone();
+    let snapshot = tokio::task::spawn_blocking(move || config_factory.load(&load))
+        .await
+        .map_err(|_| harness("configuration loading stopped unexpectedly".to_owned()))?
+        .map_err(|error| invalid(error.to_string()))?;
+
+    // A dollar limit without model pricing cannot be enforced; reject it now
+    // rather than pretend.
+    if max_cost_usd_nanos.is_some()
+        && snapshot
+            .providers()
+            .get(snapshot.model().provider())
+            .and_then(|provider| provider.models().get(snapshot.model().model()))
+            .and_then(|metadata| metadata.pricing())
+            .is_none()
+    {
+        return Err(invalid(format!(
+            "--max-cost-usd cannot be enforced: model {} has no configured pricing",
+            snapshot.model().as_str()
+        )));
+    }
+
+    let model = qq_protocol::ModelSelection {
+        model: Some(snapshot.model().as_str().to_owned()),
+        max_output_tokens: Some(snapshot.max_output_tokens()),
+        organization: snapshot.organization().map(str::to_owned),
+    };
+    let handler = runtime::RuntimeHandler::open(factory)
+        .await
+        .map_err(|error| match error {
+            runtime::RuntimeHandlerError::Config(error) => invalid(error.to_string()),
+            runtime::RuntimeHandlerError::Sessions(error) => harness(error.to_string()),
+        })?;
+
+    let options = headless::HeadlessOptions {
+        prompt: args.prompt,
+        workspace,
+        model,
+        approval: match args.approval {
+            cli::RunApproval::ReadOnly => headless::HeadlessApproval::ReadOnly,
+            cli::RunApproval::Auto => headless::HeadlessApproval::Auto,
+        },
+        timeout: args.timeout_seconds.map(std::time::Duration::from_secs),
+        max_turns: args.max_turns,
+        max_cost_usd_nanos,
+        format: match args.format {
+            cli::RunFormat::Text => headless::HeadlessFormat::Text,
+            cli::RunFormat::Jsonl => headless::HeadlessFormat::Jsonl,
+        },
+        trace: args.trace,
+    };
+    Ok((handler.sessions().clone(), options))
 }
 
 async fn serve(bind: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {
