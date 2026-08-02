@@ -10,7 +10,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    ProviderError, ProviderErrorKind, ProviderUsage, http::HttpRejection,
+    ProviderError, ProviderErrorKind, ProviderUsage,
+    http::{HttpExchange, HttpRejection, RetryPolicy, build_client, build_direct_client},
     sanitize::sanitize_message,
 };
 
@@ -156,4 +157,26 @@ pub(crate) fn subtract_cached_input_tokens(
     total
         .checked_sub(cached)
         .ok_or_else(|| ProviderError::Protocol(underflow.to_owned()))
+}
+
+/// Builds the HTTP client an adapter's exact-endpoint constructor should use:
+/// loopback plain-HTTP endpoints get the proxy-free direct client, everything
+/// else the standard client.
+pub(crate) fn client_for_endpoint(
+    endpoint: &reqwest::Url,
+) -> Result<reqwest::Client, ProviderError> {
+    if endpoint.scheme() == "http" {
+        build_direct_client()
+    } else {
+        build_client()
+    }
+}
+
+/// Disables pre-stream HTTP retries on an adapter's exchange.
+///
+/// Backs every adapter's public `without_retries`: live canaries and
+/// single-shot probes use it so one overloaded or rate-limited response is
+/// not spent across multiple attempts.
+pub(crate) fn without_retries(exchange: HttpExchange) -> HttpExchange {
+    exchange.with_retry_policy(RetryPolicy::disabled())
 }

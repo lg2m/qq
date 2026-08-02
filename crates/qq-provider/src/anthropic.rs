@@ -13,8 +13,8 @@ use crate::{
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders, build_client,
-        build_direct_client, is_request_controlled_header, validate_endpoint,
+        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
+        validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -92,11 +92,7 @@ impl AnthropicMessages {
         anthropic_version: &str,
     ) -> Result<Self, ProviderError> {
         let endpoint = validate_endpoint(endpoint, allow_http)?;
-        let client = if endpoint.scheme() == "http" {
-            build_direct_client()?
-        } else {
-            build_client()?
-        };
+        let client = support::client_for_endpoint(&endpoint)?;
         Self::with_client_authorizer_and_version(
             client,
             endpoint,
@@ -147,7 +143,7 @@ impl AnthropicMessages {
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
     pub fn without_retries(mut self) -> Self {
-        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self.exchange = support::without_retries(self.exchange);
         self
     }
 }

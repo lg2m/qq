@@ -13,8 +13,8 @@ use crate::{
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders, build_client,
-        build_direct_client, is_request_controlled_header, validate_endpoint,
+        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
+        validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -74,11 +74,7 @@ impl OpenAiChatCompletions {
         allow_http: bool,
     ) -> Result<Self, ProviderError> {
         let endpoint = validate_endpoint(endpoint, allow_http)?;
-        let client = if endpoint.scheme() == "http" {
-            build_direct_client()?
-        } else {
-            build_client()?
-        };
+        let client = support::client_for_endpoint(&endpoint)?;
         Self::with_client_and_authorizer(
             client,
             endpoint,
@@ -110,7 +106,7 @@ impl OpenAiChatCompletions {
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
     pub fn without_retries(mut self) -> Self {
-        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self.exchange = support::without_retries(self.exchange);
         self
     }
 }
@@ -662,7 +658,7 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::json;
 
-    use crate::test_support::LoopbackServer;
+    use crate::{http::build_direct_client, test_support::LoopbackServer};
 
     use super::*;
 

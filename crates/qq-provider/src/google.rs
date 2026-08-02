@@ -13,7 +13,7 @@ use crate::{
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders, build_client,
+        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, build_client,
         is_request_controlled_header, validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
@@ -97,7 +97,7 @@ impl GoogleGenerateContent {
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
     pub fn without_retries(mut self) -> Self {
-        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self.exchange = support::without_retries(self.exchange);
         self
     }
 
