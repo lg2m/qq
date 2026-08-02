@@ -493,11 +493,12 @@ mod tests {
                 "test",
             ),
         };
-        let authorizer = RequestAuthorizer::bedrock_mantle_sigv4_with_clock(
-            "us-east-1",
-            SharedCredentialsProvider::new(credentials),
-            fixed_time,
-        );
+        let authorizer =
+            RequestAuthorizer::with_sigv4_for_test(crate::aws::SigV4Authorizer::with_clock(
+                "us-east-1",
+                SharedCredentialsProvider::new(credentials),
+                fixed_time,
+            ));
         let server = LoopbackServer::respond(401, "application/json", "{}");
         let endpoint = reqwest::Url::parse(&format!("{}/invoke", server.base_url)).unwrap();
         let provider = construct_mantle_provider(
