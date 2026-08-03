@@ -29,25 +29,8 @@ impl ProviderCompiler {
 
     /// Validates and compiles one immutable provider recipe.
     pub fn compile(&self, recipe: ProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
-        self.compile_with_retry_mode(recipe, HttpRetryMode::Default)
-    }
-
-    /// Compiles one provider for an operational canary with adapter retries
-    /// disabled, so the probe observes exactly one provider attempt.
-    pub fn compile_for_canary(
-        &self,
-        recipe: ProviderRecipe,
-    ) -> Result<Arc<dyn Provider>, ProviderError> {
-        self.compile_with_retry_mode(recipe, HttpRetryMode::Disabled)
-    }
-
-    fn compile_with_retry_mode(
-        &self,
-        recipe: ProviderRecipe,
-        retry_mode: HttpRetryMode,
-    ) -> Result<Arc<dyn Provider>, ProviderError> {
         match recipe {
-            ProviderRecipe::Http(recipe) => self.compile_http(recipe, retry_mode),
+            ProviderRecipe::Http(recipe) => self.compile_http(recipe),
             ProviderRecipe::AmazonBedrock { region, auth } => {
                 Ok(Arc::new(Bedrock::new(auth, region)?))
             }
@@ -60,16 +43,53 @@ impl ProviderCompiler {
                 region,
                 protocol,
                 auth,
-                retry_mode,
+                HttpRetryMode::Default,
             )?)),
         }
     }
 
-    fn compile_http(
+    /// Compiles one provider for an operational canary with adapter retries
+    /// disabled, so the probe observes exactly one provider attempt.
+    pub fn compile_for_canary(
+        &self,
+        recipe: ProviderRecipe,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
+        match recipe {
+            ProviderRecipe::Http(recipe) => self.compile_http_for_canary(recipe),
+            ProviderRecipe::AmazonBedrock { region, auth } => {
+                Ok(Arc::new(Bedrock::new(auth, region)?))
+            }
+            ProviderRecipe::AmazonBedrockMantle {
+                region,
+                protocol,
+                auth,
+            } => Ok(Arc::new(Mantle::new(
+                self.direct_http.clone(),
+                region,
+                protocol,
+                auth,
+                HttpRetryMode::Disabled,
+            )?)),
+        }
+    }
+
+    fn compile_http(&self, recipe: HttpProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
+        Ok(Arc::new(self.construct_http(recipe)?))
+    }
+
+    fn compile_http_for_canary(
         &self,
         recipe: HttpProviderRecipe,
-        retry_mode: HttpRetryMode,
     ) -> Result<Arc<dyn Provider>, ProviderError> {
+        Ok(Arc::new(self.construct_http(recipe)?.without_retries()))
+    }
+
+    // Keep the ordinary compile path branch-free after adding the canary call site.
+    #[inline(always)]
+    fn construct_http(
+        &self,
+        recipe: HttpProviderRecipe,
+    ) -> Result<crate::construction::CompiledHttpProvider, ProviderError> {
         let endpoint_kind = recipe.endpoint.kind;
         let endpoint = recipe.endpoint.resolve(recipe.protocol)?;
         let client = if endpoint.scheme() == "http" {
@@ -86,9 +106,7 @@ impl ProviderCompiler {
             headers: recipe.headers,
         };
 
-        Ok(Arc::new(
-            construct_http_provider(client, spec)?.with_retry_mode(retry_mode),
-        ))
+        construct_http_provider(client, spec)
     }
 }
 

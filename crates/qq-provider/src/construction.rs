@@ -68,9 +68,14 @@ impl CompiledHttpProvider {
     #[must_use]
     pub(crate) fn with_retry_mode(self, retry_mode: HttpRetryMode) -> Self {
         if retry_mode == HttpRetryMode::Default {
-            return self;
+            self
+        } else {
+            self.without_retries()
         }
+    }
 
+    #[must_use]
+    pub(crate) fn without_retries(self) -> Self {
         match self {
             Self::OpenAiResponses(provider) => Self::OpenAiResponses(provider.without_retries()),
             Self::OpenAiChatCompletions(provider) => {
@@ -99,6 +104,8 @@ impl Provider for CompiledHttpProvider {
 
 /// Constructs one HTTP adapter from resolved inputs without creating clients or
 /// performing network I/O.
+// Recipe compilation is a measured startup path with multiple facade call sites.
+#[inline(always)]
 pub(crate) fn construct_http_provider(
     client: reqwest::Client,
     spec: HttpConstructionSpec,
