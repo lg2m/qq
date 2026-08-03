@@ -35,7 +35,8 @@ pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpTo
 pub use sessions::{
     GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, RuntimeLoadError, RuntimeLoadFuture,
     RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
-    SessionRuntimeOptions, WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
+    WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
@@ -974,7 +975,6 @@ impl Runtime {
                     let cancelled = Arc::clone(&cancelled);
                     let mcp = mcp.clone();
                     let spawner = spawner.clone();
-                    let spawn_model_routes = Arc::clone(&spawn_model_routes);
                     async move {
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
@@ -1002,23 +1002,20 @@ impl Runtime {
                                                 let model = model.trim().to_owned();
                                                 (!model.is_empty()).then_some(model)
                                             });
-                                            if arguments.model.as_ref().is_some_and(|model| {
-                                                !spawn_model_routes.iter().any(|route| route == model)
-                                            }) {
-                                                tools::bounded_result(
-                                                    "model must be omitted or exactly match an authenticated route listed by this tool"
-                                                        .to_owned(),
-                                                    true,
-                                                )
-                                            } else {
-                                                let outcome = spawner
-                                                    .spawn(arguments.task, arguments.model)
-                                                    .await;
-                                                tools::bounded_result(
-                                                    outcome.content,
-                                                    outcome.is_error,
-                                                )
-                                            }
+                                            // The advertised route list is
+                                            // schema guidance only; the
+                                            // session spawner validates every
+                                            // resolved route against the
+                                            // authenticated served model list
+                                            // at spawn time, before any
+                                            // durable child state exists.
+                                            let outcome = spawner
+                                                .spawn(arguments.task, arguments.model)
+                                                .await;
+                                            tools::bounded_result(
+                                                outcome.content,
+                                                outcome.is_error,
+                                            )
                                         }
                                         Err(error) => tools::bounded_result(
                                             format!("invalid arguments: {error}"),
@@ -3092,7 +3089,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_model_overrides_are_normalized_and_restricted_to_advertised_routes() {
+    async fn spawn_model_overrides_are_normalized_and_forwarded_to_the_spawner() {
         struct AllowAllGate;
 
         impl ToolGate for AllowAllGate {
@@ -3102,17 +3099,17 @@ mod tests {
         }
 
         let cases = [
-            (None, None, false),
-            (Some(""), None, false),
-            (Some("   "), None, false),
-            (
-                Some("openai-codex/gpt-test"),
-                Some("openai-codex/gpt-test"),
-                false,
-            ),
-            (Some("openai/gpt-guessed"), None, true),
+            (None, None),
+            (Some(""), None),
+            (Some("   "), None),
+            (Some("openai-codex/gpt-test"), Some("openai-codex/gpt-test")),
+            // Routes outside the advertised schema list still reach the
+            // spawner: the session layer validates every resolved route
+            // against the served model list at spawn time, so a discovered
+            // model absent from the advertised list stays spawnable.
+            (Some("openai/gpt-guessed"), Some("openai/gpt-guessed")),
         ];
-        for (requested, expected, rejected) in cases {
+        for (requested, expected) in cases {
             let directory = tempfile::tempdir().unwrap();
             let tasks = Arc::new(Mutex::new(Vec::new()));
             let spawner = Arc::new(StubSpawner {
@@ -3133,7 +3130,7 @@ mod tests {
             .unwrap()
             .with_spawn_model_routes(vec!["openai-codex/gpt-test".to_owned()]);
 
-            let events = runtime
+            let _events = runtime
                 .run_loop_with_spawner(
                     vec![Message::user("go")],
                     directory.path().to_owned(),
@@ -3145,23 +3142,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .await;
 
-            let result = events.iter().find_map(|event| match event {
-                RuntimeEvent::ToolCallFinished {
-                    result, is_error, ..
-                } => Some((result, *is_error)),
-                _ => None,
-            });
-            if rejected {
-                let (result, is_error) = result.expect("rejected call returns a tool result");
-                assert!(is_error);
-                assert!(result.contains("authenticated route listed by this tool"));
-                assert!(tasks.lock().unwrap().is_empty());
-            } else {
-                assert_eq!(
-                    tasks.lock().unwrap().as_slice(),
-                    &[("count the widgets".to_owned(), expected.map(str::to_owned))]
-                );
-            }
+            assert_eq!(
+                tasks.lock().unwrap().as_slice(),
+                &[("count the widgets".to_owned(), expected.map(str::to_owned))]
+            );
         }
     }
 

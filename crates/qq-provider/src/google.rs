@@ -3,8 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_stream::try_stream;
-use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -12,18 +11,29 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
-        build_client, is_request_controlled_header, transport_error, validate_endpoint,
+        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, build_client,
+        is_request_controlled_header, validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
+    support::{self, UsageOnce, status_error_kind, subtract_cached_input_tokens},
 };
 
 const GENERATIVE_AI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
 const X_GOOG_API_KEY: HeaderName = HeaderName::from_static("x-goog-api-key");
+
+const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
+    messages: ExchangeMessages {
+        wire_overflow: "Google GenerateContent wire size overflowed",
+        wire_limit: "Google GenerateContent stream exceeded the configured wire size limit",
+    },
+    non_sse_response: "Google GenerateContent provider returned a non-SSE response",
+    content_type_gate: ContentTypeGate::Strict,
+};
 
 /// Authentication applied by a Google GenerateContent-compatible client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,7 +97,7 @@ impl GoogleGenerateContent {
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
     pub fn without_retries(mut self) -> Self {
-        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self.exchange = support::without_retries(self.exchange);
         self
     }
 
@@ -144,110 +154,87 @@ impl Provider for GoogleGenerateContent {
             })?;
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = GenerateContentRequest::new(&request, max_output_tokens)?;
-            let wire_request = exchange
-                .request(reqwest::Method::POST, endpoint)
-                .headers(headers)
-                .header(ACCEPT, "text/event-stream")
-                .json(&body)
-                .build()
-                .map_err(|error| transport_error(error, exchange.static_redactions()))?;
-            let outcome = exchange
-                .execute(
-                    wire_request,
-                    limits.wire,
-                    ExchangeMessages {
-                        wire_overflow: "Google GenerateContent wire size overflowed",
-                        wire_limit: "Google GenerateContent stream exceeded the configured wire size limit",
-                    },
-                )
-                .await?;
-            let response = match outcome {
-                ExchangeOutcome::Success(response) => response,
-                ExchangeOutcome::Rejected(rejection) => Err(api_error(rejection))?,
-            };
-            if !crate::http::is_event_stream_headers(response.headers()) {
-                Err(ProviderError::Protocol(
-                    "Google GenerateContent provider returned a non-SSE response".to_owned(),
-                ))?;
-            }
+            let mut sse = sse_exchange(
+                &exchange,
+                endpoint,
+                headers,
+                &body,
+                sse_decoder(limits.event),
+                limits.wire,
+                SSE_SPEC,
+            )
+            .await
+            .map_err(|error| error.into_provider_error(api_error))?;
 
-            let redactions = Arc::<[String]>::from(response.redactions());
-            let mut chunks = response.into_body();
-            let mut decoder = sse_decoder(limits.event);
+            let redactions = Arc::clone(sse.redactions());
             let mut output_bytes = ByteCounter::new(
                 limits.output,
                 "Google GenerateContent output size overflowed",
                 "Google GenerateContent output exceeded the configured size limit",
             );
-            let mut usage = None;
+            let mut usage = UsageOnce::new(
+                "Google GenerateContent stream reported usage more than once",
+            );
             let mut reasoning_open = false;
             // Gemini assigns no tool-call ids; a per-stream ordinal keeps the
             // synthesized ids deterministic.
             let mut tool_call_ordinal = 0_u64;
 
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk?;
-
-                for frame in decoder.push(&chunk)? {
-                    for event in decode_event(&frame.data, &mut tool_call_ordinal, redactions.as_ref())? {
-                        match event {
-                            DecodedEvent::OutputText(text) => {
-                                if reasoning_open {
-                                    yield ProviderEvent::ReasoningCompleted {
-                                        kind: crate::ReasoningKind::ExposedThinking,
-                                    };
-                                    reasoning_open = false;
-                                }
-                                output_bytes.add(text.len())?;
-                                yield ProviderEvent::OutputTextDelta { text };
-                            }
-                            DecodedEvent::Reasoning(text) => {
-                                if !reasoning_open {
-                                    yield ProviderEvent::ReasoningStarted {
-                                        kind: crate::ReasoningKind::ExposedThinking,
-                                    };
-                                    reasoning_open = true;
-                                }
-                                output_bytes.add(text.len())?;
-                                yield ProviderEvent::ReasoningDelta {
+            while let Some(frame) = sse.next_event().await? {
+                for event in decode_event(&frame.data, &mut tool_call_ordinal, redactions.as_ref())? {
+                    match event {
+                        DecodedEvent::OutputText(text) => {
+                            if reasoning_open {
+                                yield ProviderEvent::ReasoningCompleted {
                                     kind: crate::ReasoningKind::ExposedThinking,
-                                    text,
+                                };
+                                reasoning_open = false;
+                            }
+                            output_bytes.add(text.len())?;
+                            yield ProviderEvent::OutputTextDelta { text };
+                        }
+                        DecodedEvent::Reasoning(text) => {
+                            if !reasoning_open {
+                                yield ProviderEvent::ReasoningStarted {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                };
+                                reasoning_open = true;
+                            }
+                            output_bytes.add(text.len())?;
+                            yield ProviderEvent::ReasoningDelta {
+                                kind: crate::ReasoningKind::ExposedThinking,
+                                text,
+                            };
+                        }
+                        DecodedEvent::Usage(event_usage) => {
+                            usage.set(event_usage)?;
+                        }
+                        DecodedEvent::ToolCall { id, name, arguments } => {
+                            if reasoning_open {
+                                yield ProviderEvent::ReasoningCompleted {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                };
+                                reasoning_open = false;
+                            }
+                            output_bytes.add(arguments.len())?;
+                            yield ProviderEvent::ToolCallStarted {
+                                id: id.clone(),
+                                name,
+                            };
+                            yield ProviderEvent::ToolCallArgumentsDelta {
+                                id: id.clone(),
+                                json: arguments,
+                            };
+                            yield ProviderEvent::ToolCallCompleted { id };
+                        }
+                        DecodedEvent::Completed => {
+                            if reasoning_open {
+                                yield ProviderEvent::ReasoningCompleted {
+                                    kind: crate::ReasoningKind::ExposedThinking,
                                 };
                             }
-                            DecodedEvent::Usage(event_usage) => {
-                                if usage.replace(event_usage).is_some() {
-                                    Err(ProviderError::Protocol(
-                                        "Google GenerateContent stream reported usage more than once".to_owned(),
-                                    ))?;
-                                }
-                            }
-                            DecodedEvent::ToolCall { id, name, arguments } => {
-                                if reasoning_open {
-                                    yield ProviderEvent::ReasoningCompleted {
-                                        kind: crate::ReasoningKind::ExposedThinking,
-                                    };
-                                    reasoning_open = false;
-                                }
-                                output_bytes.add(arguments.len())?;
-                                yield ProviderEvent::ToolCallStarted {
-                                    id: id.clone(),
-                                    name,
-                                };
-                                yield ProviderEvent::ToolCallArgumentsDelta {
-                                    id: id.clone(),
-                                    json: arguments,
-                                };
-                                yield ProviderEvent::ToolCallCompleted { id };
-                            }
-                            DecodedEvent::Completed => {
-                                if reasoning_open {
-                                    yield ProviderEvent::ReasoningCompleted {
-                                        kind: crate::ReasoningKind::ExposedThinking,
-                                    };
-                                }
-                                yield ProviderEvent::Completed { usage };
-                                return;
-                            }
+                            yield ProviderEvent::Completed { usage: usage.finish() };
+                            return;
                         }
                     }
                 }
@@ -723,12 +710,11 @@ fn decode_event(
 }
 
 fn provider_usage(usage: UsageMetadata) -> Result<ProviderUsage, ProviderError> {
-    let input_tokens = usage
-        .prompt_token_count
-        .checked_sub(usage.cached_content_token_count)
-        .ok_or_else(|| {
-            ProviderError::Protocol("Google cached input tokens exceeded prompt tokens".to_owned())
-        })?;
+    let input_tokens = subtract_cached_input_tokens(
+        usage.prompt_token_count,
+        usage.cached_content_token_count,
+        "Google cached input tokens exceeded prompt tokens",
+    )?;
     let output_tokens = usage
         .candidates_token_count
         .checked_add(usage.thoughts_token_count)
@@ -756,16 +742,6 @@ fn wire_api_error(error: WireApiError, redactions: &[String]) -> ProviderError {
     ProviderError::ResponseFailed { kind, message }
 }
 
-fn status_error_kind(status: u16) -> ProviderErrorKind {
-    match status {
-        400 | 404 | 409 | 422 => ProviderErrorKind::InvalidRequest,
-        401 | 403 => ProviderErrorKind::Authentication,
-        429 => ProviderErrorKind::RateLimited,
-        500..=599 => ProviderErrorKind::Unavailable,
-        _ => ProviderErrorKind::Response,
-    }
-}
-
 fn named_error_kind(name: &str) -> ProviderErrorKind {
     match name {
         "UNAUTHENTICATED" | "PERMISSION_DENIED" => ProviderErrorKind::Authentication,
@@ -779,23 +755,11 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
 }
 
 fn api_error(rejection: HttpRejection) -> ProviderError {
-    let status = rejection.status();
-    let fallback = status
-        .canonical_reason()
-        .unwrap_or("Google GenerateContent request failed")
-        .to_owned();
-    let body_text = String::from_utf8_lossy(rejection.body());
-    let message = serde_json::from_slice::<ApiErrorEnvelope>(rejection.body())
-        .ok()
-        .and_then(|envelope| envelope.error.message)
-        .or_else(|| (!body_text.trim().is_empty()).then(|| body_text.into_owned()))
-        .map_or(fallback, |message| {
-            sanitize_message(&message, rejection.redactions())
-        });
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
-    }
+    support::api_error(
+        rejection,
+        "Google GenerateContent request failed",
+        |envelope: ApiErrorEnvelope| envelope.error.message,
+    )
 }
 
 #[cfg(test)]

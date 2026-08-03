@@ -8,6 +8,7 @@ use futures_core::Stream;
 use thiserror::Error;
 
 pub mod anthropic;
+mod aws;
 pub mod bedrock;
 pub mod compiler;
 mod construction;
@@ -22,6 +23,7 @@ pub mod openai_chat;
 mod request_auth;
 mod sanitize;
 mod sse;
+mod support;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;

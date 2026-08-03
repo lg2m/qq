@@ -1,10 +1,9 @@
 //! OpenAI Responses API adapter.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_stream::try_stream;
-use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,16 +11,16 @@ use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, SharedRequestCredentialProvider, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
-    exchange::ContentTypeGate,
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
-        build_client, build_direct_client, is_request_controlled_header, transport_error,
+        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
         validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, Utf8ErrorMessage},
+    support::{self, ToolCallLedger},
 };
 
 const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -84,11 +83,7 @@ impl OpenAi {
         allow_http: bool,
     ) -> Result<Self, ProviderError> {
         let endpoint = validate_endpoint(exact_endpoint, allow_http)?;
-        let client = if endpoint.scheme() == "http" {
-            build_direct_client()?
-        } else {
-            build_client()?
-        };
+        let client = support::client_for_endpoint(&endpoint)?;
         Self::with_client_and_auth(
             client,
             endpoint,
@@ -144,7 +139,7 @@ impl OpenAi {
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
     pub fn without_retries(mut self) -> Self {
-        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self.exchange = support::without_retries(self.exchange);
         self
     }
 }
@@ -158,40 +153,19 @@ impl Provider for OpenAi {
         Box::pin(try_stream! {
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = ResponsesRequest::new(&request, request_kind);
-            let wire_request = exchange
-                .request(reqwest::Method::POST, endpoint)
-                .headers(headers)
-                .header(ACCEPT, "text/event-stream")
-                .json(&body)
-                .build()
-                .map_err(|error| transport_error(error, exchange.static_redactions()))?;
-            let outcome = exchange
-                .execute(
-                    wire_request,
-                    limits.wire,
-                    ExchangeMessages {
-                        wire_overflow: "OpenAI wire size overflowed",
-                        wire_limit: "OpenAI stream exceeded the configured wire size limit",
-                    },
-                )
-                .await?;
-            let response = match outcome {
-                ExchangeOutcome::Success(response) => response,
-                ExchangeOutcome::Rejected(rejection) => Err(api_error(rejection))?,
-            };
+            let mut sse = sse_exchange(
+                &exchange,
+                endpoint,
+                headers,
+                &body,
+                sse_decoder(limits.event),
+                limits.wire,
+                sse_spec(request_kind),
+            )
+            .await
+            .map_err(|error| error.into_provider_error(api_error))?;
 
-            // ChatGPT Codex streams valid SSE frames but often omits
-            // Content-Type entirely. Standard OpenAI Responses still requires
-            // text/event-stream so a JSON success body cannot be misread.
-            if !accepts_responses_stream(response.headers(), request_kind) {
-                Err(ProviderError::Protocol(
-                    "OpenAI returned a non-SSE response".to_owned(),
-                ))?;
-            }
-
-            let redactions = Arc::<[String]>::from(response.redactions());
-            let mut chunks = response.into_body();
-            let mut decoder = sse_decoder(limits.event);
+            let redactions = Arc::clone(sse.redactions());
             let mut output_bytes = ByteCounter::new(
                 limits.output,
                 "OpenAI output size overflowed",
@@ -200,62 +174,44 @@ impl Provider for OpenAi {
             // Maps streamed function-call item ids to call ids so argument
             // deltas and item completions can be attributed after the added
             // event; the call id is what round-trips into function_call_output.
-            let mut tool_calls: HashMap<String, String> = HashMap::new();
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk?;
+            let mut tool_calls = ToolCallLedger::new(
+                "OpenAI-compatible stream reused a function-call item id",
+                "OpenAI-compatible stream sent arguments for an unknown function call",
+            );
+            while let Some(event) = sse.next_event().await? {
+                let data = event.data;
+                if data == "[DONE]" || data.trim().is_empty() {
+                    continue;
+                }
 
-                for event in decoder.push(&chunk)? {
-                    let data = event.data;
-                    if data == "[DONE]" || data.trim().is_empty() {
-                        continue;
+                match decode_event(&data, redactions.as_ref())? {
+                    DecodedEvent::OutputTextDelta(text) => {
+                        output_bytes.add(text.len())?;
+                        yield ProviderEvent::OutputTextDelta { text };
                     }
-
-                    match decode_event(&data, redactions.as_ref())? {
-                        DecodedEvent::OutputTextDelta(text) => {
-                            output_bytes.add(text.len())?;
-                            yield ProviderEvent::OutputTextDelta { text };
-                        }
-                        DecodedEvent::RefusalDelta(text) => {
-                            output_bytes.add(text.len())?;
-                            yield ProviderEvent::RefusalDelta { text };
-                        }
-                        DecodedEvent::ToolCallStarted { item_id, call_id, name } => {
-                            if tool_calls.insert(item_id, call_id.clone()).is_some() {
-                                Err(ProviderError::Protocol(
-                                    "OpenAI-compatible stream reused a function-call item id"
-                                        .to_owned(),
-                                ))?;
-                            }
-                            yield ProviderEvent::ToolCallStarted { id: call_id, name };
-                        }
-                        DecodedEvent::ToolCallArguments { item_id, json } => {
-                            match tool_calls.get(&item_id) {
-                                Some(call_id) => {
-                                    output_bytes.add(json.len())?;
-                                    yield ProviderEvent::ToolCallArgumentsDelta {
-                                        id: call_id.clone(),
-                                        json,
-                                    };
-                                }
-                                None => {
-                                    Err(ProviderError::Protocol(
-                                        "OpenAI-compatible stream sent arguments for an unknown function call"
-                                            .to_owned(),
-                                    ))?;
-                                }
-                            }
-                        }
-                        DecodedEvent::ToolCallDone { item_id } => {
-                            if let Some(call_id) = tool_calls.remove(&item_id) {
-                                yield ProviderEvent::ToolCallCompleted { id: call_id };
-                            }
-                        }
-                        DecodedEvent::Completed(usage) => {
-                            yield ProviderEvent::Completed { usage };
-                            return;
-                        }
-                        DecodedEvent::Ignored => {}
+                    DecodedEvent::RefusalDelta(text) => {
+                        output_bytes.add(text.len())?;
+                        yield ProviderEvent::RefusalDelta { text };
                     }
+                    DecodedEvent::ToolCallStarted { item_id, call_id, name } => {
+                        tool_calls.insert(item_id, call_id.clone())?;
+                        yield ProviderEvent::ToolCallStarted { id: call_id, name };
+                    }
+                    DecodedEvent::ToolCallArguments { item_id, json } => {
+                        let id = tool_calls.get(&item_id)?.to_owned();
+                        output_bytes.add(json.len())?;
+                        yield ProviderEvent::ToolCallArgumentsDelta { id, json };
+                    }
+                    DecodedEvent::ToolCallDone { item_id } => {
+                        if let Some(call_id) = tool_calls.remove(&item_id) {
+                            yield ProviderEvent::ToolCallCompleted { id: call_id };
+                        }
+                    }
+                    DecodedEvent::Completed(usage) => {
+                        yield ProviderEvent::Completed { usage };
+                        return;
+                    }
+                    DecodedEvent::Ignored => {}
                 }
             }
 
@@ -339,12 +295,21 @@ fn build_headers(
     Ok(headers.finish())
 }
 
-fn accepts_responses_stream(headers: &HeaderMap, request_kind: ResponsesRequestKind) -> bool {
-    let gate = match request_kind {
-        ResponsesRequestKind::Standard => ContentTypeGate::Strict,
-        ResponsesRequestKind::Codex => ContentTypeGate::AllowMissingContentType,
-    };
-    gate.accepts(headers)
+/// Builds the exchange spec for one request. ChatGPT Codex streams valid SSE
+/// frames but often omits Content-Type entirely; standard OpenAI Responses
+/// still requires text/event-stream so a JSON success body cannot be misread.
+fn sse_spec(request_kind: ResponsesRequestKind) -> SseExchangeSpec {
+    SseExchangeSpec {
+        messages: ExchangeMessages {
+            wire_overflow: "OpenAI wire size overflowed",
+            wire_limit: "OpenAI stream exceeded the configured wire size limit",
+        },
+        non_sse_response: "OpenAI returned a non-SSE response",
+        content_type_gate: match request_kind {
+            ResponsesRequestKind::Standard => ContentTypeGate::Strict,
+            ResponsesRequestKind::Codex => ContentTypeGate::AllowMissingContentType,
+        },
+    }
 }
 
 fn sse_decoder(max_event_bytes: usize) -> SseDecoder {
@@ -691,9 +656,11 @@ fn provider_usage(usage: ResponsesUsage) -> Result<ProviderUsage, ProviderError>
     let cached = usage
         .input_tokens_details
         .map_or(0, |details| details.cached_tokens);
-    let input_tokens = usage.input_tokens.checked_sub(cached).ok_or_else(|| {
-        ProviderError::Protocol("OpenAI cached input tokens exceeded total input tokens".to_owned())
-    })?;
+    let input_tokens = support::subtract_cached_input_tokens(
+        usage.input_tokens,
+        cached,
+        "OpenAI cached input tokens exceeded total input tokens",
+    )?;
     Ok(ProviderUsage {
         input_tokens,
         cache_read_input_tokens: cached,
@@ -713,28 +680,16 @@ fn openai_error_kind(code: Option<&str>) -> ProviderErrorKind {
 }
 
 fn api_error(rejection: HttpRejection) -> ProviderError {
-    let status = rejection.status();
-    let fallback = status
-        .canonical_reason()
-        .unwrap_or("OpenAI request failed")
-        .to_owned();
-    let body = String::from_utf8_lossy(rejection.body());
-    let message = serde_json::from_str::<ApiErrorEnvelope>(&body)
-        .ok()
-        .and_then(|envelope| envelope.error.message)
-        .or_else(|| (!body.trim().is_empty()).then(|| body.into_owned()))
-        .map_or(fallback, |message| {
-            sanitize_message(&message, rejection.redactions())
-        });
-
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
-    }
+    support::api_error(
+        rejection,
+        "OpenAI request failed",
+        |envelope: ApiErrorEnvelope| envelope.error.message,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
     use serde_json::json;
 
     use super::*;

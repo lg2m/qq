@@ -1,10 +1,9 @@
 //! Anthropic Messages API adapter.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_stream::try_stream;
-use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,21 +11,31 @@ use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, RetryPolicy, SafeHeaders,
-        build_client, build_direct_client, is_request_controlled_header, transport_error,
+        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
         validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
     sanitize::sanitize_message,
     sse::{SseDecoder, SseEvent, Utf8ErrorMessage},
+    support::{self, ToolCallLedger, UsageOnce, value_as_status},
 };
 
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
+
+const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
+    messages: ExchangeMessages {
+        wire_overflow: "Anthropic-compatible wire size overflowed",
+        wire_limit: "Anthropic-compatible stream exceeded the configured wire size limit",
+    },
+    non_sse_response: "Anthropic-compatible provider returned a non-SSE response",
+    content_type_gate: ContentTypeGate::Strict,
+};
 
 /// Authentication applied by an Anthropic-compatible Messages client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,11 +92,7 @@ impl AnthropicMessages {
         anthropic_version: &str,
     ) -> Result<Self, ProviderError> {
         let endpoint = validate_endpoint(endpoint, allow_http)?;
-        let client = if endpoint.scheme() == "http" {
-            build_direct_client()?
-        } else {
-            build_client()?
-        };
+        let client = support::client_for_endpoint(&endpoint)?;
         Self::with_client_authorizer_and_version(
             client,
             endpoint,
@@ -138,7 +143,7 @@ impl AnthropicMessages {
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
     pub fn without_retries(mut self) -> Self {
-        self.exchange = self.exchange.with_retry_policy(RetryPolicy::disabled());
+        self.exchange = support::without_retries(self.exchange);
         self
     }
 }
@@ -152,155 +157,117 @@ impl Provider for AnthropicMessages {
         Box::pin(try_stream! {
             let limits = StreamLimits::new(request.max_output_tokens());
             let body = MessagesRequest::from(&request);
-            let wire_request = exchange
-                .request(reqwest::Method::POST, endpoint)
-                .headers(headers)
-                .header(ACCEPT, "text/event-stream")
-                .json(&body)
-                .build()
-                .map_err(|error| transport_error(error, exchange.static_redactions()))?;
-            let outcome = exchange
-                .execute(
-                    wire_request,
-                    limits.wire,
-                    ExchangeMessages {
-                        wire_overflow: "Anthropic-compatible wire size overflowed",
-                        wire_limit: "Anthropic-compatible stream exceeded the configured wire size limit",
-                    },
-                )
-                .await?;
-            let response = match outcome {
-                ExchangeOutcome::Success(response) => response,
-                ExchangeOutcome::Rejected(rejection) => Err(api_error(rejection))?,
-            };
+            let mut sse = sse_exchange(
+                &exchange,
+                endpoint,
+                headers,
+                &body,
+                sse_decoder(limits.event),
+                limits.wire,
+                SSE_SPEC,
+            )
+            .await
+            .map_err(|error| error.into_provider_error(api_error))?;
 
-            if !crate::http::is_event_stream_headers(response.headers()) {
-                Err(ProviderError::Protocol(
-                    "Anthropic-compatible provider returned a non-SSE response".to_owned(),
-                ))?;
-            }
-
-            let redactions = Arc::<[String]>::from(response.redactions());
-            let mut chunks = response.into_body();
-            let mut decoder = sse_decoder(limits.event);
+            let redactions = Arc::clone(sse.redactions());
             let mut output_bytes = ByteCounter::new(
                 limits.output,
                 "Anthropic-compatible output size overflowed",
                 "Anthropic-compatible output exceeded the configured size limit",
             );
-            let mut usage = None;
+            let mut usage = UsageOnce::new(
+                "Anthropic-compatible stream reported starting usage more than once",
+            );
             // Maps streamed content-block indexes to tool-call ids so argument
             // deltas and block stops can be attributed after the start event.
-            let mut tool_calls: HashMap<u64, String> = HashMap::new();
+            let mut tool_calls = ToolCallLedger::new(
+                "Anthropic-compatible stream reused a tool content-block index",
+                "Anthropic-compatible stream sent arguments for an unknown tool call",
+            );
             let mut reasoning_blocks = std::collections::HashSet::new();
 
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk?;
-
-                for event in decoder.push(&chunk)? {
-                    match decode_event(event, redactions.as_ref())? {
-                        DecodedEvent::OutputText(text) => {
-                            if text.is_empty() {
-                                continue;
-                            }
+            while let Some(event) = sse.next_event().await? {
+                match decode_event(event, redactions.as_ref())? {
+                    DecodedEvent::OutputText(text) => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        output_bytes.add(text.len())?;
+                        yield ProviderEvent::OutputTextDelta { text };
+                    }
+                    DecodedEvent::MessageStart(start) => {
+                        if let Some(start) = start {
+                            usage.set(start)?;
+                        }
+                    }
+                    DecodedEvent::MessageDelta { refusal, output_tokens } => {
+                        if let Some(text) = refusal {
                             output_bytes.add(text.len())?;
-                            yield ProviderEvent::OutputTextDelta { text };
+                            yield ProviderEvent::RefusalDelta { text };
                         }
-                        DecodedEvent::MessageStart(start) => {
-                            if let Some(start) = start
-                                && usage.replace(start).is_some()
-                            {
+                        if let Some(output_tokens) = output_tokens {
+                            let current = usage.stored_mut().ok_or_else(|| {
+                                ProviderError::Protocol(
+                                    "Anthropic-compatible stream reported output usage before starting usage".to_owned(),
+                                )
+                            })?;
+                            if output_tokens < current.output_tokens {
                                 Err(ProviderError::Protocol(
-                                    "Anthropic-compatible stream reported starting usage more than once".to_owned(),
+                                    "Anthropic-compatible cumulative output usage decreased".to_owned(),
                                 ))?;
                             }
+                            current.output_tokens = output_tokens;
                         }
-                        DecodedEvent::MessageDelta { refusal, output_tokens } => {
-                            if let Some(text) = refusal {
-                                output_bytes.add(text.len())?;
-                                yield ProviderEvent::RefusalDelta { text };
-                            }
-                            if let Some(output_tokens) = output_tokens {
-                                let current = usage.as_mut().ok_or_else(|| {
-                                    ProviderError::Protocol(
-                                        "Anthropic-compatible stream reported output usage before starting usage".to_owned(),
-                                    )
-                                })?;
-                                if output_tokens < current.output_tokens {
-                                    Err(ProviderError::Protocol(
-                                        "Anthropic-compatible cumulative output usage decreased".to_owned(),
-                                    ))?;
-                                }
-                                current.output_tokens = output_tokens;
-                            }
+                    }
+                    DecodedEvent::ToolCallStarted { index, id, name } => {
+                        tool_calls.insert(index, id.clone())?;
+                        yield ProviderEvent::ToolCallStarted { id, name };
+                    }
+                    DecodedEvent::ToolCallArguments { index, json } => {
+                        let id = tool_calls.get(&index)?.to_owned();
+                        output_bytes.add(json.len())?;
+                        yield ProviderEvent::ToolCallArgumentsDelta { id, json };
+                    }
+                    DecodedEvent::ThinkingStarted { index } => {
+                        if !reasoning_blocks.insert(index) {
+                            Err(ProviderError::Protocol(
+                                "Anthropic-compatible stream reused a thinking content-block index"
+                                    .to_owned(),
+                            ))?;
                         }
-                        DecodedEvent::ToolCallStarted { index, id, name } => {
-                            if tool_calls.insert(index, id.clone()).is_some() {
-                                Err(ProviderError::Protocol(
-                                    "Anthropic-compatible stream reused a tool content-block index"
-                                        .to_owned(),
-                                ))?;
-                            }
-                            yield ProviderEvent::ToolCallStarted { id, name };
+                        yield ProviderEvent::ReasoningStarted {
+                            kind: crate::ReasoningKind::ExposedThinking,
+                        };
+                    }
+                    DecodedEvent::ThinkingDelta { index, text } => {
+                        if !reasoning_blocks.contains(&index) {
+                            Err(ProviderError::Protocol(
+                                "Anthropic-compatible stream sent thinking for an unknown block"
+                                    .to_owned(),
+                            ))?;
                         }
-                        DecodedEvent::ToolCallArguments { index, json } => {
-                            match tool_calls.get(&index) {
-                                Some(id) => {
-                                    output_bytes.add(json.len())?;
-                                    yield ProviderEvent::ToolCallArgumentsDelta {
-                                        id: id.clone(),
-                                        json,
-                                    };
-                                }
-                                None => {
-                                    Err(ProviderError::Protocol(
-                                        "Anthropic-compatible stream sent arguments for an unknown tool call"
-                                            .to_owned(),
-                                    ))?;
-                                }
-                            }
-                        }
-                        DecodedEvent::ThinkingStarted { index } => {
-                            if !reasoning_blocks.insert(index) {
-                                Err(ProviderError::Protocol(
-                                    "Anthropic-compatible stream reused a thinking content-block index"
-                                        .to_owned(),
-                                ))?;
-                            }
-                            yield ProviderEvent::ReasoningStarted {
+                        if !text.is_empty() {
+                            output_bytes.add(text.len())?;
+                            yield ProviderEvent::ReasoningDelta {
                                 kind: crate::ReasoningKind::ExposedThinking,
+                                text,
                             };
                         }
-                        DecodedEvent::ThinkingDelta { index, text } => {
-                            if !reasoning_blocks.contains(&index) {
-                                Err(ProviderError::Protocol(
-                                    "Anthropic-compatible stream sent thinking for an unknown block"
-                                        .to_owned(),
-                                ))?;
-                            }
-                            if !text.is_empty() {
-                                output_bytes.add(text.len())?;
-                                yield ProviderEvent::ReasoningDelta {
-                                    kind: crate::ReasoningKind::ExposedThinking,
-                                    text,
-                                };
-                            }
-                        }
-                        DecodedEvent::BlockStopped { index } => {
-                            if reasoning_blocks.remove(&index) {
-                                yield ProviderEvent::ReasoningCompleted {
-                                    kind: crate::ReasoningKind::ExposedThinking,
-                                };
-                            } else if let Some(id) = tool_calls.remove(&index) {
-                                yield ProviderEvent::ToolCallCompleted { id };
-                            }
-                        }
-                        DecodedEvent::Completed => {
-                            yield ProviderEvent::Completed { usage };
-                            return;
-                        }
-                        DecodedEvent::Ignored => {}
                     }
+                    DecodedEvent::BlockStopped { index } => {
+                        if reasoning_blocks.remove(&index) {
+                            yield ProviderEvent::ReasoningCompleted {
+                                kind: crate::ReasoningKind::ExposedThinking,
+                            };
+                        } else if let Some(id) = tool_calls.remove(&index) {
+                            yield ProviderEvent::ToolCallCompleted { id };
+                        }
+                    }
+                    DecodedEvent::Completed => {
+                        yield ProviderEvent::Completed { usage: usage.finish() };
+                        return;
+                    }
+                    DecodedEvent::Ignored => {}
                 }
             }
 
@@ -801,20 +768,11 @@ fn wire_error_kind(error: &WireApiError) -> ProviderErrorKind {
     ProviderErrorKind::Response
 }
 
-fn value_as_status(value: &Value) -> Option<u16> {
-    value
-        .as_u64()
-        .and_then(|status| u16::try_from(status).ok())
-        .or_else(|| value.as_str()?.parse().ok())
-}
-
 fn status_error_kind(status: u16) -> ProviderErrorKind {
+    // Anthropic additionally classifies 413 (request too large) as invalid.
     match status {
-        400 | 404 | 409 | 413 | 422 => ProviderErrorKind::InvalidRequest,
-        401 | 403 => ProviderErrorKind::Authentication,
-        429 => ProviderErrorKind::RateLimited,
-        500..=599 => ProviderErrorKind::Unavailable,
-        _ => ProviderErrorKind::Response,
+        413 => ProviderErrorKind::InvalidRequest,
+        status => support::status_error_kind(status),
     }
 }
 
@@ -837,28 +795,16 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
 }
 
 fn api_error(rejection: HttpRejection) -> ProviderError {
-    let status = rejection.status();
-    let fallback = status
-        .canonical_reason()
-        .unwrap_or("Anthropic-compatible request failed")
-        .to_owned();
-    let body_text = String::from_utf8_lossy(rejection.body());
-    let message = serde_json::from_slice::<ApiErrorEnvelope>(rejection.body())
-        .ok()
-        .and_then(|envelope| envelope.error.message)
-        .or_else(|| (!body_text.trim().is_empty()).then(|| body_text.into_owned()))
-        .map_or(fallback, |message| {
-            sanitize_message(&message, rejection.redactions())
-        });
-
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
-    }
+    support::api_error(
+        rejection,
+        "Anthropic-compatible request failed",
+        |envelope: ApiErrorEnvelope| envelope.error.message,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
     use serde_json::json;
 
     use crate::test_support::LoopbackServer;

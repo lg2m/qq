@@ -14,6 +14,9 @@ use crate::{
     request_auth::RequestAuthorizer,
 };
 
+pub(crate) const GOOGLE_MANTLE_UNSUPPORTED_MESSAGE: &str =
+    "Google GenerateContent is not supported by Amazon Bedrock Mantle";
+
 /// Whether a resolved URL represents a protocol-independent base or an exact
 /// request endpoint.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,7 +232,7 @@ fn google_auth(auth: HttpConstructionAuth) -> Result<GoogleAuth, ProviderError> 
             ))
         }
         HttpConstructionAuth::MantleSigV4(_) => Err(ProviderError::Configuration(
-            "Google GenerateContent is not supported by Amazon Bedrock Mantle".to_owned(),
+            GOOGLE_MANTLE_UNSUPPORTED_MESSAGE.to_owned(),
         )),
     }
 }

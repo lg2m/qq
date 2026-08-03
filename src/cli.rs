@@ -1,8 +1,8 @@
 //! Command-line parsing and dispatch.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "qq", version, about = "Build and run AI agents")]
@@ -37,6 +37,14 @@ pub enum Command {
         prompt: String,
     },
 
+    /// Run one autonomous agent task to completion without a UI.
+    ///
+    /// The task runs through the same durable session runtime as the TUI and
+    /// server. Exit status: 0 success, 1 task or model failure, 2 invalid
+    /// configuration, 3 timeout or budget exhaustion, 4 harness or
+    /// persistence failure, 130 interrupted by Ctrl-C.
+    Run(RunArgs),
+
     /// Run the user-scoped QQ server in the foreground.
     Serve {
         /// Loopback address to bind. Port 0 selects an available port.
@@ -64,6 +72,65 @@ pub enum Command {
 
     /// Trust the sensitive operations in current project configuration.
     Trust,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Task prompt for the agent.
+    pub prompt: String,
+
+    /// Workspace directory. Defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    pub workspace: Option<PathBuf>,
+
+    /// Unattended approval policy. Interactive `ask` approval is not
+    /// available in headless mode.
+    #[arg(long, value_enum, default_value_t = RunApproval::ReadOnly)]
+    pub approval: RunApproval,
+
+    /// Cancel the run after N seconds and exit with the timeout status.
+    #[arg(long, value_name = "N")]
+    pub timeout_seconds: Option<u64>,
+
+    /// Cancel the run as soon as a model turn beyond N starts.
+    #[arg(long, value_name = "N")]
+    pub max_turns: Option<u16>,
+
+    /// Cancel the run when its estimated cost exceeds VALUE US dollars,
+    /// checked at durable accounting boundaries (committed model turns and
+    /// finished sub-agent runs). Rejected before the prompt is submitted
+    /// when the selected model has no pricing, so the limit is never
+    /// silently unenforced.
+    #[arg(long, value_name = "VALUE")]
+    pub max_cost_usd: Option<f64>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = RunFormat::Text)]
+    pub format: RunFormat,
+
+    /// Also write the JSONL trial records to this file.
+    #[arg(long, value_name = "PATH")]
+    pub trace: Option<PathBuf>,
+}
+
+/// Headless approval policies. Deliberately excludes interactive `ask`:
+/// a headless run must never wait for a human approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RunApproval {
+    /// Deny every mutating, shell, and MCP tool call without prompting.
+    ReadOnly,
+    /// Approve tool calls unattended. An explicit grant of autonomous
+    /// authority: suitable only for a disposable or otherwise trusted
+    /// workspace.
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RunFormat {
+    /// Stream readable progress to stderr and the final answer to stdout.
+    Text,
+    /// Emit ordered protocol events plus trial metadata as JSON lines.
+    Jsonl,
 }
 
 #[derive(Debug, Subcommand)]
@@ -149,6 +216,8 @@ pub struct SetCredentialArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -170,6 +239,69 @@ mod tests {
             cli.command,
             Some(Command::Ask { prompt }) if prompt == "hello"
         ));
+    }
+
+    #[test]
+    fn parses_run_command_with_every_option() {
+        let cli = Cli::try_parse_from([
+            "qq",
+            "run",
+            "fix the failing test",
+            "--workspace",
+            "/tmp/task",
+            "--approval",
+            "auto",
+            "--timeout-seconds",
+            "900",
+            "--max-turns",
+            "40",
+            "--max-cost-usd",
+            "2.5",
+            "--format",
+            "jsonl",
+            "--trace",
+            "/tmp/trace.jsonl",
+            "--model",
+            "openai/gpt-test",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.model.as_deref(), Some("openai/gpt-test"));
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected a run command");
+        };
+        assert_eq!(args.prompt, "fix the failing test");
+        assert_eq!(args.workspace.as_deref(), Some(Path::new("/tmp/task")));
+        assert_eq!(args.approval, RunApproval::Auto);
+        assert_eq!(args.timeout_seconds, Some(900));
+        assert_eq!(args.max_turns, Some(40));
+        assert_eq!(args.max_cost_usd, Some(2.5));
+        assert_eq!(args.format, RunFormat::Jsonl);
+        assert_eq!(args.trace.as_deref(), Some(Path::new("/tmp/trace.jsonl")));
+    }
+
+    #[test]
+    fn run_defaults_to_read_only_text_in_the_current_workspace() {
+        let cli = Cli::try_parse_from(["qq", "run", "summarize this repository"]).unwrap();
+
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected a run command");
+        };
+        assert_eq!(args.workspace, None);
+        assert_eq!(args.approval, RunApproval::ReadOnly);
+        assert_eq!(args.timeout_seconds, None);
+        assert_eq!(args.max_turns, None);
+        assert_eq!(args.max_cost_usd, None);
+        assert_eq!(args.format, RunFormat::Text);
+        assert_eq!(args.trace, None);
+    }
+
+    #[test]
+    fn run_rejects_interactive_ask_approval() {
+        // Headless mode must never select interactive approval; `ask` is not
+        // a value of the headless approval enum, so it fails at parse time —
+        // before any prompt could be submitted.
+        assert!(Cli::try_parse_from(["qq", "run", "task", "--approval", "ask"]).is_err());
     }
 
     #[test]

@@ -10,9 +10,9 @@ snapshots and durable events derive checked direct and immediate-child
 inclusive usage/cost from persisted runs, and the TUI consumes that projection
 without client-side aggregation. Dedicated headless/ATIF export remains part
 of the future benchmark/export work; those interfaces do not yet exist.
-Phase C is pending: spawn-time validation that a child's resolved route is
-authenticated and present in the served model list before any durable state
-is created.
+Phase C is implemented: every spawn resolution source passes one spawn-time
+choke point that rejects routes not authenticated and present in the served
+model list before any durable child state is created.
 
 Main-session context is premium real estate: every byte of gathered
 evidence is re-sent on every later turn, crowds out reasoning, and ages
@@ -291,6 +291,25 @@ must consume this projection rather than redefine completion.
 
 ### Phase C — Spawn-Time Authenticated-Model Validation
 
+Status: implemented. `RuntimeLoader` gained a `validate_spawn_model` seam,
+and `spawn_child_run` passes every resolved selection — explicit argument,
+configured worker, and parent fallback alike — through it after resolution
+and before the child-runtime load and `CreateSession`, so a rejection is
+only ever a bounded tool error naming the failed check and leaves no
+session, prompt, run, or event behind. The application-side implementation
+loads the route through the ordinary configuration path (route syntax,
+provider existence, and policy fail there), then requires
+`provider_authenticated` — which resolves request-time Codex and xAI
+credentials at spawn time — and membership in the provider's served list:
+the builtin-catalog/configured ids union the cached discovery list, with no
+network round trip while the cache is warm and no default-API fallback for
+unknown ids on this path. Unknown ids surface as the new
+`UnknownModel { provider, model }` error, listing the provider's routes
+when the list is small. The tool-schema enum of configured routes remains
+as model-facing guidance, but the runtime no longer rejects on it — a
+discovered model absent from the schema list still spawns, and enforcement
+lives solely at the choke point.
+
 #### Contract
 
 Invariant: `spawn_agent` must never create a child on a model that is not,
@@ -299,10 +318,10 @@ list `POST /v1/models` serves and the pickers display. A spawn that would
 fail later because its provider is unauthenticated or its model id is
 unknown must fail at the tool call instead, with no durable state created.
 
-Today the guarantee is partial. Config finalize validates the `worker_model`
-route syntax and provider existence, and runtime loading rejects unknown
-providers and missing static API keys before child creation. Two gaps
-remain:
+Before this phase the guarantee was partial. Config finalize validated the
+`worker_model` route syntax and provider existence, and runtime loading
+rejected unknown providers and missing static API keys before child
+creation. Two gaps remained:
 
 1. An unknown **model id** on a known provider is not rejected anywhere.
    `prepare_provider` falls back to the provider's default API and sends the
@@ -312,8 +331,8 @@ remain:
    when the first request is sent, so a child can be created on a provider
    that is not authenticated right now and fail mid-run.
 
-Close both with one validation choke point that every resolution source
-passes through — the explicit `model` argument, the configured
+Both are closed with one validation choke point that every resolution
+source passes through — the explicit `model` argument, the configured
 `worker_model`, and the parent-selection fallback alike (parent
 authentication can lapse between the parent's load and the spawn):
 
@@ -373,8 +392,8 @@ rejection is observable only as a tool error in the parent transcript.
    integration. Future headless/ATIF exporters must consume this projection.
 4. **Complete:** agent-instruction guidance (the delegation formula) in the
    versioned base prompt.
-5. **Next:** Phase C spawn-time authenticated-model validation — one choke
-   point for every resolution source, the `UnknownModel` error variant, and
-   no durable state on rejection.
+5. **Complete:** Phase C spawn-time authenticated-model validation — one
+   choke point for every resolution source, the `UnknownModel` error
+   variant, and no durable state on rejection.
 6. **Later:** mutating children with explicit approval semantics; parallel
    fan-out helpers.
