@@ -5,3 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[dependencies]
+clap.workspace = true
+futures-util.workspace = true
+qq-auth.workspace = true
+qq-provider.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

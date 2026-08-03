@@ -1,3 +1,10 @@
 #![forbid(unsafe_code)]
 
-fn main() {}
+use std::process::ExitCode;
+
+mod providers;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    providers::run().await
+}
