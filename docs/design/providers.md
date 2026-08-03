@@ -72,7 +72,7 @@ sequence. `limits.rs` owns stream budgets and checked byte counters.
 - bounded rejection-envelope interpretation and shared status classification;
 - `ToolCallLedger` attribution and reuse/unknown-call errors;
 - `UsageOnce` and checked cached-input subtraction;
-- retry-mode application and test-only exact-endpoint client selection.
+- test-only exact-endpoint client selection.
 
 Each adapter still owns its wire request/response schemas, protocol headers,
 error names, content-type exception, and streaming state machine. This is
@@ -217,9 +217,13 @@ runner constructs recipes directly rather than loading project configuration.
 
 API-key rows read only their documented provider environment variables. xAI
 and OpenAI Codex use `CredentialStore` request-time providers so OAuth refresh
-and `qq-auth` remain inside the tested path. AWS rows use the default chain;
-`QQ_CANARY_AWS_REGION` supplies an explicit region when desired. Each checked-in
-model has a `QQ_CANARY_*_MODEL` override for controlled model migrations.
+and `qq-auth` remain inside the tested path. The executable AWS rows cover the
+default chain, a named profile from `QQ_CANARY_AWS_PROFILE`, a Bedrock key from
+`QQ_CANARY_BEDROCK_API_KEY`, and Mantle keys from
+`QQ_CANARY_MANTLE_API_KEY`; `QQ_CANARY_AWS_REGION` supplies an explicit region
+when desired. Each checked-in model has a `QQ_CANARY_*_MODEL` override for
+controlled model migrations. LiteLLM/custom remains deployment-owned because
+QQ has no nonsecret endpoint or model it can probe centrally.
 
 Each live case must:
 
@@ -234,10 +238,10 @@ Each live case must:
    45-second total runner deadline, in addition to event and output limits.
 8. Emit only redacted metadata.
 
-The runner currently validates one checked-in model per matrix row. Comparing a
-pinned connectivity model with QQ's changing product default remains useful,
-but belongs in the future model-registry integration rather than being inferred
-inside this command.
+The runner validates one pinned model per executable matrix row. QQ currently
+has no global product-default model: configuration requires an explicit model
+route. If a future model registry introduces a product default, add it as a
+second canary whenever it differs from the pinned connectivity model.
 
 ### 5. Differential Diagnosis
 
@@ -260,7 +264,8 @@ still needs an update.
 
 - Live tests require the exact explicit opt-in `QQ_LIVE_PROVIDER_TESTS=1`.
 - A selected row with no credential emits a redacted `skip` record and makes the
-  command exit nonzero; unavailable credentials never become a silent pass.
+  command exit nonzero; this includes typed AWS default-chain load failures, so
+  unavailable credentials never become a silent pass.
 - Use dedicated low-quota test projects and accounts, never personal production
   credentials.
 - CI should use workload identity or OIDC and short-lived credentials where the
@@ -352,14 +357,15 @@ Current strengths:
 - Stream bounds, malformed input, terminal behavior, and secret redaction have
   focused coverage.
 - `cargo xtask providers check offline|live` provides an executable matrix and
-  bounded redacted live probes, including both xAI protocols through `qq-auth`.
+  bounded redacted live probes, including both xAI protocols through `qq-auth`
+  and every centrally managed Bedrock authentication path.
 
 Current gaps:
 
 - There is no CI workflow or scheduled live canary.
 - Live results and last-green binaries are not retained for comparison.
-- The live runner does not yet compare a pinned connectivity model with the
-  current product default.
+- QQ has no product-default model to compare against the pinned connectivity
+  model; a future registry/default must add that second canary explicitly.
 - Connection timing and sanitized provider request IDs are not exposed by the
   neutral provider interface, so result records begin at first token.
 - Bedrock SDK request/replay coverage is less complete than the HTTP codecs.

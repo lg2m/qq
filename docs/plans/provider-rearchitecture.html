@@ -118,7 +118,7 @@
 <header class="doc">
   <p class="kicker">QQ / docs / plans</p>
   <h1>qq-provider rearchitecture</h1>
-  <p class="subtitle">Completed execution record for the provider crate deepening. Ongoing architecture and validation policy now live in the design docs; only credentialed live evidence remains an external gate.</p>
+  <p class="subtitle">Completed execution record for the provider crate deepening. Ongoing architecture and validation policy now live in the design docs; within this refactor, only credentialed live evidence remains an external gate.</p>
   <div class="meta">Created 2026-07-31 &nbsp;·&nbsp; re-baselined and implemented 2026-08-02 &nbsp;·&nbsp; status is evidence-based</div>
   <nav class="toc">
     <a href="#state">Current state</a>
@@ -181,7 +181,7 @@
     <tr>
       <td>Phase 6 — verification and docs</td>
       <td><span class="badge amber">Implemented · credentialed run pending</span></td>
-      <td><code>a42a34d</code> adds the bounded executable matrix; <code>07aaf79</code> preserves the measured compiler hot path. Offline gates are automated; live rows still require explicit credentials and opt-in.</td>
+      <td><code>a42a34d</code> adds the bounded executable matrix; <code>07aaf79</code> preserves the measured compiler hot path; <code>84d4adb</code> closes the independent-review findings. Offline gates are automated; live rows still require explicit credentials and opt-in.</td>
     </tr>
   </table>
   </div>
@@ -483,7 +483,7 @@ pub(crate) fn sse_exchange(
       <span class="badge green">Done</span>
       <span class="badge gray"><code>ba1fe71..76b7504</code></span>
     </div>
-    <p><strong>Delivered:</strong> <code>compile_for_canary</code> landed before the visibility cut; adapter types and constructors became crate-private; seven files moved in a 100% rename-only commit; <code>BedrockAuth</code> moved to the root API; and the neutral model left a 68-line <code>lib.rs</code>.</p>
+    <p><strong>Delivered:</strong> <code>compile_for_canary</code> landed before the visibility cut; adapter types and constructors became crate-private; the concrete adapter retry toggles were removed; seven files moved in a 100% rename-only commit; <code>BedrockAuth</code> moved to the root API; and the neutral model left a 68-line <code>lib.rs</code>.</p>
     <h3>Steps</h3>
     <ul>
       <li><strong>Preserve the operational-validation contract first:</strong> add one compiler/facade entry point for compiling a canary provider with adapter retries disabled. It must cover every HTTP protocol through <code>ProviderCompiler</code>; live canaries must not import a concrete adapter merely to call <code>without_retries()</code>. Remove the concrete methods only after this interface test exists.</li>
@@ -496,7 +496,7 @@ pub(crate) fn sse_exchange(
     <ul class="checklist done">
       <li><code>cargo build --workspace</code> green with the two known <code>BedrockAuth</code> import edits.</li>
       <li><code>lib.rs</code> ≤ ~80 lines of declarations/re-exports/trait; no adapter type reachable outside the crate except <code>BedrockAuth</code>.</li>
-      <li>An interface test compiles every HTTP protocol with retries disabled through the public compiler/facade; no canary requires a concrete adapter type.</li>
+      <li>An interface test compiles every HTTP protocol with retries disabled through the public compiler/facade; no canary requires a concrete adapter type, and the concrete adapter retry methods are removed.</li>
       <li><code>git log --follow</code> preserved by doing moves in rename-only commits (no content edits mixed in).</li>
     </ul>
   </div>
@@ -515,11 +515,13 @@ pub(crate) fn sse_exchange(
     <ul>
       <li><strong>Done:</strong> Phase&nbsp;1 test-surface and Phase&nbsp;2 adapter-kit contracts are in <code>docs/design/providers.md</code>.</li>
       <li><strong>Done:</strong> offline validation is executable and returns failures directly; live validation is explicit, bounded, redacted, and nonzero on fail/skip.</li>
-      <li><strong>Done:</strong> a 5,000,000-iteration comparison kept recipe compilation at parity with <code>main</code> (OpenAI 536 vs 535 ns, Google 431 vs 420 ns, Mantle 281 vs 281 ns, warm dispatch 93 vs 89 ns). The canary's second call site initially exposed an optimizer regression; <code>07aaf79</code> removed it while preserving the shared construction seam.</li>
-      <li><strong>Done:</strong> the grep-backed deletion audit found one Base/Exact enum, one compatibility-message table, no public adapter exports, one loopback harness, shared error/accounting/retry implementations, and a 68-line facade.</li>
+      <li><strong>Done:</strong> three paired 5,000,000-iteration samples kept every median within the explicit 5% microbenchmark tolerance versus <code>main</code> (OpenAI 529 vs 545 ns, Google 433 vs 420 ns, Mantle 293 vs 286 ns, warm dispatch 91 vs 91 ns). The canary's second call site initially exposed an optimizer regression; <code>07aaf79</code> removed it while preserving the shared construction seam.</li>
+      <li><strong>Done:</strong> the grep-backed deletion audit found one Base/Exact enum, one compatibility-message table, no public adapter exports or concrete retry toggles, one loopback harness, shared error/accounting/retry implementations, and a 68-line facade.</li>
       <li><strong>Done:</strong> <code>cargo fmt --all -- --check</code>, strict all-target/all-feature Clippy, <code>cargo test --workspace</code>, and <code>cargo build --workspace</code> all pass.</li>
       <li><strong>Done:</strong> <code>architecture.md</code> and <code>providers.md</code> own the new layout and the Template-Method/super-trait rejection.</li>
       <li><strong>Done:</strong> xAI has Responses and Chat Completions matrix rows using request-time bearer through <code>qq-auth</code>.</li>
+      <li><strong>Done:</strong> every centrally managed Bedrock authentication path has an executable row; missing default-chain credentials are a typed redacted skip, not an ambiguous provider failure.</li>
+      <li><strong>Tracked beyond this refactor:</strong> connection timing, sanitized provider request IDs, scheduled CI, and last-green differential execution need deeper runtime/transport ownership and remain explicit gaps in <code>providers.md</code>.</li>
       <li><strong>Done:</strong> this page is now the execution record; design docs are ongoing architecture truth.</li>
       <li><strong>External gate:</strong> run affected live rows with <code>QQ_LIVE_PROVIDER_TESTS=1</code> and dedicated credentials before upstream integration or release.</li>
     </ul>
