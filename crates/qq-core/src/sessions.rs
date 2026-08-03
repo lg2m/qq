@@ -389,8 +389,8 @@ impl SessionRuntime {
         if let Some(run_id) = signal_run {
             self.inner.cancel(run_id);
         }
-        if let Some(run_id) = applied.cascade_cancel {
-            self.inner.cancel(run_id);
+        for run_id in &applied.cascade_cancels {
+            self.inner.cancel(*run_id);
         }
         if let Some(tool_call_id) = signal_approval {
             self.inner.resolve_approval(tool_call_id);
@@ -536,8 +536,8 @@ impl SessionRuntime {
                 .await?;
             self.inner.notify(applied.receipt.committed_through);
             self.inner.cancel(run_id);
-            if let Some(cascade) = applied.cascade_cancel {
-                self.inner.cancel(cascade);
+            for cascade in &applied.cascade_cancels {
+                self.inner.cancel(*cascade);
             }
         }
 
@@ -756,9 +756,8 @@ impl ToolGate for CompactionRunGate {
 }
 
 /// Executes `spawn_agent` calls for one parent run: creates a read-only child
-/// session, submits the task as its prompt through the ordinary command
-/// machinery (so every session event flows to clients and the child renders
-/// like any session), and resolves with the child run's final assistant text.
+/// session and queued task atomically (while preserving the ordinary durable
+/// event stream), then resolves with the child run's final assistant text.
 struct SessionSubagentSpawner {
     inner: Arc<SessionRuntimeInner>,
     parent: ClaimedRun,
@@ -862,80 +861,35 @@ async fn spawn_child_run(
         return spawn_error("the sub-agent scheduler is unavailable");
     };
     // Shutdown owns the write side of this gate. Hold the read side across
-    // both durable child commands so shutdown observes either no child run or
-    // the fully queued run it must settle; child admission can never cross
+    // the durable child transaction so shutdown observes either no child run
+    // or the fully queued run it must settle; child admission can never cross
     // the shutdown scan.
     let lifecycle = inner.lifecycle.read().await;
     if *inner.shutdown.borrow() || *inner.failed.borrow() {
         return spawn_error("the session runtime is shutting down");
     }
-    let Ok(command_id) = CommandId::generate() else {
-        return spawn_error("the sub-agent session could not be created");
-    };
-    // Children run read-only, so workspace config grants (which only widen
-    // mutating/shell/MCP approval) could never apply; none are seeded.
-    let created = match inner
-        .store
-        .command_with_seed(
-            command_id,
-            SessionCommand::CreateSession {
-                workspace_id: parent.workspace_id,
-                parent_id: Some(parent.session_id),
-                model: selection,
-                approval_mode: ApprovalMode::ReadOnly,
-            },
-            WorkspaceGrantSeed::default(),
-        )
-        .await
-    {
-        Ok(applied) => applied,
+    let created = match inner.store.create_child_run(&parent, selection, task).await {
+        Ok(created) => created,
         Err(error) => {
             return spawn_error(format!(
-                "the sub-agent session could not be created: {error}"
+                "the sub-agent session and task could not be created: {error}"
             ));
         }
     };
-    inner.notify(created.receipt.committed_through);
-    let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
-        return spawn_error("the sub-agent session could not be created");
-    };
-    // Subscribe to the workspace's event wakeups before queueing the prompt
-    // so the child's completion can never slip past the wait below.
-    let Ok(mut wakeup) = inner.subscribe(
-        parent.workspace_id,
-        created.receipt.committed_through.sequence,
-    ) else {
-        return spawn_error("the sub-agent could not be awaited");
-    };
-    let Ok(command_id) = CommandId::generate() else {
-        return spawn_error("the sub-agent task could not be submitted");
-    };
-    let queued = match inner
-        .store
-        .command_with_seed(
-            command_id,
-            SessionCommand::SubmitPrompt {
-                session_id,
-                prompt: task,
-            },
-            WorkspaceGrantSeed::default(),
-        )
-        .await
-    {
-        Ok(applied) => applied,
-        Err(error) => {
-            return spawn_error(format!(
-                "the sub-agent task could not be submitted: {error}"
-            ));
-        }
-    };
-    inner.notify(queued.receipt.committed_through);
-    let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
-        return spawn_error("the sub-agent task could not be submitted");
-    };
+    let CreatedChildRun {
+        session_id: _session_id,
+        run_id,
+        committed_through,
+    } = created;
     let mut guard = CancelChildOnDrop {
         inner: Arc::clone(&inner),
         run_id: Some(run_id),
+    };
+    inner.notify(committed_through);
+    // The run cannot start until scheduling below, so subscribing after the
+    // atomic commit and before that signal cannot miss its completion.
+    let Ok(mut wakeup) = inner.subscribe(parent.workspace_id, committed_through.sequence) else {
+        return spawn_error("the sub-agent could not be awaited");
     };
     drop(lifecycle);
     let _ = inner.schedule.try_send(());
@@ -2312,6 +2266,30 @@ impl Store {
         .await
     }
 
+    async fn create_child_run(
+        &self,
+        parent: &ClaimedRun,
+        model: ModelSelection,
+        task: String,
+    ) -> Result<CreatedChildRun, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let workspace_id = parent.workspace_id;
+        let parent_session_id = parent.session_id;
+        let parent_run_id = parent.run_id;
+        self.call(Priority::Control, move |connection| {
+            create_child_run(
+                connection,
+                store_id,
+                workspace_id,
+                parent_session_id,
+                parent_run_id,
+                model,
+                task,
+            )
+        })
+        .await
+    }
+
     async fn workspace_path(
         &self,
         workspace_id: WorkspaceId,
@@ -2669,37 +2647,56 @@ impl Store {
         .await
     }
 
-    /// The assistant text one run produced: its completed assistant messages
-    /// in order, output and refusal channels concatenated. This is what a
-    /// `spawn_agent` call returns to the parent.
+    /// The final committed model turn's text/refusal. Earlier assistant turns
+    /// remain in the child transcript but never enter the parent's tool
+    /// result.
     async fn run_final_text(&self, run_id: RunId) -> Result<String, SessionRuntimeError> {
         self.call(Priority::Control, move |connection| {
-            let mut statement = connection
-                .prepare(
-                    "SELECT output, refusal FROM messages
-                     WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
-                     ORDER BY ordinal",
+            let final_turn = connection
+                .query_row(
+                    "SELECT m.output, m.refusal
+                     FROM model_turns t
+                     LEFT JOIN messages m
+                       ON m.run_id = t.run_id
+                      AND m.turn_ordinal = t.turn_ordinal
+                      AND m.role = 'assistant'
+                      AND m.state = 'complete'
+                     WHERE t.run_id = ?1
+                     ORDER BY t.turn_ordinal DESC, m.ordinal DESC
+                     LIMIT 1",
+                    [run_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
                 )
+                .optional()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
-            let rows = statement
-                .query_map([run_id.to_string()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            let mut text = String::new();
-            for row in rows {
-                let (output, refusal) = row.map_err(|_| SessionRuntimeError::Persistence)?;
-                for part in [output, refusal] {
-                    if part.is_empty() {
-                        continue;
-                    }
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&part);
+            let (output, refusal) = match final_turn {
+                Some((output, refusal)) => {
+                    (output.unwrap_or_default(), refusal.unwrap_or_default())
                 }
+                None => connection
+                    .query_row(
+                        "SELECT output, refusal FROM messages
+                         WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
+                         ORDER BY turn_ordinal DESC, ordinal DESC LIMIT 1",
+                        [run_id.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|_| SessionRuntimeError::Persistence)?
+                    .unwrap_or_default(),
+            };
+            if output.is_empty() {
+                return Ok(refusal);
             }
-            Ok(text)
+            if refusal.is_empty() {
+                return Ok(output);
+            }
+            Ok(format!("{output}\n{refusal}"))
         })
         .await
     }
@@ -2773,6 +2770,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                  id TEXT PRIMARY KEY,
                  workspace_id TEXT NOT NULL REFERENCES workspaces(id),
                  parent_id TEXT REFERENCES sessions(id),
+                 owner_run_id TEXT,
                  title TEXT NOT NULL,
                  status TEXT NOT NULL,
                  active_run_id TEXT,
@@ -3078,10 +3076,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11") => {}
+        Some("10" | "11" | "12") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
-    if schema_version.as_deref() != Some("11") {
+    if !matches!(schema_version.as_deref(), Some("11" | "12")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3089,6 +3087,21 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
         transaction
             .execute(
                 "UPDATE metadata SET value = '11' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if schema_version.as_deref() != Some("12") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_sessions_owner_run_id_column(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '12' WHERE key = 'schema_version'",
                 [],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3271,6 +3284,17 @@ fn add_sessions_context_tokens_column(connection: &Connection) -> Result<(), Ses
     Ok(())
 }
 
+/// Records the parent run that owns a spawned child. Publicly created child
+/// sessions and historical rows remain unowned (NULL).
+fn add_sessions_owner_run_id_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "sessions", "owner_run_id")? {
+        connection
+            .execute("ALTER TABLE sessions ADD COLUMN owner_run_id TEXT", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
 /// Adds `runs.auto_compaction` for stores created before threshold-triggered
 /// compaction. 1 marks a compaction run the runtime claimed automatically at
 /// a context threshold; 0 (every existing row) is a user-requested run.
@@ -3345,14 +3369,20 @@ struct ClaimedRun {
 struct AppliedCommand {
     receipt: CommandReceipt,
     schedule: bool,
-    /// A second run whose in-memory cancellation should be signalled along
-    /// with the command's own: cancelling the last queued prompt cascades to
-    /// the auto-compaction that was running on its behalf.
-    cascade_cancel: Option<RunId>,
+    /// Other runs whose in-memory cancellation must be signalled with this
+    /// command: an auto-compaction made unnecessary by its queued prompt, or
+    /// running child work durably owned by a cancelled parent.
+    cascade_cancels: Vec<RunId>,
     /// Set when a first-applied approve-for-workspace decision needs its
     /// grant promoted into workspace configuration. Idempotent replays never
     /// set it: retried commands must not re-run the config write.
     promotion: Option<PendingGrantPromotion>,
+}
+
+struct CreatedChildRun {
+    session_id: SessionId,
+    run_id: RunId,
+    committed_through: EventCursor,
 }
 
 /// One approve-for-workspace promotion carried out of the command
@@ -3365,6 +3395,159 @@ struct PendingGrantPromotion {
     run_id: RunId,
     command_id: CommandId,
     grant: ApprovalGrant,
+}
+
+fn create_child_run(
+    connection: &mut Connection,
+    store_id: StoreId,
+    workspace_id: WorkspaceId,
+    parent_session_id: SessionId,
+    parent_run_id: RunId,
+    model: ModelSelection,
+    task: String,
+) -> Result<CreatedChildRun, SessionRuntimeError> {
+    validate_model_selection(&model)?;
+    let task = task.trim().to_owned();
+    if task.is_empty() {
+        return Err(SessionRuntimeError::EmptyPrompt);
+    }
+    if task.len() > MAX_PROMPT_BYTES {
+        return Err(SessionRuntimeError::PromptTooLarge);
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    ensure_workspace(&transaction, workspace_id)?;
+    let parent_workspace = transaction
+        .query_row(
+            "SELECT s.workspace_id
+             FROM sessions s JOIN runs r ON r.session_id = s.id
+             WHERE s.id = ?1 AND r.id = ?2 AND r.status = 'running'
+               AND r.cancel_requested = 0",
+            params![parent_session_id.to_string(), parent_run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::RunNotFound)?;
+    if parse_id::<WorkspaceId>(&parent_workspace)? != workspace_id {
+        return Err(SessionRuntimeError::ParentWorkspaceMismatch);
+    }
+    let session_count: u32 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1",
+            [workspace_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if session_count >= MAX_SESSIONS_PER_WORKSPACE {
+        return Err(SessionRuntimeError::SessionLimitReached);
+    }
+
+    let session_id = SessionId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    // This is one internal operation rather than a replayable client command;
+    // a generated id satisfies the run's uniqueness contract and links both
+    // child events to the same atomic cause.
+    let command_id = CommandId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let user_message_id = MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let assistant_message_id =
+        MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let now = now_ms();
+    transaction
+        .execute(
+            "INSERT INTO sessions(
+                id, workspace_id, parent_id, owner_run_id, title, status, queued_prompts,
+                model, max_output_tokens, organization, approval_mode,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 1, ?6, ?7, ?8, 'read_only', ?9, ?9)",
+            params![
+                session_id.to_string(),
+                workspace_id.to_string(),
+                parent_session_id.to_string(),
+                parent_run_id.to_string(),
+                prompt_title(&task),
+                model.model,
+                model.max_output_tokens,
+                model.organization,
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    transaction
+        .execute(
+            "INSERT INTO runs(
+                id, session_id, command_id, user_message_id, assistant_message_id,
+                status, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+            params![
+                run_id.to_string(),
+                session_id.to_string(),
+                command_id.to_string(),
+                user_message_id.to_string(),
+                assistant_message_id.to_string(),
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    transaction
+        .execute(
+            "INSERT INTO messages(
+                id, session_id, run_id, ordinal, role, state, output, created_at_ms
+             ) VALUES (?1, ?2, ?3, 1, 'user', 'queued', ?4, ?5)",
+            params![
+                user_message_id.to_string(),
+                session_id.to_string(),
+                run_id.to_string(),
+                task,
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+
+    let session = load_session_summary(&transaction, session_id)?;
+    let created = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id,
+            session_id,
+            run_id: Some(run_id),
+            caused_by: Some(command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::SessionCreated {
+            session: session.clone(),
+        },
+    )?;
+    let message = load_message(&transaction, user_message_id)?;
+    let run = load_run(&transaction, run_id)?;
+    let queued = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id,
+            session_id,
+            run_id: Some(run_id),
+            caused_by: Some(command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::PromptQueued {
+            session,
+            message,
+            run,
+            queue_position: 1,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    debug_assert_eq!(created.cursor.sequence + 1, queued.cursor.sequence);
+    Ok(CreatedChildRun {
+        session_id,
+        run_id,
+        committed_through: queued.cursor,
+    })
 }
 
 fn execute_command(
@@ -3393,7 +3576,10 @@ fn execute_command(
         return Ok(AppliedCommand {
             receipt,
             schedule: false,
-            cascade_cancel: None,
+            cascade_cancels: match &command {
+                SessionCommand::CancelRun { run_id } => owned_running_run_ids(connection, *run_id)?,
+                _ => Vec::new(),
+            },
             promotion: None,
         });
     }
@@ -3409,7 +3595,7 @@ fn execute_command(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let now = now_ms();
     let mut promotion = None;
-    let mut cascade_cancel = None;
+    let mut cascade_cancels = Vec::new();
     let (receipt, schedule) = match command {
         SessionCommand::ResolveWorkspace { path } => {
             let path = path.trim();
@@ -3723,7 +3909,7 @@ fn execute_command(
                         run_id,
                     },
                 )?;
-                let cursor = if status == "queued" {
+                let mut cursor = if status == "queued" {
                     let finished = finish_queued_run(
                         &transaction,
                         store_id,
@@ -3746,7 +3932,7 @@ fn execute_command(
                         now,
                     )? {
                         Some((compaction_run, event)) => {
-                            cascade_cancel = Some(compaction_run);
+                            cascade_cancels.push(compaction_run);
                             event.cursor
                         }
                         None => finished.cursor,
@@ -3754,13 +3940,19 @@ fn execute_command(
                 } else {
                     requested.cursor
                 };
+                let owned =
+                    cancel_owned_child_runs(&transaction, store_id, run_id, command_id, now)?;
+                if let Some(child_cursor) = owned.committed_through {
+                    cursor = child_cursor;
+                }
+                cascade_cancels.extend(owned.running);
                 (
                     CommandReceipt {
                         command_id,
                         committed_through: cursor,
                         outcome: CommandOutcome::CancellationRequested { run_id },
                     },
-                    status == "queued",
+                    status == "queued" || owned.settled_queued,
                 )
             }
         }
@@ -4176,7 +4368,7 @@ fn execute_command(
     Ok(AppliedCommand {
         receipt,
         schedule,
-        cascade_cancel,
+        cascade_cancels,
         promotion,
     })
 }
@@ -5784,6 +5976,118 @@ fn finish_queued_run(
     )
 }
 
+struct OwnedChildCancellations {
+    committed_through: Option<EventCursor>,
+    running: Vec<RunId>,
+    settled_queued: bool,
+}
+
+/// Returns running child work whose durable cancellation still needs its
+/// in-memory signal. This is also used when an idempotent parent cancellation
+/// is replayed after its first caller disappeared before signalling children.
+fn owned_running_run_ids(
+    connection: &Connection,
+    owner_run_id: RunId,
+) -> Result<Vec<RunId>, SessionRuntimeError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT r.id
+             FROM sessions child JOIN runs r ON r.session_id = child.id
+             WHERE child.owner_run_id = ?1
+               AND r.status = 'running' AND r.cancel_requested = 1
+             ORDER BY r.created_at_ms, r.rowid",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    statement
+        .query_map([owner_run_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .map(|row| {
+            let run = row.map_err(|_| SessionRuntimeError::Persistence)?;
+            parse_id(&run)
+        })
+        .collect()
+}
+
+/// Cancels every unfinished run in a session spawned by `owner_run_id`.
+/// Running children are returned for their in-memory signal; queued children
+/// are settled in this transaction, so either ordering between parent
+/// cancellation and atomic child creation has a durable outcome.
+fn cancel_owned_child_runs(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    owner_run_id: RunId,
+    command_id: CommandId,
+    now: u64,
+) -> Result<OwnedChildCancellations, SessionRuntimeError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT r.id, child.id, child.workspace_id, r.status
+             FROM sessions child JOIN runs r ON r.session_id = child.id
+             WHERE child.owner_run_id = ?1 AND r.status IN ('queued', 'running')
+             ORDER BY r.created_at_ms, r.rowid",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let owned = statement
+        .query_map([owner_run_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+
+    let mut committed_through = None;
+    let mut running = Vec::new();
+    let mut settled_queued = false;
+    for (run, session, workspace, status) in owned {
+        let run_id: RunId = parse_id(&run)?;
+        let session_id: SessionId = parse_id(&session)?;
+        let workspace_id: WorkspaceId = parse_id(&workspace)?;
+        transaction
+            .execute(
+                "UPDATE runs SET cancel_requested = 1 WHERE id = ?1",
+                [run_id.to_string()],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let summary = load_session_summary(transaction, session_id)?;
+        let requested = append_event(
+            transaction,
+            EventContext {
+                store_id,
+                workspace_id,
+                session_id,
+                run_id: Some(run_id),
+                caused_by: Some(command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::CancellationRequested {
+                session: summary,
+                run_id,
+            },
+        )?;
+        if status == "queued" {
+            committed_through = Some(
+                finish_queued_run(transaction, store_id, workspace_id, session_id, run_id, now)?
+                    .cursor,
+            );
+            settled_queued = true;
+        } else {
+            committed_through = Some(requested.cursor);
+            running.push(run_id);
+        }
+    }
+    Ok(OwnedChildCancellations {
+        committed_through,
+        running,
+        settled_queued,
+    })
+}
+
 /// Requests cancellation of the session's active auto-compaction when no
 /// queued prompt remains to run after it. Returns the compaction's run id
 /// (for the in-memory cancellation signal) and the appended
@@ -5845,6 +6149,46 @@ fn recover_interrupted_runs(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    // A spawned child can be durably queued while its owner was running when
+    // the process stopped. Settle it before recovering running rows: once the
+    // owner is marked interrupted its session no longer advertises an active
+    // run, but the explicit owner id still proves this child has no waiter.
+    let mut statement = transaction
+        .prepare(
+            "SELECT child_run.id, child.id, child.workspace_id
+             FROM runs child_run
+             JOIN sessions child ON child.id = child_run.session_id
+             JOIN runs owner ON owner.id = child.owner_run_id
+             WHERE child_run.status = 'queued'
+               AND owner.status IN ('running', 'completed', 'cancelled', 'failed', 'interrupted')
+             ORDER BY child_run.created_at_ms, child_run.rowid",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let abandoned_children = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+    let mut cursors = Vec::with_capacity(abandoned_children.len());
+    let recovery_started_at = now_ms();
+    for (run, session, workspace) in abandoned_children {
+        let event = finish_queued_run(
+            &transaction,
+            store_id,
+            parse_id(&workspace)?,
+            parse_id(&session)?,
+            parse_id(&run)?,
+            recovery_started_at,
+        )?;
+        cursors.push(event.cursor);
+    }
     let mut statement = transaction
         .prepare(
             "SELECT r.id, r.session_id, s.workspace_id
@@ -5864,7 +6208,7 @@ fn recover_interrupted_runs(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     drop(statement);
-    let mut cursors = Vec::with_capacity(rows.len());
+    cursors.reserve(rows.len());
     for (run, session, workspace) in rows {
         let run_id = parse_id(&run)?;
         let session_id = parse_id(&session)?;
@@ -7208,9 +7552,10 @@ fn delete_idle_session(
     }
     let parent_id = session_parent(transaction, session_id)?;
     let session = session_id.to_string();
-    // Children survive their parent as root sessions.
+    // Children survive their parent as root sessions; their spawn ownership
+    // ends with that parent because its run rows are deleted below.
     for statement in [
-        "UPDATE sessions SET parent_id = NULL WHERE parent_id = ?1",
+        "UPDATE sessions SET parent_id = NULL, owner_run_id = NULL WHERE parent_id = ?1",
         "DELETE FROM tool_calls WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?1)",
         "DELETE FROM model_turns WHERE run_id IN (SELECT id FROM runs WHERE session_id = ?1)",
         "DELETE FROM messages WHERE session_id = ?1",
@@ -8343,6 +8688,19 @@ mod tests {
         }
     }
 
+    struct RefusalProvider;
+
+    impl Provider for RefusalProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::RefusalDelta {
+                    text: "cannot complete that task".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
     impl Provider for DelayedProvider {
         fn stream(&self, request: ModelRequest) -> ProviderStream {
             self.requests.lock().unwrap().push(request);
@@ -9271,7 +9629,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "11"
+            "12"
         );
         assert!(
             !connection
@@ -9394,7 +9752,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "11"
+            "12"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -9462,7 +9820,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "11"
+            "12"
         );
         let (display_json, result) = connection
             .query_row(
@@ -9521,7 +9879,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "11"
+            "12"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -9543,7 +9901,7 @@ mod tests {
     }
 
     #[test]
-    fn version_ten_migration_adds_unknown_session_context_without_guessing() {
+    fn version_ten_migration_adds_context_and_child_ownership_without_guessing() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sessions.sqlite3");
         {
@@ -9586,15 +9944,26 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "11"
+            "12"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
+        assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
             connection
                 .query_row(
                     "SELECT context_tokens FROM sessions WHERE id = 'session'",
                     [],
                     |row| row.get::<_, Option<u64>>(0),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT owner_run_id FROM sessions WHERE id = 'session'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
                 )
                 .unwrap(),
             None
@@ -9617,6 +9986,64 @@ mod tests {
                 )
                 .unwrap(),
             Some(12_500)
+        );
+    }
+
+    #[test]
+    fn version_eleven_migration_adds_child_ownership_and_preserves_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version', '11');
+                     CREATE TABLE workspaces (
+                         id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                         next_sequence INTEGER NOT NULL DEFAULT 0
+                     );
+                     INSERT INTO workspaces VALUES ('workspace', '/workspace', 0);
+                     CREATE TABLE sessions (
+                         id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                         parent_id TEXT REFERENCES sessions(id), title TEXT NOT NULL,
+                         status TEXT NOT NULL, active_run_id TEXT,
+                         queued_prompts INTEGER NOT NULL DEFAULT 0, model TEXT,
+                         max_output_tokens INTEGER, organization TEXT,
+                         approval_mode TEXT NOT NULL DEFAULT 'ask', context_tokens INTEGER,
+                         estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
+                         cost_known INTEGER NOT NULL DEFAULT 1,
+                         created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+                     );
+                     INSERT INTO sessions VALUES (
+                         'session', 'workspace', NULL, 'Existing', 'idle', NULL, 0,
+                         'openai/gpt-test', 100, NULL, 'ask', 777, 0, 1, 1, 1
+                     );",
+                )
+                .unwrap();
+        }
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "12"
+        );
+        assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT context_tokens, owner_run_id FROM sessions WHERE id = 'session'",
+                    [],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap(),
+            (777, None)
         );
     }
 
@@ -15894,6 +16321,35 @@ mod tests {
         }
     }
 
+    struct SpawnThenHangProvider {
+        turn: AtomicUsize,
+        second_turn_started: Arc<tokio::sync::Notify>,
+    }
+
+    impl Provider for SpawnThenHangProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            if self.turn.fetch_add(1, Ordering::AcqRel) == 0 {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: "spawn".to_owned(),
+                        name: "spawn_agent".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: "spawn".to_owned(),
+                        json: r#"{"task":"finish first","model":"test/child"}"#.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: "spawn".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]))
+            } else {
+                self.second_turn_started.notify_one();
+                Box::pin(stream::pending())
+            }
+        }
+    }
+
     /// Tracks how many of its streams are concurrently active before
     /// completing with text, to observe the child concurrency cap.
     struct GaugedTextProvider {
@@ -15959,6 +16415,55 @@ mod tests {
                 ]))
             }
         }
+    }
+
+    async fn create_claimed_parent(
+        store: &Store,
+        workspace_path: &Path,
+    ) -> (WorkspaceId, SessionId, ClaimedRun) {
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: workspace_path.to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let root = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = root.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "delegate work".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        (workspace_id, session_id, claimed)
     }
 
     struct SpawnHarness {
@@ -16108,6 +16613,34 @@ mod tests {
             })
             .expect("the spawn call must create a child session");
         assert_eq!(child_session.model.as_deref(), Some("test/child"));
+        assert_eq!(child_session.status, SessionStatus::Queued);
+        assert_eq!(child_session.queued_prompts, 1);
+        assert_eq!(child_session.title, "Survey the widget inventory");
+        let created_event = observed
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::SessionCreated { session } if session.id == child_session.id
+                )
+            })
+            .unwrap();
+        let queued_event = observed
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::PromptQueued { session, .. } if session.id == child_session.id
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            created_event.cursor.sequence + 1,
+            queued_event.cursor.sequence
+        );
+        assert_eq!(created_event.caused_by, queued_event.caused_by);
+        assert!(created_event.caused_by.is_some());
+        assert_eq!(created_event.run_id, queued_event.run_id);
         // The task's first line names the child at prompt submission.
         assert!(observed.iter().any(|event| matches!(
             &event.event,
@@ -16151,6 +16684,399 @@ mod tests {
             finished_outcome(&observed, run_id),
             Some(RunOutcome::Completed)
         ));
+    }
+
+    #[tokio::test]
+    async fn multi_turn_child_returns_only_its_final_answer() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let child_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"Inspect the note","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let child: Arc<dyn Provider> = Arc::new(TurnTextProvider {
+            requests: Arc::clone(&child_requests),
+        });
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        std::fs::write(harness._directory.path().join("note.txt"), "evidence\n").unwrap();
+        let parent_run = submit_prompt_to(
+            &harness.runtime,
+            harness.session_id,
+            "delegate the inspection",
+        )
+        .await;
+        let observed = collect_until_run_finished(&mut harness.events, parent_run).await;
+
+        let child_session_id = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    Some(session.id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        {
+            let parent_requests = parent_requests.lock().unwrap();
+            assert!(matches!(
+                parent_requests[1].messages()[2].content(),
+                [ContentBlock::ToolResult { content, is_error: false, .. }]
+                    if content == "done"
+            ));
+        }
+
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(child_session_id),
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let assistant = snapshot
+            .focused
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.output)
+            .collect::<Vec<_>>();
+        assert_eq!(assistant, ["Let me look. ", "done"]);
+    }
+
+    #[tokio::test]
+    async fn child_final_refusal_is_returned_to_the_parent() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"Attempt the task","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let child: Arc<dyn Provider> = Arc::new(RefusalProvider);
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        let parent_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate the task").await;
+        collect_until_run_finished(&mut harness.events, parent_run).await;
+
+        let parent_requests = parent_requests.lock().unwrap();
+        assert!(matches!(
+            parent_requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: false, .. }]
+                if content == "cannot complete that task"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_child_run_insert_leaves_no_idle_orphan() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"transactional research","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = spawn_harness(
+            vec![("test/child", Arc::new(StaticTextProvider))],
+            vec![parent],
+            8,
+        )
+        .await;
+        harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, |connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_spawned_child_run BEFORE INSERT ON runs
+                         WHEN EXISTS (
+                             SELECT 1 FROM sessions
+                             WHERE id = NEW.session_id AND parent_id IS NOT NULL
+                         )
+                         BEGIN
+                             SELECT RAISE(ABORT, 'injected child run failure');
+                         END;",
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        let parent_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate atomically").await;
+        let observed = collect_until_run_finished(&mut harness.events, parent_run).await;
+
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCreated { .. })),
+            "a rolled-back spawn must publish no child event"
+        );
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 8,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].id, harness.session_id);
+        let parent_requests = parent_requests.lock().unwrap();
+        assert!(matches!(
+            parent_requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("sub-agent")
+        ));
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_linearizes_with_in_flight_child_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path).await.unwrap();
+        let (_, _, parent) = create_claimed_parent(&store, directory.path()).await;
+
+        // Hold the database operation after Store::call has handed it to the
+        // worker, then drop its awaiting task. The worker must still commit,
+        // reproducing the handoff window where no CancelChildOnDrop guard can
+        // be installed by the cancelled spawn future.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+        let create_store = store.clone();
+        let create_parent = parent.clone();
+        let create_task = tokio::spawn(async move {
+            let store_id = create_store.store_id();
+            create_store
+                .call(Priority::Control, move |connection| {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv()
+                        .map_err(|_| SessionRuntimeError::Unavailable)?;
+                    let result = create_child_run(
+                        connection,
+                        store_id,
+                        create_parent.workspace_id,
+                        create_parent.session_id,
+                        create_parent.run_id,
+                        ModelSelection {
+                            model: Some("test/child".to_owned()),
+                            max_output_tokens: Some(256),
+                            organization: None,
+                        },
+                        "queued child task".to_owned(),
+                    );
+                    let _ = created_tx.send(result.as_ref().ok().map(|created| {
+                        (
+                            created.session_id,
+                            created.run_id,
+                            created.committed_through,
+                        )
+                    }));
+                    result
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        create_task.abort();
+        assert!(matches!(create_task.await, Err(error) if error.is_cancelled()));
+        release_tx.send(()).unwrap();
+        let (_, child_run, _) = created_rx
+            .await
+            .unwrap()
+            .expect("the detached store job should commit the child");
+
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun {
+                    run_id: parent.run_id,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.run_outcome(child_run).await.unwrap(),
+            Some(RunOutcome::Cancelled)
+        );
+        assert!(store.claim_next_run(true).await.unwrap().is_none());
+        store
+            .finish_run(&parent, RunOutcome::Cancelled, None)
+            .await
+            .unwrap();
+        assert!(store.unfinished_run_ids().await.unwrap().is_empty());
+
+        // The reverse database ordering rejects creation once cancellation is
+        // durable, so no child can appear after its parent starts settling.
+        let (_, _, cancelling_parent) = create_claimed_parent(&store, directory.path()).await;
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun {
+                    run_id: cancelling_parent.run_id,
+                },
+            )
+            .await
+            .unwrap();
+        let rejected = store
+            .create_child_run(
+                &cancelling_parent,
+                ModelSelection {
+                    model: Some("test/child".to_owned()),
+                    max_output_tokens: Some(256),
+                    organization: None,
+                },
+                "too late".to_owned(),
+            )
+            .await;
+        assert!(matches!(rejected, Err(SessionRuntimeError::RunNotFound)));
+        store
+            .finish_run(&cancelling_parent, RunOutcome::Cancelled, None)
+            .await
+            .unwrap();
+        assert!(store.unfinished_run_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replayed_parent_cancellation_rediscovers_its_running_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (_, _, parent) = create_claimed_parent(&store, directory.path()).await;
+        let child = store
+            .create_child_run(
+                &parent,
+                ModelSelection {
+                    model: Some("test/child".to_owned()),
+                    max_output_tokens: Some(256),
+                    organization: None,
+                },
+                "running child task".to_owned(),
+            )
+            .await
+            .unwrap();
+        let claimed_child = store.claim_next_run(true).await.unwrap().unwrap();
+        assert_eq!(claimed_child.run_id, child.run_id);
+
+        let command_id = CommandId::generate().unwrap();
+        let command = SessionCommand::CancelRun {
+            run_id: parent.run_id,
+        };
+        let first = store.command(command_id, command.clone()).await.unwrap();
+        let replay = store.command(command_id, command).await.unwrap();
+
+        assert_eq!(replay.receipt, first.receipt);
+        assert_eq!(first.cascade_cancels, [child.run_id]);
+        assert_eq!(replay.cascade_cancels, [child.run_id]);
+        store
+            .finish_run(&claimed_child, RunOutcome::Cancelled, None)
+            .await
+            .unwrap();
+        store
+            .finish_run(&parent, RunOutcome::Cancelled, None)
+            .await
+            .unwrap();
+        assert!(store.unfinished_run_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_a_queued_child_owned_by_an_interrupted_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let (workspace_id, root_session_id, parent) =
+            create_claimed_parent(&store, directory.path()).await;
+        let child = store
+            .create_child_run(
+                &parent,
+                ModelSelection {
+                    model: Some("test/child".to_owned()),
+                    max_output_tokens: Some(256),
+                    organization: None,
+                },
+                "queued child task".to_owned(),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: child.committed_through,
+            })
+            .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut recovered = Vec::new();
+            while recovered
+                .iter()
+                .filter(|event: &&SessionEventEnvelope| {
+                    matches!(event.event, SessionEvent::RunFinished { .. })
+                })
+                .count()
+                < 2
+            {
+                recovered.push(events.next().await.unwrap().unwrap());
+            }
+            recovered
+        })
+        .await
+        .unwrap();
+        assert!(recovered.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Cancelled,
+                ..
+            } if *run_id == child.run_id
+        )));
+        assert!(recovered.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Interrupted,
+                ..
+            } if *run_id == parent.run_id
+        )));
+        assert!(requests.lock().unwrap().is_empty());
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(child.session_id),
+                session_limit: 8,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        let child_snapshot = snapshot.focused.unwrap();
+        assert_eq!(child_snapshot.summary.parent_id, Some(root_session_id));
+        assert_eq!(child_snapshot.summary.status, SessionStatus::Idle);
+        assert_eq!(child_snapshot.runs[0].outcome, Some(RunOutcome::Cancelled));
     }
 
     #[tokio::test]
@@ -16826,6 +17752,162 @@ mod tests {
             finished_outcome(&observed, child_run),
             Some(RunOutcome::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_parent_interrupts_an_in_flight_child_tool() {
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"slow read-only work","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let child: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "__test_delay",
+                r#"{"delay_ms":5000,"result":"too late"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        let parent_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate slow work").await;
+
+        let mut observed = Vec::new();
+        let (child_run, child_call) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = harness.events.next().await.unwrap().unwrap();
+                let started = match &event.event {
+                    SessionEvent::ToolCallStarted { tool_call }
+                        if tool_call.name == "__test_delay" =>
+                    {
+                        Some((tool_call.run_id, tool_call.id))
+                    }
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(started) = started {
+                    break started;
+                }
+            }
+        })
+        .await
+        .expect("the child tool never started");
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: parent_run },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while finished_outcome(&observed, parent_run).is_none()
+                || finished_outcome(&observed, child_run).is_none()
+            {
+                observed.push(harness.events.next().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .expect("parent cancellation did not stop the child tool");
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.id == child_call && tool_call.state == ToolCallState::Interrupted
+        )));
+        assert!(matches!(
+            finished_outcome(&observed, child_run),
+            Some(RunOutcome::Cancelled)
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, parent_run),
+            Some(RunOutcome::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_parent_after_child_completion_preserves_the_child() {
+        let second_turn_started = Arc::new(tokio::sync::Notify::new());
+        let parent: Arc<dyn Provider> = Arc::new(SpawnThenHangProvider {
+            turn: AtomicUsize::new(0),
+            second_turn_started: Arc::clone(&second_turn_started),
+        });
+        let child: Arc<dyn Provider> = Arc::new(StaticTextProvider);
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        let parent_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate then wait").await;
+
+        let mut observed = Vec::new();
+        let (child_session_id, child_run) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = harness.events.next().await.unwrap().unwrap();
+                let completed = match &event.event {
+                    SessionEvent::RunFinished {
+                        session,
+                        run_id,
+                        outcome: RunOutcome::Completed,
+                        ..
+                    } if session.parent_id == Some(harness.session_id) => {
+                        Some((session.id, *run_id))
+                    }
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(completed) = completed {
+                    break completed;
+                }
+            }
+        })
+        .await
+        .expect("the child did not complete");
+        tokio::time::timeout(Duration::from_secs(2), second_turn_started.notified())
+            .await
+            .expect("the parent did not consume the child answer");
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: parent_run },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while finished_outcome(&observed, parent_run).is_none() {
+                observed.push(harness.events.next().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .expect("the parent did not settle");
+
+        assert!(matches!(
+            finished_outcome(&observed, child_run),
+            Some(RunOutcome::Completed)
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, parent_run),
+            Some(RunOutcome::Cancelled)
+        ));
+        assert!(!observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::CancellationRequested { run_id, .. } if *run_id == child_run
+        )));
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(child_session_id),
+                session_limit: 8,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.focused.unwrap().runs[0].outcome,
+            Some(RunOutcome::Completed)
+        );
     }
 
     #[tokio::test]

@@ -12,7 +12,10 @@ without client-side aggregation. Dedicated headless/ATIF export remains part
 of the future benchmark/export work; those interfaces do not yet exist.
 Phase C is implemented: every spawn resolution source passes one spawn-time
 choke point that rejects routes not authenticated and present in the served
-model list before any durable child state is created.
+model list before any durable child state is created. Child creation is also
+crash-safe: one transaction persists the initialized read-only session, queued
+run, prompt, and parent-run ownership, and recovery cancels an unclaimed child
+whose owning parent is interrupted.
 
 Main-session context is premium real estate: every byte of gathered
 evidence is re-sent on every later turn, crowds out reasoning, and ages
@@ -53,11 +56,12 @@ sessions carry per-session models and cost accounting, and tool results
 are size-bounded.
 
 - **`spawn_agent` builtin** — `{ task, model? }`. Creates a child
-  session in the same workspace, submits `task` as its prompt, runs it
-  to completion under the existing loop bounds, and returns the child's
-  final assistant text as the tool result (existing result-size bounds
-  apply). The call is one tool call in the parent: collapsed one-liner,
-  live status, expandable like any other.
+  session and queued `task` run atomically in the same workspace, runs it
+  to completion under the existing loop bounds, and returns only the child's
+  final committed model turn as the tool result (existing result-size bounds
+  apply). Intermediate turns remain in the child transcript. The call is one
+  tool call in the parent: collapsed one-liner, live status, expandable like
+  any other.
 - **Read-only by default.** Children run in `read-only` approval mode:
   research agents never surface approval prompts and carry no delegated
   mutation authority. A mutating child mode is future work and requires
@@ -72,6 +76,8 @@ are size-bounded.
   permit while awaiting children, so a shared pool would deadlock at
   saturation. Global concurrency stays bounded by the two pools
   combined. Child runs are cancelled when the parent run is cancelled.
+  Durable parent-run ownership makes cancellation and restart recovery find a
+  child even before its queued run is claimed.
   Parallel spawn calls in one turn run concurrently like read-only
   tools, and a run may spawn at most 8 children in total.
 - **Cost and visibility.** Child usage and cost roll up into the parent

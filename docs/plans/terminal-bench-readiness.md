@@ -70,7 +70,8 @@ Passing one regression does not imply that its whole phase is complete.
 | Durable headless execution | on `main` | `f7b34a1` adds `qq run` with durable events, cancellation, timeout, turn/cost budgets, JSONL, and exit-status mapping | ATIF conversion, Harbor integration, resolved-model trial identity |
 | Transient provider recovery | on `main` | `55d2aa7` retries a turn only before user-visible output | One combined retry/amplification budget across provider transport and core |
 | Accepted-run supervision | implemented in `DEV-726` | Run-task panics settle as durable failures; headless sink/trace failures and owner aborts retain cancellation ownership; explicit runtime shutdown drains queued and running work; reopen interrupts abandoned running work without replaying tools | Process loss intentionally interrupts the in-flight provider request rather than attempting unsafe continuation |
-| Authoritative context projection | implemented in `DEV-727` | Completed, failed, cancelled, interrupted, and recovered runs share one projection; runtime notices and exact persisted/interrupted/not-executed tool results reach follow-up, capacity, and compaction requests without altering the transcript | Merge the reviewed slice; child creation remains `DEV-728` |
+| Authoritative context projection | implemented in `DEV-727` | Completed, failed, cancelled, interrupted, and recovered runs share one projection; runtime notices and exact persisted/interrupted/not-executed tool results reach follow-up, capacity, and compaction requests without altering the transcript | Merge the reviewed slice |
+| Atomic child-run lifecycle | implemented in `DEV-728` | One transaction persists the initialized read-only child, queued prompt run, and parent-run ownership before publishing consecutive events; recovery cancels unclaimed children of interrupted parents; the parent receives only the final model turn | Merge with its `DEV-727` prerequisite |
 | Tool/turn budget behavior | renewable slices and live cost visibility implemented in `DEV-725`; explicit headless turn/timeout gate on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before a silent over-budget turn; `DEV-725` turns the internal 256-call ceiling into a persisted checkpoint, restores tools inside the same durable run, and commits active-run cost so `--max-cost-usd` can cancel truthfully | Core-owned configurable token/dollar/turn outcomes across every front end |
 
 The remaining P0 longevity contract is explicit: every accepted run must reach
@@ -91,7 +92,6 @@ The remaining gaps are material:
 | Completion behavior | Internal tool slices checkpoint and continue without a terminal event, but caller-requested turn/time/cost budgets still settle through the headless adapter rather than one core-owned outcome | TUI, server, and future clients cannot yet impose and observe the same explicit overall budget contract |
 | Terminal control | `shell` is one-shot with null stdin and no persistent process or PTY handle | Interactive programs and background services are awkward or impossible |
 | Search and editing | Built-in search is bounded literal scanning; edits require exact replacement | Discovery or mutation can consume unnecessary model turns on large repositories |
-| Sub-agent lifecycle | Child creation and prompt submission are separate commands; the parent concatenates every completed child assistant message | A crash window can orphan child work and the result is not a true final-answer contract |
 | Cost control | Headless time, turn, and cost limits exist, but core has no unified token/dollar/turn outcome and provider/core retries can multiply attempts | Other front ends lack the same guarantees, and one logical turn can exceed the intended request budget |
 | Evaluation | Existing benchmarks cover provider construction, a synthetic read-tool loop, and manual rendering cases | There is no end-to-end evidence for useful-result latency, reliability, or cost |
 
@@ -401,11 +401,11 @@ It must never print credentials.
 Priority: P0. Complete before judging compaction quality or sub-agent
 economics.
 
-Status: in progress. `DEV-727` implements the authoritative context projection,
-including terminal runtime notices, exact tool-result pairing, restart
-equivalence, and shared follow-up/capacity/compaction input. `DEV-728` still
-needs to close the child-creation transaction gap and enforce final-only child
-answers.
+Status: implemented by `DEV-727` and `DEV-728`. Terminal runtime notices, exact
+tool-result pairing, restart equivalence, and shared
+follow-up/capacity/compaction input now use one authoritative projection. Child
+session creation, queued prompt creation, and parent-run ownership now commit
+atomically, and a parent receives only the child's final model turn.
 
 ### Context Projection Contract
 
@@ -438,8 +438,8 @@ remains unchanged and authoritative.
 
 ### Child Ownership Contract
 
-Replace the separate child-session creation and prompt-submission store
-commands used by `spawn_agent` with one internal transaction that:
+`spawn_agent` uses one internal transaction instead of separate child-session
+creation and prompt-submission commands. The transaction:
 
 - Creates the child with its parent, workspace, model, read-only policy, and
   title.
@@ -447,13 +447,14 @@ commands used by `spawn_agent` with one internal transaction that:
 - Installs parent ownership before the child becomes claimable.
 - Returns child session and run identifiers together.
 
-Parent cancellation must find every owned child even after restart. A child
-that cannot be submitted must not remain as an idle orphan.
+Parent cancellation finds every owned child through the persisted owner-run
+link. On restart, recovery cancels a queued, unclaimed child when its owning
+parent is interrupted. A child that cannot be submitted leaves no idle orphan.
 
-The parent tool result must contain only the final completed model turn's
-answer or an explicit child failure. Intermediate assistant messages remain in
-the child transcript and ATIF trajectory but are not concatenated into the
-parent context.
+The parent tool result contains only the final completed model turn's answer or
+an explicit child failure. Intermediate assistant messages remain in the child
+transcript and future ATIF trajectory but are not concatenated into the parent
+context.
 
 ### Tests
 

@@ -302,6 +302,17 @@ in-flight tool calls interrupted before scheduling resumes. Committed turns
 remain authoritative, interrupted side effects are never re-executed, and
 queued work that never started may still be claimed normally.
 
+`spawn_agent` creates a read-only child session, its queued prompt run, and the
+parent-run ownership link in one store transaction. The ordered
+`SessionCreated` and `PromptQueued` events are published only after that fully
+initialized state commits. The child is therefore either absent or durably
+owned and claimable; it cannot survive a failed submission as an idle orphan.
+If the process stops before a queued child is claimed, recovery cancels that
+child when it interrupts the owning parent. Parent cancellation uses the same
+durable ownership link for in-process children. Once a child completes, only
+its final committed model turn's text or refusal is returned to the parent;
+earlier turns remain visible in the child's authoritative transcript.
+
 Future model requests, capacity accounting, and compaction all consume the same
 provider-neutral projection of that durable state. The projection retains
 committed prompts and model turns, pairs every replayed tool call with exactly
