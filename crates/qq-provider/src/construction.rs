@@ -6,11 +6,13 @@
 
 use crate::{
     Provider, ProviderError, ProviderStream,
-    anthropic::{AnthropicAuth, AnthropicMessages},
     compiler::{EndpointKind, HttpAuth, HttpProtocol},
-    google::{GoogleAuth, GoogleGenerateContent},
-    openai::{OpenAi, ResponsesAuth, ResponsesConstructionAuth},
-    openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
+    providers::{
+        anthropic::{AnthropicAuth, AnthropicMessages},
+        google::{GoogleAuth, GoogleGenerateContent},
+        openai::{OpenAi, ResponsesAuth, ResponsesConstructionAuth},
+        openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
+    },
     request_auth::RequestAuthorizer,
 };
 

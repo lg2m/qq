@@ -16,13 +16,13 @@ use crate::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
     },
     limits::{ByteCounter, StreamLimits},
-    request_auth::RequestAuthorizer,
-    sanitize::sanitize_message,
-    sse::{SseDecoder, Utf8ErrorMessage},
-    support::{
+    providers::support::{
         self, ToolCallLedger, UsageOnce, status_error_kind, subtract_cached_input_tokens,
         value_as_status,
     },
+    request_auth::RequestAuthorizer,
+    sanitize::sanitize_message,
+    sse::{SseDecoder, Utf8ErrorMessage},
 };
 
 #[cfg(test)]

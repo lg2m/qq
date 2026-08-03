@@ -7,23 +7,17 @@ use std::{pin::Pin, sync::Arc};
 use futures_core::Stream;
 use thiserror::Error;
 
-pub mod anthropic;
 mod aws;
-pub mod bedrock;
 pub mod compiler;
 mod construction;
 mod credentials;
 mod exchange;
-pub mod google;
 mod http;
 mod limits;
-mod mantle;
-pub mod openai;
-pub mod openai_chat;
+mod providers;
 mod request_auth;
 mod sanitize;
 mod sse;
-mod support;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
