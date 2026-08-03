@@ -30,7 +30,7 @@ use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     GateDecision, Runtime, RuntimeEvent, RuntimeToolCall, SpawnAgentFuture, SpawnAgentOutcome,
@@ -82,6 +82,7 @@ const MAX_GRANT_BYTES: usize = 256;
 const MAX_SESSION_GRANTS: u32 = 256;
 const MAX_SESSION_FILES: u32 = 4_096;
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// Child runs one parent run may hold in flight at once. Spawn calls beyond
 /// this cap queue behind it inside the parent's turn rather than failing.
 const MAX_CONCURRENT_CHILDREN_PER_RUN: usize = 3;
@@ -282,6 +283,10 @@ struct SessionRuntimeInner {
     approval_timeout: Duration,
     wakeups: Mutex<HashMap<WorkspaceId, watch::Sender<u64>>>,
     failed: watch::Sender<bool>,
+    shutdown: watch::Sender<bool>,
+    scheduler_stopped: watch::Sender<bool>,
+    settlements: watch::Sender<u64>,
+    lifecycle: RwLock<()>,
 }
 
 struct PendingApproval {
@@ -301,6 +306,9 @@ impl SessionRuntime {
         let recovered = store.recover_interrupted_runs().await?;
         let (schedule, receiver) = mpsc::channel(1);
         let (failed, _) = watch::channel(false);
+        let (shutdown, shutdown_receiver) = watch::channel(false);
+        let (scheduler_stopped, _) = watch::channel(false);
+        let (settlements, _) = watch::channel(0_u64);
         let inner = Arc::new(SessionRuntimeInner {
             store,
             loader,
@@ -313,11 +321,20 @@ impl SessionRuntime {
             approval_timeout: options.approval_timeout,
             wakeups: Mutex::new(HashMap::new()),
             failed,
+            shutdown,
+            scheduler_stopped,
+            settlements,
+            lifecycle: RwLock::new(()),
         });
         for cursor in recovered {
             inner.notify(cursor);
         }
-        tokio::spawn(schedule_runs(Arc::downgrade(&inner), receiver));
+        tokio::spawn(schedule_runs(
+            Arc::downgrade(&inner),
+            receiver,
+            shutdown_receiver,
+            inner.scheduler_stopped.clone(),
+        ));
         let runtime = Self { inner };
         runtime.request_schedule();
         Ok(runtime)
@@ -328,7 +345,7 @@ impl SessionRuntime {
         command_id: CommandId,
         command: SessionCommand,
     ) -> Result<CommandReceipt, SessionRuntimeError> {
-        if *self.inner.failed.borrow() {
+        if *self.inner.shutdown.borrow() || *self.inner.failed.borrow() {
             return Err(SessionRuntimeError::Unavailable);
         }
         let signal_run = match command {
@@ -354,11 +371,16 @@ impl SessionRuntime {
             }
             _ => WorkspaceGrantSeed::default(),
         };
+        let lifecycle = self.inner.lifecycle.read().await;
+        if *self.inner.shutdown.borrow() || *self.inner.failed.borrow() {
+            return Err(SessionRuntimeError::Unavailable);
+        }
         let applied = self
             .inner
             .store
             .command_with_seed(command_id, command, seed)
             .await?;
+        drop(lifecycle);
         self.inner.notify(applied.receipt.committed_through);
 
         if let Some(run_id) = signal_run {
@@ -479,7 +501,61 @@ impl SessionRuntime {
         }))
     }
 
+    /// Stops accepting commands and new run claims, durably cancels every
+    /// accepted queued or running prompt, and waits until no unfinished run
+    /// remains. Snapshot and subscription reads stay available so callers can
+    /// inspect the settled state after shutdown.
+    pub async fn shutdown(&self) -> Result<(), SessionRuntimeError> {
+        let lifecycle = self.inner.lifecycle.write().await;
+        self.inner.shutdown.send_replace(true);
+        drop(lifecycle);
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+
+        let mut scheduler_stopped = self.inner.scheduler_stopped.subscribe();
+        while !*scheduler_stopped.borrow() {
+            tokio::time::timeout_at(deadline, scheduler_stopped.changed())
+                .await
+                .map_err(|_| SessionRuntimeError::ShutdownTimedOut)?
+                .map_err(|_| SessionRuntimeError::Unavailable)?;
+        }
+
+        let mut settlements = self.inner.settlements.subscribe();
+        for run_id in self.inner.store.unfinished_run_ids().await? {
+            let command_id = CommandId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+            let applied = self
+                .inner
+                .store
+                .command_with_seed(
+                    command_id,
+                    SessionCommand::CancelRun { run_id },
+                    WorkspaceGrantSeed::default(),
+                )
+                .await?;
+            self.inner.notify(applied.receipt.committed_through);
+            self.inner.cancel(run_id);
+            if let Some(cascade) = applied.cascade_cancel {
+                self.inner.cancel(cascade);
+            }
+        }
+
+        loop {
+            if self.inner.store.unfinished_run_ids().await?.is_empty() {
+                return Ok(());
+            }
+            if *self.inner.failed.borrow() {
+                return Err(SessionRuntimeError::Unavailable);
+            }
+            tokio::time::timeout_at(deadline, settlements.changed())
+                .await
+                .map_err(|_| SessionRuntimeError::ShutdownTimedOut)?
+                .map_err(|_| SessionRuntimeError::Unavailable)?;
+        }
+    }
+
     fn request_schedule(&self) {
+        if *self.inner.shutdown.borrow() {
+            return;
+        }
         let _ = self.inner.schedule.try_send(());
     }
 }
@@ -782,6 +858,14 @@ async fn spawn_child_run(
     let Ok(_slot) = Arc::clone(&slots).acquire_owned().await else {
         return spawn_error("the sub-agent scheduler is unavailable");
     };
+    // Shutdown owns the write side of this gate. Hold the read side across
+    // both durable child commands so shutdown observes either no child run or
+    // the fully queued run it must settle; child admission can never cross
+    // the shutdown scan.
+    let lifecycle = inner.lifecycle.read().await;
+    if *inner.shutdown.borrow() || *inner.failed.borrow() {
+        return spawn_error("the session runtime is shutting down");
+    }
     let Ok(command_id) = CommandId::generate() else {
         return spawn_error("the sub-agent session could not be created");
     };
@@ -846,14 +930,15 @@ async fn spawn_child_run(
     let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
         return spawn_error("the sub-agent task could not be submitted");
     };
-    let _ = inner.schedule.try_send(());
-    // Parent cancellation reaches the child by drop: the cancelled parent's
-    // tool loop is dropped wholesale, dropping this future mid-await, and the
-    // guard then cancels the still-running child run.
     let mut guard = CancelChildOnDrop {
         inner: Arc::clone(&inner),
         run_id: Some(run_id),
     };
+    drop(lifecycle);
+    let _ = inner.schedule.try_send(());
+    // Parent cancellation reaches the child by drop: the cancelled parent's
+    // tool loop is dropped wholesale, dropping this future mid-await, and the
+    // guard then cancels the still-running child run.
     let outcome = loop {
         match inner.store.run_outcome(run_id).await {
             Ok(Some(outcome)) => break outcome,
@@ -936,16 +1021,40 @@ impl Drop for CancelChildOnDrop {
     }
 }
 
+struct SchedulerStopGuard(watch::Sender<bool>);
+
+impl Drop for SchedulerStopGuard {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 async fn schedule_runs(
     inner: std::sync::Weak<SessionRuntimeInner>,
     mut receiver: mpsc::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
+    stopped: watch::Sender<bool>,
 ) {
-    while receiver.recv().await.is_some() {
-        let Some(inner) = inner.upgrade() else {
-            return;
+    let _stopped = SchedulerStopGuard(stopped);
+    'scheduler: loop {
+        let scheduled = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break 'scheduler;
+                }
+                continue;
+            }
+            scheduled = receiver.recv() => scheduled,
         };
-        if *inner.failed.borrow() {
-            return;
+        if scheduled.is_none() {
+            break;
+        }
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
+        if *shutdown.borrow() || *inner.failed.borrow() {
+            break;
         }
         // Root runs and child (sub-agent) runs are claimed from separate
         // queues against separate permit pools; see `child_permits` for why
@@ -957,6 +1066,9 @@ async fn schedule_runs(
                 &inner.permits
             };
             loop {
+                if *shutdown.borrow() {
+                    break 'scheduler;
+                }
                 let permit = match Arc::clone(pool).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => break,
@@ -966,7 +1078,7 @@ async fn schedule_runs(
                     Ok(None) => break,
                     Err(_) => {
                         inner.failed.send_replace(true);
-                        return;
+                        break 'scheduler;
                     }
                 };
                 inner.notify(claimed.started.cursor);
@@ -979,7 +1091,7 @@ async fn schedule_runs(
                     Ok(false) => {}
                     Err(_) => {
                         inner.failed.send_replace(true);
-                        return;
+                        break 'scheduler;
                     }
                 }
                 let task_inner = Arc::clone(&inner);
@@ -1003,7 +1115,9 @@ async fn schedule_runs(
                         .await;
                     }
                     drop(permit);
-                    let _ = task_inner.schedule.try_send(());
+                    if !*task_inner.shutdown.borrow() {
+                        let _ = task_inner.schedule.try_send(());
+                    }
                 });
             }
         }
@@ -1825,6 +1939,9 @@ async fn finish_run_accounted(
             for event in events {
                 inner.notify(event.cursor);
             }
+            inner
+                .settlements
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
         Err(_) => {
             inner.failed.send_replace(true);
@@ -2022,6 +2139,8 @@ pub enum SessionRuntimeError {
     AccountingUnavailable,
     #[error("session runtime is overloaded")]
     Overloaded,
+    #[error("session runtime shutdown timed out before every run settled")]
+    ShutdownTimedOut,
     #[error("session runtime is unavailable")]
     Unavailable,
     #[error("session persistence failed")]
@@ -2140,6 +2259,27 @@ impl Store {
         let store_id = self.store_id;
         self.call(Priority::Control, move |connection| {
             recover_interrupted_runs(connection, store_id)
+        })
+        .await
+    }
+
+    async fn unfinished_run_ids(&self) -> Result<Vec<RunId>, SessionRuntimeError> {
+        self.call(Priority::Control, |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id FROM runs
+                     WHERE status IN ('queued', 'running')
+                     ORDER BY created_at_ms, id",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .map(|row| {
+                    let run = row.map_err(|_| SessionRuntimeError::Persistence)?;
+                    parse_id(&run)
+                })
+                .collect()
         })
         .await
     }
@@ -12560,6 +12700,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_running_and_queued_prompts_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 1;
+        let runtime = SessionRuntime::open(options, Arc::new(PricedHangingLoader))
+            .await
+            .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let running = queue_prompt(&runtime, session_id, "run".to_owned()).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.next().await.unwrap().unwrap();
+                if matches!(
+                    event.event,
+                    SessionEvent::RunStarted { run_id, .. } if run_id == running
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the first prompt must start before shutdown");
+        let queued = queue_prompt(&runtime, session_id, "queued".to_owned()).await;
+
+        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+            .await
+            .expect("shutdown must settle bounded provider work")
+            .unwrap();
+
+        let mut finished = HashMap::new();
+        let mut terminal_count = 0;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while finished.len() < 2 {
+                let event = events.next().await.unwrap().unwrap();
+                if let SessionEvent::RunFinished {
+                    run_id, outcome, ..
+                } = event.event
+                {
+                    terminal_count += 1;
+                    finished.insert(run_id, outcome);
+                }
+            }
+        })
+        .await
+        .expect("both accepted prompts must publish terminal events");
+        assert_eq!(terminal_count, 2);
+        assert_eq!(finished.get(&running), Some(&RunOutcome::Cancelled));
+        assert_eq!(finished.get(&queued), Some(&RunOutcome::Cancelled));
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.summary.status, SessionStatus::Idle);
+        assert_eq!(focused.summary.active_run_id, None);
+        assert!(
+            focused
+                .runs
+                .iter()
+                .all(|run| run.status == RunStatus::Cancelled)
+        );
+
+        let error = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "too late".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, SessionRuntimeError::Unavailable);
+    }
+
+    #[tokio::test]
     async fn subscribers_converge_and_replay_from_an_intermediate_cursor() {
         let (directory, runtime) = test_runtime().await;
         let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
@@ -15636,6 +15869,216 @@ mod tests {
             finished_outcome(&observed, child_run),
             Some(RunOutcome::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_settles_a_running_parent_and_its_in_flight_child() {
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![("spawn_agent", r#"{"task":"long research"}"#.to_owned())],
+            turn: StdMutex::new(0),
+        });
+        let hanging: Arc<dyn Provider> = Arc::new(HangingProvider);
+        let mut harness = spawn_harness(Vec::new(), vec![parent, hanging], 8).await;
+        let parent_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate forever").await;
+
+        let mut observed = Vec::new();
+        let (child_session_id, child_run) = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = harness.events.next().await.unwrap().unwrap();
+                let child = match &event.event {
+                    SessionEvent::RunStarted { session, run_id }
+                        if *run_id != parent_run
+                            && session.parent_id == Some(harness.session_id) =>
+                    {
+                        Some((session.id, *run_id))
+                    }
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(child) = child {
+                    break child;
+                }
+            }
+        })
+        .await
+        .expect("the child must start before shutdown");
+
+        tokio::time::timeout(Duration::from_secs(1), harness.runtime.shutdown())
+            .await
+            .expect("shutdown must settle the parent and child")
+            .unwrap();
+
+        let mut terminal_count = 0;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while finished_outcome(&observed, parent_run).is_none()
+                || finished_outcome(&observed, child_run).is_none()
+            {
+                let event = harness.events.next().await.unwrap().unwrap();
+                if matches!(event.event, SessionEvent::RunFinished { .. }) {
+                    terminal_count += 1;
+                }
+                observed.push(event);
+            }
+        })
+        .await
+        .expect("both accepted runs must publish terminal events");
+        assert_eq!(terminal_count, 2);
+        assert!(matches!(
+            finished_outcome(&observed, parent_run),
+            Some(RunOutcome::Cancelled)
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, child_run),
+            Some(RunOutcome::Cancelled)
+        ));
+
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(child_session_id),
+                session_limit: 8,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .all(|session| session.active_run_id.is_none())
+        );
+        assert_eq!(
+            snapshot.focused.unwrap().runs[0].outcome,
+            Some(RunOutcome::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_child_admission_before_scanning_unfinished_runs() {
+        struct PausedChildLoader {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        impl RuntimeLoader for PausedChildLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                self.entered.notify_one();
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    release.notified().await;
+                    Runtime::new(StaticTextProvider, "test-model", 256)
+                        .map(|runtime| LoadedRuntime {
+                            runtime: Arc::new(runtime),
+                            pricing: None,
+                        })
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(PausedChildLoader {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let summary = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 1,
+            })
+            .await
+            .unwrap()
+            .focused
+            .unwrap()
+            .summary;
+        let parent_run = RunId::generate().unwrap();
+        let parent = ClaimedRun {
+            workspace_id,
+            workspace: std::fs::canonicalize(directory.path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            session_id,
+            run_id: parent_run,
+            command_id: CommandId::generate().unwrap(),
+            kind: RunKind::Prompt,
+            child: false,
+            model: ModelSelection {
+                model: Some("test/model".to_owned()),
+                max_output_tokens: Some(256),
+                organization: None,
+            },
+            messages: Vec::new(),
+            over_budget: false,
+            started: SessionEventEnvelope {
+                cursor: created.committed_through,
+                session_id,
+                run_id: Some(parent_run),
+                caused_by: None,
+                occurred_at_ms: 0,
+                event: SessionEvent::RunStarted {
+                    session: summary,
+                    run_id: parent_run,
+                },
+            },
+        };
+        let child = tokio::spawn(spawn_child_run(
+            Arc::clone(&runtime.inner),
+            parent,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(AtomicUsize::new(0)),
+            "research".to_owned(),
+            None,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("child admission must reach its pre-commit load");
+
+        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+            .await
+            .expect("shutdown must complete while pre-commit child work is paused")
+            .unwrap();
+        release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), child)
+            .await
+            .expect("released child admission must observe shutdown")
+            .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("shutting down"));
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 8,
+                message_limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].id, session_id);
+        assert_eq!(snapshot.sessions[0].active_run_id, None);
     }
 
     #[tokio::test]

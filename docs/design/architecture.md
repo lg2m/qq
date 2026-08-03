@@ -49,6 +49,13 @@ while still allowing several TUI or future browser clients to attach to a
 long-running server. Agents and sessions belong to the server, so they may
 continue when a client disconnects.
 
+An embedded or standalone server must reserve the user-scoped instance lock
+before opening `SessionRuntime`. Runtime construction performs crash recovery
+and starts scheduling immediately; constructing it before ownership is known
+would let a losing startup race mutate or claim work from the winning server's
+store. Dropping an unstarted reservation removes its metadata and releases the
+lock.
+
 ## Repository Layout
 
 QQ is a Cargo workspace whose root package builds the `qq` binary. Library
@@ -275,6 +282,25 @@ run with tools restored. Clients observe no terminal run event at the slice
 seam. Genuine completion, explicit caller budgets, cancellation, and failures
 remain the only user-level terminal conditions; provider adapters do not
 participate in slice rollover.
+
+Once prompt submission commits, the runtime owns that accepted run until it
+persists exactly one terminal `RunFinished` event. A run-task panic becomes a
+durable server failure. A headless output or trace failure requests ordinary
+durable cancellation and waits for the matching terminal event; dropping the
+headless owner starts the same bounded cleanup in the background. Explicit
+runtime shutdown first closes command and child-run admission and stops run
+claiming, then cancels every queued or running run and waits for the store to
+report no unfinished work. Snapshots and subscriptions remain readable while
+and after shutdown so callers can observe the settled state. An embedded HTTP
+owner first stops accepting connections, settles the runtime, and only then
+waits for a bounded response drain; a long-lived SSE subscriber cannot prevent
+accepted runs from reaching their durable terminal state.
+
+Process loss is the final backstop rather than a reason to replay uncertain
+work. Opening the store transactionally marks abandoned running runs and their
+in-flight tool calls interrupted before scheduling resumes. Committed turns
+remain authoritative, interrupted side effects are never re-executed, and
+queued work that never started may still be claimed normally.
 
 ## HTTP And SSE Protocol
 

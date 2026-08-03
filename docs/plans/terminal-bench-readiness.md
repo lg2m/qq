@@ -69,7 +69,7 @@ Passing one regression does not imply that its whole phase is complete.
 | --- | --- | --- | --- |
 | Durable headless execution | on `main` | `f7b34a1` adds `qq run` with durable events, cancellation, timeout, turn/cost budgets, JSONL, and exit-status mapping | ATIF conversion, Harbor integration, resolved-model trial identity |
 | Transient provider recovery | on `main` | `55d2aa7` retries a turn only before user-visible output | One combined retry/amplification budget across provider transport and core |
-| Run-task panic supervision | on `main` | `c68b12a` turns an unwind into a durable server failure, releases capacity, and reschedules the session | Shutdown/abort recovery still relies on restart; outer headless I/O failures must cancel accepted runs |
+| Accepted-run supervision | implemented in `DEV-726` | Run-task panics settle as durable failures; headless sink/trace failures and owner aborts retain cancellation ownership; explicit runtime shutdown drains queued and running work; reopen interrupts abandoned running work without replaying tools | Process loss intentionally interrupts the in-flight provider request rather than attempting unsafe continuation |
 | Failed/cancelled context continuity | on `main` | `c68b12a` replays every fully committed model turn and tool result | Runtime notices, never-started call results, and the full Phase 2 projection matrix |
 | Tool/turn budget behavior | renewable slices and live cost visibility implemented in `DEV-725`; explicit headless turn/timeout gate on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before a silent over-budget turn; `DEV-725` turns the internal 256-call ceiling into a persisted checkpoint, restores tools inside the same durable run, and commits active-run cost so `--max-cost-usd` can cancel truthfully | Core-owned configurable token/dollar/turn outcomes across every front end |
 
@@ -84,7 +84,6 @@ The remaining gaps are material:
 | --- | --- | --- |
 | Evaluation export | `qq run` is durable, but ATIF conversion and the Harbor adapter are absent | Trials cannot yet be compared or replayed through the benchmark's standard artifact |
 | Context continuity | Fully committed failed/cancelled turns replay after `c68b12a`, but terminal runtime notices and never-started tool-call results are not projected | Follow-up context preserves progress but does not yet explain every terminal boundary or guarantee a paired result for every call |
-| Run supervision | Run-task panics settle durably after `c68b12a`, while abort/shutdown recovery and post-submit headless output/trace failures still have separate cleanup paths | An accepted run can remain active until restart when its outer owner exits abnormally |
 | Streaming persistence | Each text batch reassembles the full context for capacity checks and grows SQLite strings by concatenation | Long output has structurally superlinear persistence work |
 | Reasoning persistence | Provider reasoning deltas commit independently rather than using text batching | High-effort models can create excessive transactions and queue pressure |
 | Store scheduling | The single worker always prefers control traffic; a full output queue is retried by polling every millisecond | Output can be delayed or starved under control load |
@@ -146,11 +145,15 @@ open
 command
 snapshot
 subscribe
+shutdown
 ```
 
 `qq run`, the TUI, and the server must compose those operations instead of
-calling separate agent implementations. Add protocol commands or event fields
-only for behavior that must be externally visible or durable.
+calling separate agent implementations. `shutdown` closes command and child-run
+admission, stops new claims, durably cancels unfinished work, and waits for
+settlement while snapshot and subscription reads remain available. Add protocol
+commands or event fields only for behavior that must be externally visible or
+durable.
 
 ### Deepen Internal Modules
 
@@ -325,6 +328,8 @@ Names may change during CLI review, but the behavior may not:
   subscribes from the returned cursor.
 - Ctrl-C and the timeout send the ordinary idempotent cancellation command and
   wait for a terminal durable event within a bounded shutdown period.
+- Embedded shutdown stops HTTP admission, settles accepted runs, then bounds
+  HTTP/SSE response draining so a held subscription cannot block teardown.
 - Text format streams user-facing output and concise tool activity to stderr
   while leaving the final answer on stdout.
 - JSONL format emits ordered protocol events plus trial metadata without
@@ -374,6 +379,10 @@ It must never print credentials.
   an auto-approved write and shell call through `SessionRuntime`.
 - Events in JSONL have monotonic cursors and exactly one terminal outcome.
 - Cancellation and timeout leave no active run or child process.
+- Post-submit output and trace failures, owner-task abort, and graceful runtime
+  shutdown each leave no accepted run active and publish one terminal event.
+- Reopening a store interrupts abandoned running messages and tool calls
+  without re-executing their side effects.
 - Restart after a completed run reproduces the same final snapshot.
 - Unknown usage or pricing remains explicitly unknown in the trace.
 - ATIF conversion fixtures cover text-only, tool-loop, failure, cancellation,

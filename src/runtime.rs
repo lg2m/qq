@@ -1097,6 +1097,13 @@ impl RuntimeHandler {
     pub fn sessions(&self) -> &SessionRuntime {
         &self.durable
     }
+
+    /// Gracefully stops the durable runtime after its serving adapter has
+    /// stopped accepting new requests.
+    pub async fn shutdown(&self) -> Result<(), RuntimeHandlerError> {
+        self.durable.shutdown().await?;
+        Ok(())
+    }
 }
 
 impl AskHandler for RuntimeHandler {
@@ -1173,6 +1180,7 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
         SessionRuntimeError::InvalidRunLimit
         | SessionRuntimeError::OutputTooLarge
         | SessionRuntimeError::AccountingUnavailable
+        | SessionRuntimeError::ShutdownTimedOut
         | SessionRuntimeError::Unavailable
         | SessionRuntimeError::Persistence => AskHandlerError::Internal,
     }

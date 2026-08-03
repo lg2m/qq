@@ -112,9 +112,17 @@ async fn headless_run(args: cli::RunArgs, overrides: &CliOverrides) -> ExitCode 
             };
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
-            headless::run(&sessions, options, interrupt, &mut stdout, &mut stderr)
-                .await
-                .exit_code()
+            let status =
+                headless::run(&sessions, options, interrupt, &mut stdout, &mut stderr).await;
+            drop(stdout);
+            drop(stderr);
+            match sessions.shutdown().await {
+                Ok(()) => status.exit_code(),
+                Err(error) => {
+                    eprintln!("error: could not settle the session runtime: {error}");
+                    headless::HeadlessStatus::HarnessFailure.exit_code()
+                }
+            }
         }
         Err((status, message)) => {
             eprintln!("error: {message}");
@@ -220,20 +228,76 @@ async fn prepare_headless(
 }
 
 async fn serve(bind: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {
-    let handler =
-        Arc::new(runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?);
     let options = server::ServerOptions::for_user()?.with_bind_address(bind);
-    match server::start(handler, options).await? {
-        server::StartOutcome::Existing(connection) => {
+    match server::reserve(options).await? {
+        server::ReserveOutcome::Existing(connection) => {
             println!("qq server already running at {}", connection.address());
         }
-        server::StartOutcome::Started(server) => {
-            println!("qq server listening at {}", server.connection().address());
-            tokio::signal::ctrl_c().await?;
-            server.shutdown().await?;
+        server::ReserveOutcome::Reserved(reservation) => {
+            let handler =
+                Arc::new(runtime::RuntimeHandler::open(runtime::RuntimeFactory::system()?).await?);
+            let embedded = EmbeddedRuntime {
+                server: reservation.start(handler.clone()),
+                handler,
+            };
+            println!(
+                "qq server listening at {}",
+                embedded.server.connection().address()
+            );
+            let signal_result = tokio::signal::ctrl_c().await;
+            let shutdown_result = embedded.shutdown().await;
+            signal_result?;
+            shutdown_result?;
         }
     }
     Ok(())
+}
+
+struct EmbeddedRuntime {
+    server: server::ServerHandle,
+    handler: Arc<runtime::RuntimeHandler>,
+}
+
+impl EmbeddedRuntime {
+    async fn shutdown(self) -> Result<(), EmbeddedShutdownError> {
+        let Self {
+            mut server,
+            handler,
+        } = self;
+        server.begin_shutdown();
+        let runtime_result = handler.shutdown().await;
+        let server_result = server.shutdown().await;
+        match (server_result, runtime_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(source), Ok(())) => Err(EmbeddedShutdownError::Server { source }),
+            (Ok(()), Err(source)) => Err(EmbeddedShutdownError::Runtime { source }),
+            (Err(server), Err(runtime)) => {
+                Err(EmbeddedShutdownError::ServerAndRuntime { server, runtime })
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum EmbeddedShutdownError {
+    #[error("could not stop the embedded HTTP server")]
+    Server {
+        #[source]
+        source: server::ServerError,
+    },
+    #[error("could not settle the embedded session runtime")]
+    Runtime {
+        #[source]
+        source: runtime::RuntimeHandlerError,
+    },
+    #[error(
+        "could not stop the embedded HTTP server ({server}); \
+         the session runtime also failed to settle ({runtime})"
+    )]
+    ServerAndRuntime {
+        server: server::ServerError,
+        runtime: runtime::RuntimeHandlerError,
+    },
 }
 
 async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
@@ -254,20 +318,16 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         .into_iter()
         .map(Into::into)
         .collect::<Vec<qq_tui::ModelOption>>();
-    let mut embedded = None;
-    let (connection, create_initial_session) = if let Some(connection) = server::discover().await? {
-        (connection, false)
-    } else {
-        let handler = Arc::new(runtime::RuntimeHandler::open(factory).await?);
-        match server::start(handler, server::ServerOptions::for_user()?).await? {
-            server::StartOutcome::Existing(connection) => (connection, false),
-            server::StartOutcome::Started(server) => {
+    let (connection, embedded, create_initial_session) =
+        match server::reserve(server::ServerOptions::for_user()?).await? {
+            server::ReserveOutcome::Existing(connection) => (connection, None, false),
+            server::ReserveOutcome::Reserved(reservation) => {
+                let handler = Arc::new(runtime::RuntimeHandler::open(factory).await?);
+                let server = reservation.start(handler.clone());
                 let connection = server.connection().clone();
-                embedded = Some(server);
-                (connection, true)
+                (connection, Some(EmbeddedRuntime { server, handler }), true)
             }
-        }
-    };
+        };
 
     let workspace = std::fs::canonicalize(std::env::current_dir()?)?;
     let configured_model = qq_protocol::ModelSelection {
@@ -297,8 +357,8 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     )
     .await;
 
-    if let Some(server) = embedded {
-        server.shutdown().await?;
+    if let Some(embedded) = embedded {
+        embedded.shutdown().await?;
     }
     result.map_err(Into::into)
 }

@@ -227,11 +227,69 @@ enum CancelReason {
     Interrupt,
 }
 
+#[derive(Clone)]
 struct RunHandle {
     workspace_id: WorkspaceId,
     session_id: SessionId,
     run_id: RunId,
     subscribe_after: qq_protocol::EventCursor,
+}
+
+struct AcceptedRunGuard {
+    cleanup: Option<(SessionRuntime, RunHandle)>,
+}
+
+impl AcceptedRunGuard {
+    fn new(sessions: SessionRuntime, handle: RunHandle) -> Self {
+        Self {
+            cleanup: Some((sessions, handle)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+
+    async fn settle(&mut self) -> Result<(), Failure> {
+        let Some((sessions, handle)) = &self.cleanup else {
+            return Ok(());
+        };
+        let result = cancel_and_settle(sessions, handle).await;
+        if result.is_ok() {
+            self.disarm();
+        }
+        result
+    }
+}
+
+impl Drop for AcceptedRunGuard {
+    fn drop(&mut self) {
+        let Some((sessions, handle)) = self.cleanup.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            report_detached_cleanup_failure(
+                "accepted run cleanup could not start outside a Tokio runtime; \
+                 restart recovery must settle it",
+            );
+            return;
+        };
+        drop(runtime.spawn(async move {
+            if let Err(failure) = cancel_and_settle(&sessions, &handle).await {
+                report_detached_cleanup_failure(&format!(
+                    "accepted run cleanup failed: {}",
+                    failure.message
+                ));
+            }
+        }));
+    }
+}
+
+fn report_detached_cleanup_failure(message: &str) {
+    // Drop has neither the invocation's borrowed writer nor a return channel.
+    // Reporting is therefore best-effort; restart recovery remains the
+    // durable backstop if stderr is unavailable too.
+    let _ = writeln!(io::stderr().lock(), "error: {message}");
 }
 
 /// The terminal result of the event-streaming phase.
@@ -282,6 +340,7 @@ pub async fn run(
             return failure.status;
         }
     };
+    let mut accepted = AcceptedRunGuard::new(sessions.clone(), handle.clone());
 
     let workspace_display = options.workspace.display().to_string();
     let trial = TrialRecord::Trial {
@@ -299,6 +358,9 @@ pub async fn run(
     };
     if let Err(error) = sink.record(stdout, &trial) {
         let _ = writeln!(stderr, "error: could not write the trial record: {error}");
+        if let Err(failure) = accepted.settle().await {
+            let _ = writeln!(stderr, "error: {}", failure.message);
+        }
         return HeadlessStatus::HarnessFailure;
     }
 
@@ -307,8 +369,17 @@ pub async fn run(
     )
     .await
     {
-        Ok(end) => end,
-        Err(failure) => RunEnd::failure(failure),
+        Ok(end) => {
+            accepted.disarm();
+            end
+        }
+        Err(mut failure) => {
+            if let Err(cleanup) = accepted.settle().await {
+                failure.message.push_str("; cleanup also failed: ");
+                failure.message.push_str(&cleanup.message);
+            }
+            RunEnd::failure(failure)
+        }
     };
 
     let outcome = TrialRecord::Outcome {
@@ -331,8 +402,13 @@ pub async fn run(
                 if !answer.ends_with('\n') {
                     answer.push('\n');
                 }
-                let _ = stdout.write_all(answer.as_bytes());
-                let _ = stdout.flush();
+                if let Err(error) = stdout
+                    .write_all(answer.as_bytes())
+                    .and_then(|()| stdout.flush())
+                {
+                    let _ = writeln!(stderr, "error: could not write the final answer: {error}");
+                    return HeadlessStatus::HarnessFailure;
+                }
             }
             _ => {
                 if let Some(message) = &end.message {
@@ -753,6 +829,47 @@ async fn request_cancel(sessions: &SessionRuntime, run_id: RunId) -> Result<(), 
     }
 }
 
+/// Retains ownership after a post-submit harness failure: request ordinary
+/// durable cancellation, then wait for the matching terminal event before the
+/// invocation returns. Restart recovery remains the backstop if persistence
+/// itself is unavailable.
+async fn cancel_and_settle(sessions: &SessionRuntime, handle: &RunHandle) -> Result<(), Failure> {
+    request_cancel(sessions, handle.run_id).await?;
+    let mut events = sessions
+        .subscribe(SubscribeRequest {
+            workspace_id: handle.workspace_id,
+            after: handle.subscribe_after,
+        })
+        .map_err(|error| Failure {
+            status: status_for_error(&error),
+            message: format!("could not observe cancellation settlement: {error}"),
+        })?;
+    tokio::time::timeout(SHUTDOWN_GRACE, async {
+        loop {
+            match events.next().await {
+                Some(Ok(SessionEventEnvelope {
+                    event: SessionEvent::RunFinished { run_id, .. },
+                    ..
+                })) if run_id == handle.run_id => return Ok(()),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    return Err(Failure {
+                        status: status_for_error(&error),
+                        message: format!("cancellation settlement stream failed: {error}"),
+                    });
+                }
+                None => {
+                    return Err(Failure::harness(
+                        "cancellation settlement stream ended before the terminal event",
+                    ));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| Failure::harness("accepted run did not settle within the shutdown period"))?
+}
+
 /// Answers one pending tool approval. Failures are reported but never fatal:
 /// an unanswerable approval resolves by the runtime's own deny-by-timeout,
 /// so the run still cannot stall forever.
@@ -945,6 +1062,45 @@ mod tests {
                 }),
                 Ok(ProviderEvent::Completed { usage: None }),
             ]))
+        }
+    }
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected output failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected output failure",
+            ))
+        }
+    }
+
+    struct BreaksAfterFlush {
+        broken: bool,
+    }
+
+    impl Write for BreaksAfterFlush {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.broken {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected event output failure",
+                ));
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.broken = true;
+            Ok(())
         }
     }
 
@@ -1541,6 +1697,157 @@ mod tests {
         assert_eq!(outcome["type"], "outcome");
         assert_eq!(outcome["status"], "timed_out");
         assert_eq!(outcome["exit_code"], 3);
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn output_failure_after_prompt_submission_cancels_and_settles_the_run() {
+        let fixture = fixture(|| HangingProvider).await;
+        let options = options(&fixture.workspace);
+        let mut stdout = BrokenWriter;
+        let mut stderr = Vec::new();
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &fixture.sessions,
+                options,
+                std::future::pending(),
+                &mut stdout,
+                &mut stderr,
+            ),
+        )
+        .await
+        .expect("an output failure must not leave the accepted run detached");
+
+        assert_eq!(status, HeadlessStatus::HarnessFailure);
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn event_output_failure_cancels_and_settles_the_run() {
+        let fixture = fixture(|| HangingProvider).await;
+        let options = options(&fixture.workspace);
+        let mut stdout = BreaksAfterFlush { broken: false };
+        let mut stderr = Vec::new();
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &fixture.sessions,
+                options,
+                std::future::pending(),
+                &mut stdout,
+                &mut stderr,
+            ),
+        )
+        .await
+        .expect("an event-output failure must retain ownership through settlement");
+
+        assert_eq!(status, HeadlessStatus::HarnessFailure);
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn trace_failure_after_prompt_submission_cancels_and_settles_the_run() {
+        let fixture = fixture(|| HangingProvider).await;
+        let mut options = options(&fixture.workspace);
+        options.format = HeadlessFormat::Text;
+        options.prompt = "x".repeat(16 * 1024);
+        options.trace = Some(PathBuf::from("/dev/full"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &fixture.sessions,
+                options,
+                std::future::pending(),
+                &mut stdout,
+                &mut stderr,
+            ),
+        )
+        .await
+        .expect("a trace failure must retain ownership through settlement");
+
+        assert_eq!(status, HeadlessStatus::HarnessFailure);
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn final_text_output_failure_is_a_harness_failure() {
+        let fixture = fixture(|| TextProvider).await;
+        let mut options = options(&fixture.workspace);
+        options.format = HeadlessFormat::Text;
+        let mut stdout = BrokenWriter;
+        let mut stderr = Vec::new();
+
+        let status = run(
+            &fixture.sessions,
+            options,
+            std::future::pending(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await;
+
+        assert_eq!(status, HeadlessStatus::HarnessFailure);
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn aborting_the_headless_owner_still_settles_its_accepted_run() {
+        let fixture = fixture(|| HangingProvider).await;
+        let options = options(&fixture.workspace);
+        let sessions = fixture.sessions.clone();
+        let owner = tokio::spawn(async move {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            run(
+                &sessions,
+                options,
+                std::future::pending(),
+                &mut stdout,
+                &mut stderr,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = workspace_snapshot(&fixture).await;
+                if snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.active_run_id.is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the headless owner must accept a run before it is aborted");
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = workspace_snapshot(&fixture).await;
+                if snapshot
+                    .sessions
+                    .iter()
+                    .all(|session| session.active_run_id.is_none())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached accepted run must settle after owner abort");
         assert_no_active_run(&fixture).await;
     }
 

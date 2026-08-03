@@ -59,6 +59,7 @@ const TOKEN_BYTES: usize = 32;
 const TOKEN_HEX_BYTES: usize = TOKEN_BYTES * 2;
 const MAX_CONCURRENT_SESSION_REQUESTS: usize = 64;
 const MAX_CONCURRENT_SUBSCRIPTIONS: usize = 64;
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// Future returned by [`AskHandler`].
 pub type AskFuture =
@@ -320,6 +321,61 @@ pub enum StartOutcome {
     Existing(ServerConnection),
 }
 
+/// Result of claiming the local-instance lock before constructing the runtime
+/// that will serve it.
+#[derive(Debug)]
+pub enum ReserveOutcome {
+    Reserved(Box<ServerReservation>),
+    Existing(ServerConnection),
+}
+
+/// Exclusive local-server ownership. Keeping reservation separate from
+/// handler construction prevents a losing startup race from opening a second
+/// durable runtime against the same store.
+pub struct ServerReservation {
+    listener: TcpListener,
+    connection: ServerConnection,
+    guard: InstanceGuard,
+}
+
+impl fmt::Debug for ServerReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerReservation")
+            .field("connection", &self.connection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerReservation {
+    /// Starts serving with the handler constructed after ownership was won.
+    #[must_use]
+    pub fn start(self, handler: Arc<dyn AskHandler>) -> ServerHandle {
+        let Self {
+            listener,
+            connection,
+            mut guard,
+        } = self;
+        let app = router(handler, connection.clone());
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let serve_result = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+                .map_err(|source| ServerError::Serve { source });
+            let cleanup_result = guard.cleanup();
+            serve_result.and(cleanup_result)
+        });
+        ServerHandle {
+            connection,
+            shutdown: Some(shutdown_sender),
+            task: Some(task),
+        }
+    }
+}
+
 /// Owns a running server task and its graceful shutdown signal.
 pub struct ServerHandle {
     connection: ServerConnection,
@@ -333,12 +389,32 @@ impl ServerHandle {
         &self.connection
     }
 
-    /// Requests graceful shutdown and waits for metadata and lock cleanup.
-    pub async fn shutdown(mut self) -> Result<(), ServerError> {
+    /// Stops accepting new connections without waiting for active responses.
+    pub fn begin_shutdown(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.join().await
+    }
+
+    /// Requests graceful shutdown and waits for bounded metadata and lock cleanup.
+    pub async fn shutdown(self) -> Result<(), ServerError> {
+        self.shutdown_with_grace(DEFAULT_SHUTDOWN_GRACE).await
+    }
+
+    /// Requests graceful shutdown, aborting active responses after `grace`.
+    pub async fn shutdown_with_grace(mut self, grace: Duration) -> Result<(), ServerError> {
+        self.begin_shutdown();
+        let mut task = self.task.take().ok_or(ServerError::ServerTaskStopped)?;
+        match tokio::time::timeout(grace, &mut task).await {
+            Ok(result) => result.map_err(|_| ServerError::ServerTaskStopped)?,
+            Err(_) => {
+                task.abort();
+                // Await the aborted task so its instance guard is dropped and
+                // releases metadata and the ownership lock before returning.
+                let _ = task.await;
+                Err(ServerError::ShutdownTimedOut)
+            }
+        }
     }
 
     /// Runs in the foreground until the server stops or this future is cancelled.
@@ -379,6 +455,18 @@ pub async fn start(
     handler: Arc<dyn AskHandler>,
     options: ServerOptions,
 ) -> Result<StartOutcome, ServerError> {
+    match reserve(options).await? {
+        ReserveOutcome::Reserved(reservation) => {
+            Ok(StartOutcome::Started(reservation.start(handler)))
+        }
+        ReserveOutcome::Existing(connection) => Ok(StartOutcome::Existing(connection)),
+    }
+}
+
+/// Claims the local-instance lock and listener before a caller constructs its
+/// durable runtime. Dropping a reservation releases the lock and removes its
+/// metadata.
+pub async fn reserve(options: ServerOptions) -> Result<ReserveOutcome, ServerError> {
     if !options.bind_address.ip().is_loopback() {
         return Err(ServerError::NonLoopbackBind(options.bind_address));
     }
@@ -391,7 +479,7 @@ pub async fn start(
             drop(lock);
             return find_existing_server(&options.paths)
                 .await
-                .map(StartOutcome::Existing);
+                .map(ReserveOutcome::Existing);
         }
         Err(TryLockError::Error(source)) => {
             return Err(ServerError::StateIo {
@@ -424,30 +512,17 @@ pub async fn start(
     let metadata = MetadataFile::new(&connection);
     write_metadata_atomically(&options.paths, &metadata)?;
 
-    let app = router(handler, connection.clone());
-    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let mut guard = InstanceGuard {
+    let guard = InstanceGuard {
         _lock: lock,
         paths: options.paths,
         connection: connection.clone(),
         cleaned: false,
     };
-    let task = tokio::spawn(async move {
-        let serve_result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_receiver.await;
-            })
-            .await
-            .map_err(|source| ServerError::Serve { source });
-        let cleanup_result = guard.cleanup();
-        serve_result.and(cleanup_result)
-    });
-
-    Ok(StartOutcome::Started(ServerHandle {
+    Ok(ReserveOutcome::Reserved(Box::new(ServerReservation {
+        listener,
         connection,
-        shutdown: Some(shutdown_sender),
-        task: Some(task),
-    }))
+        guard,
+    })))
 }
 
 #[derive(Clone)]
@@ -1370,6 +1445,8 @@ pub enum ServerError {
     },
     #[error("local server task stopped unexpectedly")]
     ServerTaskStopped,
+    #[error("local server did not drain active responses before the shutdown deadline")]
+    ShutdownTimedOut,
 }
 
 #[cfg(test)]
@@ -1380,7 +1457,9 @@ mod tests {
     };
 
     use futures_util::stream as futures_stream;
-    use qq_protocol::RunEvent;
+    use qq_protocol::{
+        EventCursor, RunEvent, SessionEvent, SessionEventEnvelope, SessionId, StoreId,
+    };
 
     use super::*;
 
@@ -1429,6 +1508,21 @@ mod tests {
             async move { Ok(Box::pin(futures_stream::iter(events)) as RunStream) }
         });
         (handler, requests)
+    }
+
+    struct HeldSubscriptionHandler {
+        event: SessionEventEnvelope,
+    }
+
+    impl AskHandler for HeldSubscriptionHandler {
+        fn subscribe(
+            &self,
+            _request: SubscribeRequest,
+        ) -> Result<SessionEventStream, AskHandlerError> {
+            let events =
+                futures_stream::iter([Ok(self.event.clone())]).chain(futures_stream::pending());
+            Ok(Box::pin(events))
+        }
     }
 
     fn test_request(prompt: &str) -> AskRequest {
@@ -1686,6 +1780,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_reservation_cleans_metadata_and_releases_ownership() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let outcome = reserve(ServerOptions::new(paths.clone())).await.unwrap();
+        let ReserveOutcome::Reserved(reservation) = outcome else {
+            panic!("test unexpectedly found an existing server");
+        };
+        assert!(paths.metadata_file().is_file());
+
+        drop(reservation);
+
+        assert!(!paths.metadata_file().exists());
+        let lock = open_private_lock_file(paths.lock_file()).unwrap();
+        lock.try_lock().unwrap();
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_removes_owned_metadata_and_releases_the_lock() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
@@ -1698,6 +1809,61 @@ mod tests {
 
         assert!(!paths.metadata_file().exists());
         assert!(read_connection(&paths).unwrap().is_none());
+        let lock = open_private_lock_file(paths.lock_file()).unwrap();
+        lock.try_lock().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_bounds_a_held_event_subscription_and_releases_ownership() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let store_id = StoreId::generate().unwrap();
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let after = EventCursor {
+            store_id,
+            workspace_id,
+            sequence: 0,
+        };
+        let handler = Arc::new(HeldSubscriptionHandler {
+            event: SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id,
+                    workspace_id,
+                    sequence: 1,
+                },
+                session_id,
+                run_id: None,
+                caused_by: None,
+                occurred_at_ms: 0,
+                event: SessionEvent::SessionDeleted { session_id },
+            },
+        });
+        let server = start_test_server(paths.clone(), handler).await;
+        let events_url = server
+            .connection()
+            .endpoint(&format!("/v1/workspaces/{workspace_id}/events"));
+        let token = server.connection().expose_bearer_token().to_owned();
+        let mut response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(events_url)
+            .bearer_auth(token)
+            .header("last-event-id", after.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.chunk().await.unwrap().is_some());
+
+        let error = server
+            .shutdown_with_grace(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ServerError::ShutdownTimedOut));
+        assert!(!paths.metadata_file().exists());
         let lock = open_private_lock_file(paths.lock_file()).unwrap();
         lock.try_lock().unwrap();
     }
