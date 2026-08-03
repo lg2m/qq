@@ -176,12 +176,12 @@
     <tr>
       <td>Phase 5 — facade and layout</td>
       <td><span class="badge green">Done</span></td>
-      <td><code>ba1fe71..76b7504</code>: facade canary mode, private adapters, rename-only moves, and the neutral <code>model.rs</code>.</td>
+      <td><code>ba1fe71..5de201b</code>: facade canary mode, private adapters, rename-only moves, and the neutral <code>model.rs</code>.</td>
     </tr>
     <tr>
       <td>Phase 6 — verification and docs</td>
       <td><span class="badge amber">Implemented · credentialed run pending</span></td>
-      <td><code>a42a34d</code> adds the bounded executable matrix; <code>07aaf79</code> preserves the measured compiler hot path; <code>84d4adb</code> closes the independent-review findings. Offline gates are automated; live rows still require explicit credentials and opt-in.</td>
+      <td><code>3407f89</code> adds the bounded executable matrix; <code>b02c80d</code> preserves the measured compiler hot path; <code>3b8510d</code> closes the independent-review findings. Offline gates are automated; live rows still require explicit credentials and opt-in.</td>
     </tr>
   </table>
   </div>
@@ -481,7 +481,7 @@ pub(crate) fn sse_exchange(
       <span class="phase-num">5</span>
       <h2>Regroup the files — <code>providers/</code> and a slim facade</h2>
       <span class="badge green">Done</span>
-      <span class="badge gray"><code>ba1fe71..76b7504</code></span>
+      <span class="badge gray"><code>ba1fe71..5de201b</code></span>
     </div>
     <p><strong>Delivered:</strong> <code>compile_for_canary</code> landed before the visibility cut; adapter types and constructors became crate-private; the concrete adapter retry toggles were removed; seven files moved in a 100% rename-only commit; <code>BedrockAuth</code> moved to the root API; and the neutral model left a 68-line <code>lib.rs</code>.</p>
     <h3>Steps</h3>
@@ -515,7 +515,7 @@ pub(crate) fn sse_exchange(
     <ul>
       <li><strong>Done:</strong> Phase&nbsp;1 test-surface and Phase&nbsp;2 adapter-kit contracts are in <code>docs/design/providers.md</code>.</li>
       <li><strong>Done:</strong> offline validation is executable and returns failures directly; live validation is explicit, bounded, redacted, and nonzero on fail/skip.</li>
-      <li><strong>Done:</strong> three paired 5,000,000-iteration samples kept every median within the explicit 5% microbenchmark tolerance versus <code>main</code> (OpenAI 529 vs 545 ns, Google 433 vs 420 ns, Mantle 293 vs 286 ns, warm dispatch 91 vs 91 ns). The canary's second call site initially exposed an optimizer regression; <code>07aaf79</code> removed it while preserving the shared construction seam.</li>
+      <li><strong>Done:</strong> three paired 5,000,000-iteration samples kept every median within the explicit 5% microbenchmark tolerance versus <code>main</code> (OpenAI 529 vs 545 ns, Google 433 vs 420 ns, Mantle 293 vs 286 ns, warm dispatch 91 vs 91 ns). The canary's second call site initially exposed an optimizer regression; <code>b02c80d</code> removed it while preserving the shared construction seam.</li>
       <li><strong>Done:</strong> the grep-backed deletion audit found one Base/Exact enum, one compatibility-message table, no public adapter exports or concrete retry toggles, one loopback harness, shared error/accounting/retry implementations, and a 68-line facade.</li>
       <li><strong>Done:</strong> <code>cargo fmt --all -- --check</code>, strict all-target/all-feature Clippy, <code>cargo test --workspace</code>, and <code>cargo build --workspace</code> all pass.</li>
       <li><strong>Done:</strong> <code>architecture.md</code> and <code>providers.md</code> own the new layout and the Template-Method/super-trait rejection.</li>
