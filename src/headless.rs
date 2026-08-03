@@ -20,7 +20,7 @@ use futures_util::StreamExt;
 use qq_core::{SessionRuntime, SessionRuntimeError};
 use qq_protocol::{
     ApprovalDecision, ApprovalMode, CommandId, CommandOutcome, CommandReceipt, MessageId,
-    MessageRole, ModelSelection, RunId, RunOutcome, SessionCommand, SessionEvent,
+    MessageRole, ModelSelection, RunActivity, RunId, RunOutcome, SessionCommand, SessionEvent,
     SessionEventEnvelope, SessionId, SnapshotRequest, SubscribeRequest, TokenUsage, ToolCallState,
     WorkspaceId,
 };
@@ -439,6 +439,7 @@ async fn stream_run(
     // streaming; earlier turns are progress, not the answer.
     let mut answer = String::new();
     let mut answer_message: Option<MessageId> = None;
+    let mut observed_turns = 0_u16;
     let text = options.format == HeadlessFormat::Text;
 
     loop {
@@ -495,6 +496,15 @@ async fn stream_run(
                 let mut over_turn_budget = false;
                 let mut check_cost = false;
                 match &envelope.event {
+                    SessionEvent::RunActivityChanged {
+                        run_id,
+                        activity: RunActivity::WaitingForProvider,
+                    } if *run_id == handle.run_id => {
+                        observed_turns = observed_turns.saturating_add(1);
+                        over_turn_budget = options
+                            .max_turns
+                            .is_some_and(|limit| observed_turns > limit);
+                    }
                     SessionEvent::AssistantMessageStarted { message } if ours => {
                         if message.role == MessageRole::Assistant {
                             answer_message = Some(message.id);
@@ -934,6 +944,47 @@ mod tests {
         }
     }
 
+    /// Completes two tool turns, then stalls before producing content on the
+    /// third. A turn budget must observe the provider request boundary rather
+    /// than waiting for text or a tool call that may never arrive.
+    struct ReadsThenHangsProvider {
+        turn: Mutex<usize>,
+    }
+
+    impl ReadsThenHangsProvider {
+        fn new() -> Self {
+            Self {
+                turn: Mutex::new(0),
+            }
+        }
+    }
+
+    impl Provider for ReadsThenHangsProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            if current >= 2 {
+                return Box::pin(stream::pending());
+            }
+            Box::pin(stream::iter([
+                Ok(ProviderEvent::ToolCallStarted {
+                    id: format!("call_{current}"),
+                    name: "read_file".to_owned(),
+                }),
+                Ok(ProviderEvent::ToolCallArgumentsDelta {
+                    id: format!("call_{current}"),
+                    json: r#"{"path":"note.txt"}"#.to_owned(),
+                }),
+                Ok(ProviderEvent::ToolCallCompleted {
+                    id: format!("call_{current}"),
+                }),
+                Ok(ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
     struct Fixture {
         sessions: SessionRuntime,
         workspace: PathBuf,
@@ -1251,6 +1302,26 @@ mod tests {
         let records = parse_records(&stdout);
         let outcome = records.last().unwrap();
         assert_eq!(outcome["status"], "budget_exhausted");
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn turn_budget_cancels_before_a_silent_over_budget_turn_can_hang() {
+        let fixture = fixture(ReadsThenHangsProvider::new).await;
+        std::fs::write(fixture.workspace.join("note.txt"), "content\n").unwrap();
+        let mut options = options(&fixture.workspace);
+        options.max_turns = Some(2);
+
+        let (status, stdout, _stderr) = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_to_end(&fixture, options, std::future::pending()),
+        )
+        .await
+        .expect("the turn budget must cancel before the silent third turn stalls");
+
+        assert_eq!(status, HeadlessStatus::BudgetExhausted);
+        let records = parse_records(&stdout);
+        assert_eq!(records.last().unwrap()["status"], "budget_exhausted");
         assert_no_active_run(&fixture).await;
     }
 }
