@@ -70,7 +70,7 @@ Passing one regression does not imply that its whole phase is complete.
 | Durable headless execution | on `main` | `f7b34a1` adds `qq run` with durable events, cancellation, timeout, turn/cost budgets, JSONL, and exit-status mapping | ATIF conversion, Harbor integration, resolved-model trial identity |
 | Transient provider recovery | on `main` | `55d2aa7` retries a turn only before user-visible output | One combined retry/amplification budget across provider transport and core |
 | Accepted-run supervision | implemented in `DEV-726` | Run-task panics settle as durable failures; headless sink/trace failures and owner aborts retain cancellation ownership; explicit runtime shutdown drains queued and running work; reopen interrupts abandoned running work without replaying tools | Process loss intentionally interrupts the in-flight provider request rather than attempting unsafe continuation |
-| Failed/cancelled context continuity | on `main` | `c68b12a` replays every fully committed model turn and tool result | Runtime notices, never-started call results, and the full Phase 2 projection matrix |
+| Authoritative context projection | implemented in `DEV-727` | Completed, failed, cancelled, interrupted, and recovered runs share one projection; runtime notices and exact persisted/interrupted/not-executed tool results reach follow-up, capacity, and compaction requests without altering the transcript | Merge the reviewed slice; child creation remains `DEV-728` |
 | Tool/turn budget behavior | renewable slices and live cost visibility implemented in `DEV-725`; explicit headless turn/timeout gate on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before a silent over-budget turn; `DEV-725` turns the internal 256-call ceiling into a persisted checkpoint, restores tools inside the same durable run, and commits active-run cost so `--max-cost-usd` can cancel truthfully | Core-owned configurable token/dollar/turn outcomes across every front end |
 
 The remaining P0 longevity contract is explicit: every accepted run must reach
@@ -83,7 +83,6 @@ The remaining gaps are material:
 | Area | Current behavior | Consequence |
 | --- | --- | --- |
 | Evaluation export | `qq run` is durable, but ATIF conversion and the Harbor adapter are absent | Trials cannot yet be compared or replayed through the benchmark's standard artifact |
-| Context continuity | Fully committed failed/cancelled turns replay after `c68b12a`, but terminal runtime notices and never-started tool-call results are not projected | Follow-up context preserves progress but does not yet explain every terminal boundary or guarantee a paired result for every call |
 | Streaming persistence | Each text batch reassembles the full context for capacity checks and grows SQLite strings by concatenation | Long output has structurally superlinear persistence work |
 | Reasoning persistence | Provider reasoning deltas commit independently rather than using text batching | High-effort models can create excessive transactions and queue pressure |
 | Store scheduling | The single worker always prefers control traffic; a full output queue is retried by polling every millisecond | Output can be delayed or starved under control load |
@@ -402,9 +401,11 @@ It must never print credentials.
 Priority: P0. Complete before judging compaction quality or sub-agent
 economics.
 
-Status: in progress. `c68b12a` preserves fully committed turns across failed
-and cancelled outcomes. It does not yet add runtime notices, synthesize every
-missing tool result, or close the child-creation transaction gap.
+Status: in progress. `DEV-727` implements the authoritative context projection,
+including terminal runtime notices, exact tool-result pairing, restart
+equivalence, and shared follow-up/capacity/compaction input. `DEV-728` still
+needs to close the child-creation transaction gap and enforce final-only child
+answers.
 
 ### Context Projection Contract
 
@@ -1001,7 +1002,7 @@ Each row should be one narrow issue and normally one focused PR.
 | ---: | --- | --- | --- |
 | 1 | `feat(cli): add durable autonomous run` | none | Benchmarkable |
 | 2 | `test(eval): add Harbor adapter and ATIF validation` | 1 | Benchmarkable |
-| 3 | `fix(runtime): replay committed failed and cancelled turns` | none | Correct continuation |
+| 3 | `fix(runtime): project terminal runs into valid follow-up context` | committed-turn replay | Correct continuation |
 | 4 | `fix(runtime): make child spawn atomic and final-only` | 3 | Correct continuation |
 | 5 | `feat(runtime): load scoped workspace instructions` | 1 | Completion quality |
 | 6 | `test(eval): baseline completion prompt and failure taxonomy` | 2, 5 | First trustworthy baseline |

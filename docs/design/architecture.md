@@ -302,6 +302,16 @@ in-flight tool calls interrupted before scheduling resumes. Committed turns
 remain authoritative, interrupted side effects are never re-executed, and
 queued work that never started may still be claimed normally.
 
+Future model requests, capacity accounting, and compaction all consume the same
+provider-neutral projection of that durable state. The projection retains
+committed prompts and model turns, pairs every replayed tool call with exactly
+one persisted or synthesized result, and appends a clearly labelled QQ runtime
+notice after failed, cancelled, or interrupted runs. These notices are model
+context only: they do not become transcript messages or pretend to be user
+instructions. Calls known to have started receive an interrupted result; calls
+that never started receive a deterministic not-executed result, so recovery
+preserves progress without retrying uncertain side effects.
+
 ## HTTP And SSE Protocol
 
 Clients issue versioned HTTP requests with JSON bodies. The server streams

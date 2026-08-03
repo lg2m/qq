@@ -91,6 +91,9 @@ const MAX_CONCURRENT_CHILDREN_PER_RUN: usize = 3;
 const MAX_SPAWNED_CHILDREN_PER_RUN: usize = 8;
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
+const RUNTIME_NOTICE_PREAMBLE: &str = "[QQ runtime notice; not a user instruction]";
+const RUNTIME_NOTICE_GUIDANCE: &str = "Continue from the committed history above. Do not \
+    automatically retry tool calls whose result says execution was interrupted.";
 /// Read-only built-in tools whose results context assembly may replace with
 /// stubs: the agent can re-derive them on demand. Mutating, shell, and MCP
 /// results are never pruned — their outputs are not re-derivable.
@@ -5589,6 +5592,7 @@ fn finalize_run(
         transaction,
         store_id,
         claimed,
+        &outcome,
         Some(claimed.command_id),
         now,
     )?;
@@ -5914,7 +5918,7 @@ fn complete_run_in_transaction(
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let now = now_ms();
     let outcome = cancellation_wins(transaction, claimed.run_id, outcome)?;
-    interrupt_active_tool_calls(transaction, store_id, claimed, None, now)?;
+    interrupt_active_tool_calls(transaction, store_id, claimed, &outcome, None, now)?;
     let (run_status, message_state) = outcome_states(&outcome);
     let outcome_json =
         serde_json::to_string(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
@@ -5968,30 +5972,45 @@ fn interrupt_active_tool_calls(
     transaction: &Transaction<'_>,
     store_id: StoreId,
     claimed: &ClaimedRun,
+    outcome: &RunOutcome,
     caused_by: Option<CommandId>,
     now: u64,
 ) -> Result<(), SessionRuntimeError> {
     let mut statement = transaction
         .prepare(
-            "SELECT id FROM tool_calls
+            "SELECT id, state = 'running' FROM tool_calls
              WHERE run_id = ?1 AND state IN ('requested', 'awaiting_approval', 'running')
              ORDER BY turn_ordinal, call_ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let ids = statement
-        .query_map([claimed.run_id.to_string()], |row| row.get::<_, String>(0))
+        .query_map([claimed.run_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     drop(statement);
-    for id in ids {
+    let not_executed_result = match outcome {
+        RunOutcome::Completed if ids.is_empty() => return Ok(()),
+        RunOutcome::Completed => return Err(SessionRuntimeError::Persistence),
+        RunOutcome::Cancelled => "Tool execution did not start before the run was cancelled.",
+        RunOutcome::Interrupted => "Tool execution did not start before the run was interrupted.",
+        RunOutcome::Failed { .. } => "Tool execution did not start before the run failed.",
+    };
+    for (id, execution_started) in ids {
         let id = parse_id::<ToolCallId>(&id)?;
+        let result = if execution_started {
+            INTERRUPTED_TOOL_RESULT
+        } else {
+            not_executed_result
+        };
         transaction
             .execute(
                 "UPDATE tool_calls
                  SET state = 'interrupted', result = ?2, is_error = 1, finished_at_ms = ?3
                  WHERE id = ?1 AND state IN ('requested', 'awaiting_approval', 'running')",
-                params![id.to_string(), INTERRUPTED_TOOL_RESULT, now],
+                params![id.to_string(), result, now],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
         let tool_call = load_tool_call(transaction, id)?;
@@ -6604,7 +6623,8 @@ fn load_model_context(
         .prepare(
             "SELECT id FROM messages
              WHERE session_id = ?1 AND ordinal <= ?2 AND ordinal > ?3
-               AND state IN ('complete', 'interrupted')
+               AND role = 'user'
+               AND state IN ('complete', 'cancelled', 'failed', 'interrupted')
              ORDER BY ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -6627,59 +6647,95 @@ fn load_model_context(
     }
     for id in message_ids {
         let snapshot = load_message(transaction, parse_id(&id)?)?;
-        match snapshot.role {
-            MessageRole::User => {
-                context.push(Message::user(snapshot.output));
-                // A run's assistant output replays right after its prompt,
-                // from the model_turns rows rather than the per-turn message
-                // rows: call-only turns persist no message row, so messages
-                // alone cannot reconstruct the run. Every committed turn is
-                // durable conversation history regardless of how the run
-                // ended; a failure or cancellation must not make visible work
-                // disappear from the next model request. A still-running run
-                // also replays so capacity measurement sees its committed
-                // turns while execution is in flight.
-                let status: String = transaction
-                    .query_row(
-                        "SELECT status FROM runs WHERE id = ?1",
-                        [snapshot.run_id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| SessionRuntimeError::Persistence)?;
-                if matches!(
-                    status.as_str(),
-                    "completed" | "cancelled" | "failed" | "interrupted" | "running"
-                ) {
-                    append_run_turns(transaction, snapshot.run_id, &mut context)?;
-                }
+        if snapshot.role != MessageRole::User {
+            return Err(SessionRuntimeError::Persistence);
+        }
+        context.push(Message::user(snapshot.output));
+        // Reconstruct each run immediately after its prompt rather than
+        // following message-row ordinals. Follow-up prompts can be queued
+        // while the prior run is active, so its later committed output still
+        // belongs before the follow-up in model context.
+        let status: String = transaction
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                [snapshot.run_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        if matches!(
+            status.as_str(),
+            "completed" | "cancelled" | "failed" | "interrupted" | "running"
+        ) {
+            let has_turns: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM model_turns WHERE run_id = ?1)",
+                    [snapshot.run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            if has_turns {
+                append_run_turns(transaction, snapshot.run_id, &mut context)?;
+            } else {
+                append_legacy_run_messages(transaction, snapshot.run_id, &mut context)?;
             }
-            MessageRole::Assistant => {
-                let has_turns: bool = transaction
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM model_turns WHERE run_id = ?1)",
-                        [snapshot.run_id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| SessionRuntimeError::Persistence)?;
-                // Runs with persisted turns already replayed after their
-                // prompt; only legacy pre-tool-loop runs replay from the
-                // flat message text.
-                if has_turns {
-                    continue;
-                }
-                let content = if snapshot.output.is_empty() {
-                    snapshot.refusal
-                } else {
-                    snapshot.output
-                };
-                if !content.trim().is_empty() {
-                    context.push(Message::assistant(content));
-                }
+        }
+        if matches!(status.as_str(), "cancelled" | "failed" | "interrupted") {
+            let outcome_json: String = transaction
+                .query_row(
+                    "SELECT outcome_json FROM runs WHERE id = ?1",
+                    [snapshot.run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let outcome: RunOutcome = serde_json::from_str(&outcome_json)
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            if let Some(notice) = runtime_notice(&outcome) {
+                context.push(Message::user(notice));
             }
         }
     }
     prune_stale_tool_results(&mut context);
     Ok(context)
+}
+
+fn append_legacy_run_messages(
+    connection: &Connection,
+    run_id: RunId,
+    context: &mut Vec<Message>,
+) -> Result<(), SessionRuntimeError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT output, refusal FROM messages
+             WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
+             ORDER BY turn_ordinal, ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let messages = statement
+        .query_map([run_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    for (output, refusal) in messages {
+        let content = if output.is_empty() { refusal } else { output };
+        if !content.trim().is_empty() {
+            context.push(Message::assistant(content));
+        }
+    }
+    Ok(())
+}
+
+fn runtime_notice(outcome: &RunOutcome) -> Option<String> {
+    let status = match outcome {
+        RunOutcome::Completed => return None,
+        RunOutcome::Cancelled => "The previous run was cancelled.".to_owned(),
+        RunOutcome::Interrupted => "The previous run was interrupted before completion.".to_owned(),
+        RunOutcome::Failed { failure } => format!("The previous run failed: {}", failure.message),
+    };
+    Some(format!(
+        "{RUNTIME_NOTICE_PREAMBLE}\n{status}\n{RUNTIME_NOTICE_GUIDANCE}"
+    ))
 }
 
 /// One persisted compaction: the summary that replaces everything at or
@@ -10007,6 +10063,41 @@ mod tests {
             .collect()
     }
 
+    fn assert_tool_results_are_exact(messages: &[Message]) {
+        let mut calls = HashMap::<String, Vec<usize>>::new();
+        let mut results = HashMap::<String, Vec<usize>>::new();
+        for (message_index, message) in messages.iter().enumerate() {
+            for block in message.content() {
+                match block {
+                    ContentBlock::ToolCall { id, .. } => {
+                        calls.entry(id.clone()).or_default().push(message_index);
+                    }
+                    ContentBlock::ToolResult { call_id, .. } => {
+                        results
+                            .entry(call_id.clone())
+                            .or_default()
+                            .push(message_index);
+                    }
+                    ContentBlock::Text { .. } => {}
+                }
+            }
+        }
+        for (id, call_positions) in &calls {
+            assert_eq!(call_positions.len(), 1, "duplicate ToolCall for {id}");
+            let result_positions = results.get(id).unwrap_or_else(|| {
+                panic!("missing ToolResult for {id}");
+            });
+            assert_eq!(result_positions.len(), 1, "duplicate ToolResult for {id}");
+            assert!(
+                result_positions[0] > call_positions[0],
+                "ToolResult for {id} must follow its ToolCall"
+            );
+        }
+        for id in results.keys() {
+            assert!(calls.contains_key(id), "orphaned ToolResult for {id}");
+        }
+    }
+
     #[tokio::test]
     async fn compact_session_is_refused_while_a_run_is_active_and_runs_toolless_after() {
         let mut harness = session_management_harness().await;
@@ -11802,18 +11893,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_and_cancelled_runs_replay_committed_turns_in_follow_up_context() {
+    async fn terminal_runs_replay_committed_turns_and_status_in_follow_up_context() {
         let outcomes = [
-            RunOutcome::Failed {
-                failure: RunFailure {
-                    kind: RunFailureKind::ProviderTransport,
-                    message: "provider connection dropped".to_owned(),
+            (RunOutcome::Completed, None),
+            (
+                RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::ProviderTransport,
+                        message: "provider connection dropped".to_owned(),
+                    },
                 },
-            },
-            RunOutcome::Cancelled,
+                Some("The previous run failed: provider connection dropped"),
+            ),
+            (
+                RunOutcome::Cancelled,
+                Some("The previous run was cancelled."),
+            ),
+            (
+                RunOutcome::Interrupted,
+                Some("The previous run was interrupted before completion."),
+            ),
         ];
 
-        for outcome in outcomes {
+        for (outcome, expected_status) in outcomes {
             let directory = tempfile::tempdir().unwrap();
             let store = Store::open(directory.path().join("sessions.sqlite3"))
                 .await
@@ -11930,7 +12032,877 @@ mod tests {
                 [ContentBlock::ToolResult { call_id, content, .. }]
                     if call_id == "call_0" && content == "tool result\n"
             ));
+            assert_tool_results_are_exact(&continued.messages);
+            match expected_status {
+                Some(expected_status) => {
+                    assert!(matches!(
+                        continued.messages[3].content(),
+                        [ContentBlock::Text { text }]
+                            if text == &format!(
+                                "[QQ runtime notice; not a user instruction]\n{expected_status}\n\
+                                 Continue from the committed history above. Do not automatically \
+                                 retry tool calls whose result says execution was interrupted."
+                            )
+                    ));
+                    assert!(matches!(
+                        continued.messages[4].content(),
+                        [ContentBlock::Text { text }] if text == "continue"
+                    ));
+                }
+                None => {
+                    assert_eq!(continued.messages.len(), 4);
+                    assert!(matches!(
+                        continued.messages[3].content(),
+                        [ContentBlock::Text { text }] if text == "continue"
+                    ));
+                }
+            }
         }
+    }
+
+    async fn project_terminal_run_with_tool_boundaries(
+        outcome: RunOutcome,
+    ) -> (Vec<Message>, Vec<Message>) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "inspect the tool boundaries".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        let completed_call_id = ToolCallId::generate().unwrap();
+        let started_call_id = ToolCallId::generate().unwrap();
+        let awaiting_call_id = ToolCallId::generate().unwrap();
+        let untouched_call_id = ToolCallId::generate().unwrap();
+        let calls = vec![
+            RuntimeToolCall {
+                id: completed_call_id,
+                turn_ordinal: 1,
+                call_ordinal: 1,
+                provider_call_id: "completed-call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"completed.txt"}"#.to_owned(),
+                argument_error: None,
+            },
+            RuntimeToolCall {
+                id: started_call_id,
+                turn_ordinal: 1,
+                call_ordinal: 2,
+                provider_call_id: "started-call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"first.txt"}"#.to_owned(),
+                argument_error: None,
+            },
+            RuntimeToolCall {
+                id: awaiting_call_id,
+                turn_ordinal: 1,
+                call_ordinal: 3,
+                provider_call_id: "awaiting-call".to_owned(),
+                name: "shell".to_owned(),
+                arguments: r#"{"command":"true"}"#.to_owned(),
+                argument_error: None,
+            },
+            RuntimeToolCall {
+                id: untouched_call_id,
+                turn_ordinal: 1,
+                call_ordinal: 4,
+                provider_call_id: "untouched-call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"second.txt"}"#.to_owned(),
+                argument_error: None,
+            },
+        ];
+        store
+            .persist_model_turn(
+                &claimed,
+                ModelTurnCommit {
+                    turn_ordinal: 1,
+                    message: Message::new(
+                        Role::Assistant,
+                        calls
+                            .iter()
+                            .map(|call| ContentBlock::ToolCall {
+                                id: call.provider_call_id.clone(),
+                                name: call.name.clone(),
+                                arguments: serde_json::from_str(&call.arguments).unwrap(),
+                            })
+                            .collect(),
+                    ),
+                    calls,
+                    turn_message: None,
+                    context_tokens: None,
+                    accounting: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .start_tool_call(&claimed, completed_call_id)
+            .await
+            .unwrap();
+        store
+            .finish_tool_call(
+                &claimed,
+                completed_call_id,
+                "persisted result".to_owned(),
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .start_tool_call(&claimed, started_call_id)
+            .await
+            .unwrap();
+        store
+            .request_tool_approval(&claimed, awaiting_call_id, None, None)
+            .await
+            .unwrap();
+        let finished = store.finish_run(&claimed, outcome, None).await.unwrap();
+        let after = finished.last().unwrap().cursor;
+        drop(store);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+        let restarted_database_path = directory.path().join("restarted-sessions.sqlite3");
+        std::fs::copy(&database_path, &restarted_database_path).unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue safely".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let projected_before_restart = {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            requests[0].messages().to_vec()
+        };
+        drop(runtime);
+
+        let restarted_requests = Arc::new(StdMutex::new(Vec::new()));
+        let restarted = SessionRuntime::open(
+            SessionRuntimeOptions::new(restarted_database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&restarted_requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut restarted_events = restarted
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after,
+            })
+            .unwrap();
+        restarted
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue safely".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut restarted_events).await;
+        let restarted_requests = restarted_requests.lock().unwrap();
+        assert_eq!(restarted_requests.len(), 1);
+        (
+            projected_before_restart,
+            restarted_requests[0].messages().to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn terminal_runs_project_exact_tool_boundaries_across_restart() {
+        let outcomes = [
+            (
+                RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::ProviderTransport,
+                        message: "provider connection dropped".to_owned(),
+                    },
+                },
+                "Tool execution did not start before the run failed.",
+                "The previous run failed: provider connection dropped",
+            ),
+            (
+                RunOutcome::Cancelled,
+                "Tool execution did not start before the run was cancelled.",
+                "The previous run was cancelled.",
+            ),
+            (
+                RunOutcome::Interrupted,
+                "Tool execution did not start before the run was interrupted.",
+                "The previous run was interrupted before completion.",
+            ),
+        ];
+
+        for (outcome, expected_not_executed, expected_status) in outcomes {
+            let (messages, restarted_messages) =
+                project_terminal_run_with_tool_boundaries(outcome).await;
+            assert_eq!(
+                restarted_messages, messages,
+                "reopening the store must not change projected context"
+            );
+            assert_eq!(messages.len(), 5);
+            assert_tool_results_are_exact(&messages);
+            assert!(matches!(
+                messages[2].content(),
+                [
+                    ContentBlock::ToolResult {
+                        call_id: completed_id,
+                        content: completed_result,
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        call_id: started_id,
+                        content: started_result,
+                        is_error: true,
+                    },
+                    ContentBlock::ToolResult {
+                        call_id: awaiting_id,
+                        content: awaiting_result,
+                        is_error: true,
+                    },
+                    ContentBlock::ToolResult {
+                        call_id: untouched_id,
+                        content: untouched_result,
+                        is_error: true,
+                    },
+                ] if completed_id == "completed-call"
+                    && completed_result == "persisted result"
+                    && started_id == "started-call"
+                    && started_result == INTERRUPTED_TOOL_RESULT
+                    && awaiting_id == "awaiting-call"
+                    && awaiting_result == expected_not_executed
+                    && untouched_id == "untouched-call"
+                    && untouched_result == expected_not_executed
+            ));
+            assert!(matches!(
+                messages[3].content(),
+                [ContentBlock::Text { text }]
+                    if text == &format!(
+                        "[QQ runtime notice; not a user instruction]\n{expected_status}\n\
+                         Continue from the committed history above. Do not automatically retry \
+                         tool calls whose result says execution was interrupted."
+                    )
+            ));
+            assert!(matches!(
+                messages[4].content(),
+                [ContentBlock::Text { text }] if text == "continue safely"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_unclaimed_prompt_remains_explicit_in_follow_up_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "this prompt never started".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let cancelled = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: cancelled.receipt.committed_through,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue after cancellation".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0].messages();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages[0].content(),
+            [ContentBlock::Text { text }] if text == "this prompt never started"
+        ));
+        assert!(matches!(
+            messages[1].content(),
+            [ContentBlock::Text { text }]
+                if text == "[QQ runtime notice; not a user instruction]\n\
+                    The previous run was cancelled.\n\
+                    Continue from the committed history above. Do not automatically retry tool \
+                    calls whose result says execution was interrupted."
+        ));
+        assert!(matches!(
+            messages[2].content(),
+            [ContentBlock::Text { text }] if text == "continue after cancellation"
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupted_uncommitted_assistant_text_stays_out_of_model_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "begin the task".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        store
+            .begin_assistant_message(
+                &claimed,
+                MessageId::generate().unwrap(),
+                1,
+                TextChannel::Output,
+                "partial text from an uncommitted turn".to_owned(),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let recovered = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert!(recovered.focused.unwrap().messages.iter().any(|message| {
+            message.state == MessageState::Interrupted
+                && message.output == "partial text from an uncommitted turn"
+        }));
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: recovered.cursor,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue from durable work".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0].messages();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages[0].content(),
+            [ContentBlock::Text { text }] if text == "begin the task"
+        ));
+        assert!(matches!(
+            messages[1].content(),
+            [ContentBlock::Text { text }]
+                if text == "[QQ runtime notice; not a user instruction]\n\
+                    The previous run was interrupted before completion.\n\
+                    Continue from the committed history above. Do not automatically retry tool \
+                    calls whose result says execution was interrupted."
+        ));
+        assert!(matches!(
+            messages[2].content(),
+            [ContentBlock::Text { text }] if text == "continue from durable work"
+        ));
+    }
+
+    #[tokio::test]
+    async fn historical_flat_assistant_output_precedes_the_terminal_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "legacy prompt".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        store
+            .begin_assistant_message(
+                &claimed,
+                MessageId::generate().unwrap(),
+                1,
+                TextChannel::Output,
+                "legacy committed answer".to_owned(),
+            )
+            .await
+            .unwrap();
+        let finished = store
+            .finish_run(
+                &claimed,
+                RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::ProviderTransport,
+                        message: "legacy provider failed".to_owned(),
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let after = finished.last().unwrap().cursor;
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET state = 'complete'\
+                 WHERE session_id = ?1 AND role = 'assistant'",
+                [session_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after,
+            })
+            .unwrap();
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue from the legacy store".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = collect_through_finished(&mut events).await;
+
+        let requests = requests.lock().unwrap();
+        let messages = requests[0].messages();
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            messages[0].content(),
+            [ContentBlock::Text { text }] if text == "legacy prompt"
+        ));
+        assert!(matches!(
+            messages[1].content(),
+            [ContentBlock::Text { text }] if text == "legacy committed answer"
+        ));
+        assert!(matches!(
+            messages[2].content(),
+            [ContentBlock::Text { text }]
+                if text.contains("The previous run failed: legacy provider failed")
+        ));
+        assert!(matches!(
+            messages[3].content(),
+            [ContentBlock::Text { text }] if text == "continue from the legacy store"
+        ));
+    }
+
+    #[tokio::test]
+    async fn manual_and_auto_compaction_share_the_terminal_run_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "finish the migration".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        store
+            .finish_run(
+                &claimed,
+                RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::ProviderTransport,
+                        message: "provider connection dropped".to_owned(),
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "grow the context".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let growth_run = store.claim_next_run(false).await.unwrap().unwrap();
+        store
+            .persist_model_turn(
+                &growth_run,
+                ModelTurnCommit {
+                    turn_ordinal: 1,
+                    message: Message::assistant(over_threshold_output()),
+                    calls: Vec::new(),
+                    turn_message: None,
+                    context_tokens: None,
+                    accounting: None,
+                },
+            )
+            .await
+            .unwrap();
+        let finished = store
+            .finish_run(&growth_run, RunOutcome::Completed, None)
+            .await
+            .unwrap();
+        let after = finished.last().unwrap().cursor;
+        drop(store);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+        let auto_database_path = directory.path().join("auto-sessions.sqlite3");
+        std::fs::copy(&database_path, &auto_database_path).unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert!(snapshot.focused.unwrap().messages.iter().all(|message| {
+            !message.output.contains(RUNTIME_NOTICE_PREAMBLE)
+                && !message.refusal.contains(RUNTIME_NOTICE_PREAMBLE)
+        }));
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after,
+            })
+            .unwrap();
+        compact_session(&runtime, session_id).await;
+        let _ = collect_through_compacted(&mut events).await;
+
+        let manual_projection = {
+            let requests = requests.lock().unwrap();
+            assert!(!requests.is_empty());
+            let texts = request_texts(&requests[0]);
+            assert_eq!(texts[0], "finish the migration");
+            assert_eq!(
+                texts[1],
+                "[QQ runtime notice; not a user instruction]\n\
+                 The previous run failed: provider connection dropped\n\
+                 Continue from the committed history above. Do not automatically retry tool \
+                 calls whose result says execution was interrupted."
+            );
+            assert_eq!(texts[2], "grow the context");
+            assert!(texts[4].starts_with("Summarize this conversation"));
+            requests[0].messages().to_vec()
+        };
+        drop(runtime);
+
+        let auto_requests = Arc::new(StdMutex::new(Vec::new()));
+        let auto_runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(auto_database_path),
+            Arc::new(CapturingLoader {
+                requests: Arc::clone(&auto_requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut auto_events = auto_runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after,
+            })
+            .unwrap();
+        let follow_up = auto_runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "continue after compaction".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = follow_up.outcome else {
+            panic!("unexpected receipt")
+        };
+        let _ = collect_until(&mut auto_events, finished_for(run_id)).await;
+
+        let auto_requests = auto_requests.lock().unwrap();
+        assert_eq!(auto_requests.len(), 2);
+        assert_eq!(
+            auto_requests[0].messages(),
+            manual_projection,
+            "manual and automatic compaction must consume the same projection"
+        );
     }
 
     #[tokio::test]
@@ -12505,22 +13477,7 @@ mod tests {
                 is_error: true,
             }] if call_id == "orphan-call" && content == INTERRUPTED_TOOL_RESULT
         ));
-        // Provider validity: every ToolCall block must be answered by a
-        // ToolResult with the same call ID in a later message.
-        for (index, message) in messages.iter().enumerate() {
-            for block in message.content() {
-                if let ContentBlock::ToolCall { id, .. } = block {
-                    assert!(messages[index + 1..].iter().any(|candidate| {
-                        candidate.content().iter().any(|result| {
-                            matches!(
-                                result,
-                                ContentBlock::ToolResult { call_id, .. } if call_id == id
-                            )
-                        })
-                    }));
-                }
-            }
-        }
+        assert_tool_results_are_exact(messages);
     }
 
     struct ContextBudgetLoader;
