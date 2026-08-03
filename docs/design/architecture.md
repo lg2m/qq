@@ -83,7 +83,20 @@ crates/
     src/lib.rs
   qq-provider/
     Cargo.toml
-    src/lib.rs
+    src/
+      lib.rs
+      model.rs
+      compiler.rs
+      construction.rs
+      providers.rs
+      providers/
+        openai.rs
+        openai_chat.rs
+        anthropic.rs
+        google.rs
+        bedrock.rs
+        mantle.rs
+        support.rs
   qq-protocol/
     Cargo.toml
     src/lib.rs
@@ -98,7 +111,9 @@ crates/
     src/lib.rs
 xtask/
   Cargo.toml
-  src/main.rs
+  src/
+    main.rs
+    providers.rs
 ```
 
 - The root `qq` package is the executable and composition root. It owns process
@@ -118,8 +133,10 @@ xtask/
   `qq-protocol` and exposes a small interface that hides orchestration details
   from clients.
 - `qq-provider` contains the provider-neutral model interface and concrete
-  model-provider adapters. It also owns the provider-neutral secret-reference
-  vocabulary shared by config and auth.
+  model-provider adapters. `lib.rs`, `model.rs`, and `compiler.rs` form its
+  public facade; concrete adapters live privately under `providers/`. It also
+  owns the provider-neutral secret-reference vocabulary shared by config and
+  auth.
 - `qq-protocol` contains shared identifiers, commands, events, and versioned
   wire types, plus the redacted local-server connection capability shared by
   the server and client adapters. It does not depend on an HTTP client or
@@ -174,7 +191,8 @@ than create unbounded queues.
 Provider names are configuration presets, not runtime dispatch keys. The root
 package translates layered configuration into a `qq-provider` recipe, and the
 provider compiler validates that recipe before returning the single
-`Provider::stream` interface consumed by `qq-core`.
+`Provider::stream` interface consumed by `qq-core`. Concrete adapter modules and
+constructors are crate-private; downstream crates cannot bypass compilation.
 
 ```text
 provider configuration
@@ -195,6 +213,11 @@ same path. Base endpoints append protocol path segments; exact endpoints are
 never rewritten. Invalid protocol/authentication combinations fail during
 compilation rather than during a model request.
 
+`construction.rs` owns the one compatibility matrix that resolves public
+`HttpAuth` intent into protocol-specific headers and request authorization. The
+internal Mantle authorizer cannot be expressed by a public recipe. Base versus
+exact endpoint intent has one representation beside `EndpointSpec`.
+
 Provider compilation follows these performance rules:
 
 - One `ProviderCompiler` and HTTP connection pool are shared by every model in
@@ -208,10 +231,19 @@ Provider compilation follows these performance rules:
 - Provider identity must not cause branching in the request hot path.
 
 Protocol codecs, request-time authorization, framing, retry policy, and
-transport are internal implementation details. Add a public seam only when two
-real adapters require it. A new deployment over an existing protocol should
-normally require configuration only; a new protocol should add one codec and
-its contract fixtures without changing `qq-core`.
+transport are internal implementation details. Shared protocol behavior is
+composed from private functions and small structs; do not introduce a
+`ProtocolCodec` super-trait or Template-Method hierarchy that exposes vendor
+differences as hooks. Add a public seam only when two real consumers require it.
+A new deployment over an existing protocol should normally require
+configuration only; a new protocol should add one codec and its contract
+fixtures without changing `qq-core`.
+
+Operational probes call `ProviderCompiler::compile_for_canary`. It uses the same
+recipe and adapter-selection path while disabling pre-stream HTTP/Mantle retries
+so a single probe cannot spend multiple inference attempts. The checked-in
+runner is `cargo xtask providers check live`; it is explicitly credentialed,
+bounded, and outside normal runtime control flow.
 
 Run `cargo bench -p qq-provider --bench provider_compiler` to measure compiled
 recipe construction independently from provider network latency. End-to-end

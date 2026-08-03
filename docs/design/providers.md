@@ -1,4 +1,4 @@
-# Provider Validation
+# Provider Architecture And Validation
 
 ## Purpose
 
@@ -18,34 +18,69 @@ No single test layer proves all five properties. Default tests must remain
 offline and deterministic, while opt-in live canaries detect upstream API,
 credential, permission, and model availability changes.
 
-## HTTP Exchange Execution
+## Public Seam And Module Ownership
 
-The direct HTTP adapters share a transport seam before their protocol decoders:
-OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, and Google
-GenerateContent all build a request, authorize and send it, reject unsuccessful
-statuses, enforce response-byte limits, and then hand chunks to an SSE decoder.
-That seam belongs to the existing private `http` module rather than to each
-adapter.
+`qq-provider` exposes a provider-neutral model and one construction facade. A
+consumer creates a typed `ProviderRecipe`, passes it to `ProviderCompiler`, and
+receives `Arc<dyn Provider>`. Concrete adapters and their constructors are not
+public API.
 
-The target ownership is:
+```text
+lib.rs                 public table of contents and Provider trait
+model.rs               requests, messages, events, usage, and errors
+compiler.rs            ProviderCompiler, recipes, HttpAuth, EndpointSpec
+construction.rs        protocol/auth compatibility and adapter selection
+http.rs                HTTP client, header safety, retry, bounds, redaction
+exchange.rs            shared HTTP-to-SSE exchange driver
+aws.rs                 AWS config, credential lease, SigV4, region rules
+request_auth.rs        request-time bearer/Codex credentials and authorizer
+providers.rs           private adapter module declarations
+providers/
+  support.rs           protocol-side error and accounting kit
+  openai.rs            Responses codec, including Codex request shape
+  openai_chat.rs       Chat Completions codec
+  anthropic.rs         Messages codec
+  google.rs            GenerateContent codec
+  bedrock.rs           ConverseStream adapter
+  mantle.rs            lazy Mantle deployment adapter
+```
 
-- `http.rs` owns client policy, globally controlled-header safety, request-time
-  authorization and execution, pre-stream retry/backoff for transient transport
-  and overload statuses, transport-error sanitization, bounded non-2xx bodies,
-  success response metadata, and a wire-limited response-body stream.
-- `limits.rs` owns calculated stream budgets and reusable checked byte counters.
-- Each adapter continues to own endpoint and request-body construction,
-  protocol-owned/authentication headers, interpretation of non-2xx bodies,
-  accepted success content types, SSE configuration, protocol state, output
-  event accounting, and conversion to `ProviderEvent`.
+The root re-exports `BedrockAuth`, the recipe/compiler types, request-credential
+types, structural secret types, the neutral model, and
+`XAI_CREDENTIAL_ENDPOINT`. It does not expose adapter modules. The root package
+is the composition layer that translates `qq-config` and `qq-auth` values into
+provider recipes.
 
-The exchange returns either a successful response whose body can only be read
-through the wire-limited stream, or a rejection containing status and an
-already bounded body. It does not accept callbacks or know provider error JSON
-schemas. This keeps the transport implementation deep without creating a
-"generic provider" abstraction that leaks every protocol distinction into its
-interface. The Responses adapter may, for example, retain its explicit Codex
-exception for a missing SSE content type.
+`construction.rs` is the only protocol/authentication compatibility authority.
+`HttpAuth` is the public intent vocabulary. Construction resolves that intent
+once into protocol-owned headers and an optional request authorizer. Mantle's
+SigV4 authorizer is an internal field on `HttpConstructionSpec`, so public
+recipes cannot manufacture Mantle-only capability. `EndpointKind` beside
+`EndpointSpec` is the sole Base/Exact representation.
+
+## Shared HTTP Execution And Adapter Kit
+
+The four direct HTTP protocols share transport before their local decoders.
+`HttpExchange` owns client policy, globally controlled-header safety,
+request-time authorization, pre-stream retry/backoff, transport sanitization,
+bounded non-2xx bodies, response metadata, and a wire-limited success stream.
+`exchange.rs` owns the invariant request → execute → content-type gate → SSE
+sequence. `limits.rs` owns stream budgets and checked byte counters.
+
+`providers/support.rs` owns only behavior proven common across protocols:
+
+- bounded rejection-envelope interpretation and shared status classification;
+- `ToolCallLedger` attribution and reuse/unknown-call errors;
+- `UsageOnce` and checked cached-input subtraction;
+- retry-mode application and test-only exact-endpoint client selection.
+
+Each adapter still owns its wire request/response schemas, protocol headers,
+error names, content-type exception, and streaming state machine. This is
+deliberate composition, not a Template Method. A `ProtocolCodec` super-trait was
+rejected because its hooks would expose every vendor difference and turn the
+shared driver into a shallow generic-provider abstraction. Shared behavior must
+continue to pass the deletion test: it replaces implementation in at least two
+adapters.
 
 Before a successful response is handed to an adapter, `HttpExchange` may retry
 transient pre-stream failures under a fixed internal policy (default three
@@ -53,31 +88,29 @@ attempts, exponential backoff with full jitter, a total delay budget, and
 `Retry-After` delta-seconds when present). Retryable outcomes are transport
 errors and HTTP `408` / `429` / `500` / `502` / `503` / `504`. Auth and other
 client errors are not retried, and nothing is retried after success headers are
-observed. Live canaries must call each HTTP adapter's `without_retries()` so a
-single probe does not spend multiple attempts. The policy, attempt loop, and
-acceptance tests are recorded in
-[`docs/plans/http-retry.md`](../plans/http-retry.md). Bedrock's AWS SDK
-transport remains outside this path.
+observed. Operational probes use `ProviderCompiler::compile_for_canary`, which
+disables direct HTTP and Mantle adapter retries through the facade. Bedrock's AWS
+SDK client already has SDK retries disabled.
 
-Header consolidation follows the same boundary. The HTTP module defines the
-universal request-controlled names and a builder that parses names and values,
-marks sensitive values, rejects case-insensitive duplicates and reserved-name
-overrides, and produces normalized redactions. Adapters add their small set of
-protocol-owned names and continue to validate protocol-specific auth choices.
-Secrets never move into generic debug-visible configuration.
+Header consolidation follows the same boundary. `http.rs` defines universal
+request-controlled names and parses names and values, marks sensitive values,
+rejects case-insensitive duplicates and reserved-name overrides, and produces
+normalized redactions. Adapters add their small protocol-owned set. Secrets use
+`SecretLiteral` rather than debug-visible strings.
 
-Migration must preserve observable wire contracts and error classification,
-except that every adapter will consistently reject a configured `user-agent`.
-Move one adapter at a time, beginning with Chat Completions, and delete each
-adapter's local wire counter, controlled-header list, send/status branch, and
-error-body reader only after its contract tests pass. Responses moves last
-because request-time Codex authorization and its content-type exception exercise
-the full seam. Bedrock's SDK transport remains outside the HTTP exchange, but it
-should use the common output byte counter from `limits.rs`.
+## Interface Test Contract
 
-The implementation sequence, proposed interfaces, compatibility decisions, and
-acceptance tests are recorded in
-[`docs/plans/http-exchange.md`](../plans/http-exchange.md).
+Composition tests under `crates/qq-provider/tests/interface/` enter only through
+`ProviderCompiler` and `Provider::stream`. Every direct HTTP protocol has
+auth-failure and output-limit coverage; compiler tests cover successful
+compile-to-stream request capture. A separate interface test proves
+`compile_for_canary` surfaces the first retryable response for all four HTTP
+protocols. Adapter-local tests remain appropriate for decoding tables,
+fragmentation, protocol state, and owned headers.
+
+All socket tests use `test_support::LoopbackServer`; private one-off HTTP
+harnesses are not allowed. This keeps file moves and internal refactors guarded
+by the same public behavior rather than by tests coupled to concrete adapters.
 
 ## Validation Matrix
 
@@ -91,6 +124,8 @@ assigned live-validation cadence.
 | OpenAI Codex | Responses | OAuth access token, account headers | every PR | manual and release |
 | Anthropic | Messages | `x-api-key` | every PR | nightly |
 | Google Gemini | GenerateContent | `x-goog-api-key` | every PR | nightly |
+| xAI | Responses | request-time bearer resolved by `qq-auth` | every PR | nightly |
+| xAI | Chat Completions | request-time bearer resolved by `qq-auth` | every PR | nightly |
 | Amazon Bedrock | ConverseStream | Bedrock API key, default AWS chain, named profile | every PR | nightly and release |
 | Bedrock Mantle | Responses | API key, SigV4 | every PR | nightly and release |
 | Bedrock Mantle | Chat Completions | API key, SigV4 | every PR | nightly and release |
@@ -166,18 +201,25 @@ or plaintext credential store.
 
 ### 4. Credentialed Live Canaries
 
-Live checks are explicit, bounded, and excluded from normal `cargo test`. The
-target interface is:
+Live checks are explicit, bounded, and excluded from normal `cargo test`:
 
 ```sh
 cargo xtask providers check offline
-cargo xtask providers check live --provider google
-cargo xtask providers check live --all
+QQ_LIVE_PROVIDER_TESTS=1 cargo xtask providers check live --provider google
+QQ_LIVE_PROVIDER_TESTS=1 cargo xtask providers check live --all
 ```
 
-These commands are an implementation target; `xtask` does not provide them yet.
-The live runner should construct recipes directly from a checked-in, nonsecret
-matrix instead of loading project configuration.
+The executable, nonsecret matrix lives in `xtask/src/providers.rs`. The live
+runner constructs recipes directly rather than loading project configuration.
+`--provider` may be repeated and accepts `openai`, `openai-codex`, `anthropic`,
+`google`, `xai`, `amazon-bedrock`, and `bedrock-mantle`. `--all` and
+`--provider` are mutually exclusive.
+
+API-key rows read only their documented provider environment variables. xAI
+and OpenAI Codex use `CredentialStore` request-time providers so OAuth refresh
+and `qq-auth` remain inside the tested path. AWS rows use the default chain;
+`QQ_CANARY_AWS_REGION` supplies an explicit region when desired. Each checked-in
+model has a `QQ_CANARY_*_MODEL` override for controlled model migrations.
 
 Each live case must:
 
@@ -185,17 +227,17 @@ Each live case must:
 2. Send only `Reply only with QQ_PROVIDER_SMOKE_OK`.
 3. Request no more than 32 output tokens and perform no tool calls.
 4. Require at least one text event and exactly one successful terminal event.
-5. Record whether the marker appeared, but not fail solely for harmless prose
-   around it.
-6. Disable automatic inference retries to prevent duplicate spend. HTTP adapters
-   expose `without_retries()` for this; call it when constructing canary
-   clients so pre-stream transport retry stays off.
-7. Enforce connection, first-token, total-time, event-size, and output limits.
+5. Require the marker, while accepting harmless prose around it.
+6. Compile with `ProviderCompiler::compile_for_canary` so pre-stream retries are
+   disabled without exposing a concrete adapter.
+7. Enforce provider connection/request timeouts plus a 20-second first-token and
+   45-second total runner deadline, in addition to event and output limits.
 8. Emit only redacted metadata.
 
-A canary validates both a pinned stable model and, when different, QQ's current
-default model. The pinned model separates provider connectivity from model
-catalog churn; the default-model check detects a broken product default.
+The runner currently validates one checked-in model per matrix row. Comparing a
+pinned connectivity model with QQ's changing product default remains useful,
+but belongs in the future model-registry integration rather than being inferred
+inside this command.
 
 ### 5. Differential Diagnosis
 
@@ -216,7 +258,9 @@ still needs an update.
 
 ## Live Credential Policy
 
-- Live tests require an explicit opt-in such as `QQ_LIVE_PROVIDER_TESTS=1`.
+- Live tests require the exact explicit opt-in `QQ_LIVE_PROVIDER_TESTS=1`.
+- A selected row with no credential emits a redacted `skip` record and makes the
+  command exit nonzero; unavailable credentials never become a silent pass.
 - Use dedicated low-quota test projects and accounts, never personal production
   credentials.
 - CI should use workload identity or OIDC and short-lived credentials where the
@@ -239,15 +283,16 @@ the validity check for expiration, revocation, endpoint scope, and permissions.
 
 ## Result Records
 
-Each live result should produce a small machine-readable record containing:
+Each live result is one JSON line containing:
 
-- UTC timestamp and QQ commit.
+- Unix timestamp and QQ commit.
 - Deployment, protocol, authentication mode, region, and model.
 - Pass, fail, skip, or infrastructure-error outcome.
-- HTTP/provider error category and sanitized provider request ID on failure.
-- Connection time, time to first token, total time, event count, and output
-  byte count.
-- Baseline result when differential diagnosis ran.
+- Provider error category on failure.
+- Time to first token, total time, event count, and output byte count.
+
+Future differential automation may add the last-green baseline result to this
+record without adding prompts, generated text, or raw provider errors.
 
 Do not store prompts, generated text, headers, URLs containing query secrets, or
 raw error bodies. Retain enough history to distinguish a one-off outage from a
@@ -300,17 +345,23 @@ Current strengths:
 
 - OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, and Google
   GenerateContent have localhost request and stream contract tests.
+- Interface tests enter through `ProviderCompiler` and prove auth failures,
+  bounds, and single-attempt canary compilation for every HTTP protocol.
 - Mantle tests cover protocol-specific API-key headers and SigV4 signing.
 - Provider compilation and runtime construction have deterministic tests.
 - Stream bounds, malformed input, terminal behavior, and secret redaction have
   focused coverage.
+- `cargo xtask providers check offline|live` provides an executable matrix and
+  bounded redacted live probes, including both xAI protocols through `qq-auth`.
 
 Current gaps:
 
-- There is no checked-in executable provider matrix.
-- `xtask` has no provider validation command.
 - There is no CI workflow or scheduled live canary.
 - Live results and last-green binaries are not retained for comparison.
+- The live runner does not yet compare a pinned connectivity model with the
+  current product default.
+- Connection timing and sanitized provider request IDs are not exposed by the
+  neutral provider interface, so result records begin at first token.
 - Bedrock SDK request/replay coverage is less complete than the HTTP codecs.
 - Codex OAuth has deterministic login tests but no approved live release check.
 - Model defaults and provider resolution are not yet owned by a model registry.
