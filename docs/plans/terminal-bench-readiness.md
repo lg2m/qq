@@ -1,6 +1,6 @@
 # QQ Harness Reliability, Cost, And Terminal-Bench Readiness
 
-Status: proposed.
+Status: active. Re-baselined against `main` on 2026-08-02.
 
 This plan turns QQ into a trustworthy autonomous terminal harness before
 optimizing it against Terminal-Bench. It covers the failures found in the
@@ -47,6 +47,8 @@ The implementation is successful when:
 QQ already has important foundations:
 
 - One provider-neutral runtime is reused by direct CLI, TUI, and server paths.
+- Durable non-interactive `qq run` now composes `SessionRuntime`; `qq ask`
+  remains the intentionally lightweight, non-durable compatibility path.
 - Commands are idempotent and authoritative events persist before publication.
 - Prompt queueing, tool turns, run completion, and compaction use transactions.
 - SQLite work stays off Tokio workers.
@@ -58,22 +60,41 @@ QQ already has important foundations:
 - Provider usage, cache usage, and estimated cost are normalized and retained.
 - The TUI now preserves and efficiently renders long completed output.
 
+### 2026-08-02 Recovery Ledger
+
+This ledger distinguishes shipped work from the broader phase contracts below.
+Passing one regression does not imply that its whole phase is complete.
+
+| Slice | Status | Evidence | Still open |
+| --- | --- | --- | --- |
+| Durable headless execution | on `main` | `f7b34a1` adds `qq run` with durable events, cancellation, timeout, turn/cost budgets, JSONL, and exit-status mapping | ATIF conversion, Harbor integration, resolved-model trial identity |
+| Transient provider recovery | on `main` | `55d2aa7` retries a turn only before user-visible output | One combined retry/amplification budget across provider transport and core |
+| Run-task panic supervision | on `main` | `c68b12a` turns an unwind into a durable server failure, releases capacity, and reschedules the session | Shutdown/abort recovery still relies on restart; outer headless I/O failures must cancel accepted runs |
+| Failed/cancelled context continuity | on `main` | `c68b12a` replays every fully committed model turn and tool result | Runtime notices, never-started call results, and the full Phase 2 projection matrix |
+| Silent over-budget provider turn | on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before an over-budget turn can hang without output | Core-owned budget outcomes and renewable continuation/checkpoint semantics |
+
+The remaining P0 longevity contract is explicit: every accepted run must reach
+one durable terminal event; every imposed bound must produce a truthful outcome;
+and resumable work must retain enough committed context to continue without
+repeating side effects. Raising a numeric cap is not completion semantics.
+
 The remaining gaps are material:
 
 | Area | Current behavior | Consequence |
 | --- | --- | --- |
-| Headless execution | `qq ask` calls `Runtime::run_in_workspace` directly with a static `ask` gate, no approval client, no durable session, and no sub-agent spawner | It cannot autonomously perform a normal coding task and does not evaluate the actual QQ harness |
-| Context continuity | Model turns from failed and cancelled runs are omitted from later context | The model may repeat visible work or reason from history that contradicts the transcript |
+| Evaluation export | `qq run` is durable, but ATIF conversion and the Harbor adapter are absent | Trials cannot yet be compared or replayed through the benchmark's standard artifact |
+| Context continuity | Fully committed failed/cancelled turns replay after `c68b12a`, but terminal runtime notices and never-started tool-call results are not projected | Follow-up context preserves progress but does not yet explain every terminal boundary or guarantee a paired result for every call |
+| Run supervision | Run-task panics settle durably after `c68b12a`, while abort/shutdown recovery and post-submit headless output/trace failures still have separate cleanup paths | An accepted run can remain active until restart when its outer owner exits abnormally |
 | Streaming persistence | Each text batch reassembles the full context for capacity checks and grows SQLite strings by concatenation | Long output has structurally superlinear persistence work |
 | Reasoning persistence | Provider reasoning deltas commit independently rather than using text batching | High-effort models can create excessive transactions and queue pressure |
 | Store scheduling | The single worker always prefers control traffic; a full output queue is retried by polling every millisecond | Output can be delayed or starved under control load |
 | Context budgeting | Automatic compaction uses a fixed 4 MiB budget and a 70% byte trigger | Small-context models may fail before compaction; large-context models may compact and spend unnecessarily |
 | Resolved model state | Runtime loading returns the runtime and pricing but drops effective context limits and generation capabilities | Core cannot budget, explain, or reproduce the exact model execution |
-| Completion behavior | The base prompt explains tools but does not establish a strong implement-recover-verify completion contract or load workspace instructions | Models can stop after analysis, skip verification, or ignore repository conventions |
+| Completion behavior | The base prompt explains tools, but the hard tool/turn cap's final tool-free response still settles as ordinary completion even when it is only a checkpoint | Automation can report exit 0 for unfinished bounded work instead of returning a resumable budget outcome |
 | Terminal control | `shell` is one-shot with null stdin and no persistent process or PTY handle | Interactive programs and background services are awkward or impossible |
 | Search and editing | Built-in search is bounded literal scanning; edits require exact replacement | Discovery or mutation can consume unnecessary model turns on large repositories |
 | Sub-agent lifecycle | Child creation and prompt submission are separate commands; the parent concatenates every completed child assistant message | A crash window can orphan child work and the result is not a true final-answer contract |
-| Cost control | Usage is accounted after model turns, but there are no enforced per-run dollar, token, or time budgets | A valid but stalled run can spend until a coarse loop bound stops it |
+| Cost control | Headless time, turn, and cost limits exist, but core has no unified token/dollar/turn outcome and provider/core retries can multiply attempts | Other front ends lack the same guarantees, and one logical turn can exceed the intended request budget |
 | Evaluation | Existing benchmarks cover provider construction, a synthetic read-tool loop, and manual rendering cases | There is no end-to-end evidence for useful-result latency, reliability, or cost |
 
 Existing plans remain authoritative for their narrower scopes:
@@ -271,10 +292,13 @@ Do not hide a capability regression behind a cheaper average.
 
 Priority: P0. This is the critical-path vertical slice.
 
+Status: partially delivered by `f7b34a1`. The durable CLI, cancellation,
+budgets, JSONL stream, and exit mapping exist. Trial identity, ATIF conversion,
+Harbor integration, and the end-to-end evaluation gate remain.
+
 ### Behavior
 
-Add `qq run` as the durable non-interactive execution mode. A proposed command
-shape is:
+`qq run` is the durable non-interactive execution mode. Its command shape is:
 
 ```text
 qq run [OPTIONS] PROMPT
@@ -368,6 +392,10 @@ It must never print credentials.
 
 Priority: P0. Complete before judging compaction quality or sub-agent
 economics.
+
+Status: in progress. `c68b12a` preserves fully committed turns across failed
+and cancelled outcomes. It does not yet add runtime notices, synthesize every
+missing tool result, or close the child-creation transaction gap.
 
 ### Context Projection Contract
 
@@ -687,6 +715,11 @@ Support per-run:
 - Tool-call limit.
 - Token limit.
 - Dollar limit when pricing and usage are known.
+
+`d989cf8` closes one headless failure mode by observing the provider-request
+boundary before a silent over-budget turn can hang. The remaining contract is
+core-owned: a tool/turn bound must not turn unfinished work into ordinary
+`Completed`, and every front end must observe the same explicit outcome.
 
 Before each new model turn, reserve enough budget for a bounded final response.
 When the work budget is exhausted:
