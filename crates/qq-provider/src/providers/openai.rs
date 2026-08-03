@@ -58,7 +58,7 @@ pub(crate) enum ResponsesConstructionAuth {
 
 /// A client for OpenAI-compatible Responses endpoints.
 pub(crate) struct OpenAi {
-    exchange: HttpExchange,
+    pub(crate) exchange: HttpExchange,
     endpoint: reqwest::Url,
     headers: HeaderMap,
     request_kind: ResponsesRequestKind,
@@ -136,16 +136,6 @@ impl OpenAi {
             headers,
             request_kind,
         })
-    }
-
-    /// Disables pre-stream HTTP retries for this client.
-    ///
-    /// Live canaries and single-shot probes use this so one overloaded or
-    /// rate-limited response is not spent across multiple attempts.
-    #[must_use]
-    pub(crate) fn without_retries(mut self) -> Self {
-        self.exchange = support::without_retries(self.exchange);
-        self
     }
 }
 
@@ -709,12 +699,6 @@ mod tests {
         assert_eq!(provider.endpoint.as_str(), RESPONSES_ENDPOINT);
         assert!(!format!("{bearer:?}").contains("openai-test-secret"));
         assert!(!format!("{header:?}").contains("custom-test-secret"));
-    }
-
-    #[test]
-    fn without_retries_preserves_endpoint_for_canary_clients() {
-        let provider = OpenAi::new("openai-test-secret").unwrap().without_retries();
-        assert_eq!(provider.endpoint.as_str(), RESPONSES_ENDPOINT);
     }
 
     #[test]

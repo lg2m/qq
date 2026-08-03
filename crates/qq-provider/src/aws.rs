@@ -32,7 +32,10 @@ use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
-use crate::{ProviderError, ProviderErrorKind, credentials::SecretLiteral};
+use crate::{ProviderError, credentials::SecretLiteral};
+
+#[cfg(test)]
+use crate::ProviderErrorKind;
 
 const AWS_CONFIG_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const AWS_CONFIG_BUILD_CONCURRENCY: usize = 2;
@@ -272,10 +275,9 @@ impl AwsConfigLoadError {
                 "AWS configuration worker runtime could not be initialized"
             }
             Self::CredentialsUnavailable => {
-                return ProviderError::ResponseFailed {
-                    kind: ProviderErrorKind::Authentication,
-                    message: "Amazon Bedrock could not load AWS credentials".to_owned(),
-                };
+                return ProviderError::CredentialsUnavailable(
+                    "Amazon Bedrock could not load AWS credentials".to_owned(),
+                );
             }
         };
         ProviderError::Transport(message.to_owned())
@@ -597,10 +599,9 @@ impl AwsCredentialLeaseError {
 
     fn to_provider_error(self) -> ProviderError {
         match self {
-            Self::ProviderFailure => ProviderError::ResponseFailed {
-                kind: ProviderErrorKind::Authentication,
-                message: self.message().to_owned(),
-            },
+            Self::ProviderFailure => {
+                ProviderError::CredentialsUnavailable(self.message().to_owned())
+            }
             Self::CallerTimedOut
             | Self::CapacityUnavailable
             | Self::ProviderDeadlineExceeded
@@ -1306,10 +1307,11 @@ mod tests {
             let error = task.await.unwrap().unwrap_err();
             assert_eq!(error, AwsCredentialLeaseError::ProviderFailure);
             let error = error.to_provider_error();
-            assert_eq!(
-                error.to_string(),
-                format!("provider response failed: {CREDENTIAL_LOAD_FAILURE_MESSAGE}")
-            );
+            assert!(matches!(
+                &error,
+                ProviderError::CredentialsUnavailable(message)
+                    if message == CREDENTIAL_LOAD_FAILURE_MESSAGE
+            ));
             assert!(!error.to_string().contains("credential helper failed"));
             assert!(!error.to_string().contains("SUPER_SECRET"));
         }

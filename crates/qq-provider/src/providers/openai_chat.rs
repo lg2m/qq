@@ -50,7 +50,7 @@ pub(crate) enum ChatCompletionsAuth {
 
 /// A client for OpenAI-compatible Chat Completions endpoints.
 pub(crate) struct OpenAiChatCompletions {
-    exchange: HttpExchange,
+    pub(crate) exchange: HttpExchange,
     endpoint: reqwest::Url,
     headers: HeaderMap,
 }
@@ -103,16 +103,6 @@ impl OpenAiChatCompletions {
             endpoint,
             headers,
         })
-    }
-
-    /// Disables pre-stream HTTP retries for this client.
-    ///
-    /// Live canaries and single-shot probes use this so one overloaded or
-    /// rate-limited response is not spent across multiple attempts.
-    #[must_use]
-    pub(crate) fn without_retries(mut self) -> Self {
-        self.exchange = support::without_retries(self.exchange);
-        self
     }
 }
 

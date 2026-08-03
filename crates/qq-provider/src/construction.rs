@@ -76,18 +76,15 @@ impl CompiledHttpProvider {
 
     #[must_use]
     pub(crate) fn without_retries(self) -> Self {
-        match self {
-            Self::OpenAiResponses(provider) => Self::OpenAiResponses(provider.without_retries()),
-            Self::OpenAiChatCompletions(provider) => {
-                Self::OpenAiChatCompletions(provider.without_retries())
-            }
-            Self::AnthropicMessages(provider) => {
-                Self::AnthropicMessages(provider.without_retries())
-            }
-            Self::GoogleGenerateContent(provider) => {
-                Self::GoogleGenerateContent(provider.without_retries())
-            }
-        }
+        let mut provider = self;
+        let exchange = match &mut provider {
+            Self::OpenAiResponses(provider) => &mut provider.exchange,
+            Self::OpenAiChatCompletions(provider) => &mut provider.exchange,
+            Self::AnthropicMessages(provider) => &mut provider.exchange,
+            Self::GoogleGenerateContent(provider) => &mut provider.exchange,
+        };
+        exchange.disable_retries();
+        provider
     }
 }
 

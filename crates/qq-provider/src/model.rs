@@ -226,6 +226,8 @@ pub struct ProviderUsage {
 pub enum ProviderError {
     #[error("provider configuration is invalid: {0}")]
     Configuration(String),
+    #[error("provider credentials are unavailable: {0}")]
+    CredentialsUnavailable(String),
     #[error("provider request failed: {0}")]
     Transport(String),
     #[error("provider returned HTTP {status}: {message}")]
@@ -246,6 +248,7 @@ impl ProviderError {
     pub const fn kind(&self) -> ProviderErrorKind {
         match self {
             Self::Configuration(_) => ProviderErrorKind::Configuration,
+            Self::CredentialsUnavailable(_) => ProviderErrorKind::Authentication,
             Self::Transport(_) => ProviderErrorKind::Transport,
             Self::Api { status, .. } => match *status {
                 400 | 404 | 409 | 422 => ProviderErrorKind::InvalidRequest,

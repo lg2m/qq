@@ -281,9 +281,14 @@ impl HttpExchange {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
+    }
+
+    pub(crate) fn disable_retries(&mut self) {
+        self.retry = RetryPolicy::disabled();
     }
 
     pub(crate) fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {

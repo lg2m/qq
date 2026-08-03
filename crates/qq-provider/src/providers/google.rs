@@ -47,7 +47,7 @@ pub(crate) enum GoogleAuth {
 
 /// A client for Google GenerateContent-compatible endpoints.
 pub(crate) struct GoogleGenerateContent {
-    exchange: HttpExchange,
+    pub(crate) exchange: HttpExchange,
     endpoint: reqwest::Url,
     endpoint_kind: EndpointKind,
     headers: HeaderMap,
@@ -72,16 +72,6 @@ impl GoogleGenerateContent {
             endpoint_kind,
             headers,
         })
-    }
-
-    /// Disables pre-stream HTTP retries for this client.
-    ///
-    /// Live canaries and single-shot probes use this so one overloaded or
-    /// rate-limited response is not spent across multiple attempts.
-    #[must_use]
-    pub(crate) fn without_retries(mut self) -> Self {
-        self.exchange = support::without_retries(self.exchange);
-        self
     }
 
     fn request_endpoint(&self, model: &str) -> Result<reqwest::Url, ProviderError> {

@@ -113,7 +113,25 @@ const CASES: &[CanaryCase] = &[
         auth: "default-aws-chain",
         model: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         model_env: "QQ_CANARY_BEDROCK_MODEL",
-        recipe: RecipeKind::AmazonBedrock,
+        recipe: RecipeKind::AmazonBedrock(AwsCredentialKind::DefaultChain),
+    },
+    CanaryCase {
+        id: "amazon-bedrock-converse-stream-profile",
+        provider: ProviderName::AmazonBedrock,
+        protocol: "converse-stream",
+        auth: "named-aws-profile",
+        model: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        model_env: "QQ_CANARY_BEDROCK_MODEL",
+        recipe: RecipeKind::AmazonBedrock(AwsCredentialKind::Profile("QQ_CANARY_AWS_PROFILE")),
+    },
+    CanaryCase {
+        id: "amazon-bedrock-converse-stream-api-key",
+        provider: ProviderName::AmazonBedrock,
+        protocol: "converse-stream",
+        auth: "bedrock-api-key",
+        model: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        model_env: "QQ_CANARY_BEDROCK_MODEL",
+        recipe: RecipeKind::AmazonBedrock(AwsCredentialKind::ApiKey("QQ_CANARY_BEDROCK_API_KEY")),
     },
     CanaryCase {
         id: "bedrock-mantle-responses",
@@ -122,7 +140,10 @@ const CASES: &[CanaryCase] = &[
         auth: "default-aws-chain-sigv4",
         model: "openai.gpt-oss-120b",
         model_env: "QQ_CANARY_MANTLE_RESPONSES_MODEL",
-        recipe: RecipeKind::BedrockMantle(HttpProtocol::OpenAiResponses),
+        recipe: RecipeKind::BedrockMantle {
+            protocol: HttpProtocol::OpenAiResponses,
+            credential: AwsCredentialKind::DefaultChain,
+        },
     },
     CanaryCase {
         id: "bedrock-mantle-chat-completions",
@@ -131,7 +152,10 @@ const CASES: &[CanaryCase] = &[
         auth: "default-aws-chain-sigv4",
         model: "openai.gpt-oss-120b",
         model_env: "QQ_CANARY_MANTLE_CHAT_MODEL",
-        recipe: RecipeKind::BedrockMantle(HttpProtocol::OpenAiChatCompletions),
+        recipe: RecipeKind::BedrockMantle {
+            protocol: HttpProtocol::OpenAiChatCompletions,
+            credential: AwsCredentialKind::DefaultChain,
+        },
     },
     CanaryCase {
         id: "bedrock-mantle-anthropic-messages",
@@ -140,7 +164,46 @@ const CASES: &[CanaryCase] = &[
         auth: "default-aws-chain-sigv4",
         model: "anthropic.claude-haiku-4-5-20251001-v1:0",
         model_env: "QQ_CANARY_MANTLE_ANTHROPIC_MODEL",
-        recipe: RecipeKind::BedrockMantle(HttpProtocol::AnthropicMessages),
+        recipe: RecipeKind::BedrockMantle {
+            protocol: HttpProtocol::AnthropicMessages,
+            credential: AwsCredentialKind::DefaultChain,
+        },
+    },
+    CanaryCase {
+        id: "bedrock-mantle-responses-api-key",
+        provider: ProviderName::BedrockMantle,
+        protocol: "responses",
+        auth: "bedrock-api-key",
+        model: "openai.gpt-oss-120b",
+        model_env: "QQ_CANARY_MANTLE_RESPONSES_MODEL",
+        recipe: RecipeKind::BedrockMantle {
+            protocol: HttpProtocol::OpenAiResponses,
+            credential: AwsCredentialKind::ApiKey("QQ_CANARY_MANTLE_API_KEY"),
+        },
+    },
+    CanaryCase {
+        id: "bedrock-mantle-chat-completions-api-key",
+        provider: ProviderName::BedrockMantle,
+        protocol: "chat-completions",
+        auth: "bedrock-api-key",
+        model: "openai.gpt-oss-120b",
+        model_env: "QQ_CANARY_MANTLE_CHAT_MODEL",
+        recipe: RecipeKind::BedrockMantle {
+            protocol: HttpProtocol::OpenAiChatCompletions,
+            credential: AwsCredentialKind::ApiKey("QQ_CANARY_MANTLE_API_KEY"),
+        },
+    },
+    CanaryCase {
+        id: "bedrock-mantle-anthropic-messages-api-key",
+        provider: ProviderName::BedrockMantle,
+        protocol: "anthropic-messages",
+        auth: "bedrock-api-key",
+        model: "anthropic.claude-haiku-4-5-20251001-v1:0",
+        model_env: "QQ_CANARY_MANTLE_ANTHROPIC_MODEL",
+        recipe: RecipeKind::BedrockMantle {
+            protocol: HttpProtocol::AnthropicMessages,
+            credential: AwsCredentialKind::ApiKey("QQ_CANARY_MANTLE_API_KEY"),
+        },
     },
 ];
 
@@ -237,6 +300,13 @@ enum CredentialKind {
 }
 
 #[derive(Clone, Copy)]
+enum AwsCredentialKind {
+    DefaultChain,
+    Profile(&'static str),
+    ApiKey(&'static str),
+}
+
+#[derive(Clone, Copy)]
 enum RecipeKind {
     Http {
         endpoint: &'static str,
@@ -244,8 +314,23 @@ enum RecipeKind {
         protocol: HttpProtocol,
         credential: CredentialKind,
     },
-    AmazonBedrock,
-    BedrockMantle(HttpProtocol),
+    AmazonBedrock(AwsCredentialKind),
+    BedrockMantle {
+        protocol: HttpProtocol,
+        credential: AwsCredentialKind,
+    },
+}
+
+impl RecipeKind {
+    const fn needs_credential_store(self) -> bool {
+        matches!(
+            self,
+            Self::Http {
+                credential: CredentialKind::OpenAiCodex | CredentialKind::XAi,
+                ..
+            }
+        )
+    }
 }
 
 struct CanaryCase {
@@ -259,7 +344,7 @@ struct CanaryCase {
 }
 
 struct ProbeResult {
-    outcome: &'static str,
+    outcome: Outcome,
     marker: bool,
     event_count: u64,
     output_bytes: usize,
@@ -269,8 +354,9 @@ struct ProbeResult {
 }
 
 impl ProbeResult {
-    fn failure(
+    fn error(
         started: Instant,
+        outcome: Outcome,
         marker: bool,
         event_count: u64,
         output_bytes: usize,
@@ -278,7 +364,7 @@ impl ProbeResult {
         error_kind: impl Into<String>,
     ) -> Self {
         Self {
-            outcome: "fail",
+            outcome,
             marker,
             event_count,
             output_bytes,
@@ -288,6 +374,36 @@ impl ProbeResult {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Pass,
+    Fail,
+    Skip,
+    InfrastructureError,
+}
+
+impl Outcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+            Self::InfrastructureError => "infrastructure-error",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProbeDeadlines {
+    first_token: Duration,
+    total: Duration,
+}
+
+const LIVE_DEADLINES: ProbeDeadlines = ProbeDeadlines {
+    first_token: FIRST_TOKEN_TIMEOUT,
+    total: TOTAL_TIMEOUT,
+};
 
 enum SetupError {
     Skip(&'static str),
@@ -304,8 +420,12 @@ enum XtaskError {
     OfflineLaunch(#[source] io::Error),
     #[error("offline provider gate failed with status {0:?}")]
     OfflineFailed(Option<i32>),
+    #[error("offline provider gate task stopped unexpectedly")]
+    OfflineTask(#[source] tokio::task::JoinError),
     #[error("provider compiler construction failed")]
     Compiler(#[source] ProviderError),
+    #[error("live provider setup task stopped unexpectedly")]
+    LiveSetupTask(#[source] tokio::task::JoinError),
     #[error("one or more live provider checks did not pass")]
     LiveFailed,
 }
@@ -324,14 +444,20 @@ async fn try_run(cli: Cli) -> Result<(), XtaskError> {
     match cli.command {
         Task::Providers(args) => match args.command {
             ProvidersCommand::Check(args) => match args.mode {
-                CheckMode::Offline => run_offline(),
+                CheckMode::Offline => run_offline().await,
                 CheckMode::Live(args) => run_live(args).await,
             },
         },
     }
 }
 
-fn run_offline() -> Result<(), XtaskError> {
+async fn run_offline() -> Result<(), XtaskError> {
+    tokio::task::spawn_blocking(run_offline_blocking)
+        .await
+        .map_err(XtaskError::OfflineTask)?
+}
+
+fn run_offline_blocking() -> Result<(), XtaskError> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = ProcessCommand::new(cargo)
         .args(["test", "-p", "qq-provider"])
@@ -343,57 +469,61 @@ fn run_offline() -> Result<(), XtaskError> {
     Ok(())
 }
 
+struct PreparedCase {
+    case: &'static CanaryCase,
+    model: String,
+    provider: Result<Arc<dyn Provider>, SetupResult>,
+}
+
+struct SetupResult {
+    outcome: Outcome,
+    reason: &'static str,
+}
+
+struct LiveSetup {
+    cases: Vec<PreparedCase>,
+    commit: String,
+    region: Option<String>,
+}
+
 async fn run_live(args: LiveArgs) -> Result<(), XtaskError> {
     if env::var(LIVE_OPT_IN).ok().as_deref() != Some("1") {
         return Err(XtaskError::LiveOptInRequired);
     }
     let selected = selected_cases(&args)?;
-    let compiler = ProviderCompiler::new().map_err(XtaskError::Compiler)?;
-    let needs_store = selected.iter().any(|case| {
-        matches!(
-            case.recipe,
-            RecipeKind::Http {
-                credential: CredentialKind::OpenAiCodex | CredentialKind::XAi,
-                ..
-            }
-        )
-    });
-    let store = needs_store.then(CredentialStore::system).transpose();
-    let commit = git_commit();
+    let setup = tokio::task::spawn_blocking(move || prepare_live(selected))
+        .await
+        .map_err(XtaskError::LiveSetupTask)??;
     let timestamp = unix_timestamp();
     let mut all_passed = true;
 
-    for case in selected {
-        let recipe = match case.recipe(store.as_ref().ok().and_then(Option::as_ref)) {
-            Ok(recipe) => recipe,
-            Err(SetupError::Skip(reason)) => {
-                print_setup_result(case, timestamp, &commit, "skip", reason);
-                all_passed = false;
-                continue;
-            }
-            Err(SetupError::Infrastructure(reason)) => {
-                print_setup_result(case, timestamp, &commit, "infrastructure-error", reason);
-                all_passed = false;
-                continue;
-            }
-        };
-        let provider = match compiler.compile_for_canary(recipe) {
+    for prepared in setup.cases {
+        let provider = match prepared.provider {
             Ok(provider) => provider,
-            Err(error) => {
+            Err(result) => {
                 print_setup_result(
-                    case,
+                    prepared.case,
+                    &prepared.model,
+                    setup.region.as_deref(),
                     timestamp,
-                    &commit,
-                    "fail",
-                    provider_error_kind(&error),
+                    &setup.commit,
+                    result.outcome,
+                    result.reason,
                 );
                 all_passed = false;
                 continue;
             }
         };
-        let result = probe(provider, case.model()).await;
-        print_probe_result(case, timestamp, &commit, &result);
-        all_passed &= result.outcome == "pass";
+        let result = probe(provider, prepared.model.clone()).await;
+        print_probe_result(
+            prepared.case,
+            &prepared.model,
+            setup.region.as_deref(),
+            timestamp,
+            &setup.commit,
+            &result,
+        );
+        all_passed &= result.outcome == Outcome::Pass;
     }
 
     if all_passed {
@@ -401,6 +531,53 @@ async fn run_live(args: LiveArgs) -> Result<(), XtaskError> {
     } else {
         Err(XtaskError::LiveFailed)
     }
+}
+
+fn prepare_live(selected: Vec<&'static CanaryCase>) -> Result<LiveSetup, XtaskError> {
+    let compiler = ProviderCompiler::new().map_err(XtaskError::Compiler)?;
+    let needs_store = selected
+        .iter()
+        .any(|case| case.recipe.needs_credential_store());
+    let store = needs_store.then(CredentialStore::system).transpose();
+    let commit = git_commit();
+    let region = canary_region();
+    let cases = selected
+        .into_iter()
+        .map(|case| {
+            let model = case.model();
+            let recipe = match &store {
+                Err(_) if case.recipe.needs_credential_store() => {
+                    Err(SetupError::Infrastructure("credential-store-unavailable"))
+                }
+                store => case.recipe(store.as_ref().ok().and_then(Option::as_ref), region.clone()),
+            };
+            let provider = match recipe {
+                Ok(recipe) => compiler.compile_for_canary(recipe).map_err(|error| {
+                    let (outcome, reason) = classify_provider_error(&error);
+                    SetupResult { outcome, reason }
+                }),
+                Err(SetupError::Skip(reason)) => Err(SetupResult {
+                    outcome: Outcome::Skip,
+                    reason,
+                }),
+                Err(SetupError::Infrastructure(reason)) => Err(SetupResult {
+                    outcome: Outcome::InfrastructureError,
+                    reason,
+                }),
+            };
+            PreparedCase {
+                case,
+                model,
+                provider,
+            }
+        })
+        .collect();
+
+    Ok(LiveSetup {
+        cases,
+        commit,
+        region,
+    })
 }
 
 fn selected_cases(args: &LiveArgs) -> Result<Vec<&'static CanaryCase>, XtaskError> {
@@ -424,7 +601,11 @@ impl CanaryCase {
             .unwrap_or_else(|| self.model.to_owned())
     }
 
-    fn recipe(&self, store: Option<&CredentialStore>) -> Result<ProviderRecipe, SetupError> {
+    fn recipe(
+        &self,
+        store: Option<&CredentialStore>,
+        region: Option<String>,
+    ) -> Result<ProviderRecipe, SetupError> {
         match self.recipe {
             RecipeKind::Http {
                 endpoint,
@@ -434,9 +615,7 @@ impl CanaryCase {
             } => {
                 let auth = match credential {
                     CredentialKind::Environment(name) => {
-                        let value = env::var(name)
-                            .ok()
-                            .filter(|value| !value.trim().is_empty())
+                        let value = environment_value(name)
                             .ok_or(SetupError::Skip("credential-unavailable"))?;
                         HttpAuth::ApiKey(value.into())
                     }
@@ -455,9 +634,7 @@ impl CanaryCase {
                     CredentialKind::XAi => {
                         let store = store
                             .ok_or(SetupError::Infrastructure("credential-store-unavailable"))?;
-                        let environment_present = env::var("XAI_API_KEY")
-                            .ok()
-                            .is_some_and(|value| !value.trim().is_empty());
+                        let environment_present = environment_value("XAI_API_KEY").is_some();
                         if !environment_present {
                             let stored_present = store
                                 .status("xai/default")
@@ -478,23 +655,50 @@ impl CanaryCase {
                     endpoint, protocol, auth,
                 )))
             }
-            RecipeKind::AmazonBedrock => Ok(ProviderRecipe::amazon_bedrock(
-                canary_region(),
-                BedrockAuth::DefaultChain,
+            RecipeKind::AmazonBedrock(credential) => Ok(ProviderRecipe::amazon_bedrock(
+                region,
+                aws_auth(credential)?,
             )),
-            RecipeKind::BedrockMantle(protocol) => Ok(ProviderRecipe::amazon_bedrock_mantle(
-                canary_region(),
+            RecipeKind::BedrockMantle {
                 protocol,
-                BedrockAuth::DefaultChain,
+                credential,
+            } => Ok(ProviderRecipe::amazon_bedrock_mantle(
+                region,
+                protocol,
+                aws_auth(credential)?,
             )),
         }
     }
 }
 
+fn aws_auth(credential: AwsCredentialKind) -> Result<BedrockAuth, SetupError> {
+    match credential {
+        AwsCredentialKind::DefaultChain => Ok(BedrockAuth::DefaultChain),
+        AwsCredentialKind::Profile(variable) => environment_value(variable)
+            .map(BedrockAuth::Profile)
+            .ok_or(SetupError::Skip("credential-unavailable")),
+        AwsCredentialKind::ApiKey(variable) => environment_value(variable)
+            .map(|value| BedrockAuth::ApiKey(value.into()))
+            .ok_or(SetupError::Skip("credential-unavailable")),
+    }
+}
+
+fn environment_value(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
 async fn probe(provider: Arc<dyn Provider>, model: String) -> ProbeResult {
+    probe_with_deadlines(provider, model, LIVE_DEADLINES).await
+}
+
+async fn probe_with_deadlines(
+    provider: Arc<dyn Provider>,
+    model: String,
+    deadlines: ProbeDeadlines,
+) -> ProbeResult {
     let started = Instant::now();
-    let first_token_deadline = started + FIRST_TOKEN_TIMEOUT;
-    let total_deadline = started + TOTAL_TIMEOUT;
+    let first_token_deadline = started + deadlines.first_token;
+    let total_deadline = started + deadlines.total;
     let mut stream = provider.stream(ModelRequest::new(
         model,
         vec![Message::user(format!("Reply only with {SMOKE_MARKER}"))],
@@ -521,8 +725,9 @@ async fn probe(provider: Arc<dyn Provider>, model: String) -> ProbeResult {
                 } else {
                     "first-token-timeout"
                 };
-                return ProbeResult::failure(
+                return ProbeResult::error(
                     started,
+                    Outcome::Fail,
                     output.contains(SMOKE_MARKER),
                     event_count,
                     output_bytes,
@@ -545,13 +750,15 @@ async fn probe(provider: Arc<dyn Provider>, model: String) -> ProbeResult {
             }
             Ok(_) => {}
             Err(error) => {
-                return ProbeResult::failure(
+                let (outcome, error_kind) = classify_provider_error(&error);
+                return ProbeResult::error(
                     started,
+                    outcome,
                     output.contains(SMOKE_MARKER),
                     event_count,
                     output_bytes,
                     first_token_ms,
-                    provider_error_kind(&error),
+                    error_kind,
                 );
             }
         }
@@ -568,7 +775,11 @@ async fn probe(provider: Arc<dyn Provider>, model: String) -> ProbeResult {
         None
     };
     ProbeResult {
-        outcome: if error_kind.is_some() { "fail" } else { "pass" },
+        outcome: if error_kind.is_some() {
+            Outcome::Fail
+        } else {
+            Outcome::Pass
+        },
         marker,
         event_count,
         output_bytes,
@@ -578,11 +789,21 @@ async fn probe(provider: Arc<dyn Provider>, model: String) -> ProbeResult {
     }
 }
 
+fn classify_provider_error(error: &ProviderError) -> (Outcome, &'static str) {
+    if matches!(error, ProviderError::CredentialsUnavailable(_)) {
+        (Outcome::Skip, "credential-unavailable")
+    } else {
+        (Outcome::Fail, provider_error_kind(error))
+    }
+}
+
 fn print_setup_result(
     case: &CanaryCase,
+    model: &str,
+    region: Option<&str>,
     timestamp: u64,
     commit: &str,
-    outcome: &str,
+    outcome: Outcome,
     reason: &str,
 ) {
     println!(
@@ -594,15 +815,22 @@ fn print_setup_result(
             "deployment": case.provider.as_str(),
             "protocol": case.protocol,
             "authentication": case.auth,
-            "region": canary_region(),
-            "model": case.model(),
-            "outcome": outcome,
+            "region": region,
+            "model": model,
+            "outcome": outcome.as_str(),
             "reason": reason,
         })
     );
 }
 
-fn print_probe_result(case: &CanaryCase, timestamp: u64, commit: &str, result: &ProbeResult) {
+fn print_probe_result(
+    case: &CanaryCase,
+    model: &str,
+    region: Option<&str>,
+    timestamp: u64,
+    commit: &str,
+    result: &ProbeResult,
+) {
     println!(
         "{}",
         json!({
@@ -612,9 +840,9 @@ fn print_probe_result(case: &CanaryCase, timestamp: u64, commit: &str, result: &
             "deployment": case.provider.as_str(),
             "protocol": case.protocol,
             "authentication": case.auth,
-            "region": canary_region(),
-            "model": case.model(),
-            "outcome": result.outcome,
+            "region": region,
+            "model": model,
+            "outcome": result.outcome.as_str(),
             "marker": result.marker,
             "event_count": result.event_count,
             "output_bytes": result.output_bytes,
@@ -671,7 +899,78 @@ fn git_commit() -> String {
 mod tests {
     use std::collections::BTreeSet;
 
+    use futures_util::stream;
+    use qq_provider::ProviderStream;
+
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum StubScenario {
+        Success,
+        MissingText,
+        MissingMarker,
+        MissingCompletion,
+        DuplicateCompletion,
+        ProviderFailure,
+        CredentialsUnavailable,
+        Pending,
+        TextThenPending,
+    }
+
+    struct StubProvider(StubScenario);
+
+    impl Provider for StubProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let output = |text: &str| {
+                Ok(ProviderEvent::OutputTextDelta {
+                    text: text.to_owned(),
+                })
+            };
+            let completed = || Ok(ProviderEvent::Completed { usage: None });
+
+            match self.0 {
+                StubScenario::Success => {
+                    Box::pin(stream::iter(vec![output(SMOKE_MARKER), completed()]))
+                }
+                StubScenario::MissingText => Box::pin(stream::iter(vec![completed()])),
+                StubScenario::MissingMarker => {
+                    Box::pin(stream::iter(vec![output("different"), completed()]))
+                }
+                StubScenario::MissingCompletion => {
+                    Box::pin(stream::iter(vec![output(SMOKE_MARKER)]))
+                }
+                StubScenario::DuplicateCompletion => Box::pin(stream::iter(vec![
+                    output(SMOKE_MARKER),
+                    completed(),
+                    completed(),
+                ])),
+                StubScenario::ProviderFailure => Box::pin(stream::iter(vec![Err(
+                    ProviderError::Transport("offline".to_owned()),
+                )])),
+                StubScenario::CredentialsUnavailable => Box::pin(stream::iter(vec![Err(
+                    ProviderError::CredentialsUnavailable("missing".to_owned()),
+                )])),
+                StubScenario::Pending => Box::pin(stream::pending()),
+                StubScenario::TextThenPending => {
+                    Box::pin(stream::iter(vec![output(SMOKE_MARKER)]).chain(stream::pending()))
+                }
+            }
+        }
+    }
+
+    async fn probe_stub(scenario: StubScenario, deadlines: ProbeDeadlines) -> ProbeResult {
+        probe_with_deadlines(
+            Arc::new(StubProvider(scenario)),
+            "test-model".to_owned(),
+            deadlines,
+        )
+        .await
+    }
+
+    const TEST_DEADLINES: ProbeDeadlines = ProbeDeadlines {
+        first_token: Duration::from_millis(20),
+        total: Duration::from_millis(20),
+    };
 
     #[test]
     fn parses_the_documented_provider_commands() {
@@ -701,7 +1000,7 @@ mod tests {
             .iter()
             .filter_map(|case| match case.recipe {
                 RecipeKind::Http { protocol, .. } => Some(protocol),
-                RecipeKind::AmazonBedrock | RecipeKind::BedrockMantle(_) => None,
+                RecipeKind::AmazonBedrock(_) | RecipeKind::BedrockMantle { .. } => None,
             })
             .collect::<Vec<_>>();
         for protocol in [
@@ -711,6 +1010,20 @@ mod tests {
             HttpProtocol::GoogleGenerateContent,
         ] {
             assert!(protocols.contains(&protocol));
+        }
+
+        for id in [
+            "amazon-bedrock-converse-stream",
+            "amazon-bedrock-converse-stream-profile",
+            "amazon-bedrock-converse-stream-api-key",
+            "bedrock-mantle-responses",
+            "bedrock-mantle-responses-api-key",
+            "bedrock-mantle-chat-completions",
+            "bedrock-mantle-chat-completions-api-key",
+            "bedrock-mantle-anthropic-messages",
+            "bedrock-mantle-anthropic-messages-api-key",
+        ] {
+            assert!(ids.contains(id), "missing executable matrix row {id}");
         }
     }
 
@@ -737,5 +1050,53 @@ mod tests {
         .unwrap();
         assert_eq!(google.len(), 1);
         assert_eq!(google[0].id, "google-generate-content");
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_one_marked_text_stream_and_one_completion() {
+        let result = probe_stub(StubScenario::Success, TEST_DEADLINES).await;
+        assert_eq!(result.outcome, Outcome::Pass);
+        assert!(result.marker);
+        assert_eq!(result.event_count, 2);
+        assert_eq!(result.error_kind, None);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_missing_text_marker_and_terminal_events() {
+        for (scenario, expected) in [
+            (StubScenario::MissingText, "missing-output-text"),
+            (StubScenario::MissingMarker, "smoke-marker-missing"),
+            (StubScenario::MissingCompletion, "invalid-terminal-count"),
+            (StubScenario::DuplicateCompletion, "invalid-terminal-count"),
+        ] {
+            let result = probe_stub(scenario, TEST_DEADLINES).await;
+            assert_eq!(result.outcome, Outcome::Fail);
+            assert_eq!(result.error_kind.as_deref(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_provider_failures_and_missing_credentials() {
+        let failed = probe_stub(StubScenario::ProviderFailure, TEST_DEADLINES).await;
+        assert_eq!(failed.outcome, Outcome::Fail);
+        assert_eq!(failed.error_kind.as_deref(), Some("transport"));
+
+        let skipped = probe_stub(StubScenario::CredentialsUnavailable, TEST_DEADLINES).await;
+        assert_eq!(skipped.outcome, Outcome::Skip);
+        assert_eq!(
+            skipped.error_kind.as_deref(),
+            Some("credential-unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_enforces_first_token_and_total_deadlines() {
+        let first = probe_stub(StubScenario::Pending, TEST_DEADLINES).await;
+        assert_eq!(first.outcome, Outcome::Fail);
+        assert_eq!(first.error_kind.as_deref(), Some("first-token-timeout"));
+
+        let total = probe_stub(StubScenario::TextThenPending, TEST_DEADLINES).await;
+        assert_eq!(total.outcome, Outcome::Fail);
+        assert_eq!(total.error_kind.as_deref(), Some("total-timeout"));
     }
 }

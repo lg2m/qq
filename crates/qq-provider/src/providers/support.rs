@@ -10,8 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    ProviderError, ProviderErrorKind, ProviderUsage,
-    http::{HttpExchange, HttpRejection, RetryPolicy},
+    ProviderError, ProviderErrorKind, ProviderUsage, http::HttpRejection,
     sanitize::sanitize_message,
 };
 
@@ -174,13 +173,4 @@ pub(crate) fn client_for_endpoint(
     } else {
         build_client()
     }
-}
-
-/// Disables pre-stream HTTP retries on an adapter's exchange.
-///
-/// Backs every adapter's public `without_retries`: live canaries and
-/// single-shot probes use it so one overloaded or rate-limited response is
-/// not spent across multiple attempts.
-pub(crate) fn without_retries(exchange: HttpExchange) -> HttpExchange {
-    exchange.with_retry_policy(RetryPolicy::disabled())
 }
