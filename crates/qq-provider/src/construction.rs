@@ -48,12 +48,40 @@ enum ResolvedHttpAuth {
     GoogleGenerateContent(GoogleAuth),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpRetryMode {
+    Default,
+    Disabled,
+}
+
 /// The concrete HTTP provider selected by compiled construction.
 pub(crate) enum CompiledHttpProvider {
     OpenAiResponses(OpenAi),
     OpenAiChatCompletions(OpenAiChatCompletions),
     AnthropicMessages(AnthropicMessages),
     GoogleGenerateContent(GoogleGenerateContent),
+}
+
+impl CompiledHttpProvider {
+    #[must_use]
+    pub(crate) fn with_retry_mode(self, retry_mode: HttpRetryMode) -> Self {
+        if retry_mode == HttpRetryMode::Default {
+            return self;
+        }
+
+        match self {
+            Self::OpenAiResponses(provider) => Self::OpenAiResponses(provider.without_retries()),
+            Self::OpenAiChatCompletions(provider) => {
+                Self::OpenAiChatCompletions(provider.without_retries())
+            }
+            Self::AnthropicMessages(provider) => {
+                Self::AnthropicMessages(provider.without_retries())
+            }
+            Self::GoogleGenerateContent(provider) => {
+                Self::GoogleGenerateContent(provider.without_retries())
+            }
+        }
+    }
 }
 
 impl Provider for CompiledHttpProvider {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{
     Provider, ProviderError, SharedRequestCredentialProvider,
     bedrock::{Bedrock, BedrockAuth},
-    construction::{HttpConstructionSpec, construct_http_provider},
+    construction::{HttpConstructionSpec, HttpRetryMode, construct_http_provider},
     credentials::SecretLiteral,
     http::{build_client, build_direct_client, validate_endpoint},
     mantle::Mantle,
@@ -29,8 +29,25 @@ impl ProviderCompiler {
 
     /// Validates and compiles one immutable provider recipe.
     pub fn compile(&self, recipe: ProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
+        self.compile_with_retry_mode(recipe, HttpRetryMode::Default)
+    }
+
+    /// Compiles one provider for an operational canary with adapter retries
+    /// disabled, so the probe observes exactly one provider attempt.
+    pub fn compile_for_canary(
+        &self,
+        recipe: ProviderRecipe,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
+        self.compile_with_retry_mode(recipe, HttpRetryMode::Disabled)
+    }
+
+    fn compile_with_retry_mode(
+        &self,
+        recipe: ProviderRecipe,
+        retry_mode: HttpRetryMode,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
         match recipe {
-            ProviderRecipe::Http(recipe) => self.compile_http(recipe),
+            ProviderRecipe::Http(recipe) => self.compile_http(recipe, retry_mode),
             ProviderRecipe::AmazonBedrock { region, auth } => {
                 Ok(Arc::new(Bedrock::new(auth, region)?))
             }
@@ -43,11 +60,16 @@ impl ProviderCompiler {
                 region,
                 protocol,
                 auth,
+                retry_mode,
             )?)),
         }
     }
 
-    fn compile_http(&self, recipe: HttpProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
+    fn compile_http(
+        &self,
+        recipe: HttpProviderRecipe,
+        retry_mode: HttpRetryMode,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
         let endpoint_kind = recipe.endpoint.kind;
         let endpoint = recipe.endpoint.resolve(recipe.protocol)?;
         let client = if endpoint.scheme() == "http" {
@@ -64,7 +86,9 @@ impl ProviderCompiler {
             headers: recipe.headers,
         };
 
-        Ok(Arc::new(construct_http_provider(client, spec)?))
+        Ok(Arc::new(
+            construct_http_provider(client, spec)?.with_retry_mode(retry_mode),
+        ))
     }
 }
 

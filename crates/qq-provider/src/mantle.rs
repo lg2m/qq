@@ -16,7 +16,7 @@ use crate::{
     compiler::{EndpointKind, HttpAuth, HttpProtocol},
     construction::{
         CompiledHttpProvider, GOOGLE_MANTLE_UNSUPPORTED_MESSAGE, HttpConstructionSpec,
-        construct_http_provider,
+        HttpRetryMode, construct_http_provider,
     },
     http::validate_endpoint,
     request_auth::RequestAuthorizer,
@@ -33,6 +33,7 @@ struct MantleInner {
     region: Option<String>,
     protocol: HttpProtocol,
     auth: BedrockAuth,
+    retry_mode: HttpRetryMode,
     provider: OnceCell<CompiledHttpProvider>,
     #[cfg(test)]
     warm_streams: std::sync::atomic::AtomicUsize,
@@ -55,6 +56,7 @@ impl Mantle {
         region: Option<String>,
         protocol: HttpProtocol,
         auth: BedrockAuth,
+        retry_mode: HttpRetryMode,
     ) -> Result<Self, ProviderError> {
         if protocol == HttpProtocol::GoogleGenerateContent {
             return Err(ProviderError::Configuration(
@@ -72,6 +74,7 @@ impl Mantle {
                     protocol,
                     HttpAuth::ApiKey(api_key.clone()),
                     None,
+                    retry_mode,
                 )
                 .map_err(|error| error.to_provider_error())?;
                 OnceCell::from(provider)
@@ -88,6 +91,7 @@ impl Mantle {
                 region,
                 protocol,
                 auth,
+                retry_mode,
                 provider,
                 #[cfg(test)]
                 warm_streams: std::sync::atomic::AtomicUsize::new(0),
@@ -141,6 +145,7 @@ impl MantleInner {
                 self.protocol,
                 HttpAuth::ApiKey(api_key.clone()),
                 None,
+                self.retry_mode,
             ),
             BedrockAuth::DefaultChain | BedrockAuth::Profile(_) => {
                 let credentials = config.credentials.ok_or_else(|| {
@@ -154,6 +159,7 @@ impl MantleInner {
                     self.protocol,
                     HttpAuth::NoAuth,
                     Some(RequestAuthorizer::bedrock_mantle_sigv4(region, credentials)),
+                    self.retry_mode,
                 )
             }
         }
@@ -166,6 +172,7 @@ fn construct_mantle_provider(
     protocol: HttpProtocol,
     auth: HttpAuth,
     authorizer: Option<RequestAuthorizer>,
+    retry_mode: HttpRetryMode,
 ) -> Result<CompiledHttpProvider, MantleInitError> {
     construct_http_provider(
         client,
@@ -178,6 +185,7 @@ fn construct_mantle_provider(
             headers: Vec::new(),
         },
     )
+    .map(|provider| provider.with_retry_mode(retry_mode))
     .map_err(MantleInitError::from)
 }
 
@@ -291,6 +299,7 @@ mod tests {
             Some("us-east-1".to_owned()),
             HttpProtocol::GoogleGenerateContent,
             BedrockAuth::ApiKey("mantle-test-secret".into()),
+            HttpRetryMode::Default,
         )
         .expect_err("Google must be rejected before Mantle initialization");
 
@@ -308,6 +317,7 @@ mod tests {
             Some("us-east-1".to_owned()),
             HttpProtocol::OpenAiResponses,
             BedrockAuth::ApiKey("mantle-test-secret".into()),
+            HttpRetryMode::Default,
         )
         .unwrap();
 
@@ -318,6 +328,7 @@ mod tests {
                 Some("us-east-1/path".to_owned()),
                 HttpProtocol::OpenAiResponses,
                 BedrockAuth::DefaultChain,
+                HttpRetryMode::Default,
             )
             .is_err()
         );
@@ -330,6 +341,7 @@ mod tests {
             Some("us-east-1".to_owned()),
             HttpProtocol::OpenAiResponses,
             BedrockAuth::ApiKey("mantle-test-secret".into()),
+            HttpRetryMode::Default,
         )
         .unwrap();
 
@@ -359,6 +371,7 @@ mod tests {
                     HttpProtocol::OpenAiResponses,
                     HttpAuth::ApiKey("mantle-test-secret".into()),
                     None,
+                    HttpRetryMode::Default,
                 )
             })
             .await;
@@ -382,6 +395,7 @@ mod tests {
                 protocol,
                 HttpAuth::ApiKey("mantle-test-secret".into()),
                 None,
+                HttpRetryMode::Default,
             )
             .unwrap();
 
@@ -466,6 +480,7 @@ mod tests {
                 protocol,
                 HttpAuth::ApiKey("mantle-test-secret".into()),
                 None,
+                HttpRetryMode::Default,
             )
             .unwrap();
             let events = provider
@@ -512,6 +527,7 @@ mod tests {
             HttpProtocol::OpenAiResponses,
             HttpAuth::NoAuth,
             Some(authorizer),
+            HttpRetryMode::Default,
         )
         .unwrap();
 
