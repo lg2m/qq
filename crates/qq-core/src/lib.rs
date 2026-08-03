@@ -43,20 +43,18 @@ pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
 type RuntimeStream = Pin<Box<dyn Stream<Item = RuntimeEvent> + Send + 'static>>;
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 16;
-// A runaway-loop backstop, not a work limiter: routine agentic tasks
-// must finish well below it. Exhaustion settles the run with a
-// tool-free final turn, never a failure, so the session always
-// continues from where the run stopped.
-const MAX_TOOL_CALLS_PER_RUN: usize = 256;
-// Leave room for the reserved final answer after the last permitted
-// tool call.
-const MAX_MODEL_TURNS: u16 = MAX_TOOL_CALLS_PER_RUN as u16 + 1;
-// Appended to the system prompt on the reserved final turn so the
-// model closes the run in a resumable state instead of attempting
-// more work.
-const TOOL_BUDGET_NOTICE: &str = "This run has used its entire tool budget, so no tools are \
-available for this reply. Summarize what was accomplished, what remains, and the exact next \
-step. The session keeps this full history: the next prompt resumes where this run stopped.";
+// A runaway-loop backstop for one internal execution slice, not a task
+// completion limit. Before a new model turn can exceed this ceiling, QQ
+// records a tool-free checkpoint, resets the counter, and continues the same
+// run with tools restored.
+const MAX_TOOL_CALLS_PER_SLICE: usize = 256;
+const SLICE_CHECKPOINT_NOTICE: &str = "This execution slice is at its safe tool-call boundary, so no tools \
+are available for this reply. Record a concise checkpoint of what was accomplished, what \
+remains, and the exact next step. QQ will persist this checkpoint and continue the same run \
+with tools restored.";
+const SLICE_CONTINUATION_NOTICE: &str = "Continue the task from the preceding persisted \
+checkpoint. Tools are available again. Do not stop at a progress summary: complete the user's \
+request unless an explicit overall budget, cancellation, or genuine failure prevents it.";
 const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_TOOL_CALL_ID_BYTES: usize = 1_024;
 const MAX_TOOL_NAME_BYTES: usize = 128;
@@ -568,16 +566,20 @@ impl Runtime {
             }
             let system: Arc<str> = Arc::from(agent_system_prompt(workspace.path(), &tool_specs));
 
-            let mut total_tool_calls = 0_usize;
+            let mut slice_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
-            for turn_ordinal in 1..=MAX_MODEL_TURNS {
-                // Once the tool budget is spent (or only the reserved turn
-                // remains), the model gets one tool-free turn to settle.
-                // The run then completes normally, so every committed turn
-                // stays valid context and a follow-up prompt resumes where
-                // this run stopped — budget exhaustion is never a failure.
-                let final_turn = total_tool_calls >= MAX_TOOL_CALLS_PER_RUN
-                    || turn_ordinal == MAX_MODEL_TURNS;
+            let mut continuing_slice = false;
+            for turn_ordinal in 1..=u16::MAX {
+                // Reserve enough capacity for the largest valid provider
+                // turn. Without this reservation, a slice at (for example)
+                // 255 calls could accept a 16-call turn and overshoot its
+                // strict ceiling before reaching the next turn boundary.
+                // The tool-free checkpoint is persisted but is not the run's
+                // terminal outcome; the next turn starts a new slice.
+                let checkpoint_turn = slice_tool_calls
+                    .saturating_add(MAX_TOOL_CALLS_PER_TURN)
+                    > MAX_TOOL_CALLS_PER_SLICE;
+                let continuation_turn = std::mem::take(&mut continuing_slice);
                 // Transient provider failures (overload, rate limits, dropped
                 // connections) re-issue this turn with backoff instead of
                 // failing the run — but only while nothing user-visible has
@@ -586,8 +588,12 @@ impl Runtime {
                 let (blocks, pending_calls, terminal_usage) = 'turn: loop {
                 let request =
                     ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens);
-                let request = if final_turn {
-                    request.with_system(format!("{system}\n\n{TOOL_BUDGET_NOTICE}"))
+                let request = if checkpoint_turn {
+                    request.with_system(format!("{system}\n\n{SLICE_CHECKPOINT_NOTICE}"))
+                } else if continuation_turn {
+                    request
+                        .with_tools(tool_specs.clone())
+                        .with_system(format!("{system}\n\n{SLICE_CONTINUATION_NOTICE}"))
                 } else {
                     request
                         .with_tools(tool_specs.clone())
@@ -717,13 +723,14 @@ impl Runtime {
                                 };
                                 return;
                             }
-                            // The per-run budget is enforced at the top of the
-                            // turn, where it settles gracefully; a call arriving
-                            // on the reserved tool-free turn is a provider bug.
-                            if final_turn {
+                            // The per-slice ceiling reserves a complete turn
+                            // at the top of the loop; a call arriving on the
+                            // declared tool-free checkpoint turn is a provider
+                            // bug.
+                            if checkpoint_turn {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,
-                                    message: "provider requested a tool on the reserved final turn, which declares none".to_owned(),
+                                    message: "provider requested a tool on the tool-free checkpoint turn, which declares none".to_owned(),
                                 };
                                 return;
                             }
@@ -744,7 +751,7 @@ impl Runtime {
                                 argument_error: None,
                                 completed: false,
                             });
-                            total_tool_calls += 1;
+                            slice_tool_calls += 1;
                             blocks.push(TurnBlock::ToolCall(index));
                         }
                         Ok(ProviderEvent::ToolCallArgumentsDelta { id, json }) => {
@@ -928,6 +935,19 @@ impl Runtime {
                     calls: calls.clone(),
                 };
 
+                if checkpoint_turn && !assistant.has_content() {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::ProviderResponse,
+                        message: "provider returned an empty slice checkpoint".to_owned(),
+                    };
+                    return;
+                }
+                if calls.is_empty() && checkpoint_turn {
+                    messages.push(assistant);
+                    slice_tool_calls = 0;
+                    continuing_slice = true;
+                    continue;
+                }
                 if calls.is_empty() {
                     yield RuntimeEvent::Completed;
                     return;
@@ -1137,7 +1157,7 @@ impl Runtime {
 
             yield RuntimeEvent::Failed {
                 kind: RunFailureKind::Policy,
-                message: format!("tool loop exceeded {MAX_MODEL_TURNS} model turns"),
+                message: "run exhausted the durable u16 model-turn ordinal space".to_owned(),
             };
         })
     }
@@ -2191,7 +2211,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforces_per_turn_and_per_run_tool_call_limits() {
+    async fn renews_the_internal_tool_budget_until_the_task_completes() {
+        struct CompletesAfterCheckpoint {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+            emitted: Arc<Mutex<usize>>,
+            checkpoint_at: Arc<Mutex<Option<usize>>>,
+        }
+
+        impl Provider for CompletesAfterCheckpoint {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                self.requests.lock().unwrap().push(request.clone());
+                if request.tools().is_empty() {
+                    let emitted = *self.emitted.lock().unwrap();
+                    *self.checkpoint_at.lock().unwrap() = Some(emitted);
+                    return Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "slice checkpoint".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]));
+                }
+
+                let mut emitted = self.emitted.lock().unwrap();
+                let required = MAX_TOOL_CALLS_PER_SLICE + 1;
+                if *emitted >= required {
+                    return Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "task complete".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]));
+                }
+
+                // Fifteen calls per provider turn deliberately leaves the
+                // first slice at 255. A rollover implementation that checks
+                // only after a turn would accept two more calls and overshoot
+                // the 256-call ceiling.
+                let first = *emitted;
+                let count = (required - first).min(MAX_TOOL_CALLS_PER_TURN - 1);
+                *emitted += count;
+                drop(emitted);
+                let mut events = Vec::with_capacity(count * 3 + 1);
+                for index in first..first + count {
+                    let id = format!("call-{index}");
+                    events.push(Ok(ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "unknown".to_owned(),
+                    }));
+                    events.push(Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: "{}".to_owned(),
+                    }));
+                    events.push(Ok(ProviderEvent::ToolCallCompleted { id }));
+                }
+                events.push(Ok(ProviderEvent::Completed { usage: None }));
+                Box::pin(stream::iter(events))
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let emitted = Arc::new(Mutex::new(0));
+        let checkpoint_at = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            CompletesAfterCheckpoint {
+                requests: Arc::clone(&requests),
+                emitted: Arc::clone(&emitted),
+                checkpoint_at: Arc::clone(&checkpoint_at),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run(RunCommand::new("finish a long task"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events.last(), Some(&RunEvent::Completed));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::OutputTextDelta { text } if text == "slice checkpoint"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::OutputTextDelta { text } if text == "task complete"
+        )));
+        assert_eq!(*emitted.lock().unwrap(), MAX_TOOL_CALLS_PER_SLICE + 1);
+        assert_eq!(*checkpoint_at.lock().unwrap(), Some(255));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RunEvent::Completed))
+                .count(),
+            1
+        );
+        let requests = requests.lock().unwrap();
+        let checkpoint_index = requests
+            .iter()
+            .position(|request| request.tools().is_empty())
+            .unwrap();
+        assert!(!requests[checkpoint_index + 1].tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enforces_the_per_turn_limit_and_checkpoint_request_contract() {
         struct TooManyInOneTurn;
 
         impl Provider for TooManyInOneTurn {
@@ -2220,113 +2343,6 @@ mod tests {
                 ..
             })
         ));
-
-        struct RespectsFinalTurn {
-            turn: Arc<Mutex<usize>>,
-        }
-
-        impl Provider for RespectsFinalTurn {
-            fn stream(&self, request: ModelRequest) -> ProviderStream {
-                let mut turn = self.turn.lock().unwrap();
-                let current = *turn;
-                *turn += 1;
-                drop(turn);
-                // The reserved final turn declares no tools; a conforming
-                // provider answers with text and completes.
-                if request.tools().is_empty() {
-                    return Box::pin(stream::iter([
-                        Ok(ProviderEvent::OutputTextDelta {
-                            text: "stopping point recorded".to_owned(),
-                        }),
-                        Ok(ProviderEvent::Completed { usage: None }),
-                    ]));
-                }
-                let mut events = Vec::with_capacity(MAX_TOOL_CALLS_PER_TURN * 3 + 1);
-                for index in 0..MAX_TOOL_CALLS_PER_TURN {
-                    let id = format!("call-{current}-{index}");
-                    events.push(Ok(ProviderEvent::ToolCallStarted {
-                        id: id.clone(),
-                        name: "unknown".to_owned(),
-                    }));
-                    events.push(Ok(ProviderEvent::ToolCallArgumentsDelta {
-                        id: id.clone(),
-                        json: "{}".to_owned(),
-                    }));
-                    events.push(Ok(ProviderEvent::ToolCallCompleted { id }));
-                }
-                events.push(Ok(ProviderEvent::Completed { usage: None }));
-                Box::pin(stream::iter(events))
-            }
-        }
-
-        // A model that would consume tools forever settles gracefully:
-        // exhausting the budget triggers one tool-free final turn and the
-        // run completes, leaving the session resumable instead of failed.
-        let turns = Arc::new(Mutex::new(0));
-        let runtime = Runtime::new(
-            RespectsFinalTurn {
-                turn: Arc::clone(&turns),
-            },
-            "gpt-test",
-            256,
-        )
-        .unwrap();
-        let events = runtime
-            .run(RunCommand::new("hello"))
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(events.last(), Some(&RunEvent::Completed));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RunEvent::OutputTextDelta { text } if text == "stopping point recorded"
-        )));
-        assert_eq!(
-            *turns.lock().unwrap(),
-            MAX_TOOL_CALLS_PER_RUN / MAX_TOOL_CALLS_PER_TURN + 1
-        );
-
-        struct FiniteToolTurns {
-            turn: Mutex<usize>,
-        }
-
-        impl Provider for FiniteToolTurns {
-            fn stream(&self, _: ModelRequest) -> ProviderStream {
-                let mut turn = self.turn.lock().unwrap();
-                let current = *turn;
-                *turn += 1;
-                drop(turn);
-                if current == MAX_TOOL_CALLS_PER_RUN {
-                    return Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]));
-                }
-                let id = format!("call-{current}");
-                Box::pin(stream::iter([
-                    Ok(ProviderEvent::ToolCallStarted {
-                        id: id.clone(),
-                        name: "unknown".to_owned(),
-                    }),
-                    Ok(ProviderEvent::ToolCallArgumentsDelta {
-                        id: id.clone(),
-                        json: "{}".to_owned(),
-                    }),
-                    Ok(ProviderEvent::ToolCallCompleted { id }),
-                    Ok(ProviderEvent::Completed { usage: None }),
-                ]))
-            }
-        }
-
-        let runtime = Runtime::new(
-            FiniteToolTurns {
-                turn: Mutex::new(0),
-            },
-            "gpt-test",
-            256,
-        )
-        .unwrap();
-        let events = runtime
-            .run(RunCommand::new("hello"))
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(events.last(), Some(&RunEvent::Completed));
 
         struct EndlessToolTurns {
             turn: Mutex<usize>,
@@ -2365,14 +2381,84 @@ mod tests {
             .run(RunCommand::new("hello"))
             .collect::<Vec<_>>()
             .await;
-        // A provider that emits a tool call on the reserved tool-free
-        // final turn is violating the request, not the run policy.
+        // A provider that emits a tool call on the tool-free checkpoint turn
+        // is violating the request, not the run policy.
         assert!(matches!(
             events.last(),
             Some(RunEvent::Failed {
                 kind: RunFailureKind::ProviderProtocol,
                 message,
-            }) if message.contains("reserved final turn")
+            }) if message.contains("checkpoint turn")
+        ));
+
+        struct EmptyCheckpoint {
+            turn: Mutex<usize>,
+        }
+
+        impl Provider for EmptyCheckpoint {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                if request.tools().is_empty() {
+                    return Box::pin(stream::iter([Ok(ProviderEvent::Completed {
+                        usage: Some(qq_provider::ProviderUsage {
+                            input_tokens: 3,
+                            cache_read_input_tokens: 1,
+                            cache_write_input_tokens: 2,
+                            output_tokens: 5,
+                        }),
+                    })]));
+                }
+
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                let mut events = Vec::with_capacity(MAX_TOOL_CALLS_PER_TURN * 3 + 1);
+                for index in 0..MAX_TOOL_CALLS_PER_TURN {
+                    let id = format!("empty-checkpoint-{current}-{index}");
+                    events.push(Ok(ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "unknown".to_owned(),
+                    }));
+                    events.push(Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: "{}".to_owned(),
+                    }));
+                    events.push(Ok(ProviderEvent::ToolCallCompleted { id }));
+                }
+                events.push(Ok(ProviderEvent::Completed { usage: None }));
+                Box::pin(stream::iter(events))
+            }
+        }
+
+        let runtime = Runtime::new(
+            EmptyCheckpoint {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: 3,
+                    cache_read_input_tokens: 1,
+                    cache_write_input_tokens: 2,
+                    output_tokens: 5,
+                }
+            }
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderResponse,
+                message,
+            }) if message == "provider returned an empty slice checkpoint"
         ));
     }
 

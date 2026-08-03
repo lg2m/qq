@@ -20,9 +20,9 @@ use futures_util::StreamExt;
 use qq_core::{SessionRuntime, SessionRuntimeError};
 use qq_protocol::{
     ApprovalDecision, ApprovalMode, CommandId, CommandOutcome, CommandReceipt, MessageId,
-    MessageRole, ModelSelection, RunActivity, RunId, RunOutcome, SessionCommand, SessionEvent,
-    SessionEventEnvelope, SessionId, SnapshotRequest, SubscribeRequest, TokenUsage, ToolCallState,
-    WorkspaceId,
+    MessageRole, ModelSelection, RunActivity, RunId, RunOutcome, SessionAccounting, SessionCommand,
+    SessionEvent, SessionEventEnvelope, SessionId, SnapshotRequest, SubscribeRequest, TokenUsage,
+    ToolCallState, WorkspaceId,
 };
 use serde::Serialize;
 use tokio::time::Instant;
@@ -440,6 +440,7 @@ async fn stream_run(
     let mut answer = String::new();
     let mut answer_message: Option<MessageId> = None;
     let mut observed_turns = 0_u16;
+    let mut child_sessions = Vec::new();
     let text = options.format == HeadlessFormat::Text;
 
     loop {
@@ -493,6 +494,13 @@ async fn stream_run(
                     })?;
 
                 let ours = envelope.session_id == handle.session_id;
+                if let SessionEvent::SessionCreated { session } = &envelope.event
+                    && session.parent_id == Some(handle.session_id)
+                    && !child_sessions.contains(&session.id)
+                {
+                    child_sessions.push(session.id);
+                }
+                let related = ours || child_sessions.contains(&envelope.session_id);
                 let mut over_turn_budget = false;
                 let mut check_cost = false;
                 match &envelope.event {
@@ -501,9 +509,22 @@ async fn stream_run(
                         activity: RunActivity::WaitingForProvider,
                     } if *run_id == handle.run_id => {
                         observed_turns = observed_turns.saturating_add(1);
+                        // Every waiting boundary after the first follows a
+                        // completed turn, including a call-free internal
+                        // checkpoint whose provider omitted usage.
+                        check_cost = observed_turns > 1;
                         over_turn_budget = options
                             .max_turns
                             .is_some_and(|limit| observed_turns > limit);
+                    }
+                    SessionEvent::RunActivityChanged {
+                        activity: RunActivity::WaitingForProvider,
+                        ..
+                    } if related => {
+                        // Child turns contribute to the selected session's
+                        // inclusive hard-cost budget even though their turn
+                        // count does not consume the parent's turn budget.
+                        check_cost = true;
                     }
                     SessionEvent::AssistantMessageStarted { message } if ours => {
                         if message.role == MessageRole::Assistant {
@@ -542,8 +563,15 @@ async fn stream_run(
                             let _ = writeln!(stderr, "[tool] {} {verdict}", tool_call.name);
                         }
                     }
-                    SessionEvent::ToolCallRequested { tool_call } if ours => {
-                        over_turn_budget = beyond_turn_budget(options, tool_call.turn_ordinal);
+                    SessionEvent::ToolCallRequested { tool_call } if related => {
+                        if ours {
+                            over_turn_budget = beyond_turn_budget(options, tool_call.turn_ordinal);
+                        }
+                        // Tool requests commit atomically with the turn's
+                        // cumulative accounting, including an explicit
+                        // unknown value when provider usage was absent. Child
+                        // accounting is included in the parent snapshot.
+                        check_cost = true;
                     }
                     SessionEvent::ToolApprovalRequested { tool_call, .. } => {
                         // The headless invocation is the approval client. Auto
@@ -558,20 +586,28 @@ async fn stream_run(
                                 .await;
                         }
                     }
-                    SessionEvent::RunContextUpdated { run_id, .. }
-                        if *run_id == handle.run_id => {
+                    SessionEvent::RunContextUpdated { .. } if related => {
                         check_cost = true;
                     }
-                    SessionEvent::SessionContextUpdated { .. } if ours => {
+                    SessionEvent::SessionContextUpdated { .. }
+                    | SessionEvent::SessionUpdated { .. }
+                        if related => {
                         check_cost = true;
                     }
                     SessionEvent::RunFinished { session, run_id, outcome, usage, .. }
                         if *run_id == handle.run_id => {
-                        let cost = session
-                            .accounting
-                            .and_then(|accounting| accounting.inclusive.estimated_cost_usd_nanos)
-                            .or(session.estimated_cost_usd_nanos);
-                        let (status, message) = settle(outcome, cancel.as_ref());
+                        let cost = inclusive_cost(
+                            session.accounting,
+                            session.estimated_cost_usd_nanos,
+                        );
+                        let (status, message) = if matches!(outcome, RunOutcome::Completed)
+                            && let Some(limit) = options.max_cost_usd_nanos
+                            && let Some(message) = cost_budget_violation(limit, cost)
+                        {
+                            (HeadlessStatus::BudgetExhausted, Some(message))
+                        } else {
+                            settle(outcome, cancel.as_ref())
+                        };
                         return Ok(RunEnd {
                             status,
                             message,
@@ -579,6 +615,9 @@ async fn stream_run(
                             estimated_cost_usd_nanos: cost,
                             answer,
                         });
+                    }
+                    SessionEvent::RunFinished { .. } if related => {
+                        check_cost = true;
                     }
                     _ => {}
                 }
@@ -594,20 +633,15 @@ async fn stream_run(
                         let _ = writeln!(stderr, "[run] model turn budget exhausted; cancelling");
                     }
                 }
-                if check_cost
-                    && cancel.is_none()
-                    && let Some(limit) = options.max_cost_usd_nanos
-                    && let Some(cost) = session_cost(sessions, handle).await?
-                    && cost > limit
-                {
-                    request_cancel(sessions, handle.run_id).await?;
-                    cancel = Some(CancelReason::Budget(format!(
-                        "the run's estimated cost exceeded its budget \
-                         ({cost} > {limit} USD nanos)"
-                    )));
-                    shutdown_at = Some(Instant::now() + SHUTDOWN_GRACE);
-                    if text {
-                        let _ = writeln!(stderr, "[run] cost budget exhausted; cancelling");
+                if check_cost && cancel.is_none() && let Some(limit) = options.max_cost_usd_nanos {
+                    let cost = session_cost(sessions, handle).await?;
+                    if let Some(message) = cost_budget_violation(limit, cost) {
+                        request_cancel(sessions, handle.run_id).await?;
+                        cancel = Some(CancelReason::Budget(message));
+                        shutdown_at = Some(Instant::now() + SHUTDOWN_GRACE);
+                        if text {
+                            let _ = writeln!(stderr, "[run] cost budget exhausted; cancelling");
+                        }
                     }
                 }
             }
@@ -617,6 +651,30 @@ async fn stream_run(
 
 fn beyond_turn_budget(options: &HeadlessOptions, turn_ordinal: u16) -> bool {
     options.max_turns.is_some_and(|limit| turn_ordinal > limit)
+}
+
+fn cost_budget_violation(limit: u64, cost: Option<u64>) -> Option<String> {
+    match cost {
+        Some(cost) if cost > limit => Some(format!(
+            "the run's estimated cost exceeded its budget \
+             ({cost} > {limit} USD nanos)"
+        )),
+        Some(_) => None,
+        None => Some(
+            "the run's cost became unknown, so its hard cost budget could not be enforced"
+                .to_owned(),
+        ),
+    }
+}
+
+fn inclusive_cost(
+    accounting: Option<SessionAccounting>,
+    legacy_direct_cost: Option<u64>,
+) -> Option<u64> {
+    match accounting {
+        Some(accounting) => accounting.inclusive.estimated_cost_usd_nanos,
+        None => legacy_direct_cost,
+    }
 }
 
 /// Maps the run's durable outcome plus this invocation's cancellation intent
@@ -655,8 +713,9 @@ fn settle(outcome: &RunOutcome, cancel: Option<&CancelReason>) -> (HeadlessStatu
     }
 }
 
-/// The session's inclusive estimated cost, read through the ordinary snapshot
-/// operation. `None` means the cost is unknown, never zero.
+/// The session's inclusive estimated cost, including durable in-progress run
+/// accounting, read through the ordinary snapshot operation. `None` means the
+/// total is unknown, never zero.
 async fn session_cost(
     sessions: &SessionRuntime,
     handle: &RunHandle,
@@ -674,11 +733,10 @@ async fn session_cost(
             message: format!("could not read the session snapshot: {error}"),
         })?;
     Ok(snapshot.focused.and_then(|session| {
-        session
-            .summary
-            .accounting
-            .and_then(|accounting| accounting.inclusive.estimated_cost_usd_nanos)
-            .or(session.summary.estimated_cost_usd_nanos)
+        inclusive_cost(
+            session.summary.accounting,
+            session.summary.estimated_cost_usd_nanos,
+        )
     }))
 }
 
@@ -781,7 +839,7 @@ mod tests {
         LoadedRuntime, Runtime, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
         RuntimeLoader, SessionRuntimeOptions,
     };
-    use qq_protocol::{ModelPricing, RunStatus, SessionStatus, WorkspaceSnapshot};
+    use qq_protocol::{AccountingTotal, ModelPricing, RunStatus, SessionStatus, WorkspaceSnapshot};
     use qq_provider::{ModelRequest, Provider, ProviderEvent, ProviderStream, ProviderUsage};
 
     use super::*;
@@ -801,6 +859,41 @@ mod tests {
                 Runtime::new(provider, "test-model", 256)
                     .map(|runtime| LoadedRuntime {
                         runtime: Arc::new(runtime),
+                        pricing: Some(ModelPricing {
+                            input_usd_nanos_per_token: 1_000,
+                            output_usd_nanos_per_token: 2_000,
+                            cache_read_usd_nanos_per_token: None,
+                            cache_write_usd_nanos_per_token: None,
+                            context_tier: None,
+                            provenance: "test".to_owned(),
+                        }),
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: qq_protocol::RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct ParentChildLoader {
+        parent: Arc<dyn Provider>,
+        child: Arc<dyn Provider>,
+    }
+
+    impl RuntimeLoader for ParentChildLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = if request.model.model.as_deref() == Some("test/child") {
+                Arc::clone(&self.child)
+            } else {
+                Arc::clone(&self.parent)
+            };
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(
+                            runtime.with_spawn_model_routes(vec!["test/child".to_owned()]),
+                        ),
                         pricing: Some(ModelPricing {
                             input_usd_nanos_per_token: 1_000,
                             output_usd_nanos_per_token: 2_000,
@@ -838,6 +931,19 @@ mod tests {
                         output_tokens: 5,
                     }),
                 }),
+            ]))
+        }
+    }
+
+    struct UnmeteredTextProvider;
+
+    impl Provider for UnmeteredTextProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            Box::pin(stream::iter([
+                Ok(ProviderEvent::OutputTextDelta {
+                    text: "done".to_owned(),
+                }),
+                Ok(ProviderEvent::Completed { usage: None }),
             ]))
         }
     }
@@ -911,12 +1017,21 @@ mod tests {
     /// Requests one read per turn forever, so only a budget can stop it.
     struct ReadLoopProvider {
         turn: Mutex<usize>,
+        report_usage: bool,
     }
 
     impl ReadLoopProvider {
         fn new() -> Self {
             Self {
                 turn: Mutex::new(0),
+                report_usage: true,
+            }
+        }
+
+        fn unmetered() -> Self {
+            Self {
+                turn: Mutex::new(0),
+                report_usage: false,
             }
         }
     }
@@ -939,8 +1054,127 @@ mod tests {
                 Ok(ProviderEvent::ToolCallCompleted {
                     id: format!("call_{current}"),
                 }),
-                Ok(ProviderEvent::Completed { usage: None }),
+                Ok(ProviderEvent::Completed {
+                    usage: self.report_usage.then_some(ProviderUsage {
+                        input_tokens: 1,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 1,
+                    }),
+                }),
             ]))
+        }
+    }
+
+    struct SpawnsLoopingChildProvider {
+        turn: Mutex<usize>,
+    }
+
+    impl SpawnsLoopingChildProvider {
+        fn new() -> Self {
+            Self {
+                turn: Mutex::new(0),
+            }
+        }
+    }
+
+    impl Provider for SpawnsLoopingChildProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            if current == 0 {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: "spawn_child".to_owned(),
+                        name: "spawn_agent".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: "spawn_child".to_owned(),
+                        json: r#"{"task":"keep reading","model":"test/child"}"#.to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted {
+                        id: "spawn_child".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed {
+                        usage: Some(ProviderUsage {
+                            input_tokens: 1,
+                            cache_read_input_tokens: 0,
+                            cache_write_input_tokens: 0,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed {
+                        usage: Some(ProviderUsage {
+                            input_tokens: 1,
+                            cache_read_input_tokens: 0,
+                            cache_write_input_tokens: 0,
+                            output_tokens: 1,
+                        }),
+                    }),
+                ]))
+            }
+        }
+    }
+
+    struct CompletesAfterInternalSlice {
+        state: Mutex<(usize, bool)>,
+    }
+
+    impl CompletesAfterInternalSlice {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new((0, false)),
+            }
+        }
+    }
+
+    impl Provider for CompletesAfterInternalSlice {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut state = self.state.lock().unwrap();
+            if request.tools().is_empty() {
+                state.1 = true;
+                return Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "slice checkpoint".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]));
+            }
+            if state.1 {
+                return Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "task complete".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]));
+            }
+            let turn = state.0;
+            state.0 += 1;
+            drop(state);
+
+            let mut events = Vec::with_capacity(49);
+            for index in 0..16 {
+                let id = format!("call_{turn}_{index}");
+                events.push(Ok(ProviderEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: "read_file".to_owned(),
+                }));
+                events.push(Ok(ProviderEvent::ToolCallArgumentsDelta {
+                    id: id.clone(),
+                    json: r#"{"path":"note.txt"}"#.to_owned(),
+                }));
+                events.push(Ok(ProviderEvent::ToolCallCompleted { id }));
+            }
+            events.push(Ok(ProviderEvent::Completed { usage: None }));
+            Box::pin(stream::iter(events))
         }
     }
 
@@ -996,13 +1230,17 @@ mod tests {
         P: Provider + 'static,
         F: Fn() -> P + Send + Sync + 'static,
     {
+        fixture_with_loader(Arc::new(ProviderLoader(provider))).await
+    }
+
+    async fn fixture_with_loader(loader: Arc<dyn RuntimeLoader>) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("work");
         std::fs::create_dir_all(&workspace).unwrap();
         let workspace = std::fs::canonicalize(&workspace).unwrap();
         let sessions = SessionRuntime::open(
             SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
-            Arc::new(ProviderLoader(provider)),
+            loader,
         )
         .await
         .unwrap();
@@ -1241,6 +1479,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_slice_rollover_is_not_a_headless_terminal_outcome() {
+        let fixture = fixture(CompletesAfterInternalSlice::new).await;
+        std::fs::write(fixture.workspace.join("note.txt"), "content\n").unwrap();
+        let options = options(&fixture.workspace);
+
+        let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
+
+        assert_eq!(status, HeadlessStatus::Completed);
+        let records = parse_records(&stdout);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["type"] == "outcome")
+                .count(),
+            1
+        );
+        assert_eq!(
+            event_records(&records)
+                .iter()
+                .filter(|record| record["envelope"]["event"]["type"] == "run_finished")
+                .count(),
+            1
+        );
+        assert_eq!(finished_tool_calls(&records).len(), 256);
+        assert!(event_records(&records).iter().any(|record| {
+            record["envelope"]["event"]["type"] == "text_appended"
+                && record["envelope"]["event"]["text"] == "slice checkpoint"
+        }));
+        assert!(event_records(&records).iter().any(|record| {
+            record["envelope"]["event"]["type"] == "text_appended"
+                && record["envelope"]["event"]["text"] == "task complete"
+        }));
+    }
+
+    #[tokio::test]
     async fn text_format_streams_progress_to_stderr_and_answers_on_stdout() {
         let fixture = fixture(|| TextProvider).await;
         let mut options = options(&fixture.workspace);
@@ -1297,11 +1570,147 @@ mod tests {
 
         let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
 
-        assert_eq!(status, HeadlessStatus::BudgetExhausted);
+        assert_eq!(
+            status,
+            HeadlessStatus::BudgetExhausted,
+            "stdout: {stdout}\nstderr: {_stderr}"
+        );
         assert_eq!(status.code(), 3);
         let records = parse_records(&stdout);
         let outcome = records.last().unwrap();
         assert_eq!(outcome["status"], "budget_exhausted");
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn cost_budget_cancels_a_looping_run_as_budget_exhaustion() {
+        let fixture = fixture(ReadLoopProvider::new).await;
+        std::fs::write(fixture.workspace.join("note.txt"), "content\n").unwrap();
+        let mut options = options(&fixture.workspace);
+        options.max_cost_usd_nanos = Some(4_000);
+
+        let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
+
+        assert_eq!(
+            status,
+            HeadlessStatus::BudgetExhausted,
+            "stdout: {stdout}\nstderr: {_stderr}"
+        );
+        assert_eq!(status.code(), 3);
+        let records = parse_records(&stdout);
+        let outcome = records.last().unwrap();
+        assert_eq!(outcome["status"], "budget_exhausted");
+        assert!(
+            outcome["estimated_cost_usd_nanos"]
+                .as_u64()
+                .is_some_and(|cost| cost >= 6_000)
+        );
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn hard_cost_budget_cancels_when_provider_usage_becomes_unknown() {
+        let fixture = fixture(ReadLoopProvider::unmetered).await;
+        std::fs::write(fixture.workspace.join("note.txt"), "content\n").unwrap();
+        let mut options = options(&fixture.workspace);
+        options.max_cost_usd_nanos = Some(4_000);
+
+        let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
+
+        assert_eq!(status, HeadlessStatus::BudgetExhausted);
+        let records = parse_records(&stdout);
+        let outcome = records.last().unwrap();
+        assert_eq!(outcome["status"], "budget_exhausted");
+        assert!(
+            outcome["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cost became unknown"))
+        );
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn hard_cost_budget_cancels_an_unmetered_looping_child() {
+        let parent: Arc<dyn Provider> = Arc::new(SpawnsLoopingChildProvider::new());
+        let child: Arc<dyn Provider> = Arc::new(ReadLoopProvider::unmetered());
+        let fixture = fixture_with_loader(Arc::new(ParentChildLoader { parent, child })).await;
+        std::fs::write(fixture.workspace.join("note.txt"), "content\n").unwrap();
+        let mut options = options(&fixture.workspace);
+        options.max_cost_usd_nanos = Some(4_000);
+
+        let (status, stdout, _stderr) = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_to_end(&fixture, options, std::future::pending()),
+        )
+        .await
+        .expect("the child turn must trigger its parent's inclusive cost budget");
+
+        assert_eq!(status, HeadlessStatus::BudgetExhausted);
+        let records = parse_records(&stdout);
+        let outcome = records.last().unwrap();
+        assert_eq!(outcome["status"], "budget_exhausted");
+        assert!(
+            outcome["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cost became unknown"))
+        );
+        assert!(event_records(&records).iter().any(|record| {
+            record["envelope"]["event"]["type"] == "session_created"
+                && record["envelope"]["event"]["session"]["parent_id"].is_string()
+        }));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = workspace_snapshot(&fixture).await;
+                if snapshot.sessions.iter().all(|session| {
+                    session.status == SessionStatus::Idle && session.active_run_id.is_none()
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("parent cancellation must settle its in-flight child");
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn completed_unmetered_turn_still_reports_cost_budget_exhaustion() {
+        let fixture = fixture(|| UnmeteredTextProvider).await;
+        let mut options = options(&fixture.workspace);
+        options.max_cost_usd_nanos = Some(4_000);
+
+        let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
+
+        assert_eq!(status, HeadlessStatus::BudgetExhausted);
+        let records = parse_records(&stdout);
+        let outcome = records.last().unwrap();
+        assert_eq!(outcome["status"], "budget_exhausted");
+        assert!(
+            outcome["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cost became unknown"))
+        );
+        assert_no_active_run(&fixture).await;
+    }
+
+    #[tokio::test]
+    async fn completed_over_cost_turn_still_reports_cost_budget_exhaustion() {
+        let fixture = fixture(|| TextProvider).await;
+        let mut options = options(&fixture.workspace);
+        options.max_cost_usd_nanos = Some(10_000);
+
+        let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
+
+        assert_eq!(status, HeadlessStatus::BudgetExhausted);
+        let records = parse_records(&stdout);
+        let outcome = records.last().unwrap();
+        assert_eq!(outcome["status"], "budget_exhausted");
+        assert!(
+            outcome["estimated_cost_usd_nanos"]
+                .as_u64()
+                .is_some_and(|cost| cost > 10_000)
+        );
         assert_no_active_run(&fixture).await;
     }
 
@@ -1323,5 +1732,22 @@ mod tests {
         let records = parse_records(&stdout);
         assert_eq!(records.last().unwrap()["status"], "budget_exhausted");
         assert_no_active_run(&fixture).await;
+    }
+
+    #[test]
+    fn inclusive_cost_never_substitutes_a_direct_alias_for_unknown_child_cost() {
+        let accounting = SessionAccounting {
+            direct: AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: Some(5),
+            },
+            inclusive: AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: None,
+            },
+        };
+
+        assert_eq!(inclusive_cost(Some(accounting), Some(5)), None);
+        assert_eq!(inclusive_cost(None, Some(5)), Some(5));
     }
 }

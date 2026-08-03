@@ -260,7 +260,21 @@ One run follows a simple loop:
 6. Repeat until completion, cancellation, or failure.
 
 This ordering makes persisted state authoritative and allows clients to resume
-an event stream without losing output.
+an event stream without losing output. Each completed model turn also commits
+the run's cumulative usage and estimated cost, so a live budget observes the
+same durable boundary as the work it may cancel. If a provider omits usage
+after a hard cost budget was accepted, the headless runner cancels with an
+explicit budget outcome instead of continuing under an unmeasurable limit.
+
+A run may cross multiple bounded internal execution slices. The strict
+256-tool-call ceiling is a runaway-loop backstop for one slice, not a
+task-completion signal. Before a bounded provider turn could push a slice past
+that ceiling, the runtime requests a tool-free checkpoint, requires and
+persists that assistant turn, resets the slice counter, and continues the same
+run with tools restored. Clients observe no terminal run event at the slice
+seam. Genuine completion, explicit caller budgets, cancellation, and failures
+remain the only user-level terminal conditions; provider adapters do not
+participate in slice rollover.
 
 ## HTTP And SSE Protocol
 

@@ -1343,6 +1343,7 @@ async fn execute_run(
                 }
                 flush_at = None;
                 accounting.record_turn(usage);
+                let turn_accounting = accounting.snapshot();
                 // The completed turn's usage measures the context the run now
                 // occupies; the turn transaction publishes it so the meter
                 // moves while the tool loop is still running.
@@ -1357,11 +1358,14 @@ async fn execute_run(
                         .store
                         .persist_model_turn(
                             &claimed,
-                            turn_ordinal,
-                            message,
-                            calls,
-                            turn_message,
-                            context_tokens,
+                            ModelTurnCommit {
+                                turn_ordinal,
+                                message,
+                                calls,
+                                turn_message,
+                                context_tokens,
+                                accounting: Some(turn_accounting),
+                            },
                         )
                         .await
                     {
@@ -2030,6 +2034,15 @@ struct Store {
     store_id: StoreId,
 }
 
+struct ModelTurnCommit {
+    turn_ordinal: u16,
+    message: Message,
+    calls: Vec<RuntimeToolCall>,
+    turn_message: Option<MessageId>,
+    context_tokens: Option<u64>,
+    accounting: Option<RunAccounting>,
+}
+
 struct StoreInner {
     control: Sender<WorkerMessage>,
     output: Sender<WorkerMessage>,
@@ -2290,31 +2303,18 @@ impl Store {
     /// The turn's assistant message (when the turn streamed text) is finalized
     /// in the same transaction so no crash window can leave a committed turn
     /// with a message still marked streaming.
-    /// The turn's reported context occupancy (its input-token total) rides
-    /// the same transaction: it updates the run audit row and, when this is a
-    /// prompt for the still-selected model, the authoritative session meter.
+    /// The turn's cumulative usage, cost, and reported context occupancy ride
+    /// the same transaction. This keeps live budgets and run snapshots on the
+    /// same committed boundary as the model work they measure.
     async fn persist_model_turn(
         &self,
         claimed: &ClaimedRun,
-        turn_ordinal: u16,
-        message: Message,
-        calls: Vec<RuntimeToolCall>,
-        turn_message_id: Option<MessageId>,
-        context_tokens: Option<u64>,
+        turn: ModelTurnCommit,
     ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         let store_id = self.store_id;
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
-            persist_model_turn(
-                connection,
-                store_id,
-                &claimed,
-                turn_ordinal,
-                &message,
-                &calls,
-                turn_message_id,
-                context_tokens,
-            )
+            persist_model_turn(connection, store_id, &claimed, &turn)
         })
         .await
     }
@@ -4485,20 +4485,20 @@ fn append_text(
     Ok(event)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one persisted turn transaction; bundling the columns adds nothing"
-)]
 fn persist_model_turn(
     connection: &mut Connection,
     store_id: StoreId,
     claimed: &ClaimedRun,
-    turn_ordinal: u16,
-    message: &Message,
-    calls: &[RuntimeToolCall],
-    turn_message_id: Option<MessageId>,
-    context_tokens: Option<u64>,
+    turn: &ModelTurnCommit,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    let ModelTurnCommit {
+        turn_ordinal,
+        message,
+        calls,
+        turn_message,
+        context_tokens,
+        accounting,
+    } = turn;
     if message.role() != Role::Assistant {
         return Err(SessionRuntimeError::Persistence);
     }
@@ -4520,7 +4520,7 @@ fn persist_model_turn(
     // keeps message state and turn persistence atomic: after a crash, a
     // streaming message always identifies exactly the turn that never
     // committed, and recovery interrupts only that message.
-    if let Some(message_id) = turn_message_id {
+    if let Some(message_id) = turn_message {
         let updated = transaction
             .execute(
                 "UPDATE messages SET state = 'complete'
@@ -4574,12 +4574,29 @@ fn persist_model_turn(
             SessionEvent::ToolCallRequested { tool_call },
         )?);
     }
+    let usage_json = accounting
+        .as_ref()
+        .and_then(|accounting| accounting.usage)
+        .map(|usage| serde_json::to_string(&usage))
+        .transpose()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let estimated_cost_usd_nanos = accounting
+        .as_ref()
+        .and_then(|accounting| accounting.estimated_cost_usd_nanos)
+        .and_then(|cost| i64::try_from(cost).ok());
     // Persist-before-publish like every other event. A missing provider value
     // clears the previous turn's audit value instead of leaving stale data.
     transaction
         .execute(
-            "UPDATE runs SET context_tokens = ?2 WHERE id = ?1",
-            params![claimed.run_id.to_string(), context_tokens],
+            "UPDATE runs
+             SET context_tokens = ?2, usage_json = ?3, estimated_cost_usd_nanos = ?4
+             WHERE id = ?1",
+            params![
+                claimed.run_id.to_string(),
+                context_tokens,
+                usage_json,
+                estimated_cost_usd_nanos,
+            ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     if let Some(context_tokens) = context_tokens {
@@ -4595,7 +4612,7 @@ fn persist_model_turn(
             },
             SessionEvent::RunContextUpdated {
                 run_id: claimed.run_id,
-                context_tokens,
+                context_tokens: *context_tokens,
             },
         )?);
     }
@@ -4628,7 +4645,7 @@ fn persist_model_turn(
             },
             SessionEvent::SessionContextUpdated {
                 run_id: claimed.run_id,
-                context_tokens,
+                context_tokens: *context_tokens,
             },
         )?);
     }
@@ -6184,7 +6201,8 @@ fn load_session_accounting(
 ) -> Result<SessionAccounting, SessionRuntimeError> {
     let mut statement = connection
         .prepare(
-            "SELECT r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos
+            "SELECT r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos,
+                    EXISTS(SELECT 1 FROM model_turns turn WHERE turn.run_id = r.id)
              FROM runs r
              JOIN sessions owner ON owner.id = r.session_id
              WHERE owner.id = ?1 OR owner.parent_id = ?1
@@ -6198,6 +6216,7 @@ fn load_session_accounting(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<u64>>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         })
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -6206,13 +6225,18 @@ fn load_session_accounting(
     let mut direct = AccountingAggregate::known_zero();
     let mut inclusive = AccountingAggregate::known_zero();
     for row in rows {
-        let (owner_id, status, encoded_usage, cost) =
+        let (owner_id, status, encoded_usage, cost, saw_turn) =
             row.map_err(|_| SessionRuntimeError::Persistence)?;
         let Some(encoded_usage) = encoded_usage else {
-            if matches!(
+            let terminal = matches!(
                 status.as_str(),
                 "completed" | "cancelled" | "failed" | "interrupted"
-            ) {
+            );
+            // A cancelled run with no committed model turn spent no measured
+            // request and preserves known prior accounting. Other terminal
+            // rows without usage stay unknown for legacy/provider-failure
+            // compatibility; a committed turn is always an explicit unknown.
+            if saw_turn || (terminal && status != "cancelled") {
                 inclusive.mark_unknown();
                 if owner_id == session_id {
                     direct.mark_unknown();
@@ -6249,9 +6273,7 @@ fn load_session_summary(
     connection
         .query_row(
             "SELECT s.workspace_id, s.parent_id, s.title, s.status, s.active_run_id,
-                     s.queued_prompts, s.model, s.context_tokens,
-                     CASE WHEN s.cost_known = 1 THEN s.estimated_cost_usd_nanos END,
-                     s.updated_at_ms,
+                     s.queued_prompts, s.model, s.context_tokens, s.updated_at_ms,
                      (SELECT outcome_json FROM runs
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
                       ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1)
@@ -6267,9 +6289,8 @@ fn load_session_summary(
                     row.get::<_, u16>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<u64>>(7)?,
-                    row.get::<_, Option<u64>>(8)?,
-                    row.get::<_, u64>(9)?,
-                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, u64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )
@@ -6286,10 +6307,10 @@ fn load_session_summary(
                 queued,
                 model,
                 context_tokens,
-                cost,
                 updated,
                 last_outcome,
             )| {
+                let direct_cost = accounting.direct.estimated_cost_usd_nanos;
                 Ok(SessionSummary {
                     id: session_id,
                     workspace_id: parse_id(&workspace)?,
@@ -6301,7 +6322,7 @@ fn load_session_summary(
                     model,
                     context_tokens,
                     accounting: Some(accounting),
-                    estimated_cost_usd_nanos: cost,
+                    estimated_cost_usd_nanos: direct_cost,
                     updated_at_ms: updated,
                     last_outcome: last_outcome
                         .as_deref()
@@ -7354,16 +7375,17 @@ mod tests {
         status: &str,
         usage: Option<TokenUsage>,
         cost: Option<u64>,
-    ) {
+    ) -> RunId {
+        let run_id = RunId::generate().unwrap();
         connection
             .execute(
                 "INSERT INTO runs(
                      id, session_id, command_id, user_message_id,
                      assistant_message_id, status, outcome_json, usage_json,
                      estimated_cost_usd_nanos, created_at_ms, finished_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, 1, 2)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, 1, 2)",
                 params![
-                    RunId::generate().unwrap().to_string(),
+                    run_id.to_string(),
                     session_id.to_string(),
                     CommandId::generate().unwrap().to_string(),
                     MessageId::generate().unwrap().to_string(),
@@ -7374,6 +7396,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        run_id
     }
 
     #[test]
@@ -7467,7 +7490,7 @@ mod tests {
     }
 
     #[test]
-    fn store_accounting_marks_terminal_missing_usage_unknown_but_ignores_active_rows() {
+    fn store_accounting_includes_measured_active_rows_and_keeps_alias_consistent() {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("sessions.sqlite3");
         let workspace_id = WorkspaceId::generate().unwrap();
@@ -7487,7 +7510,7 @@ mod tests {
             Some(usage(2, 3)),
             Some(5),
         );
-        insert_accounting_run(&connection, session_id, "running", None, None);
+        let active_run = insert_accounting_run(&connection, session_id, "running", None, None);
         assert_eq!(
             load_session_accounting(&connection, session_id)
                 .unwrap()
@@ -7497,6 +7520,44 @@ mod tests {
                 estimated_cost_usd_nanos: Some(5),
             }
         );
+
+        connection
+            .execute(
+                "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
+                 VALUES (?1, 1, '[]')",
+                [active_run.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            load_session_accounting(&connection, session_id)
+                .unwrap()
+                .direct,
+            AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: None,
+            }
+        );
+
+        connection
+            .execute(
+                "UPDATE runs
+                 SET usage_json = ?2, estimated_cost_usd_nanos = 13
+                 WHERE session_id = ?1 AND status = 'running'",
+                params![
+                    session_id.to_string(),
+                    serde_json::to_string(&usage(7, 11)).unwrap(),
+                ],
+            )
+            .unwrap();
+        let summary = load_session_summary(&connection, session_id).unwrap();
+        assert_eq!(
+            summary.accounting.unwrap().direct,
+            AccountingTotal {
+                usage: Some(usage(9, 14)),
+                estimated_cost_usd_nanos: Some(18),
+            }
+        );
+        assert_eq!(summary.estimated_cost_usd_nanos, Some(18));
 
         insert_accounting_run(&connection, session_id, "failed", None, None);
         assert_eq!(
@@ -7899,6 +7960,128 @@ mod tests {
                     }),
                 ]))
             }
+        }
+    }
+
+    struct RenewableSliceLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        checkpoint_wait: Option<Arc<tokio::sync::Notify>>,
+        metered_empty_checkpoint: bool,
+    }
+
+    impl RuntimeLoader for RenewableSliceLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let requests = Arc::clone(&self.requests);
+            let checkpoint_wait = self.checkpoint_wait.clone();
+            let metered_empty_checkpoint = self.metered_empty_checkpoint;
+            Box::pin(async move {
+                Runtime::new(
+                    RenewableSliceProvider {
+                        requests,
+                        checkpoint_wait,
+                        metered_empty_checkpoint,
+                    },
+                    "test-model",
+                    256,
+                )
+                .map(|runtime| LoadedRuntime {
+                    runtime: Arc::new(runtime),
+                    pricing: metered_empty_checkpoint.then_some(ModelPricing {
+                        input_usd_nanos_per_token: 1_000,
+                        output_usd_nanos_per_token: 2_000,
+                        cache_read_usd_nanos_per_token: Some(100),
+                        cache_write_usd_nanos_per_token: Some(300),
+                        context_tier: None,
+                        provenance: "test".to_owned(),
+                    }),
+                })
+                .map_err(|error| RuntimeLoadError {
+                    kind: RunFailureKind::Configuration,
+                    message: error.to_string(),
+                })
+            })
+        }
+    }
+
+    struct RenewableSliceProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        checkpoint_wait: Option<Arc<tokio::sync::Notify>>,
+        metered_empty_checkpoint: bool,
+    }
+
+    impl Provider for RenewableSliceProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut requests = self.requests.lock().unwrap();
+            let current = requests.len();
+            requests.push(request.clone());
+            drop(requests);
+
+            let tool_turns = crate::MAX_TOOL_CALLS_PER_SLICE / crate::MAX_TOOL_CALLS_PER_TURN;
+            if request.tools().is_empty() {
+                if let Some(checkpoint_wait) = &self.checkpoint_wait {
+                    checkpoint_wait.notify_one();
+                    return Box::pin(stream::pending());
+                }
+                if self.metered_empty_checkpoint {
+                    return Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                        usage: Some(qq_provider::ProviderUsage {
+                            input_tokens: 3,
+                            cache_read_input_tokens: 1,
+                            cache_write_input_tokens: 2,
+                            output_tokens: 5,
+                        }),
+                    })]));
+                }
+                return Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "slice checkpoint".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]));
+            }
+            if current > tool_turns {
+                return Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "task complete".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]));
+            }
+
+            let mut events = Vec::with_capacity(crate::MAX_TOOL_CALLS_PER_TURN * 3 + 1);
+            for index in 0..crate::MAX_TOOL_CALLS_PER_TURN {
+                let id = format!("call-{current}-{index}");
+                let (name, json) = if current == 0 && index == 0 {
+                    ("read_file", r#"{"path":"slice-effects.txt"}"#)
+                } else if current == 0 && index == 1 {
+                    (
+                        "edit_file",
+                        r#"{"path":"slice-effects.txt","old_string":"seed","new_string":"seedx"}"#,
+                    )
+                } else {
+                    ("read_file", r#"{"path":"note.txt"}"#)
+                };
+                events.push(Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: name.to_owned(),
+                }));
+                events.push(Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                    id: id.clone(),
+                    json: json.to_owned(),
+                }));
+                events.push(Ok(qq_provider::ProviderEvent::ToolCallCompleted { id }));
+            }
+            events.push(Ok(qq_provider::ProviderEvent::Completed {
+                usage: self
+                    .metered_empty_checkpoint
+                    .then_some(qq_provider::ProviderUsage {
+                        input_tokens: 1,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 1,
+                    }),
+            }));
+            Box::pin(stream::iter(events))
         }
     }
 
@@ -9583,6 +9766,15 @@ mod tests {
         workspace_id: WorkspaceId,
         parent_id: Option<SessionId>,
     ) -> CommandReceipt {
+        create_session_with_mode(runtime, workspace_id, parent_id, ApprovalMode::default()).await
+    }
+
+    async fn create_session_with_mode(
+        runtime: &SessionRuntime,
+        workspace_id: WorkspaceId,
+        parent_id: Option<SessionId>,
+        approval_mode: ApprovalMode,
+    ) -> CommandReceipt {
         runtime
             .command(
                 CommandId::generate().unwrap(),
@@ -9594,7 +9786,7 @@ mod tests {
                         max_output_tokens: Some(256),
                         organization: None,
                     },
-                    approval_mode: ApprovalMode::default(),
+                    approval_mode,
                 },
             )
             .await
@@ -11130,6 +11322,346 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_durable_run_continues_across_the_internal_tool_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "tool result\n").unwrap();
+        std::fs::write(directory.path().join("slice-effects.txt"), "seed").unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            Arc::new(RenewableSliceLoader {
+                requests: Arc::clone(&requests),
+                checkpoint_wait: None,
+                metered_empty_checkpoint: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created =
+            create_session_with_mode(&runtime, workspace_id, None, ApprovalMode::Auto).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = queue_prompt(&runtime, session_id, "finish a long task".to_owned()).await;
+
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    SessionEvent::RunStarted { run_id: started, .. } if started == run_id
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    SessionEvent::RunFinished { run_id: finished, .. } if finished == run_id
+                ))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            observed.last().map(|event| &event.event),
+            Some(SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Completed,
+                ..
+            }) if *finished == run_id
+        ));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::ToolCallRequested { .. }))
+                .count(),
+            crate::MAX_TOOL_CALLS_PER_SLICE
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::ToolCallFinished { .. }))
+                .count(),
+            crate::MAX_TOOL_CALLS_PER_SLICE
+        );
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 16,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.runs.len(), 1);
+        assert_eq!(focused.runs[0].outcome, Some(RunOutcome::Completed));
+        assert_eq!(focused.tool_calls.len(), crate::MAX_TOOL_CALLS_PER_SLICE);
+        assert!(
+            focused
+                .tool_calls
+                .iter()
+                .all(|call| { call.run_id == run_id && call.state == ToolCallState::Completed })
+        );
+        let mut provider_call_ids = focused
+            .tool_calls
+            .iter()
+            .map(|call| call.provider_call_id.as_str())
+            .collect::<Vec<_>>();
+        provider_call_ids.sort_unstable();
+        provider_call_ids.dedup();
+        assert_eq!(provider_call_ids.len(), crate::MAX_TOOL_CALLS_PER_SLICE);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("slice-effects.txt")).unwrap(),
+            "seedx",
+            "the mutating call before rollover must execute exactly once"
+        );
+        assert!(focused.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.output == "slice checkpoint"
+        }));
+        assert!(focused.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.output == "task complete"
+        }));
+
+        {
+            let recorded_requests = requests.lock().unwrap();
+            let checkpoint = &recorded_requests[recorded_requests.len() - 2];
+            let continuation = recorded_requests.last().unwrap();
+            assert!(checkpoint.tools().is_empty());
+            assert!(!continuation.tools().is_empty());
+            assert!(
+                continuation
+                    .system()
+                    .is_some_and(|system| system.contains(crate::SLICE_CONTINUATION_NOTICE))
+            );
+            assert!(continuation.messages().iter().any(|message| {
+                message.content().iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if text == "slice checkpoint"
+                    )
+                })
+            }));
+        }
+
+        let replay_after = observed.last().unwrap().cursor;
+        drop(runtime);
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(RenewableSliceLoader {
+                requests: Arc::clone(&requests),
+                checkpoint_wait: None,
+                metered_empty_checkpoint: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: replay_after,
+            })
+            .unwrap();
+        let follow_up = queue_prompt(&runtime, session_id, "confirm completion".to_owned()).await;
+        let replayed = collect_until(&mut events, finished_for(follow_up)).await;
+        assert!(matches!(
+            replayed.last().map(|event| &event.event),
+            Some(SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Completed,
+                ..
+            }) if *finished == follow_up
+        ));
+        let requests = requests.lock().unwrap();
+        let replay_request = requests.last().unwrap();
+        assert!(replay_request.messages().iter().any(|message| {
+            message.content().iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text == "slice checkpoint"
+                )
+            })
+        }));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("slice-effects.txt")).unwrap(),
+            "seedx",
+            "replay and follow-up context must not repeat the mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_the_slice_checkpoint_has_one_cancelled_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "tool result\n").unwrap();
+        std::fs::write(directory.path().join("slice-effects.txt"), "seed").unwrap();
+        let checkpoint_wait = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(RenewableSliceLoader {
+                requests: Arc::clone(&requests),
+                checkpoint_wait: Some(Arc::clone(&checkpoint_wait)),
+                metered_empty_checkpoint: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created =
+            create_session_with_mode(&runtime, workspace_id, None, ApprovalMode::Auto).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = queue_prompt(&runtime, session_id, "finish a long task".to_owned()).await;
+
+        tokio::time::timeout(Duration::from_secs(30), checkpoint_wait.notified())
+            .await
+            .expect("the run must reach its tool-free checkpoint request");
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id },
+            )
+            .await
+            .unwrap();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    SessionEvent::RunFinished { run_id: finished, .. } if finished == run_id
+                ))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            observed.last().map(|event| &event.event),
+            Some(SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Cancelled,
+                ..
+            }) if *finished == run_id
+        ));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::ToolCallRequested { .. }))
+                .count(),
+            crate::MAX_TOOL_CALLS_PER_SLICE
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::ToolCallFinished { .. }))
+                .count(),
+            crate::MAX_TOOL_CALLS_PER_SLICE
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("slice-effects.txt")).unwrap(),
+            "seedx"
+        );
+        let requests = requests.lock().unwrap();
+        assert!(requests.last().unwrap().tools().is_empty());
+        assert!(!requests.iter().any(|request| {
+            request
+                .system()
+                .is_some_and(|system| system.contains(crate::SLICE_CONTINUATION_NOTICE))
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_checkpoint_failure_retains_the_billed_turn_accounting() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "tool result\n").unwrap();
+        std::fs::write(directory.path().join("slice-effects.txt"), "seed").unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(RenewableSliceLoader {
+                requests,
+                checkpoint_wait: None,
+                metered_empty_checkpoint: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created =
+            create_session_with_mode(&runtime, workspace_id, None, ApprovalMode::Auto).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = queue_prompt(&runtime, session_id, "finish a long task".to_owned()).await;
+
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+        assert!(matches!(
+            observed.last().map(|event| &event.event),
+            Some(SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::ProviderResponse,
+                        message,
+                    },
+                },
+                ..
+            }) if *finished == run_id && message == "provider returned an empty slice checkpoint"
+        ));
+
+        let expected_usage = TokenUsage {
+            input_tokens: 19,
+            cache_read_input_tokens: 1,
+            cache_write_input_tokens: 2,
+            output_tokens: 21,
+        };
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 16,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.runs[0].usage, Some(expected_usage));
+        assert_eq!(focused.runs[0].estimated_cost_usd_nanos, Some(61_700));
+        let accounting = focused.summary.accounting.unwrap();
+        assert_eq!(accounting.direct.usage, Some(expected_usage));
+        assert_eq!(accounting.direct.estimated_cost_usd_nanos, Some(61_700));
+        assert_eq!(focused.summary.estimated_cost_usd_nanos, Some(61_700));
+        assert!(!focused.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.output == "slice checkpoint"
+        }));
+    }
+
+    #[tokio::test]
     async fn failed_and_cancelled_runs_replay_committed_turns_in_follow_up_context() {
         let outcomes = [
             RunOutcome::Failed {
@@ -11202,18 +11734,21 @@ mod tests {
             store
                 .persist_model_turn(
                     &claimed,
-                    1,
-                    Message::new(
-                        Role::Assistant,
-                        vec![ContentBlock::ToolCall {
-                            id: call.provider_call_id.clone(),
-                            name: call.name.clone(),
-                            arguments: serde_json::from_str(&call.arguments).unwrap(),
-                        }],
-                    ),
-                    vec![call],
-                    None,
-                    None,
+                    ModelTurnCommit {
+                        turn_ordinal: 1,
+                        message: Message::new(
+                            Role::Assistant,
+                            vec![ContentBlock::ToolCall {
+                                id: call.provider_call_id.clone(),
+                                name: call.name.clone(),
+                                arguments: serde_json::from_str(&call.arguments).unwrap(),
+                            }],
+                        ),
+                        calls: vec![call],
+                        turn_message: None,
+                        context_tokens: None,
+                        accounting: None,
+                    },
                 )
                 .await
                 .unwrap();
@@ -11479,23 +12014,26 @@ mod tests {
         store
             .persist_model_turn(
                 &claimed,
-                1,
-                Message::new(
-                    Role::Assistant,
-                    vec![
-                        ContentBlock::Text {
-                            text: "Checking. ".to_owned(),
-                        },
-                        ContentBlock::ToolCall {
-                            id: call.provider_call_id.clone(),
-                            name: call.name.clone(),
-                            arguments: serde_json::from_str(&call.arguments).unwrap(),
-                        },
-                    ],
-                ),
-                vec![call],
-                Some(first_message),
-                None,
+                ModelTurnCommit {
+                    turn_ordinal: 1,
+                    message: Message::new(
+                        Role::Assistant,
+                        vec![
+                            ContentBlock::Text {
+                                text: "Checking. ".to_owned(),
+                            },
+                            ContentBlock::ToolCall {
+                                id: call.provider_call_id.clone(),
+                                name: call.name.clone(),
+                                arguments: serde_json::from_str(&call.arguments).unwrap(),
+                            },
+                        ],
+                    ),
+                    calls: vec![call],
+                    turn_message: Some(first_message),
+                    context_tokens: None,
+                    accounting: None,
+                },
             )
             .await
             .unwrap();
@@ -11623,18 +12161,21 @@ mod tests {
         store
             .persist_model_turn(
                 &claimed,
-                1,
-                Message::new(
-                    Role::Assistant,
-                    vec![ContentBlock::ToolCall {
-                        id: call.provider_call_id.clone(),
-                        name: call.name.clone(),
-                        arguments: serde_json::from_str(&call.arguments).unwrap(),
-                    }],
-                ),
-                vec![call],
-                None,
-                None,
+                ModelTurnCommit {
+                    turn_ordinal: 1,
+                    message: Message::new(
+                        Role::Assistant,
+                        vec![ContentBlock::ToolCall {
+                            id: call.provider_call_id.clone(),
+                            name: call.name.clone(),
+                            arguments: serde_json::from_str(&call.arguments).unwrap(),
+                        }],
+                    ),
+                    calls: vec![call],
+                    turn_message: None,
+                    context_tokens: None,
+                    accounting: None,
+                },
             )
             .await
             .unwrap();
@@ -11761,18 +12302,21 @@ mod tests {
         store
             .persist_model_turn(
                 &claimed,
-                1,
-                Message::new(
-                    Role::Assistant,
-                    vec![ContentBlock::ToolCall {
-                        id: "orphan-call".to_owned(),
-                        name: "read_file".to_owned(),
-                        arguments: serde_json::json!({"path": "note.txt"}),
-                    }],
-                ),
-                Vec::new(),
-                None,
-                None,
+                ModelTurnCommit {
+                    turn_ordinal: 1,
+                    message: Message::new(
+                        Role::Assistant,
+                        vec![ContentBlock::ToolCall {
+                            id: "orphan-call".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: serde_json::json!({"path": "note.txt"}),
+                        }],
+                    ),
+                    calls: Vec::new(),
+                    turn_message: None,
+                    context_tokens: None,
+                    accounting: None,
+                },
             )
             .await
             .unwrap();
@@ -13719,18 +14263,21 @@ mod tests {
         store
             .persist_model_turn(
                 &claimed,
-                1,
-                Message::new(
-                    Role::Assistant,
-                    vec![ContentBlock::ToolCall {
-                        id: call.provider_call_id.clone(),
-                        name: call.name.clone(),
-                        arguments: serde_json::from_str(&call.arguments).unwrap(),
-                    }],
-                ),
-                vec![call],
-                None,
-                None,
+                ModelTurnCommit {
+                    turn_ordinal: 1,
+                    message: Message::new(
+                        Role::Assistant,
+                        vec![ContentBlock::ToolCall {
+                            id: call.provider_call_id.clone(),
+                            name: call.name.clone(),
+                            arguments: serde_json::from_str(&call.arguments).unwrap(),
+                        }],
+                    ),
+                    calls: vec![call],
+                    turn_message: None,
+                    context_tokens: None,
+                    accounting: None,
+                },
             )
             .await
             .unwrap();

@@ -60,7 +60,7 @@ QQ already has important foundations:
 - Provider usage, cache usage, and estimated cost are normalized and retained.
 - The TUI now preserves and efficiently renders long completed output.
 
-### 2026-08-02 Recovery Ledger
+### 2026-08-03 Recovery Ledger
 
 This ledger distinguishes shipped work from the broader phase contracts below.
 Passing one regression does not imply that its whole phase is complete.
@@ -71,7 +71,7 @@ Passing one regression does not imply that its whole phase is complete.
 | Transient provider recovery | on `main` | `55d2aa7` retries a turn only before user-visible output | One combined retry/amplification budget across provider transport and core |
 | Run-task panic supervision | on `main` | `c68b12a` turns an unwind into a durable server failure, releases capacity, and reschedules the session | Shutdown/abort recovery still relies on restart; outer headless I/O failures must cancel accepted runs |
 | Failed/cancelled context continuity | on `main` | `c68b12a` replays every fully committed model turn and tool result | Runtime notices, never-started call results, and the full Phase 2 projection matrix |
-| Silent over-budget provider turn | on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before an over-budget turn can hang without output | Core-owned budget outcomes and renewable continuation/checkpoint semantics |
+| Tool/turn budget behavior | renewable slices and live cost visibility implemented in `DEV-725`; explicit headless turn/timeout gate on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before a silent over-budget turn; `DEV-725` turns the internal 256-call ceiling into a persisted checkpoint, restores tools inside the same durable run, and commits active-run cost so `--max-cost-usd` can cancel truthfully | Core-owned configurable token/dollar/turn outcomes across every front end |
 
 The remaining P0 longevity contract is explicit: every accepted run must reach
 one durable terminal event; every imposed bound must produce a truthful outcome;
@@ -90,7 +90,7 @@ The remaining gaps are material:
 | Store scheduling | The single worker always prefers control traffic; a full output queue is retried by polling every millisecond | Output can be delayed or starved under control load |
 | Context budgeting | Automatic compaction uses a fixed 4 MiB budget and a 70% byte trigger | Small-context models may fail before compaction; large-context models may compact and spend unnecessarily |
 | Resolved model state | Runtime loading returns the runtime and pricing but drops effective context limits and generation capabilities | Core cannot budget, explain, or reproduce the exact model execution |
-| Completion behavior | The base prompt explains tools, but the hard tool/turn cap's final tool-free response still settles as ordinary completion even when it is only a checkpoint | Automation can report exit 0 for unfinished bounded work instead of returning a resumable budget outcome |
+| Completion behavior | Internal tool slices checkpoint and continue without a terminal event, but caller-requested turn/time/cost budgets still settle through the headless adapter rather than one core-owned outcome | TUI, server, and future clients cannot yet impose and observe the same explicit overall budget contract |
 | Terminal control | `shell` is one-shot with null stdin and no persistent process or PTY handle | Interactive programs and background services are awkward or impossible |
 | Search and editing | Built-in search is bounded literal scanning; edits require exact replacement | Discovery or mutation can consume unnecessary model turns on large repositories |
 | Sub-agent lifecycle | Child creation and prompt submission are separate commands; the parent concatenates every completed child assistant message | A crash window can orphan child work and the result is not a true final-answer contract |
@@ -717,9 +717,11 @@ Support per-run:
 - Dollar limit when pricing and usage are known.
 
 `d989cf8` closes one headless failure mode by observing the provider-request
-boundary before a silent over-budget turn can hang. The remaining contract is
-core-owned: a tool/turn bound must not turn unfinished work into ordinary
-`Completed`, and every front end must observe the same explicit outcome.
+boundary before a silent over-budget turn can hang. `DEV-725` makes the
+runtime's internal 256-call backstop renewable: it persists a tool-free
+checkpoint and continues the same run instead of emitting ordinary
+`Completed`. The remaining contract is core-owned configurable budgets, so
+every front end can impose and observe the same explicit overall outcome.
 
 Before each new model turn, reserve enough budget for a bounded final response.
 When the work budget is exhausted:
@@ -729,7 +731,9 @@ When the work budget is exhausted:
 - Never label budget exhaustion as provider failure.
 
 If a hard dollar limit is requested but cost cannot be measured, reject the
-configuration before the run rather than pretend to enforce it.
+configuration before the run rather than pretend to enforce it. If a provider
+with configured pricing later omits turn usage, stop with an explicit
+`budget_exhausted` result instead of silently continuing under an unknown cost.
 
 ### Generation Controls And Prompt Caching
 
