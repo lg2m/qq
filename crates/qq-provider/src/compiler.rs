@@ -5,9 +5,7 @@ use std::sync::Arc;
 use crate::{
     Provider, ProviderError, SharedRequestCredentialProvider,
     bedrock::{Bedrock, BedrockAuth},
-    construction::{
-        HttpConstructionAuth, HttpConstructionSpec, HttpEndpointKind, construct_http_provider,
-    },
+    construction::{HttpConstructionSpec, construct_http_provider},
     credentials::SecretLiteral,
     http::{build_client, build_direct_client, validate_endpoint},
     mantle::Mantle,
@@ -50,10 +48,7 @@ impl ProviderCompiler {
     }
 
     fn compile_http(&self, recipe: HttpProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
-        let endpoint_kind = match recipe.endpoint.kind {
-            EndpointKind::Base => HttpEndpointKind::Base,
-            EndpointKind::Exact => HttpEndpointKind::Exact,
-        };
+        let endpoint_kind = recipe.endpoint.kind;
         let endpoint = recipe.endpoint.resolve(recipe.protocol)?;
         let client = if endpoint.scheme() == "http" {
             self.direct_http.clone()
@@ -64,7 +59,8 @@ impl ProviderCompiler {
             protocol: recipe.protocol,
             endpoint,
             endpoint_kind,
-            auth: recipe.auth.into(),
+            auth: recipe.auth,
+            authorizer: None,
             headers: recipe.headers,
         };
 
@@ -187,7 +183,7 @@ impl EndpointSpec {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EndpointKind {
+pub(crate) enum EndpointKind {
     Base,
     Exact,
 }
@@ -231,28 +227,6 @@ pub enum HttpAuth {
     /// This intent is valid only for OpenAI Responses and selects the Codex
     /// request body shape automatically.
     RequestTimeCodex(SharedRequestCredentialProvider),
-}
-
-impl From<HttpAuth> for HttpConstructionAuth {
-    fn from(auth: HttpAuth) -> Self {
-        match auth {
-            HttpAuth::NoAuth => Self::NoAuth,
-            HttpAuth::ApiKey(secret) => Self::ApiKey(secret),
-            HttpAuth::Bearer(secret) => Self::Bearer(secret),
-            HttpAuth::Header(name, secret) => Self::Header(name, secret),
-            HttpAuth::Codex {
-                access_token,
-                account_id,
-                is_fedramp,
-            } => Self::Codex {
-                access_token,
-                account_id,
-                is_fedramp,
-            },
-            HttpAuth::RequestTimeBearer(credentials) => Self::RequestTimeBearer(credentials),
-            HttpAuth::RequestTimeCodex(credentials) => Self::RequestTimeCodex(credentials),
-        }
-    }
 }
 
 #[cfg(test)]

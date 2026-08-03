@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use crate::{
     ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role, ToolSpec,
+    compiler::EndpointKind,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
@@ -44,17 +45,11 @@ pub enum GoogleAuth {
     Header(String, SecretLiteral),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum GoogleEndpoint {
-    Base,
-    Exact,
-}
-
 /// A client for Google GenerateContent-compatible endpoints.
 pub struct GoogleGenerateContent {
     exchange: HttpExchange,
     endpoint: reqwest::Url,
-    endpoint_kind: GoogleEndpoint,
+    endpoint_kind: EndpointKind,
     headers: HeaderMap,
 }
 
@@ -65,7 +60,7 @@ impl GoogleGenerateContent {
         Self::with_client(
             build_client()?,
             endpoint,
-            GoogleEndpoint::Base,
+            EndpointKind::Base,
             GoogleAuth::XGoogApiKey(api_key.into()),
             [],
         )
@@ -74,7 +69,7 @@ impl GoogleGenerateContent {
     pub(crate) fn with_client(
         client: reqwest::Client,
         endpoint: reqwest::Url,
-        endpoint_kind: GoogleEndpoint,
+        endpoint_kind: EndpointKind,
         auth: GoogleAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, ProviderError> {
@@ -102,7 +97,7 @@ impl GoogleGenerateContent {
     }
 
     fn request_endpoint(&self, model: &str) -> Result<reqwest::Url, ProviderError> {
-        if matches!(self.endpoint_kind, GoogleEndpoint::Exact) {
+        if matches!(self.endpoint_kind, EndpointKind::Exact) {
             return Ok(self.endpoint.clone());
         }
 
@@ -782,7 +777,7 @@ mod tests {
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&base_url, true).unwrap(),
-            GoogleEndpoint::Base,
+            EndpointKind::Base,
             GoogleAuth::XGoogApiKey("google-test-secret".into()),
             [],
         )
@@ -856,7 +851,7 @@ mod tests {
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
-            GoogleEndpoint::Base,
+            EndpointKind::Base,
             GoogleAuth::NoAuth,
             [],
         )
@@ -951,7 +946,7 @@ mod tests {
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
-            GoogleEndpoint::Exact,
+            EndpointKind::Exact,
             GoogleAuth::NoAuth,
             [],
         )
@@ -1009,7 +1004,7 @@ mod tests {
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
-            GoogleEndpoint::Exact,
+            EndpointKind::Exact,
             GoogleAuth::NoAuth,
             [],
         )
@@ -1065,7 +1060,7 @@ mod tests {
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint("https://example.test/custom", false).unwrap(),
-            GoogleEndpoint::Exact,
+            EndpointKind::Exact,
             GoogleAuth::NoAuth,
             [],
         )
@@ -1198,7 +1193,7 @@ mod tests {
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             endpoint.clone(),
-            GoogleEndpoint::Base,
+            EndpointKind::Base,
             GoogleAuth::NoAuth,
             [],
         )
@@ -1209,7 +1204,7 @@ mod tests {
         let exact = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint("https://example.test/custom?alt=sse", false).unwrap(),
-            GoogleEndpoint::Exact,
+            EndpointKind::Exact,
             GoogleAuth::NoAuth,
             [],
         )
@@ -1223,7 +1218,7 @@ mod tests {
             GoogleGenerateContent::with_client(
                 crate::http::build_direct_client().unwrap(),
                 endpoint,
-                GoogleEndpoint::Base,
+                EndpointKind::Base,
                 GoogleAuth::XGoogApiKey("secret".into()),
                 [("x-goog-api-key".to_owned(), "override".to_owned())],
             )
@@ -1243,7 +1238,7 @@ mod tests {
         let provider = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
-            GoogleEndpoint::Exact,
+            EndpointKind::Exact,
             GoogleAuth::XGoogApiKey(secret.into()),
             [],
         )
@@ -1274,7 +1269,7 @@ mod tests {
         let incomplete = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
-            GoogleEndpoint::Exact,
+            EndpointKind::Exact,
             GoogleAuth::NoAuth,
             [],
         )
@@ -1300,7 +1295,7 @@ mod tests {
         let error = GoogleGenerateContent::with_client(
             crate::http::build_direct_client().unwrap(),
             validate_endpoint(&endpoint, true).unwrap(),
-            GoogleEndpoint::Exact,
+            EndpointKind::Exact,
             GoogleAuth::NoAuth,
             [],
         )

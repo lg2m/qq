@@ -13,10 +13,10 @@ use crate::{
         AwsConfigLoadError, BedrockAuth, INVALID_REGION_MESSAGE, load_aws_config,
         valid_region_label, validate_configuration,
     },
-    compiler::HttpProtocol,
+    compiler::{EndpointKind, HttpAuth, HttpProtocol},
     construction::{
-        CompiledHttpProvider, GOOGLE_MANTLE_UNSUPPORTED_MESSAGE, HttpConstructionAuth,
-        HttpConstructionSpec, HttpEndpointKind, construct_http_provider,
+        CompiledHttpProvider, GOOGLE_MANTLE_UNSUPPORTED_MESSAGE, HttpConstructionSpec,
+        construct_http_provider,
     },
     http::validate_endpoint,
     request_auth::RequestAuthorizer,
@@ -70,7 +70,8 @@ impl Mantle {
                     client.clone(),
                     endpoint,
                     protocol,
-                    HttpConstructionAuth::ApiKey(api_key.clone()),
+                    HttpAuth::ApiKey(api_key.clone()),
+                    None,
                 )
                 .map_err(|error| error.to_provider_error())?;
                 OnceCell::from(provider)
@@ -138,7 +139,8 @@ impl MantleInner {
                 self.client.clone(),
                 endpoint,
                 self.protocol,
-                HttpConstructionAuth::ApiKey(api_key.clone()),
+                HttpAuth::ApiKey(api_key.clone()),
+                None,
             ),
             BedrockAuth::DefaultChain | BedrockAuth::Profile(_) => {
                 let credentials = config.credentials.ok_or_else(|| {
@@ -150,10 +152,8 @@ impl MantleInner {
                     self.client.clone(),
                     endpoint,
                     self.protocol,
-                    HttpConstructionAuth::MantleSigV4(RequestAuthorizer::bedrock_mantle_sigv4(
-                        region,
-                        credentials,
-                    )),
+                    HttpAuth::NoAuth,
+                    Some(RequestAuthorizer::bedrock_mantle_sigv4(region, credentials)),
                 )
             }
         }
@@ -164,15 +164,17 @@ fn construct_mantle_provider(
     client: reqwest::Client,
     endpoint: reqwest::Url,
     protocol: HttpProtocol,
-    auth: HttpConstructionAuth,
+    auth: HttpAuth,
+    authorizer: Option<RequestAuthorizer>,
 ) -> Result<CompiledHttpProvider, MantleInitError> {
     construct_http_provider(
         client,
         HttpConstructionSpec {
             protocol,
             endpoint,
-            endpoint_kind: HttpEndpointKind::Exact,
+            endpoint_kind: EndpointKind::Exact,
             auth,
+            authorizer,
             headers: Vec::new(),
         },
     )
@@ -355,7 +357,8 @@ mod tests {
                     build_direct_client().unwrap(),
                     mantle_endpoint("us-east-1", HttpProtocol::OpenAiResponses).unwrap(),
                     HttpProtocol::OpenAiResponses,
-                    HttpConstructionAuth::ApiKey("mantle-test-secret".into()),
+                    HttpAuth::ApiKey("mantle-test-secret".into()),
+                    None,
                 )
             })
             .await;
@@ -377,7 +380,8 @@ mod tests {
                 build_direct_client().unwrap(),
                 endpoint,
                 protocol,
-                HttpConstructionAuth::ApiKey("mantle-test-secret".into()),
+                HttpAuth::ApiKey("mantle-test-secret".into()),
+                None,
             )
             .unwrap();
 
@@ -460,7 +464,8 @@ mod tests {
                 build_direct_client().unwrap(),
                 endpoint,
                 protocol,
-                HttpConstructionAuth::ApiKey("mantle-test-secret".into()),
+                HttpAuth::ApiKey("mantle-test-secret".into()),
+                None,
             )
             .unwrap();
             let events = provider
@@ -505,7 +510,8 @@ mod tests {
             build_direct_client().unwrap(),
             endpoint,
             HttpProtocol::OpenAiResponses,
-            HttpConstructionAuth::MantleSigV4(authorizer),
+            HttpAuth::NoAuth,
+            Some(authorizer),
         )
         .unwrap();
 

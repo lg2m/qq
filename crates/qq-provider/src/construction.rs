@@ -5,10 +5,10 @@
 //! entering this boundary.
 
 use crate::{
-    Provider, ProviderError, ProviderStream, SharedRequestCredentialProvider,
+    Provider, ProviderError, ProviderStream,
     anthropic::{AnthropicAuth, AnthropicMessages},
-    credentials::SecretLiteral,
-    google::{GoogleAuth, GoogleEndpoint, GoogleGenerateContent},
+    compiler::{EndpointKind, HttpAuth, HttpProtocol},
+    google::{GoogleAuth, GoogleGenerateContent},
     openai::{OpenAi, ResponsesAuth, ResponsesConstructionAuth},
     openai_chat::{ChatCompletionsAuth, OpenAiChatCompletions},
     request_auth::RequestAuthorizer,
@@ -16,38 +16,36 @@ use crate::{
 
 pub(crate) const GOOGLE_MANTLE_UNSUPPORTED_MESSAGE: &str =
     "Google GenerateContent is not supported by Amazon Bedrock Mantle";
-
-/// Whether a resolved URL represents a protocol-independent base or an exact
-/// request endpoint.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HttpEndpointKind {
-    Base,
-    Exact,
-}
-
-/// Coherent authorization intent accepted by compiled HTTP construction.
-pub(crate) enum HttpConstructionAuth {
-    NoAuth,
-    ApiKey(SecretLiteral),
-    Bearer(SecretLiteral),
-    Header(String, SecretLiteral),
-    Codex {
-        access_token: SecretLiteral,
-        account_id: SecretLiteral,
-        is_fedramp: bool,
-    },
-    RequestTimeBearer(SharedRequestCredentialProvider),
-    RequestTimeCodex(SharedRequestCredentialProvider),
-    MantleSigV4(RequestAuthorizer),
-}
+const CODEX_REQUIRES_RESPONSES_MESSAGE: &str =
+    "Codex authentication requires the OpenAI Responses protocol";
+const REQUEST_TIME_CODEX_REQUIRES_RESPONSES_MESSAGE: &str =
+    "request-time Codex authentication requires the OpenAI Responses protocol";
+const GOOGLE_REQUEST_TIME_UNSUPPORTED_MESSAGE: &str =
+    "request-time credentials are not supported by Google GenerateContent";
+const AUTHORIZER_WITH_AUTH_MESSAGE: &str =
+    "internal request authorization cannot be combined with HTTP authentication";
 
 /// Fully resolved inputs for constructing one compiled HTTP provider.
 pub(crate) struct HttpConstructionSpec {
-    pub(crate) protocol: crate::compiler::HttpProtocol,
+    pub(crate) protocol: HttpProtocol,
     pub(crate) endpoint: reqwest::Url,
-    pub(crate) endpoint_kind: HttpEndpointKind,
-    pub(crate) auth: HttpConstructionAuth,
+    pub(crate) endpoint_kind: EndpointKind,
+    pub(crate) auth: HttpAuth,
+    pub(crate) authorizer: Option<RequestAuthorizer>,
     pub(crate) headers: Vec<(String, String)>,
+}
+
+enum ResolvedHttpAuth {
+    OpenAiResponses(ResponsesConstructionAuth),
+    OpenAiChatCompletions {
+        auth: ChatCompletionsAuth,
+        authorizer: RequestAuthorizer,
+    },
+    AnthropicMessages {
+        auth: AnthropicAuth,
+        authorizer: RequestAuthorizer,
+    },
+    GoogleGenerateContent(GoogleAuth),
 }
 
 /// The concrete HTTP provider selected by compiled construction.
@@ -75,165 +73,174 @@ pub(crate) fn construct_http_provider(
     client: reqwest::Client,
     spec: HttpConstructionSpec,
 ) -> Result<CompiledHttpProvider, ProviderError> {
-    match spec.protocol {
-        crate::compiler::HttpProtocol::OpenAiResponses => {
-            let auth = responses_auth(spec.auth)?;
-            Ok(CompiledHttpProvider::OpenAiResponses(
-                OpenAi::with_client_and_auth(client, spec.endpoint, auth, spec.headers)?,
-            ))
-        }
-        crate::compiler::HttpProtocol::OpenAiChatCompletions => {
-            let (auth, authorizer) = chat_completions_auth(spec.auth)?;
+    let HttpConstructionSpec {
+        protocol,
+        endpoint,
+        endpoint_kind,
+        auth,
+        authorizer,
+        headers,
+    } = spec;
+
+    match resolve_http_auth(protocol, auth, authorizer)? {
+        ResolvedHttpAuth::OpenAiResponses(auth) => Ok(CompiledHttpProvider::OpenAiResponses(
+            OpenAi::with_client_and_auth(client, endpoint, auth, headers)?,
+        )),
+        ResolvedHttpAuth::OpenAiChatCompletions { auth, authorizer } => {
             Ok(CompiledHttpProvider::OpenAiChatCompletions(
                 OpenAiChatCompletions::with_client_and_authorizer(
-                    client,
-                    spec.endpoint,
-                    auth,
-                    spec.headers,
-                    authorizer,
+                    client, endpoint, auth, headers, authorizer,
                 )?,
             ))
         }
-        crate::compiler::HttpProtocol::AnthropicMessages => {
-            let (auth, authorizer) = anthropic_auth(spec.auth)?;
-            Ok(CompiledHttpProvider::AnthropicMessages(
-                AnthropicMessages::with_client_and_authorizer(
-                    client,
-                    spec.endpoint,
-                    auth,
-                    spec.headers,
-                    authorizer,
-                )?,
-            ))
-        }
-        crate::compiler::HttpProtocol::GoogleGenerateContent => {
-            let auth = google_auth(spec.auth)?;
-            let endpoint_kind = match spec.endpoint_kind {
-                HttpEndpointKind::Base => GoogleEndpoint::Base,
-                HttpEndpointKind::Exact => GoogleEndpoint::Exact,
-            };
-            Ok(CompiledHttpProvider::GoogleGenerateContent(
-                GoogleGenerateContent::with_client(
-                    client,
-                    spec.endpoint,
-                    endpoint_kind,
-                    auth,
-                    spec.headers,
-                )?,
-            ))
-        }
-    }
-}
-
-fn responses_auth(auth: HttpConstructionAuth) -> Result<ResponsesConstructionAuth, ProviderError> {
-    match auth {
-        HttpConstructionAuth::NoAuth => {
-            Ok(ResponsesConstructionAuth::Static(ResponsesAuth::NoAuth))
-        }
-        HttpConstructionAuth::ApiKey(secret) | HttpConstructionAuth::Bearer(secret) => Ok(
-            ResponsesConstructionAuth::Static(ResponsesAuth::Bearer(secret)),
+        ResolvedHttpAuth::AnthropicMessages { auth, authorizer } => Ok(
+            CompiledHttpProvider::AnthropicMessages(AnthropicMessages::with_client_and_authorizer(
+                client, endpoint, auth, headers, authorizer,
+            )?),
         ),
-        HttpConstructionAuth::Header(name, secret) => Ok(ResponsesConstructionAuth::Static(
-            ResponsesAuth::Header(name, secret),
-        )),
-        HttpConstructionAuth::Codex {
-            access_token,
-            account_id,
-            is_fedramp,
-        } => Ok(ResponsesConstructionAuth::Static(ResponsesAuth::Codex {
-            access_token,
-            account_id,
-            is_fedramp,
-        })),
-        HttpConstructionAuth::RequestTimeBearer(credentials) => {
-            Ok(ResponsesConstructionAuth::RequestTimeBearer(credentials))
-        }
-        HttpConstructionAuth::RequestTimeCodex(credentials) => {
-            Ok(ResponsesConstructionAuth::RequestTimeCodex(credentials))
-        }
-        HttpConstructionAuth::MantleSigV4(authorizer) => {
-            Ok(ResponsesConstructionAuth::MantleSigV4(authorizer))
-        }
-    }
-}
-
-fn chat_completions_auth(
-    auth: HttpConstructionAuth,
-) -> Result<(ChatCompletionsAuth, RequestAuthorizer), ProviderError> {
-    match auth {
-        HttpConstructionAuth::NoAuth => {
-            Ok((ChatCompletionsAuth::NoAuth, RequestAuthorizer::default()))
-        }
-        HttpConstructionAuth::ApiKey(secret) | HttpConstructionAuth::Bearer(secret) => Ok((
-            ChatCompletionsAuth::Bearer(secret),
-            RequestAuthorizer::default(),
-        )),
-        HttpConstructionAuth::Header(name, secret) => Ok((
-            ChatCompletionsAuth::Header(name, secret),
-            RequestAuthorizer::default(),
-        )),
-        HttpConstructionAuth::Codex { .. } => Err(ProviderError::Configuration(
-            "Codex authentication requires the OpenAI Responses protocol".to_owned(),
-        )),
-        HttpConstructionAuth::RequestTimeBearer(credentials) => Ok((
-            ChatCompletionsAuth::NoAuth,
-            RequestAuthorizer::request_time_bearer(credentials),
-        )),
-        HttpConstructionAuth::RequestTimeCodex(_) => Err(ProviderError::Configuration(
-            "request-time Codex authentication requires the OpenAI Responses protocol".to_owned(),
-        )),
-        HttpConstructionAuth::MantleSigV4(authorizer) => {
-            Ok((ChatCompletionsAuth::NoAuth, authorizer))
-        }
-    }
-}
-
-fn anthropic_auth(
-    auth: HttpConstructionAuth,
-) -> Result<(AnthropicAuth, RequestAuthorizer), ProviderError> {
-    match auth {
-        HttpConstructionAuth::NoAuth => Ok((AnthropicAuth::NoAuth, RequestAuthorizer::default())),
-        HttpConstructionAuth::ApiKey(secret) => {
-            Ok((AnthropicAuth::XApiKey(secret), RequestAuthorizer::default()))
-        }
-        HttpConstructionAuth::Bearer(secret) => {
-            Ok((AnthropicAuth::Bearer(secret), RequestAuthorizer::default()))
-        }
-        HttpConstructionAuth::Header(name, secret) => Ok((
-            AnthropicAuth::Header(name, secret),
-            RequestAuthorizer::default(),
-        )),
-        HttpConstructionAuth::Codex { .. } => Err(ProviderError::Configuration(
-            "Codex authentication requires the OpenAI Responses protocol".to_owned(),
-        )),
-        HttpConstructionAuth::RequestTimeBearer(credentials) => Ok((
-            AnthropicAuth::NoAuth,
-            RequestAuthorizer::request_time_bearer(credentials),
-        )),
-        HttpConstructionAuth::RequestTimeCodex(_) => Err(ProviderError::Configuration(
-            "request-time Codex authentication requires the OpenAI Responses protocol".to_owned(),
-        )),
-        HttpConstructionAuth::MantleSigV4(authorizer) => Ok((AnthropicAuth::NoAuth, authorizer)),
-    }
-}
-
-fn google_auth(auth: HttpConstructionAuth) -> Result<GoogleAuth, ProviderError> {
-    match auth {
-        HttpConstructionAuth::NoAuth => Ok(GoogleAuth::NoAuth),
-        HttpConstructionAuth::ApiKey(secret) => Ok(GoogleAuth::XGoogApiKey(secret)),
-        HttpConstructionAuth::Bearer(secret) => Ok(GoogleAuth::Bearer(secret)),
-        HttpConstructionAuth::Header(name, secret) => Ok(GoogleAuth::Header(name, secret)),
-        HttpConstructionAuth::Codex { .. } => Err(ProviderError::Configuration(
-            "Codex authentication requires the OpenAI Responses protocol".to_owned(),
-        )),
-        HttpConstructionAuth::RequestTimeBearer(_) | HttpConstructionAuth::RequestTimeCodex(_) => {
-            Err(ProviderError::Configuration(
-                "request-time credentials are not supported by Google GenerateContent".to_owned(),
+        ResolvedHttpAuth::GoogleGenerateContent(auth) => {
+            Ok(CompiledHttpProvider::GoogleGenerateContent(
+                GoogleGenerateContent::with_client(client, endpoint, endpoint_kind, auth, headers)?,
             ))
         }
-        HttpConstructionAuth::MantleSigV4(_) => Err(ProviderError::Configuration(
-            GOOGLE_MANTLE_UNSUPPORTED_MESSAGE.to_owned(),
+    }
+}
+
+fn resolve_http_auth(
+    protocol: HttpProtocol,
+    auth: HttpAuth,
+    authorizer: Option<RequestAuthorizer>,
+) -> Result<ResolvedHttpAuth, ProviderError> {
+    match (auth, authorizer) {
+        (HttpAuth::NoAuth, Some(authorizer)) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::MantleSigV4(authorizer),
+            )),
+            HttpProtocol::OpenAiChatCompletions => Ok(ResolvedHttpAuth::OpenAiChatCompletions {
+                auth: ChatCompletionsAuth::NoAuth,
+                authorizer,
+            }),
+            HttpProtocol::AnthropicMessages => Ok(ResolvedHttpAuth::AnthropicMessages {
+                auth: AnthropicAuth::NoAuth,
+                authorizer,
+            }),
+            HttpProtocol::GoogleGenerateContent => Err(ProviderError::Configuration(
+                GOOGLE_MANTLE_UNSUPPORTED_MESSAGE.to_owned(),
+            )),
+        },
+        (_, Some(_)) => Err(ProviderError::Configuration(
+            AUTHORIZER_WITH_AUTH_MESSAGE.to_owned(),
         )),
+        (HttpAuth::NoAuth, None) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::Static(ResponsesAuth::NoAuth),
+            )),
+            HttpProtocol::OpenAiChatCompletions => Ok(ResolvedHttpAuth::OpenAiChatCompletions {
+                auth: ChatCompletionsAuth::NoAuth,
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::AnthropicMessages => Ok(ResolvedHttpAuth::AnthropicMessages {
+                auth: AnthropicAuth::NoAuth,
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::GoogleGenerateContent => {
+                Ok(ResolvedHttpAuth::GoogleGenerateContent(GoogleAuth::NoAuth))
+            }
+        },
+        (HttpAuth::ApiKey(secret), None) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::Static(ResponsesAuth::Bearer(secret)),
+            )),
+            HttpProtocol::OpenAiChatCompletions => Ok(ResolvedHttpAuth::OpenAiChatCompletions {
+                auth: ChatCompletionsAuth::Bearer(secret),
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::AnthropicMessages => Ok(ResolvedHttpAuth::AnthropicMessages {
+                auth: AnthropicAuth::XApiKey(secret),
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::GoogleGenerateContent => Ok(ResolvedHttpAuth::GoogleGenerateContent(
+                GoogleAuth::XGoogApiKey(secret),
+            )),
+        },
+        (HttpAuth::Bearer(secret), None) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::Static(ResponsesAuth::Bearer(secret)),
+            )),
+            HttpProtocol::OpenAiChatCompletions => Ok(ResolvedHttpAuth::OpenAiChatCompletions {
+                auth: ChatCompletionsAuth::Bearer(secret),
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::AnthropicMessages => Ok(ResolvedHttpAuth::AnthropicMessages {
+                auth: AnthropicAuth::Bearer(secret),
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::GoogleGenerateContent => Ok(ResolvedHttpAuth::GoogleGenerateContent(
+                GoogleAuth::Bearer(secret),
+            )),
+        },
+        (HttpAuth::Header(name, secret), None) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::Static(ResponsesAuth::Header(name, secret)),
+            )),
+            HttpProtocol::OpenAiChatCompletions => Ok(ResolvedHttpAuth::OpenAiChatCompletions {
+                auth: ChatCompletionsAuth::Header(name, secret),
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::AnthropicMessages => Ok(ResolvedHttpAuth::AnthropicMessages {
+                auth: AnthropicAuth::Header(name, secret),
+                authorizer: RequestAuthorizer::default(),
+            }),
+            HttpProtocol::GoogleGenerateContent => Ok(ResolvedHttpAuth::GoogleGenerateContent(
+                GoogleAuth::Header(name, secret),
+            )),
+        },
+        (
+            HttpAuth::Codex {
+                access_token,
+                account_id,
+                is_fedramp,
+            },
+            None,
+        ) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::Static(ResponsesAuth::Codex {
+                    access_token,
+                    account_id,
+                    is_fedramp,
+                }),
+            )),
+            _ => Err(ProviderError::Configuration(
+                CODEX_REQUIRES_RESPONSES_MESSAGE.to_owned(),
+            )),
+        },
+        (HttpAuth::RequestTimeBearer(credentials), None) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::RequestTimeBearer(credentials),
+            )),
+            HttpProtocol::OpenAiChatCompletions => Ok(ResolvedHttpAuth::OpenAiChatCompletions {
+                auth: ChatCompletionsAuth::NoAuth,
+                authorizer: RequestAuthorizer::request_time_bearer(credentials),
+            }),
+            HttpProtocol::AnthropicMessages => Ok(ResolvedHttpAuth::AnthropicMessages {
+                auth: AnthropicAuth::NoAuth,
+                authorizer: RequestAuthorizer::request_time_bearer(credentials),
+            }),
+            HttpProtocol::GoogleGenerateContent => Err(ProviderError::Configuration(
+                GOOGLE_REQUEST_TIME_UNSUPPORTED_MESSAGE.to_owned(),
+            )),
+        },
+        (HttpAuth::RequestTimeCodex(credentials), None) => match protocol {
+            HttpProtocol::OpenAiResponses => Ok(ResolvedHttpAuth::OpenAiResponses(
+                ResponsesConstructionAuth::RequestTimeCodex(credentials),
+            )),
+            HttpProtocol::GoogleGenerateContent => Err(ProviderError::Configuration(
+                GOOGLE_REQUEST_TIME_UNSUPPORTED_MESSAGE.to_owned(),
+            )),
+            _ => Err(ProviderError::Configuration(
+                REQUEST_TIME_CODEX_REQUIRES_RESPONSES_MESSAGE.to_owned(),
+            )),
+        },
     }
 }
 
@@ -242,7 +249,7 @@ mod tests {
     use super::*;
     use crate::{
         RequestCredential, RequestCredentialFuture, RequestCredentialProvider,
-        compiler::HttpProtocol,
+        SharedRequestCredentialProvider, compiler::HttpProtocol,
     };
 
     struct StaticBearerCredentials;
@@ -261,12 +268,13 @@ mod tests {
         }
     }
 
-    fn spec(protocol: HttpProtocol, auth: HttpConstructionAuth) -> HttpConstructionSpec {
+    fn spec(protocol: HttpProtocol, auth: HttpAuth) -> HttpConstructionSpec {
         HttpConstructionSpec {
             protocol,
             endpoint: reqwest::Url::parse("http://127.0.0.1:1/test").unwrap(),
-            endpoint_kind: HttpEndpointKind::Exact,
+            endpoint_kind: EndpointKind::Exact,
             auth,
+            authorizer: None,
             headers: Vec::new(),
         }
     }
@@ -281,7 +289,7 @@ mod tests {
         ] {
             construct_http_provider(
                 reqwest::Client::new(),
-                spec(protocol, HttpConstructionAuth::ApiKey("test-secret".into())),
+                spec(protocol, HttpAuth::ApiKey("test-secret".into())),
             )
             .unwrap();
         }
@@ -290,19 +298,19 @@ mod tests {
     #[test]
     fn constructs_every_supported_direct_auth_intent_without_network_io() {
         let cases = [
-            HttpConstructionAuth::NoAuth,
-            HttpConstructionAuth::ApiKey("test-api-key".into()),
-            HttpConstructionAuth::Bearer("test-bearer".into()),
-            HttpConstructionAuth::Header("x-test-key".to_owned(), "test-value".into()),
-            HttpConstructionAuth::Codex {
+            HttpAuth::NoAuth,
+            HttpAuth::ApiKey("test-api-key".into()),
+            HttpAuth::Bearer("test-bearer".into()),
+            HttpAuth::Header("x-test-key".to_owned(), "test-value".into()),
+            HttpAuth::Codex {
                 access_token: "test-codex".into(),
                 account_id: "test-account".into(),
                 is_fedramp: false,
             },
-            HttpConstructionAuth::RequestTimeBearer(SharedRequestCredentialProvider::new(
+            HttpAuth::RequestTimeBearer(SharedRequestCredentialProvider::new(
                 StaticBearerCredentials,
             )),
-            HttpConstructionAuth::RequestTimeCodex(SharedRequestCredentialProvider::new(
+            HttpAuth::RequestTimeCodex(SharedRequestCredentialProvider::new(
                 StaticCodexCredentials,
             )),
         ];
@@ -313,8 +321,9 @@ mod tests {
                 HttpConstructionSpec {
                     protocol: HttpProtocol::OpenAiResponses,
                     endpoint: reqwest::Url::parse("http://127.0.0.1:1/test").unwrap(),
-                    endpoint_kind: HttpEndpointKind::Base,
+                    endpoint_kind: EndpointKind::Base,
                     auth,
+                    authorizer: None,
                     headers: Vec::new(),
                 },
             )
@@ -333,7 +342,7 @@ mod tests {
                 reqwest::Client::new(),
                 spec(
                     protocol,
-                    HttpConstructionAuth::Codex {
+                    HttpAuth::Codex {
                         access_token: "codex-secret".into(),
                         account_id: "account-secret".into(),
                         is_fedramp: false,
@@ -357,25 +366,35 @@ mod tests {
             HttpProtocol::OpenAiChatCompletions,
             HttpProtocol::AnthropicMessages,
         ] {
-            construct_http_provider(
-                reqwest::Client::new(),
-                spec(
-                    protocol,
-                    HttpConstructionAuth::MantleSigV4(RequestAuthorizer::default()),
-                ),
-            )
-            .unwrap();
+            let mut spec = spec(protocol, HttpAuth::NoAuth);
+            spec.authorizer = Some(RequestAuthorizer::default());
+            construct_http_provider(reqwest::Client::new(), spec).unwrap();
         }
 
+        let mut spec = spec(HttpProtocol::GoogleGenerateContent, HttpAuth::NoAuth);
+        spec.authorizer = Some(RequestAuthorizer::default());
+        let error = construct_http_provider(reqwest::Client::new(), spec)
+            .err()
+            .expect("Google must reject Mantle SigV4");
+        assert!(matches!(error, ProviderError::Configuration(_)));
+    }
+
+    #[test]
+    fn rejects_internal_authorizer_combined_with_recipe_auth() {
         let error = construct_http_provider(
             reqwest::Client::new(),
-            spec(
-                HttpProtocol::GoogleGenerateContent,
-                HttpConstructionAuth::MantleSigV4(RequestAuthorizer::default()),
-            ),
+            HttpConstructionSpec {
+                protocol: HttpProtocol::OpenAiResponses,
+                endpoint: reqwest::Url::parse("http://127.0.0.1:1/test").unwrap(),
+                endpoint_kind: EndpointKind::Exact,
+                auth: HttpAuth::ApiKey("test-secret".into()),
+                authorizer: Some(RequestAuthorizer::default()),
+                headers: Vec::new(),
+            },
         )
         .err()
-        .expect("Google must reject Mantle SigV4");
+        .expect("recipe auth and an internal authorizer must be mutually exclusive");
+
         assert!(matches!(error, ProviderError::Configuration(_)));
     }
 }
