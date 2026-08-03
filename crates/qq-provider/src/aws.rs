@@ -36,6 +36,7 @@ use crate::{ProviderError, ProviderErrorKind, credentials::SecretLiteral};
 
 const AWS_CONFIG_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const AWS_CONFIG_BUILD_CONCURRENCY: usize = 2;
+pub(crate) const INVALID_REGION_MESSAGE: &str = "AWS region must be a valid DNS label";
 
 static AWS_CONFIG_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(AWS_CONFIG_BUILD_CONCURRENCY)));
@@ -79,7 +80,7 @@ pub(crate) fn validate_configuration(
 
     if region.is_some_and(|region| !valid_region_label(region)) {
         return Err(ProviderError::Configuration(
-            "AWS region must be a valid DNS label".to_owned(),
+            INVALID_REGION_MESSAGE.to_owned(),
         ));
     }
 

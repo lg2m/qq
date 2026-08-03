@@ -10,13 +10,13 @@ use tokio::sync::OnceCell;
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream,
     aws::{
-        AwsConfigLoadError, BedrockAuth, load_aws_config, valid_region_label,
-        validate_configuration,
+        AwsConfigLoadError, BedrockAuth, INVALID_REGION_MESSAGE, load_aws_config,
+        valid_region_label, validate_configuration,
     },
     compiler::HttpProtocol,
     construction::{
-        CompiledHttpProvider, HttpConstructionAuth, HttpConstructionSpec, HttpEndpointKind,
-        construct_http_provider,
+        CompiledHttpProvider, GOOGLE_MANTLE_UNSUPPORTED_MESSAGE, HttpConstructionAuth,
+        HttpConstructionSpec, HttpEndpointKind, construct_http_provider,
     },
     http::validate_endpoint,
     request_auth::RequestAuthorizer,
@@ -58,7 +58,7 @@ impl Mantle {
     ) -> Result<Self, ProviderError> {
         if protocol == HttpProtocol::GoogleGenerateContent {
             return Err(ProviderError::Configuration(
-                "Google GenerateContent is not supported by Amazon Bedrock Mantle".to_owned(),
+                GOOGLE_MANTLE_UNSUPPORTED_MESSAGE.to_owned(),
             ));
         }
         validate_configuration(&auth, region.as_deref())?;
@@ -182,7 +182,7 @@ fn construct_mantle_provider(
 fn mantle_endpoint(region: &str, protocol: HttpProtocol) -> Result<reqwest::Url, MantleInitError> {
     if !valid_region_label(region) {
         return Err(MantleInitError::Configuration(
-            "AWS region must be a valid DNS label".to_owned(),
+            INVALID_REGION_MESSAGE.to_owned(),
         ));
     }
     let path = match protocol {
@@ -191,7 +191,7 @@ fn mantle_endpoint(region: &str, protocol: HttpProtocol) -> Result<reqwest::Url,
         HttpProtocol::AnthropicMessages => "/anthropic/v1/messages",
         HttpProtocol::GoogleGenerateContent => {
             return Err(MantleInitError::Configuration(
-                "Google GenerateContent is not supported by Amazon Bedrock Mantle".to_owned(),
+                GOOGLE_MANTLE_UNSUPPORTED_MESSAGE.to_owned(),
             ));
         }
     };
@@ -295,7 +295,7 @@ mod tests {
         assert!(matches!(
             error,
             ProviderError::Configuration(message)
-                if message == "Google GenerateContent is not supported by Amazon Bedrock Mantle"
+                if message == GOOGLE_MANTLE_UNSUPPORTED_MESSAGE
         ));
     }
 
