@@ -34,7 +34,7 @@ use http_body::Body;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-pub use crate::aws::BedrockAuth;
+use crate::aws::BedrockAuth;
 use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role,
@@ -47,7 +47,7 @@ const EVENT_FRAME_OVERHEAD_BYTES: usize = 64;
 
 /// A client for Amazon Bedrock's `ConverseStream` API.
 #[derive(Clone)]
-pub struct Bedrock {
+pub(crate) struct Bedrock {
     client: Arc<OnceCell<Client>>,
     auth: BedrockAuth,
     region: Option<String>,
@@ -71,7 +71,7 @@ impl Bedrock {
     ///
     /// Returns an error if the authentication or region configuration is empty or contains
     /// control characters.
-    pub fn new(auth: BedrockAuth, region: Option<String>) -> Result<Self, ProviderError> {
+    pub(crate) fn new(auth: BedrockAuth, region: Option<String>) -> Result<Self, ProviderError> {
         validate_configuration(&auth, region.as_deref())?;
         let redactions: Arc<[String]> = match &auth {
             BedrockAuth::ApiKey(secret) => Arc::from([secret.expose_secret().to_owned()]),

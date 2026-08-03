@@ -14,7 +14,6 @@ use crate::{
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
-        validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -26,6 +25,10 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::http::validate_endpoint;
+
+#[cfg(test)]
 const CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
 const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
@@ -39,14 +42,14 @@ const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
 
 /// Authentication applied by an OpenAI-compatible Chat Completions client.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChatCompletionsAuth {
+pub(crate) enum ChatCompletionsAuth {
     NoAuth,
     Bearer(SecretLiteral),
     Header(String, SecretLiteral),
 }
 
 /// A client for OpenAI-compatible Chat Completions endpoints.
-pub struct OpenAiChatCompletions {
+pub(crate) struct OpenAiChatCompletions {
     exchange: HttpExchange,
     endpoint: reqwest::Url,
     headers: HeaderMap,
@@ -54,7 +57,8 @@ pub struct OpenAiChatCompletions {
 
 impl OpenAiChatCompletions {
     /// Creates a client for OpenAI's standard Chat Completions endpoint.
-    pub fn new(api_key: &str) -> Result<Self, ProviderError> {
+    #[cfg(test)]
+    pub(crate) fn new(api_key: &str) -> Result<Self, ProviderError> {
         Self::with_endpoint(
             CHAT_COMPLETIONS_ENDPOINT,
             ChatCompletionsAuth::Bearer(api_key.into()),
@@ -67,7 +71,8 @@ impl OpenAiChatCompletions {
     ///
     /// Plain HTTP is accepted only when `allow_http` is true and the URL host is
     /// loopback. Header names and values are validated while constructing the client.
-    pub fn with_endpoint(
+    #[cfg(test)]
+    pub(crate) fn with_endpoint(
         endpoint: &str,
         auth: ChatCompletionsAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
@@ -105,7 +110,7 @@ impl OpenAiChatCompletions {
     /// Live canaries and single-shot probes use this so one overloaded or
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
-    pub fn without_retries(mut self) -> Self {
+    pub(crate) fn without_retries(mut self) -> Self {
         self.exchange = support::without_retries(self.exchange);
         self
     }

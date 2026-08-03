@@ -28,6 +28,7 @@ mod support;
 #[doc(hidden)]
 pub mod test_support;
 
+pub use aws::BedrockAuth;
 pub use compiler::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderRecipe,
 };

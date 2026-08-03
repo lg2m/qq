@@ -14,8 +14,7 @@ use crate::{
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
-        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, build_client,
-        is_request_controlled_header, validate_endpoint,
+        ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -24,7 +23,8 @@ use crate::{
     support::{self, UsageOnce, status_error_kind, subtract_cached_input_tokens},
 };
 
-const GENERATIVE_AI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
+#[cfg(test)]
+use crate::http::validate_endpoint;
 const X_GOOG_API_KEY: HeaderName = HeaderName::from_static("x-goog-api-key");
 
 const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
@@ -38,7 +38,7 @@ const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
 
 /// Authentication applied by a Google GenerateContent-compatible client.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GoogleAuth {
+pub(crate) enum GoogleAuth {
     NoAuth,
     XGoogApiKey(SecretLiteral),
     Bearer(SecretLiteral),
@@ -46,7 +46,7 @@ pub enum GoogleAuth {
 }
 
 /// A client for Google GenerateContent-compatible endpoints.
-pub struct GoogleGenerateContent {
+pub(crate) struct GoogleGenerateContent {
     exchange: HttpExchange,
     endpoint: reqwest::Url,
     endpoint_kind: EndpointKind,
@@ -54,18 +54,6 @@ pub struct GoogleGenerateContent {
 }
 
 impl GoogleGenerateContent {
-    /// Creates a client for Google's Gemini Developer API.
-    pub fn new(api_key: &str) -> Result<Self, ProviderError> {
-        let endpoint = validate_endpoint(GENERATIVE_AI_ENDPOINT, false)?;
-        Self::with_client(
-            build_client()?,
-            endpoint,
-            EndpointKind::Base,
-            GoogleAuth::XGoogApiKey(api_key.into()),
-            [],
-        )
-    }
-
     pub(crate) fn with_client(
         client: reqwest::Client,
         endpoint: reqwest::Url,
@@ -91,7 +79,7 @@ impl GoogleGenerateContent {
     /// Live canaries and single-shot probes use this so one overloaded or
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
-    pub fn without_retries(mut self) -> Self {
+    pub(crate) fn without_retries(mut self) -> Self {
         self.exchange = support::without_retries(self.exchange);
         self
     }

@@ -14,7 +14,6 @@ use crate::{
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
-        validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -23,6 +22,10 @@ use crate::{
     support::{self, ToolCallLedger, UsageOnce, value_as_status},
 };
 
+#[cfg(test)]
+use crate::http::validate_endpoint;
+
+#[cfg(test)]
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
@@ -39,7 +42,7 @@ const SSE_SPEC: SseExchangeSpec = SseExchangeSpec {
 
 /// Authentication applied by an Anthropic-compatible Messages client.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AnthropicAuth {
+pub(crate) enum AnthropicAuth {
     NoAuth,
     XApiKey(SecretLiteral),
     Bearer(SecretLiteral),
@@ -47,7 +50,7 @@ pub enum AnthropicAuth {
 }
 
 /// A client for Anthropic-compatible Messages endpoints.
-pub struct AnthropicMessages {
+pub(crate) struct AnthropicMessages {
     exchange: HttpExchange,
     endpoint: reqwest::Url,
     headers: HeaderMap,
@@ -55,7 +58,8 @@ pub struct AnthropicMessages {
 
 impl AnthropicMessages {
     /// Creates a client for Anthropic's standard Messages endpoint.
-    pub fn new(api_key: &str) -> Result<Self, ProviderError> {
+    #[cfg(test)]
+    pub(crate) fn new(api_key: &str) -> Result<Self, ProviderError> {
         Self::with_endpoint(
             MESSAGES_ENDPOINT,
             AnthropicAuth::XApiKey(api_key.into()),
@@ -68,7 +72,8 @@ impl AnthropicMessages {
     ///
     /// Plain HTTP is accepted only when `allow_http` is true and the URL host is
     /// loopback. The Anthropic version defaults to `2023-06-01`.
-    pub fn with_endpoint(
+    #[cfg(test)]
+    pub(crate) fn with_endpoint(
         endpoint: &str,
         auth: AnthropicAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
@@ -84,7 +89,8 @@ impl AnthropicMessages {
     }
 
     /// Creates a client with an explicit `anthropic-version` header value.
-    pub fn with_endpoint_and_version(
+    #[cfg(test)]
+    pub(crate) fn with_endpoint_and_version(
         endpoint: &str,
         auth: AnthropicAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
@@ -142,7 +148,7 @@ impl AnthropicMessages {
     /// Live canaries and single-shot probes use this so one overloaded or
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
-    pub fn without_retries(mut self) -> Self {
+    pub(crate) fn without_retries(mut self) -> Self {
         self.exchange = support::without_retries(self.exchange);
         self
     }

@@ -11,9 +11,12 @@ use serde_json::Value;
 
 use crate::{
     ProviderError, ProviderErrorKind, ProviderUsage,
-    http::{HttpExchange, HttpRejection, RetryPolicy, build_client, build_direct_client},
+    http::{HttpExchange, HttpRejection, RetryPolicy},
     sanitize::sanitize_message,
 };
+
+#[cfg(test)]
+use crate::http::{build_client, build_direct_client};
 
 /// Interprets a rejected HTTP exchange against the adapter's error envelope.
 ///
@@ -162,6 +165,7 @@ pub(crate) fn subtract_cached_input_tokens(
 /// Builds the HTTP client an adapter's exact-endpoint constructor should use:
 /// loopback plain-HTTP endpoints get the proxy-free direct client, everything
 /// else the standard client.
+#[cfg(test)]
 pub(crate) fn client_for_endpoint(
     endpoint: &reqwest::Url,
 ) -> Result<reqwest::Client, ProviderError> {

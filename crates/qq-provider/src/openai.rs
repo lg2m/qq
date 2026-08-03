@@ -14,7 +14,6 @@ use crate::{
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
-        validate_endpoint,
     },
     limits::{ByteCounter, StreamLimits},
     request_auth::RequestAuthorizer,
@@ -23,11 +22,15 @@ use crate::{
     support::{self, ToolCallLedger},
 };
 
+#[cfg(test)]
+use crate::http::validate_endpoint;
+
+#[cfg(test)]
 const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 
 /// Authentication applied by an OpenAI-compatible Responses client.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResponsesAuth {
+pub(crate) enum ResponsesAuth {
     NoAuth,
     Bearer(SecretLiteral),
     Header(String, SecretLiteral),
@@ -54,7 +57,7 @@ pub(crate) enum ResponsesConstructionAuth {
 }
 
 /// A client for OpenAI-compatible Responses endpoints.
-pub struct OpenAi {
+pub(crate) struct OpenAi {
     exchange: HttpExchange,
     endpoint: reqwest::Url,
     headers: HeaderMap,
@@ -63,7 +66,8 @@ pub struct OpenAi {
 
 impl OpenAi {
     /// Creates a client for OpenAI's standard Responses endpoint.
-    pub fn new(api_key: &str) -> Result<Self, ProviderError> {
+    #[cfg(test)]
+    pub(crate) fn new(api_key: &str) -> Result<Self, ProviderError> {
         Self::with_endpoint(
             RESPONSES_ENDPOINT,
             ResponsesAuth::Bearer(api_key.into()),
@@ -76,7 +80,8 @@ impl OpenAi {
     ///
     /// Plain HTTP is accepted only when `allow_http` is true and the URL host is
     /// loopback. Header names and values are validated while constructing the client.
-    pub fn with_endpoint(
+    #[cfg(test)]
+    pub(crate) fn with_endpoint(
         exact_endpoint: &str,
         auth: ResponsesAuth,
         static_headers: impl IntoIterator<Item = (String, String)>,
@@ -138,7 +143,7 @@ impl OpenAi {
     /// Live canaries and single-shot probes use this so one overloaded or
     /// rate-limited response is not spent across multiple attempts.
     #[must_use]
-    pub fn without_retries(mut self) -> Self {
+    pub(crate) fn without_retries(mut self) -> Self {
         self.exchange = support::without_retries(self.exchange);
         self
     }

@@ -1,8 +1,8 @@
 use std::{hint::black_box, time::Instant};
 
 use qq_provider::{
-    EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ModelRequest, Provider,
-    ProviderCompiler, ProviderRecipe, bedrock::BedrockAuth,
+    BedrockAuth, EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ModelRequest, Provider,
+    ProviderCompiler, ProviderRecipe,
 };
 
 const DEFAULT_ITERATIONS: u64 = 25_000;

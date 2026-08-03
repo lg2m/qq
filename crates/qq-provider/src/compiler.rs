@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::{
     Provider, ProviderError, SharedRequestCredentialProvider,
-    bedrock::{Bedrock, BedrockAuth},
+    aws::BedrockAuth,
+    bedrock::Bedrock,
     construction::{HttpConstructionSpec, HttpRetryMode, construct_http_provider},
     credentials::SecretLiteral,
     http::{build_client, build_direct_client, validate_endpoint},

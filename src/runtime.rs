@@ -23,8 +23,8 @@ use qq_protocol::{
     SnapshotRequest, SubscribeRequest, WorkspaceGrantOutcome,
 };
 use qq_provider::{
-    EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderError,
-    ProviderRecipe, bedrock::BedrockAuth as ProviderBedrockAuth,
+    BedrockAuth as ProviderBedrockAuth, EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe,
+    ProviderCompiler, ProviderError, ProviderRecipe,
 };
 use qq_server::{AskHandler, AskHandlerError, CommandFuture, ModelsFuture, SnapshotFuture};
 use sha2::{Digest, Sha256};
