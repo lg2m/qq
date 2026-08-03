@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -14,7 +15,7 @@ use std::{
 use async_stream::stream;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use qq_protocol::{
     AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId,
     CommandOutcome, CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole,
@@ -982,8 +983,25 @@ async fn schedule_runs(
                     }
                 }
                 let task_inner = Arc::clone(&inner);
+                let panic_claimed = claimed.clone();
                 tokio::spawn(async move {
-                    execute_run(Arc::clone(&task_inner), claimed, cancel_receiver).await;
+                    let execution = AssertUnwindSafe(execute_run(
+                        Arc::clone(&task_inner),
+                        claimed,
+                        cancel_receiver,
+                    ))
+                    .catch_unwind()
+                    .await;
+                    if execution.is_err() {
+                        finish_run(
+                            &task_inner,
+                            &panic_claimed,
+                            internal_failure(
+                                "agent run task panicked; committed work was preserved",
+                            ),
+                        )
+                        .await;
+                    }
                     drop(permit);
                     let _ = task_inner.schedule.try_send(());
                 });
@@ -6454,11 +6472,12 @@ fn load_model_context(
                 // A run's assistant output replays right after its prompt,
                 // from the model_turns rows rather than the per-turn message
                 // rows: call-only turns persist no message row, so messages
-                // alone cannot reconstruct the run. Completed and interrupted
-                // runs replay, and so does a still-running run so capacity
-                // measurement mid-run sees its committed turns — cancelled
-                // and failed runs are excluded, matching the previous
-                // message-state gate.
+                // alone cannot reconstruct the run. Every committed turn is
+                // durable conversation history regardless of how the run
+                // ended; a failure or cancellation must not make visible work
+                // disappear from the next model request. A still-running run
+                // also replays so capacity measurement sees its committed
+                // turns while execution is in flight.
                 let status: String = transaction
                     .query_row(
                         "SELECT status FROM runs WHERE id = ?1",
@@ -6466,7 +6485,10 @@ fn load_model_context(
                         |row| row.get(0),
                     )
                     .map_err(|_| SessionRuntimeError::Persistence)?;
-                if status == "completed" || status == "interrupted" || status == "running" {
+                if matches!(
+                    status.as_str(),
+                    "completed" | "cancelled" | "failed" | "interrupted" | "running"
+                ) {
                     append_run_turns(transaction, snapshot.run_id, &mut context)?;
                 }
             }
@@ -11108,6 +11130,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_and_cancelled_runs_replay_committed_turns_in_follow_up_context() {
+        let outcomes = [
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::ProviderTransport,
+                    message: "provider connection dropped".to_owned(),
+                },
+            },
+            RunOutcome::Cancelled,
+        ];
+
+        for outcome in outcomes {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap();
+            let resolved = store
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::ResolveWorkspace {
+                        path: directory.path().to_str().unwrap().to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+            let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome
+            else {
+                panic!("unexpected receipt")
+            };
+            let created = store
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::CreateSession {
+                        workspace_id,
+                        parent_id: None,
+                        model: ModelSelection {
+                            model: Some("test/model".to_owned()),
+                            max_output_tokens: Some(256),
+                            organization: None,
+                        },
+                        approval_mode: ApprovalMode::default(),
+                    },
+                )
+                .await
+                .unwrap();
+            let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+                panic!("unexpected receipt")
+            };
+            store
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::SubmitPrompt {
+                        session_id,
+                        prompt: "inspect the note".to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+            let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+            let tool_call_id = ToolCallId::generate().unwrap();
+            let call = RuntimeToolCall {
+                id: tool_call_id,
+                turn_ordinal: 1,
+                call_ordinal: 1,
+                provider_call_id: "call_0".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"note.txt"}"#.to_owned(),
+                argument_error: None,
+            };
+            store
+                .persist_model_turn(
+                    &claimed,
+                    1,
+                    Message::new(
+                        Role::Assistant,
+                        vec![ContentBlock::ToolCall {
+                            id: call.provider_call_id.clone(),
+                            name: call.name.clone(),
+                            arguments: serde_json::from_str(&call.arguments).unwrap(),
+                        }],
+                    ),
+                    vec![call],
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            store.start_tool_call(&claimed, tool_call_id).await.unwrap();
+            store
+                .finish_tool_call(
+                    &claimed,
+                    tool_call_id,
+                    "tool result\n".to_owned(),
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .finish_run(&claimed, outcome.clone(), None)
+                .await
+                .unwrap();
+
+            store
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::SubmitPrompt {
+                        session_id,
+                        prompt: "continue".to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+            let continued = store.claim_next_run(false).await.unwrap().unwrap();
+
+            assert!(matches!(
+                continued.messages[1].content(),
+                [ContentBlock::ToolCall { id, .. }] if id == "call_0"
+            ));
+            assert!(matches!(
+                continued.messages[2].content(),
+                [ContentBlock::ToolResult { call_id, content, .. }]
+                    if call_id == "call_0" && content == "tool result\n"
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn multi_turn_runs_emit_one_assistant_message_per_turn() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("note.txt"), "noted\n").unwrap();
@@ -11767,6 +11918,101 @@ mod tests {
                 }
             } if message.contains("4 MiB limit")
         ));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_run_task_fails_durably_and_the_session_keeps_scheduling() {
+        struct PanicOnceLoader {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for PanicOnceLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let calls = Arc::clone(&self.calls);
+                Box::pin(async move {
+                    struct PanicOnceProvider {
+                        calls: Arc<AtomicUsize>,
+                    }
+
+                    impl Provider for PanicOnceProvider {
+                        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                panic!("injected run-task panic");
+                            }
+                            Box::pin(stream::iter([
+                                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                                    text: "recovered".to_owned(),
+                                }),
+                                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                            ]))
+                        }
+                    }
+
+                    Runtime::new(PanicOnceProvider { calls }, "test-model", 256)
+                        .map(|runtime| LoadedRuntime {
+                            runtime: Arc::new(runtime),
+                            pricing: None,
+                        })
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(PanicOnceLoader {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let failed_run = queue_prompt(&runtime, session_id, "panic".to_owned()).await;
+        let failed = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_through_finished(&mut events),
+        )
+        .await
+        .expect("a panicking run must settle durably within one second");
+        assert!(failed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Server,
+                        ..
+                    }
+                },
+                ..
+            } if *run_id == failed_run
+        )));
+
+        let continued_run = queue_prompt(&runtime, session_id, "continue".to_owned()).await;
+        let continued = collect_through_finished(&mut events).await;
+        assert!(continued.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Completed,
+                ..
+            } if run_id == continued_run
+        )));
     }
 
     #[tokio::test]
