@@ -21,15 +21,16 @@ pub use qq_reasoning::{ReasoningEvent, ReasoningKind};
 pub use sessions::{
     AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution,
     CommandOutcome, CommandReceipt, CommandRequest, CursorError, EditPreview, EventCursor,
-    MessageRole, MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
-    ModelPricingTier, ModelSelection, RunActivity, RunFailure, RunOutcome, RunSnapshot, RunStatus,
+    InstructionHash, InstructionHashError, MessageRole, MessageSnapshot, MessageState,
+    ModelCatalogRequest, ModelDescriptor, ModelPricing, ModelPricingTier, ModelSelection,
+    PromptVersion, RunActivity, RunFailure, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus,
     SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot,
     SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, SubscribeRequest,
     TextChannel, TokenUsage, ToolCallDisplay, ToolCallSnapshot, ToolCallState,
     WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Starts one model run from a user prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

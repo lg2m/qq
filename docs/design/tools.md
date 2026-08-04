@@ -51,10 +51,28 @@ that it is an agent. `ModelRequest` carries a system-prompt field, and
 `qq-core` owns a base agent prompt assembled per run: what the workspace
 is, which tools are available, and the working conventions — read a file
 before editing it, prefer `search` over guessing paths, cite paths
-relative to the workspace root. The prompt is versioned in code, not
-user-editable configuration for now, so behavior changes ship as reviewed
-diffs rather than config drift. Each provider maps the field to its native
-system/instructions slot; no codec invents its own preamble.
+relative to the workspace root, establish observable completion criteria,
+verify resulting state, and report remaining failures honestly. The prompt is
+versioned in code, not user-editable configuration for now, so behavior
+changes ship as reviewed diffs rather than config drift. Each provider maps the
+field to its native system/instructions slot; no codec invents its own
+preamble.
+
+Before provider work, the same bounded blocking task that opens the workspace
+selects root `AGENTS.md`, or root `CLAUDE.md` only when `AGENTS.md` is absent.
+The selected regular UTF-8 file is capability-resolved, cannot escape through
+a symlink, and is capped at 64 KiB. Because preparation selects at most one
+root file, that individual limit is also the aggregate injected-instruction
+limit. Missing both names is valid. The selected content joins the stable
+system prefix; the prompt tells the model to inspect nested scopes root-to-leaf
+and apply the same filename fallback before changing files below them.
+
+Every prepared durable run records one all-or-none prompt identity before the
+runtime is polled far enough to contact a provider: the nonzero base-prompt
+version plus a validated SHA-256 hash of the prepared root path and bytes (or
+the empty-selection hash). Historical runs and runs that fail before
+preparation keep no identity. Nested instruction reads stay in the durable tool
+transcript and do not retroactively change the pre-provider identity.
 
 ### Message And Content Model
 

@@ -18,8 +18,8 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
 use qq_protocol::{
-    ApprovalMode, ReasoningKind, RunActivity, RunCommand, RunEvent, RunFailureKind, TokenUsage,
-    ToolCallId,
+    ApprovalMode, PromptVersion, ReasoningKind, RunActivity, RunCommand, RunEvent, RunFailureKind,
+    RunPromptIdentity, TokenUsage, ToolCallId,
 };
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
@@ -61,10 +61,17 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_RUN_MODEL_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_REASONING_BYTES: usize = 1024 * 1024;
 const MAX_PARALLEL_READS: usize = 4;
+const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(6) {
+    Some(version) => version,
+    None => panic!("agent prompt version must be nonzero"),
+};
 
 #[derive(Debug, Clone, PartialEq)]
 enum RuntimeEvent {
     Started,
+    Prepared {
+        identity: RunPromptIdentity,
+    },
     ActivityChanged {
         activity: RunActivity,
     },
@@ -375,84 +382,15 @@ impl Runtime {
 
     /// Runs one command with read-only tools scoped to `workspace`.
     pub fn run_in_workspace(&self, command: RunCommand, workspace: PathBuf) -> RunStream {
-        let mut events =
-            self.run_messages_in_workspace(vec![Message::user(command.into_prompt())], workspace);
-        Box::pin(stream! {
-            while let Some(event) = events.next().await {
-                match event {
-                    RuntimeEvent::Started => yield RunEvent::Started,
-                    RuntimeEvent::ActivityChanged { activity } => {
-                        yield RunEvent::ActivityChanged { activity };
-                    }
-                    RuntimeEvent::ReasoningStarted { kind } => {
-                        yield RunEvent::ReasoningStarted { kind };
-                    }
-                    RuntimeEvent::ReasoningDelta { kind, text } => {
-                        yield RunEvent::ReasoningDelta { kind, text };
-                    }
-                    RuntimeEvent::ReasoningCompleted { kind } => {
-                        yield RunEvent::ReasoningCompleted { kind };
-                    }
-                    RuntimeEvent::OutputTextDelta { text } => {
-                        yield RunEvent::OutputTextDelta { text };
-                    }
-                    RuntimeEvent::RefusalDelta { text } => {
-                        yield RunEvent::RefusalDelta { text };
-                    }
-                    RuntimeEvent::AssistantTurnCompleted { usage: Some(usage), .. } => {
-                        yield RunEvent::Usage { usage };
-                    }
-                    RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
-                    | RuntimeEvent::ToolCallStarted { .. }
-                    | RuntimeEvent::ToolCallDenied { .. }
-                    | RuntimeEvent::ToolCallOutputDelta { .. }
-                    | RuntimeEvent::ToolCallFinished { .. } => {}
-                    RuntimeEvent::Completed => {
-                        yield RunEvent::Completed;
-                        return;
-                    }
-                    RuntimeEvent::Failed { kind, message } => {
-                        yield RunEvent::Failed { kind, message };
-                        return;
-                    }
-                }
-            }
-        })
+        public_run_stream(
+            self.run_messages_in_workspace(vec![Message::user(command.into_prompt())], workspace),
+        )
     }
 
     /// Runs a multi-turn model/tool loop with explicit prior conversation context.
     pub fn run_messages(&self, messages: Vec<Message>) -> RunStream {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut events = self.run_messages_in_workspace(messages, workspace);
-        Box::pin(stream! {
-            while let Some(event) = events.next().await {
-                match event {
-                    RuntimeEvent::Started => yield RunEvent::Started,
-                    RuntimeEvent::ActivityChanged { activity } => yield RunEvent::ActivityChanged { activity },
-                    RuntimeEvent::ReasoningStarted { kind } => yield RunEvent::ReasoningStarted { kind },
-                    RuntimeEvent::ReasoningDelta { kind, text } => yield RunEvent::ReasoningDelta { kind, text },
-                    RuntimeEvent::ReasoningCompleted { kind } => yield RunEvent::ReasoningCompleted { kind },
-                    RuntimeEvent::OutputTextDelta { text } => yield RunEvent::OutputTextDelta { text },
-                    RuntimeEvent::RefusalDelta { text } => yield RunEvent::RefusalDelta { text },
-                    RuntimeEvent::AssistantTurnCompleted { usage: Some(usage), .. } => {
-                        yield RunEvent::Usage { usage };
-                    }
-                    RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
-                    | RuntimeEvent::ToolCallStarted { .. }
-                    | RuntimeEvent::ToolCallDenied { .. }
-                    | RuntimeEvent::ToolCallOutputDelta { .. }
-                    | RuntimeEvent::ToolCallFinished { .. } => {}
-                    RuntimeEvent::Completed => {
-                        yield RunEvent::Completed;
-                        return;
-                    }
-                    RuntimeEvent::Failed { kind, message } => {
-                        yield RunEvent::Failed { kind, message };
-                        return;
-                    }
-                }
-            }
-        })
+        public_run_stream(self.run_messages_in_workspace(messages, workspace))
     }
 
     fn run_messages_in_workspace(
@@ -533,15 +471,34 @@ impl Runtime {
                 return;
             }
 
-            let workspace = match tools::open_workspace(workspace, Arc::clone(&cancelled)).await {
-                Ok(workspace) => workspace,
-                Err(error) => {
+            let (workspace, workspace_instructions) = match tools::prepare_workspace(
+                workspace,
+                Arc::clone(&cancelled),
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(error @ (tools::WorkspacePreparationError::Canonicalize { .. }
+                    | tools::WorkspacePreparationError::Open { .. })) => {
                     yield RuntimeEvent::Failed {
                         kind: RunFailureKind::InvalidCommand,
                         message: format!("could not open the workspace directory: {error}"),
                     };
                     return;
                 }
+                Err(error) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    };
+                    return;
+                }
+            };
+            yield RuntimeEvent::Prepared {
+                identity: RunPromptIdentity {
+                    version: AGENT_PROMPT_VERSION,
+                    instruction_hash: workspace_instructions.hash(),
+                },
             };
             // MCP declarations join the built-ins once per run: the cached
             // specs are fetched here (connecting lazily on first use) so
@@ -564,7 +521,11 @@ impl Runtime {
                     }
                 }
             }
-            let system: Arc<str> = Arc::from(agent_system_prompt(workspace.path(), &tool_specs));
+            let system: Arc<str> = Arc::from(agent_system_prompt(
+                workspace.path(),
+                &tool_specs,
+                &workspace_instructions,
+            ));
 
             let mut slice_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
@@ -1163,9 +1124,61 @@ impl Runtime {
     }
 }
 
-/// Version 5 of the base agent prompt. The text is versioned in code, not
+/// Translates the richer internal runtime stream into the direct public API.
+/// Session execution consumes the internal preparation and tool events
+/// separately so it can persist them before publishing visible state.
+fn public_run_stream(mut events: RuntimeStream) -> RunStream {
+    Box::pin(stream! {
+        while let Some(event) = events.next().await {
+            match event {
+                RuntimeEvent::Started => yield RunEvent::Started,
+                RuntimeEvent::Prepared { .. } => {}
+                RuntimeEvent::ActivityChanged { activity } => {
+                    yield RunEvent::ActivityChanged { activity };
+                }
+                RuntimeEvent::ReasoningStarted { kind } => {
+                    yield RunEvent::ReasoningStarted { kind };
+                }
+                RuntimeEvent::ReasoningDelta { kind, text } => {
+                    yield RunEvent::ReasoningDelta { kind, text };
+                }
+                RuntimeEvent::ReasoningCompleted { kind } => {
+                    yield RunEvent::ReasoningCompleted { kind };
+                }
+                RuntimeEvent::OutputTextDelta { text } => {
+                    yield RunEvent::OutputTextDelta { text };
+                }
+                RuntimeEvent::RefusalDelta { text } => {
+                    yield RunEvent::RefusalDelta { text };
+                }
+                RuntimeEvent::AssistantTurnCompleted { usage: Some(usage), .. } => {
+                    yield RunEvent::Usage { usage };
+                }
+                RuntimeEvent::AssistantTurnCompleted { usage: None, .. }
+                | RuntimeEvent::ToolCallStarted { .. }
+                | RuntimeEvent::ToolCallDenied { .. }
+                | RuntimeEvent::ToolCallOutputDelta { .. }
+                | RuntimeEvent::ToolCallFinished { .. } => {}
+                RuntimeEvent::Completed => {
+                    yield RunEvent::Completed;
+                    return;
+                }
+                RuntimeEvent::Failed { kind, message } => {
+                    yield RunEvent::Failed { kind, message };
+                    return;
+                }
+            }
+        }
+    })
+}
+
+/// Version 6 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
-fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSpec]) -> String {
+fn agent_system_prompt(
+    workspace: &std::path::Path,
+    specs: &[qq_provider::ToolSpec],
+    workspace_instructions: &tools::WorkspaceInstructions,
+) -> String {
     let mut tool_names = String::new();
     let mut has_mcp = false;
     let mut has_spawn = false;
@@ -1201,7 +1214,7 @@ fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSp
     } else {
         ""
     };
-    format!(
+    let mut prompt = format!(
         "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
          \n\
          Available tools: {tool_names}. read_file, list_dir, and search are read-only; \
@@ -1209,12 +1222,23 @@ fn agent_system_prompt(workspace: &std::path::Path, specs: &[qq_provider::ToolSp
          shell runs one command in the workspace with a bounded timeout and may require user approval.{mcp_note}\n\
          \n\
          Working conventions:\n\
+         - Determine observable completion criteria from the user's request before acting.\n\
          - Read a file with read_file before editing or overwriting it; edits without a prior read in this session are rejected.\n\
+         - Inspect existing state before changing it and preserve unrelated work.\n\
          - Prefer search over guessing file paths.\n\
          - Give every tool path relative to the workspace root; absolute paths are rejected.\n\
+         - Before changing files below a subdirectory, inspect each directory from the workspace root to the target for AGENTS.md; when AGENTS.md is absent at one scope, check CLAUDE.md. Apply selected instructions root-to-leaf, with more-specific instructions taking precedence.\n\
+         - Implement requested changes rather than stopping at analysis unless the user requested analysis-only work.\n\
+         - Treat failed tools and tests as evidence: diagnose them and continue when a safe path remains.\n\
+         - Run the narrowest relevant verification before broader checks.\n\
+         - Do not claim success without evidence from the resulting state.\n\
+         - Report remaining failures and uncertainty honestly.\n\
+         - Respect explicit time, token, cost, and safety budgets.\n\
          - Prefer edit_file and write_file over shell for changing files.{spawn_section}",
         root = workspace.display(),
-    )
+    );
+    workspace_instructions.append_to_prompt(&mut prompt);
+    prompt
 }
 
 fn append_turn_text(blocks: &mut Vec<TurnBlock>, text: &str) {
@@ -1299,6 +1323,541 @@ mod tests {
                 }),
             ]))
         }
+    }
+
+    #[tokio::test]
+    async fn root_agents_instructions_and_completion_contract_reach_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("AGENTS.md"),
+            "Run the repository's focused checks before reporting success.\n",
+        )
+        .unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(
+                RunCommand::new("finish the task"),
+                directory.path().to_owned(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RunEvent::Completed)));
+        let captured = captured.lock().unwrap();
+        let system = captured
+            .as_ref()
+            .and_then(ModelRequest::system)
+            .expect("the provider request must carry a system prompt");
+        assert!(system.contains("Workspace instructions from AGENTS.md"));
+        assert!(system.contains("Run the repository's focused checks"));
+        assert!(system.contains("observable completion criteria"));
+        assert!(system.contains("preserve unrelated work"));
+        assert!(system.contains("analysis-only"));
+        assert!(system.contains("failed tools and tests as evidence"));
+        assert!(system.contains("continue when a safe path remains"));
+        assert!(system.contains("narrowest relevant verification before broader checks"));
+        assert!(system.contains("Do not claim success without evidence"));
+        assert!(system.contains("remaining failures and uncertainty honestly"));
+        assert!(system.contains("time, token, cost, and safety budgets"));
+        assert!(system.contains("root-to-leaf"));
+    }
+
+    #[tokio::test]
+    async fn agents_instructions_win_and_claude_is_an_absence_only_fallback() {
+        for (agents, claude, expected_source, expected_text, rejected_text) in [
+            (
+                Some("Follow AGENTS policy.\n"),
+                Some("Follow CLAUDE policy.\n"),
+                "AGENTS.md",
+                "Follow AGENTS policy.",
+                "Follow CLAUDE policy.",
+            ),
+            (
+                None,
+                Some("Use the CLAUDE fallback.\n"),
+                "CLAUDE.md",
+                "Use the CLAUDE fallback.",
+                "Follow AGENTS policy.",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            if let Some(content) = agents {
+                std::fs::write(directory.path().join("AGENTS.md"), content).unwrap();
+            }
+            if let Some(content) = claude {
+                std::fs::write(directory.path().join("CLAUDE.md"), content).unwrap();
+            }
+            let captured = Arc::new(Mutex::new(None));
+            let runtime = Runtime::new(
+                ScriptedProvider {
+                    request: Arc::clone(&captured),
+                    fails: false,
+                },
+                "gpt-test",
+                256,
+            )
+            .unwrap();
+
+            let events = runtime
+                .run_in_workspace(RunCommand::new("work"), directory.path().to_owned())
+                .collect::<Vec<_>>()
+                .await;
+
+            assert!(matches!(events.last(), Some(RunEvent::Completed)));
+            let captured = captured.lock().unwrap();
+            let system = captured.as_ref().unwrap().system().unwrap();
+            assert!(system.contains(&format!("Workspace instructions from {expected_source}")));
+            assert!(system.contains(expected_text));
+            assert!(!system.contains(rejected_text));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_instruction_file_and_analysis_only_request_complete_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("note.txt");
+        std::fs::write(&note, "unchanged\n").unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(
+                RunCommand::new("Analyze the design only; do not edit files."),
+                directory.path().to_owned(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RunEvent::Completed)));
+        assert_eq!(std::fs::read_to_string(note).unwrap(), "unchanged\n");
+        let captured = captured.lock().unwrap();
+        let request = captured
+            .as_ref()
+            .expect("missing instruction files must not prevent provider work");
+        assert!(
+            !request
+                .system()
+                .unwrap()
+                .contains("BEGIN WORKSPACE INSTRUCTIONS")
+        );
+        assert_eq!(
+            request.messages(),
+            [Message::user("Analyze the design only; do not edit files.")]
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_flow_discovers_mixed_scopes_and_verifies_before_completion() {
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        struct VerificationProvider {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for VerificationProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let system = request
+                    .system()
+                    .expect("every turn must retain the root prefix");
+                assert!(system.contains("Follow root policy."));
+                assert!(!system.contains("Follow src fallback."));
+                assert!(!system.contains("Follow feature policy."));
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests.len();
+                requests.push(request.clone());
+                drop(requests);
+
+                let tool_turn = |id: &str, name: &str, arguments: &str| {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: id.to_owned(),
+                            name: name.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: id.to_owned(),
+                            json: arguments.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted { id: id.to_owned() }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ])) as ProviderStream
+                };
+
+                match turn {
+                    0 => tool_turn("list-src", "list_dir", r#"{"path":"src"}"#),
+                    1 => {
+                        assert!(matches!(
+                            request.messages().last().map(Message::content),
+                            Some([ContentBlock::ToolResult {
+                                call_id,
+                                content,
+                                is_error: false,
+                            }]) if call_id == "list-src"
+                                && content.contains("CLAUDE.md")
+                                && content.contains("feature/")
+                        ));
+                        tool_turn(
+                            "read-src-policy",
+                            "read_file",
+                            r#"{"path":"src/CLAUDE.md"}"#,
+                        )
+                    }
+                    2 => {
+                        assert!(matches!(
+                            request.messages().last().map(Message::content),
+                            Some([ContentBlock::ToolResult {
+                                call_id,
+                                content,
+                                is_error: false,
+                            }]) if call_id == "read-src-policy"
+                                && content == "Follow src fallback.\n"
+                        ));
+                        tool_turn("list-feature", "list_dir", r#"{"path":"src/feature"}"#)
+                    }
+                    3 => {
+                        assert!(matches!(
+                            request.messages().last().map(Message::content),
+                            Some([ContentBlock::ToolResult {
+                                call_id,
+                                content,
+                                is_error: false,
+                            }]) if call_id == "list-feature"
+                                && content.contains("AGENTS.md")
+                                && content.contains("CLAUDE.md")
+                        ));
+                        tool_turn(
+                            "read-feature-policy",
+                            "read_file",
+                            r#"{"path":"src/feature/AGENTS.md"}"#,
+                        )
+                    }
+                    4 => {
+                        assert!(matches!(
+                            request.messages().last().map(Message::content),
+                            Some([ContentBlock::ToolResult {
+                                call_id,
+                                content,
+                                is_error: false,
+                            }]) if call_id == "read-feature-policy"
+                                && content == "Follow feature policy.\n"
+                        ));
+                        tool_turn(
+                            "read-before",
+                            "read_file",
+                            r#"{"path":"src/feature/note.txt"}"#,
+                        )
+                    }
+                    5 => {
+                        assert!(matches!(
+                            request.messages().last().map(Message::content),
+                            Some([ContentBlock::ToolResult {
+                                call_id,
+                                content,
+                                is_error: false,
+                            }]) if call_id == "read-before" && content == "before\n"
+                        ));
+                        tool_turn(
+                            "edit",
+                            "edit_file",
+                            r#"{"path":"src/feature/note.txt","old_string":"before\n","new_string":"after\n"}"#,
+                        )
+                    }
+                    6 => tool_turn(
+                        "read-after",
+                        "read_file",
+                        r#"{"path":"src/feature/note.txt"}"#,
+                    ),
+                    7 => {
+                        assert!(matches!(
+                            request.messages().last().map(Message::content),
+                            Some([ContentBlock::ToolResult {
+                                call_id,
+                                content,
+                                is_error: false,
+                            }]) if call_id == "read-after" && content == "after\n"
+                        ));
+                        Box::pin(stream::iter([
+                            Ok(ProviderEvent::OutputTextDelta {
+                                text: "verified".to_owned(),
+                            }),
+                            Ok(ProviderEvent::Completed { usage: None }),
+                        ]))
+                    }
+                    _ => panic!("provider was polled after its verified completion"),
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src/feature")).unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "Follow root policy.\n").unwrap();
+        std::fs::write(
+            directory.path().join("src/CLAUDE.md"),
+            "Follow src fallback.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/feature/AGENTS.md"),
+            "Follow feature policy.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/feature/CLAUDE.md"),
+            "This same-scope fallback must not be loaded.\n",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("src/feature/note.txt"), "before\n").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            VerificationProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_loop(
+                vec![Message::user(
+                    "Update src/feature/note.txt and verify the result.",
+                )],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(tools::FileState::default()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("src/feature/note.txt")).unwrap(),
+            "after\n"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        assert!(
+            !requests
+                .iter()
+                .flat_map(ModelRequest::messages)
+                .any(|message| {
+                    message.content().iter().any(|block| {
+                        matches!(block, ContentBlock::ToolResult { content, .. }
+                    if content.contains("same-scope fallback"))
+                    })
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_primary_instructions_fail_before_provider_work() {
+        for case in ["oversized", "invalid_utf8", "directory"] {
+            let directory = tempfile::tempdir().unwrap();
+            match case {
+                "oversized" => {
+                    std::fs::write(
+                        directory.path().join("AGENTS.md"),
+                        vec![b'x'; 64 * 1024 + 1],
+                    )
+                    .unwrap();
+                }
+                "invalid_utf8" => {
+                    std::fs::write(directory.path().join("AGENTS.md"), [0xff]).unwrap();
+                }
+                "directory" => {
+                    std::fs::create_dir(directory.path().join("AGENTS.md")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                directory.path().join("CLAUDE.md"),
+                "This fallback must not mask an invalid AGENTS.md.\n",
+            )
+            .unwrap();
+            let captured = Arc::new(Mutex::new(None));
+            let runtime = Runtime::new(
+                ScriptedProvider {
+                    request: Arc::clone(&captured),
+                    fails: false,
+                },
+                "gpt-test",
+                256,
+            )
+            .unwrap();
+
+            let events = runtime
+                .run_in_workspace(RunCommand::new("work"), directory.path().to_owned())
+                .collect::<Vec<_>>()
+                .await;
+
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    RunEvent::Started,
+                    RunEvent::Failed {
+                        kind: RunFailureKind::Configuration,
+                        message,
+                    }
+                ] if message.contains("AGENTS.md")
+            ));
+            assert!(captured.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn instruction_file_at_the_byte_limit_reaches_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), vec![b'x'; 64 * 1024]).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(RunCommand::new("work"), directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RunEvent::Completed)));
+        let captured = captured.lock().unwrap();
+        let system = captured.as_ref().unwrap().system().unwrap();
+        assert!(system.contains(&"x".repeat(64 * 1024)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_workspace_open_starts_no_provider_work() {
+        struct ExecuteGate;
+
+        impl ToolGate for ExecuteGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let run_cancelled = Arc::clone(&cancelled);
+        let pause = tools::test_pause_after_workspace_open(&cancelled);
+        let task = tokio::spawn(async move {
+            runtime
+                .run_loop(
+                    vec![Message::user("work")],
+                    directory.path().to_owned(),
+                    run_cancelled,
+                    Arc::new(ExecuteGate),
+                    Arc::new(tools::FileState::default()),
+                )
+                .collect::<Vec<_>>()
+                .await
+        });
+        let pause = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                pause.wait_until_opened().unwrap();
+                pause
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cancelled.store(true, Ordering::Release);
+        pause.resume().unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::Started,
+                RuntimeEvent::Failed {
+                    kind: RunFailureKind::Configuration,
+                    message,
+                }
+            ] if message.contains("cancelled")
+        ));
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instruction_symlink_escape_fails_before_provider_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("policy.md"), "outside policy\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("policy.md"),
+            directory.path().join("AGENTS.md"),
+        )
+        .unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(RunCommand::new("work"), directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RunEvent::Started,
+                RunEvent::Failed {
+                    kind: RunFailureKind::Configuration,
+                    message,
+                }
+            ] if message.contains("AGENTS.md") && message.contains("workspace")
+        ));
+        assert!(captured.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3238,13 +3797,14 @@ mod tests {
     #[test]
     fn agent_prompt_teaches_delegation_only_when_spawn_agent_is_declared() {
         let workspace = std::path::Path::new("/tmp/qq-prompt-test");
-        let without = agent_system_prompt(workspace, &tools::specs());
+        let instructions = tools::WorkspaceInstructions::empty();
+        let without = agent_system_prompt(workspace, &tools::specs(), &instructions);
         assert!(!without.contains("spawn_agent"));
         assert!(!without.contains("Delegation:"));
 
         let mut specs = tools::specs();
         specs.push(tools::spawn_agent_spec(&[]));
-        let with = agent_system_prompt(workspace, &specs);
+        let with = agent_system_prompt(workspace, &specs, &instructions);
         assert!(with.contains("spawn_agent"));
         assert!(with.contains("Delegation:"));
         assert!(with.contains("independent questions"));

@@ -20,11 +20,11 @@ use qq_protocol::{
     AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId,
     CommandOutcome, CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole,
     MessageSnapshot, MessageState, ModelPricing, ModelSelection, ReasoningEvent, RunActivity,
-    RunFailure, RunFailureKind, RunId, RunOutcome, RunSnapshot, RunStatus, SessionAccounting,
-    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
-    SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest, TextChannel,
-    TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
-    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    RunFailure, RunFailureKind, RunId, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus,
+    SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
+    SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
+    SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot,
+    ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -1293,6 +1293,17 @@ async fn execute_run(
                 return;
             }
             RunInput::Event(Some(RuntimeEvent::Started)) => {}
+            RunInput::Event(Some(RuntimeEvent::Prepared { identity })) => {
+                if let Err(error) = inner.store.record_prompt_identity(&claimed, identity).await {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist the run prompt identity", &error),
+                    )
+                    .await;
+                    return;
+                }
+            }
             RunInput::Event(Some(RuntimeEvent::ActivityChanged { activity })) => {
                 if internal {
                     continue;
@@ -2453,6 +2464,38 @@ impl Store {
         .await
     }
 
+    /// Commits the exact system-prompt identity before the runtime is polled
+    /// far enough to begin provider work.
+    async fn record_prompt_identity(
+        &self,
+        claimed: &ClaimedRun,
+        identity: RunPromptIdentity,
+    ) -> Result<(), SessionRuntimeError> {
+        let claimed = claimed.clone();
+        let identity =
+            serde_json::to_string(&identity).map_err(|_| SessionRuntimeError::Persistence)?;
+        self.call(Priority::Control, move |connection| {
+            let changed = connection
+                .execute(
+                    "UPDATE runs
+                     SET prompt_identity_json = ?3
+                     WHERE id = ?1 AND session_id = ?2 AND status = 'running'
+                       AND prompt_identity_json IS NULL",
+                    params![
+                        claimed.run_id.to_string(),
+                        claimed.session_id.to_string(),
+                        identity,
+                    ],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            if changed != 1 {
+                return Err(SessionRuntimeError::Persistence);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn append_reasoning(
         &self,
         claimed: &ClaimedRun,
@@ -2795,6 +2838,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                   kind TEXT NOT NULL DEFAULT 'prompt',
                   auto_compaction INTEGER NOT NULL DEFAULT 0,
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
+                  prompt_identity_json TEXT,
                    outcome_json TEXT,
                    usage_json TEXT,
                    context_tokens INTEGER,
@@ -3076,10 +3120,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12") => {}
+        Some("10" | "11" | "12" | "13") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
-    if !matches!(schema_version.as_deref(), Some("11" | "12")) {
+    if !matches!(schema_version.as_deref(), Some("11" | "12" | "13")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3094,7 +3138,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if schema_version.as_deref() != Some("12") {
+    if !matches!(schema_version.as_deref(), Some("12" | "13")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3102,6 +3146,21 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
         transaction
             .execute(
                 "UPDATE metadata SET value = '12' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if schema_version.as_deref() != Some("13") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_runs_prompt_identity_column(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '13' WHERE key = 'schema_version'",
                 [],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3305,6 +3364,18 @@ fn add_runs_auto_compaction_column(connection: &Connection) -> Result<(), Sessio
                 "ALTER TABLE runs ADD COLUMN auto_compaction INTEGER NOT NULL DEFAULT 0",
                 [],
             )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+/// Adds the stable prompt and workspace-instruction identity prepared before
+/// provider work. Existing runs remain unknown rather than being assigned the
+/// current prompt after the fact.
+fn add_runs_prompt_identity_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "runs", "prompt_identity_json")? {
+        connection
+            .execute("ALTER TABLE runs ADD COLUMN prompt_identity_json TEXT", [])
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     Ok(())
@@ -7415,7 +7486,8 @@ fn load_tool_call(
 fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, SessionRuntimeError> {
     connection
         .query_row(
-            "SELECT session_id, status, outcome_json, usage_json, context_tokens,
+            "SELECT session_id, status, outcome_json, prompt_identity_json,
+                    usage_json, context_tokens,
                     estimated_cost_usd_nanos
              FROM runs WHERE id = ?1",
             [run_id.to_string()],
@@ -7425,31 +7497,40 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<u64>>(4)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<u64>>(5)?,
+                    row.get::<_, Option<u64>>(6)?,
                 ))
             },
         )
         .map_err(|_| SessionRuntimeError::Persistence)
-        .and_then(|(session, status, outcome, usage, context_tokens, cost)| {
-            Ok(RunSnapshot {
-                id: run_id,
-                session_id: parse_id(&session)?,
-                status: parse_run_status(&status)?,
-                outcome: outcome
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|_| SessionRuntimeError::Persistence)?,
-                usage: usage
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|_| SessionRuntimeError::Persistence)?,
-                context_tokens,
-                estimated_cost_usd_nanos: cost,
-            })
-        })
+        .and_then(
+            |(session, status, outcome, prompt_identity, usage, context_tokens, cost)| {
+                Ok(RunSnapshot {
+                    id: run_id,
+                    session_id: parse_id(&session)?,
+                    status: parse_run_status(&status)?,
+                    outcome: outcome
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRuntimeError::Persistence)?,
+                    prompt_identity: prompt_identity
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRuntimeError::Persistence)?
+                        .map(Box::new),
+                    usage: usage
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRuntimeError::Persistence)?,
+                    context_tokens,
+                    estimated_cost_usd_nanos: cost,
+                })
+            },
+        )
 }
 
 fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
@@ -9098,6 +9179,229 @@ mod tests {
         (directory, runtime)
     }
 
+    #[tokio::test]
+    async fn run_snapshot_preserves_prompt_identity_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("AGENTS.md"),
+            "Keep provenance stable.\n",
+        )
+        .unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            Arc::new(ScriptedLoader),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = submit_prompt_to(&runtime, session_id, "finish the work").await;
+        collect_through_finished(&mut events).await;
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 8,
+                message_limit: 32,
+            })
+            .await
+            .unwrap();
+        let run = snapshot
+            .focused
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .unwrap();
+        let prompt_identity = run
+            .prompt_identity
+            .expect("a sent prompt must retain its prompt identity");
+        assert_eq!(prompt_identity.version, crate::AGENT_PROMPT_VERSION);
+        assert_eq!(prompt_identity.instruction_hash.to_string().len(), 64);
+
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        let reopened = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(ScriptedLoader),
+        )
+        .await
+        .unwrap();
+        let snapshot = reopened
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 8,
+                message_limit: 32,
+            })
+            .await
+            .unwrap();
+        let run = snapshot
+            .focused
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .unwrap();
+        assert_eq!(run.prompt_identity, Some(prompt_identity));
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_identity_persistence_failure_starts_no_provider_work() {
+        struct CountingLoader {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for CountingLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    let runtime =
+                        Runtime::new(CountingProvider { provider_calls }, "test-model", 256)
+                            .map_err(|error| RuntimeLoadError {
+                                kind: RunFailureKind::Configuration,
+                                message: error.to_string(),
+                            })?;
+                    Ok(LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                })
+            }
+        }
+
+        struct CountingProvider {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl Provider for CountingProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                self.provider_calls.fetch_add(1, Ordering::AcqRel);
+                Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                    usage: None,
+                })]))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            Arc::new(CountingLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_prompt_identity
+                 BEFORE UPDATE OF prompt_identity_json ON runs
+                 WHEN NEW.prompt_identity_json IS NOT NULL
+                 BEGIN
+                     SELECT RAISE(FAIL, 'forced prompt identity failure');
+                 END;",
+            )
+            .unwrap();
+
+        let run_id = submit_prompt_to(&runtime, session_id, "work").await;
+        let observed = collect_through_finished(&mut events).await;
+
+        assert_eq!(provider_calls.load(Ordering::Acquire), 0);
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Failed { failure },
+                ..
+            } if *finished == run_id
+                && failure.kind == RunFailureKind::Server
+                && failure.message.contains("failed to persist the run prompt identity")
+        )));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn instruction_hash_tracks_selected_path_and_bytes_deterministically() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "same\n").unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(ScriptedLoader),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let first =
+            completed_instruction_hash(&runtime, workspace_id, session_id, &mut events, "first")
+                .await;
+        let second =
+            completed_instruction_hash(&runtime, workspace_id, session_id, &mut events, "second")
+                .await;
+        assert_eq!(
+            first,
+            "6aba264a3fed8588d4e09f84ce073452fb551b53e8c3beae1b4aaf6bbb55a0c4"
+        );
+        assert_eq!(second, first);
+
+        std::fs::remove_file(directory.path().join("AGENTS.md")).unwrap();
+        std::fs::write(directory.path().join("CLAUDE.md"), "same\n").unwrap();
+        let fallback =
+            completed_instruction_hash(&runtime, workspace_id, session_id, &mut events, "fallback")
+                .await;
+        assert_eq!(
+            fallback,
+            "6d0da1256387dfa8d1521b942048efc90d6fa610b0d8f3e9d9dc7d0e4733d73e"
+        );
+        assert_ne!(fallback, first);
+
+        std::fs::remove_file(directory.path().join("CLAUDE.md")).unwrap();
+        let empty =
+            completed_instruction_hash(&runtime, workspace_id, session_id, &mut events, "empty")
+                .await;
+        assert_eq!(
+            empty,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
     /// Records the model each run is loaded with, then behaves like a
     /// one-tool-turn approval run: the run parks at a `__test_mutate`
     /// approval, which gives tests a deterministic "run is active" point.
@@ -9629,7 +9933,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "12"
+            "13"
         );
         assert!(
             !connection
@@ -9752,7 +10056,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "12"
+            "13"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -9820,7 +10124,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "12"
+            "13"
         );
         let (display_json, result) = connection
             .query_row(
@@ -9879,7 +10183,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "12"
+            "13"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -9944,7 +10248,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "12"
+            "13"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -10032,7 +10336,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "12"
+            "13"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -10044,6 +10348,62 @@ mod tests {
                 )
                 .unwrap(),
             (777, None)
+        );
+    }
+
+    #[test]
+    fn version_twelve_migration_adds_prompt_identity_without_guessing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO metadata VALUES ('schema_version', '12');
+                     CREATE TABLE runs (
+                         id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                         command_id TEXT NOT NULL UNIQUE, user_message_id TEXT NOT NULL,
+                         assistant_message_id TEXT NOT NULL, status TEXT NOT NULL,
+                         kind TEXT NOT NULL DEFAULT 'prompt',
+                         auto_compaction INTEGER NOT NULL DEFAULT 0,
+                         cancel_requested INTEGER NOT NULL DEFAULT 0,
+                         outcome_json TEXT, usage_json TEXT, context_tokens INTEGER,
+                         estimated_cost_usd_nanos INTEGER, created_at_ms INTEGER NOT NULL,
+                         started_at_ms INTEGER, finished_at_ms INTEGER
+                     );
+                     INSERT INTO runs(
+                         id, session_id, command_id, user_message_id,
+                         assistant_message_id, status, created_at_ms, finished_at_ms
+                     ) VALUES (
+                         'run', 'session', 'command', 'user', 'assistant',
+                         'completed', 1, 2
+                     );",
+                )
+                .unwrap();
+        }
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "13"
+        );
+        assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT prompt_identity_json FROM runs WHERE id = 'run'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            None
         );
     }
 
@@ -16536,6 +16896,36 @@ mod tests {
             panic!("unexpected receipt")
         };
         run_id
+    }
+
+    async fn completed_instruction_hash(
+        runtime: &SessionRuntime,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        events: &mut SessionEventStream,
+        prompt: &str,
+    ) -> String {
+        let run_id = submit_prompt_to(runtime, session_id, prompt).await;
+        collect_through_finished(events).await;
+        runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 8,
+                message_limit: 32,
+            })
+            .await
+            .unwrap()
+            .focused
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .unwrap()
+            .prompt_identity
+            .expect("a sent prompt must retain its prompt identity")
+            .instruction_hash
+            .to_string()
     }
 
     /// Collects events until `run_id` finishes, with a timeout generous

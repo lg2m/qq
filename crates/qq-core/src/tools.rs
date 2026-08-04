@@ -15,9 +15,18 @@ use cap_std::fs::Dir;
 use qq_provider::ToolSpec;
 use serde::Deserialize;
 use serde_json::json;
+use thiserror::Error;
 use tokio::{
     io::AsyncReadExt,
     sync::{Semaphore, mpsc},
+};
+
+mod instructions;
+
+#[cfg(test)]
+pub(crate) use instructions::test_pause_after_workspace_open;
+pub(crate) use instructions::{
+    WorkspaceInstructions, WorkspacePreparationError, prepare_workspace,
 };
 
 pub(crate) const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
@@ -169,36 +178,6 @@ fn content_hash(bytes: &[u8]) -> String {
         let _ = write!(hash, "{byte:02x}");
     }
     hash
-}
-
-pub(crate) async fn open_workspace(
-    path: PathBuf,
-    cancelled: Arc<AtomicBool>,
-) -> Result<Workspace, std::io::Error> {
-    let permit = blocking_permits()
-        .acquire_owned()
-        .await
-        .map_err(|_| std::io::Error::other("tool executor is unavailable"))?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        if cancelled.load(Ordering::Acquire) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "workspace opening was cancelled",
-            ));
-        }
-        let path = std::fs::canonicalize(path)?;
-        let workspace = Workspace::open(&path)?;
-        if cancelled.load(Ordering::Acquire) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "workspace opening was cancelled",
-            ));
-        }
-        Ok(workspace)
-    })
-    .await
-    .map_err(|_| std::io::Error::other("workspace opening stopped unexpectedly"))?
 }
 
 fn blocking_permits() -> Arc<Semaphore> {
@@ -702,7 +681,7 @@ fn read_file(
     }
     let path = match contained_path(workspace, &arguments.path) {
         Ok(path) => path,
-        Err(error) => return ToolExecutionResult::error(error),
+        Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
     if !workspace.root.is_file(&path) {
         return ToolExecutionResult::error("path is not a file");
@@ -805,7 +784,7 @@ fn edit_file(
     }
     let path = match contained_path(workspace, &arguments.path) {
         Ok(path) => path,
-        Err(error) => return ToolExecutionResult::error(error),
+        Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
     if !workspace.root.is_file(&path) {
         return ToolExecutionResult::error("path is not a file");
@@ -1007,7 +986,7 @@ fn read_editable(workspace: &Workspace, path: &Path) -> Result<EditableFile, Str
 fn resolve_write_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, String> {
     let resolve_error = match contained_path(workspace, requested) {
         Ok(path) => return Ok(path),
-        Err(error) => error,
+        Err(error) => error.to_string(),
     };
     let requested_path = Path::new(requested);
     if requested.is_empty() || requested_path.is_absolute() {
@@ -1093,7 +1072,7 @@ fn list_dir(
     }
     let path = match contained_path(workspace, &arguments.path) {
         Ok(path) => path,
-        Err(error) => return ToolExecutionResult::error(error),
+        Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
     if !workspace.root.is_dir(&path) {
         return ToolExecutionResult::error("path is not a directory");
@@ -1158,7 +1137,7 @@ fn search(
     }
     let root = match contained_path(workspace, &arguments.path) {
         Ok(path) => path,
-        Err(error) => return ToolExecutionResult::error(error),
+        Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
     let mut pending = vec![root];
     let mut files = 0_usize;
@@ -1382,7 +1361,7 @@ async fn run_shell(
         Some(requested) => {
             let relative = match contained_path(workspace, requested) {
                 Ok(relative) => relative,
-                Err(error) => return ToolExecutionResult::error(error),
+                Err(error) => return ToolExecutionResult::error(error.to_string()),
             };
             if !workspace.root.is_dir(&relative) {
                 return ToolExecutionResult::error("cwd is not a directory");
@@ -1663,24 +1642,39 @@ impl BoundedCapture {
     }
 }
 
-fn contained_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, String> {
+#[derive(Debug, Error)]
+pub(crate) enum WorkspacePathError {
+    #[error("path must not be empty")]
+    Empty,
+    #[error("path must be relative to the workspace")]
+    Absolute,
+    #[error("path could not be resolved: {source}")]
+    Resolve {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("path escapes the workspace")]
+    Escape,
+}
+
+fn contained_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, WorkspacePathError> {
     if requested.is_empty() {
-        return Err("path must not be empty".to_owned());
+        return Err(WorkspacePathError::Empty);
     }
     let requested = Path::new(requested);
     if requested.is_absolute() {
-        return Err("path must be relative to the workspace".to_owned());
+        return Err(WorkspacePathError::Absolute);
     }
     let canonical = workspace
         .root
         .canonicalize(requested)
-        .map_err(|error| format!("path could not be resolved: {error}"))?;
+        .map_err(|source| WorkspacePathError::Resolve { source })?;
     if canonical.is_absolute()
         || canonical
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        return Err("path escapes the workspace".to_owned());
+        return Err(WorkspacePathError::Escape);
     }
     Ok(canonical)
 }
