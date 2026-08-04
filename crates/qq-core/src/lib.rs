@@ -18,12 +18,13 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
 use qq_protocol::{
-    ApprovalMode, PromptVersion, ReasoningKind, RunActivity, RunCommand, RunEvent, RunFailureKind,
-    RunPromptIdentity, TokenUsage, ToolCallId,
+    ApprovalMode, ContentHash, PromptVersion, ReasoningKind, RunActivity, RunCommand, RunEvent,
+    RunFailureKind, RunPromptIdentity, TokenUsage, ToolCallId,
 };
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod approval;
@@ -61,7 +62,7 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_RUN_MODEL_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_REASONING_BYTES: usize = 1024 * 1024;
 const MAX_PARALLEL_READS: usize = 4;
-const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(6) {
+const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(7) {
     Some(version) => version,
     None => panic!("agent prompt version must be nonzero"),
 };
@@ -183,6 +184,41 @@ pub(crate) type SpawnAgentFuture =
 /// in-flight child work.
 pub(crate) trait SubagentSpawner: Send + Sync {
     fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture;
+}
+
+/// Capabilities granted to one model run. Guidance is allowed for durable
+/// user commands, including explicit follow-ups in a child session. Runtime-
+/// authored compactions and model-authored child tasks remain restricted.
+pub(crate) struct RunCapabilities {
+    spawner: Option<Arc<dyn SubagentSpawner>>,
+    allow_guidance: bool,
+    slash_is_literal: bool,
+}
+
+impl RunCapabilities {
+    pub(crate) fn user(spawner: Option<Arc<dyn SubagentSpawner>>) -> Self {
+        Self {
+            spawner,
+            allow_guidance: true,
+            slash_is_literal: false,
+        }
+    }
+
+    /// Marks a leading slash as already normalized from the durable `//`
+    /// escape. The message is provider-ready and must not be reinterpreted as
+    /// a guidance invocation.
+    pub(crate) fn with_literal_slash(mut self, literal: bool) -> Self {
+        self.slash_is_literal = literal;
+        self
+    }
+
+    pub(crate) const fn restricted() -> Self {
+        Self {
+            spawner: None,
+            allow_guidance: false,
+            slash_is_literal: false,
+        }
+    }
 }
 
 /// The dispatcher's defensive answer when `spawn_agent` is called by a run
@@ -441,7 +477,14 @@ impl Runtime {
         gate: Arc<dyn ToolGate>,
         file_state: Arc<tools::FileState>,
     ) -> RuntimeStream {
-        self.run_loop_with_spawner(messages, workspace, cancelled, gate, file_state, None)
+        self.run_loop_with_spawner(
+            messages,
+            workspace,
+            cancelled,
+            gate,
+            file_state,
+            RunCapabilities::user(None),
+        )
     }
 
     pub(crate) fn run_loop_with_spawner(
@@ -451,7 +494,7 @@ impl Runtime {
         cancelled: Arc<AtomicBool>,
         gate: Arc<dyn ToolGate>,
         file_state: Arc<tools::FileState>,
-        spawner: Option<Arc<dyn SubagentSpawner>>,
+        capabilities: RunCapabilities,
     ) -> RuntimeStream {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
@@ -460,6 +503,11 @@ impl Runtime {
         let spawn_model_routes = Arc::clone(&self.spawn_model_routes);
         let turn_retry = self.turn_retry;
         Box::pin(stream! {
+            let RunCapabilities {
+                spawner,
+                allow_guidance,
+                slash_is_literal,
+            } = capabilities;
             let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
             yield RuntimeEvent::Started;
 
@@ -471,9 +519,27 @@ impl Runtime {
                 return;
             }
 
-            let (workspace, workspace_instructions) = match tools::prepare_workspace(
+            let parsed_invocation = match if allow_guidance && !slash_is_literal {
+                tools::parse_invocation(&mut messages)
+            } else {
+                Ok(tools::ParsedInvocation {
+                    guidance: None,
+                })
+            } {
+                Ok(request) => request,
+                Err(error) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::InvalidCommand,
+                        message: error.to_string(),
+                    };
+                    return;
+                }
+            };
+
+            let (workspace, workspace_instructions, selected_guidance) = match tools::prepare_workspace(
                 workspace,
                 Arc::clone(&cancelled),
+                parsed_invocation.guidance,
             )
             .await
             {
@@ -486,6 +552,13 @@ impl Runtime {
                     };
                     return;
                 }
+                Err(tools::WorkspacePreparationError::Guidance(error)) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::InvalidCommand,
+                        message: error.to_string(),
+                    };
+                    return;
+                }
                 Err(error) => {
                     yield RuntimeEvent::Failed {
                         kind: RunFailureKind::Configuration,
@@ -493,12 +566,6 @@ impl Runtime {
                     };
                     return;
                 }
-            };
-            yield RuntimeEvent::Prepared {
-                identity: RunPromptIdentity {
-                    version: AGENT_PROMPT_VERSION,
-                    instruction_hash: workspace_instructions.hash(),
-                },
             };
             // MCP declarations join the built-ins once per run: the cached
             // specs are fetched here (connecting lazily on first use) so
@@ -525,7 +592,21 @@ impl Runtime {
                 workspace.path(),
                 &tool_specs,
                 &workspace_instructions,
+                selected_guidance.as_ref(),
             ));
+            yield RuntimeEvent::Prepared {
+                identity: RunPromptIdentity {
+                    version: AGENT_PROMPT_VERSION,
+                    instruction_hash: workspace_instructions.hash(),
+                    system_prompt_hash: Some(ContentHash::from_bytes(
+                        Sha256::digest(system.as_bytes()).into(),
+                    )),
+                    tool_schema_hash: Some(tool_schema_hash(&tool_specs)),
+                    selected_guidance: selected_guidance
+                        .as_ref()
+                        .map(|guidance| Box::new(guidance.identity())),
+                },
+            };
 
             let mut slice_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
@@ -1172,12 +1253,13 @@ fn public_run_stream(mut events: RuntimeStream) -> RunStream {
     })
 }
 
-/// Version 6 of the base agent prompt. The text is versioned in code, not
+/// Version 7 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
 fn agent_system_prompt(
     workspace: &std::path::Path,
     specs: &[qq_provider::ToolSpec],
     workspace_instructions: &tools::WorkspaceInstructions,
+    selected_guidance: Option<&tools::SelectedGuidance>,
 ) -> String {
     let mut tool_names = String::new();
     let mut has_mcp = false;
@@ -1238,7 +1320,28 @@ fn agent_system_prompt(
         root = workspace.display(),
     );
     workspace_instructions.append_to_prompt(&mut prompt);
+    if let Some(guidance) = selected_guidance {
+        guidance.append_to_prompt(&mut prompt);
+    }
     prompt
+}
+
+fn tool_schema_hash(specs: &[qq_provider::ToolSpec]) -> ContentHash {
+    let mut digest = Sha256::new();
+    for spec in specs {
+        for bytes in [spec.name().as_bytes(), spec.description().as_bytes()] {
+            digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+            digest.update(bytes);
+        }
+        let schema = spec.input_schema().to_string();
+        digest.update(
+            u64::try_from(schema.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        digest.update(schema.as_bytes());
+    }
+    ContentHash::from_bytes(digest.finalize().into())
 }
 
 fn append_turn_text(blocks: &mut Vec<TurnBlock>, text: &str) {
@@ -1462,6 +1565,250 @@ mod tests {
             request.messages(),
             [Message::user("Analyze the design only; do not edit files.")]
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_workspace_skill_reaches_the_shared_provider_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join(".qq/skills/review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "Review the requested change for durable-state regressions.\n",
+        )
+        .unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(
+                RunCommand::new("/review focus on cancellation"),
+                directory.path().to_owned(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RunEvent::Completed)));
+        let captured = captured.lock().unwrap();
+        let request = captured.as_ref().expect("the provider must be called");
+        let system = request.system().expect("the selected skill needs a prompt");
+        assert!(system.contains("Selected skill `review`"));
+        assert!(system.contains(".qq/skills/review/SKILL.md"));
+        assert!(system.contains("Review the requested change for durable-state regressions."));
+        assert_eq!(
+            request.messages(),
+            [Message::user("/review focus on cancellation")]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_guidance_shadows_compatibility_without_loading_ambient_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        for (path, content) in [
+            (".qq/commands/check.md", "Use the native command.\n"),
+            (
+                ".agents/skills/check/SKILL.md",
+                "Do not load the compatibility skill.\n",
+            ),
+            (
+                ".qq/skills/ambient/SKILL.md",
+                "Do not load an unselected skill.\n",
+            ),
+        ] {
+            let path = directory.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(RunCommand::new("/check"), directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RunEvent::Completed)));
+        let captured = captured.lock().unwrap();
+        let system = captured.as_ref().unwrap().system().unwrap();
+        assert!(system.contains("Selected command `check`"));
+        assert!(system.contains("Use the native command."));
+        assert!(!system.contains("Do not load the compatibility skill."));
+        assert!(!system.contains("Do not load an unselected skill."));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_and_unknown_guidance_fail_before_provider_work() {
+        for (name, setup, expected) in [
+            (
+                "duplicate",
+                vec![
+                    (".qq/commands/duplicate.md", "command\n"),
+                    (".qq/skills/duplicate/SKILL.md", "skill\n"),
+                ],
+                "ambiguous command or skill /duplicate",
+            ),
+            ("missing", Vec::new(), "unknown command or skill /missing"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            for (path, content) in setup {
+                let path = directory.path().join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, content).unwrap();
+            }
+            let captured = Arc::new(Mutex::new(None));
+            let runtime = Runtime::new(
+                ScriptedProvider {
+                    request: Arc::clone(&captured),
+                    fails: false,
+                },
+                "gpt-test",
+                256,
+            )
+            .unwrap();
+
+            let events = runtime
+                .run_in_workspace(
+                    RunCommand::new(format!("/{name}")),
+                    directory.path().to_owned(),
+                )
+                .collect::<Vec<_>>()
+                .await;
+
+            assert!(matches!(
+                events.last(),
+                Some(RunEvent::Failed {
+                    kind: RunFailureKind::InvalidCommand,
+                    message,
+                }) if message.contains(expected)
+            ));
+            assert!(captured.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn guidance_bounds_and_reserved_names_fail_before_provider_work() {
+        for (prompt, write_oversized, expected) in [
+            ("/large", true, "exceeds the 65536-byte file limit"),
+            ("/quit", false, "reserved client command"),
+            ("/Upper", false, "slash invocation names must start"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            if write_oversized {
+                let skill = directory.path().join(".qq/skills/large");
+                std::fs::create_dir_all(&skill).unwrap();
+                std::fs::write(skill.join("SKILL.md"), vec![b'x'; 64 * 1024 + 1]).unwrap();
+            }
+            let captured = Arc::new(Mutex::new(None));
+            let runtime = Runtime::new(
+                ScriptedProvider {
+                    request: Arc::clone(&captured),
+                    fails: false,
+                },
+                "gpt-test",
+                256,
+            )
+            .unwrap();
+
+            let events = runtime
+                .run_in_workspace(RunCommand::new(prompt), directory.path().to_owned())
+                .collect::<Vec<_>>()
+                .await;
+
+            assert!(matches!(
+                events.last(),
+                Some(RunEvent::Failed {
+                    kind: RunFailureKind::InvalidCommand,
+                    message,
+                }) if message.contains(expected)
+            ));
+            assert!(captured.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn double_slash_escapes_runtime_guidance_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join(".qq/skills/review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "Must not be loaded.\n").unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(
+                RunCommand::new("//review literally"),
+                directory.path().to_owned(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(events.last(), Some(RunEvent::Completed)));
+        let captured = captured.lock().unwrap();
+        let request = captured.as_ref().unwrap();
+        assert_eq!(request.messages(), [Message::user("/review literally")]);
+        assert!(!request.system().unwrap().contains("Must not be loaded."));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guidance_symlink_escape_fails_before_provider_work() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("SKILL.md");
+        std::fs::write(&target, "outside authority\n").unwrap();
+        let skill = directory.path().join(".qq/skills/escape");
+        std::fs::create_dir_all(&skill).unwrap();
+        symlink(target, skill.join("SKILL.md")).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let runtime = Runtime::new(
+            ScriptedProvider {
+                request: Arc::clone(&captured),
+                fails: false,
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+
+        let events = runtime
+            .run_in_workspace(RunCommand::new("/escape"), directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::InvalidCommand,
+                ..
+            })
+        ));
+        assert!(captured.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3708,7 +4055,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AllowAllGate),
                 Arc::new(tools::FileState::default()),
-                Some(spawner),
+                RunCapabilities::user(Some(spawner)),
             )
             .collect::<Vec<_>>()
             .await;
@@ -3782,7 +4129,7 @@ mod tests {
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AllowAllGate),
                     Arc::new(tools::FileState::default()),
-                    Some(spawner),
+                    RunCapabilities::user(Some(spawner)),
                 )
                 .collect::<Vec<_>>()
                 .await;
@@ -3798,13 +4145,13 @@ mod tests {
     fn agent_prompt_teaches_delegation_only_when_spawn_agent_is_declared() {
         let workspace = std::path::Path::new("/tmp/qq-prompt-test");
         let instructions = tools::WorkspaceInstructions::empty();
-        let without = agent_system_prompt(workspace, &tools::specs(), &instructions);
+        let without = agent_system_prompt(workspace, &tools::specs(), &instructions, None);
         assert!(!without.contains("spawn_agent"));
         assert!(!without.contains("Delegation:"));
 
         let mut specs = tools::specs();
         specs.push(tools::spawn_agent_spec(&[]));
-        let with = agent_system_prompt(workspace, &specs, &instructions);
+        let with = agent_system_prompt(workspace, &specs, &instructions, None);
         assert!(with.contains("spawn_agent"));
         assert!(with.contains("Delegation:"));
         assert!(with.contains("independent questions"));

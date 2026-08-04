@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -63,7 +63,9 @@ authoritative session state (`SessionSummary.context_tokens` and
 `session_context_updated`) so legacy billing totals and internal compaction
 runs cannot masquerade as the current session context, and added explicit
 direct and inclusive session accounting totals; version 6 added persisted
-run prompt identity (`RunSnapshot.prompt_identity`).
+run prompt identity (`RunSnapshot.prompt_identity`); version 7 added the
+persisted `model_turn_completed` event so each provider turn records its model,
+usage, and estimated cost before it is published.
 
 Clients and servers must agree on this value.
 
@@ -781,6 +783,7 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `run_started` | `session`, `run_id` | Run leaves the queue |
 | `assistant_message_started` | `message` | A model turn's message begins streaming |
 | `text_appended` | `message_id`, `channel`, `text` | Output or refusal delta |
+| `model_turn_completed` | `run_id`, `turn_ordinal`, `model`, optional `usage`, optional `estimated_cost_usd_nanos` | A provider inference and its accounting committed |
 | `tool_call_requested` | `tool_call` | Model finished requesting a tool call |
 | `tool_approval_requested` | `tool_call`, optional `shell`, optional `edit` | Policy needs a human decision |
 | `tool_approval_resolved` | `tool_call`, `resolution` | Approval decision recorded |
@@ -846,8 +849,16 @@ it from cumulative run billing.
   "status": "running",
   "outcome": null,
   "prompt_identity": {
-    "version": 6,
-    "instruction_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "version": 7,
+    "instruction_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "system_prompt_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+    "tool_schema_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "selected_guidance": {
+      "kind": "skill",
+      "name": "review",
+      "source": ".qq/skills/review/SKILL.md",
+      "content_hash": "4444444444444444444444444444444444444444444444444444444444444444"
+    }
   },
   "usage": null,
   "estimated_cost_usd_nanos": null,
@@ -859,18 +870,25 @@ Run status: `queued`, `running`, `completed`, `cancelled`, `failed`,
 `interrupted`.
 
 `prompt_identity.version` identifies the shared provider-neutral system prompt
-prepared for the run. `prompt_identity.instruction_hash` is the SHA-256 identity
-of the prepared workspace-root instruction selection: root `AGENTS.md`, root
-`CLAUDE.md` when `AGENTS.md` is absent, or the empty selection. Nested
-instructions discovered by the model remain durable tool evidence but do not
-retroactively change this pre-provider identity. `prompt_identity` is absent
-for historical runs and runs that failed before prompt preparation.
+contract prepared for the run. `instruction_hash` identifies the selected root
+instructions: `AGENTS.md`, `CLAUDE.md` when `AGENTS.md` is absent, or the empty
+selection. `system_prompt_hash` identifies the exact prepared system text, and
+`tool_schema_hash` identifies the ordered provider tool schemas. When a slash
+command or skill was selected, `selected_guidance` records its kind, name,
+source, optional declared version, and content hash. Nested instructions found
+later remain durable tool evidence but do not retroactively change this
+pre-provider identity. `prompt_identity` is absent for historical runs and
+runs that failed before prompt preparation; version-6 rows may omit the fields
+added in version 7.
 
 `usage` sums every model turn in the run and is the billing figure;
 `context_tokens` is the final completed turn's input-token total (fresh
 input + cache reads + cache writes) for that run. Internal compaction runs
 measure the pre-compaction summarizer request, so this per-run audit field is
 not a substitute for `SessionSummary.context_tokens`.
+`model_turn_completed` is persisted before any tool dispatch and records every
+provider inference, including tool-only and internal compaction turns, so
+trajectory exporters do not have to infer per-turn model or accounting data.
 `run_context_updated` streams measured per-run audit values and is absent for
 unmeasured turns and runs persisted before version 3.
 `session_context_updated` is the live session-meter event. It is emitted only

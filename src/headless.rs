@@ -10,7 +10,7 @@
 use std::{
     future::Future,
     io::{self, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::pin,
     process::ExitCode,
     time::Duration,
@@ -20,11 +20,12 @@ use futures_util::StreamExt;
 use qq_core::{SessionRuntime, SessionRuntimeError};
 use qq_protocol::{
     ApprovalDecision, ApprovalMode, CommandId, CommandOutcome, CommandReceipt, MessageId,
-    MessageRole, ModelSelection, RunActivity, RunId, RunOutcome, SessionAccounting, SessionCommand,
-    SessionEvent, SessionEventEnvelope, SessionId, SnapshotRequest, SubscribeRequest, TokenUsage,
-    ToolCallState, WorkspaceId,
+    MessageRole, ModelSelection, RunActivity, RunId, RunOutcome, RunPromptIdentity,
+    SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
+    SnapshotRequest, SubscribeRequest, TokenUsage, ToolCallState, WorkspaceId,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 /// How long a cancelled run may take to reach its terminal durable event
@@ -40,6 +41,10 @@ pub struct HeadlessOptions {
     /// Workspace directory; resolved to its canonical form by the store.
     pub workspace: PathBuf,
     pub model: ModelSelection,
+    /// Resolved model context limit when configured; unknown stays absent.
+    pub context_window: Option<u32>,
+    /// Source of the pricing table used for durable accounting.
+    pub pricing_provenance: Option<String>,
     pub approval: HeadlessApproval,
     pub timeout: Option<Duration>,
     pub max_turns: Option<u16>,
@@ -130,9 +135,14 @@ impl HeadlessStatus {
 enum TrialRecord<'a> {
     Trial {
         qq_version: &'static str,
+        qq_source_revision: &'static str,
         protocol_version: u16,
-        workspace: &'a str,
+        workspace_identity: &'a str,
         model: &'a ModelSelection,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_window: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pricing_provenance: Option<&'a str>,
         approval: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         timeout_seconds: Option<u64>,
@@ -156,6 +166,8 @@ enum TrialRecord<'a> {
         usage: Option<TokenUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         estimated_cost_usd_nanos: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_identity: Option<&'a RunPromptIdentity>,
     },
 }
 
@@ -298,6 +310,7 @@ struct RunEnd {
     message: Option<String>,
     usage: Option<TokenUsage>,
     estimated_cost_usd_nanos: Option<u64>,
+    prompt_identity: Option<Box<RunPromptIdentity>>,
     /// Accumulated text of the last assistant message: the final answer.
     answer: String,
 }
@@ -309,6 +322,7 @@ impl RunEnd {
             message: Some(failure.message),
             usage: None,
             estimated_cost_usd_nanos: None,
+            prompt_identity: None,
             answer: String::new(),
         }
     }
@@ -342,12 +356,15 @@ pub async fn run(
     };
     let mut accepted = AcceptedRunGuard::new(sessions.clone(), handle.clone());
 
-    let workspace_display = options.workspace.display().to_string();
+    let workspace_identity = workspace_identity(&options.workspace);
     let trial = TrialRecord::Trial {
         qq_version: env!("CARGO_PKG_VERSION"),
+        qq_source_revision: option_env!("QQ_SOURCE_REVISION").unwrap_or("unknown"),
         protocol_version: qq_protocol::PROTOCOL_VERSION,
-        workspace: &workspace_display,
+        workspace_identity: &workspace_identity,
         model: &options.model,
+        context_window: options.context_window,
+        pricing_provenance: options.pricing_provenance.as_deref(),
         approval: options.approval.as_str(),
         timeout_seconds: options.timeout.map(|timeout| timeout.as_secs()),
         max_turns: options.max_turns,
@@ -388,6 +405,7 @@ pub async fn run(
         message: end.message.as_deref(),
         usage: end.usage,
         estimated_cost_usd_nanos: end.estimated_cost_usd_nanos,
+        prompt_identity: end.prompt_identity.as_deref(),
     };
     if let Err(error) = sink.record(stdout, &outcome).and_then(|()| sink.finish()) {
         let _ = writeln!(stderr, "error: could not write the outcome record: {error}");
@@ -672,6 +690,7 @@ async fn stream_run(
                     }
                     SessionEvent::RunFinished { session, run_id, outcome, usage, .. }
                         if *run_id == handle.run_id => {
+                        let usage = inclusive_usage(session.accounting, *usage);
                         let cost = inclusive_cost(
                             session.accounting,
                             session.estimated_cost_usd_nanos,
@@ -684,11 +703,13 @@ async fn stream_run(
                         } else {
                             settle(outcome, cancel.as_ref())
                         };
+                        let prompt_identity = run_prompt_identity(sessions, handle).await?;
                         return Ok(RunEnd {
                             status,
                             message,
-                            usage: *usage,
+                            usage,
                             estimated_cost_usd_nanos: cost,
+                            prompt_identity,
                             answer,
                         });
                     }
@@ -751,6 +772,49 @@ fn inclusive_cost(
         Some(accounting) => accounting.inclusive.estimated_cost_usd_nanos,
         None => legacy_direct_cost,
     }
+}
+
+fn inclusive_usage(
+    accounting: Option<SessionAccounting>,
+    legacy_direct_usage: Option<TokenUsage>,
+) -> Option<TokenUsage> {
+    match accounting {
+        Some(accounting) => accounting.inclusive.usage,
+        None => legacy_direct_usage,
+    }
+}
+
+fn workspace_identity(workspace: &Path) -> String {
+    let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
+    let mut identity = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(identity, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    identity
+}
+
+async fn run_prompt_identity(
+    sessions: &SessionRuntime,
+    handle: &RunHandle,
+) -> Result<Option<Box<RunPromptIdentity>>, Failure> {
+    let snapshot = sessions
+        .snapshot(SnapshotRequest {
+            workspace_id: handle.workspace_id,
+            focused_session_id: Some(handle.session_id),
+            session_limit: 1,
+            message_limit: 1,
+        })
+        .await
+        .map_err(|error| Failure {
+            status: status_for_error(&error),
+            message: format!("could not read the terminal run identity: {error}"),
+        })?;
+    snapshot
+        .focused
+        .and_then(|session| session.runs.into_iter().find(|run| run.id == handle.run_id))
+        .map(|run| run.prompt_identity)
+        .ok_or_else(|| Failure::harness("the terminal run is missing from its session snapshot"))
 }
 
 /// Maps the run's durable outcome plus this invocation's cancellation intent
@@ -1416,6 +1480,8 @@ mod tests {
                 max_output_tokens: Some(256),
                 organization: None,
             },
+            context_window: Some(128_000),
+            pricing_provenance: Some("test fixture".to_owned()),
             approval: HeadlessApproval::ReadOnly,
             timeout: None,
             max_turns: None,
@@ -1605,6 +1671,11 @@ mod tests {
         assert_eq!(records[0]["type"], "trial", "metadata must lead the trial");
         assert_eq!(records[0]["model"]["model"], "test/model");
         assert_eq!(records[0]["approval"], "read-only");
+        assert!(records[0].get("workspace").is_none());
+        assert_eq!(records[0]["workspace_identity"].as_str().unwrap().len(), 64);
+        assert_eq!(records[0]["context_window"], 128_000);
+        assert_eq!(records[0]["pricing_provenance"], "test fixture");
+        assert!(records[0]["qq_source_revision"].is_string());
 
         let mut previous = None;
         for record in event_records(&records) {
@@ -1627,6 +1698,9 @@ mod tests {
         assert_eq!(outcomes.len(), 1, "exactly one terminal outcome");
         assert_eq!(outcomes[0]["status"], "completed");
         assert_eq!(outcomes[0]["exit_code"], 0);
+        assert_eq!(outcomes[0]["prompt_identity"]["version"], 7);
+        assert!(outcomes[0]["prompt_identity"]["system_prompt_hash"].is_string());
+        assert!(outcomes[0]["prompt_identity"]["tool_schema_hash"].is_string());
         assert_eq!(
             records.last().unwrap()["type"],
             "outcome",
@@ -2056,5 +2130,45 @@ mod tests {
 
         assert_eq!(inclusive_cost(Some(accounting), Some(5)), None);
         assert_eq!(inclusive_cost(None, Some(5)), Some(5));
+    }
+
+    #[test]
+    fn inclusive_usage_counts_children_and_preserves_unknown_totals() {
+        let direct = TokenUsage {
+            input_tokens: 10,
+            cache_read_input_tokens: 2,
+            cache_write_input_tokens: 1,
+            output_tokens: 3,
+        };
+        let inclusive = TokenUsage {
+            input_tokens: 30,
+            cache_read_input_tokens: 5,
+            cache_write_input_tokens: 4,
+            output_tokens: 9,
+        };
+        let accounting = SessionAccounting {
+            direct: AccountingTotal {
+                usage: Some(direct),
+                estimated_cost_usd_nanos: Some(5),
+            },
+            inclusive: AccountingTotal {
+                usage: Some(inclusive),
+                estimated_cost_usd_nanos: Some(15),
+            },
+        };
+        assert_eq!(
+            inclusive_usage(Some(accounting), Some(direct)),
+            Some(inclusive)
+        );
+
+        let unknown_children = SessionAccounting {
+            inclusive: AccountingTotal {
+                usage: None,
+                estimated_cost_usd_nanos: None,
+            },
+            ..accounting
+        };
+        assert_eq!(inclusive_usage(Some(unknown_children), Some(direct)), None);
+        assert_eq!(inclusive_usage(None, Some(direct)), Some(direct));
     }
 }

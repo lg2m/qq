@@ -179,14 +179,16 @@ async fn prepare_headless(
         .map_err(|_| harness("configuration loading stopped unexpectedly".to_owned()))?
         .map_err(|error| invalid(error.to_string()))?;
 
+    let model_metadata = snapshot
+        .providers()
+        .get(snapshot.model().provider())
+        .and_then(|provider| provider.models().get(snapshot.model().model()));
+
     // A dollar limit without model pricing cannot be enforced; reject it now
     // rather than pretend.
     if max_cost_usd_nanos.is_some()
-        && snapshot
-            .providers()
-            .get(snapshot.model().provider())
-            .and_then(|provider| provider.models().get(snapshot.model().model()))
-            .and_then(|metadata| metadata.pricing())
+        && model_metadata
+            .and_then(qq_config::ModelMetadata::pricing)
             .is_none()
     {
         return Err(invalid(format!(
@@ -211,6 +213,10 @@ async fn prepare_headless(
         prompt: args.prompt,
         workspace,
         model,
+        context_window: model_metadata.and_then(qq_config::ModelMetadata::context_window),
+        pricing_provenance: model_metadata
+            .and_then(qq_config::ModelMetadata::pricing)
+            .map(|pricing| pricing.provenance.clone()),
         approval: match args.approval {
             cli::RunApproval::ReadOnly => headless::HeadlessApproval::ReadOnly,
             cli::RunApproval::Auto => headless::HeadlessApproval::Auto,
