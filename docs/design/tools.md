@@ -74,6 +74,70 @@ the empty-selection hash). Historical runs and runs that fail before
 preparation keep no identity. Nested instruction reads stay in the durable tool
 transcript and do not retroactively change the pre-provider identity.
 
+### Explicit Commands And Skills
+
+Commands and skills are optional run guidance, not ambient policy. A leading
+`/<name>` in the newest user message asks the shared `qq-core` runtime to load
+one named Markdown document before contacting a provider. The original
+invocation and its optional whitespace-separated remainder stay in the user
+message so the selected document can interpret arguments without a second
+client-side parser. A leading `//` escapes selection: QQ removes one slash and
+sends the resulting literal slash-leading message without loading guidance.
+That normalized text commits in the same transaction as `PromptQueued`; the
+original command journal retains the escape marker so preparation does not
+reinterpret it. Restart, event replay, snapshots, and follow-up context
+therefore see the same prompt the first provider request saw.
+Only an exact leading invocation is special; ordinary prompts never discover
+or inject skill bodies.
+
+The initial resolver searches repository-local sources in two precedence
+tiers:
+
+1. Native QQ sources: `.qq/commands/<name>.md` and
+   `.qq/skills/<name>/SKILL.md`.
+2. Compatibility sources, considered only when the native tier has no match:
+   `.agents/skills/<name>/SKILL.md`, `.claude/commands/<name>.md`, and
+   `.claude/skills/<name>/SKILL.md`.
+
+Exactly one regular file must match within the selected tier. Multiple matches
+are ambiguous and no match is unknown; both fail before provider work. Native
+sources intentionally shadow compatibility sources, while a command and skill
+in the same tier do not silently shadow each other. Names are 1--64 bytes,
+start with a lowercase ASCII letter, and otherwise contain lowercase ASCII
+letters, digits, `-`, or `_`. TUI control names (`models`, `sessions`,
+`resume`, `new`, `compact`, `quit`, and `exit`) are reserved and cannot name
+runtime guidance.
+
+Authority follows command provenance rather than session ancestry. The
+model-authored task that creates a child session cannot select guidance, while
+an explicit user follow-up in that child may do so; child sessions remain
+depth-capped and never gain `spawn_agent` from that selection.
+
+Commands and skills use the same UTF-8 Markdown body contract. Their paths
+supply name and kind; no front-matter schema is interpreted initially, so
+foreign metadata remains ordinary guidance text. A body is capped at 64 KiB,
+resolved through the workspace capability, and rejected if it is not a regular
+file, is invalid UTF-8, or escapes through a symlink. Supporting files remain
+references only: loading a skill grants neither filesystem authority nor
+permission to execute its scripts. The selected body joins the stable system
+prefix after ambient workspace instructions, explicitly subordinate to those
+instructions and to ordinary tool policy.
+
+The durable run identity records the selected kind, name, repository-relative
+source, optional declared version (absent in this initial format), and SHA-256
+content hash. It also records hashes of the complete system prompt and ordered
+provider-neutral tool declarations so evaluation artifacts remain explainable.
+Clients may offer completion for discoverable names, but discovery, resolution,
+loading, and rejection remain runtime behavior shared by direct, server, TUI,
+and benchmark paths.
+
+User-home, administrator-managed, and bundled roots are reserved follow-up
+tiers. Reading the server process's home directory implicitly would make a
+remote TUI mean something different from a direct run and would grant
+host-level authority outside the selected workspace. Add such roots only as
+explicit server-owned configuration with provenance and the same bounds; do
+not infer them from the connecting client.
+
 ### Message And Content Model
 
 Tool calls require structured message content. `qq_provider::Message` is a

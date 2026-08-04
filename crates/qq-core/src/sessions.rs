@@ -33,8 +33,8 @@ use thiserror::Error;
 use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
-    GateDecision, Runtime, RuntimeEvent, RuntimeToolCall, SpawnAgentFuture, SpawnAgentOutcome,
-    SubagentSpawner, ToolGate, ToolGateFuture, approval,
+    GateDecision, RunCapabilities, Runtime, RuntimeEvent, RuntimeToolCall, SpawnAgentFuture,
+    SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, approval,
     tools::{FileState, FileStateUpdate},
 };
 
@@ -1157,26 +1157,34 @@ async fn execute_run(
             return;
         }
     };
-    // Only prompt runs of root sessions may spawn sub-agents: internal runs
-    // call no tools at all, and child runs are depth-capped (the tool is
-    // neither declared nor dispatchable without a spawner).
-    let spawner: Option<Arc<dyn SubagentSpawner>> = if internal || claimed.child {
-        None
+    // Guidance authority follows the command's durable provenance, not the
+    // session's ancestry: a user may explicitly submit /skill to an existing
+    // child session, while the model-authored prompt that created that child
+    // must not load repository guidance. Spawning remains depth-capped to
+    // root sessions.
+    let capabilities = if internal || !claimed.user_initiated {
+        RunCapabilities::restricted()
     } else {
-        Some(Arc::new(SessionSubagentSpawner {
-            inner: Arc::clone(&inner),
-            parent: claimed.clone(),
-            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CHILDREN_PER_RUN)),
-            spawned: Arc::new(AtomicUsize::new(0)),
-        }))
-    };
+        let spawner = if claimed.child {
+            None
+        } else {
+            Some(Arc::new(SessionSubagentSpawner {
+                inner: Arc::clone(&inner),
+                parent: claimed.clone(),
+                slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CHILDREN_PER_RUN)),
+                spawned: Arc::new(AtomicUsize::new(0)),
+            }) as Arc<dyn SubagentSpawner>)
+        };
+        RunCapabilities::user(spawner)
+    }
+    .with_literal_slash(claimed.literal_slash);
     let mut events = loaded.runtime.run_loop_with_spawner(
         claimed.messages.clone(),
         PathBuf::from(&claimed.workspace),
         Arc::clone(&tool_cancellation),
         gate,
         file_state,
-        spawner,
+        capabilities,
     );
     let mut accounting = RunAccountingAccumulator::new(loaded.pricing.clone());
     let mut pending_text = String::new();
@@ -1391,8 +1399,16 @@ async fn execute_run(
                 calls,
             })) => {
                 if internal {
-                    // Usage and cost account like any run; the turn's text
-                    // joins the summary instead of the transcript.
+                    // Usage, cost, and provider-turn identity persist like
+                    // any run. The turn's text joins the summary instead of
+                    // the transcript, and compaction tool calls remain
+                    // non-authoritative and unpublished.
+                    let turn_cost = usage.and_then(|usage| {
+                        accounting
+                            .pricing
+                            .as_ref()
+                            .and_then(|pricing| run_cost(usage, pricing))
+                    });
                     accounting.record_turn(usage);
                     for block in message.content() {
                         if let ContentBlock::Text { text } = block {
@@ -1403,6 +1419,41 @@ async fn execute_run(
                         }
                     }
                     current_turn = turn_ordinal.saturating_add(1);
+                    match inner
+                        .store
+                        .persist_model_turn(
+                            &claimed,
+                            ModelTurnCommit {
+                                turn_ordinal,
+                                message,
+                                calls,
+                                turn_message: None,
+                                context_tokens: usage.map(turn_context_tokens),
+                                usage,
+                                estimated_cost_usd_nanos: turn_cost,
+                                accounting: Some(accounting.snapshot()),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                inner.notify(event.cursor);
+                            }
+                        }
+                        Err(error) => {
+                            finish_run(
+                                &inner,
+                                &claimed,
+                                persistence_failure(
+                                    "failed to persist the completed compaction turn",
+                                    &error,
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
                     continue;
                 }
                 if let Err(error) = flush_pending_text(
@@ -1424,6 +1475,12 @@ async fn execute_run(
                     return;
                 }
                 flush_at = None;
+                let turn_cost = usage.and_then(|usage| {
+                    accounting
+                        .pricing
+                        .as_ref()
+                        .and_then(|pricing| run_cost(usage, pricing))
+                });
                 accounting.record_turn(usage);
                 let turn_accounting = accounting.snapshot();
                 // The completed turn's usage measures the context the run now
@@ -1435,39 +1492,39 @@ async fn execute_run(
                 // lazily start a fresh message.
                 let turn_message = current_message.take();
                 current_turn = turn_ordinal.saturating_add(1);
-                if message.has_content() || !calls.is_empty() {
-                    match inner
-                        .store
-                        .persist_model_turn(
+                match inner
+                    .store
+                    .persist_model_turn(
+                        &claimed,
+                        ModelTurnCommit {
+                            turn_ordinal,
+                            message,
+                            calls,
+                            turn_message,
+                            context_tokens,
+                            usage,
+                            estimated_cost_usd_nanos: turn_cost,
+                            accounting: Some(turn_accounting),
+                        },
+                    )
+                    .await
+                {
+                    Ok(events) => {
+                        for event in events {
+                            inner.notify(event.cursor);
+                        }
+                    }
+                    Err(error) => {
+                        finish_run(
+                            &inner,
                             &claimed,
-                            ModelTurnCommit {
-                                turn_ordinal,
-                                message,
-                                calls,
-                                turn_message,
-                                context_tokens,
-                                accounting: Some(turn_accounting),
-                            },
+                            persistence_failure(
+                                "failed to persist the completed model turn",
+                                &error,
+                            ),
                         )
-                        .await
-                    {
-                        Ok(events) => {
-                            for event in events {
-                                inner.notify(event.cursor);
-                            }
-                        }
-                        Err(error) => {
-                            finish_run(
-                                &inner,
-                                &claimed,
-                                persistence_failure(
-                                    "failed to persist the completed model turn",
-                                    &error,
-                                ),
-                            )
-                            .await;
-                            return;
-                        }
+                        .await;
+                        return;
                     }
                 }
             }
@@ -2127,6 +2184,8 @@ struct ModelTurnCommit {
     calls: Vec<RuntimeToolCall>,
     turn_message: Option<MessageId>,
     context_tokens: Option<u64>,
+    usage: Option<TokenUsage>,
+    estimated_cost_usd_nanos: Option<u64>,
     accounting: Option<RunAccounting>,
 }
 
@@ -3120,10 +3179,10 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12" | "13") => {}
+        Some("10" | "11" | "12" | "13" | "14") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
-    if !matches!(schema_version.as_deref(), Some("11" | "12" | "13")) {
+    if !matches!(schema_version.as_deref(), Some("11" | "12" | "13" | "14")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3138,7 +3197,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("12" | "13")) {
+    if !matches!(schema_version.as_deref(), Some("12" | "13" | "14")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3153,7 +3212,7 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if schema_version.as_deref() != Some("13") {
+    if !matches!(schema_version.as_deref(), Some("13" | "14")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3168,6 +3227,22 @@ fn open_database(path: &PathBuf) -> Result<(Connection, StoreId), SessionRuntime
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
+    if schema_version.as_deref() != Some("14") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_model_turn_audit_columns(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '14' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_model_turn_audit_schema(&connection)?;
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -3201,6 +3276,10 @@ fn create_tool_tables(connection: &Connection) -> Result<(), SessionRuntimeError
                  run_id TEXT NOT NULL REFERENCES runs(id),
                  turn_ordinal INTEGER NOT NULL,
                  assistant_content_json TEXT NOT NULL,
+                 model_json TEXT,
+                 usage_json TEXT,
+                 estimated_cost_usd_nanos INTEGER,
+                 completed_at_ms INTEGER,
                  PRIMARY KEY(run_id, turn_ordinal)
              );
              CREATE TABLE tool_calls (
@@ -3227,6 +3306,56 @@ fn create_tool_tables(connection: &Connection) -> Result<(), SessionRuntimeError
                  ON tool_calls(run_id, turn_ordinal, call_ordinal);",
         )
         .map_err(|_| SessionRuntimeError::Persistence)
+}
+
+fn add_model_turn_audit_columns(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS model_turns (
+                 run_id TEXT NOT NULL REFERENCES runs(id),
+                 turn_ordinal INTEGER NOT NULL,
+                 assistant_content_json TEXT NOT NULL,
+                 model_json TEXT,
+                 usage_json TEXT,
+                 estimated_cost_usd_nanos INTEGER,
+                 completed_at_ms INTEGER,
+                 PRIMARY KEY(run_id, turn_ordinal)
+             );",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    for (column, declaration) in [
+        ("model_json", "TEXT"),
+        ("usage_json", "TEXT"),
+        ("estimated_cost_usd_nanos", "INTEGER"),
+        ("completed_at_ms", "INTEGER"),
+    ] {
+        if !has_column(connection, "model_turns", column)? {
+            connection
+                .execute(
+                    &format!("ALTER TABLE model_turns ADD COLUMN {column} {declaration}"),
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_turn_audit_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    for column in [
+        "run_id",
+        "turn_ordinal",
+        "assistant_content_json",
+        "model_json",
+        "usage_json",
+        "estimated_cost_usd_nanos",
+        "completed_at_ms",
+    ] {
+        if !has_column(connection, "model_turns", column)? {
+            return Err(SessionRuntimeError::Persistence);
+        }
+    }
+    Ok(())
 }
 
 /// Adds `messages.turn_ordinal` for stores created before per-turn assistant
@@ -3427,6 +3556,14 @@ struct ClaimedRun {
     /// the claim query's parent filter; child runs may not spawn further
     /// children.
     child: bool,
+    /// True only when this run's command is present in the durable command
+    /// journal. Runtime- and model-created runs use generated command ids but
+    /// intentionally have no command row.
+    user_initiated: bool,
+    /// The durable command used `//` to escape runtime slash semantics. Its
+    /// message was normalized before `PromptQueued`, so preparation must not
+    /// reinterpret the resulting leading slash.
+    literal_slash: bool,
     model: ModelSelection,
     messages: Vec<Message>,
     started: SessionEventEnvelope,
@@ -3805,6 +3942,9 @@ fn execute_command(
             if prompt.len() > MAX_PROMPT_BYTES {
                 return Err(SessionRuntimeError::PromptTooLarge);
             }
+            let prompt = prompt
+                .strip_prefix("//")
+                .map_or(prompt.clone(), |literal| format!("/{literal}"));
             let (workspace_id, queued, title) = transaction
                 .query_row(
                     "SELECT workspace_id, queued_prompts, title FROM sessions WHERE id = ?1",
@@ -4455,7 +4595,8 @@ fn claim_next_run(
     let row = transaction
         .query_row(
             "SELECT r.id, r.session_id, r.command_id, r.user_message_id, r.kind,
-                    s.workspace_id, w.path, s.model, s.max_output_tokens, s.organization
+                    s.workspace_id, w.path, s.model, s.max_output_tokens, s.organization,
+                    (SELECT c.request_json FROM commands c WHERE c.id = r.command_id)
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
@@ -4481,6 +4622,7 @@ fn claim_next_run(
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<u32>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -4497,6 +4639,7 @@ fn claim_next_run(
         model,
         max_tokens,
         organization,
+        command_request,
     )) = row
     else {
         return Ok(None);
@@ -4505,6 +4648,19 @@ fn claim_next_run(
     let session_id: SessionId = parse_id(&session)?;
     let command_id: CommandId = parse_id(&command)?;
     let user_message_id = parse_id::<MessageId>(&user_message)?;
+    let (user_initiated, literal_slash) = match command_request {
+        Some(request) => {
+            let request = serde_json::from_str::<SessionCommand>(&request)
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let literal_slash = matches!(
+                &request,
+                SessionCommand::SubmitPrompt { prompt, .. }
+                    if prompt.trim().starts_with("//")
+            );
+            (true, literal_slash)
+        }
+        None => (false, false),
+    };
     let kind = parse_run_kind(&kind)?;
     let workspace_id: WorkspaceId = parse_id(&workspace)?;
     let now = now_ms();
@@ -4625,6 +4781,8 @@ fn claim_next_run(
         command_id,
         kind,
         child: children,
+        user_initiated,
+        literal_slash,
         model,
         messages,
         started,
@@ -4741,6 +4899,8 @@ fn claim_auto_compaction(
         // Compaction runs are internal: execute_run never installs the
         // subagent spawner for them, so child-ness is irrelevant here.
         child: false,
+        user_initiated: false,
+        literal_slash: false,
         model,
         messages: context,
         started,
@@ -4903,6 +5063,8 @@ fn persist_model_turn(
         calls,
         turn_message,
         context_tokens,
+        usage,
+        estimated_cost_usd_nanos,
         accounting,
     } = turn;
     if message.role() != Role::Assistant {
@@ -4915,10 +5077,26 @@ fn persist_model_turn(
         .collect::<Vec<_>>();
     let content_json =
         serde_json::to_string(&content).map_err(|_| SessionRuntimeError::Persistence)?;
+    let model_json =
+        serde_json::to_string(&claimed.model).map_err(|_| SessionRuntimeError::Persistence)?;
+    let usage_json = usage
+        .map(|usage| serde_json::to_string(&usage))
+        .transpose()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let turn_cost = estimated_cost_usd_nanos
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let argument_bytes = calls.iter().fold(0_usize, |total, call| {
+    let persisted_calls = if claimed.kind == RunKind::Prompt {
+        calls.as_slice()
+    } else {
+        &[]
+    };
+    let argument_bytes = persisted_calls.iter().fold(0_usize, |total, call| {
         total.saturating_add(call.arguments.len())
     });
     ensure_context_capacity(&transaction, claimed.session_id, argument_bytes)?;
@@ -4940,14 +5118,41 @@ fn persist_model_turn(
     }
     transaction
         .execute(
-            "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
-             VALUES (?1, ?2, ?3)",
-            params![claimed.run_id.to_string(), turn_ordinal, content_json],
+            "INSERT INTO model_turns(
+                 run_id, turn_ordinal, assistant_content_json, model_json,
+                 usage_json, estimated_cost_usd_nanos, completed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                claimed.run_id.to_string(),
+                turn_ordinal,
+                content_json,
+                model_json,
+                usage_json,
+                turn_cost,
+                now,
+            ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let now = now_ms();
-    let mut events = Vec::with_capacity(calls.len().saturating_add(2));
-    for call in calls {
+    let mut events = Vec::with_capacity(persisted_calls.len().saturating_add(3));
+    events.push(append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::ModelTurnCompleted {
+            run_id: claimed.run_id,
+            turn_ordinal: *turn_ordinal,
+            model: claimed.model.clone(),
+            usage: *usage,
+            estimated_cost_usd_nanos: *estimated_cost_usd_nanos,
+        },
+    )?);
+    for call in persisted_calls {
         transaction
             .execute(
                 "INSERT INTO tool_calls(
@@ -6296,6 +6501,8 @@ fn recover_interrupted_runs(
             // irrelevant here: recovery never runs the tool loop.
             kind: RunKind::Prompt,
             child: false,
+            user_initiated: false,
+            literal_slash: false,
             model: ModelSelection::default(),
             messages: Vec::new(),
             over_budget: false,
@@ -8945,6 +9152,7 @@ mod tests {
         runtime: SessionRuntime,
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
         workspace_path: PathBuf,
+        workspace_id: WorkspaceId,
         session_id: SessionId,
         events: SessionEventStream,
     }
@@ -9007,6 +9215,7 @@ mod tests {
             runtime,
             requests,
             workspace_path,
+            workspace_id,
             session_id,
             events,
         }
@@ -9187,6 +9396,9 @@ mod tests {
             "Keep provenance stable.\n",
         )
         .unwrap();
+        let skill = directory.path().join(".qq/skills/stable");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "Retain exact run provenance.\n").unwrap();
         let database_path = directory.path().join("sessions.sqlite3");
         let runtime = SessionRuntime::open(
             SessionRuntimeOptions::new(database_path.clone()),
@@ -9205,7 +9417,7 @@ mod tests {
                 after: created.committed_through,
             })
             .unwrap();
-        let run_id = submit_prompt_to(&runtime, session_id, "finish the work").await;
+        let run_id = submit_prompt_to(&runtime, session_id, "/stable finish the work").await;
         collect_through_finished(&mut events).await;
 
         let snapshot = runtime
@@ -9229,6 +9441,30 @@ mod tests {
             .expect("a sent prompt must retain its prompt identity");
         assert_eq!(prompt_identity.version, crate::AGENT_PROMPT_VERSION);
         assert_eq!(prompt_identity.instruction_hash.to_string().len(), 64);
+        assert_eq!(
+            prompt_identity
+                .system_prompt_hash
+                .expect("new runs must retain their full prompt hash")
+                .to_string()
+                .len(),
+            64
+        );
+        assert_eq!(
+            prompt_identity
+                .tool_schema_hash
+                .expect("new runs must retain their tool schema hash")
+                .to_string()
+                .len(),
+            64
+        );
+        let guidance = prompt_identity
+            .selected_guidance
+            .as_deref()
+            .expect("the selected skill must retain provenance");
+        assert_eq!(guidance.kind, qq_protocol::GuidanceKind::Skill);
+        assert_eq!(guidance.name, "stable");
+        assert_eq!(guidance.source, ".qq/skills/stable/SKILL.md");
+        assert_eq!(guidance.version, None);
 
         runtime.shutdown().await.unwrap();
         drop(runtime);
@@ -9256,6 +9492,59 @@ mod tests {
             .unwrap();
         assert_eq!(run.prompt_identity, Some(prompt_identity));
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn escaped_slash_is_persisted_as_the_provider_visible_prompt() {
+        let mut harness =
+            scripted_runs_harness(ApprovalMode::Ask, vec![Vec::new(), Vec::new()]).await;
+
+        submit_prompt(&harness, "//review literally").await;
+        let first_events = collect_through_finished(&mut harness.events).await;
+        assert!(first_events.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::PromptQueued { message, .. }
+                if message.output == "/review literally"
+        )));
+        submit_prompt(&harness, "follow up").await;
+        collect_through_finished(&mut harness.events).await;
+
+        {
+            let requests = harness.requests.lock().unwrap();
+            assert_eq!(
+                requests[0].messages()[0],
+                Message::user("/review literally")
+            );
+            assert_eq!(
+                requests[1].messages()[0],
+                Message::user("/review literally")
+            );
+            assert!(
+                requests[1]
+                    .messages()
+                    .iter()
+                    .all(|message| message != &Message::user("//review literally"))
+            );
+        }
+
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 8,
+                message_limit: 32,
+            })
+            .await
+            .unwrap()
+            .focused
+            .unwrap();
+        let first_user = snapshot
+            .messages
+            .iter()
+            .find(|message| message.role == qq_protocol::MessageRole::User)
+            .unwrap();
+        assert_eq!(first_user.output, "/review literally");
     }
 
     #[tokio::test]
@@ -9933,7 +10222,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "13"
+            "14"
         );
         assert!(
             !connection
@@ -9947,6 +10236,10 @@ mod tests {
         assert!(has_column(&connection, "runs", "usage_json").unwrap());
         assert!(has_column(&connection, "tool_calls", "provider_call_id").unwrap());
         assert!(has_column(&connection, "model_turns", "assistant_content_json").unwrap());
+        assert!(has_column(&connection, "model_turns", "model_json").unwrap());
+        assert!(has_column(&connection, "model_turns", "usage_json").unwrap());
+        assert!(has_column(&connection, "model_turns", "estimated_cost_usd_nanos").unwrap());
+        assert!(has_column(&connection, "model_turns", "completed_at_ms").unwrap());
         assert!(has_column(&connection, "tool_calls", "approval_resolution").unwrap());
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         assert_eq!(
@@ -10056,7 +10349,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "13"
+            "14"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -10124,7 +10417,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "13"
+            "14"
         );
         let (display_json, result) = connection
             .query_row(
@@ -10183,7 +10476,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "13"
+            "14"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -10248,7 +10541,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "13"
+            "14"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -10336,7 +10629,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "13"
+            "14"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -10392,7 +10685,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "13"
+            "14"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -10404,6 +10697,75 @@ mod tests {
                 )
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn version_thirteen_migration_adds_per_turn_audit_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata VALUES ('schema_version', '13');
+                 CREATE TABLE model_turns (
+                     run_id TEXT NOT NULL,
+                     turn_ordinal INTEGER NOT NULL,
+                     assistant_content_json TEXT NOT NULL,
+                     PRIMARY KEY(run_id, turn_ordinal)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "14"
+        );
+        for column in [
+            "model_json",
+            "usage_json",
+            "estimated_cost_usd_nanos",
+            "completed_at_ms",
+        ] {
+            assert!(
+                has_column(&connection, "model_turns", column).unwrap(),
+                "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_fourteen_store_missing_audit_columns_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata VALUES ('schema_version', '14');
+                 CREATE TABLE model_turns (
+                     run_id TEXT NOT NULL,
+                     turn_ordinal INTEGER NOT NULL,
+                     assistant_content_json TEXT NOT NULL,
+                     PRIMARY KEY(run_id, turn_ordinal)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            open_database(&path).unwrap_err(),
+            SessionRuntimeError::Persistence
         );
     }
 
@@ -11015,6 +11377,16 @@ mod tests {
                 output_tokens: 5,
             })
         );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ModelTurnCompleted {
+                run_id,
+                turn_ordinal: 1,
+                model: ModelSelection { model: Some(model), .. },
+                usage: Some(TokenUsage { input_tokens: 10, output_tokens: 5, .. }),
+                estimated_cost_usd_nanos: Some(20_500),
+            } if *run_id == compaction_run && model == "test/model"
+        )));
         assert!(observed.iter().any(|event| matches!(
             &event.event,
             SessionEvent::RunFinished {
@@ -12062,6 +12434,25 @@ mod tests {
                 ..
             }
         )));
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ModelTurnCompleted {
+                turn_ordinal: 1,
+                model: ModelSelection {
+                    model: Some(model),
+                    max_output_tokens: Some(256),
+                    organization: None,
+                },
+                usage: Some(TokenUsage {
+                    input_tokens: 10,
+                    cache_read_input_tokens: 2,
+                    cache_write_input_tokens: 1,
+                    output_tokens: 5,
+                }),
+                estimated_cost_usd_nanos: Some(20_500),
+                ..
+            } if model == "test/model"
+        )));
         let snapshot = runtime
             .snapshot(SnapshotRequest {
                 workspace_id,
@@ -12089,6 +12480,33 @@ mod tests {
         );
         assert_eq!(focused.runs[0].context_tokens, Some(13));
         assert_eq!(focused.runs[0].estimated_cost_usd_nanos, Some(20_500));
+        let connection = Connection::open(directory.path().join("sessions.sqlite3")).unwrap();
+        let (model, usage, cost, completed): (String, String, u64, u64) = connection
+            .query_row(
+                "SELECT model_json, usage_json, estimated_cost_usd_nanos, completed_at_ms
+                 FROM model_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ModelSelection>(&model)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("test/model")
+        );
+        assert_eq!(
+            serde_json::from_str::<TokenUsage>(&usage).unwrap(),
+            TokenUsage {
+                input_tokens: 10,
+                cache_read_input_tokens: 2,
+                cache_write_input_tokens: 1,
+                output_tokens: 5,
+            }
+        );
+        assert_eq!(cost, 20_500);
+        assert!(completed > 0);
         assert!(snapshot.cursor.sequence > initial.sequence);
     }
 
@@ -12776,6 +13194,8 @@ mod tests {
                         calls: vec![call],
                         turn_message: None,
                         context_tokens: None,
+                        usage: None,
+                        estimated_cost_usd_nanos: None,
                         accounting: None,
                     },
                 )
@@ -12956,6 +13376,8 @@ mod tests {
                     calls,
                     turn_message: None,
                     context_tokens: None,
+                    usage: None,
+                    estimated_cost_usd_nanos: None,
                     accounting: None,
                 },
             )
@@ -13585,6 +14007,8 @@ mod tests {
                     calls: Vec::new(),
                     turn_message: None,
                     context_tokens: None,
+                    usage: None,
+                    estimated_cost_usd_nanos: None,
                     accounting: None,
                 },
             )
@@ -13931,6 +14355,8 @@ mod tests {
                     calls: vec![call],
                     turn_message: Some(first_message),
                     context_tokens: None,
+                    usage: None,
+                    estimated_cost_usd_nanos: None,
                     accounting: None,
                 },
             )
@@ -14073,6 +14499,8 @@ mod tests {
                     calls: vec![call],
                     turn_message: None,
                     context_tokens: None,
+                    usage: None,
+                    estimated_cost_usd_nanos: None,
                     accounting: None,
                 },
             )
@@ -14214,6 +14642,8 @@ mod tests {
                     calls: Vec::new(),
                     turn_message: None,
                     context_tokens: None,
+                    usage: None,
+                    estimated_cost_usd_nanos: None,
                     accounting: None,
                 },
             )
@@ -16253,6 +16683,8 @@ mod tests {
                     calls: vec![call],
                     turn_message: None,
                     context_tokens: None,
+                    usage: None,
+                    estimated_cost_usd_nanos: None,
                     accounting: None,
                 },
             )
@@ -16972,7 +17404,7 @@ mod tests {
             requests: Arc::clone(&parent_requests),
             script: vec![(
                 "spawn_agent",
-                r#"{"task":"Survey the widget inventory","model":"test/child"}"#.to_owned(),
+                r#"{"task":"/review Survey the widget inventory","model":"test/child"}"#.to_owned(),
             )],
             turn: StdMutex::new(0),
         });
@@ -16987,6 +17419,9 @@ mod tests {
             turn: StdMutex::new(0),
         });
         let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        let skill = harness._directory.path().join(".qq/skills/review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "User-selected guidance only.\n").unwrap();
         let run_id =
             submit_prompt_to(&harness.runtime, harness.session_id, "delegate the survey").await;
         let observed = collect_until_run_finished(&mut harness.events, run_id).await;
@@ -17005,7 +17440,7 @@ mod tests {
         assert_eq!(child_session.model.as_deref(), Some("test/child"));
         assert_eq!(child_session.status, SessionStatus::Queued);
         assert_eq!(child_session.queued_prompts, 1);
-        assert_eq!(child_session.title, "Survey the widget inventory");
+        assert_eq!(child_session.title, "/review Survey the widget inventory");
         let created_event = observed
             .iter()
             .find(|event| {
@@ -17034,9 +17469,9 @@ mod tests {
         // The task's first line names the child at prompt submission.
         assert!(observed.iter().any(|event| matches!(
             &event.event,
-            SessionEvent::PromptQueued { session, .. }
+                SessionEvent::PromptQueued { session, .. }
                 if session.id == child_session.id
-                    && session.title == "Survey the widget inventory"
+                    && session.title == "/review Survey the widget inventory"
         )));
         // spawn_agent is read-only: no approval round trip in Ask mode.
         assert!(
@@ -17044,6 +17479,17 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.event, SessionEvent::ToolApprovalRequested { .. }))
         );
+        let follow_up = submit_prompt_to(
+            &harness.runtime,
+            child_session.id,
+            "/review user-authored follow-up",
+        )
+        .await;
+        let follow_up_events = collect_until_run_finished(&mut harness.events, follow_up).await;
+        assert!(matches!(
+            finished_outcome(&follow_up_events, follow_up),
+            Some(RunOutcome::Completed)
+        ));
         let child_reqs = child_requests.lock().unwrap();
         assert!(
             !child_reqs[0]
@@ -17052,11 +17498,36 @@ mod tests {
                 .any(|spec| spec.name() == "spawn_agent"),
             "child sessions must not have spawn_agent declared"
         );
+        assert_eq!(
+            child_reqs[0].messages(),
+            [Message::user("/review Survey the widget inventory")]
+        );
+        assert!(
+            !child_reqs[0]
+                .system()
+                .unwrap()
+                .contains("User-selected guidance only."),
+            "a model-created child task must not select runtime guidance"
+        );
         assert!(matches!(
             child_reqs[1].messages()[2].content(),
             [ContentBlock::ToolResult { content, is_error: true, .. }]
                 if content == approval::POLICY_DENIED_RESULT
         ));
+        assert!(
+            child_reqs[2]
+                .system()
+                .unwrap()
+                .contains("User-selected guidance only."),
+            "an explicit user prompt in a child session may select runtime guidance"
+        );
+        assert!(
+            !child_reqs[2]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "spawn_agent"),
+            "child sessions remain depth-capped after a user follow-up"
+        );
         drop(child_reqs);
         let parent_reqs = parent_requests.lock().unwrap();
         assert!(
@@ -18453,6 +18924,8 @@ mod tests {
             command_id: CommandId::generate().unwrap(),
             kind: RunKind::Prompt,
             child: false,
+            user_initiated: true,
+            literal_slash: false,
             model: ModelSelection {
                 model: Some("test/model".to_owned()),
                 max_output_tokens: Some(256),

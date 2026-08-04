@@ -34,3 +34,8 @@ target
 
 .opencode
 .claude
+
+# Harbor adapter environments and generated evaluation artifacts
+benchmarks/harbor/.venv/
+benchmarks/harbor/jobs/
+**/__pycache__/

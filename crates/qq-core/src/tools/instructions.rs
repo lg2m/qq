@@ -11,7 +11,10 @@ use qq_protocol::InstructionHash;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{Workspace, WorkspacePathError, blocking_permits, contained_path};
+use super::{
+    GuidanceError, GuidanceRequest, SelectedGuidance, Workspace, WorkspacePathError,
+    blocking_permits, contained_path,
+};
 
 const AGENTS_FILE: &str = "AGENTS.md";
 const CLAUDE_FILE: &str = "CLAUDE.md";
@@ -114,6 +117,8 @@ pub(crate) enum WorkspacePreparationError {
     },
     #[error(transparent)]
     Instructions(#[from] WorkspaceInstructionError),
+    #[error(transparent)]
+    Guidance(#[from] GuidanceError),
 }
 
 #[derive(Debug, Error)]
@@ -188,7 +193,9 @@ impl WorkspaceInstructions {
 pub(crate) async fn prepare_workspace(
     path: PathBuf,
     cancelled: Arc<AtomicBool>,
-) -> Result<(Workspace, WorkspaceInstructions), WorkspacePreparationError> {
+    guidance: Option<GuidanceRequest>,
+) -> Result<(Workspace, WorkspaceInstructions, Option<SelectedGuidance>), WorkspacePreparationError>
+{
     let permit = blocking_permits()
         .acquire_owned()
         .await
@@ -215,7 +222,10 @@ pub(crate) async fn prepare_workspace(
             return Err(WorkspacePreparationError::Cancelled);
         }
         let instructions = load(&workspace, &cancelled)?;
-        Ok((workspace, instructions))
+        let guidance = guidance
+            .map(|request| super::guidance::load(&workspace, request, &cancelled))
+            .transpose()?;
+        Ok((workspace, instructions, guidance))
     })
     .await
     .map_err(|source| WorkspacePreparationError::Stopped { source })?

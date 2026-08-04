@@ -218,6 +218,8 @@ struct Cli {
 enum Task {
     /// Run provider validation tasks.
     Providers(ProvidersArgs),
+    /// Run and inspect reproducible Harbor evaluations.
+    Eval(Box<crate::eval::EvalArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -412,6 +414,8 @@ enum SetupError {
 
 #[derive(Debug, Error)]
 enum XtaskError {
+    #[error(transparent)]
+    Eval(#[from] crate::eval::EvalError),
     #[error("choose one or more --provider values or --all, but not both")]
     InvalidSelection,
     #[error("live provider checks require {LIVE_OPT_IN}=1")]
@@ -448,6 +452,7 @@ async fn try_run(cli: Cli) -> Result<(), XtaskError> {
                 CheckMode::Live(args) => run_live(args).await,
             },
         },
+        Task::Eval(args) => crate::eval::run(*args).await.map_err(Into::into),
     }
 }
 
@@ -988,6 +993,53 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["cargo xtask", "providers", "check", "live", "--all",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo xtask",
+                "eval",
+                "run",
+                "--model",
+                "anthropic/claude-sonnet-4-5",
+                "--dataset",
+                "terminal-bench/terminal-bench-2",
+                "--job-name",
+                "qq-baseline",
+                "--dry-run",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo xtask",
+                "eval",
+                "run",
+                "--model",
+                "test/model",
+                "--dataset",
+                "dataset",
+                "--path",
+                "task",
+                "--job-name",
+                "invalid",
+            ])
+            .is_err(),
+            "dataset and path must remain mutually exclusive"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cargo xtask",
+                "eval",
+                "classify",
+                "jobs/trial",
+                "--category",
+                "verification-omitted",
+                "--evidence",
+                "trajectory:4",
+                "--note",
+                "No verification followed the mutation.",
+            ])
+            .is_ok()
         );
     }
 

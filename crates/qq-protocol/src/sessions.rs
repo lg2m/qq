@@ -599,12 +599,106 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-/// All-or-none identity of the system prefix prepared for one run.
+/// Validated SHA-256 identity for a prompt, tool declaration set, or selected
+/// guidance document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentHash([u8; 32]);
+
+impl ContentHash {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ContentHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for ContentHash {
+    type Err = ContentHashError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err(ContentHashError);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0]).ok_or(ContentHashError)?;
+            let low = hex_nibble(pair[1]).ok_or(ContentHashError)?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for ContentHash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("content hash must be exactly 64 lowercase hexadecimal characters")]
+pub struct ContentHashError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidanceKind {
+    Command,
+    Skill,
+}
+
+/// Provenance for one explicitly selected command or skill document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuidanceIdentity {
+    pub kind: GuidanceKind,
+    pub name: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub content_hash: ContentHash,
+}
+
+/// All-or-none identity of the system prefix prepared for one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunPromptIdentity {
     pub version: PromptVersion,
     pub instruction_hash: InstructionHash,
+    /// Absent only on rows written before protocol version 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_hash: Option<ContentHash>,
+    /// Absent only on rows written before protocol version 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schema_hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_guidance: Option<Box<GuidanceIdentity>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -767,6 +861,19 @@ pub enum SessionEvent {
         channel: TextChannel,
         text: String,
     },
+    /// One provider inference committed durably. This is the authoritative
+    /// per-turn audit seam used by trajectory exporters: model selection,
+    /// usage, and cost stay attributable even when a turn contains only tool
+    /// calls and therefore has no assistant message row.
+    ModelTurnCompleted {
+        run_id: RunId,
+        turn_ordinal: u16,
+        model: ModelSelection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_cost_usd_nanos: Option<u64>,
+    },
     ToolCallRequested {
         tool_call: ToolCallSnapshot,
     },
@@ -913,6 +1020,38 @@ mod tests {
             envelope
         );
         assert_eq!(envelope.cursor.to_string().parse(), Ok(envelope.cursor));
+    }
+
+    #[test]
+    fn model_turn_event_preserves_per_turn_audit_fields() {
+        let event = SessionEvent::ModelTurnCompleted {
+            run_id: id(1),
+            turn_ordinal: 2,
+            model: ModelSelection {
+                model: Some("provider/model".to_owned()),
+                max_output_tokens: Some(4096),
+                organization: Some("org".to_owned()),
+            },
+            usage: Some(TokenUsage {
+                input_tokens: 10,
+                cache_read_input_tokens: 3,
+                cache_write_input_tokens: 1,
+                output_tokens: 4,
+            }),
+            estimated_cost_usd_nanos: Some(99),
+        };
+
+        let encoded = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(encoded["type"], "model_turn_completed");
+        assert_eq!(encoded["turn_ordinal"], 2);
+        assert_eq!(encoded["model"]["organization"], "org");
+        assert_eq!(encoded["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(encoded["estimated_cost_usd_nanos"], 99);
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+            event
+        );
     }
 
     #[test]
@@ -1608,8 +1747,17 @@ mod tests {
             status: RunStatus::Completed,
             outcome: Some(RunOutcome::Completed),
             prompt_identity: Some(Box::new(RunPromptIdentity {
-                version: PromptVersion::new(6).unwrap(),
+                version: PromptVersion::new(7).unwrap(),
                 instruction_hash: "a".repeat(64).parse().unwrap(),
+                system_prompt_hash: Some("b".repeat(64).parse().unwrap()),
+                tool_schema_hash: Some("c".repeat(64).parse().unwrap()),
+                selected_guidance: Some(Box::new(GuidanceIdentity {
+                    kind: GuidanceKind::Skill,
+                    name: "review".to_owned(),
+                    source: ".qq/skills/review/SKILL.md".to_owned(),
+                    version: None,
+                    content_hash: "d".repeat(64).parse().unwrap(),
+                })),
             })),
             usage: Some(TokenUsage {
                 input_tokens: 30,
@@ -1622,12 +1770,30 @@ mod tests {
         };
         let encoded = serde_json::to_value(&run).unwrap();
         assert_eq!(encoded["context_tokens"], 16);
-        assert_eq!(encoded["prompt_identity"]["version"], 6);
+        assert_eq!(encoded["prompt_identity"]["version"], 7);
         assert_eq!(
             encoded["prompt_identity"]["instruction_hash"],
             "a".repeat(64)
         );
+        assert_eq!(
+            encoded["prompt_identity"]["system_prompt_hash"],
+            "b".repeat(64)
+        );
+        assert_eq!(
+            encoded["prompt_identity"]["selected_guidance"]["kind"],
+            "skill"
+        );
         assert_eq!(serde_json::from_value::<RunSnapshot>(encoded).unwrap(), run);
+
+        let legacy_identity: RunPromptIdentity = serde_json::from_value(serde_json::json!({
+            "version": 6,
+            "instruction_hash": "e".repeat(64),
+        }))
+        .unwrap();
+        assert_eq!(legacy_identity.version, PromptVersion::new(6).unwrap());
+        assert_eq!(legacy_identity.system_prompt_hash, None);
+        assert_eq!(legacy_identity.tool_schema_hash, None);
+        assert_eq!(legacy_identity.selected_guidance, None);
 
         // Runs persisted before the protocol carried context tokens must
         // still decode; legacy snapshots default to no value.
