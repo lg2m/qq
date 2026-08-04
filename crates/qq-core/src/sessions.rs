@@ -15010,7 +15010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approving_once_executes_the_tool_after_the_client_decides() {
+    async fn immediate_approval_response_cannot_race_past_registered_waiter() {
         let mut harness = approval_harness(
             ApprovalMode::Ask,
             "__test_mutate",
