@@ -1,6 +1,7 @@
-use std::{fmt, str::FromStr};
+use std::{fmt, num::NonZeroU16, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use thiserror::Error;
 
 use crate::{
     CommandId, MessageId, ReasoningKind, RunFailureKind, RunId, SessionId, StoreId, ToolCallId,
@@ -486,6 +487,10 @@ pub struct RunSnapshot {
     pub status: RunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<RunOutcome>,
+    /// Shared system-prompt version and workspace-instruction identity. Absent
+    /// on historical runs and runs that failed before prompt preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_identity: Option<Box<RunPromptIdentity>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
     /// Input-token total (fresh input + cache reads + cache writes) of the
@@ -498,6 +503,108 @@ pub struct RunSnapshot {
     pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd_nanos: Option<u64>,
+}
+
+/// Version of the provider-neutral system prompt prepared for a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PromptVersion(NonZeroU16);
+
+impl PromptVersion {
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        match NonZeroU16::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+/// SHA-256 identity of ordered workspace-instruction paths and bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InstructionHash([u8; 32]);
+
+impl InstructionHash {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for InstructionHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for InstructionHash {
+    type Err = InstructionHashError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err(InstructionHashError);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0]).ok_or(InstructionHashError)?;
+            let low = hex_nibble(pair[1]).ok_or(InstructionHashError)?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for InstructionHash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for InstructionHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("instruction hash must be exactly 64 lowercase hexadecimal characters")]
+pub struct InstructionHashError;
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// All-or-none identity of the system prefix prepared for one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunPromptIdentity {
+    pub version: PromptVersion,
+    pub instruction_hash: InstructionHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1500,6 +1607,10 @@ mod tests {
             session_id: id(3),
             status: RunStatus::Completed,
             outcome: Some(RunOutcome::Completed),
+            prompt_identity: Some(Box::new(RunPromptIdentity {
+                version: PromptVersion::new(6).unwrap(),
+                instruction_hash: "a".repeat(64).parse().unwrap(),
+            })),
             usage: Some(TokenUsage {
                 input_tokens: 30,
                 cache_read_input_tokens: 4,
@@ -1511,26 +1622,45 @@ mod tests {
         };
         let encoded = serde_json::to_value(&run).unwrap();
         assert_eq!(encoded["context_tokens"], 16);
+        assert_eq!(encoded["prompt_identity"]["version"], 6);
+        assert_eq!(
+            encoded["prompt_identity"]["instruction_hash"],
+            "a".repeat(64)
+        );
         assert_eq!(serde_json::from_value::<RunSnapshot>(encoded).unwrap(), run);
 
         // Runs persisted before the protocol carried context tokens must
         // still decode; legacy snapshots default to no value.
         let mut legacy = serde_json::to_value(&run).unwrap();
         legacy.as_object_mut().unwrap().remove("context_tokens");
+        legacy.as_object_mut().unwrap().remove("prompt_identity");
         let decoded = serde_json::from_value::<RunSnapshot>(legacy).unwrap();
         assert_eq!(decoded.context_tokens, None);
+        assert_eq!(decoded.prompt_identity, None);
         assert_eq!(decoded.usage, run.usage);
 
         // Snapshots without a value keep their previous wire shape.
         let bare = RunSnapshot {
             context_tokens: None,
-            ..run
+            prompt_identity: None,
+            ..run.clone()
         };
         let encoded = serde_json::to_value(&bare).unwrap();
         assert!(encoded.get("context_tokens").is_none());
+        assert!(encoded.get("prompt_identity").is_none());
         assert_eq!(
             serde_json::from_value::<RunSnapshot>(encoded).unwrap(),
             bare
         );
+
+        for invalid in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+            assert!(invalid.parse::<InstructionHash>().is_err());
+        }
+        let mut invalid = serde_json::to_value(&run).unwrap();
+        invalid["prompt_identity"]["version"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
+        let mut invalid = serde_json::to_value(&run).unwrap();
+        invalid["prompt_identity"]["instruction_hash"] = serde_json::json!("A".repeat(64));
+        assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
     }
 }

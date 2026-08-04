@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -62,7 +62,8 @@ approvals (the `approve_for_workspace` decision, the
 authoritative session state (`SessionSummary.context_tokens` and
 `session_context_updated`) so legacy billing totals and internal compaction
 runs cannot masquerade as the current session context, and added explicit
-direct and inclusive session accounting totals.
+direct and inclusive session accounting totals; version 6 added persisted
+run prompt identity (`RunSnapshot.prompt_identity`).
 
 Clients and servers must agree on this value.
 
@@ -844,6 +845,10 @@ it from cumulative run billing.
   "session_id": "...",
   "status": "running",
   "outcome": null,
+  "prompt_identity": {
+    "version": 6,
+    "instruction_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
   "usage": null,
   "estimated_cost_usd_nanos": null,
   "context_tokens": null
@@ -852,6 +857,14 @@ it from cumulative run billing.
 
 Run status: `queued`, `running`, `completed`, `cancelled`, `failed`,
 `interrupted`.
+
+`prompt_identity.version` identifies the shared provider-neutral system prompt
+prepared for the run. `prompt_identity.instruction_hash` is the SHA-256 identity
+of the prepared workspace-root instruction selection: root `AGENTS.md`, root
+`CLAUDE.md` when `AGENTS.md` is absent, or the empty selection. Nested
+instructions discovered by the model remain durable tool evidence but do not
+retroactively change this pre-provider identity. `prompt_identity` is absent
+for historical runs and runs that failed before prompt preparation.
 
 `usage` sums every model turn in the run and is the billing figure;
 `context_tokens` is the final completed turn's input-token total (fresh
