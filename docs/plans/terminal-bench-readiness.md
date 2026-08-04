@@ -486,14 +486,23 @@ Priority: P0 for capability. Keep this generic and benchmark-independent.
 
 Add a bounded instruction loader in the root/core composition path:
 
-- Load a root `AGENTS.md` when present.
-- Instruct the model to discover and obey more specific nested instruction
+- At each directory scope, load `AGENTS.md` when present; otherwise load
+  `CLAUDE.md` as a compatibility fallback. If both exist in the same
+  directory, use only `AGENTS.md` so policy is not duplicated or merged
+  ambiguously.
+- Apply the same fallback at the workspace root and instruct the model to
+  discover and obey more-specific nested `AGENTS.md` or fallback `CLAUDE.md`
   files before changing files below them.
 - Resolve every instruction path through the workspace capability.
 - Reject symlink escape and bound individual and aggregate instruction bytes.
 - Preserve deterministic root-to-leaf precedence.
 - Include the instruction content in the stable system-prefix region.
-- Persist the prompt version and instruction hash on the run.
+- Persist the prompt version and a hash of the ordered selected paths and
+  instruction bytes on the run.
+
+This is filename compatibility, not an implementation of Claude-specific
+imports, settings, memory lookup, or command semantics. Missing both files is
+valid and contributes no workspace instruction content.
 
 Do not silently interpret project instructions in the TUI or Harbor adapter;
 the shared core runtime owns the behavior.
@@ -516,6 +525,47 @@ Bump the versioned base prompt with concise, provider-neutral requirements:
 Do not add a planner DSL, hidden scratch database, or task-specific prompt
 rules. First improve the prompt and measure it.
 
+### Slash-Invoked Commands And Skills
+
+Keep commands and skills as a separate delivery task from scoped workspace
+instructions. `AGENTS.md` and fallback `CLAUDE.md` files are ambient,
+directory-scoped policy. A command or skill is optional guidance selected
+explicitly at runtime.
+
+Add a shared runtime contract for a leading `/<name>` invocation, with optional
+arguments, to resolve and load a named command or skill for that run:
+
+- Resolve slash invocations in the shared runtime so the TUI, direct CLI,
+  server, and benchmark adapter cannot acquire different semantics.
+- Load only explicitly selected skill content; do not inject every discovered
+  skill into the base prompt.
+- Keep loaded content provider-neutral, bounded, and ordered deterministically.
+- Resolve workspace-backed sources through the workspace capability and reject
+  symlink escape.
+- Persist the selected command or skill identity, source, version when
+  available, and content hash so the run remains explainable.
+- Treat supporting scripts or assets as references, not implicit authority to
+  execute them. Tool policy and approval still govern every action.
+- Reject unknown and ambiguous names before making a provider request.
+- Permit clients to offer completion or a picker after `/`, but keep discovery
+  and loading out of client-only code.
+
+Before implementation, settle and document these open design questions:
+
+- Which roots are searched and in what precedence order: repository-local,
+  user-local, managed, bundled, and compatibility locations used by other
+  agent harnesses.
+- Whether commands and skills share one document format and metadata schema.
+- Naming, collision, argument, escaping, and explicit path rules.
+- Whether the initial contract is user-invoked only or may later permit the
+  model to select from a bounded catalog. Do not add automatic model selection
+  without a measured need.
+
+Tests must cover deterministic resolution, precedence, containment, byte
+bounds, unknown and ambiguous names, persisted provenance, and equivalent
+behavior across direct and server-backed runs. An ordinary prompt must not load
+skill bodies merely because they are discoverable.
+
 ### Stall Observation
 
 Record, but initially do not automatically interfere with:
@@ -534,6 +584,8 @@ demonstrates improvement.
 
 - Instruction precedence, bounds, containment, and hashing have deterministic
   tests.
+- Instruction fixtures cover `AGENTS.md` preference, `CLAUDE.md` fallback, and
+  mixed root-to-leaf selection without loading both names at one scope.
 - Prompt contract fixtures assert presence and provider mapping, not prose
   formatting beyond the versioned contract.
 - Analysis-only requests are not forced into edits.
@@ -1007,18 +1059,19 @@ Each row should be one narrow issue and normally one focused PR.
 | 4 | `fix(runtime): make child spawn atomic and final-only` | 3 | Correct continuation |
 | 5 | `feat(runtime): load scoped workspace instructions` | 1 | Completion quality |
 | 6 | `test(eval): baseline completion prompt and failure taxonomy` | 2, 5 | First trustworthy baseline |
-| 7 | `perf(session): make streamed text persistence linear` | 1 | Long-stream performance |
-| 8 | `perf(session): batch reasoning and fairly schedule persistence` | 7 | Long-stream performance |
-| 9 | `feat(runtime): carry and persist resolved model limits` | 3 | Model-aware runtime |
-| 10 | `feat(runtime): plan context and enforce run budgets` | 8, 9 | Model-aware runtime |
-| 11 | `feat(runtime): validate compaction and add history recall` | 10 | Durable long sessions |
-| 12 | `perf(provider): add measured generation and cache controls` | 9, 10 | Cost frontier |
-| 13 | `test(tools): run search edit and terminal contract ablations` | 2, 6 | Tool evidence |
-| 14 | `feat(tools): ship winning tool contracts` | 13 | Tool capability |
-| 15 | `perf(runtime): configure worker models and roll up child cost` | 4, 9 | Sub-agent economics |
-| 16 | `perf(runtime): cache resolved runtimes and credential leases` | 6 | Warm path |
-| 17 | `perf(runtime): add provider-aware scheduling from trace evidence` | 15, 16 | Concurrent efficiency |
-| 18 | `test(eval): run full fixed-model and efficiency qualification` | all promoted work | Release candidate |
+| 7 | `feat(runtime): load slash-invoked commands and skills` | 5 | On-demand guidance |
+| 8 | `perf(session): make streamed text persistence linear` | 1 | Long-stream performance |
+| 9 | `perf(session): batch reasoning and fairly schedule persistence` | 8 | Long-stream performance |
+| 10 | `feat(runtime): carry and persist resolved model limits` | 3 | Model-aware runtime |
+| 11 | `feat(runtime): plan context and enforce run budgets` | 9, 10 | Model-aware runtime |
+| 12 | `feat(runtime): validate compaction and add history recall` | 11 | Durable long sessions |
+| 13 | `perf(provider): add measured generation and cache controls` | 10, 11 | Cost frontier |
+| 14 | `test(tools): run search edit and terminal contract ablations` | 2, 6 | Tool evidence |
+| 15 | `feat(tools): ship winning tool contracts` | 14 | Tool capability |
+| 16 | `perf(runtime): configure worker models and roll up child cost` | 4, 10 | Sub-agent economics |
+| 17 | `perf(runtime): cache resolved runtimes and credential leases` | 6 | Warm path |
+| 18 | `perf(runtime): add provider-aware scheduling from trace evidence` | 16, 17 | Concurrent efficiency |
+| 19 | `test(eval): run full fixed-model and efficiency qualification` | all promoted work | Release candidate |
 
 Orders 3 and 5 may proceed while the Harbor adapter is being built, and tool
 fixtures may be prepared while storage work proceeds. Do not let multiple
