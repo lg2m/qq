@@ -4,22 +4,20 @@
 
 use std::{
     collections::HashMap,
-    future::Future,
     path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
 use qq_protocol::{
-    ApprovalMode, PromptVersion, ReasoningKind, RunActivity, RunCommand, RunEvent, RunFailureKind,
-    RunPromptIdentity, TokenUsage, ToolCallId,
+    ApprovalMode, RunActivity, RunCommand, RunEvent, RunFailureKind, RunPromptIdentity, TokenUsage,
+    ToolCallId,
 };
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
@@ -28,8 +26,17 @@ use thiserror::Error;
 
 mod approval;
 mod mcp;
+mod runtime;
 mod sessions;
 mod tools;
+
+pub use runtime::TurnRetryPolicy;
+use runtime::{
+    AGENT_PROMPT_VERSION, GateDecision, PendingToolCall, RuntimeEvent, RuntimeToolCall,
+    SPAWN_UNAVAILABLE_RESULT, SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate,
+    ToolGateFuture, TurnBlock, agent_system_prompt, attempts_message,
+    is_transient_provider_failure,
+};
 
 pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult};
 pub use sessions::{
@@ -61,140 +68,12 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_RUN_MODEL_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_REASONING_BYTES: usize = 1024 * 1024;
 const MAX_PARALLEL_READS: usize = 4;
-const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(6) {
-    Some(version) => version,
-    None => panic!("agent prompt version must be nonzero"),
-};
-
-#[derive(Debug, Clone, PartialEq)]
-enum RuntimeEvent {
-    Started,
-    Prepared {
-        identity: RunPromptIdentity,
-    },
-    ActivityChanged {
-        activity: RunActivity,
-    },
-    ReasoningStarted {
-        kind: ReasoningKind,
-    },
-    ReasoningDelta {
-        kind: ReasoningKind,
-        text: String,
-    },
-    ReasoningCompleted {
-        kind: ReasoningKind,
-    },
-    OutputTextDelta {
-        text: String,
-    },
-    RefusalDelta {
-        text: String,
-    },
-    AssistantTurnCompleted {
-        turn_ordinal: u16,
-        message: Message,
-        usage: Option<TokenUsage>,
-        /// Tool calls requested by this turn, in request order. Carried on the
-        /// same event as the completed turn so the store can persist the turn
-        /// and its calls in one transaction; a crash must never leave a
-        /// persisted ToolCall block without its tool_calls rows.
-        calls: Vec<RuntimeToolCall>,
-    },
-    ToolCallStarted {
-        id: ToolCallId,
-    },
-    ToolCallDenied {
-        id: ToolCallId,
-        message: String,
-    },
-    /// A chunk of live output from a running tool (shell commands stream their
-    /// combined stdout+stderr). Display-only: the bounded result on
-    /// `ToolCallFinished` remains authoritative.
-    ToolCallOutputDelta {
-        id: ToolCallId,
-        chunk: String,
-    },
-    ToolCallFinished {
-        id: ToolCallId,
-        result: String,
-        is_error: bool,
-        /// A file-state map entry recorded by this execution, persisted with
-        /// the result so the map can be rebuilt for later runs.
-        file_state: Option<tools::FileStateUpdate>,
-        /// A UI-facing payload persisted with the result (the applied diff of
-        /// a successful edit). Never enters model context.
-        display: Option<qq_protocol::ToolCallDisplay>,
-    },
-    Completed,
-    Failed {
-        kind: RunFailureKind,
-        message: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeToolCall {
-    id: ToolCallId,
-    turn_ordinal: u16,
-    call_ordinal: u16,
-    provider_call_id: String,
-    name: String,
-    arguments: String,
-    /// Set when the provider streamed arguments that were not valid JSON. The
-    /// call is never executed; this message is returned to the model as a
-    /// retryable tool error instead of failing the run.
-    argument_error: Option<String>,
-}
-
 struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
     }
-}
-
-/// The runtime's answer for one requested tool call after policy and, when
-/// required, an approval round trip.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GateDecision {
-    Execute,
-    Deny { message: String },
-}
-
-pub(crate) type ToolGateFuture = Pin<Box<dyn Future<Output = GateDecision> + Send + 'static>>;
-
-/// The outcome one spawned sub-agent call returns to its parent. The content
-/// flows through the same bounded-result truncation as built-in tools.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SpawnAgentOutcome {
-    pub(crate) content: String,
-    pub(crate) is_error: bool,
-}
-
-pub(crate) type SpawnAgentFuture =
-    Pin<Box<dyn Future<Output = SpawnAgentOutcome> + Send + 'static>>;
-
-/// Runs one sub-agent task to completion on behalf of a `spawn_agent` call.
-/// The session runtime installs a spawner for eligible runs only: child
-/// sessions (and session-less runs) get none, so the tool is neither declared
-/// nor dispatchable there. Dropping the returned future must cancel the
-/// in-flight child work.
-pub(crate) trait SubagentSpawner: Send + Sync {
-    fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture;
-}
-
-/// The dispatcher's defensive answer when `spawn_agent` is called by a run
-/// that has no spawner (a child session, or a run outside the session layer).
-pub(crate) const SPAWN_UNAVAILABLE_RESULT: &str =
-    "spawn_agent is not available in this session; sub-agents cannot spawn sub-agents.";
-
-/// Resolves approval policy for tool calls before they execute. The session
-/// runtime installs a gate that persists approval state and waits for clients;
-/// gate-less runs fall back to a static policy that cannot prompt.
-pub(crate) trait ToolGate: Send + Sync {
-    fn resolve(&self, call: &RuntimeToolCall) -> ToolGateFuture;
 }
 
 struct StaticPolicyGate {
@@ -217,86 +96,6 @@ impl ToolGate for StaticPolicyGate {
             },
         };
         Box::pin(std::future::ready(decision))
-    }
-}
-
-#[derive(Debug)]
-struct PendingToolCall {
-    provider_call_id: String,
-    name: String,
-    arguments: String,
-    parsed_arguments: Option<serde_json::Value>,
-    argument_error: Option<String>,
-    completed: bool,
-}
-
-enum TurnBlock {
-    Text(String),
-    ToolCall(usize),
-}
-
-/// Turn-level retry for transient provider failures.
-///
-/// A model turn whose provider stream fails with a transient error
-/// (`Unavailable`, `RateLimited`, `Transport`) — or ends without a terminal
-/// event — is re-issued with exponential backoff instead of failing the run,
-/// but only while nothing user-visible has streamed, so a retry can never
-/// duplicate output. Non-transient failures (authentication, configuration,
-/// invalid requests, protocol violations) always fail fast.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TurnRetryPolicy {
-    max_attempts: u32,
-    base_delay: Duration,
-    max_delay: Duration,
-}
-
-impl Default for TurnRetryPolicy {
-    /// Eight attempts with 1 s → 60 s exponential backoff (about two minutes
-    /// of waiting in total), sized to ride out provider overload blips
-    /// without surrendering the run.
-    fn default() -> Self {
-        Self {
-            max_attempts: 8,
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(60),
-        }
-    }
-}
-
-impl TurnRetryPolicy {
-    /// Fails the run on the first provider error of any kind.
-    #[must_use]
-    pub const fn disabled() -> Self {
-        Self {
-            max_attempts: 1,
-            base_delay: Duration::ZERO,
-            max_delay: Duration::ZERO,
-        }
-    }
-
-    fn delay(&self, completed_attempts: u32) -> Duration {
-        let exponent = completed_attempts.saturating_sub(1).min(31);
-        self.base_delay
-            .saturating_mul(1_u32 << exponent)
-            .min(self.max_delay)
-    }
-}
-
-const fn is_transient_provider_failure(kind: ProviderErrorKind) -> bool {
-    matches!(
-        kind,
-        ProviderErrorKind::Unavailable
-            | ProviderErrorKind::RateLimited
-            | ProviderErrorKind::Transport
-    )
-}
-
-/// Appends the attempt count to a terminal failure message when retries ran.
-fn attempts_message(message: String, attempts: u32) -> String {
-    if attempts > 1 {
-        format!("{message} (gave up after {attempts} attempts with backoff)")
-    } else {
-        message
     }
 }
 
@@ -802,7 +601,7 @@ impl Runtime {
                         Err(error) => {
                             if is_transient_provider_failure(error.kind())
                                 && !turn_streamed
-                                && attempt < turn_retry.max_attempts
+                                && attempt < turn_retry.max_attempts()
                             {
                                 let delay = turn_retry.delay(attempt);
                                 attempt += 1;
@@ -821,7 +620,7 @@ impl Runtime {
                 if !completed {
                     // A stream that ends without a terminal event is the same
                     // transient class as a dropped connection.
-                    if !turn_streamed && attempt < turn_retry.max_attempts {
+                    if !turn_streamed && attempt < turn_retry.max_attempts() {
                         let delay = turn_retry.delay(attempt);
                         attempt += 1;
                         tokio::time::sleep(delay).await;
@@ -1172,75 +971,6 @@ fn public_run_stream(mut events: RuntimeStream) -> RunStream {
     })
 }
 
-/// Version 6 of the base agent prompt. The text is versioned in code, not
-/// configuration: bump this note and review the diff whenever it changes.
-fn agent_system_prompt(
-    workspace: &std::path::Path,
-    specs: &[qq_provider::ToolSpec],
-    workspace_instructions: &tools::WorkspaceInstructions,
-) -> String {
-    let mut tool_names = String::new();
-    let mut has_mcp = false;
-    let mut has_spawn = false;
-    for spec in specs {
-        if !tool_names.is_empty() {
-            tool_names.push_str(", ");
-        }
-        tool_names.push_str(spec.name());
-        has_mcp |= spec.name().starts_with(MCP_TOOL_PREFIX);
-        has_spawn |= spec.name() == tools::SPAWN_AGENT_TOOL;
-    }
-    let mcp_note = if has_mcp {
-        " Tools named mcp__<server>__<tool> call external MCP servers, execute outside the \
-         workspace, and may require user approval."
-    } else {
-        ""
-    };
-    let spawn_section = if has_spawn {
-        "\n\nDelegation:\n\
-         - spawn_agent runs a one-shot read-only sub-agent in this workspace from a \
-         self-contained task brief and returns only its final answer.\n\
-         - Omit spawn_agent's model argument by default. QQ then uses the configured worker \
-         model or this session's persisted selected model, including its authenticated provider. \
-         Set model only when the user explicitly requests an exact provider/model route; never \
-         guess, translate, or invent one.\n\
-         - Delegate when all three hold: the raw evidence would dwarf the distilled answer, \
-         you will not need that evidence verbatim later, and the task needs no mid-flight \
-         steering.\n\
-         - Default to working inline: single reads, searches, and quick lookups are never \
-         worth a sub-agent.\n\
-         - Exception: several independent questions are worth delegating even when each is \
-         small, because sub-agents run concurrently."
-    } else {
-        ""
-    };
-    let mut prompt = format!(
-        "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
-         \n\
-         Available tools: {tool_names}. read_file, list_dir, and search are read-only; \
-         edit_file and write_file modify workspace files and may require user approval; \
-         shell runs one command in the workspace with a bounded timeout and may require user approval.{mcp_note}\n\
-         \n\
-         Working conventions:\n\
-         - Determine observable completion criteria from the user's request before acting.\n\
-         - Read a file with read_file before editing or overwriting it; edits without a prior read in this session are rejected.\n\
-         - Inspect existing state before changing it and preserve unrelated work.\n\
-         - Prefer search over guessing file paths.\n\
-         - Give every tool path relative to the workspace root; absolute paths are rejected.\n\
-         - Before changing files below a subdirectory, inspect each directory from the workspace root to the target for AGENTS.md; when AGENTS.md is absent at one scope, check CLAUDE.md. Apply selected instructions root-to-leaf, with more-specific instructions taking precedence.\n\
-         - Implement requested changes rather than stopping at analysis unless the user requested analysis-only work.\n\
-         - Treat failed tools and tests as evidence: diagnose them and continue when a safe path remains.\n\
-         - Run the narrowest relevant verification before broader checks.\n\
-         - Do not claim success without evidence from the resulting state.\n\
-         - Report remaining failures and uncertainty honestly.\n\
-         - Respect explicit time, token, cost, and safety budgets.\n\
-         - Prefer edit_file and write_file over shell for changing files.{spawn_section}",
-        root = workspace.display(),
-    );
-    workspace_instructions.append_to_prompt(&mut prompt);
-    prompt
-}
-
 fn append_turn_text(blocks: &mut Vec<TurnBlock>, text: &str) {
     match blocks.last_mut() {
         Some(TurnBlock::Text(existing)) => existing.push_str(text),
@@ -1281,9 +1011,13 @@ pub enum RuntimeConfigError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use futures_util::{StreamExt, stream};
+    use qq_protocol::ReasoningKind;
     use qq_provider::{ProviderError, ProviderStream};
 
     use super::*;
