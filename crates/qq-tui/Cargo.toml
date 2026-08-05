@@ -29,10 +29,3 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
 tree-sitter-yaml = "0.7"
 unicode-width = "0.2"
-
-[dev-dependencies]
-
-[[example]]
-name = "tui_prototype"
-path = "examples/tui_prototype.rs"
-test = true
