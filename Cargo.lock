@@ -4678,9 +4678,14 @@ dependencies = [
  "clap",
  "futures-util",
  "qq-auth",
+ "qq-protocol",
  "qq-provider",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.19",
+ "time",
  "tokio",
 ]
 

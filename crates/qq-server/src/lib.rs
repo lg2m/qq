@@ -1458,7 +1458,8 @@ mod tests {
 
     use futures_util::stream as futures_stream;
     use qq_protocol::{
-        EventCursor, RunEvent, SessionEvent, SessionEventEnvelope, SessionId, StoreId,
+        CommandOutcome, EventCursor, RunEvent, SessionEvent, SessionEventEnvelope, SessionId,
+        StoreId,
     };
 
     use super::*;
@@ -1522,6 +1523,42 @@ mod tests {
             let events =
                 futures_stream::iter([Ok(self.event.clone())]).chain(futures_stream::pending());
             Ok(Box::pin(events))
+        }
+    }
+
+    struct CommandCaptureHandler {
+        commands: Arc<Mutex<Vec<CommandRequest>>>,
+    }
+
+    impl AskHandler for CommandCaptureHandler {
+        fn command(&self, request: CommandRequest) -> CommandFuture {
+            let command_id = request.command_id;
+            let outcome = match &request.command {
+                SessionCommand::SubmitPrompt { session_id, .. } => CommandOutcome::PromptQueued {
+                    session_id: *session_id,
+                    run_id: qq_protocol::RunId::generate().unwrap(),
+                    queue_position: 0,
+                },
+                _ => {
+                    return Box::pin(async {
+                        Err(AskHandlerError::InvalidRequest(
+                            "unexpected command".to_owned(),
+                        ))
+                    });
+                }
+            };
+            self.commands.lock().unwrap().push(request);
+            Box::pin(async move {
+                Ok(CommandReceipt {
+                    command_id,
+                    committed_through: EventCursor {
+                        store_id: StoreId::generate().unwrap(),
+                        workspace_id: WorkspaceId::generate().unwrap(),
+                        sequence: 1,
+                    },
+                    outcome,
+                })
+            })
         }
     }
 
@@ -1602,6 +1639,48 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(requests.lock().unwrap().is_empty());
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_forwards_runtime_slash_invocations_without_client_semantics() {
+        let directory = TestDirectory::new();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn AskHandler> = Arc::new(CommandCaptureHandler {
+            commands: Arc::clone(&commands),
+        });
+        let server = start_test_server(directory.paths(), handler).await;
+        let session_id = SessionId::generate().unwrap();
+        let request = CommandRequest {
+            command_id: qq_protocol::CommandId::generate().unwrap(),
+            command: SessionCommand::SubmitPrompt {
+                session_id,
+                prompt: "/review focus on cancellation".to_owned(),
+            },
+        };
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(server.connection().endpoint("/v1/sessions/prompts"))
+            .bearer_auth(server.connection().expose_bearer_token())
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json::<CommandReceipt>().await.unwrap();
+        {
+            let captured = commands.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(matches!(
+                &captured[0].command,
+                SessionCommand::SubmitPrompt { prompt, .. }
+                    if prompt == "/review focus on cancellation"
+            ));
+        }
         server.shutdown().await.unwrap();
     }
 

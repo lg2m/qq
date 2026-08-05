@@ -1,6 +1,6 @@
 # QQ Harness Reliability, Cost, And Terminal-Bench Readiness
 
-Status: active. Re-baselined against `main` on 2026-08-02.
+Status: active. Re-baselined against `main` on 2026-08-04.
 
 This plan turns QQ into a trustworthy autonomous terminal harness before
 optimizing it against Terminal-Bench. It covers the failures found in the
@@ -67,12 +67,15 @@ Passing one regression does not imply that its whole phase is complete.
 
 | Slice | Status | Evidence | Still open |
 | --- | --- | --- | --- |
-| Durable headless execution | on `main` | `f7b34a1` adds `qq run` with durable events, cancellation, timeout, turn/cost budgets, JSONL, and exit-status mapping | ATIF conversion, Harbor integration, resolved-model trial identity |
+| Durable headless execution | on `main` | `f7b34a1` adds `qq run` with durable events, cancellation, timeout, turn/cost budgets, JSONL, and exit-status mapping | Resolved model capabilities remain Task 10; `DEV-730` adds the evaluation identity required before that broader runtime work |
 | Transient provider recovery | on `main` | `55d2aa7` retries a turn only before user-visible output | One combined retry/amplification budget across provider transport and core |
 | Accepted-run supervision | implemented in `DEV-726` | Run-task panics settle as durable failures; headless sink/trace failures and owner aborts retain cancellation ownership; explicit runtime shutdown drains queued and running work; reopen interrupts abandoned running work without replaying tools | Process loss intentionally interrupts the in-flight provider request rather than attempting unsafe continuation |
-| Authoritative context projection | implemented in `DEV-727` | Completed, failed, cancelled, interrupted, and recovered runs share one projection; runtime notices and exact persisted/interrupted/not-executed tool results reach follow-up, capacity, and compaction requests without altering the transcript | Merge the reviewed slice |
-| Atomic child-run lifecycle | implemented in `DEV-728` | One transaction persists the initialized read-only child, queued prompt run, and parent-run ownership before publishing consecutive events; recovery cancels unclaimed children of interrupted parents; the parent receives only the final model turn | Merge with its `DEV-727` prerequisite |
+| Authoritative context projection | on `main` | `fec1e0a` makes completed, failed, cancelled, interrupted, and recovered runs share one projection; runtime notices and exact tool boundaries reach follow-up, capacity, and compaction requests without altering the transcript | No remaining Task 3 work |
+| Atomic child-run lifecycle | on `main` | `681ee07` persists the initialized read-only child, queued prompt run, and parent-run ownership atomically; recovery cancels unclaimed children of interrupted parents; the parent receives only the final model turn | No remaining Task 4 work |
 | Tool/turn budget behavior | renewable slices and live cost visibility implemented in `DEV-725`; explicit headless turn/timeout gate on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before a silent over-budget turn; `DEV-725` turns the internal 256-call ceiling into a persisted checkpoint, restores tools inside the same durable run, and commits active-run cost so `--max-cost-usd` can cancel truthfully | Core-owned configurable token/dollar/turn outcomes across every front end |
+| Scoped workspace instructions | on `main` | `f8847d2` capability-loads root `AGENTS.md` with `CLAUDE.md` as an absence-only fallback, versions the completion prompt, and persists instruction provenance before provider work | Nested policy remains explicitly model-discovered through bounded tools |
+| Harbor baseline and failure taxonomy | implemented in `DEV-730` | Repository adapter converts durable per-turn traces to ATIF-v1.7 and passes Harbor 0.20.0 validation; the local smoke task resolves under Harbor; `cargo xtask eval` revision-stamps launches, hashes resolved job/trial locks, rejects mixed identity, and requires identifier-grounded primary categories before reporting | Run the credentialed fixed-model smoke and baseline; no paid public run is performed by repository tests |
+| Slash-invoked commands and skills | implemented in `DEV-731` | Shared runtime resolves explicit repository-local Markdown through the workspace capability, rejects unknown/colliding/oversized sources before provider work, and persists source/content/full-prompt/tool hashes | User-home, managed, and bundled roots stay deferred until explicit server-owned configuration preserves remote equivalence |
 
 The remaining P0 longevity contract is explicit: every accepted run must reach
 one durable terminal event; every imposed bound must produce a truthful outcome;
@@ -83,7 +86,7 @@ The remaining gaps are material:
 
 | Area | Current behavior | Consequence |
 | --- | --- | --- |
-| Evaluation export | `qq run` is durable, but ATIF conversion and the Harbor adapter are absent | Trials cannot yet be compared or replayed through the benchmark's standard artifact |
+| Evaluation export | `DEV-730` supplies the pinned Harbor adapter, ATIF validation fixtures, revision-stamped launcher, fixed-identity scorecard, and grounded failure taxonomy | A real fixed-model baseline still needs credentials, benchmark compute, and deliberate spend |
 | Streaming persistence | Each text batch reassembles the full context for capacity checks and grows SQLite strings by concatenation | Long output has structurally superlinear persistence work |
 | Reasoning persistence | Provider reasoning deltas commit independently rather than using text batching | High-effort models can create excessive transactions and queue pressure |
 | Store scheduling | The single worker always prefers control traffic; a full output queue is retried by polling every millisecond | Output can be delayed or starved under control load |
@@ -294,9 +297,12 @@ Do not hide a capability regression behind a cheaper average.
 
 Priority: P0. This is the critical-path vertical slice.
 
-Status: partially delivered by `f7b34a1`. The durable CLI, cancellation,
-budgets, JSONL stream, and exit mapping exist. Trial identity, ATIF conversion,
-Harbor integration, and the end-to-end evaluation gate remain.
+Status: implementation complete through `DEV-730`. The durable CLI,
+cancellation, budgets, JSONL stream, exit mapping, reproducible trial identity,
+Harbor adapter, local smoke task, ATIF conversion/validation, and evaluation
+report exist. The remaining operational gate is a deliberately authorized
+credentialed smoke and baseline; repository tests do not spend model credits
+or start a public benchmark run.
 
 ### Behavior
 

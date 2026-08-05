@@ -58,37 +58,37 @@ enum SlashAction {
 
 const SLASH_COMMANDS: [SlashCommand; 7] = [
     SlashCommand {
-        name: "/models",
+        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[0],
         description: "choose a model",
         action: SlashAction::Models,
     },
     SlashCommand {
-        name: "/sessions",
+        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[1],
         description: "open sessions",
         action: SlashAction::Sessions,
     },
     SlashCommand {
-        name: "/resume",
+        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[2],
         description: "open sessions",
         action: SlashAction::Sessions,
     },
     SlashCommand {
-        name: "/new",
+        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[3],
         description: "create a session",
         action: SlashAction::New,
     },
     SlashCommand {
-        name: "/compact",
+        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[4],
         description: "compact session context",
         action: SlashAction::Compact,
     },
     SlashCommand {
-        name: "/quit",
+        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[5],
         description: "exit QQ",
         action: SlashAction::Quit,
     },
     SlashCommand {
-        name: "/exit",
+        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[6],
         description: "exit QQ",
         action: SlashAction::Quit,
     },
@@ -759,7 +759,7 @@ impl App {
             // Run-level audit updates are not session state. In particular,
             // old persisted events may predate the authoritative session
             // field, so replaying one must not repopulate the meter.
-            SessionEvent::RunContextUpdated { .. } => {}
+            SessionEvent::ModelTurnCompleted { .. } | SessionEvent::RunContextUpdated { .. } => {}
             SessionEvent::SessionContextUpdated { context_tokens, .. } => {
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
                     session.summary.context_tokens = *context_tokens;
@@ -1742,29 +1742,19 @@ impl App {
         if prompt.is_empty() {
             return (false, Vec::new());
         }
-        // Composer commands: input starting with '/' is never sent to the
-        // model. The first token names the command; an unknown name shows a
-        // hint instead of becoming a prompt.
+        // Reserved composer commands stay client-side. Every other leading
+        // slash is submitted through the ordinary command path so the shared
+        // runtime can resolve an explicit command or skill consistently for
+        // direct, embedded, and remote clients.
         if prompt.starts_with('/') {
             let name = prompt.split_whitespace().next().unwrap_or(&prompt);
-            let Some(action) = SLASH_COMMANDS
+            if let Some(action) = SLASH_COMMANDS
                 .iter()
                 .find(|command| command.name == name)
                 .map(|command| command.action)
-            else {
-                self.set_warning(format!(
-                    "unknown command {name}; try {}",
-                    SLASH_COMMANDS
-                        .iter()
-                        .map(|command| command.name)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ));
-                self.composer.clear();
-                self.slash_selected = 0;
-                return (true, Vec::new());
-            };
-            return self.execute_slash_action(action);
+            {
+                return self.execute_slash_action(action);
+            }
         }
         let Some(session_id) = self.focused else {
             self.set_warning("create a session before sending a prompt".to_owned());
@@ -2738,24 +2728,28 @@ mod tests {
     }
 
     #[test]
-    fn unknown_slash_commands_hint_instead_of_prompting() {
+    fn runtime_slash_invocations_are_submitted_as_prompts() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
         app.composer.text = "/frobnicate the context".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(
-            requests.is_empty(),
-            "slash input must never become a prompt"
-        );
+        assert_eq!(requests.len(), 1);
+        let ClientRequest::Command(CommandRequest {
+            command:
+                SessionCommand::SubmitPrompt {
+                    session_id: _,
+                    prompt,
+                },
+            ..
+        }) = &requests[0]
+        else {
+            panic!("runtime slash invocation must use the ordinary prompt command")
+        };
+        assert_eq!(prompt, "/frobnicate the context");
         assert!(app.composer.text.is_empty());
-        let status = app.status.as_deref().unwrap();
-        assert!(
-            status.starts_with("unknown command /frobnicate"),
-            "{status}"
-        );
-        assert!(status.contains("/compact"), "{status}");
+        assert_eq!(app.status, None);
     }
 
     #[test]

@@ -1,24 +1,25 @@
 use std::path::Path;
 
-use qq_protocol::PromptVersion;
+use qq_protocol::{ContentHash, PromptVersion};
 use qq_provider::ToolSpec;
 
 use crate::{
     mcp::MCP_TOOL_PREFIX,
-    tools::{SPAWN_AGENT_TOOL, WorkspaceInstructions},
+    tools::{SPAWN_AGENT_TOOL, SelectedGuidance, WorkspaceInstructions},
 };
 
-pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(6) {
+pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(7) {
     Some(version) => version,
     None => panic!("agent prompt version must be nonzero"),
 };
 
-/// Version 6 of the base agent prompt. The text is versioned in code, not
+/// Version 7 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
 pub(crate) fn agent_system_prompt(
     workspace: &Path,
     specs: &[ToolSpec],
     workspace_instructions: &WorkspaceInstructions,
+    selected_guidance: Option<&SelectedGuidance>,
 ) -> String {
     let mut tool_names = String::new();
     let mut has_mcp = false;
@@ -79,5 +80,28 @@ pub(crate) fn agent_system_prompt(
         root = workspace.display(),
     );
     workspace_instructions.append_to_prompt(&mut prompt);
+    if let Some(guidance) = selected_guidance {
+        guidance.append_to_prompt(&mut prompt);
+    }
     prompt
+}
+
+pub(crate) fn tool_schema_hash(specs: &[ToolSpec]) -> ContentHash {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    for spec in specs {
+        for bytes in [spec.name().as_bytes(), spec.description().as_bytes()] {
+            digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+            digest.update(bytes);
+        }
+        let schema = spec.input_schema().to_string();
+        digest.update(
+            u64::try_from(schema.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        digest.update(schema.as_bytes());
+    }
+    ContentHash::from_bytes(digest.finalize().into())
 }

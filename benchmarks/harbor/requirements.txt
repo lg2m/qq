@@ -1,0 +1,2 @@
+# Pinned because Harbor's installed-agent and ATIF interfaces are evaluation contracts.
+harbor==0.20.0

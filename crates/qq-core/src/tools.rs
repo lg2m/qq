@@ -21,8 +21,12 @@ use tokio::{
     sync::{Semaphore, mpsc},
 };
 
+mod guidance;
 mod instructions;
 
+pub(crate) use guidance::{
+    GuidanceError, GuidanceRequest, ParsedInvocation, SelectedGuidance, parse_invocation,
+};
 #[cfg(test)]
 pub(crate) use instructions::test_pause_after_workspace_open;
 pub(crate) use instructions::{

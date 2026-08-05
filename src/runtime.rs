@@ -1361,13 +1361,20 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicU64, Ordering},
         },
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use futures_util::stream;
     use qq_auth::{CredentialPaths, KeyringBackend, KeyringError};
     use qq_config::{ConfigPaths, RuntimeOverrides};
+    use qq_protocol::{
+        CommandId, CommandOutcome, ModelSelection, RunId, RunPromptIdentity, RunStatus,
+        SessionCommand, SessionId, WorkspaceId,
+    };
+    use qq_provider::{ModelRequest, Provider, ProviderEvent, ProviderStream};
+    use qq_server::{ServerOptions, ServerPaths, StartOutcome};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1456,6 +1463,221 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    struct CapturingProvider {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for CapturingProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(stream::iter([
+                Ok(ProviderEvent::OutputTextDelta {
+                    text: "done".to_owned(),
+                }),
+                Ok(ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
+    struct FixedRuntimeLoader {
+        runtime: Arc<Runtime>,
+    }
+
+    impl RuntimeLoader for FixedRuntimeLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let runtime = Arc::clone(&self.runtime);
+            Box::pin(async move {
+                Ok(LoadedRuntime {
+                    runtime,
+                    pricing: None,
+                })
+            })
+        }
+    }
+
+    async fn completed_prompt_identity(
+        runtime: &SessionRuntime,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        run_id: RunId,
+    ) -> RunPromptIdentity {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = runtime
+                    .snapshot(SnapshotRequest {
+                        workspace_id,
+                        focused_session_id: Some(session_id),
+                        session_limit: 8,
+                        message_limit: 32,
+                    })
+                    .await
+                    .unwrap();
+                if let Some(run) = snapshot
+                    .focused
+                    .unwrap()
+                    .runs
+                    .into_iter()
+                    .find(|run| run.id == run_id)
+                    && run.status == RunStatus::Completed
+                {
+                    return *run.prompt_identity.unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_and_server_commands_resolve_identical_slash_guidance() {
+        let fixture = RuntimeFixture::new();
+        fs::create_dir_all(fixture.path("work/.qq/skills/review")).unwrap();
+        fs::write(
+            fixture.path("work/.qq/skills/review/SKILL.md"),
+            "Review cancellation and persistence invariants.\n",
+        )
+        .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model_runtime = Arc::new(
+            Runtime::new(
+                CapturingProvider {
+                    requests: Arc::clone(&requests),
+                },
+                "test/model",
+                256,
+            )
+            .unwrap(),
+        );
+        let durable = SessionRuntime::open(
+            SessionRuntimeOptions::new(fixture.path("sessions.sqlite3")),
+            Arc::new(FixedRuntimeLoader {
+                runtime: model_runtime,
+            }),
+        )
+        .await
+        .unwrap();
+        let handler = Arc::new(RuntimeHandler {
+            durable,
+            factory: fixture.factory(),
+        });
+        let resolved = handler
+            .sessions()
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: fixture.path("work").display().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let created = handler
+                .sessions()
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::CreateSession {
+                        workspace_id,
+                        parent_id: None,
+                        model: ModelSelection {
+                            model: Some("test/model".to_owned()),
+                            max_output_tokens: Some(256),
+                            organization: None,
+                        },
+                        approval_mode: qq_protocol::ApprovalMode::Ask,
+                    },
+                )
+                .await
+                .unwrap();
+            let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+                panic!("unexpected receipt")
+            };
+            sessions.push(session_id);
+        }
+
+        let direct = handler
+            .sessions()
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: sessions[0],
+                    prompt: "/review focus on cancellation".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: direct_run, ..
+        } = direct.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let direct_identity =
+            completed_prompt_identity(handler.sessions(), workspace_id, sessions[0], direct_run)
+                .await;
+
+        let server = match qq_server::start(
+            handler.clone(),
+            ServerOptions::new(ServerPaths::new(fixture.path("server"))),
+        )
+        .await
+        .unwrap()
+        {
+            StartOutcome::Started(server) => server,
+            StartOutcome::Existing(_) => panic!("test unexpectedly found a running server"),
+        };
+        let server_command = CommandRequest {
+            command_id: CommandId::generate().unwrap(),
+            command: SessionCommand::SubmitPrompt {
+                session_id: sessions[1],
+                prompt: "/review focus on cancellation".to_owned(),
+            },
+        };
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(server.connection().endpoint("/v1/sessions/prompts"))
+            .bearer_auth(server.connection().expose_bearer_token())
+            .json(&server_command)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let receipt = response
+            .json::<qq_protocol::CommandReceipt>()
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: server_run, ..
+        } = receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let server_identity =
+            completed_prompt_identity(handler.sessions(), workspace_id, sessions[1], server_run)
+                .await;
+
+        assert_eq!(direct_identity, server_identity);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].system(), requests[1].system());
+            assert!(
+                requests[0]
+                    .system()
+                    .unwrap()
+                    .contains("Review cancellation and persistence invariants.")
+            );
+        }
+        server.shutdown().await.unwrap();
+        handler.shutdown().await.unwrap();
     }
 
     #[tokio::test]
