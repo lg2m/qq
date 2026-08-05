@@ -1065,12 +1065,10 @@ path (`qq ask` and internal runtime tests):
 - `RunCommand { prompt }`
 - `RunEvent` — `started`, `output_text_delta`, `refusal_delta`, `usage`,
   `completed`, `failed`
-- `AskRequest` — prompt plus workspace/model fields for a one-shot ask style
-  API
 
-These types are not the TUI session protocol. Prefer the workspace/session
-routes for anything that must resume, approve tools, or share state across
-clients.
+These types are not persisted session state. `qq ask` consumes them entirely
+in-process; use the workspace/session routes or `qq run` for work that must be
+durable, resumable, approval-capable, or shared across clients.
 
 ## Size And Validation Bounds
 

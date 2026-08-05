@@ -8,10 +8,9 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use qq_protocol::{
-    AskRequest, AskValidationError, CommandId, CommandReceipt, CommandRequest, EventCursor,
-    LocalServerConnection, MAX_EVENT_BYTES, MAX_REQUEST_BYTES, ModelCatalogRequest,
-    ModelDescriptor, RunEvent, SessionCommand, SessionEventEnvelope, SnapshotRequest, WorkspaceId,
-    WorkspaceSnapshot, validate_ask_request,
+    CommandId, CommandReceipt, CommandRequest, EventCursor, LocalServerConnection, MAX_EVENT_BYTES,
+    MAX_REQUEST_BYTES, ModelCatalogRequest, ModelDescriptor, SessionCommand, SessionEventEnvelope,
+    SnapshotRequest, WorkspaceId, WorkspaceSnapshot,
 };
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -23,11 +22,10 @@ mod port;
 pub use interactive::TuiClient;
 pub use port::{ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState};
 
-const ASK_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
-const ERROR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_SSE_WIRE_EVENT_BYTES: usize = MAX_EVENT_BYTES + 16 * 1024;
 const MAX_SSE_LINE_BYTES: usize = MAX_SSE_WIRE_EVENT_BYTES;
@@ -37,9 +35,6 @@ const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 /// Authenticated coordinates discovered from private local metadata.
 pub type Connection = LocalServerConnection;
 
-/// Owned event stream returned by [`ask`].
-pub type RunEventStream =
-    Pin<Box<dyn Stream<Item = Result<RunEvent, ClientError>> + Send + 'static>>;
 pub type SessionEventStream =
     Pin<Box<dyn Stream<Item = Result<SessionEventEnvelope, ClientError>> + Send + 'static>>;
 
@@ -52,7 +47,7 @@ pub struct SessionClient {
 impl SessionClient {
     pub fn new(connection: Connection) -> Result<Self, ClientError> {
         let http = reqwest::Client::builder()
-            .connect_timeout(ASK_CONNECT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -317,117 +312,11 @@ async fn read_response_bounded(response: reqwest::Response, limit: usize) -> Res
     Ok(bytes)
 }
 
-/// Sends one request and returns an owned, incrementally decoded SSE stream.
-pub async fn ask(
-    connection: &Connection,
-    request: AskRequest,
-) -> Result<RunEventStream, ClientError> {
-    validate_ask_request(&request).map_err(ClientError::InvalidRequest)?;
-    let body = serde_json::to_vec(&request).map_err(|_| ClientError::InvalidRequestEncoding)?;
-    if body.len() > MAX_REQUEST_BYTES {
-        return Err(ClientError::RequestTooLarge);
-    }
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(ASK_CONNECT_TIMEOUT)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| ClientError::Unavailable)?;
-    let response = authorize(connection, client.post(connection.endpoint("/v1/ask")))
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "text/event-stream")
-        .body(body)
-        .send()
-        .await
-        .map_err(|_| ClientError::Unavailable)?;
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_ERROR_BODY_BYTES as u64)
-        {
-            return Err(ClientError::ErrorResponseTooLarge);
-        }
-        let bytes = tokio::time::timeout(
-            ERROR_RESPONSE_TIMEOUT,
-            read_response_bounded(response, MAX_ERROR_BODY_BYTES),
-        )
-        .await
-        .map_err(|_| ClientError::ErrorResponseUnavailable)?
-        .map_err(|()| ClientError::ErrorResponseTooLarge)?;
-        return Err(server_response_error(status, &bytes));
-    }
-    if !is_event_stream(response.headers().get(CONTENT_TYPE)) {
-        return Err(ClientError::UnexpectedContentType);
-    }
-
-    let output = stream! {
-        let mut chunks = response.bytes_stream();
-        let mut decoder = SseDecoder::<RunEvent>::default();
-        let mut terminal = false;
-
-        while let Some(chunk) = chunks.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(_) => {
-                    yield Err(ClientError::StreamTransport);
-                    return;
-                }
-            };
-            for byte in chunk {
-                match decoder.feed_byte(byte) {
-                    Ok(Some(decoded)) => {
-                        let event = decoded.event;
-                        if terminal {
-                            yield Err(ClientError::EventAfterTerminal);
-                            return;
-                        }
-                        terminal = is_terminal(&event);
-                        yield Ok(event);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                }
-            }
-        }
-
-        match decoder.finish() {
-            Ok(Some(decoded)) => {
-                let event = decoded.event;
-                if terminal {
-                    yield Err(ClientError::EventAfterTerminal);
-                    return;
-                }
-                terminal = is_terminal(&event);
-                yield Ok(event);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
-        }
-        if !terminal {
-            yield Err(ClientError::MissingTerminalEvent);
-        }
-    };
-    Ok(Box::pin(output))
-}
-
 fn is_event_stream(value: Option<&reqwest::header::HeaderValue>) -> bool {
     value
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-}
-
-const fn is_terminal(event: &RunEvent) -> bool {
-    matches!(event, RunEvent::Completed | RunEvent::Failed { .. })
 }
 
 #[derive(Debug)]
@@ -565,8 +454,6 @@ where
 pub enum ClientError {
     #[error("local server is unavailable")]
     Unavailable,
-    #[error("invalid request: {0}")]
-    InvalidRequest(#[source] AskValidationError),
     #[error("request cannot be encoded")]
     InvalidRequestEncoding,
     #[error("request exceeds the wire size limit")]
@@ -581,39 +468,28 @@ pub enum ClientError {
     ServerResponse { status: u16 },
     #[error("local server rejected the request ({status}): {message}")]
     ServerMessage { status: u16, message: String },
-    #[error("local server error response exceeds the size limit")]
-    ErrorResponseTooLarge,
-    #[error("local server error response did not finish in time")]
-    ErrorResponseUnavailable,
     #[error("local server returned an unexpected content type")]
     UnexpectedContentType,
     #[error("local server stream failed")]
     StreamTransport,
     #[error("local server returned malformed SSE")]
     MalformedSse,
-    #[error("local server returned a malformed run event")]
+    #[error("local server returned a malformed event")]
     MalformedEvent,
     #[error("local server event exceeds the wire size limit")]
     EventTooLarge,
-    #[error("local server stream ended without a terminal event")]
-    MissingTerminalEvent,
-    #[error("local server sent data after a terminal event")]
-    EventAfterTerminal,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
 
     use qq_protocol::{
         CommandOutcome, EventCursor, ModelSelection, PROTOCOL_VERSION, ServerInfo, SessionId,
         StoreId,
     };
     use qq_server::{
-        AskHandler, CommandFuture, ModelsFuture, ServerHandle, ServerOptions, ServerPaths,
+        CommandFuture, ModelsFuture, ServerHandle, ServerHandler, ServerOptions, ServerPaths,
         StartOutcome,
     };
     use tempfile::TempDir;
@@ -623,7 +499,7 @@ mod tests {
 
     struct CatalogHandler;
 
-    impl AskHandler for CatalogHandler {
+    impl ServerHandler for CatalogHandler {
         fn models(&self, request: ModelCatalogRequest) -> ModelsFuture {
             Box::pin(async move {
                 Ok(vec![ModelDescriptor {
@@ -641,7 +517,7 @@ mod tests {
         commands: Arc<Mutex<Vec<CommandRequest>>>,
     }
 
-    impl AskHandler for CommandEchoHandler {
+    impl ServerHandler for CommandEchoHandler {
         fn command(&self, request: CommandRequest) -> CommandFuture {
             self.commands.lock().unwrap().push(request.clone());
             Box::pin(async move {
@@ -660,7 +536,7 @@ mod tests {
         }
     }
 
-    async fn start_test_server(handler: Arc<dyn AskHandler>) -> (TempDir, ServerHandle) {
+    async fn start_test_server(handler: Arc<dyn ServerHandler>) -> (TempDir, ServerHandle) {
         let directory = tempfile::tempdir().unwrap();
         let paths = ServerPaths::new(directory.path().join("state"));
         let server = match qq_server::start(handler, ServerOptions::new(paths))
@@ -768,22 +644,30 @@ mod tests {
         )
         .unwrap();
 
-        let error = match ask(
-            &connection,
-            AskRequest::new("hello", PathBuf::from("/test/workspace")),
-        )
-        .await
-        {
-            Ok(_) => panic!("oversized error response should fail"),
-            Err(error) => error,
-        };
+        let client = SessionClient::new(connection).unwrap();
+        let error = client
+            .command(
+                CommandId::from_bytes([9; 16]),
+                SessionCommand::DeleteSession {
+                    session_id: SessionId::from_bytes([3; 16]),
+                },
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(error, ClientError::ErrorResponseTooLarge);
+        assert_eq!(error, ClientError::ResponseTooLarge);
         raw_server.await.unwrap();
     }
 
-    fn decode_fragments(fragments: &[&[u8]]) -> Result<Vec<RunEvent>, ClientError> {
-        let mut decoder = SseDecoder::<RunEvent>::default();
+    #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+    #[serde(rename_all = "snake_case", tag = "type")]
+    enum TestEvent {
+        Started,
+        Completed,
+    }
+
+    fn decode_fragments(fragments: &[&[u8]]) -> Result<Vec<TestEvent>, ClientError> {
+        let mut decoder = SseDecoder::<TestEvent>::default();
         let mut events = Vec::new();
         for fragment in fragments {
             for byte in *fragment {
@@ -810,14 +694,14 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(events, vec![RunEvent::Started, RunEvent::Completed]);
+        assert_eq!(events, vec![TestEvent::Started, TestEvent::Completed]);
     }
 
     #[test]
     fn accepts_a_final_event_without_a_blank_line() {
         let events = decode_fragments(&[b"data: {\"type\":\"completed\"}"]).unwrap();
 
-        assert_eq!(events, vec![RunEvent::Completed]);
+        assert_eq!(events, vec![TestEvent::Completed]);
     }
 
     #[test]
@@ -830,7 +714,7 @@ mod tests {
 
     #[test]
     fn bounds_sse_lines_and_events() {
-        let mut decoder = SseDecoder::<RunEvent>::default();
+        let mut decoder = SseDecoder::<TestEvent>::default();
         for _ in 0..MAX_SSE_LINE_BYTES {
             decoder.feed_byte(b'x').unwrap();
         }
@@ -840,7 +724,7 @@ mod tests {
             ClientError::EventTooLarge
         );
 
-        let mut decoder = SseDecoder::<RunEvent> {
+        let mut decoder = SseDecoder::<TestEvent> {
             event_bytes: MAX_SSE_WIRE_EVENT_BYTES,
             ..SseDecoder::default()
         };

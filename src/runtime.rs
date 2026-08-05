@@ -26,7 +26,7 @@ use qq_provider::{
     BedrockAuth as ProviderBedrockAuth, EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe,
     ProviderCompiler, ProviderError, ProviderRecipe,
 };
-use qq_server::{AskHandler, AskHandlerError, CommandFuture, ModelsFuture, SnapshotFuture};
+use qq_server::{CommandFuture, ModelsFuture, ServerHandler, ServerHandlerError, SnapshotFuture};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -1106,7 +1106,7 @@ impl RuntimeHandler {
     }
 }
 
-impl AskHandler for RuntimeHandler {
+impl ServerHandler for RuntimeHandler {
     fn command(&self, request: CommandRequest) -> CommandFuture {
         let runtime = self.durable.clone();
         Box::pin(async move {
@@ -1132,24 +1132,27 @@ impl AskHandler for RuntimeHandler {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || factory.models_for(&request))
                 .await
-                .map_err(|_| AskHandlerError::Internal)?
+                .map_err(|_| ServerHandlerError::Internal)?
                 .map_err(|error| match error.failure_kind() {
                     RunFailureKind::Configuration | RunFailureKind::Policy => {
-                        AskHandlerError::InvalidRequest(error.to_string())
+                        ServerHandlerError::InvalidRequest(error.to_string())
                     }
-                    _ => AskHandlerError::Internal,
+                    _ => ServerHandlerError::Internal,
                 })
         })
     }
 
-    fn subscribe(&self, request: SubscribeRequest) -> Result<SessionEventStream, AskHandlerError> {
+    fn subscribe(
+        &self,
+        request: SubscribeRequest,
+    ) -> Result<SessionEventStream, ServerHandlerError> {
         self.durable
             .subscribe(request)
             .map_err(map_session_runtime_error)
     }
 }
 
-fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
+fn map_session_runtime_error(error: SessionRuntimeError) -> ServerHandlerError {
     match error {
         error @ (SessionRuntimeError::EmptyWorkspace
         | SessionRuntimeError::InvalidWorkspace
@@ -1170,19 +1173,19 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> AskHandlerError {
         | SessionRuntimeError::CursorStoreMismatch
         | SessionRuntimeError::CursorWorkspaceMismatch
         | SessionRuntimeError::InvalidPageLimit) => {
-            AskHandlerError::InvalidRequest(error.to_string())
+            ServerHandlerError::InvalidRequest(error.to_string())
         }
         SessionRuntimeError::QueueFull
         | SessionRuntimeError::WorkspaceLimitReached
         | SessionRuntimeError::SessionLimitReached
         | SessionRuntimeError::CommandLimitReached
-        | SessionRuntimeError::Overloaded => AskHandlerError::Unavailable,
+        | SessionRuntimeError::Overloaded => ServerHandlerError::Unavailable,
         SessionRuntimeError::InvalidRunLimit
         | SessionRuntimeError::OutputTooLarge
         | SessionRuntimeError::AccountingUnavailable
         | SessionRuntimeError::ShutdownTimedOut
         | SessionRuntimeError::Unavailable
-        | SessionRuntimeError::Persistence => AskHandlerError::Internal,
+        | SessionRuntimeError::Persistence => ServerHandlerError::Internal,
     }
 }
 

@@ -2,8 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 mod ids;
@@ -13,8 +11,8 @@ mod sessions;
 
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
 pub use limits::{
-    AskValidationError, MAX_EVENT_BYTES, MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES,
-    MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES, validate_ask_request,
+    MAX_EVENT_BYTES, MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES,
+    MAX_WORKSPACE_BYTES,
 };
 pub use local::{LocalConnectionError, LocalServerConnection};
 pub use qq_reasoning::{ReasoningEvent, ReasoningKind};
@@ -117,36 +115,6 @@ pub enum RunFailureKind {
     ProviderApi,
     ProviderResponse,
     ProviderProtocol,
-}
-
-/// One prompt submitted to a QQ server, optionally within a session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AskRequest {
-    pub prompt: String,
-    pub workspace: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub organization: Option<String>,
-}
-
-impl AskRequest {
-    #[must_use]
-    pub fn new(prompt: impl Into<String>, workspace: PathBuf) -> Self {
-        Self {
-            prompt: prompt.into(),
-            workspace,
-            session_id: None,
-            model: None,
-            max_output_tokens: None,
-            organization: None,
-        }
-    }
 }
 
 /// Version information returned by the server health endpoint.

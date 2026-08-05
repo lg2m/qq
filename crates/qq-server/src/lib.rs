@@ -27,13 +27,12 @@ use axum::{
 };
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use qq_core::{RunStream, SessionEventStream};
+use qq_core::SessionEventStream;
 use qq_protocol::{
-    AskRequest, CommandReceipt, CommandRequest, LocalConnectionError, LocalServerConnection,
-    MAX_EVENT_BYTES, MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES,
-    MAX_WORKSPACE_BYTES, ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION, ServerInfo,
-    SessionCommand, SnapshotRequest, SubscribeRequest, WorkspaceId, WorkspaceSnapshot,
-    validate_ask_request,
+    CommandReceipt, CommandRequest, LocalConnectionError, LocalServerConnection, MAX_EVENT_BYTES,
+    MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES,
+    ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION, ServerInfo, SessionCommand,
+    SnapshotRequest, SubscribeRequest, WorkspaceId, WorkspaceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -61,53 +60,39 @@ const MAX_CONCURRENT_SESSION_REQUESTS: usize = 64;
 const MAX_CONCURRENT_SUBSCRIPTIONS: usize = 64;
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
-/// Future returned by [`AskHandler`].
-pub type AskFuture =
-    Pin<Box<dyn Future<Output = Result<RunStream, AskHandlerError>> + Send + 'static>>;
-
 pub type CommandFuture =
-    Pin<Box<dyn Future<Output = Result<CommandReceipt, AskHandlerError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<CommandReceipt, ServerHandlerError>> + Send + 'static>>;
 pub type SnapshotFuture =
-    Pin<Box<dyn Future<Output = Result<WorkspaceSnapshot, AskHandlerError>> + Send + 'static>>;
-pub type ModelsFuture =
-    Pin<Box<dyn Future<Output = Result<Vec<ModelDescriptor>, AskHandlerError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<WorkspaceSnapshot, ServerHandlerError>> + Send + 'static>>;
+pub type ModelsFuture = Pin<
+    Box<dyn Future<Output = Result<Vec<ModelDescriptor>, ServerHandlerError>> + Send + 'static>,
+>;
 
-/// Root-supplied application seam for handling one request.
-pub trait AskHandler: Send + Sync + 'static {
-    fn ask(&self, _request: AskRequest) -> AskFuture {
-        Box::pin(async { Err(AskHandlerError::Unavailable) })
-    }
-
+/// Root-supplied application seam for durable session requests.
+pub trait ServerHandler: Send + Sync + 'static {
     fn command(&self, _request: CommandRequest) -> CommandFuture {
-        Box::pin(async { Err(AskHandlerError::Unavailable) })
+        Box::pin(async { Err(ServerHandlerError::Unavailable) })
     }
 
     fn snapshot(&self, _request: SnapshotRequest) -> SnapshotFuture {
-        Box::pin(async { Err(AskHandlerError::Unavailable) })
+        Box::pin(async { Err(ServerHandlerError::Unavailable) })
     }
 
     fn models(&self, _request: ModelCatalogRequest) -> ModelsFuture {
-        Box::pin(async { Err(AskHandlerError::Unavailable) })
+        Box::pin(async { Err(ServerHandlerError::Unavailable) })
     }
 
-    fn subscribe(&self, _request: SubscribeRequest) -> Result<SessionEventStream, AskHandlerError> {
-        Err(AskHandlerError::Unavailable)
-    }
-}
-
-impl<F, Fut> AskHandler for F
-where
-    F: Fn(AskRequest) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<RunStream, AskHandlerError>> + Send + 'static,
-{
-    fn ask(&self, request: AskRequest) -> AskFuture {
-        Box::pin(self(request))
+    fn subscribe(
+        &self,
+        _request: SubscribeRequest,
+    ) -> Result<SessionEventStream, ServerHandlerError> {
+        Err(ServerHandlerError::Unavailable)
     }
 }
 
 /// Sanitized failures a root handler may return before streaming starts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum AskHandlerError {
+pub enum ServerHandlerError {
     #[error("{0}")]
     InvalidRequest(String),
     #[error("request service is unavailable")]
@@ -350,7 +335,7 @@ impl fmt::Debug for ServerReservation {
 impl ServerReservation {
     /// Starts serving with the handler constructed after ownership was won.
     #[must_use]
-    pub fn start(self, handler: Arc<dyn AskHandler>) -> ServerHandle {
+    pub fn start(self, handler: Arc<dyn ServerHandler>) -> ServerHandle {
         let Self {
             listener,
             connection,
@@ -452,7 +437,7 @@ impl Drop for ServerHandle {
 
 /// Starts the server or returns the authenticated connection for the existing instance.
 pub async fn start(
-    handler: Arc<dyn AskHandler>,
+    handler: Arc<dyn ServerHandler>,
     options: ServerOptions,
 ) -> Result<StartOutcome, ServerError> {
     match reserve(options).await? {
@@ -527,13 +512,13 @@ pub async fn reserve(options: ServerOptions) -> Result<ReserveOutcome, ServerErr
 
 #[derive(Clone)]
 struct AppState {
-    handler: Arc<dyn AskHandler>,
+    handler: Arc<dyn ServerHandler>,
     connection: ServerConnection,
     session_requests: Arc<Semaphore>,
     subscriptions: Arc<Semaphore>,
 }
 
-fn router(handler: Arc<dyn AskHandler>, connection: ServerConnection) -> Router {
+fn router(handler: Arc<dyn ServerHandler>, connection: ServerConnection) -> Router {
     let state = AppState {
         handler,
         connection,
@@ -587,59 +572,6 @@ fn authorized(headers: &HeaderMap, connection: &ServerConnection) -> bool {
 
 async fn health(State(state): State<AppState>) -> Json<ServerInfo> {
     Json(state.connection.server_info().clone())
-}
-
-#[allow(
-    dead_code,
-    reason = "the behavior-neutral extraction keeps the legacy one-shot handler unmounted"
-)]
-async fn ask(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Response {
-    let body = match body {
-        Ok(body) => body,
-        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
-    };
-    let request = match serde_json::from_slice::<AskRequest>(&body) {
-        Ok(request) => request,
-        Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
-    };
-    if let Err(error) = validate_ask_request(&request) {
-        return api_error(StatusCode::BAD_REQUEST, &error.to_string());
-    }
-
-    let events = match state.handler.ask(request).await {
-        Ok(events) => events,
-        Err(AskHandlerError::InvalidRequest(message)) => {
-            return api_error(StatusCode::BAD_REQUEST, &message);
-        }
-        Err(AskHandlerError::Unavailable) => {
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "request service is unavailable",
-            );
-        }
-        Err(AskHandlerError::Internal) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "request failed");
-        }
-    };
-
-    let output = stream! {
-        let mut events = events;
-        while let Some(event) = events.next().await {
-            let encoded = serde_json::to_string(&event)
-                .expect("RunEvent serialization cannot fail");
-            if encoded.len() > MAX_EVENT_BYTES {
-                return;
-            }
-            yield Ok::<Event, Infallible>(Event::default().data(encoded));
-        }
-    };
-    Sse::new(output)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        )
-        .into_response()
 }
 
 async fn resolve_workspace(
@@ -828,7 +760,7 @@ async fn models(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         {
             Json(models).into_response()
         }
-        Ok(_) => handler_error_response(AskHandlerError::Internal),
+        Ok(_) => handler_error_response(ServerHandlerError::Internal),
         Err(error) => handler_error_response(error),
     }
 }
@@ -893,14 +825,16 @@ async fn workspace_events(
         .into_response()
 }
 
-fn handler_error_response(error: AskHandlerError) -> Response {
+fn handler_error_response(error: ServerHandlerError) -> Response {
     match error {
-        AskHandlerError::InvalidRequest(message) => api_error(StatusCode::BAD_REQUEST, &message),
-        AskHandlerError::Unavailable => api_error(
+        ServerHandlerError::InvalidRequest(message) => api_error(StatusCode::BAD_REQUEST, &message),
+        ServerHandlerError::Unavailable => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "request service is unavailable",
         ),
-        AskHandlerError::Internal => api_error(StatusCode::INTERNAL_SERVER_ERROR, "request failed"),
+        ServerHandlerError::Internal => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "request failed")
+        }
     }
 }
 
@@ -1458,8 +1392,7 @@ mod tests {
 
     use futures_util::stream as futures_stream;
     use qq_protocol::{
-        CommandOutcome, EventCursor, RunEvent, SessionEvent, SessionEventEnvelope, SessionId,
-        StoreId,
+        CommandOutcome, EventCursor, SessionEvent, SessionEventEnvelope, SessionId, StoreId,
     };
 
     use super::*;
@@ -1500,26 +1433,23 @@ mod tests {
         }
     }
 
-    fn fake_handler(events: Vec<RunEvent>) -> (Arc<dyn AskHandler>, Arc<Mutex<Vec<AskRequest>>>) {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&requests);
-        let handler: Arc<dyn AskHandler> = Arc::new(move |request: AskRequest| {
-            captured.lock().unwrap().push(request);
-            let events = events.clone();
-            async move { Ok(Box::pin(futures_stream::iter(events)) as RunStream) }
-        });
-        (handler, requests)
+    struct UnavailableHandler;
+
+    impl ServerHandler for UnavailableHandler {}
+
+    fn unavailable_handler() -> Arc<dyn ServerHandler> {
+        Arc::new(UnavailableHandler)
     }
 
     struct HeldSubscriptionHandler {
         event: SessionEventEnvelope,
     }
 
-    impl AskHandler for HeldSubscriptionHandler {
+    impl ServerHandler for HeldSubscriptionHandler {
         fn subscribe(
             &self,
             _request: SubscribeRequest,
-        ) -> Result<SessionEventStream, AskHandlerError> {
+        ) -> Result<SessionEventStream, ServerHandlerError> {
             let events =
                 futures_stream::iter([Ok(self.event.clone())]).chain(futures_stream::pending());
             Ok(Box::pin(events))
@@ -1530,7 +1460,7 @@ mod tests {
         commands: Arc<Mutex<Vec<CommandRequest>>>,
     }
 
-    impl AskHandler for CommandCaptureHandler {
+    impl ServerHandler for CommandCaptureHandler {
         fn command(&self, request: CommandRequest) -> CommandFuture {
             let command_id = request.command_id;
             let outcome = match &request.command {
@@ -1541,7 +1471,7 @@ mod tests {
                 },
                 _ => {
                     return Box::pin(async {
-                        Err(AskHandlerError::InvalidRequest(
+                        Err(ServerHandlerError::InvalidRequest(
                             "unexpected command".to_owned(),
                         ))
                     });
@@ -1562,11 +1492,10 @@ mod tests {
         }
     }
 
-    fn test_request(prompt: &str) -> AskRequest {
-        AskRequest::new(prompt, PathBuf::from("/test/workspace"))
-    }
-
-    async fn start_test_server(paths: ServerPaths, handler: Arc<dyn AskHandler>) -> ServerHandle {
+    async fn start_test_server(
+        paths: ServerPaths,
+        handler: Arc<dyn ServerHandler>,
+    ) -> ServerHandle {
         match start(handler, ServerOptions::new(paths)).await.unwrap() {
             StartOutcome::Started(handle) => handle,
             StartOutcome::Existing(_) => panic!("test unexpectedly found an existing server"),
@@ -1576,7 +1505,7 @@ mod tests {
     #[tokio::test]
     async fn health_requires_the_metadata_token() {
         let directory = TestDirectory::new();
-        let (handler, requests) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let server = start_test_server(directory.paths(), handler).await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let health_url = server.connection().endpoint("/v1/health");
@@ -1616,7 +1545,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_route.status(), StatusCode::NOT_FOUND);
-        assert!(requests.lock().unwrap().is_empty());
 
         server.shutdown().await.unwrap();
     }
@@ -1624,7 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_ask_route_is_not_exposed() {
         let directory = TestDirectory::new();
-        let (handler, requests) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let server = start_test_server(directory.paths(), handler).await;
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -1632,13 +1560,11 @@ mod tests {
             .unwrap()
             .post(server.connection().endpoint("/v1/ask"))
             .bearer_auth(server.connection().expose_bearer_token())
-            .json(&test_request("say hello"))
             .send()
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(requests.lock().unwrap().is_empty());
         server.shutdown().await.unwrap();
     }
 
@@ -1646,7 +1572,7 @@ mod tests {
     async fn server_forwards_runtime_slash_invocations_without_client_semantics() {
         let directory = TestDirectory::new();
         let commands = Arc::new(Mutex::new(Vec::new()));
-        let handler: Arc<dyn AskHandler> = Arc::new(CommandCaptureHandler {
+        let handler: Arc<dyn ServerHandler> = Arc::new(CommandCaptureHandler {
             commands: Arc::clone(&commands),
         });
         let server = start_test_server(directory.paths(), handler).await;
@@ -1684,31 +1610,11 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn validates_session_identifiers() {
-        let mut request = test_request("hello");
-        request.session_id = Some("0123456789abcdef0123456789abcdef".to_owned());
-        assert_eq!(validate_ask_request(&request), Ok(()));
-
-        for invalid in [
-            "",
-            "0123456789abcdef",
-            "0123456789ABCDEF0123456789ABCDEF",
-            "0123456789abcdef0123456789abcdeg",
-        ] {
-            request.session_id = Some(invalid.to_owned());
-            assert_eq!(
-                validate_ask_request(&request),
-                Err(qq_protocol::AskValidationError::InvalidSessionId)
-            );
-        }
-    }
-
     #[tokio::test]
     async fn only_one_concurrent_start_wins() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
 
         let (left, right) = tokio::join!(
             start(Arc::clone(&handler), ServerOptions::new(paths.clone())),
@@ -1739,7 +1645,7 @@ mod tests {
     async fn detects_an_already_running_server() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let server = start_test_server(paths.clone(), Arc::clone(&handler)).await;
 
         let outcome = start(handler, ServerOptions::new(paths)).await.unwrap();
@@ -1755,7 +1661,7 @@ mod tests {
     async fn discovers_the_running_server_connection() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let server = start_test_server(paths.clone(), handler).await;
 
         assert_eq!(
@@ -1801,7 +1707,7 @@ mod tests {
             probe_health(&probe, &stale).await,
             Err(HealthProbeError::Unavailable)
         ));
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
 
         let server = start_test_server(paths.clone(), handler).await;
 
@@ -1847,7 +1753,7 @@ mod tests {
                 found,
             }) if expected == PROTOCOL_VERSION && found == PROTOCOL_VERSION + 1
         ));
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let error = start(handler, ServerOptions::new(paths)).await.unwrap_err();
         assert!(matches!(
             error,
@@ -1879,7 +1785,7 @@ mod tests {
     async fn graceful_shutdown_removes_owned_metadata_and_releases_the_lock() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let server = start_test_server(paths.clone(), handler).await;
         assert!(paths.metadata_file().is_file());
         assert!(read_connection(&paths).unwrap().is_some());
@@ -1951,7 +1857,7 @@ mod tests {
     async fn shutdown_does_not_remove_replaced_metadata() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let server = start_test_server(paths.clone(), handler).await;
         let replacement = ServerConnection::new(
             "127.0.0.1:10".parse().unwrap(),
@@ -1994,7 +1900,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_loopback_bind_addresses() {
         let directory = TestDirectory::new();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let options =
             ServerOptions::new(directory.paths()).with_bind_address("0.0.0.0:0".parse().unwrap());
 
@@ -2010,7 +1916,7 @@ mod tests {
 
         let directory = TestDirectory::new();
         let secure_paths = directory.child_paths("secure");
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         let server = start_test_server(secure_paths.clone(), handler).await;
         assert_eq!(
             fs::metadata(secure_paths.directory())
@@ -2037,7 +1943,7 @@ mod tests {
             fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         assert!(matches!(
             start(handler, ServerOptions::new(insecure_paths))
                 .await
@@ -2050,7 +1956,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
         symlink(&target, symlink_paths.directory()).unwrap();
-        let (handler, _) = fake_handler(vec![RunEvent::Completed]);
+        let handler = unavailable_handler();
         assert!(matches!(
             start(handler, ServerOptions::new(symlink_paths))
                 .await
