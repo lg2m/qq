@@ -1,36 +1,21 @@
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
-    collections::HashMap,
-    fmt::Write as _,
     io::{BufRead, BufReader, Cursor, Read, Take, Write as _},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak,
+        Arc, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use cap_std::fs::Dir;
 use qq_provider::ToolSpec;
 use serde::Deserialize;
 use serde_json::json;
-use thiserror::Error;
-use tokio::{
-    io::AsyncReadExt,
-    sync::{Semaphore, mpsc},
-};
+use tokio::{io::AsyncReadExt, sync::mpsc};
 
-mod guidance;
-mod instructions;
-
-pub(crate) use guidance::{
-    GuidanceError, GuidanceRequest, ParsedInvocation, SelectedGuidance, parse_invocation,
-};
-#[cfg(test)]
-pub(crate) use instructions::test_pause_after_workspace_open;
-pub(crate) use instructions::{
-    WorkspaceInstructions, WorkspacePreparationError, prepare_workspace,
+use crate::workspace::{
+    FileState, FileStateUpdate, Workspace, blocking_permits, content_hash, stale_file_error,
 };
 
 pub(crate) const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
@@ -50,7 +35,6 @@ const MAX_SEARCH_ENTRIES: usize = 20_000;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_FILES: usize = 10_000;
 const MAX_SEARCH_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_BLOCKING_TOOL_TASKS: usize = 8;
 /// Combined stdout+stderr retained for one shell call: the first half of this
 /// budget is kept from the head of the output and the second half from the
 /// tail, with an explicit omission marker between them.
@@ -61,132 +45,11 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 /// How often a running shell command re-checks the cancellation flag.
 const SHELL_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const TRUNCATION_MARKER: &str = "\n...[truncated by qq]\n";
-static BLOCKING_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-/// One apply lock per canonical workspace path, shared by every session in
-/// this process; entries are pruned once no workspace handle keeps them alive.
-static APPLY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<StdMutex<()>>>>> = OnceLock::new();
 static TEMP_FILE_ORDINAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static TEST_EXECUTIONS_STARTED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static TEST_EXECUTION_BARRIER: OnceLock<std::sync::Barrier> = OnceLock::new();
-
-#[derive(Clone)]
-pub(crate) struct Workspace {
-    root: Arc<Dir>,
-    path: Arc<PathBuf>,
-    /// Serializes the hash-check-and-rename apply section for this workspace.
-    apply_lock: Arc<StdMutex<()>>,
-}
-
-impl Workspace {
-    pub(crate) fn open(path: &Path) -> Result<Self, std::io::Error> {
-        if !path.is_absolute() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "workspace path must be absolute",
-            ));
-        }
-        let components = path
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(component) => Some(Ok(component)),
-                std::path::Component::Prefix(_) | std::path::Component::RootDir => None,
-                std::path::Component::CurDir | std::path::Component::ParentDir => {
-                    Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "workspace path must be canonical",
-                    )))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut anchor = path.to_owned();
-        for _ in &components {
-            anchor.pop();
-        }
-        let mut root = cap_primitives::fs::open_ambient_dir(&anchor, cap_std::ambient_authority())?;
-        for component in components {
-            root = cap_primitives::fs::open_dir_nofollow(&root, Path::new(component))?;
-        }
-
-        Ok(Self {
-            root: Arc::new(Dir::from_std_file(root)),
-            apply_lock: apply_lock(path),
-            path: Arc::new(path.to_owned()),
-        })
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-fn apply_lock(path: &Path) -> Arc<StdMutex<()>> {
-    let registry = APPLY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut locks = registry.lock().unwrap_or_else(PoisonError::into_inner);
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(StdMutex::new(()));
-    locks.insert(path.to_owned(), Arc::downgrade(&lock));
-    lock
-}
-
-/// Content hashes for every workspace file one session has read, keyed by
-/// canonical workspace-relative path. `read_file` records into it on each
-/// successful read, applied edits refresh it, and a future `@` file
-/// attachment records through the same [`FileState::record`] seam so pinned
-/// files satisfy the read-before-write rule without a redundant read.
-#[derive(Default)]
-pub(crate) struct FileState {
-    entries: StdMutex<HashMap<String, String>>,
-}
-
-impl FileState {
-    pub(crate) fn with_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            entries: StdMutex::new(entries.into_iter().collect()),
-        }
-    }
-
-    pub(crate) fn record(&self, path: String, hash: String) {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(path, hash);
-    }
-
-    fn recorded(&self, path: &str) -> Option<String> {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(path)
-            .cloned()
-    }
-}
-
-/// A file-state map entry produced by a successful tool execution, carried on
-/// the tool result so session persistence can record it durably.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileStateUpdate {
-    pub(crate) path: String,
-    pub(crate) hash: String,
-}
-
-fn content_hash(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut hash = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(hash, "{byte:02x}");
-    }
-    hash
-}
-
-fn blocking_permits() -> Arc<Semaphore> {
-    Arc::clone(BLOCKING_PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_BLOCKING_TOOL_TASKS))))
-}
 
 #[derive(Clone, Copy)]
 enum BuiltInTool {
@@ -683,14 +546,14 @@ fn read_file(
     if arguments.limit == 0 || arguments.limit > MAX_READ_LINES {
         return ToolExecutionResult::error(format!("limit must be between 1 and {MAX_READ_LINES}"));
     }
-    let path = match contained_path(workspace, &arguments.path) {
+    let path = match workspace.contained_path(&arguments.path) {
         Ok(path) => path,
         Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
-    if !workspace.root.is_file(&path) {
+    if !workspace.root().is_file(&path) {
         return ToolExecutionResult::error("path is not a file");
     }
-    let file = match workspace.root.open(&path) {
+    let file = match workspace.root().open(&path) {
         Ok(file) => file,
         Err(error) => return ToolExecutionResult::error(format!("could not open file: {error}")),
     };
@@ -786,11 +649,11 @@ fn edit_file(
             "old_string and new_string are identical; there is nothing to change",
         );
     }
-    let path = match contained_path(workspace, &arguments.path) {
+    let path = match workspace.contained_path(&arguments.path) {
         Ok(path) => path,
         Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
-    if !workspace.root.is_file(&path) {
+    if !workspace.root().is_file(&path) {
         return ToolExecutionResult::error("path is not a file");
     }
     let key = path.to_string_lossy().into_owned();
@@ -804,7 +667,7 @@ fn edit_file(
     // The exclusive apply section: re-hash, validate, and rename while no
     // other session can interleave a write to this workspace.
     let guard = workspace
-        .apply_lock
+        .apply_lock()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let current = match read_editable(workspace, &path) {
@@ -885,10 +748,10 @@ fn write_file(
     let key = path.to_string_lossy().into_owned();
 
     let guard = workspace
-        .apply_lock
+        .apply_lock()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let created = match workspace.root.symlink_metadata(&path) {
+    let created = match workspace.root().symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => {
             // Overwrites follow the same read-before-write and staleness
             // rules as edits; only brand-new files are exempt.
@@ -945,10 +808,6 @@ fn write_file(
     result
 }
 
-fn stale_file_error(path: &str) -> String {
-    format!("{path} changed since it was last read in this session; read it again and retry")
-}
-
 struct EditableFile {
     bytes: Vec<u8>,
     permissions: cap_std::fs::Permissions,
@@ -956,7 +815,7 @@ struct EditableFile {
 
 fn read_editable(workspace: &Workspace, path: &Path) -> Result<EditableFile, String> {
     let file = workspace
-        .root
+        .root()
         .open(path)
         .map_err(|error| format!("could not open file: {error}"))?;
     let metadata = file
@@ -988,7 +847,7 @@ fn read_editable(workspace: &Workspace, path: &Path) -> Result<EditableFile, Str
 /// resolves through the same containment as every other tool, and a new file
 /// resolves its parent directory and re-attaches the final component.
 fn resolve_write_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, String> {
-    let resolve_error = match contained_path(workspace, requested) {
+    let resolve_error = match workspace.contained_path(requested) {
         Ok(path) => return Ok(path),
         Err(error) => error.to_string(),
     };
@@ -1003,9 +862,10 @@ fn resolve_write_path(workspace: &Workspace, requested: &str) -> Result<PathBuf,
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_string_lossy().into_owned(),
         _ => ".".to_owned(),
     };
-    let parent = contained_path(workspace, &parent)
+    let parent = workspace
+        .contained_path(&parent)
         .map_err(|error| format!("parent directory could not be resolved: {error}"))?;
-    if !workspace.root.is_dir(&parent) {
+    if !workspace.root().is_dir(&parent) {
         return Err("parent path is not a directory".to_owned());
     }
     if parent.as_os_str().is_empty() || parent == Path::new(".") {
@@ -1036,7 +896,7 @@ fn apply_atomically(
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     let mut temp = workspace
-        .root
+        .root()
         .open_with(&temp_path, &options)
         .map_err(|error| format!("could not create a temporary file: {error}"))?;
     let written = temp
@@ -1047,19 +907,19 @@ fn apply_atomically(
     let applied = written
         .and_then(|()| match permissions {
             Some(permissions) => workspace
-                .root
+                .root()
                 .set_permissions(&temp_path, permissions)
                 .map_err(|error| format!("could not preserve file permissions: {error}")),
             None => Ok(()),
         })
         .and_then(|()| {
             workspace
-                .root
-                .rename(&temp_path, &workspace.root, path)
+                .root()
+                .rename(&temp_path, workspace.root(), path)
                 .map_err(|error| format!("could not apply the change: {error}"))
         });
     if applied.is_err() {
-        let _ = workspace.root.remove_file(&temp_path);
+        let _ = workspace.root().remove_file(&temp_path);
     }
     applied
 }
@@ -1074,14 +934,14 @@ fn list_dir(
             "limit must be between 1 and {MAX_DIRECTORY_ENTRIES}"
         ));
     }
-    let path = match contained_path(workspace, &arguments.path) {
+    let path = match workspace.contained_path(&arguments.path) {
         Ok(path) => path,
         Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
-    if !workspace.root.is_dir(&path) {
+    if !workspace.root().is_dir(&path) {
         return ToolExecutionResult::error("path is not a directory");
     }
-    let read_dir = match workspace.root.read_dir(&path) {
+    let read_dir = match workspace.root().read_dir(&path) {
         Ok(entries) => entries,
         Err(error) => {
             return ToolExecutionResult::error(format!("could not list directory: {error}"));
@@ -1139,7 +999,7 @@ fn search(
     if arguments.query.is_empty() || arguments.query.len() > 1_024 {
         return ToolExecutionResult::error("query must contain between 1 and 1024 bytes");
     }
-    let root = match contained_path(workspace, &arguments.path) {
+    let root = match workspace.contained_path(&arguments.path) {
         Ok(path) => path,
         Err(error) => return ToolExecutionResult::error(error.to_string()),
     };
@@ -1167,7 +1027,7 @@ fn search(
             break;
         }
         visited_entries += 1;
-        let metadata = match workspace.root.symlink_metadata(&path) {
+        let metadata = match workspace.root().symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
                 return ToolExecutionResult::error(format!(
@@ -1180,7 +1040,7 @@ fn search(
             continue;
         }
         if metadata.is_dir() {
-            let entries = match workspace.root.read_dir(&path) {
+            let entries = match workspace.root().read_dir(&path) {
                 Ok(entries) => entries,
                 Err(error) => {
                     return ToolExecutionResult::error(format!(
@@ -1246,7 +1106,7 @@ fn search(
             bounded = true;
             break;
         }
-        let file = match workspace.root.open(&path) {
+        let file = match workspace.root().open(&path) {
             Ok(file) => file,
             Err(error) => {
                 return ToolExecutionResult::error(format!(
@@ -1363,11 +1223,11 @@ async fn run_shell(
     let cwd = match &arguments.cwd {
         None => workspace.path().to_owned(),
         Some(requested) => {
-            let relative = match contained_path(workspace, requested) {
+            let relative = match workspace.contained_path(requested) {
                 Ok(relative) => relative,
                 Err(error) => return ToolExecutionResult::error(error.to_string()),
             };
-            if !workspace.root.is_dir(&relative) {
+            if !workspace.root().is_dir(&relative) {
                 return ToolExecutionResult::error("cwd is not a directory");
             }
             workspace.path().join(relative)
@@ -1644,43 +1504,6 @@ impl BoundedCapture {
             String::from_utf8_lossy(&tail),
         )
     }
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum WorkspacePathError {
-    #[error("path must not be empty")]
-    Empty,
-    #[error("path must be relative to the workspace")]
-    Absolute,
-    #[error("path could not be resolved: {source}")]
-    Resolve {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("path escapes the workspace")]
-    Escape,
-}
-
-fn contained_path(workspace: &Workspace, requested: &str) -> Result<PathBuf, WorkspacePathError> {
-    if requested.is_empty() {
-        return Err(WorkspacePathError::Empty);
-    }
-    let requested = Path::new(requested);
-    if requested.is_absolute() {
-        return Err(WorkspacePathError::Absolute);
-    }
-    let canonical = workspace
-        .root
-        .canonicalize(requested)
-        .map_err(|source| WorkspacePathError::Resolve { source })?;
-    if canonical.is_absolute()
-        || canonical
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(WorkspacePathError::Escape);
-    }
-    Ok(canonical)
 }
 
 /// The size of `byte` once serde_json escapes it inside a JSON string.

@@ -4,7 +4,7 @@ use qq_protocol::{
 };
 use qq_provider::Message;
 
-use crate::tools::FileStateUpdate;
+use crate::workspace::FileStateUpdate;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RuntimeEvent {

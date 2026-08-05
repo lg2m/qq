@@ -11,7 +11,7 @@ use qq_provider::{ContentBlock, Message, Role};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{Workspace, WorkspacePathError, contained_path};
+use super::{Workspace, WorkspacePathError};
 
 const MAX_NAME_BYTES: usize = 64;
 const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
@@ -220,18 +220,20 @@ pub(crate) fn load(
     if cancelled.load(Ordering::Acquire) {
         return Err(GuidanceError::Cancelled);
     }
-    let resolved =
-        contained_path(workspace, &candidate.path).map_err(|source| GuidanceError::Resolve {
+    let resolved = workspace
+        .contained_path(&candidate.path)
+        .map_err(|source| GuidanceError::Resolve {
             path: candidate.path.clone(),
             source,
         })?;
-    let metadata = workspace
-        .root
-        .metadata(&resolved)
-        .map_err(|source| GuidanceError::Inspect {
-            path: candidate.path.clone(),
-            source,
-        })?;
+    let metadata =
+        workspace
+            .root()
+            .metadata(&resolved)
+            .map_err(|source| GuidanceError::Inspect {
+                path: candidate.path.clone(),
+                source,
+            })?;
     if !metadata.is_file() {
         return Err(GuidanceError::NotAFile {
             path: candidate.path.clone(),
@@ -245,7 +247,7 @@ pub(crate) fn load(
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
     workspace
-        .root
+        .root()
         .open(&resolved)
         .map_err(|source| GuidanceError::Read {
             path: candidate.path.clone(),
@@ -306,7 +308,7 @@ fn existing_candidates<'a>(
 ) -> Result<Vec<&'a Candidate>, GuidanceError> {
     let mut matches = Vec::new();
     for candidate in candidates {
-        match workspace.root.symlink_metadata(&candidate.path) {
+        match workspace.root().symlink_metadata(&candidate.path) {
             Ok(_) => matches.push(candidate),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(source) => {

@@ -35,7 +35,7 @@ use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
 use crate::{
     GateDecision, RunCapabilities, Runtime, RuntimeEvent, RuntimeToolCall, SpawnAgentFuture,
     SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, approval,
-    tools::{FileState, FileStateUpdate},
+    workspace::{FileState, FileStateUpdate},
 };
 
 const CONTROL_QUEUE_CAPACITY: usize = 256;
@@ -16382,16 +16382,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_mode_applies_edits_without_prompting_and_file_state_survives_runs() {
+    async fn file_state_survives_restart_and_auto_mode_applies_the_edit_without_prompting() {
         let mut harness = scripted_runs_harness(
             ApprovalMode::Auto,
-            vec![
-                vec![("read_file", r#"{"path":"note.txt"}"#.to_owned())],
-                vec![(
-                    "edit_file",
-                    r#"{"path":"note.txt","old_string":"hello","new_string":"goodbye"}"#.to_owned(),
-                )],
-            ],
+            vec![vec![("read_file", r#"{"path":"note.txt"}"#.to_owned())]],
         )
         .await;
         let note = harness.workspace_path.join("note.txt");
@@ -16404,11 +16398,55 @@ mod tests {
             SessionEvent::ToolCallFinished { tool_call }
                 if tool_call.name == "read_file" && tool_call.state == ToolCallState::Completed
         )));
+        let after = first.last().unwrap().cursor;
+        let ScriptedRunsHarness {
+            _directory,
+            runtime,
+            workspace_path,
+            workspace_id,
+            session_id,
+            ..
+        } = harness;
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
 
-        // The second run edits without re-reading: the read-before-write rule
-        // is satisfied by the durable file-state map recorded by run one.
-        submit_prompt(&harness, "now edit it").await;
-        let second = collect_through_finished(&mut harness.events).await;
+        let reopened = SessionRuntime::open(
+            SessionRuntimeOptions::new(workspace_path.join("sessions.sqlite3")),
+            Arc::new(ScriptedRunsLoader {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                runs: vec![vec![(
+                    "edit_file",
+                    r#"{"path":"note.txt","old_string":"hello","new_string":"goodbye"}"#.to_owned(),
+                )]],
+                loads: StdMutex::new(0),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = reopened
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after,
+            })
+            .unwrap();
+
+        // The restarted runtime edits without re-reading: the read-before-write
+        // rule is satisfied by the durable file-state map recorded by run one.
+        let queued = reopened
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "now edit it".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            queued.outcome,
+            CommandOutcome::PromptQueued { .. }
+        ));
+        let second = collect_through_finished(&mut events).await;
         assert!(
             !second
                 .iter()
@@ -16421,6 +16459,8 @@ mod tests {
                 if tool_call.name == "edit_file" && tool_call.state == ToolCallState::Completed
         )));
         assert_eq!(std::fs::read_to_string(&note).unwrap(), "goodbye\n");
+        reopened.shutdown().await.unwrap();
+        drop(_directory);
     }
 
     #[tokio::test]

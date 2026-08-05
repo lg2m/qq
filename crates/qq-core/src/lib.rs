@@ -30,6 +30,7 @@ mod mcp;
 mod runtime;
 mod sessions;
 mod tools;
+mod workspace;
 
 pub use runtime::TurnRetryPolicy;
 use runtime::{
@@ -264,7 +265,7 @@ impl Runtime {
                 mode: ApprovalMode::Ask,
                 grants,
             }),
-            Arc::new(tools::FileState::default()),
+            Arc::new(workspace::FileState::default()),
         )
     }
 
@@ -274,7 +275,7 @@ impl Runtime {
         workspace: PathBuf,
         cancelled: Arc<AtomicBool>,
         gate: Arc<dyn ToolGate>,
-        file_state: Arc<tools::FileState>,
+        file_state: Arc<workspace::FileState>,
     ) -> RuntimeStream {
         self.run_loop_with_spawner(
             messages,
@@ -292,7 +293,7 @@ impl Runtime {
         workspace: PathBuf,
         cancelled: Arc<AtomicBool>,
         gate: Arc<dyn ToolGate>,
-        file_state: Arc<tools::FileState>,
+        file_state: Arc<workspace::FileState>,
         capabilities: RunCapabilities,
     ) -> RuntimeStream {
         let provider = Arc::clone(&self.provider);
@@ -319,9 +320,9 @@ impl Runtime {
             }
 
             let parsed_invocation = match if allow_guidance && !slash_is_literal {
-                tools::parse_invocation(&mut messages)
+                workspace::parse_invocation(&mut messages)
             } else {
-                Ok(tools::ParsedInvocation {
+                Ok(workspace::ParsedInvocation {
                     guidance: None,
                 })
             } {
@@ -335,7 +336,7 @@ impl Runtime {
                 }
             };
 
-            let (workspace, workspace_instructions, selected_guidance) = match tools::prepare_workspace(
+            let (workspace, workspace_instructions, selected_guidance) = match workspace::prepare_workspace(
                 workspace,
                 Arc::clone(&cancelled),
                 parsed_invocation.guidance,
@@ -343,15 +344,15 @@ impl Runtime {
             .await
             {
                 Ok(prepared) => prepared,
-                Err(error @ (tools::WorkspacePreparationError::Canonicalize { .. }
-                    | tools::WorkspacePreparationError::Open { .. })) => {
+                Err(error @ (workspace::WorkspacePreparationError::Canonicalize { .. }
+                    | workspace::WorkspacePreparationError::Open { .. })) => {
                     yield RuntimeEvent::Failed {
                         kind: RunFailureKind::InvalidCommand,
                         message: format!("could not open the workspace directory: {error}"),
                     };
                     return;
                 }
-                Err(tools::WorkspacePreparationError::Guidance(error)) => {
+                Err(workspace::WorkspacePreparationError::Guidance(error)) => {
                     yield RuntimeEvent::Failed {
                         kind: RunFailureKind::InvalidCommand,
                         message: error.to_string(),
@@ -1707,7 +1708,7 @@ mod tests {
                 directory.path().to_owned(),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AllowAllGate),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;
@@ -1836,7 +1837,7 @@ mod tests {
         .unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let run_cancelled = Arc::clone(&cancelled);
-        let pause = tools::test_pause_after_workspace_open(&cancelled);
+        let pause = workspace::test_pause_after_workspace_open(&cancelled);
         let task = tokio::spawn(async move {
             runtime
                 .run_loop(
@@ -1844,7 +1845,7 @@ mod tests {
                     directory.path().to_owned(),
                     run_cancelled,
                     Arc::new(ExecuteGate),
-                    Arc::new(tools::FileState::default()),
+                    Arc::new(workspace::FileState::default()),
                 )
                 .collect::<Vec<_>>()
                 .await
@@ -2265,12 +2266,12 @@ mod tests {
             ] if content == "slow" && second_content == "fast"
         ));
 
-        let workspace = tools::Workspace::open(directory.path()).unwrap();
+        let workspace = workspace::Workspace::open(directory.path()).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let started = tools::test_executions_started();
         let execution = tokio::spawn(tools::execute(
             workspace,
-            Arc::new(tools::FileState::default()),
+            Arc::new(workspace::FileState::default()),
             "__test_delay".to_owned(),
             r#"{"delay_ms":500,"result":"late"}"#.to_owned(),
             Arc::clone(&cancelled),
@@ -2352,7 +2353,7 @@ mod tests {
                     mode: ApprovalMode::Auto,
                     grants: approval::SessionGrants::default(),
                 }),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;
@@ -2440,7 +2441,7 @@ mod tests {
                 directory.path().to_owned(),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AllowAllGate),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;
@@ -2714,7 +2715,7 @@ mod tests {
                 Arc::new(RecordingGate {
                     consulted: Arc::clone(&consulted),
                 }),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;
@@ -3509,7 +3510,7 @@ mod tests {
                 directory.path().to_owned(),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AllowAllGate),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;
@@ -3543,7 +3544,7 @@ mod tests {
                 directory.path().to_owned(),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AllowAllGate),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;
@@ -3611,7 +3612,7 @@ mod tests {
                 directory.path().to_owned(),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AllowAllGate),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
             )
             .collect::<Vec<_>>()
             .await;
@@ -3766,7 +3767,7 @@ mod tests {
                 directory.path().to_owned(),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AllowAllGate),
-                Arc::new(tools::FileState::default()),
+                Arc::new(workspace::FileState::default()),
                 RunCapabilities::user(Some(spawner)),
             )
             .collect::<Vec<_>>()
@@ -3840,7 +3841,7 @@ mod tests {
                     directory.path().to_owned(),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AllowAllGate),
-                    Arc::new(tools::FileState::default()),
+                    Arc::new(workspace::FileState::default()),
                     RunCapabilities::user(Some(spawner)),
                 )
                 .collect::<Vec<_>>()
@@ -3856,7 +3857,7 @@ mod tests {
     #[test]
     fn agent_prompt_teaches_delegation_only_when_spawn_agent_is_declared() {
         let workspace = std::path::Path::new("/tmp/qq-prompt-test");
-        let instructions = tools::WorkspaceInstructions::empty();
+        let instructions = workspace::WorkspaceInstructions::empty();
         let without = agent_system_prompt(workspace, &tools::specs(), &instructions, None);
         assert!(!without.contains("spawn_agent"));
         assert!(!without.contains("Delegation:"));

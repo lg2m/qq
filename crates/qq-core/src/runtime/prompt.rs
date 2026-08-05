@@ -5,7 +5,8 @@ use qq_provider::ToolSpec;
 
 use crate::{
     mcp::MCP_TOOL_PREFIX,
-    tools::{SPAWN_AGENT_TOOL, SelectedGuidance, WorkspaceInstructions},
+    tools::SPAWN_AGENT_TOOL,
+    workspace::{SelectedGuidance, WorkspaceInstructions},
 };
 
 pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(7) {
