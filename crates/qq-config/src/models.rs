@@ -312,7 +312,12 @@ const MODELS: &[ModelDefinition] = &[
     model! { catalogs: BEDROCK_RUNTIME, wire: "us.anthropic.claude-sonnet-4-6", canonical: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6 (US)", reasoning: true, limits: 1_000_000 / 64_000, pricing: metered(3_000, 15_000, 300, 3_750) },
     model! { catalogs: BEDROCK_RUNTIME, wire: "global.anthropic.claude-sonnet-4-6", canonical: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6 (Global)", reasoning: true, limits: 1_000_000 / 64_000, pricing: metered(3_000, 15_000, 300, 3_750) },
     model! { catalogs: BEDROCK_RUNTIME, wire: "us.anthropic.claude-haiku-4-5-20251001-v1:0", canonical: "anthropic/claude-haiku-4-5", name: "Claude Haiku 4.5 (US)", reasoning: true, limits: 200_000 / 64_000, pricing: metered(1_000, 5_000, 100, 1_250) },
-    model! { catalogs: BEDROCK_MANTLE, wire: "openai.gpt-oss-120b", canonical: "openai/gpt-oss-120b", name: "GPT OSS 120B", reasoning: true, limits: 131_072 / 32_768, pricing: None, api: ProviderApi::OpenAiResponses },
+    model! { catalogs: BEDROCK_MANTLE, wire: "anthropic.claude-opus-5", canonical: "anthropic/claude-opus-5", name: "Claude Opus 5", reasoning: true, limits: 1_000_000 / 128_000, pricing: metered(5_000, 25_000, 0, 0), api: ProviderApi::AnthropicMessages },
+    model! { catalogs: BEDROCK_MANTLE, wire: "anthropic.claude-fable-5", canonical: "anthropic/claude-fable-5", name: "Claude Fable 5", reasoning: true, limits: 1_000_000 / 128_000, pricing: metered(10_000, 50_000, 0, 0), api: ProviderApi::AnthropicMessages },
+    model! { catalogs: BEDROCK_MANTLE, wire: "anthropic.claude-sonnet-5", canonical: "anthropic/claude-sonnet-5", name: "Claude Sonnet 5", reasoning: true, limits: 1_000_000 / 128_000, pricing: metered(2_000, 10_000, 0, 0), api: ProviderApi::AnthropicMessages },
+    model! { catalogs: BEDROCK_MANTLE, wire: "openai.gpt-5.6-sol", canonical: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol", reasoning: true, limits: 272_000 / 128_000, pricing: metered(5_500, 33_000, 0, 0), api: ProviderApi::OpenAiResponses },
+    model! { catalogs: BEDROCK_MANTLE, wire: "openai.gpt-5.6-luna", canonical: "openai/gpt-5.6-luna", name: "GPT-5.6 Luna", reasoning: true, limits: 272_000 / 128_000, pricing: metered(1_100, 6_600, 0, 0), api: ProviderApi::OpenAiResponses },
+    model! { catalogs: BEDROCK_MANTLE, wire: "openai.gpt-5.6-terra", canonical: "openai/gpt-5.6-terra", name: "GPT-5.6 Terra", reasoning: true, limits: 272_000 / 128_000, pricing: metered(2_200, 13_200, 0, 0), api: ProviderApi::OpenAiResponses },
     model! { catalogs: XAI_API, wire: "grok-4.5", canonical: "xai/grok-4.5", name: "Grok 4.5", reasoning: true, limits: 256_000 / 128_000, pricing: None, api: ProviderApi::OpenAiResponses },
     model! { catalogs: XAI_API, wire: "grok-4.3", canonical: "xai/grok-4.3", name: "Grok 4.3", reasoning: true, limits: 131_072 / 32_768, pricing: None, api: ProviderApi::OpenAiChatCompletions },
 ];
@@ -325,7 +330,11 @@ pub(crate) fn builtin_models(catalog: BuiltinCatalog) -> BTreeMap<String, ModelM
             let pricing = model.pricing.map(|pricing| ModelPricing {
                 input_usd_nanos_per_token: pricing.input,
                 output_usd_nanos_per_token: pricing.output,
-                cache_read_usd_nanos_per_token: Some(pricing.cache_read),
+                cache_read_usd_nanos_per_token: if pricing.cache_read == 0 {
+                    None
+                } else {
+                    Some(pricing.cache_read)
+                },
                 cache_write_usd_nanos_per_token: pricing.cache_write,
                 context_tier: pricing.context_tier.map(|tier| ModelPricingTier {
                     above_input_tokens: tier.above_input_tokens,
@@ -375,5 +384,26 @@ mod tests {
             xai["grok-4.3"].api(),
             Some(ProviderApi::OpenAiChatCompletions)
         );
+    }
+
+    #[test]
+    fn bedrock_mantle_models_select_protocol_per_vendor() {
+        let mantle = builtin_models(BuiltinCatalog::BedrockMantle);
+
+        for wire in [
+            "openai.gpt-5.6-sol",
+            "openai.gpt-5.6-luna",
+            "openai.gpt-5.6-terra",
+        ] {
+            assert_eq!(mantle[wire].api(), Some(ProviderApi::OpenAiResponses));
+        }
+        for wire in [
+            "anthropic.claude-opus-5",
+            "anthropic.claude-sonnet-5",
+            "anthropic.claude-fable-5",
+        ] {
+            assert_eq!(mantle[wire].api(), Some(ProviderApi::AnthropicMessages));
+        }
+        assert!(!mantle.contains_key("openai.gpt-oss-120b"));
     }
 }

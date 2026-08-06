@@ -232,6 +232,8 @@ struct ModelPatch {
     #[serde(skip_serializing_if = "StringField::is_missing")]
     name: StringField,
     #[serde(skip_serializing_if = "Field::is_missing")]
+    api: Field<ProviderApi>,
+    #[serde(skip_serializing_if = "Field::is_missing")]
     reasoning: Field<bool>,
     #[serde(skip_serializing_if = "Field::is_missing")]
     input: Field<Vec<InputModality>>,
@@ -1591,6 +1593,7 @@ fn apply_models(
 
 fn apply_model_patch(model: &mut ModelMetadata, patch: &ModelPatch) {
     apply_optional_string(&patch.name, &mut model.name);
+    apply_optional(&patch.api, &mut model.api);
     apply_default(&patch.reasoning, &mut model.reasoning, false);
     apply_default(&patch.input, &mut model.input, Vec::new());
     apply_optional(&patch.context_window, &mut model.context_window);

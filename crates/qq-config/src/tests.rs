@@ -136,6 +136,53 @@ fn loads_target_syntax_and_splits_model_on_only_the_first_slash() {
 }
 
 #[test]
+fn model_api_patch_layers_over_builtin_mantle_protocols() {
+    let tree = TempTree::new();
+    let request = LoadRequest::new(tree.path("work")).with_explicit_content(
+        r#"(
+            version: 1,
+            model: "bedrock-mantle/openai.gpt-5.6-luna",
+            providers: {
+                "bedrock-mantle": AmazonBedrockMantle(
+                    region: "us-east-1",
+                    auth: Aws(DefaultChain),
+                    models: {
+                        "custom-model": (name: "Custom model", api: OpenAiChatCompletions),
+                        "openai.gpt-5.6-sol": (api: AnthropicMessages),
+                    },
+                ),
+            },
+        )"#,
+    );
+
+    let snapshot = tree.loader().load(&request).unwrap();
+    let models = snapshot.providers().get("bedrock-mantle").unwrap().models();
+
+    // Builtin catalog ships per-vendor protocols.
+    assert_eq!(
+        models["openai.gpt-5.6-luna"].api(),
+        Some(ProviderApi::OpenAiResponses)
+    );
+    assert_eq!(
+        models["anthropic.claude-opus-5"].api(),
+        Some(ProviderApi::AnthropicMessages)
+    );
+    assert_eq!(
+        models["anthropic.claude-fable-5"].api(),
+        Some(ProviderApi::AnthropicMessages)
+    );
+    // A patch sets the API on new models and overrides builtins.
+    assert_eq!(
+        models["custom-model"].api(),
+        Some(ProviderApi::OpenAiChatCompletions)
+    );
+    assert_eq!(
+        models["openai.gpt-5.6-sol"].api(),
+        Some(ProviderApi::AnthropicMessages)
+    );
+}
+
+#[test]
 fn worker_model_layers_clears_and_tracks_provenance_independently() {
     let tree = TempTree::new();
     tree.write(
