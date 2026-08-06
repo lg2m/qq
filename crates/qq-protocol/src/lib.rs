@@ -110,6 +110,10 @@ pub enum RunFailureKind {
     ProviderAuthentication,
     ProviderRateLimited,
     ProviderInvalidRequest,
+    /// The assembled request exceeded the model's context window. The
+    /// session layer treats this as recoverable: it compacts and retries
+    /// before ever surfacing this kind as terminal.
+    ProviderContextExceeded,
     ProviderUnavailable,
     ProviderTransport,
     ProviderApi,

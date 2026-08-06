@@ -1003,7 +1003,13 @@ impl App {
         self.status = Some(text);
         self.status_session_id = session_id;
         self.status_level = level;
-        self.status_ticks_left = NOTICE_TICKS;
+        // Errors are sticky: a failure must stay visible until the user acts
+        // (a new prompt, an interrupt, or another notice replaces it).
+        // Informational notices expire on their own.
+        self.status_ticks_left = match level {
+            NoticeLevel::Error => 0,
+            NoticeLevel::Info | NoticeLevel::Warning => NOTICE_TICKS,
+        };
     }
 
     fn set_notice(&mut self, text: String, level: NoticeLevel) {
@@ -1140,6 +1146,15 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => {
+                // A sticky error notice dismisses first: acknowledging the
+                // failure is the most immediate intent Esc can carry.
+                if self.status.is_some()
+                    && self.status_level == NoticeLevel::Error
+                    && self.status_session_id == self.focused
+                {
+                    self.status = None;
+                    return (true, Vec::new());
+                }
                 if let Some(parent) = self
                     .focused
                     .and_then(|focused| self.sessions.get(&focused)?.summary.parent_id)
@@ -1767,6 +1782,10 @@ impl App {
         self.record_prompt(session_id, &prompt);
         self.composer.clear();
         self.reset_history_browse();
+        // Submitting a new prompt acknowledges any sticky failure notice.
+        if self.status_level == NoticeLevel::Error && self.status_session_id == Some(session_id) {
+            self.status = None;
+        }
         self.pending.insert(
             command_id,
             PendingIntent::Prompt {
@@ -2694,19 +2713,32 @@ mod tests {
     }
 
     #[test]
-    fn warning_and_error_notices_expire() {
-        for level in [NoticeLevel::Warning, NoticeLevel::Error] {
-            let mut app = App::new(TuiOptions::default());
-            app.apply_snapshot(snapshot());
-            app.set_notice("temporary notice".to_owned(), level);
-
-            for _ in 0..NOTICE_TICKS {
-                app.advance_animation();
-            }
-
-            assert_eq!(app.visible_status(), None, "{level:?} notice remained");
-            assert!(!app.has_activity());
+    fn warning_notices_expire_but_error_notices_stick_until_dismissed() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        app.set_notice("temporary notice".to_owned(), NoticeLevel::Warning);
+        for _ in 0..NOTICE_TICKS {
+            app.advance_animation();
         }
+        assert_eq!(app.visible_status(), None, "warning notice remained");
+        assert!(!app.has_activity());
+
+        // An error notice never expires on its own: a failure must stay
+        // visible until the user acknowledges it (Esc) or replaces it.
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        app.set_notice("model request failed".to_owned(), NoticeLevel::Error);
+        for _ in 0..NOTICE_TICKS * 4 {
+            app.advance_animation();
+        }
+        assert_eq!(
+            app.visible_status(),
+            Some(("model request failed", NoticeLevel::Error))
+        );
+        let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert_eq!(app.visible_status(), None);
     }
 
     #[test]

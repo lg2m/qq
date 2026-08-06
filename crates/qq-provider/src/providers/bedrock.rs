@@ -536,9 +536,10 @@ fn decode_stop_reason(reason: &StopReason) -> Result<DecodedEvent, ProviderError
         StopReason::MaxTokens => Err(ProviderError::ResponseIncomplete(
             "Amazon Bedrock reached the maximum output token limit".to_owned(),
         )),
-        StopReason::ModelContextWindowExceeded => Err(ProviderError::ResponseIncomplete(
-            "Amazon Bedrock exceeded the model context window".to_owned(),
-        )),
+        StopReason::ModelContextWindowExceeded => Err(ProviderError::ResponseFailed {
+            kind: ProviderErrorKind::ContextExceeded,
+            message: "Amazon Bedrock exceeded the model context window".to_owned(),
+        }),
         StopReason::MalformedModelOutput => Err(ProviderError::ResponseFailed {
             kind: ProviderErrorKind::Response,
             message: "Amazon Bedrock reported malformed model output".to_owned(),
@@ -1083,15 +1084,17 @@ mod tests {
             ));
         }
 
-        for reason in [
-            StopReason::MaxTokens,
-            StopReason::ModelContextWindowExceeded,
-        ] {
-            assert!(matches!(
-                decode_stop_reason(&reason),
-                Err(ProviderError::ResponseIncomplete(_))
-            ));
-        }
+        assert!(matches!(
+            decode_stop_reason(&StopReason::MaxTokens),
+            Err(ProviderError::ResponseIncomplete(_))
+        ));
+        assert!(matches!(
+            decode_stop_reason(&StopReason::ModelContextWindowExceeded),
+            Err(ProviderError::ResponseFailed {
+                kind: ProviderErrorKind::ContextExceeded,
+                ..
+            })
+        ));
 
         assert_eq!(
             decode_stop_reason(&StopReason::ToolUse).unwrap(),

@@ -38,10 +38,32 @@ pub(crate) fn api_error<E: DeserializeOwned>(
             sanitize_message(&message, rejection.redactions())
         });
 
-    ProviderError::Api {
-        status: status.as_u16(),
-        message,
+    // A rejected request that names the context window is recoverable by
+    // compaction; surface it as such rather than as a generic API failure.
+    let status = status.as_u16();
+    if status == 413 || (status == 400 && names_context_overflow(&message)) {
+        return ProviderError::ResponseFailed {
+            kind: ProviderErrorKind::ContextExceeded,
+            message,
+        };
     }
+
+    ProviderError::Api { status, message }
+}
+
+/// Message-text detection of context-window overflow for providers that
+/// report it only as a generic 400. The phrases cover OpenAI-compatible,
+/// Anthropic-compatible, and Google wire messages observed in practice.
+pub(crate) fn names_context_overflow(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    lowered.contains("context window")
+        || lowered.contains("context length")
+        || lowered.contains("context_length")
+        || lowered.contains("too many tokens")
+        || lowered.contains("maximum number of tokens")
+        || lowered.contains("input is too long")
+        || lowered.contains("prompt is too long")
+        || lowered.contains("exceeds the maximum")
 }
 
 /// Maps an HTTP-shaped status embedded in an error payload to an error kind.

@@ -717,11 +717,13 @@ fn decode_message_delta(
 
     match delta.stop_reason.as_deref() {
         None | Some("end_turn" | "stop_sequence" | "tool_use") => Ok(None),
-        Some("max_tokens" | "model_context_window_exceeded") => {
-            Err(ProviderError::ResponseIncomplete(
-                "Anthropic response reached a configured model limit".to_owned(),
-            ))
-        }
+        Some("max_tokens") => Err(ProviderError::ResponseIncomplete(
+            "Anthropic response reached the maximum output token limit".to_owned(),
+        )),
+        Some("model_context_window_exceeded") => Err(ProviderError::ResponseFailed {
+            kind: ProviderErrorKind::ContextExceeded,
+            message: "Anthropic request exceeded the model context window".to_owned(),
+        }),
         Some("pause_turn") => Err(ProviderError::ResponseIncomplete(
             "Anthropic paused the response before completion".to_owned(),
         )),
@@ -765,9 +767,10 @@ fn wire_error_kind(error: &WireApiError) -> ProviderErrorKind {
 }
 
 fn status_error_kind(status: u16) -> ProviderErrorKind {
-    // Anthropic additionally classifies 413 (request too large) as invalid.
+    // Anthropic classifies 413 (request too large) as a context-size
+    // failure the session layer can compact away.
     match status {
-        413 => ProviderErrorKind::InvalidRequest,
+        413 => ProviderErrorKind::ContextExceeded,
         status => support::status_error_kind(status),
     }
 }
@@ -778,11 +781,10 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
             ProviderErrorKind::Authentication
         }
         "rate_limit_error" | "rate_limit_exceeded" => ProviderErrorKind::RateLimited,
-        "conflict_error"
-        | "invalid_request_error"
-        | "model_not_found"
-        | "not_found_error"
-        | "request_too_large" => ProviderErrorKind::InvalidRequest,
+        "conflict_error" | "invalid_request_error" | "model_not_found" | "not_found_error" => {
+            ProviderErrorKind::InvalidRequest
+        }
+        "request_too_large" => ProviderErrorKind::ContextExceeded,
         "api_error" | "overloaded_error" | "service_unavailable" | "timeout_error" => {
             ProviderErrorKind::Unavailable
         }

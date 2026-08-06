@@ -138,7 +138,7 @@ const CASES: &[CanaryCase] = &[
         provider: ProviderName::BedrockMantle,
         protocol: "responses",
         auth: "default-aws-chain-sigv4",
-        model: "openai.gpt-oss-120b",
+        model: "openai.gpt-5.6-luna",
         model_env: "QQ_CANARY_MANTLE_RESPONSES_MODEL",
         recipe: RecipeKind::BedrockMantle {
             protocol: HttpProtocol::OpenAiResponses,
@@ -150,7 +150,7 @@ const CASES: &[CanaryCase] = &[
         provider: ProviderName::BedrockMantle,
         protocol: "chat-completions",
         auth: "default-aws-chain-sigv4",
-        model: "openai.gpt-oss-120b",
+        model: "openai.gpt-5.6-luna",
         model_env: "QQ_CANARY_MANTLE_CHAT_MODEL",
         recipe: RecipeKind::BedrockMantle {
             protocol: HttpProtocol::OpenAiChatCompletions,
@@ -174,7 +174,7 @@ const CASES: &[CanaryCase] = &[
         provider: ProviderName::BedrockMantle,
         protocol: "responses",
         auth: "bedrock-api-key",
-        model: "openai.gpt-oss-120b",
+        model: "openai.gpt-5.6-luna",
         model_env: "QQ_CANARY_MANTLE_RESPONSES_MODEL",
         recipe: RecipeKind::BedrockMantle {
             protocol: HttpProtocol::OpenAiResponses,
@@ -186,7 +186,7 @@ const CASES: &[CanaryCase] = &[
         provider: ProviderName::BedrockMantle,
         protocol: "chat-completions",
         auth: "bedrock-api-key",
-        model: "openai.gpt-oss-120b",
+        model: "openai.gpt-5.6-luna",
         model_env: "QQ_CANARY_MANTLE_CHAT_MODEL",
         recipe: RecipeKind::BedrockMantle {
             protocol: HttpProtocol::OpenAiChatCompletions,
@@ -864,6 +864,7 @@ fn provider_error_kind(error: &ProviderError) -> &'static str {
         qq_provider::ProviderErrorKind::Authentication => "authentication",
         qq_provider::ProviderErrorKind::RateLimited => "rate-limited",
         qq_provider::ProviderErrorKind::InvalidRequest => "invalid-request",
+        qq_provider::ProviderErrorKind::ContextExceeded => "context-exceeded",
         qq_provider::ProviderErrorKind::Unavailable => "unavailable",
         qq_provider::ProviderErrorKind::Transport => "transport",
         qq_provider::ProviderErrorKind::Api => "api",

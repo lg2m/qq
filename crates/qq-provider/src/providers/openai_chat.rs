@@ -629,8 +629,8 @@ fn named_error_kind(name: &str) -> ProviderErrorKind {
             ProviderErrorKind::Authentication
         }
         "rate_limit_exceeded" | "insufficient_quota" => ProviderErrorKind::RateLimited,
-        "context_length_exceeded"
-        | "invalid_prompt"
+        "context_length_exceeded" => ProviderErrorKind::ContextExceeded,
+        "invalid_prompt"
         | "invalid_request_error"
         | "invalid_value"
         | "model_not_found"

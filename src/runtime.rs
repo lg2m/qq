@@ -526,7 +526,12 @@ impl RuntimeFactory {
                 self.prepare_bedrock_provider(provider_id, region.as_deref(), auth)
             }
             ProviderAccess::AmazonBedrockMantle { region, api, auth } => {
-                self.prepare_bedrock_mantle_provider(provider_id, region.as_deref(), *api, auth)
+                let api = config
+                    .models()
+                    .get(model_id)
+                    .and_then(|metadata| metadata.api())
+                    .unwrap_or(*api);
+                self.prepare_bedrock_mantle_provider(provider_id, region.as_deref(), api, auth)
             }
         }
     }
@@ -1336,6 +1341,9 @@ impl RuntimeBuildError {
                 qq_provider::ProviderErrorKind::RateLimited => RunFailureKind::ProviderRateLimited,
                 qq_provider::ProviderErrorKind::InvalidRequest => {
                     RunFailureKind::ProviderInvalidRequest
+                }
+                qq_provider::ProviderErrorKind::ContextExceeded => {
+                    RunFailureKind::ProviderContextExceeded
                 }
                 qq_provider::ProviderErrorKind::Unavailable => RunFailureKind::ProviderUnavailable,
                 qq_provider::ProviderErrorKind::Transport => RunFailureKind::ProviderTransport,
@@ -2570,6 +2578,53 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &different_region));
         assert!(!Arc::ptr_eq(&first, &different_api));
         assert!(!Arc::ptr_eq(&first, &different_profile));
+    }
+
+    #[test]
+    fn mantle_model_api_metadata_overrides_the_provider_default() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let document = |model: &str| {
+            fixture.request(format!(
+                r#"(
+                    version: 1,
+                    model: "mantle/{model}",
+                    providers: {{
+                        "mantle": AmazonBedrockMantle(
+                            region: "us-east-1",
+                            api: AnthropicMessages,
+                            auth: Aws(DefaultChain),
+                            models: {{
+                                "openai-model": (name: "OpenAI model", api: OpenAiResponses),
+                                "rejected-model": (name: "Rejected model", api: BedrockConverse),
+                                "anthropic-model": (name: "Anthropic model"),
+                            }},
+                        ),
+                    }},
+                )"#
+            ))
+        };
+
+        factory
+            .runtime_for(&document("openai-model"))
+            .expect("per-model OpenAiResponses override must construct");
+        factory
+            .runtime_for(&document("anthropic-model"))
+            .expect("provider default AnthropicMessages must construct");
+
+        // The per-model API must reach Mantle preparation: an unsupported
+        // override fails even though the provider default is supported.
+        let error = factory
+            .runtime_for(&document("rejected-model"))
+            .err()
+            .expect("unsupported per-model API must fail");
+        assert!(matches!(
+            error,
+            RuntimeBuildError::UnsupportedApi {
+                api: ProviderApi::BedrockConverse,
+                ..
+            }
+        ));
     }
 
     #[test]

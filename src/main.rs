@@ -220,6 +220,7 @@ async fn prepare_headless(
         approval: match args.approval {
             cli::RunApproval::ReadOnly => headless::HeadlessApproval::ReadOnly,
             cli::RunApproval::Auto => headless::HeadlessApproval::Auto,
+            cli::RunApproval::Full => headless::HeadlessApproval::Full,
         },
         timeout: args.timeout_seconds.map(std::time::Duration::from_secs),
         max_turns: args.max_turns,

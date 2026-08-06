@@ -1303,7 +1303,15 @@ fn claim_next_run(
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
         let total = assembled.saturating_add(usize::try_from(prompt_bytes).unwrap_or(usize::MAX));
-        if total > AUTO_COMPACT_CONTEXT_BYTES {
+        // Two compaction triggers share the one-attempt no-thrash guard: the
+        // assembled byte budget, and a provider context-window overflow on
+        // the session's previous run. Bytes approximate tokens loosely, so a
+        // token-dense context can overflow the model window while still
+        // under the byte threshold; the failure-driven trigger makes the
+        // next prompt compact-then-continue instead of failing again.
+        if total > AUTO_COMPACT_CONTEXT_BYTES
+            || last_run_failed_with_context_overflow(&transaction, session_id)?
+        {
             if !last_finished_run_was_compaction(&transaction, session_id)? {
                 return claim_auto_compaction(
                     transaction,
@@ -1422,6 +1430,42 @@ fn last_finished_run_was_compaction(
         .optional()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(kind.as_deref() == Some("compaction"))
+}
+
+/// True when the session's most recently finished prompt run failed because
+/// the provider rejected the request as exceeding the model context window.
+/// The claim path uses this as a compaction trigger so the next prompt
+/// recovers instead of hitting the same wall.
+fn last_run_failed_with_context_overflow(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<bool, SessionRuntimeError> {
+    let outcome_json: Option<String> = transaction
+        .query_row(
+            "SELECT outcome_json FROM runs
+             WHERE session_id = ?1 AND outcome_json IS NOT NULL
+             ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let Some(outcome_json) = outcome_json else {
+        return Ok(false);
+    };
+    let Ok(outcome) = serde_json::from_str::<RunOutcome>(&outcome_json) else {
+        // An unreadable historical outcome must not block claiming.
+        return Ok(false);
+    };
+    Ok(matches!(
+        outcome,
+        RunOutcome::Failed {
+            failure: RunFailure {
+                kind: RunFailureKind::ProviderContextExceeded,
+                ..
+            }
+        }
+    ))
 }
 
 /// Claims an automatic compaction run for `session_id` in place of the
@@ -4596,6 +4640,7 @@ const fn approval_mode_str(mode: ApprovalMode) -> &'static str {
         ApprovalMode::ReadOnly => "read_only",
         ApprovalMode::Ask => "ask",
         ApprovalMode::Auto => "auto",
+        ApprovalMode::Full => "full",
     }
 }
 
@@ -4604,6 +4649,7 @@ fn parse_approval_mode(value: &str) -> Result<ApprovalMode, SessionRuntimeError>
         "read_only" => Ok(ApprovalMode::ReadOnly),
         "ask" => Ok(ApprovalMode::Ask),
         "auto" => Ok(ApprovalMode::Auto),
+        "full" => Ok(ApprovalMode::Full),
         _ => Err(SessionRuntimeError::Persistence),
     }
 }
@@ -6364,7 +6410,10 @@ mod tests {
         .await
         .unwrap();
         let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
-        let created = create_session(&runtime, workspace_id, None).await;
+        // These management tests park a run at its tool approval, so the
+        // session must ask rather than auto-execute the scripted mutation.
+        let created =
+            create_session_with_mode(&runtime, workspace_id, None, ApprovalMode::Ask).await;
         let CommandOutcome::SessionCreated { session_id } = created.outcome else {
             panic!("unexpected receipt")
         };
@@ -8131,6 +8180,8 @@ mod tests {
         Text(String),
         /// Fails the model stream with a transport error.
         Fail,
+        /// Fails the model stream with a context-window overflow.
+        ContextOverflow,
         /// Never yields: the run parks until cancelled.
         Stall,
     }
@@ -8188,6 +8239,12 @@ mod tests {
                 ])),
                 AutoCompactScript::Fail => Box::pin(stream::iter([Err(
                     qq_provider::ProviderError::Transport("scripted model failure".to_owned()),
+                )])),
+                AutoCompactScript::ContextOverflow => Box::pin(stream::iter([Err(
+                    qq_provider::ProviderError::ResponseFailed {
+                        kind: qq_provider::ProviderErrorKind::ContextExceeded,
+                        message: "scripted context overflow".to_owned(),
+                    },
                 )])),
                 AutoCompactScript::Stall => Box::pin(stream::pending()),
             }
@@ -8408,6 +8465,64 @@ mod tests {
             SessionEvent::SessionCompacted { .. } => false,
             _ => true,
         }));
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_failure_compacts_before_the_next_prompt() {
+        // The provider rejects the first prompt as exceeding the model
+        // context window while the session is still under the byte
+        // threshold. The failure must be loud (a failed run outcome naming
+        // the overflow) and the next prompt must compact first instead of
+        // hitting the same wall.
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::ContextOverflow,
+            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text("recovered".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "big ask".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(first)).await;
+        assert!(
+            observed.iter().any(|event| matches!(
+                &event.event,
+                SessionEvent::RunFinished {
+                    run_id,
+                    outcome: RunOutcome::Failed { failure },
+                    ..
+                } if *run_id == first
+                    && failure.kind == RunFailureKind::ProviderContextExceeded
+            )),
+            "the overflow must surface as a failed run outcome"
+        );
+
+        let second = queue_prompt(&harness.runtime, harness.session_id, "retry".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        // A compaction run claims ahead of the retried prompt.
+        let compaction = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunStarted { run_id, .. } if *run_id != second => Some(*run_id),
+                _ => None,
+            })
+            .expect("a compaction must run before the retried prompt");
+        let compacted = position_of(&observed, |event| {
+            matches!(event, SessionEvent::SessionCompacted { .. })
+        });
+        let prompt_started = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == second),
+        );
+        assert!(compacted < prompt_started);
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                if *run_id == compaction
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                if *run_id == second
+        )));
     }
 
     #[tokio::test]
@@ -12674,11 +12789,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_approval_requests_carry_the_command_and_auto_mode_asks_without_a_grant() {
+    async fn shell_approval_requests_carry_the_command_and_auto_mode_asks_for_dangerous_shell() {
         let mut harness = approval_harness(
             ApprovalMode::Auto,
             "__test_shell",
-            r#"{"command":"cargo test --workspace","cwd":"crates"}"#,
+            r#"{"command":"git push --force origin main","cwd":"crates"}"#,
             1,
             DEFAULT_APPROVAL_TIMEOUT,
         )
@@ -12691,7 +12806,7 @@ mod tests {
                 _ => None,
             })
             .expect("shell approval requests carry the command");
-        assert_eq!(shell.command, "cargo test --workspace");
+        assert_eq!(shell.command, "git push --force origin main");
         assert_eq!(shell.cwd.as_deref(), Some("crates"));
 
         respond_approval(
@@ -12700,7 +12815,7 @@ mod tests {
             tool_call.id,
             ApprovalDecision::ApproveForSession {
                 grant: ApprovalGrant::ShellPrefix {
-                    prefix: "cargo test".to_owned(),
+                    prefix: "git push".to_owned(),
                 },
             },
         )

@@ -1075,6 +1075,7 @@ const fn run_failure_kind(kind: ProviderErrorKind) -> RunFailureKind {
         ProviderErrorKind::Authentication => RunFailureKind::ProviderAuthentication,
         ProviderErrorKind::RateLimited => RunFailureKind::ProviderRateLimited,
         ProviderErrorKind::InvalidRequest => RunFailureKind::ProviderInvalidRequest,
+        ProviderErrorKind::ContextExceeded => RunFailureKind::ProviderContextExceeded,
         ProviderErrorKind::Unavailable => RunFailureKind::ProviderUnavailable,
         ProviderErrorKind::Transport => RunFailureKind::ProviderTransport,
         ProviderErrorKind::Api => RunFailureKind::ProviderApi,

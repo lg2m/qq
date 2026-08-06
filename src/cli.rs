@@ -119,10 +119,14 @@ pub struct RunArgs {
 pub enum RunApproval {
     /// Deny every mutating, shell, and MCP tool call without prompting.
     ReadOnly,
-    /// Approve tool calls unattended. An explicit grant of autonomous
-    /// authority: suitable only for a disposable or otherwise trusted
-    /// workspace.
+    /// Approve tool calls unattended except dangerous shell commands
+    /// (destructive deletions, privilege escalation, force-pushes, piping
+    /// downloads into an interpreter), which are denied without prompting.
     Auto,
+    /// Approve every tool call unattended with zero restrictions. An
+    /// explicit grant of unrestricted authority: suitable only for a
+    /// disposable or otherwise trusted workspace.
+    Full,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

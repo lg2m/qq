@@ -160,9 +160,14 @@ pub struct ModelDescriptor {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
     ReadOnly,
-    #[default]
     Ask,
+    /// Default: edits and safe shell run without prompting; only dangerous
+    /// shell commands (deletion, privilege escalation, force-push, piped
+    /// installers) require approval.
+    #[default]
     Auto,
+    /// Zero restrictions: every tool call executes without prompting.
+    Full,
 }
 
 /// A client's answer to one pending tool approval.
@@ -1371,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn create_session_without_an_approval_mode_defaults_to_ask() {
+    fn create_session_without_an_approval_mode_defaults_to_auto() {
         let encoded = serde_json::json!({
             "type": "create_session",
             "workspace_id": id::<WorkspaceId>(2).to_string(),
@@ -1381,7 +1386,7 @@ mod tests {
         assert!(matches!(
             command,
             SessionCommand::CreateSession {
-                approval_mode: ApprovalMode::Ask,
+                approval_mode: ApprovalMode::Auto,
                 ..
             }
         ));

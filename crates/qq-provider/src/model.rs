@@ -270,6 +270,10 @@ pub enum ProviderErrorKind {
     Authentication,
     RateLimited,
     InvalidRequest,
+    /// The request exceeded the model's context window (or the provider's
+    /// request-size cap). Distinguished from other invalid requests because
+    /// the session layer can recover by compacting and retrying.
+    ContextExceeded,
     Unavailable,
     Transport,
     Api,

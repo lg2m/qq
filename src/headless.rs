@@ -59,6 +59,7 @@ pub struct HeadlessOptions {
 pub enum HeadlessApproval {
     ReadOnly,
     Auto,
+    Full,
 }
 
 impl HeadlessApproval {
@@ -66,6 +67,7 @@ impl HeadlessApproval {
         match self {
             Self::ReadOnly => "read-only",
             Self::Auto => "auto",
+            Self::Full => "full",
         }
     }
 
@@ -73,6 +75,7 @@ impl HeadlessApproval {
         match self {
             Self::ReadOnly => ApprovalMode::ReadOnly,
             Self::Auto => ApprovalMode::Auto,
+            Self::Full => ApprovalMode::Full,
         }
     }
 }
@@ -668,11 +671,15 @@ async fn stream_run(
                         check_cost = true;
                     }
                     SessionEvent::ToolApprovalRequested { tool_call, .. } => {
-                        // The headless invocation is the approval client. Auto
-                        // approves unattended; anything else denies so the run
-                        // can never stall waiting for a human.
+                        // The headless invocation is the approval client.
+                        // Full approves everything unattended; auto approves
+                        // whatever the policy escalated (dangerous shell)
+                        // only if the caller opted into full autonomy —
+                        // otherwise it denies so the run never stalls
+                        // waiting for a human.
                         let decision = match options.approval {
-                            HeadlessApproval::Auto => ApprovalDecision::ApproveOnce,
+                            HeadlessApproval::Full => ApprovalDecision::ApproveOnce,
+                            HeadlessApproval::Auto => ApprovalDecision::Deny,
                             HeadlessApproval::ReadOnly => ApprovalDecision::Deny,
                         };
                         if let Some(run_id) = envelope.run_id {
@@ -1626,12 +1633,13 @@ mod tests {
         };
         assert_eq!(call_state("write_file"), "completed");
         assert_eq!(call_state("shell"), "completed");
-        // The shell call went through the ordinary approval flow, resolved
-        // unattended by this invocation rather than by a human.
-        assert!(event_records(&records).iter().any(|record| {
-            record["envelope"]["event"]["type"] == "tool_approval_resolved"
-                && record["envelope"]["event"]["resolution"] == "approved_once"
-        }));
+        // Under auto, edits and safe shell run directly: no approval
+        // round-trip happened and nothing waited for a human.
+        assert!(
+            event_records(&records)
+                .iter()
+                .all(|record| { record["envelope"]["event"]["type"] != "tool_approval_requested" })
+        );
     }
 
     #[tokio::test]
