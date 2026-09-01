@@ -8,6 +8,7 @@ use crate::workspace::FileStateUpdate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreparedRequestWeight {
+    pub(crate) max_output_tokens: u32,
     pub(crate) system_bytes: u64,
     pub(crate) tool_schema_bytes: u64,
     pub(crate) reducible_message_bytes: u64,

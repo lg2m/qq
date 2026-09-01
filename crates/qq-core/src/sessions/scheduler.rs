@@ -1,6 +1,6 @@
 use super::*;
 use super::{
-    execution::{execute_run, finish_run, internal_failure},
+    execution::{execute_run, internal_failure, persistence_failure},
     runtime::SessionRuntimeInner,
 };
 
@@ -49,14 +49,14 @@ pub(super) async fn schedule_runs(
                 &inner.permits
             };
             loop {
-                if *shutdown.borrow() {
+                if *shutdown.borrow() || *inner.failed.borrow() {
                     break 'scheduler;
                 }
                 let permit = match Arc::clone(pool).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => break,
                 };
-                let claimed = match inner.store.claim_next_run(children).await {
+                let claimed = match inner.store.reserve_next_run(children).await {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => break,
                     Err(_) => {
@@ -64,44 +64,152 @@ pub(super) async fn schedule_runs(
                         break 'scheduler;
                     }
                 };
-                inner.notify(claimed.started.cursor);
-                let (cancel, cancel_receiver) = watch::channel(false);
-                if let Ok(mut cancellations) = inner.cancellations.lock() {
-                    cancellations.insert(claimed.run_id, cancel);
-                }
-                match inner.store.cancellation_requested(claimed.run_id).await {
-                    Ok(true) => inner.cancel(claimed.run_id),
-                    Ok(false) => {}
-                    Err(_) => {
-                        inner.failed.send_replace(true);
-                        break 'scheduler;
-                    }
-                }
                 let task_inner = Arc::clone(&inner);
-                let panic_claimed = claimed.clone();
+                let panic_claimed = claimed.panic_settlement_claim();
                 tokio::spawn(async move {
-                    let execution = AssertUnwindSafe(execute_run(
-                        Arc::clone(&task_inner),
-                        claimed,
-                        cancel_receiver,
-                    ))
-                    .catch_unwind()
-                    .await;
+                    let execution =
+                        AssertUnwindSafe(supervise_reserved_run(Arc::clone(&task_inner), claimed))
+                            .catch_unwind()
+                            .await;
                     if execution.is_err() {
-                        finish_run(
-                            &task_inner,
-                            &panic_claimed,
-                            internal_failure(
-                                "agent run task panicked; committed work was preserved",
-                            ),
-                        )
-                        .await;
+                        settle_panicked_execution_with_retry(&task_inner, &panic_claimed).await;
                     }
                     drop(permit);
+                    task_inner
+                        .settlements
+                        .send_modify(|generation| *generation = generation.wrapping_add(1));
                     if !*task_inner.shutdown.borrow() {
                         let _ = task_inner.schedule.try_send(());
                     }
                 });
+            }
+        }
+    }
+}
+
+async fn supervise_reserved_run(inner: Arc<SessionRuntimeInner>, claimed: ClaimedRun) {
+    let (cancel, cancel_receiver) = watch::channel(false);
+    let registered = match inner.cancellations.lock() {
+        Ok(mut cancellations) => {
+            cancellations.insert(claimed.run_id, cancel.clone());
+            true
+        }
+        Err(_) => false,
+    };
+    if !registered {
+        settle_unstartable_reservation_with_retry(
+            &inner,
+            &claimed,
+            internal_failure("run cancellation registry is unavailable"),
+            true,
+        )
+        .await;
+        return;
+    }
+    loop {
+        match inner.store.cancellation_requested(claimed.run_id).await {
+            Ok(true) => {
+                cancel.send_replace(true);
+                break;
+            }
+            Ok(false) => break,
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(error) => {
+                settle_unstartable_reservation_with_retry(
+                    &inner,
+                    &claimed,
+                    persistence_failure("failed to read reserved-run cancellation state", &error),
+                    false,
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    if *inner.failed.borrow() {
+        settle_unstartable_reservation_with_retry(
+            &inner,
+            &claimed,
+            internal_failure("session runtime failed before run preparation"),
+            true,
+        )
+        .await;
+        return;
+    }
+    execute_run(inner, claimed, cancel_receiver).await;
+}
+
+async fn settle_unstartable_reservation_with_retry(
+    inner: &SessionRuntimeInner,
+    claimed: &ClaimedRun,
+    outcome: RunOutcome,
+    fail_runtime: bool,
+) {
+    if fail_runtime {
+        inner.failed.send_replace(true);
+    }
+    loop {
+        match inner
+            .store
+            .finish_reserved_run(claimed, outcome.clone())
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    inner.notify(event.cursor);
+                }
+                break;
+            }
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(_) => {
+                inner.failed.send_replace(true);
+                break;
+            }
+        }
+    }
+    if let Ok(mut cancellations) = inner.cancellations.lock() {
+        cancellations.remove(&claimed.run_id);
+    }
+    inner.clear_run_approvals(claimed.run_id);
+    inner
+        .settlements
+        .send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
+async fn settle_panicked_execution_with_retry(inner: &SessionRuntimeInner, claimed: &ClaimedRun) {
+    loop {
+        match inner
+            .store
+            .settle_panicked_execution(
+                claimed,
+                internal_failure("agent run task panicked; committed work was preserved"),
+            )
+            .await
+        {
+            Ok(settlement) => {
+                for event in settlement.events {
+                    inner.notify(event.cursor);
+                }
+                if let Ok(mut cancellations) = inner.cancellations.lock() {
+                    for run_id in &settlement.run_ids {
+                        cancellations.remove(run_id);
+                    }
+                }
+                for run_id in settlement.run_ids {
+                    inner.clear_run_approvals(run_id);
+                }
+                break;
+            }
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(_) => {
+                inner.failed.send_replace(true);
+                break;
             }
         }
     }

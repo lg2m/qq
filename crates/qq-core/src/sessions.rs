@@ -32,8 +32,8 @@ use thiserror::Error;
 use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
-    GateDecision, RunCapabilities, Runtime, RuntimeEvent, RuntimeToolCall, SpawnAgentFuture,
-    SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, approval,
+    GateDecision, PreparedRequestWeight, RunCapabilities, Runtime, RuntimeEvent, RuntimeToolCall,
+    SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, approval,
     workspace::{FileState, FileStateUpdate},
 };
 
@@ -63,15 +63,6 @@ use subagents::spawn_child_run;
 
 const MAX_PENDING_PROMPTS: u16 = 16;
 const MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
-/// Auto-compaction trigger: when a prompt run is about to be claimed and the
-/// session's assembled (pruned) context — including the queued prompt —
-/// exceeds this share of [`MAX_CONTEXT_BYTES`], a compaction run is claimed
-/// first and the prompt runs right after it. ~70% of the session budget. A
-/// second trigger on the model context window (the run's last reported
-/// `context_tokens` against the window) needs the window plumbed into
-/// qq-core; today it lives only in the client-facing model catalog, so the
-/// byte threshold is the sole automatic signal.
-const AUTO_COMPACT_CONTEXT_BYTES: usize = MAX_CONTEXT_BYTES / 10 * 7;
 /// The assembly recency window: the last K model turns keep their tool
 /// results verbatim. Read-only results older than that are replaced by
 /// one-line stubs during context assembly (the stored rows are untouched).
@@ -181,12 +172,99 @@ struct ClaimedRun {
     literal_slash: bool,
     model: ModelSelection,
     messages: Vec<Message>,
-    started: SessionEventEnvelope,
-    /// The prompt's assembled context still exceeded the hard budget when it
-    /// was claimed — after the one auto-compaction attempt the claim path
-    /// guarantees. The run fails immediately with the context policy failure
-    /// instead of reaching the model.
-    over_budget: bool,
+    context_compaction_attempted: bool,
+    context_overflow_model: Option<Arc<ResolvedModel>>,
+}
+
+impl ClaimedRun {
+    /// Panic settlement needs durable ownership identity, never the assembled
+    /// transcript. Keeping this clone scalar avoids retaining a second copy
+    /// of up to 4 MiB for every active execution task.
+    fn panic_settlement_claim(&self) -> Self {
+        Self {
+            workspace_id: self.workspace_id,
+            workspace: String::new(),
+            session_id: self.session_id,
+            run_id: self.run_id,
+            command_id: self.command_id,
+            kind: self.kind,
+            child: self.child,
+            user_initiated: self.user_initiated,
+            literal_slash: self.literal_slash,
+            model: self.model.clone(),
+            messages: Vec::new(),
+            context_compaction_attempted: self.context_compaction_attempted,
+            context_overflow_model: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PreparedRunAudit {
+    prompt_identity: Arc<RunPromptIdentity>,
+    resolved_model: Arc<ResolvedModel>,
+    weight: PreparedRequestWeight,
+}
+
+/// Whether two immutable descriptors produce the same provider request shape
+/// for context occupancy. Pricing/provenance can refresh independently and
+/// must not make a known provider overflow look safe to resend.
+fn same_context_request_shape(left: &ResolvedModel, right: &ResolvedModel) -> bool {
+    left.route == right.route
+        && left.provider_model == right.provider_model
+        && left.organization == right.organization
+        && left.credential_profile == right.credential_profile
+        && left.max_output_tokens == right.max_output_tokens
+        && left.context_window == right.context_window
+        && left.output_token_control == right.output_token_control
+        && left.generation == right.generation
+        && left.prompt_cache.control == right.prompt_cache.control
+}
+
+#[cfg(test)]
+fn test_prepared_audit(claimed: &ClaimedRun) -> PreparedRunAudit {
+    let route = claimed
+        .model
+        .model
+        .clone()
+        .unwrap_or_else(|| "test/test-model".to_owned());
+    let max_output_tokens = claimed.model.max_output_tokens.unwrap_or(256);
+    PreparedRunAudit {
+        prompt_identity: Arc::new(RunPromptIdentity {
+            version: qq_protocol::PromptVersion::new(1).unwrap(),
+            instruction_hash: qq_protocol::InstructionHash::from_bytes([0; 32]),
+            system_prompt_hash: Some(qq_protocol::ContentHash::from_bytes([0; 32])),
+            tool_schema_hash: Some(qq_protocol::ContentHash::from_bytes([0; 32])),
+            selected_guidance: None,
+        }),
+        resolved_model: Arc::new(ResolvedModel {
+            version: qq_protocol::ResolvedModelVersion::new(1).unwrap(),
+            route: route.clone(),
+            provider_model: route,
+            organization: claimed.model.organization.clone(),
+            credential_profile: None,
+            max_output_tokens,
+            context_window: None,
+            pricing: None,
+            output_token_control: qq_protocol::CapabilitySupport::Native,
+            generation: qq_protocol::GenerationCapabilities {
+                reasoning_effort: qq_protocol::CapabilitySupport::Unsupported,
+            },
+            prompt_cache: qq_protocol::PromptCacheCapabilities {
+                control: qq_protocol::CapabilitySupport::Unsupported,
+                cache_read_usage: false,
+                cache_write_usage: false,
+            },
+        }),
+        weight: PreparedRequestWeight {
+            max_output_tokens,
+            system_bytes: 0,
+            tool_schema_bytes: 0,
+            reducible_message_bytes: crate::measure_messages(&claimed.messages),
+            irreducible_message_bytes: 0,
+            compatible_input_tokens: None,
+        },
+    }
 }
 
 struct AppliedCommand {
@@ -400,7 +478,9 @@ fn execute_command(
             receipt,
             schedule: false,
             cascade_cancels: match &command {
-                SessionCommand::CancelRun { run_id } => owned_running_run_ids(connection, *run_id)?,
+                SessionCommand::CancelRun { run_id } => {
+                    cancellation_signal_run_ids(connection, *run_id)?
+                }
                 _ => Vec::new(),
             },
             grant_promotion_pending: connection
@@ -796,10 +876,17 @@ fn execute_command(
             tool_call_id,
             decision,
         } => {
-            let (call_run, state, resolution, provider_call_id) = transaction
+            let (call_run, state, resolution, provider_call_id, first_result_in_turn) = transaction
                 .query_row(
-                    "SELECT run_id, state, approval_resolution, provider_call_id
-                     FROM tool_calls WHERE id = ?1",
+                    "SELECT current.run_id, current.state, current.approval_resolution,
+                            current.provider_call_id,
+                            NOT EXISTS(
+                                SELECT 1 FROM tool_calls previous
+                                WHERE previous.run_id = current.run_id
+                                  AND previous.turn_ordinal = current.turn_ordinal
+                                  AND previous.result IS NOT NULL
+                            )
+                     FROM tool_calls current WHERE current.id = ?1",
                     [tool_call_id.to_string()],
                     |row| {
                         Ok((
@@ -807,6 +894,7 @@ fn execute_command(
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, bool>(4)?,
                         ))
                     },
                 )
@@ -878,12 +966,12 @@ fn execute_command(
                             .map_err(|_| SessionRuntimeError::Persistence)?;
                     }
                     ApprovalDecision::Deny => {
-                        reserve_context_capacity(
+                        reserve_tool_result_capacity(
                             &transaction,
                             run_id,
-                            provider_call_id
-                                .len()
-                                .saturating_add(approval::USER_DENIED_RESULT.len()),
+                            &provider_call_id,
+                            approval::USER_DENIED_RESULT,
+                            first_result_in_turn,
                         )?;
                         transaction
                             .execute(
@@ -1098,7 +1186,8 @@ fn execute_command(
                 .prepare(
                     "SELECT id FROM sessions
                      WHERE workspace_id = ?1 AND status = 'idle'
-                       AND active_run_id IS NULL AND queued_prompts = 0
+                       AND active_run_id IS NULL AND preparing_run_id IS NULL
+                       AND queued_prompts = 0
                        AND NOT EXISTS (
                            SELECT 1 FROM messages WHERE messages.session_id = sessions.id
                        )
@@ -1147,11 +1236,17 @@ fn execute_command(
         }
         SessionCommand::CompactSession { session_id } => {
             let workspace_id = session_workspace(&transaction, session_id)?;
-            let (status, active_run, queued): (String, Option<String>, u16) = transaction
+            let (status, active_run, preparing_run, queued): (
+                String,
+                Option<String>,
+                Option<String>,
+                u16,
+            ) = transaction
                 .query_row(
-                    "SELECT status, active_run_id, queued_prompts FROM sessions WHERE id = ?1",
+                    "SELECT status, active_run_id, preparing_run_id, queued_prompts
+                     FROM sessions WHERE id = ?1",
                     [session_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(|_| SessionRuntimeError::Persistence)?
@@ -1159,7 +1254,7 @@ fn execute_command(
             // Compaction is valid only while the session is idle: a running
             // run keeps the context it started with, and a queued prompt
             // must not race the summarizer.
-            if status != "idle" || active_run.is_some() || queued > 0 {
+            if status != "idle" || active_run.is_some() || preparing_run.is_some() || queued > 0 {
                 return Err(SessionRuntimeError::SessionActive);
             }
             let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
@@ -1238,9 +1333,32 @@ fn execute_command(
     })
 }
 
-fn claim_next_run(
+fn reserve_next_run(
     connection: &mut Connection,
     store_id: StoreId,
+    children: bool,
+) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
+    // A preparation reservation is unpublished coordination: the prompt,
+    // message, and queued run were already committed under FULL. In WAL mode,
+    // NORMAL keeps this transaction consistent and process-crash durable while
+    // allowing an OS/power loss to discard only the recoverable pointer. FULL
+    // is restored before any authoritative start or terminal transaction.
+    connection
+        .pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let reserved = reserve_next_run_recoverable(connection, store_id, children);
+    let restored = connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(|_| SessionRuntimeError::Persistence);
+    match (reserved, restored) {
+        (_, Err(error)) => Err(error),
+        (result, Ok(())) => result,
+    }
+}
+
+fn reserve_next_run_recoverable(
+    connection: &mut Connection,
+    _store_id: StoreId,
     children: bool,
 ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
     let transaction = connection
@@ -1250,11 +1368,14 @@ fn claim_next_run(
         .query_row(
             "SELECT r.id, r.session_id, r.command_id, r.user_message_id, r.kind,
                     s.workspace_id, w.path, s.model, s.max_output_tokens, s.organization,
-                    (SELECT c.request_json FROM commands c WHERE c.id = r.command_id)
+                    r.context_compaction_attempted,
+                    (SELECT c.request_json FROM commands c WHERE c.id = r.command_id),
+                    s.pending_context_overflow_model_json
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
              WHERE r.status = 'queued' AND s.active_run_id IS NULL
+               AND s.preparing_run_id IS NULL
                AND (s.parent_id IS NOT NULL) = ?1
              ORDER BY COALESCE((
                          SELECT MAX(previous.started_at_ms)
@@ -1276,7 +1397,9 @@ fn claim_next_run(
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<u32>>(8)?,
                     row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, bool>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             },
         )
@@ -1293,7 +1416,9 @@ fn claim_next_run(
         model,
         max_tokens,
         organization,
+        context_compaction_attempted,
         command_request,
+        pending_context_overflow_model,
     )) = row
     else {
         return Ok(None);
@@ -1317,81 +1442,21 @@ fn claim_next_run(
     };
     let kind = parse_run_kind(&kind)?;
     let workspace_id: WorkspaceId = parse_id(&workspace)?;
-    let now = now_ms();
     let model = ModelSelection {
         model,
         max_output_tokens: max_tokens,
         organization,
     };
-    // Threshold trigger: a prompt about to run on an oversized assembly
-    // compacts first; the prompt stays queued and runs right after. This is
-    // evaluated only here — between runs — so a run in flight always
-    // completes on the context it started with. The guard on the session's
-    // most recently finished run yields exactly one automatic attempt per
-    // prompt: straight after a compaction (auto or manual, whatever its
-    // outcome) the prompt proceeds regardless, so a summarizer failure — or
-    // a pathological summary that did not shrink the assembly under the
-    // threshold — can never loop.
-    let mut over_budget = false;
-    if kind == RunKind::Prompt {
-        let assembled = assembled_context_bytes(&transaction, session_id)?;
-        // The queued prompt has not joined the assembly yet (its message row
-        // is still 'queued'); measure what the claimed run would send.
-        let prompt_bytes: u64 = transaction
-            .query_row(
-                "SELECT length(CAST(output AS BLOB)) FROM messages WHERE id = ?1",
-                [user_message_id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|_| SessionRuntimeError::Persistence)?;
-        let total = assembled.saturating_add(usize::try_from(prompt_bytes).unwrap_or(usize::MAX));
-        // Two compaction triggers share the one-attempt no-thrash guard: the
-        // assembled byte budget, and a provider context-window overflow on
-        // the session's previous run. Bytes approximate tokens loosely, so a
-        // token-dense context can overflow the model window while still
-        // under the byte threshold; the failure-driven trigger makes the
-        // next prompt compact-then-continue instead of failing again.
-        if total > AUTO_COMPACT_CONTEXT_BYTES
-            || last_run_failed_with_context_overflow(&transaction, session_id)?
-        {
-            if !last_finished_run_was_compaction(&transaction, session_id)? {
-                return claim_auto_compaction(
-                    transaction,
-                    store_id,
-                    workspace_id,
-                    workspace_path,
-                    session_id,
-                    model,
-                    now,
-                );
-            }
-            // The one attempt already happened; past the hard budget the run
-            // fails with the context policy failure instead of reaching the
-            // model.
-            over_budget = total > MAX_CONTEXT_BYTES;
-        }
+    let reserved = transaction
+        .execute(
+            "UPDATE sessions SET preparing_run_id = ?2
+             WHERE id = ?1 AND active_run_id IS NULL AND preparing_run_id IS NULL",
+            params![session, run],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if reserved != 1 {
+        return Ok(None);
     }
-    transaction
-        .execute(
-            "UPDATE runs SET status = 'running', started_at_ms = ?2 WHERE id = ?1",
-            params![run, now],
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    transaction
-        .execute(
-            "UPDATE messages SET state = 'complete' WHERE id = ?1",
-            [user_message],
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    transaction
-        .execute(
-            "UPDATE sessions
-             SET active_run_id = ?2, status = 'running', queued_prompts = queued_prompts - 1,
-                 updated_at_ms = ?3
-             WHERE id = ?1",
-            params![session, run, now],
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
     let messages = match kind {
         RunKind::Prompt => {
             let user_ordinal: u64 = transaction
@@ -1401,7 +1466,17 @@ fn claim_next_run(
                     |row| row.get(0),
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
-            load_model_context(&transaction, session_id, user_ordinal)?
+            let prompt: String = transaction
+                .query_row(
+                    "SELECT output FROM messages WHERE id = ?1 AND state = 'queued'",
+                    [user_message_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let mut context =
+                load_model_context(&transaction, session_id, user_ordinal.saturating_sub(1))?;
+            context.push(Message::user(prompt));
+            context
         }
         RunKind::Compaction => {
             // The summarization request is the session's assembled context —
@@ -1416,32 +1491,17 @@ fn claim_next_run(
             context
         }
     };
-    let context_base_bytes =
-        i64::try_from(context_bytes(&messages)).map_err(|_| SessionRuntimeError::OutputTooLarge)?;
-    transaction
-        .execute(
-            "UPDATE runs
-             SET context_base_bytes = ?2, context_increment_bytes = 0
-             WHERE id = ?1 AND status = 'running'",
-            params![run_id.to_string(), context_base_bytes],
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let summary = load_session_summary(&transaction, session_id)?;
-    let started = append_event(
-        &transaction,
-        EventContext {
-            store_id,
-            workspace_id,
-            session_id,
-            run_id: Some(run_id),
-            caused_by: None,
-            occurred_at_ms: now,
-        },
-        SessionEvent::RunStarted {
-            session: summary,
-            run_id,
-        },
-    )?;
+    let context_overflow_model = if kind == RunKind::Prompt {
+        pending_context_overflow_model
+            .map(|model| {
+                serde_json::from_str(&model)
+                    .map(Arc::new)
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1457,143 +1517,195 @@ fn claim_next_run(
         literal_slash,
         model,
         messages,
-        started,
-        over_budget,
+        context_compaction_attempted,
+        context_overflow_model,
     }))
 }
 
-/// True when the session's most recently finished run — any outcome — was a
-/// compaction. The claim path consults this as its no-thrash guard: crossing
-/// the threshold triggers at most one automatic compaction per prompt, and a
-/// fresh trigger requires the context to grow past the threshold again after
-/// some other run.
-fn last_finished_run_was_compaction(
-    transaction: &Transaction<'_>,
-    session_id: SessionId,
-) -> Result<bool, SessionRuntimeError> {
-    let kind: Option<String> = transaction
-        .query_row(
-            "SELECT kind FROM runs
-             WHERE session_id = ?1 AND outcome_json IS NOT NULL
-             ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(kind.as_deref() == Some("compaction"))
+fn prepared_context_bytes(weight: PreparedRequestWeight) -> Result<i64, SessionRuntimeError> {
+    i64::try_from(
+        weight
+            .system_bytes
+            .saturating_add(weight.tool_schema_bytes)
+            .saturating_add(weight.reducible_message_bytes)
+            .saturating_add(weight.irreducible_message_bytes),
+    )
+    .map_err(|_| SessionRuntimeError::OutputTooLarge)
 }
 
-/// True when the session's most recently finished prompt run failed because
-/// the provider rejected the request as exceeding the model context window.
-/// The claim path uses this as a compaction trigger so the next prompt
-/// recovers instead of hitting the same wall.
-fn last_run_failed_with_context_overflow(
-    transaction: &Transaction<'_>,
-    session_id: SessionId,
-) -> Result<bool, SessionRuntimeError> {
-    let outcome_json: Option<String> = transaction
-        .query_row(
-            "SELECT outcome_json FROM runs
-             WHERE session_id = ?1 AND outcome_json IS NOT NULL
-             ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let Some(outcome_json) = outcome_json else {
-        return Ok(false);
-    };
-    let Ok(outcome) = serde_json::from_str::<RunOutcome>(&outcome_json) else {
-        // An unreadable historical outcome must not block claiming.
-        return Ok(false);
-    };
-    Ok(matches!(
-        outcome,
-        RunOutcome::Failed {
-            failure: RunFailure {
-                kind: RunFailureKind::ProviderContextExceeded,
-                ..
-            }
-        }
-    ))
-}
-
-/// Claims an automatic compaction run for `session_id` in place of the
-/// queued prompt that crossed the context threshold. The prompt run is left
-/// untouched — still queued, still counted, its user message still pending —
-/// so it is the session's next claim once the compaction settles. The
-/// compaction run is ordinary in every other way: same kind, events, usage
-/// and cost accounting, and internal-run transcript exclusion as a manual
-/// `CompactSession`; `auto_compaction = 1` marks its provenance in the run
-/// row.
-fn claim_auto_compaction(
-    transaction: Transaction<'_>,
+fn start_reserved_run(
+    connection: &mut Connection,
     store_id: StoreId,
-    workspace_id: WorkspaceId,
-    workspace_path: String,
-    session_id: SessionId,
-    model: ModelSelection,
-    now: u64,
-) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
-    let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
-    // No client command requested this run; a generated id satisfies the
-    // unique command column without joining the commands table.
-    let command_id = CommandId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
-    // Internal runs persist no message rows; the ids are placeholders
-    // satisfying the runs schema.
-    let user_message_id = MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
-    let assistant_message_id =
-        MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
-    transaction
+    claimed: &ClaimedRun,
+    audit: &PreparedRunAudit,
+) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
+    let prompt_identity = serde_json::to_string(audit.prompt_identity.as_ref())
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let resolved_model = serde_json::to_string(audit.resolved_model.as_ref())
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let context_base_bytes = prepared_context_bytes(audit.weight)?;
+    let now = now_ms();
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let run_started = transaction
         .execute(
-            "INSERT INTO runs(
-                id, session_id, command_id, user_message_id, assistant_message_id,
-                status, kind, auto_compaction, created_at_ms, started_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', 'compaction', 1, ?6, ?6)",
+            "UPDATE runs
+             SET status = 'running', started_at_ms = ?3,
+                 prompt_identity_json = ?4, resolved_model_json = ?5,
+                 context_base_bytes = ?6, context_increment_bytes = 0
+             WHERE id = ?1 AND session_id = ?2 AND status = 'queued'
+               AND outcome_json IS NULL AND cancel_requested = 0",
             params![
-                run_id.to_string(),
-                session_id.to_string(),
-                command_id.to_string(),
-                user_message_id.to_string(),
-                assistant_message_id.to_string(),
+                claimed.run_id.to_string(),
+                claimed.session_id.to_string(),
+                now,
+                prompt_identity,
+                resolved_model,
+                context_base_bytes,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if run_started != 1 {
+        return Ok(None);
+    }
+    let session_started = transaction
+        .execute(
+            "UPDATE sessions
+             SET active_run_id = ?2, preparing_run_id = NULL, status = 'running',
+                 queued_prompts = queued_prompts - 1, updated_at_ms = ?3
+             WHERE id = ?1 AND active_run_id IS NULL AND preparing_run_id = ?2
+               AND queued_prompts > 0",
+            params![
+                claimed.session_id.to_string(),
+                claimed.run_id.to_string(),
                 now,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    // `queued_prompts` keeps counting the waiting prompt; it runs next.
+    if session_started != 1 {
+        return Ok(None);
+    }
     transaction
         .execute(
-            "UPDATE sessions
-             SET active_run_id = ?2, status = 'running', updated_at_ms = ?3
-             WHERE id = ?1",
-            params![session_id.to_string(), run_id.to_string(), now],
+            "UPDATE messages SET state = 'complete'
+             WHERE run_id = ?1 AND role = 'user' AND state = 'queued'",
+            [claimed.run_id.to_string()],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    // The summarization request assembles exactly like a manual compaction:
-    // the queued prompt's message is still pending and therefore excluded.
-    let mut context = load_model_context(&transaction, session_id, u64::MAX)?;
-    context.push(Message::user(compaction_instruction(
-        &transaction,
-        session_id,
-    )?));
-    let context_base_bytes =
-        i64::try_from(context_bytes(&context)).map_err(|_| SessionRuntimeError::OutputTooLarge)?;
-    transaction
-        .execute(
-            "UPDATE runs SET context_base_bytes = ?2, context_increment_bytes = 0
-             WHERE id = ?1 AND status = 'running'",
-            params![run_id.to_string(), context_base_bytes],
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let summary = load_session_summary(&transaction, session_id)?;
+    let summary = load_session_summary(&transaction, claimed.session_id)?;
     let started = append_event(
         &transaction,
         EventContext {
             store_id,
-            workspace_id,
-            session_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: None,
+            occurred_at_ms: now,
+        },
+        SessionEvent::RunStarted {
+            session: summary,
+            run_id: claimed.run_id,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(Some(started))
+}
+
+fn start_auto_compaction(
+    connection: &mut Connection,
+    store_id: StoreId,
+    original: &ClaimedRun,
+    audit: &PreparedRunAudit,
+) -> Result<Option<(ClaimedRun, SessionEventEnvelope)>, SessionRuntimeError> {
+    let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let command_id = CommandId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let user_message_id = MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let assistant_message_id =
+        MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+    let prompt_identity = serde_json::to_string(audit.prompt_identity.as_ref())
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let resolved_model = serde_json::to_string(audit.resolved_model.as_ref())
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let context_base_bytes = prepared_context_bytes(audit.weight)?;
+    let now = now_ms();
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let attempted = transaction
+        .execute(
+            "UPDATE runs SET context_compaction_attempted = 1
+             WHERE id = ?1 AND session_id = ?2 AND status = 'queued'
+               AND outcome_json IS NULL AND cancel_requested = 0
+               AND context_compaction_attempted = 0",
+            params![original.run_id.to_string(), original.session_id.to_string()],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if attempted != 1 {
+        return Ok(None);
+    }
+    let reservation_valid: bool = transaction
+        .query_row(
+            "SELECT active_run_id IS NULL AND preparing_run_id = ?2
+             FROM sessions WHERE id = ?1",
+            params![original.session_id.to_string(), original.run_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if !reservation_valid {
+        return Ok(None);
+    }
+    transaction
+        .execute(
+            "INSERT INTO runs(
+                 id, session_id, command_id, user_message_id, assistant_message_id,
+                 status, kind, auto_compaction, auto_compaction_for_run_id,
+                 prompt_identity_json,
+                 resolved_model_json, context_base_bytes, context_increment_bytes,
+                 created_at_ms, started_at_ms
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, 'running', 'compaction', 1, ?6, ?7,
+                 ?8, ?9, 0, ?10, ?10
+             )",
+            params![
+                run_id.to_string(),
+                original.session_id.to_string(),
+                command_id.to_string(),
+                user_message_id.to_string(),
+                assistant_message_id.to_string(),
+                original.run_id.to_string(),
+                prompt_identity,
+                resolved_model,
+                context_base_bytes,
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let session_started = transaction
+        .execute(
+            "UPDATE sessions SET active_run_id = ?2, status = 'running', updated_at_ms = ?3
+             WHERE id = ?1 AND active_run_id IS NULL AND preparing_run_id = ?4",
+            params![
+                original.session_id.to_string(),
+                run_id.to_string(),
+                now,
+                original.run_id.to_string(),
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if session_started != 1 {
+        return Ok(None);
+    }
+    let summary = load_session_summary(&transaction, original.session_id)?;
+    let started = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: original.workspace_id,
+            session_id: original.session_id,
             run_id: Some(run_id),
             caused_by: None,
             occurred_at_ms: now,
@@ -1606,23 +1718,105 @@ fn claim_auto_compaction(
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(Some(ClaimedRun {
-        workspace_id,
-        workspace: workspace_path,
-        session_id,
-        run_id,
-        command_id,
-        kind: RunKind::Compaction,
-        // Compaction runs are internal: execute_run never installs the
-        // subagent spawner for them, so child-ness is irrelevant here.
-        child: false,
-        user_initiated: false,
-        literal_slash: false,
-        model,
-        messages: context,
+    Ok(Some((
+        ClaimedRun {
+            workspace_id: original.workspace_id,
+            workspace: original.workspace.clone(),
+            session_id: original.session_id,
+            run_id,
+            command_id,
+            kind: RunKind::Compaction,
+            child: original.child,
+            user_initiated: false,
+            literal_slash: false,
+            model: original.model.clone(),
+            messages: Vec::new(),
+            context_compaction_attempted: true,
+            context_overflow_model: None,
+        },
         started,
-        over_budget: false,
-    }))
+    )))
+}
+
+fn load_auto_compaction_messages(
+    connection: &mut Connection,
+    session_id: SessionId,
+) -> Result<Vec<Message>, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut messages = load_model_context(&transaction, session_id, u64::MAX)?;
+    messages.push(Message::user(compaction_instruction(
+        &transaction,
+        session_id,
+    )?));
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(messages)
+}
+
+fn reload_reserved_messages(
+    connection: &mut Connection,
+    claimed: &ClaimedRun,
+) -> Result<Option<(Vec<Message>, bool)>, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let row = transaction
+        .query_row(
+            "SELECT r.status, r.cancel_requested, r.context_compaction_attempted,
+                    r.user_message_id, s.preparing_run_id, s.active_run_id
+             FROM runs r JOIN sessions s ON s.id = r.session_id
+             WHERE r.id = ?1 AND r.session_id = ?2",
+            params![claimed.run_id.to_string(), claimed.session_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let Some((status, cancelled, attempted, user_message_id, preparing, active)) = row else {
+        return Ok(None);
+    };
+    if status != "queued"
+        || cancelled
+        || preparing.as_deref() != Some(claimed.run_id.to_string().as_str())
+        || active.is_some()
+    {
+        return Ok(None);
+    }
+    let user_ordinal: u64 = transaction
+        .query_row(
+            "SELECT ordinal FROM messages WHERE id = ?1",
+            [user_message_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let prompt: String = transaction
+        .query_row(
+            "SELECT output FROM messages WHERE id = ?1 AND state = 'queued'",
+            [user_message_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut messages = load_model_context(
+        &transaction,
+        claimed.session_id,
+        user_ordinal.saturating_sub(1),
+    )?;
+    messages.push(Message::user(prompt));
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(Some((messages, attempted)))
 }
 
 /// Creates the assistant message for one model turn and appends its first
@@ -1725,7 +1919,6 @@ fn append_text(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    reserve_context_capacity(&transaction, claimed.run_id, text.len())?;
     let streaming = transaction
         .query_row(
             "SELECT 1 FROM messages WHERE id = ?1 AND state = 'streaming'",
@@ -1737,6 +1930,7 @@ fn append_text(
     if streaming.is_none() {
         return Err(SessionRuntimeError::Unavailable);
     }
+    reserve_context_capacity(&transaction, claimed.run_id, text.len())?;
     insert_message_chunk(&transaction, message_id, channel, &text)?;
     let event = append_event(
         &transaction,
@@ -1826,22 +2020,23 @@ fn persist_model_turn(
     } else {
         &[]
     };
-    let non_text_bytes = message.content().iter().fold(0_usize, |total, block| {
-        total.saturating_add(match block {
-            ContentBlock::Text { .. } => 0,
-            ContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            } => id
-                .len()
-                .saturating_add(name.len())
-                .saturating_add(arguments.to_string().len()),
-            ContentBlock::ToolResult {
-                call_id, content, ..
-            } => call_id.len().saturating_add(content.len()),
-        })
-    });
+    let full_message_bytes = crate::measure_message(message);
+    let already_reserved_text_bytes = if turn_message.is_some() {
+        message
+            .content()
+            .iter()
+            .fold(0_u64, |total, block| match block {
+                ContentBlock::Text { text } => {
+                    total.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX))
+                }
+                ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. } => total,
+            })
+    } else {
+        0
+    };
+    let non_text_bytes =
+        usize::try_from(full_message_bytes.saturating_sub(already_reserved_text_bytes))
+            .map_err(|_| SessionRuntimeError::OutputTooLarge)?;
     reserve_context_capacity(&transaction, claimed.run_id, non_text_bytes)?;
     // Completing the turn's message in the same transaction as the turn row
     // keeps message state and turn persistence atomic: after a crash, a
@@ -2207,12 +2402,19 @@ fn finish_tool_call(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let provider_call_id = transaction
+    let (provider_call_id, first_result_in_turn) = transaction
         .query_row(
-            "SELECT provider_call_id FROM tool_calls
-             WHERE id = ?1 AND run_id = ?2 AND state = 'running'",
+            "SELECT current.provider_call_id,
+                    NOT EXISTS(
+                        SELECT 1 FROM tool_calls previous
+                        WHERE previous.run_id = current.run_id
+                          AND previous.turn_ordinal = current.turn_ordinal
+                          AND previous.result IS NOT NULL
+                    )
+             FROM tool_calls current
+             WHERE current.id = ?1 AND current.run_id = ?2 AND current.state = 'running'",
             params![tool_call_id.to_string(), claimed.run_id.to_string()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
         )
         .optional()
         .map_err(|_| SessionRuntimeError::Persistence)?
@@ -2220,10 +2422,12 @@ fn finish_tool_call(
     // The display payload is deliberately absent from the capacity check: it
     // never enters model context, so it cannot crowd the context budget. The
     // provider call id does enter the next ToolResult block and is counted.
-    reserve_context_capacity(
+    reserve_tool_result_capacity(
         &transaction,
         claimed.run_id,
-        provider_call_id.len().saturating_add(result.len()),
+        &provider_call_id,
+        &result,
+        first_result_in_turn,
     )?;
     let now = now_ms();
     let state = if is_error { "failed" } else { "completed" };
@@ -2391,20 +2595,29 @@ fn deny_tool_call(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let provider_call_id = transaction
+    let (provider_call_id, first_result_in_turn) = transaction
         .query_row(
-            "SELECT provider_call_id FROM tool_calls
-             WHERE id = ?1 AND run_id = ?2 AND state = 'requested'",
+            "SELECT current.provider_call_id,
+                    NOT EXISTS(
+                        SELECT 1 FROM tool_calls previous
+                        WHERE previous.run_id = current.run_id
+                          AND previous.turn_ordinal = current.turn_ordinal
+                          AND previous.result IS NOT NULL
+                    )
+             FROM tool_calls current
+             WHERE current.id = ?1 AND current.run_id = ?2 AND current.state = 'requested'",
             params![tool_call_id.to_string(), claimed.run_id.to_string()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
         )
         .optional()
         .map_err(|_| SessionRuntimeError::Persistence)?
         .ok_or(SessionRuntimeError::ToolCallNotFound)?;
-    reserve_context_capacity(
+    reserve_tool_result_capacity(
         &transaction,
         claimed.run_id,
-        provider_call_id.len().saturating_add(message.len()),
+        &provider_call_id,
+        message,
+        first_result_in_turn,
     )?;
     let now = now_ms();
     let updated = transaction
@@ -2551,10 +2764,18 @@ fn conclude_tool_approval(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let (state, resolution, result, provider_call_id) = transaction
+    let (state, resolution, result, provider_call_id, first_result_in_turn) = transaction
         .query_row(
-            "SELECT state, approval_resolution, result, provider_call_id FROM tool_calls
-             WHERE id = ?1 AND run_id = ?2",
+            "SELECT current.state, current.approval_resolution, current.result,
+                    current.provider_call_id,
+                    NOT EXISTS(
+                        SELECT 1 FROM tool_calls previous
+                        WHERE previous.run_id = current.run_id
+                          AND previous.turn_ordinal = current.turn_ordinal
+                          AND previous.result IS NOT NULL
+                    )
+             FROM tool_calls current
+             WHERE current.id = ?1 AND current.run_id = ?2",
             params![tool_call_id.to_string(), claimed.run_id.to_string()],
             |row| {
                 Ok((
@@ -2562,6 +2783,7 @@ fn conclude_tool_approval(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             },
         )
@@ -2587,12 +2809,12 @@ fn conclude_tool_approval(
     if !timed_out || state != "awaiting_approval" {
         return Ok(ConcludedApproval::StillWaiting);
     }
-    reserve_context_capacity(
+    reserve_tool_result_capacity(
         &transaction,
         claimed.run_id,
-        provider_call_id
-            .len()
-            .saturating_add(approval::TIMEOUT_DENIED_RESULT.len()),
+        &provider_call_id,
+        approval::TIMEOUT_DENIED_RESULT,
+        first_result_in_turn,
     )?;
     let now = now_ms();
     transaction
@@ -2718,6 +2940,29 @@ fn settle_grant_promotion(
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(Some(event))
+}
+
+fn reserve_tool_result_capacity(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    provider_call_id: &str,
+    result: &str,
+    first_result_in_turn: bool,
+) -> Result<(), SessionRuntimeError> {
+    let framing =
+        (crate::CONTEXT_BLOCK_FRAMING_BYTES as usize).saturating_add(if first_result_in_turn {
+            crate::CONTEXT_MESSAGE_FRAMING_BYTES as usize
+        } else {
+            0
+        });
+    reserve_context_capacity(
+        transaction,
+        run_id,
+        provider_call_id
+            .len()
+            .saturating_add(result.len())
+            .saturating_add(framing),
+    )
 }
 
 fn reserve_context_capacity(
@@ -2911,7 +3156,10 @@ fn complete_compaction(
         // session unknown until its next prompt turn reports exact usage.
         transaction
             .execute(
-                "UPDATE sessions SET context_tokens = NULL WHERE id = ?1",
+                "UPDATE sessions
+                 SET context_tokens = NULL,
+                     pending_context_overflow_model_json = NULL
+                 WHERE id = ?1",
                 [claimed.session_id.to_string()],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3002,6 +3250,29 @@ fn finalize_run(
     let saw_turn = accounting
         .as_ref()
         .is_some_and(|accounting| accounting.saw_turn);
+    let pending_context_overflow_model = if claimed.kind == RunKind::Prompt
+        && matches!(
+            &outcome,
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::ProviderContextExceeded,
+                    ..
+                }
+            }
+        ) {
+        Some(
+            transaction
+                .query_row(
+                    "SELECT resolved_model_json FROM runs WHERE id = ?1",
+                    [claimed.run_id.to_string()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::Persistence)?,
+        )
+    } else {
+        None
+    };
     let (current_cost, current_cost_known) = transaction
         .query_row(
             "SELECT estimated_cost_usd_nanos, cost_known FROM sessions WHERE id = ?1",
@@ -3059,6 +3330,9 @@ fn finalize_run(
                       THEN ?8
                       ELSE context_tokens
                   END,
+                  pending_context_overflow_model_json = COALESCE(
+                      ?10, pending_context_overflow_model_json
+                  ),
                   updated_at_ms = ?2
              WHERE id = ?1 AND active_run_id = ?3",
             params![
@@ -3071,6 +3345,7 @@ fn finalize_run(
                 saw_turn,
                 reported_context_tokens,
                 &claimed.model.model,
+                pending_context_overflow_model,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3118,27 +3393,55 @@ fn finish_queued_run(
     run_id: RunId,
     now: u64,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let outcome = RunOutcome::Cancelled;
+    finish_queued_run_with_outcome(
+        transaction,
+        store_id,
+        workspace_id,
+        session_id,
+        run_id,
+        RunOutcome::Cancelled,
+        now,
+    )
+}
+
+fn finish_queued_run_with_outcome(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    workspace_id: WorkspaceId,
+    session_id: SessionId,
+    run_id: RunId,
+    outcome: RunOutcome,
+    now: u64,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let outcome = cancellation_wins(transaction, run_id, outcome)?;
+    let (run_status, message_state) = outcome_states(&outcome);
     let outcome_json =
         serde_json::to_string(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
-    transaction
+    let settled = transaction
         .execute(
             "UPDATE runs
-             SET status = 'cancelled', outcome_json = ?2, finished_at_ms = ?3
+             SET status = ?2, outcome_json = ?3, finished_at_ms = ?4
              WHERE id = ?1 AND status = 'queued'",
-            params![run_id.to_string(), outcome_json, now],
+            params![run_id.to_string(), run_status, outcome_json, now],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    if settled != 1 {
+        return Err(SessionRuntimeError::Unavailable);
+    }
     transaction
         .execute(
-            "UPDATE messages SET state = 'cancelled' WHERE run_id = ?1",
-            [run_id.to_string()],
+            "UPDATE messages SET state = ?2 WHERE run_id = ?1 AND state = 'queued'",
+            params![run_id.to_string(), message_state],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     transaction
         .execute(
             "UPDATE sessions
              SET queued_prompts = queued_prompts - 1,
+                 preparing_run_id = CASE
+                     WHEN preparing_run_id = ?3 THEN NULL
+                     ELSE preparing_run_id
+                 END,
                  status = CASE
                      WHEN active_run_id IS NOT NULL THEN 'running'
                      WHEN queued_prompts > 1 THEN 'queued'
@@ -3146,7 +3449,7 @@ fn finish_queued_run(
                  END,
                  updated_at_ms = ?2
              WHERE id = ?1",
-            params![session_id.to_string(), now],
+            params![session_id.to_string(), now, run_id.to_string()],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let summary = load_session_summary(transaction, session_id)?;
@@ -3171,6 +3474,265 @@ fn finish_queued_run(
     )
 }
 
+fn finish_reserved_run(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    outcome: RunOutcome,
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let state = transaction
+        .query_row(
+            "SELECT status, outcome_json FROM runs WHERE id = ?1 AND session_id = ?2",
+            params![claimed.run_id.to_string(), claimed.session_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let Some((status, stored_outcome)) = state else {
+        return Ok(Vec::new());
+    };
+    if stored_outcome.is_some() {
+        return Ok(Vec::new());
+    }
+    if status != "queued" {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let mut events = vec![finish_queued_run_with_outcome(
+        &transaction,
+        store_id,
+        claimed.workspace_id,
+        claimed.session_id,
+        claimed.run_id,
+        outcome,
+        now_ms(),
+    )?];
+    append_parent_session_update(
+        &transaction,
+        store_id,
+        claimed.workspace_id,
+        claimed.session_id,
+        claimed.command_id,
+        now_ms(),
+        &mut events,
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(events)
+}
+
+fn finish_prepared_run(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    audit: &PreparedRunAudit,
+    outcome: RunOutcome,
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    let prompt_identity = serde_json::to_string(audit.prompt_identity.as_ref())
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let resolved_model = serde_json::to_string(audit.resolved_model.as_ref())
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let context_base_bytes = prepared_context_bytes(audit.weight)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let state = transaction
+        .query_row(
+            "SELECT status, outcome_json FROM runs WHERE id = ?1 AND session_id = ?2",
+            params![claimed.run_id.to_string(), claimed.session_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let Some((status, stored_outcome)) = state else {
+        return Ok(Vec::new());
+    };
+    if stored_outcome.is_some() {
+        return Ok(Vec::new());
+    }
+    if status != "queued" {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let recorded = transaction
+        .execute(
+            "UPDATE runs
+             SET prompt_identity_json = ?3, resolved_model_json = ?4,
+                 context_base_bytes = ?5, context_increment_bytes = 0
+             WHERE id = ?1 AND session_id = ?2 AND status = 'queued'
+               AND outcome_json IS NULL",
+            params![
+                claimed.run_id.to_string(),
+                claimed.session_id.to_string(),
+                prompt_identity,
+                resolved_model,
+                context_base_bytes,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if recorded != 1 {
+        return Err(SessionRuntimeError::Unavailable);
+    }
+    let mut events = vec![finish_queued_run_with_outcome(
+        &transaction,
+        store_id,
+        claimed.workspace_id,
+        claimed.session_id,
+        claimed.run_id,
+        outcome,
+        now_ms(),
+    )?];
+    append_parent_session_update(
+        &transaction,
+        store_id,
+        claimed.workspace_id,
+        claimed.session_id,
+        claimed.command_id,
+        now_ms(),
+        &mut events,
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(events)
+}
+
+struct PanickedExecutionSettlement {
+    events: Vec<SessionEventEnvelope>,
+    run_ids: Vec<RunId>,
+}
+
+/// Settles whichever durable state an execution task owned when it panicked.
+/// The task may still be preparing its original queued prompt, may have
+/// started that prompt, or may have atomically handed the session to a
+/// distinct auto-compaction while retaining the prompt reservation.
+fn settle_panicked_execution(
+    connection: &mut Connection,
+    store_id: StoreId,
+    original: &ClaimedRun,
+    outcome: RunOutcome,
+) -> Result<PanickedExecutionSettlement, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let session_state = transaction
+        .query_row(
+            "SELECT active_run_id, preparing_run_id FROM sessions WHERE id = ?1",
+            [original.session_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let Some((active_run, _preparing_run)) = session_state else {
+        return Ok(PanickedExecutionSettlement {
+            events: Vec::new(),
+            run_ids: Vec::new(),
+        });
+    };
+    let original_id = original.run_id.to_string();
+    let original_state = transaction
+        .query_row(
+            "SELECT status, outcome_json
+             FROM runs WHERE id = ?1 AND session_id = ?2",
+            params![original_id, original.session_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut events = Vec::with_capacity(3);
+    // Cleanup ownership is independent of whether this transaction emits a
+    // new terminal event: a concurrent cancel may already have settled the
+    // original while its task still owns the in-memory registration.
+    let mut run_ids = vec![original.run_id];
+    if let Some(active_run) = active_run {
+        let active = transaction
+            .query_row(
+                "SELECT command_id, kind, auto_compaction_for_run_id, status, outcome_json
+                 FROM runs WHERE id = ?1 AND session_id = ?2",
+                params![active_run, original.session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        if let Some((command_id, kind, auto_compaction_for_run_id, status, stored_outcome)) = active
+            && (active_run == original_id
+                || auto_compaction_for_run_id.as_deref() == Some(original_id.as_str()))
+            && status == "running"
+            && stored_outcome.is_none()
+        {
+            let active_run_id: RunId = parse_id(&active_run)?;
+            let active_claim = ClaimedRun {
+                workspace_id: original.workspace_id,
+                workspace: String::new(),
+                session_id: original.session_id,
+                run_id: active_run_id,
+                command_id: parse_id(&command_id)?,
+                kind: parse_run_kind(&kind)?,
+                child: original.child,
+                user_initiated: false,
+                literal_slash: false,
+                model: original.model.clone(),
+                messages: Vec::new(),
+                context_compaction_attempted: true,
+                context_overflow_model: None,
+            };
+            events.push(complete_run_in_transaction(
+                &transaction,
+                store_id,
+                &active_claim,
+                outcome.clone(),
+            )?);
+            if !run_ids.contains(&active_run_id) {
+                run_ids.push(active_run_id);
+            }
+        }
+    }
+    if let Some((status, stored_outcome)) = original_state
+        && status == "queued"
+        && stored_outcome.is_none()
+    {
+        events.push(finish_queued_run_with_outcome(
+            &transaction,
+            store_id,
+            original.workspace_id,
+            original.session_id,
+            original.run_id,
+            outcome,
+            now_ms(),
+        )?);
+    }
+    if !events.is_empty() {
+        append_parent_session_update(
+            &transaction,
+            store_id,
+            original.workspace_id,
+            original.session_id,
+            original.command_id,
+            now_ms(),
+            &mut events,
+        )?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(PanickedExecutionSettlement { events, run_ids })
+}
+
 struct OwnedChildCancellations {
     committed_through: Option<EventCursor>,
     running: Vec<RunId>,
@@ -3189,7 +3751,12 @@ fn owned_running_run_ids(
             "SELECT r.id
              FROM sessions child JOIN runs r ON r.session_id = child.id
              WHERE child.owner_run_id = ?1
-               AND r.status = 'running' AND r.cancel_requested = 1
+               AND r.cancel_requested = 1
+               AND (
+                   r.status = 'running'
+                   OR (r.status = 'queued' AND child.preparing_run_id = r.id)
+                   OR r.status = 'cancelled'
+               )
              ORDER BY r.created_at_ms, r.rowid",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3201,6 +3768,34 @@ fn owned_running_run_ids(
             parse_id(&run)
         })
         .collect()
+}
+
+fn cancellation_signal_run_ids(
+    connection: &Connection,
+    cancelled_run_id: RunId,
+) -> Result<Vec<RunId>, SessionRuntimeError> {
+    let mut run_ids = owned_running_run_ids(connection, cancelled_run_id)?;
+    let auto_compaction = connection
+        .query_row(
+            "SELECT active.id
+             FROM runs cancelled
+             JOIN sessions session ON session.id = cancelled.session_id
+             JOIN runs active ON active.id = session.active_run_id
+             WHERE cancelled.id = ?1
+               AND active.kind = 'compaction' AND active.auto_compaction = 1
+               AND active.status = 'running' AND active.cancel_requested = 1",
+            [cancelled_run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if let Some(auto_compaction) = auto_compaction {
+        let run_id = parse_id(&auto_compaction)?;
+        if !run_ids.contains(&run_id) {
+            run_ids.push(run_id);
+        }
+    }
+    Ok(run_ids)
 }
 
 /// Cancels every unfinished run in a session spawned by `owner_run_id`.
@@ -3216,7 +3811,8 @@ fn cancel_owned_child_runs(
 ) -> Result<OwnedChildCancellations, SessionRuntimeError> {
     let mut statement = transaction
         .prepare(
-            "SELECT r.id, child.id, child.workspace_id, r.status
+            "SELECT r.id, child.id, child.workspace_id, r.status,
+                    COALESCE(child.preparing_run_id = r.id, 0)
              FROM sessions child JOIN runs r ON r.session_id = child.id
              WHERE child.owner_run_id = ?1 AND r.status IN ('queued', 'running')
              ORDER BY r.created_at_ms, r.rowid",
@@ -3229,6 +3825,7 @@ fn cancel_owned_child_runs(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         })
         .map_err(|_| SessionRuntimeError::Persistence)?
@@ -3239,7 +3836,7 @@ fn cancel_owned_child_runs(
     let mut committed_through = None;
     let mut running = Vec::new();
     let mut settled_queued = false;
-    for (run, session, workspace, status) in owned {
+    for (run, session, workspace, status, preparing) in owned {
         let run_id: RunId = parse_id(&run)?;
         let session_id: SessionId = parse_id(&session)?;
         let workspace_id: WorkspaceId = parse_id(&workspace)?;
@@ -3271,6 +3868,12 @@ fn cancel_owned_child_runs(
                     .cursor,
             );
             settled_queued = true;
+            if preparing {
+                // The durable row is terminal, but its loader/runtime
+                // preparation may still be holding a permit. Signal that
+                // task so parent cancellation and shutdown can quiesce.
+                running.push(run_id);
+            }
         } else {
             committed_through = Some(requested.cursor);
             running.push(run_id);
@@ -3343,6 +3946,18 @@ fn recover_interrupted_runs(
 ) -> Result<Vec<EventCursor>, SessionRuntimeError> {
     let transaction = connection
         .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    // Reservation is process-local work backed by a queued run. A crash may
+    // leave the pointer behind before RunStarted; clearing it makes that same
+    // queued row eligible again. The per-prompt compaction-attempt marker is
+    // deliberately retained: once a compaction start committed, recovery
+    // must not spend a second attempt.
+    transaction
+        .execute(
+            "UPDATE sessions SET preparing_run_id = NULL
+             WHERE preparing_run_id IS NOT NULL",
+            [],
+        )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     // A spawned child can be durably queued while its owner was running when
     // the process stopped. Settle it before recovering running rows: once the
@@ -3424,22 +4039,8 @@ fn recover_interrupted_runs(
             literal_slash: false,
             model: ModelSelection::default(),
             messages: Vec::new(),
-            over_budget: false,
-            started: SessionEventEnvelope {
-                cursor: EventCursor {
-                    store_id,
-                    workspace_id,
-                    sequence: 0,
-                },
-                session_id,
-                run_id: Some(run_id),
-                caused_by: None,
-                occurred_at_ms: 0,
-                event: SessionEvent::RunStarted {
-                    session: load_session_summary(&transaction, session_id)?,
-                    run_id,
-                },
-            },
+            context_compaction_attempted: false,
+            context_overflow_model: None,
         };
         let event =
             complete_run_in_transaction(&transaction, store_id, &claimed, RunOutcome::Interrupted)?;
@@ -3902,7 +4503,8 @@ fn load_session_accounting(
     let mut statement = connection
         .prepare(
             "SELECT r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos,
-                    EXISTS(SELECT 1 FROM model_turns turn WHERE turn.run_id = r.id)
+                    EXISTS(SELECT 1 FROM model_turns turn WHERE turn.run_id = r.id),
+                    r.started_at_ms
              FROM runs r
              JOIN sessions owner ON owner.id = r.session_id
              WHERE owner.id = ?1 OR owner.parent_id = ?1
@@ -3917,6 +4519,7 @@ fn load_session_accounting(
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<u64>>(3)?,
                 row.get::<_, bool>(4)?,
+                row.get::<_, Option<u64>>(5)?,
             ))
         })
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3925,7 +4528,7 @@ fn load_session_accounting(
     let mut direct = AccountingAggregate::known_zero();
     let mut inclusive = AccountingAggregate::known_zero();
     for row in rows {
-        let (owner_id, status, encoded_usage, cost, saw_turn) =
+        let (owner_id, status, encoded_usage, cost, saw_turn, started_at_ms) =
             row.map_err(|_| SessionRuntimeError::Persistence)?;
         let Some(encoded_usage) = encoded_usage else {
             let terminal = matches!(
@@ -3936,7 +4539,7 @@ fn load_session_accounting(
             // request and preserves known prior accounting. Other terminal
             // rows without usage stay unknown for legacy/provider-failure
             // compatibility; a committed turn is always an explicit unknown.
-            if saw_turn || (terminal && status != "cancelled") {
+            if saw_turn || (terminal && status != "cancelled" && started_at_ms.is_some()) {
                 inclusive.mark_unknown();
                 if owner_id == session_id {
                     direct.mark_unknown();
@@ -4507,7 +5110,19 @@ fn compaction_instruction(
     if paths.is_empty() {
         instruction.push_str("(none recorded)\n");
     } else {
-        for path in paths {
+        let path_count = paths.len();
+        for (index, path) in paths.into_iter().enumerate() {
+            let required = 2_usize.saturating_add(path.len()).saturating_add(1);
+            if instruction.len().saturating_add(required) > context::COMPACTION_INSTRUCTION_BYTES {
+                let omitted = path_count.saturating_sub(index);
+                let notice = format!("- ... {omitted} additional paths omitted\n");
+                if instruction.len().saturating_add(notice.len())
+                    <= context::COMPACTION_INSTRUCTION_BYTES
+                {
+                    instruction.push_str(&notice);
+                }
+                break;
+            }
             instruction.push_str("- ");
             instruction.push_str(&path);
             instruction.push('\n');
@@ -4810,16 +5425,36 @@ fn delete_idle_session(
     command_id: CommandId,
     now: u64,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let active_run: Option<String> = transaction
+    let state = transaction
         .query_row(
-            "SELECT active_run_id FROM sessions WHERE id = ?1",
+            "SELECT status, active_run_id, preparing_run_id, queued_prompts,
+                    EXISTS(
+                        SELECT 1 FROM runs
+                        WHERE session_id = sessions.id
+                          AND status IN ('queued', 'running')
+                    )
+             FROM sessions WHERE id = ?1",
             [session_id.to_string()],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, u16>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(|_| SessionRuntimeError::Persistence)?
         .ok_or(SessionRuntimeError::SessionNotFound)?;
-    if active_run.is_some() {
+    let (status, active_run, preparing_run, queued_prompts, unfinished) = state;
+    if status != "idle"
+        || active_run.is_some()
+        || preparing_run.is_some()
+        || queued_prompts != 0
+        || unfinished
+    {
         return Err(SessionRuntimeError::SessionActive);
     }
     let parent_id = session_parent(transaction, session_id)?;
@@ -5250,8 +5885,8 @@ mod tests {
                 "INSERT INTO runs(
                      id, session_id, command_id, user_message_id,
                      assistant_message_id, status, outcome_json, usage_json,
-                     estimated_cost_usd_nanos, created_at_ms, finished_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, 1, 2)",
+                     estimated_cost_usd_nanos, created_at_ms, started_at_ms, finished_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, 1, 1, 2)",
                 params![
                     run_id.to_string(),
                     session_id.to_string(),
@@ -5636,6 +6271,38 @@ mod tests {
                 }),
                 Ok(qq_provider::ProviderEvent::Completed { usage: None }),
             ]))
+        }
+    }
+
+    struct CountingTextLoader {
+        provider_calls: Arc<AtomicUsize>,
+    }
+
+    impl RuntimeLoader for CountingTextLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider_calls = Arc::clone(&self.provider_calls);
+            Box::pin(async move {
+                struct CountingTextProvider(Arc<AtomicUsize>);
+
+                impl Provider for CountingTextProvider {
+                    fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(stream::iter([
+                            Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                                text: "done".to_owned(),
+                            }),
+                            Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                        ]))
+                    }
+                }
+
+                Runtime::new(CountingTextProvider(provider_calls), "test-model", 256)
+                    .map(|runtime| loaded_runtime(runtime, None))
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
         }
     }
 
@@ -6886,7 +7553,7 @@ mod tests {
                 ..
             } if *finished == run_id
                 && failure.kind == RunFailureKind::Server
-                && failure.message.contains("failed to persist the run prompt identity")
+                && failure.message.contains("failed to persist prepared run state")
         )));
         runtime.shutdown().await.unwrap();
     }
@@ -6970,7 +7637,7 @@ mod tests {
                 ..
             } if *finished == run_id
                 && failure.kind == RunFailureKind::Server
-                && failure.message.contains("failed to persist the resolved model")
+                && failure.message.contains("failed to persist prepared run state")
         )));
         let persisted: Option<String> = Connection::open(&database_path)
             .unwrap()
@@ -6994,7 +7661,18 @@ mod tests {
             fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
                 let provider_calls = Arc::clone(&self.provider_calls);
                 Box::pin(async move {
-                    Runtime::new(CountingContextProvider { provider_calls }, "test-model", 1)
+                    struct PricedTinyContextProvider(Arc<AtomicUsize>);
+
+                    impl Provider for PricedTinyContextProvider {
+                        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                                usage: None,
+                            })]))
+                        }
+                    }
+
+                    Runtime::new(PricedTinyContextProvider(provider_calls), "test-model", 1)
                         .map(|runtime| runtime.with_context_window(Some(1)))
                         .map(|runtime| {
                             let mut loaded = loaded_runtime(runtime, None);
@@ -7008,19 +7686,6 @@ mod tests {
                             message: error.to_string(),
                         })
                 })
-            }
-        }
-
-        struct CountingContextProvider {
-            provider_calls: Arc<AtomicUsize>,
-        }
-
-        impl Provider for CountingContextProvider {
-            fn stream(&self, _request: ModelRequest) -> ProviderStream {
-                self.provider_calls.fetch_add(1, Ordering::AcqRel);
-                Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
-                    usage: None,
-                })]))
             }
         }
 
@@ -7057,6 +7722,133 @@ mod tests {
             } if failure.kind == RunFailureKind::Policy
         )));
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overloaded_prepared_rejection_retries_and_keeps_priced_accounting_known_zero() {
+        struct PricedTinyContextLoader {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for PricedTinyContextLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    struct PricedTinyContextProvider(Arc<AtomicUsize>);
+
+                    impl Provider for PricedTinyContextProvider {
+                        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                                usage: None,
+                            })]))
+                        }
+                    }
+
+                    Runtime::new(PricedTinyContextProvider(provider_calls), "test-model", 1)
+                        .map(|runtime| runtime.with_context_window(Some(1)))
+                        .map(|runtime| {
+                            let mut loaded = loaded_runtime(
+                                runtime,
+                                Some(ModelPricing {
+                                    input_usd_nanos_per_token: 1_000,
+                                    output_usd_nanos_per_token: 2_000,
+                                    cache_read_usd_nanos_per_token: Some(100),
+                                    cache_write_usd_nanos_per_token: Some(300),
+                                    context_tier: None,
+                                    provenance: "priced-test".to_owned(),
+                                }),
+                            );
+                            Arc::get_mut(&mut loaded.resolved_model)
+                                .unwrap()
+                                .context_window = Some(1);
+                            loaded
+                        })
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(PricedTinyContextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "known overflow".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store::fail_prepared_settlements(run_id, [SessionRuntimeError::Overloaded]);
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        runtime.request_schedule();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(observed.iter().all(|event| !matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id: started, .. } if started == run_id
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Policy,
+                        ..
+                    }
+                },
+                ..
+            } if *finished == run_id
+        )));
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 2,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(
+            focused.summary.accounting.unwrap().direct,
+            AccountingTotal {
+                usage: Some(usage(0, 0)),
+                estimated_cost_usd_nanos: Some(0),
+            }
+        );
+        assert!(focused.runs[0].resolved_model.is_some());
+        assert!(!*runtime.inner.failed.borrow());
     }
 
     #[tokio::test]
@@ -7254,6 +8046,7 @@ mod tests {
         directory: TempDir,
         runtime: SessionRuntime,
         models: Arc<StdMutex<Vec<Option<String>>>>,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
         workspace_id: WorkspaceId,
         session_id: SessionId,
         store_id: StoreId,
@@ -7263,11 +8056,12 @@ mod tests {
     async fn session_management_harness() -> SessionManagementHarness {
         let directory = tempfile::tempdir().unwrap();
         let models = Arc::new(StdMutex::new(Vec::new()));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let runtime = SessionRuntime::open(
             SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
             Arc::new(RecordingApprovalLoader {
                 models: Arc::clone(&models),
-                requests: Arc::new(StdMutex::new(Vec::new())),
+                requests: Arc::clone(&requests),
             }),
         )
         .await
@@ -7290,6 +8084,7 @@ mod tests {
             directory,
             runtime,
             models,
+            requests,
             workspace_id,
             session_id,
             store_id: created.committed_through.store_id,
@@ -7747,7 +8542,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(
             !connection
@@ -7874,7 +8669,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -7942,7 +8737,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         let (display_json, result) = connection
             .query_row(
@@ -8001,7 +8796,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -8066,7 +8861,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -8154,7 +8949,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -8210,7 +9005,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -8254,7 +9049,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         for column in [
             "model_json",
@@ -8321,7 +9116,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -8363,7 +9158,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -8433,7 +9228,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "16"
+            "17"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -8447,6 +9242,273 @@ mod tests {
             None
         );
         assert_eq!(load_run(&connection, run_id).unwrap().resolved_model, None);
+    }
+
+    #[test]
+    fn version_seventeen_migration_adds_preparation_and_exact_compaction_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let run_id = RunId::generate().unwrap();
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/v16-preparation')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                     id, workspace_id, title, status, queued_prompts, approval_mode,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'Queued', 'queued', 1, 'ask', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(
+                     id, session_id, command_id, user_message_id, assistant_message_id,
+                     status, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 1)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    CommandId::generate().unwrap().to_string(),
+                    MessageId::generate().unwrap().to_string(),
+                    MessageId::generate().unwrap().to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '16' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("ALTER TABLE sessions DROP COLUMN preparing_run_id", [])
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN pending_context_overflow_model_json",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs DROP COLUMN context_compaction_attempted",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs DROP COLUMN auto_compaction_for_run_id",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "17"
+        );
+        let preparing_shape: (String, bool, Option<String>) = connection
+            .query_row(
+                "SELECT type, [notnull], dflt_value
+                 FROM pragma_table_info('sessions') WHERE name = 'preparing_run_id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preparing_shape, ("TEXT".to_owned(), false, None));
+        let overflow_shape: (String, bool, Option<String>) = connection
+            .query_row(
+                "SELECT type, [notnull], dflt_value
+                 FROM pragma_table_info('sessions')
+                 WHERE name = 'pending_context_overflow_model_json'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(overflow_shape, ("TEXT".to_owned(), false, None));
+        let attempted_shape: (String, bool, Option<String>) = connection
+            .query_row(
+                "SELECT type, [notnull], dflt_value
+                 FROM pragma_table_info('runs') WHERE name = 'context_compaction_attempted'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            attempted_shape,
+            ("INTEGER".to_owned(), true, Some("0".to_owned()))
+        );
+        let row: (String, bool, Option<String>) = connection
+            .query_row(
+                "SELECT status, context_compaction_attempted,
+                        auto_compaction_for_run_id
+                 FROM runs WHERE id = ?1",
+                [run_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("queued".to_owned(), false, None));
+        let (preparing, pending_overflow): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT preparing_run_id, pending_context_overflow_model_json
+                 FROM sessions WHERE id = ?1",
+                [session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preparing, None);
+        assert_eq!(pending_overflow, None);
+    }
+
+    #[test]
+    fn partially_applied_version_seventeen_migration_completes_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '16' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs DROP COLUMN auto_compaction_for_run_id",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert!(has_column(&connection, "sessions", "preparing_run_id").unwrap());
+        assert!(
+            has_column(
+                &connection,
+                "sessions",
+                "pending_context_overflow_model_json"
+            )
+            .unwrap()
+        );
+        assert!(has_column(&connection, "runs", "context_compaction_attempted").unwrap());
+        assert!(has_column(&connection, "runs", "auto_compaction_for_run_id").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "17"
+        );
+    }
+
+    #[test]
+    fn malformed_version_seventeen_preparation_schema_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN pending_context_overflow_model_json",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN pending_context_overflow_model_json
+                 INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            open_database(&path),
+            Err(SessionRuntimeError::Persistence)
+        ));
+    }
+
+    #[test]
+    fn failed_version_seventeen_validation_rolls_back_schema_and_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '16' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN pending_context_overflow_model_json",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs DROP COLUMN context_compaction_attempted",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs ADD COLUMN context_compaction_attempted TEXT",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            open_database(&path),
+            Err(SessionRuntimeError::Persistence)
+        ));
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "16"
+        );
+        assert!(
+            !has_column(
+                &connection,
+                "sessions",
+                "pending_context_overflow_model_json"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT type FROM pragma_table_info('runs')
+                     WHERE name = 'context_compaction_attempted'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "TEXT"
+        );
     }
 
     fn rewrite_run_capacity_schema(
@@ -9321,21 +10383,6 @@ mod tests {
                 ],
             )
             .unwrap();
-        let started = SessionEventEnvelope {
-            cursor: EventCursor {
-                store_id,
-                workspace_id,
-                sequence: 0,
-            },
-            session_id,
-            run_id: Some(run_id),
-            caused_by: Some(command_id),
-            occurred_at_ms: 1,
-            event: SessionEvent::RunStarted {
-                session: load_session_summary(&connection, session_id).unwrap(),
-                run_id,
-            },
-        };
         let claimed = ClaimedRun {
             workspace_id,
             workspace: "/w".to_owned(),
@@ -9348,8 +10395,8 @@ mod tests {
             literal_slash: false,
             model: ModelSelection::default(),
             messages: Vec::new(),
-            started,
-            over_budget: false,
+            context_compaction_attempted: false,
+            context_overflow_model: None,
         };
         (
             directory,
@@ -9431,7 +10478,11 @@ mod tests {
             DenialCapacityPath::Client,
             DenialCapacityPath::Timeout,
         ] {
-            let result_bytes = "provider-call".len().saturating_add(path.result().len());
+            let result_bytes = "provider-call"
+                .len()
+                .saturating_add(path.result().len())
+                .saturating_add(crate::CONTEXT_MESSAGE_FRAMING_BYTES as usize)
+                .saturating_add(crate::CONTEXT_BLOCK_FRAMING_BYTES as usize);
             let (_directory, mut connection, store_id, claimed, tool_call_id, _) =
                 denial_capacity_fixture(path, MAX_CONTEXT_BYTES - result_bytes);
             apply_denial_capacity_path(&mut connection, store_id, &claimed, tool_call_id, path)
@@ -9576,6 +10627,114 @@ mod tests {
             .unwrap();
         let claimed = store.claim_next_run(false).await.unwrap().unwrap();
         (directory, store, claimed)
+    }
+
+    #[tokio::test]
+    async fn interleaved_turn_framing_accepts_exact_capacity_and_rejects_one_over() {
+        for one_over in [false, true] {
+            let (_directory, store, claimed) = claimed_store_fixture().await;
+            let message_id = MessageId::generate().unwrap();
+            let tool_call_id = ToolCallId::generate().unwrap();
+            let call = RuntimeToolCall {
+                id: tool_call_id,
+                turn_ordinal: 1,
+                call_ordinal: 1,
+                provider_call_id: "provider-call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"note.txt"}"#.to_owned(),
+                argument_error: None,
+            };
+            let message = Message::new(
+                Role::Assistant,
+                vec![
+                    ContentBlock::Text {
+                        text: "a".to_owned(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: call.provider_call_id.clone(),
+                        name: call.name.clone(),
+                        arguments: serde_json::from_str(&call.arguments).unwrap(),
+                    },
+                    ContentBlock::Text {
+                        text: "b".to_owned(),
+                    },
+                ],
+            );
+            let measured = crate::measure_message(&message);
+            let context_base = u64::try_from(MAX_CONTEXT_BYTES)
+                .unwrap()
+                .saturating_sub(measured)
+                .saturating_add(u64::from(one_over));
+            store
+                .call(Priority::Control, move |connection| {
+                    connection
+                        .execute(
+                            "UPDATE runs
+                             SET context_base_bytes = ?2, context_increment_bytes = 0
+                             WHERE id = ?1",
+                            params![claimed.run_id.to_string(), context_base],
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            store
+                .begin_assistant_message(
+                    &claimed,
+                    message_id,
+                    1,
+                    TextChannel::Output,
+                    "a".to_owned(),
+                )
+                .await
+                .unwrap();
+            store
+                .append_text(&claimed, message_id, TextChannel::Output, "b".to_owned())
+                .await
+                .unwrap();
+            let result = store
+                .persist_model_turn(
+                    &claimed,
+                    ModelTurnCommit {
+                        turn_ordinal: 1,
+                        message,
+                        calls: vec![call],
+                        turn_message: Some(message_id),
+                        context_tokens: None,
+                        usage: None,
+                        estimated_cost_usd_nanos: None,
+                        accounting: None,
+                    },
+                )
+                .await;
+            let (increment, turns, calls, state): (u64, u64, u64, String) = store
+                .call(Priority::Control, move |connection| {
+                    connection
+                        .query_row(
+                            "SELECT r.context_increment_bytes,
+                                    (SELECT COUNT(*) FROM model_turns WHERE run_id = r.id),
+                                    (SELECT COUNT(*) FROM tool_calls WHERE run_id = r.id),
+                                    m.state
+                             FROM runs r JOIN messages m ON m.id = ?2
+                             WHERE r.id = ?1",
+                            params![claimed.run_id.to_string(), message_id.to_string()],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)
+                })
+                .await
+                .unwrap();
+            if one_over {
+                assert_eq!(result.unwrap_err(), SessionRuntimeError::OutputTooLarge);
+                assert_eq!(increment, 2);
+                assert_eq!((turns, calls, state.as_str()), (0, 0, "streaming"));
+            } else {
+                result.unwrap();
+                assert_eq!(increment, measured);
+                assert_eq!((turns, calls, state.as_str()), (1, 1, "complete"));
+            }
+        }
     }
 
     async fn streaming_transaction_state(
@@ -10240,7 +11399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_session_is_refused_while_a_run_is_active_and_runs_toolless_after() {
+    async fn compact_session_is_refused_while_active_and_rejects_undeclared_provider_tools() {
         let mut harness = session_management_harness().await;
         let queued = harness
             .runtime
@@ -10285,14 +11444,23 @@ mod tests {
         collect_through_finished(&mut harness.events).await;
 
         // Idle now: the compaction queues and executes through the ordinary
-        // machinery. The provider requests a tool on its first turn, but
-        // internal runs deny every call without persisting or prompting.
+        // machinery. Its request declares no tools, so a provider tool call
+        // is a protocol violation and cannot create a transient second turn.
+        let request_count_before = harness.requests.lock().unwrap().len();
         let compaction_run = compact_session(&harness.runtime, harness.session_id).await;
-        let observed = collect_through_compacted(&mut harness.events).await;
+        let observed = collect_through_finished(&mut harness.events).await;
         assert!(observed.iter().any(|event| matches!(
             &event.event,
-            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
-                if *run_id == compaction_run
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::ProviderProtocol,
+                        ..
+                    }
+                },
+                ..
+            } if *run_id == compaction_run
         )));
         assert!(
             !observed.iter().any(|event| matches!(
@@ -10304,6 +11472,9 @@ mod tests {
             )),
             "an internal run must publish no transcript or tool events"
         );
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(requests.len(), request_count_before + 1);
+        assert!(requests.last().unwrap().tools().is_empty());
         // The summarizer loaded through the ordinary loader path.
         assert_eq!(harness.models.lock().unwrap().len(), 2);
     }
@@ -10518,12 +11689,16 @@ mod tests {
         ContextOverflow,
         /// Never yields: the run parks until cancelled.
         Stall,
+        /// Panics synchronously when the provider stream is created.
+        Panic,
     }
 
     struct AutoCompactLoader {
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
         scripts: Vec<AutoCompactScript>,
         loads: StdMutex<usize>,
+        context_window: Option<u32>,
+        max_output_tokens: u32,
     }
 
     impl RuntimeLoader for AutoCompactLoader {
@@ -10540,15 +11715,20 @@ mod tests {
                 requests: Arc::clone(&self.requests),
                 script,
             };
+            let context_window = self.context_window;
+            let max_output_tokens = self.max_output_tokens;
             Box::pin(async move {
-                Runtime::new(provider, "test-model", 256)
+                Runtime::new(provider, "test-model", max_output_tokens)
+                    .map(|runtime| runtime.with_context_window(context_window))
                     .map(|runtime| {
                         // Failure-path tests assert on the first error; turn
                         // retry is covered in lib.rs.
-                        loaded_runtime(
+                        let mut loaded = loaded_runtime(
                             runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
                             None,
-                        )
+                        );
+                        Arc::make_mut(&mut loaded.resolved_model).context_window = context_window;
+                        loaded
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -10581,6 +11761,7 @@ mod tests {
                     },
                 )])),
                 AutoCompactScript::Stall => Box::pin(stream::pending()),
+                AutoCompactScript::Panic => panic!("injected auto-compaction provider panic"),
             }
         }
     }
@@ -10590,11 +11771,27 @@ mod tests {
         runtime: SessionRuntime,
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
         workspace_path: PathBuf,
+        workspace_id: WorkspaceId,
         session_id: SessionId,
         events: SessionEventStream,
     }
 
     async fn auto_compact_harness(scripts: Vec<AutoCompactScript>) -> AutoCompactHarness {
+        auto_compact_harness_with_window(scripts, None).await
+    }
+
+    async fn auto_compact_harness_with_window(
+        scripts: Vec<AutoCompactScript>,
+        context_window: Option<u32>,
+    ) -> AutoCompactHarness {
+        auto_compact_harness_with_limits(scripts, context_window, 256).await
+    }
+
+    async fn auto_compact_harness_with_limits(
+        scripts: Vec<AutoCompactScript>,
+        context_window: Option<u32>,
+        max_output_tokens: u32,
+    ) -> AutoCompactHarness {
         let directory = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let runtime = SessionRuntime::open(
@@ -10603,6 +11800,8 @@ mod tests {
                 requests: Arc::clone(&requests),
                 scripts,
                 loads: StdMutex::new(0),
+                context_window,
+                max_output_tokens,
             }),
         )
         .await
@@ -10624,6 +11823,7 @@ mod tests {
             runtime,
             requests,
             workspace_path,
+            workspace_id,
             session_id,
             events,
         }
@@ -10682,10 +11882,52 @@ mod tests {
             .unwrap()
     }
 
-    /// An output that pushes the assembled context past the auto-compaction
-    /// threshold while staying comfortably under the hard budget.
+    /// A large prior answer that still fits its originating run, while a
+    /// maximum-sized queued prompt pushes the next request past the storage
+    /// backstop. The compaction request omits that queued prompt and fits.
     fn over_threshold_output() -> String {
-        "x".repeat(AUTO_COMPACT_CONTEXT_BYTES + 64 * 1024)
+        "x".repeat(MAX_CONTEXT_BYTES - 100 * 1024)
+    }
+
+    #[test]
+    fn compaction_instruction_bounds_large_utf8_file_lists() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/bounded-instruction')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                     id, workspace_id, title, status, approval_mode,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'Bounded', 'idle', 'ask', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        for ordinal in 0..100 {
+            let path = format!("目录/{ordinal:03}/{}", "é".repeat(4_000));
+            connection
+                .execute(
+                    "INSERT INTO session_files(session_id, path, content_hash, updated_at_ms)
+                     VALUES (?1, ?2, 'hash', 1)",
+                    params![session_id.to_string(), path],
+                )
+                .unwrap();
+        }
+
+        let instruction = compaction_instruction(&connection, session_id).unwrap();
+
+        assert!(instruction.len() <= context::COMPACTION_INSTRUCTION_BYTES);
+        assert!(instruction.contains("目录/"));
+        assert!(instruction.contains("additional paths omitted"));
+        assert!(instruction.is_char_boundary(instruction.len()));
     }
 
     #[tokio::test]
@@ -10713,7 +11955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crossing_the_byte_threshold_compacts_before_the_queued_prompt() {
+    async fn storage_overflow_compacts_before_the_queued_prompt() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::Text(over_threshold_output()),
             AutoCompactScript::Text("the summary".to_owned()),
@@ -10724,7 +11966,12 @@ mod tests {
         let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
         collect_until(&mut harness.events, finished_for(first)).await;
 
-        let prompt = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let prompt = queue_prompt(
+            &harness.runtime,
+            harness.session_id,
+            "y".repeat(MAX_PROMPT_BYTES),
+        )
+        .await;
         let observed = collect_until(&mut harness.events, finished_for(prompt)).await;
 
         // The compaction claims first; the prompt stays queued and runs
@@ -10776,7 +12023,7 @@ mod tests {
             let after = request_texts(&requests[2]);
             assert!(after[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
             assert!(after[0].contains("the summary"));
-            assert_eq!(after[after.len() - 1], "over");
+            assert_eq!(after[after.len() - 1], "y".repeat(MAX_PROMPT_BYTES));
         }
 
         // The run row records automatic provenance.
@@ -10792,7 +12039,15 @@ mod tests {
                 .unwrap();
         assert!(auto);
         assert!(context_base_bytes.is_some_and(|bytes| bytes > 0));
-        assert_eq!(context_increment_bytes, 0);
+        assert_eq!(
+            context_increment_bytes,
+            i64::try_from(
+                crate::CONTEXT_MESSAGE_FRAMING_BYTES
+                    + crate::CONTEXT_BLOCK_FRAMING_BYTES
+                    + "the summary".len() as u64,
+            )
+            .unwrap()
+        );
 
         // No re-trigger: the assembly shrank below the threshold, so the
         // next prompt runs directly.
@@ -10803,6 +12058,182 @@ mod tests {
             SessionEvent::SessionCompacted { .. } => false,
             _ => true,
         }));
+    }
+
+    #[tokio::test]
+    async fn compaction_sends_and_persists_the_effective_output_cap() {
+        for (configured, expected) in [(1_024, 1_024), (4_096, 2_048)] {
+            let mut harness = auto_compact_harness_with_limits(
+                vec![
+                    AutoCompactScript::Text(over_threshold_output()),
+                    AutoCompactScript::Text("the summary".to_owned()),
+                    AutoCompactScript::Text("done".to_owned()),
+                ],
+                None,
+                configured,
+            )
+            .await;
+            let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+            collect_until(&mut harness.events, finished_for(first)).await;
+            let prompt = queue_prompt(
+                &harness.runtime,
+                harness.session_id,
+                "y".repeat(MAX_PROMPT_BYTES),
+            )
+            .await;
+            let observed = collect_until(&mut harness.events, finished_for(prompt)).await;
+            let compaction = observed
+                .iter()
+                .find_map(|event| match event.event {
+                    SessionEvent::RunStarted { run_id, .. } if run_id != prompt => Some(run_id),
+                    _ => None,
+                })
+                .expect("the automatic compaction must start");
+
+            {
+                let requests = harness.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[1].max_output_tokens(), expected);
+                assert!(requests[1].tools().is_empty());
+            }
+            assert!(observed.iter().any(|event| matches!(
+                &event.event,
+                SessionEvent::ModelTurnCompleted {
+                    run_id,
+                    model: ModelSelection {
+                        max_output_tokens: Some(cap),
+                        ..
+                    },
+                    ..
+                } if *run_id == compaction && *cap == expected
+            )));
+            let snapshot = harness
+                .runtime
+                .snapshot(SnapshotRequest {
+                    workspace_id: harness.workspace_id,
+                    focused_session_id: Some(harness.session_id),
+                    session_limit: 1,
+                    message_limit: 8,
+                })
+                .await
+                .unwrap();
+            let persisted = snapshot
+                .focused
+                .unwrap()
+                .runs
+                .into_iter()
+                .find(|run| run.id == compaction)
+                .and_then(|run| run.resolved_model)
+                .expect("the compaction must retain its resolved model audit");
+            assert_eq!(persisted.max_output_tokens, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn overloaded_reserved_reload_retries_after_auto_compaction() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text(over_threshold_output()),
+            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text("done".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let queued = harness
+            .runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "y".repeat(MAX_PROMPT_BYTES),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store::fail_reserved_reloads(run_id, [SessionRuntimeError::Overloaded]);
+        harness.runtime.request_schedule();
+        let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Completed,
+                ..
+            } if finished == run_id
+        )));
+        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+        assert!(!*harness.runtime.inner.failed.borrow());
+    }
+
+    #[tokio::test]
+    async fn permanent_reserved_reload_failure_settles_only_that_prompt() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text(over_threshold_output()),
+            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text("next completed".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let queued = harness
+            .runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "y".repeat(MAX_PROMPT_BYTES),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store::fail_reserved_reloads(run_id, [SessionRuntimeError::Persistence]);
+        harness.runtime.request_schedule();
+        let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Server,
+                        message,
+                    }
+                },
+                ..
+            } if *finished == run_id && message.contains("failed to reload the reserved prompt")
+        )));
+        assert!(!*harness.runtime.inner.failed.borrow());
+        let next = queue_prompt(&harness.runtime, harness.session_id, "next".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(next)).await;
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Completed,
+                ..
+            } if finished == next
+        )));
+        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+        assert!(!*harness.runtime.inner.failed.borrow());
     }
 
     #[tokio::test]
@@ -10864,6 +12295,277 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_manual_compaction_does_not_mask_provider_overflow_evidence() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::ContextOverflow,
+            AutoCompactScript::Fail,
+            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text("recovered".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "big ask".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let failed_compaction = compact_session(&harness.runtime, harness.session_id).await;
+        let failed = collect_until(&mut harness.events, finished_for(failed_compaction)).await;
+        assert!(failed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed { .. },
+                ..
+            } if *run_id == failed_compaction
+        )));
+
+        let retry = queue_prompt(&harness.runtime, harness.session_id, "retry".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(retry)).await;
+        let compacted = position_of(&observed, |event| {
+            matches!(event, SessionEvent::SessionCompacted { .. })
+        });
+        let prompt_started = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == retry),
+        );
+        assert!(compacted < prompt_started);
+        assert_eq!(
+            harness.requests.lock().unwrap().len(),
+            4,
+            "the retry must compact instead of repeating the known overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_prompt_does_not_mask_provider_overflow_evidence() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::ContextOverflow,
+            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text("recovered".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "big ask".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let queued = harness
+            .runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "cancel this".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: cancelled, ..
+        } = queued.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        harness
+            .runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: cancelled },
+            )
+            .await
+            .unwrap();
+
+        let retry = queue_prompt(&harness.runtime, harness.session_id, "retry".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(retry)).await;
+        let compacted = position_of(&observed, |event| {
+            matches!(event, SessionEvent::SessionCompacted { .. })
+        });
+        let prompt_started = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == retry),
+        );
+        assert!(compacted < prompt_started);
+        assert_eq!(
+            harness.requests.lock().unwrap().len(),
+            3,
+            "the retry must compact instead of repeating the known overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_overflow_evidence_survives_restart_until_compaction_commits() {
+        let mut harness = auto_compact_harness(vec![AutoCompactScript::ContextOverflow]).await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "big ask".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(first)).await;
+        let after = observed.last().unwrap().cursor;
+        let workspace_id = harness.workspace_id;
+        let session_id = harness.session_id;
+        let database_path = harness.workspace_path.join("sessions.sqlite3");
+        harness.runtime.close().await.unwrap();
+        drop(harness.runtime);
+
+        let connection = Connection::open(&database_path).unwrap();
+        let pending: Option<String> = connection
+            .query_row(
+                "SELECT pending_context_overflow_model_json FROM sessions WHERE id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pending.is_some());
+        drop(connection);
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(AutoCompactLoader {
+                requests: Arc::clone(&requests),
+                scripts: vec![
+                    AutoCompactScript::Text("the summary".to_owned()),
+                    AutoCompactScript::Text("recovered".to_owned()),
+                ],
+                loads: StdMutex::new(0),
+                context_window: None,
+                max_output_tokens: 256,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after,
+            })
+            .unwrap();
+        let retry = queue_prompt(&runtime, session_id, "retry after restart".to_owned()).await;
+        let observed = collect_until(&mut events, finished_for(retry)).await;
+        let compacted = position_of(&observed, |event| {
+            matches!(event, SessionEvent::SessionCompacted { .. })
+        });
+        let prompt_started = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == retry),
+        );
+        assert!(compacted < prompt_started);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        let connection = Connection::open(harness.workspace_path.join("sessions.sqlite3")).unwrap();
+        let pending: Option<String> = connection
+            .query_row(
+                "SELECT pending_context_overflow_model_json FROM sessions WHERE id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, None);
+    }
+
+    #[tokio::test]
+    async fn failed_overflow_recovery_never_resends_the_known_overflowing_prompt() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::ContextOverflow,
+            AutoCompactScript::Fail,
+            AutoCompactScript::Text("must not be polled".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "big ask".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let second = queue_prompt(&harness.runtime, harness.session_id, "retry".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Policy,
+                        message,
+                    },
+                },
+                ..
+            } if *run_id == second && message.contains("provider previously rejected")
+        )));
+        assert_eq!(
+            harness.requests.lock().unwrap().len(),
+            2,
+            "the second prompt must not repeat a provider-known overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_panic_settles_its_exact_prompt_reservation() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text(over_threshold_output()),
+            AutoCompactScript::Panic,
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let prompt = queue_prompt(
+            &harness.runtime,
+            harness.session_id,
+            "y".repeat(MAX_PROMPT_BYTES),
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(prompt)).await;
+        let compaction = observed
+            .iter()
+            .find_map(|event| match event.event {
+                SessionEvent::RunStarted { run_id, .. } if run_id != prompt => Some(run_id),
+                _ => None,
+            })
+            .expect("the automatic compaction must start before panicking");
+        for run_id in [compaction, prompt] {
+            assert!(observed.iter().any(|event| matches!(
+                &event.event,
+                SessionEvent::RunFinished {
+                    run_id: finished,
+                    outcome: RunOutcome::Failed {
+                        failure: RunFailure {
+                            kind: RunFailureKind::Server,
+                            ..
+                        }
+                    },
+                    ..
+                } if *finished == run_id
+            )));
+        }
+        assert!(
+            harness
+                .runtime
+                .inner
+                .store
+                .unfinished_run_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let created = create_session(&harness.runtime, harness.workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: next_session,
+        } = created.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let next = queue_prompt(&harness.runtime, next_session, "try again".to_owned()).await;
+        let continued = collect_until(&mut harness.events, finished_for(next)).await;
+        assert!(
+            continued.iter().any(|event| matches!(
+                event.event,
+                SessionEvent::RunFinished {
+                    run_id,
+                    outcome: RunOutcome::Completed,
+                    ..
+                } if run_id == next
+            )),
+            "subsequent scheduling did not recover: {continued:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn exceeding_the_hard_budget_compacts_once_and_the_prompt_proceeds() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::Text("x".repeat(MAX_CONTEXT_BYTES - 100 * 1024)),
@@ -10899,22 +12601,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_prompt_still_over_budget_after_compacting_fails_with_the_policy_outcome() {
-        let mut harness = auto_compact_harness(vec![
-            AutoCompactScript::Text("x".repeat(MAX_CONTEXT_BYTES - 100 * 1024)),
-            // Pathological summarizer: the summary is as large as the
-            // transcript it replaces, so the retry is still past the budget.
-            AutoCompactScript::Text("s".repeat(MAX_CONTEXT_BYTES - 100 * 1024)),
-        ])
+        let mut harness = auto_compact_harness_with_window(
+            vec![
+                AutoCompactScript::Text("x".repeat(20 * 1024)),
+                // Pathological summarizer: the summary is as large as the
+                // transcript it replaces, so the retry is still past the model
+                // window.
+                AutoCompactScript::Text("s".repeat(20 * 1024)),
+            ],
+            Some(32 * 1024),
+        )
         .await;
         let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
         collect_until(&mut harness.events, finished_for(first)).await;
 
-        let second = queue_prompt(
-            &harness.runtime,
-            harness.session_id,
-            "y".repeat(MAX_PROMPT_BYTES),
-        )
-        .await;
+        let second =
+            queue_prompt(&harness.runtime, harness.session_id, "y".repeat(10 * 1024)).await;
         let observed = collect_until(&mut harness.events, finished_for(second)).await;
         // The one attempt happened...
         assert!(
@@ -10940,7 +12642,7 @@ mod tests {
                     kind: RunFailureKind::Policy,
                     ref message,
                 }
-            } if message.contains("4 MiB limit")
+            } if message.contains("selected model")
         ));
         assert_eq!(harness.requests.lock().unwrap().len(), 2);
     }
@@ -10997,7 +12699,12 @@ mod tests {
         let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
         collect_until(&mut harness.events, finished_for(first)).await;
 
-        let second = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let second = queue_prompt(
+            &harness.runtime,
+            harness.session_id,
+            "y".repeat(MAX_PROMPT_BYTES),
+        )
+        .await;
         let observed = collect_until(&mut harness.events, finished_for(second)).await;
         // The summarizer failed and committed nothing...
         let compaction = observed
@@ -11017,29 +12724,42 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
         );
-        // ...and the prompt still ran to completion, with no second attempt.
+        // ...and the unchanged overflowing prompt fails closed after that one
+        // attempt instead of reaching the provider.
         assert!(observed.iter().any(|event| matches!(
             &event.event,
-            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
-                if *run_id == second
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Policy,
+                        ..
+                    },
+                },
+                ..
+            } if *run_id == second
         )));
-        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+        assert_eq!(harness.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn a_compaction_that_does_not_shrink_the_assembly_never_loops() {
-        let mut harness = auto_compact_harness(vec![
-            AutoCompactScript::Text(over_threshold_output()),
-            // The summary itself stays past the threshold: the guard must
-            // let the prompt proceed after the single attempt.
-            AutoCompactScript::Text(over_threshold_output()),
-            AutoCompactScript::Text("done".to_owned()),
-        ])
+        let mut harness = auto_compact_harness_with_window(
+            vec![
+                AutoCompactScript::Text("x".repeat(20 * 1024)),
+                // The summary itself stays past the threshold: the guard must
+                // reject the prompt after the single attempt.
+                AutoCompactScript::Text("s".repeat(20 * 1024)),
+                AutoCompactScript::Text("done".to_owned()),
+            ],
+            Some(32 * 1024),
+        )
         .await;
         let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
         collect_until(&mut harness.events, finished_for(first)).await;
 
-        let second = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let second =
+            queue_prompt(&harness.runtime, harness.session_id, "y".repeat(10 * 1024)).await;
         let observed = collect_until(&mut harness.events, finished_for(second)).await;
         let compactions = observed
             .iter()
@@ -11053,10 +12773,18 @@ mod tests {
         assert_eq!(compactions, 1, "exactly one automatic attempt per prompt");
         assert!(observed.iter().any(|event| matches!(
             &event.event,
-            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
-                if *run_id == second
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Policy,
+                        ..
+                    },
+                },
+                ..
+            } if *run_id == second
         )));
-        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+        assert_eq!(harness.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -11069,7 +12797,12 @@ mod tests {
         let first = queue_prompt(&harness.runtime, harness.session_id, "grow".to_owned()).await;
         collect_until(&mut harness.events, finished_for(first)).await;
 
-        let prompt = queue_prompt(&harness.runtime, harness.session_id, "over".to_owned()).await;
+        let prompt = queue_prompt(
+            &harness.runtime,
+            harness.session_id,
+            "y".repeat(MAX_PROMPT_BYTES),
+        )
+        .await;
         let observed = collect_until(
             &mut harness.events,
             |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id != prompt),
@@ -11756,14 +13489,14 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(base, "Say hello".len() as u64);
-        assert_eq!(increment, "hello".len() as u64);
-        let transaction = connection.unchecked_transaction().unwrap();
+        assert!(base > "Say hello".len() as u64);
         assert_eq!(
-            base + increment,
-            assembled_context_bytes(&transaction, session_id).unwrap() as u64
+            increment,
+            crate::CONTEXT_MESSAGE_FRAMING_BYTES
+                + crate::CONTEXT_BLOCK_FRAMING_BYTES
+                + "hello".len() as u64
         );
-        transaction.rollback().unwrap();
+        assert!(base + increment <= MAX_CONTEXT_BYTES as u64);
         assert!(snapshot.cursor.sequence > initial.sequence);
     }
 
@@ -11997,12 +13730,9 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        let transaction = connection.unchecked_transaction().unwrap();
-        assert_eq!(
-            base + increment,
-            assembled_context_bytes(&transaction, session_id).unwrap() as u64
-        );
-        transaction.rollback().unwrap();
+        assert!(base > "inspect the note".len() as u64);
+        assert!(increment > 0);
+        assert!(base + increment <= MAX_CONTEXT_BYTES as u64);
 
         runtime
             .command(
@@ -13375,7 +15105,7 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue after compaction".to_owned(),
+                    prompt: "y".repeat(MAX_PROMPT_BYTES),
                 },
             )
             .await
@@ -14149,6 +15879,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_panicking_loader_settles_the_reservation_without_run_started() {
+        struct PanicBeforeStartLoader {
+            loads: Arc<AtomicUsize>,
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for PanicBeforeStartLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let panic = self.loads.fetch_add(1, Ordering::SeqCst) == 0;
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    assert!(!panic, "injected loader panic before RunStarted");
+                    struct CountingProvider(Arc<AtomicUsize>);
+
+                    impl Provider for CountingProvider {
+                        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(stream::iter([
+                                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                                    text: "recovered".to_owned(),
+                                }),
+                                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                            ]))
+                        }
+                    }
+
+                    Runtime::new(CountingProvider(provider_calls), "test-model", 256)
+                        .map(|runtime| loaded_runtime(runtime, None))
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(PanicBeforeStartLoader {
+                loads: Arc::new(AtomicUsize::new(0)),
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let failed_run = queue_prompt(&runtime, session_id, "panic in load".to_owned()).await;
+        let failed = collect_until(&mut events, finished_for(failed_run)).await;
+        assert!(failed.iter().all(|event| !matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id, .. } if run_id == failed_run
+        )));
+        assert!(failed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Server,
+                        ..
+                    }
+                },
+                ..
+            } if *run_id == failed_run
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+        let next = queue_prompt(&runtime, session_id, "continue".to_owned()).await;
+        let continued = collect_until(&mut events, finished_for(next)).await;
+        assert!(continued.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Completed,
+                ..
+            } if run_id == next
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn shutdown_cancels_running_and_queued_prompts_before_returning() {
         let directory = tempfile::tempdir().unwrap();
         let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
@@ -14368,6 +16192,721 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overloaded_cancellation_read_and_start_retry_without_failing_the_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "retry the read".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store::fail_cancellation_reads(run_id, [SessionRuntimeError::Overloaded]);
+        store::fail_reserved_starts(run_id, [SessionRuntimeError::Overloaded]);
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        runtime.request_schedule();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id: started, .. } if started == run_id
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Completed,
+                ..
+            } if finished == run_id
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert!(!*runtime.inner.failed.borrow());
+    }
+
+    #[tokio::test]
+    async fn permanent_cancellation_read_failure_settles_only_that_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 2;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let first_session = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: first_session,
+        } = first_session.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let second_session = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: second_session,
+        } = second_session.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let first = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: first_session,
+                    prompt: "fail initialization".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: first_run, ..
+        } = first.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let second = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: second_session,
+                    prompt: "must not load".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: second_run, ..
+        } = second.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        store::fail_cancellation_reads(first_run, [SessionRuntimeError::Persistence]);
+        let (second_read, release_second) = store::hold_cancellation_read(second_run);
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: second.receipt.committed_through,
+            })
+            .unwrap();
+        runtime.request_schedule();
+        tokio::time::timeout(Duration::from_secs(1), second_read)
+            .await
+            .expect("both reservations must transfer to supervisors")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let run = runtime
+                    .inner
+                    .store
+                    .call(Priority::Control, move |connection| {
+                        load_run(connection, first_run)
+                    })
+                    .await
+                    .unwrap();
+                if run.outcome.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the permanent read error must settle its own run");
+        assert!(!*runtime.inner.failed.borrow());
+        release_second.send(()).unwrap();
+        let observed = collect_until(&mut events, finished_for(second_run)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.inner.permits.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both supervisors must release their permits");
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert!(observed.iter().all(|event| !matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id, .. } if run_id == first_run
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id, .. } if run_id == second_run
+        )));
+        let first = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, first_run)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            &first.outcome,
+            Some(RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Server,
+                    message,
+                }
+            }) if message.contains("failed to read reserved-run cancellation state")
+        ));
+        let second = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, second_run)
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.outcome, Some(RunOutcome::Completed));
+        assert!(!*runtime.inner.failed.borrow());
+    }
+
+    #[tokio::test]
+    async fn overloaded_start_cannot_race_past_a_sibling_runtime_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 2;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let first = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: first_session,
+        } = first.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let second = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: second_session,
+        } = second.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let retrying = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: first_session,
+                    prompt: "wait at start".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: retrying_run,
+            ..
+        } = retrying.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let failing = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: second_session,
+                    prompt: "fail initialization".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: failing_run,
+            ..
+        } = failing.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let (start_entered, release_start) = store::hold_overloaded_reserved_start(retrying_run);
+        let (read_entered, release_read) = store::hold_cancellation_read(failing_run);
+        store::fail_cancellation_reads(failing_run, [SessionRuntimeError::Persistence]);
+        store::fail_reserved_settlements(failing_run, [SessionRuntimeError::Persistence]);
+        runtime.request_schedule();
+        tokio::time::timeout(Duration::from_secs(1), start_entered)
+            .await
+            .expect("the first supervisor must enter the reserved-start attempt")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), read_entered)
+            .await
+            .expect("the sibling supervisor must own its reservation")
+            .unwrap();
+        release_read.send(()).unwrap();
+        let mut failed = runtime.inner.failed.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*failed.borrow() {
+                failed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the sibling terminal-settlement failure must fail the runtime");
+        release_start.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.inner.permits.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both supervisors must settle before releasing their permits");
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        let events = runtime
+            .inner
+            .store
+            .events_after(workspace_id, failing.receipt.committed_through.sequence, 16)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::RunStarted { .. }))
+        );
+        let retrying = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, retrying_run)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            retrying.outcome,
+            Some(RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Server,
+                    ..
+                }
+            })
+        ));
+        let failing = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, failing_run)
+            })
+            .await
+            .unwrap();
+        assert_eq!(failing.status, RunStatus::Queued);
+        assert_eq!(failing.outcome, None);
+    }
+
+    #[tokio::test]
+    async fn fatal_settlement_stops_an_already_started_sibling_before_provider_poll() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 2;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let started_session = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: started_session,
+        } = started_session.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let failing_session = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: failing_session,
+        } = failing_session.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let started = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: started_session,
+                    prompt: "start but do not poll".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: started_run,
+            ..
+        } = started.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let failing = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: failing_session,
+                    prompt: "fail settlement".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: failing_run,
+            ..
+        } = failing.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let (_initial_read, release_initial_read) = store::hold_cancellation_read(started_run);
+        let (post_start_read, release_post_start_read) = store::hold_cancellation_read(started_run);
+        let (failing_read, release_failing_read) = store::hold_cancellation_read(failing_run);
+        store::fail_cancellation_reads(failing_run, [SessionRuntimeError::Persistence]);
+        store::fail_reserved_settlements(failing_run, [SessionRuntimeError::Persistence]);
+        release_initial_read.send(()).unwrap();
+        runtime.request_schedule();
+        tokio::time::timeout(Duration::from_secs(1), post_start_read)
+            .await
+            .expect("the first run must commit start before provider polling")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), failing_read)
+            .await
+            .expect("the sibling supervisor must own its reservation")
+            .unwrap();
+        release_failing_read.send(()).unwrap();
+        let mut failed = runtime.inner.failed.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*failed.borrow() {
+                failed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the sibling terminal-settlement failure must fail the runtime");
+        release_post_start_read.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.inner.permits.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both supervisors must stop and return their permits");
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        let events = runtime
+            .inner
+            .store
+            .events_after(workspace_id, failing.receipt.committed_through.sequence, 16)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id, .. } if run_id == started_run
+        )));
+        assert!(events.iter().all(|event| !matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id, .. } if run_id == failing_run
+        )));
+        let started = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, started_run)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            started.outcome,
+            Some(RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Server,
+                    ..
+                }
+            })
+        ));
+        let failing = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, failing_run)
+            })
+            .await
+            .unwrap();
+        assert_eq!(failing.status, RunStatus::Queued);
+        assert_eq!(failing.outcome, None);
+    }
+
+    #[tokio::test]
+    async fn poisoned_cancellation_registry_settles_before_start_and_returns_the_permit() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 1;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "poisoned registry".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let poisoned = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = runtime.inner.cancellations.lock().unwrap();
+            panic!("poison cancellation registry for test");
+        }));
+        assert!(poisoned.is_err());
+        runtime.request_schedule();
+        let mut failed = runtime.inner.failed.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*failed.borrow() {
+                failed.changed().await.unwrap();
+            }
+            while runtime.inner.permits.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("poisoned registration must settle and release its permit");
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        let run = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, run_id)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            run.outcome,
+            Some(RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Server,
+                    ..
+                }
+            })
+        ));
+        let preparing: Option<String> = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT preparing_run_id FROM sessions WHERE id = ?1",
+                        [session_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(preparing, None);
+        let events = runtime
+            .inner
+            .store
+            .events_after(workspace_id, queued.receipt.committed_through.sequence, 8)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::RunStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_prestart_settlement_failure_is_recovered_on_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut options = SessionRuntimeOptions::new(database_path.clone());
+        options.max_active_runs = 1;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "recover me".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .execute(
+                        "UPDATE runs SET context_compaction_attempted = 1 WHERE id = ?1",
+                        [run_id.to_string()],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store::fail_cancellation_reads(run_id, [SessionRuntimeError::Persistence]);
+        store::fail_reserved_settlements(run_id, [SessionRuntimeError::Persistence]);
+        runtime.request_schedule();
+        let mut failed = runtime.inner.failed.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*failed.borrow() {
+                failed.changed().await.unwrap();
+            }
+            while runtime.inner.permits.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the permanent settlement failure must release its permit");
+        let (status, preparing): (String, Option<String>) = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT r.status, s.preparing_run_id
+                         FROM runs r JOIN sessions s ON s.id = r.session_id
+                         WHERE r.id = ?1",
+                        [run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "queued");
+        assert_eq!(preparing.as_deref(), Some(run_id.to_string().as_str()));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        runtime.inner.store.close().await.unwrap();
+        drop(runtime);
+
+        let recovered_calls = Arc::new(AtomicUsize::new(0));
+        let recovered = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&recovered_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = recovered
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: queued.receipt.committed_through,
+            })
+            .unwrap();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Completed,
+                ..
+            } if finished == run_id
+        )));
+        assert_eq!(recovered_calls.load(Ordering::SeqCst), 1);
+        let (attempted, preparing): (bool, Option<String>) = recovered
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT r.context_compaction_attempted, s.preparing_run_id
+                         FROM runs r JOIN sessions s ON s.id = r.session_id
+                         WHERE r.id = ?1",
+                        [run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert!(attempted);
+        assert_eq!(preparing, None);
+    }
+
+    #[tokio::test]
     async fn queues_follow_ups_without_reordering_conversation_context() {
         let directory = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -14436,7 +16975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_cancellation_requested_before_runtime_registration() {
+    async fn reservation_is_publicly_queued_exclusive_and_cancel_wins_before_start() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("sessions.sqlite3"))
             .await
@@ -14486,8 +17025,71 @@ mod tests {
         let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
             panic!("unexpected receipt")
         };
+        let second = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "later".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
 
-        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        let claimed = store.reserve_next_run(false).await.unwrap().unwrap();
+        assert_eq!(claimed.run_id, run_id);
+        let synchronous = store
+            .call(Priority::Control, |connection| {
+                connection
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            synchronous, 2,
+            "authoritative start and terminal commits must run under FULL"
+        );
+        assert!(store.reserve_next_run(false).await.unwrap().is_none());
+        assert!(
+            store
+                .events_after(workspace_id, second.receipt.committed_through.sequence, 100,)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let snapshot = store
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.summary.status, SessionStatus::Queued);
+        assert_eq!(focused.summary.active_run_id, None);
+        assert_eq!(focused.summary.queued_prompts, 2);
+        assert!(
+            focused
+                .runs
+                .iter()
+                .all(|run| run.status == RunStatus::Queued)
+        );
+        assert!(focused.messages.iter().all(|message| {
+            message.role != MessageRole::User || message.state == MessageState::Queued
+        }));
+        assert_eq!(
+            store
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::DeleteSession { session_id },
+                )
+                .await
+                .err(),
+            Some(SessionRuntimeError::SessionActive)
+        );
         store
             .command(
                 CommandId::generate().unwrap(),
@@ -14496,11 +17098,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.cancellation_requested(run_id).await.unwrap());
-        store
-            .finish_run(&claimed, RunOutcome::Completed, None)
-            .await
-            .unwrap();
+        assert!(
+            store
+                .start_reserved_run(&claimed, test_prepared_audit(&claimed))
+                .await
+                .unwrap()
+                .is_none()
+        );
         let run = store
             .call(Priority::Control, move |connection| {
                 load_run(connection, run_id)
@@ -14508,6 +17112,833 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.outcome, Some(RunOutcome::Cancelled));
+        let second_run_id = match second.receipt.outcome {
+            CommandOutcome::PromptQueued { run_id, .. } => run_id,
+            _ => panic!("unexpected receipt"),
+        };
+        store
+            .call(Priority::Control, move |connection| {
+                let deleted = connection
+                    .execute(
+                        "DELETE FROM messages WHERE run_id = ?1 AND role = 'user'",
+                        [second_run_id.to_string()],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                if deleted == 1 {
+                    Ok(())
+                } else {
+                    Err(SessionRuntimeError::Persistence)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.reserve_next_run(false).await.err(),
+            Some(SessionRuntimeError::Persistence)
+        );
+        let (synchronous, preparing): (i64, Option<String>) = store
+            .call(Priority::Control, move |connection| {
+                let synchronous = connection
+                    .pragma_query_value(None, "synchronous", |row| row.get(0))
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let preparing = connection
+                    .query_row(
+                        "SELECT preparing_run_id FROM sessions WHERE id = ?1",
+                        [session_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok((synchronous, preparing))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            synchronous, 2,
+            "reservation failures must restore FULL before returning"
+        );
+        assert_eq!(
+            preparing, None,
+            "the failed recoverable transaction must roll back its pointer"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_old_panic_cannot_settle_a_newer_auto_compaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+
+        let old = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "old".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id: old_id, .. } = old.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let old = store.reserve_next_run(false).await.unwrap().unwrap();
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: old_id },
+            )
+            .await
+            .unwrap();
+
+        let new = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "new".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id: new_id, .. } = new.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let new = store.reserve_next_run(false).await.unwrap().unwrap();
+        let (compaction, _) = store
+            .start_auto_compaction(&new, test_prepared_audit(&new))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let settlement = store
+            .settle_panicked_execution(
+                &old,
+                execution::internal_failure("delayed panic from an older scheduler task"),
+            )
+            .await
+            .unwrap();
+        assert!(settlement.events.is_empty());
+        assert_eq!(settlement.run_ids, vec![old_id]);
+        let (active, newer, session_state) = store
+            .call(Priority::Control, move |connection| {
+                Ok((
+                    load_run(connection, compaction.run_id)?,
+                    load_run(connection, new_id)?,
+                    connection
+                        .query_row(
+                            "SELECT active_run_id, preparing_run_id
+                             FROM sessions WHERE id = ?1",
+                            [session_id.to_string()],
+                            |row| {
+                                Ok((
+                                    row.get::<_, Option<String>>(0)?,
+                                    row.get::<_, Option<String>>(1)?,
+                                ))
+                            },
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(active.status, RunStatus::Running);
+        assert_eq!(active.outcome, None);
+        assert_eq!(newer.status, RunStatus::Queued);
+        assert_eq!(newer.outcome, None);
+        assert_eq!(session_state.0, Some(compaction.run_id.to_string()));
+        assert_eq!(session_state.1, Some(new_id.to_string()));
+
+        store
+            .finish_run(
+                &compaction,
+                execution::internal_failure("test cleanup"),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_reserved_run(&new, RunOutcome::Cancelled)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_interrupts_active_auto_compaction_without_spending_a_second_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "known provider overflow".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let original = store.reserve_next_run(false).await.unwrap().unwrap();
+        let pending =
+            serde_json::to_string(&test_resolved_model("test/model", "test-model", 256, None))
+                .unwrap();
+        store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .execute(
+                        "UPDATE sessions
+                         SET pending_context_overflow_model_json = ?2
+                         WHERE id = ?1",
+                        params![session_id.to_string(), pending],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (compaction, started) = store
+            .start_auto_compaction(&original, test_prepared_audit(&original))
+            .await
+            .unwrap()
+            .unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: started.cursor,
+            })
+            .unwrap();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Interrupted,
+                ..
+            } if finished == compaction.run_id
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Policy,
+                        message,
+                    }
+                },
+                ..
+            } if *finished == run_id && message.contains("provider previously rejected")
+        )));
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::RunStarted { .. }))
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        let (attempted, auto_runs, preparing, pending): (
+            bool,
+            u32,
+            Option<String>,
+            Option<String>,
+        ) = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT r.context_compaction_attempted,
+                                (SELECT COUNT(*) FROM runs c
+                                 WHERE c.auto_compaction_for_run_id = r.id),
+                                s.preparing_run_id,
+                                s.pending_context_overflow_model_json
+                         FROM runs r JOIN sessions s ON s.id = r.session_id
+                         WHERE r.id = ?1",
+                        [run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert!(attempted);
+        assert_eq!(auto_runs, 1);
+        assert_eq!(preparing, None);
+        assert!(pending.is_some());
+    }
+
+    #[tokio::test]
+    async fn version_sixteen_active_auto_compaction_backfills_exact_attempt_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let store = Store::open(database_path.clone()).await.unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "resume after legacy crash".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let original = store.reserve_next_run(false).await.unwrap().unwrap();
+        let (compaction, started) = store
+            .start_auto_compaction(&original, test_prepared_audit(&original))
+            .await
+            .unwrap()
+            .unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '16' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("ALTER TABLE sessions DROP COLUMN preparing_run_id", [])
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN pending_context_overflow_model_json",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs DROP COLUMN context_compaction_attempted",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs DROP COLUMN auto_compaction_for_run_id",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path),
+            Arc::new(CountingTextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: started.cursor,
+            })
+            .unwrap();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Interrupted,
+                ..
+            } if finished == compaction.run_id
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Completed,
+                ..
+            } if finished == run_id
+        )));
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        let (attempted, auto_runs, owner): (bool, u32, Option<String>) = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT original.context_compaction_attempted,
+                                (SELECT COUNT(*) FROM runs auto
+                                 WHERE auto.auto_compaction = 1
+                                   AND auto.session_id = original.session_id),
+                                auto.auto_compaction_for_run_id
+                         FROM runs original JOIN runs auto ON auto.id = ?2
+                         WHERE original.id = ?1",
+                        params![run_id.to_string(), compaction.run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert!(attempted);
+        assert_eq!(auto_runs, 1);
+        assert_eq!(owner.as_deref(), Some(run_id.to_string().as_str()));
+    }
+
+    #[tokio::test]
+    async fn slow_preparation_does_not_serialize_an_independent_permit() {
+        struct FirstPreparationPausedLoader {
+            loads: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for FirstPreparationPausedLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let first = self.loads.fetch_add(1, Ordering::SeqCst) == 0;
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    if first {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    struct CountingProvider(Arc<AtomicUsize>);
+
+                    impl Provider for CountingProvider {
+                        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                                usage: None,
+                            })]))
+                        }
+                    }
+
+                    Runtime::new(CountingProvider(provider_calls), "test-model", 256)
+                        .map(|runtime| loaded_runtime(runtime, None))
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 2;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(FirstPreparationPausedLoader {
+                loads: Arc::clone(&loads),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let first = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: first_session,
+        } = first.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let second = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated {
+            session_id: second_session,
+        } = second.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let first = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: first_session,
+                    prompt: "first".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: first_run, ..
+        } = first.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let second = runtime
+            .inner
+            .store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: second_session,
+                    prompt: "second".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: second_run, ..
+        } = second.receipt.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: second.receipt.committed_through,
+            })
+            .unwrap();
+        runtime.request_schedule();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("one loader must remain in preparation");
+        let observed = collect_until(&mut events, |event| {
+            matches!(event, SessionEvent::RunFinished { .. })
+        })
+        .await;
+        let completed = observed
+            .iter()
+            .find_map(|event| match event.event {
+                SessionEvent::RunFinished { run_id, .. } => Some(run_id),
+                _ => None,
+            })
+            .unwrap();
+        let blocked = if completed == first_run {
+            second_run
+        } else {
+            assert_eq!(completed, second_run);
+            first_run
+        };
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert!(observed.iter().all(|event| !matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id, .. } if run_id == blocked
+        )));
+
+        release.notify_one();
+        let observed = collect_until(&mut events, finished_for(blocked)).await;
+        assert!(observed.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Completed,
+                ..
+            } if run_id == blocked
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn blocked_preparation_stays_queued_and_shutdown_waits_for_its_permit() {
+        struct PausedPreparationLoader {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            loads: Arc<AtomicUsize>,
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for PausedPreparationLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                let release = Arc::clone(&self.release);
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    release.notified().await;
+                    struct CountingProvider(Arc<AtomicUsize>);
+
+                    impl Provider for CountingProvider {
+                        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                                usage: None,
+                            })]))
+                        }
+                    }
+
+                    Runtime::new(CountingProvider(provider_calls), "test-model", 256)
+                        .map(|runtime| loaded_runtime(runtime, None))
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 1;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(PausedPreparationLoader {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                loads: Arc::clone(&loads),
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "block during load".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the reserved run must enter preparation");
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: queued.committed_through,
+            })
+            .unwrap();
+
+        let second = queue_prompt(&runtime, session_id, "same session".to_owned()).await;
+        assert!(matches!(
+            events.next().await.unwrap().unwrap().event,
+            SessionEvent::PromptQueued { run, .. } if run.id == second
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 4,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        assert_eq!(focused.summary.status, SessionStatus::Queued);
+        assert_eq!(focused.summary.active_run_id, None);
+        assert_eq!(focused.summary.queued_prompts, 2);
+        assert!(
+            focused
+                .runs
+                .iter()
+                .all(|run| run.status == RunStatus::Queued)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::DeleteSession { session_id },
+                )
+                .await
+                .err(),
+            Some(SessionRuntimeError::SessionActive)
+        );
+
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id },
+            )
+            .await
+            .unwrap();
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+        assert!(observed.iter().all(|event| !matches!(
+            event.event,
+            SessionEvent::RunStarted { run_id: started, .. } if started == run_id
+        )));
+
+        let mut shutdown = Box::pin(runtime.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown must finish after preparation exits")
+            .unwrap();
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            runtime
+                .inner
+                .store
+                .unfinished_run_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(runtime.inner.permits.available_permits(), 1);
+        assert_eq!(runtime.inner.child_permits.available_permits(), 1);
+        let preparing: Option<String> = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT preparing_run_id FROM sessions WHERE id = ?1",
+                        [session_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(preparing, None);
+        let second = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                load_run(connection, second)
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.outcome, Some(RunOutcome::Cancelled));
     }
 
     #[tokio::test]
@@ -19100,18 +22531,6 @@ mod tests {
         let CommandOutcome::SessionCreated { session_id } = created.outcome else {
             panic!("unexpected receipt")
         };
-        let summary = runtime
-            .snapshot(SnapshotRequest {
-                workspace_id,
-                focused_session_id: Some(session_id),
-                session_limit: 1,
-                message_limit: 1,
-            })
-            .await
-            .unwrap()
-            .focused
-            .unwrap()
-            .summary;
         let parent_run = RunId::generate().unwrap();
         let parent = ClaimedRun {
             workspace_id,
@@ -19133,18 +22552,8 @@ mod tests {
                 organization: None,
             },
             messages: Vec::new(),
-            over_budget: false,
-            started: SessionEventEnvelope {
-                cursor: created.committed_through,
-                session_id,
-                run_id: Some(parent_run),
-                caused_by: None,
-                occurred_at_ms: 0,
-                event: SessionEvent::RunStarted {
-                    session: summary,
-                    run_id: parent_run,
-                },
-            },
+            context_compaction_attempted: false,
+            context_overflow_model: None,
         };
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),

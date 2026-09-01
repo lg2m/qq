@@ -89,6 +89,8 @@ pub(crate) struct RunCapabilities {
     spawner: Option<Arc<dyn SubagentSpawner>>,
     allow_guidance: bool,
     slash_is_literal: bool,
+    allow_tools: bool,
+    max_output_tokens: Option<u32>,
 }
 
 impl RunCapabilities {
@@ -97,6 +99,8 @@ impl RunCapabilities {
             spawner,
             allow_guidance: true,
             slash_is_literal: false,
+            allow_tools: true,
+            max_output_tokens: None,
         }
     }
 
@@ -108,11 +112,23 @@ impl RunCapabilities {
         self
     }
 
+    pub(crate) fn without_tools(mut self) -> Self {
+        self.allow_tools = false;
+        self
+    }
+
+    pub(crate) fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
+
     pub(crate) const fn restricted() -> Self {
         Self {
             spawner: None,
             allow_guidance: false,
             slash_is_literal: false,
+            allow_tools: true,
+            max_output_tokens: None,
         }
     }
 }
@@ -239,7 +255,6 @@ impl Runtime {
         public_run_stream(
             self.run_messages_in_workspace(vec![Message::user(command.into_prompt())], workspace),
             self.context_window,
-            self.max_output_tokens,
         )
     }
 
@@ -249,7 +264,6 @@ impl Runtime {
         public_run_stream(
             self.run_messages_in_workspace(messages, workspace),
             self.context_window,
-            self.max_output_tokens,
         )
     }
 
@@ -322,7 +336,7 @@ impl Runtime {
     ) -> RuntimeStream {
         let provider = Arc::clone(&self.provider);
         let model = Arc::clone(&self.model);
-        let max_output_tokens = self.max_output_tokens;
+        let model_max_output_tokens = self.max_output_tokens;
         let mcp = self.mcp.clone();
         let spawn_model_routes = Arc::clone(&self.spawn_model_routes);
         let turn_retry = self.turn_retry;
@@ -331,7 +345,12 @@ impl Runtime {
                 spawner,
                 allow_guidance,
                 slash_is_literal,
+                allow_tools,
+                max_output_tokens,
             } = capabilities;
+            let max_output_tokens = max_output_tokens
+                .unwrap_or(model_max_output_tokens)
+                .min(model_max_output_tokens);
             let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
             yield RuntimeEvent::Started;
 
@@ -396,13 +415,13 @@ impl Runtime {
             // every turn of the run sees one stable tool list. The `mcp__`
             // prefix keeps collisions with built-ins impossible, and specs
             // that do not carry it are discarded to keep dispatch unambiguous.
-            let mut tool_specs = tools::specs();
+            let mut tool_specs = if allow_tools { tools::specs() } else { Vec::new() };
             // The sub-agent tool is declared only when this run may spawn:
             // depth is one, so child runs (spawner-less) never see it.
-            if spawner.is_some() {
+            if allow_tools && spawner.is_some() {
                 tool_specs.push(tools::spawn_agent_spec(&spawn_model_routes));
             }
-            if let Some(registry) = &mcp {
+            if allow_tools && let Some(registry) = &mcp {
                 for spec in registry.tool_specs().await {
                     if spec.name().starts_with(MCP_TOOL_PREFIX)
                         && spec.name().len() <= MAX_TOOL_NAME_BYTES
@@ -460,7 +479,7 @@ impl Runtime {
                 } else {
                     Arc::clone(&system)
                 };
-                let request_has_tools = !checkpoint_turn;
+                let request_has_tools = allow_tools && !checkpoint_turn;
                 let system_bytes = u64::try_from(request_system.len())
                     .unwrap_or(u64::MAX)
                     .saturating_add(CONTEXT_BLOCK_FRAMING_BYTES);
@@ -485,6 +504,7 @@ impl Runtime {
                     turn_ordinal,
                     identity: prompt_identity.take(),
                     weight: PreparedRequestWeight {
+                        max_output_tokens,
                         system_bytes,
                         tool_schema_bytes,
                         reducible_message_bytes,
@@ -608,6 +628,17 @@ impl Runtime {
                             yield RuntimeEvent::RefusalDelta { text };
                         }
                         Ok(ProviderEvent::ToolCallStarted { id, name }) => {
+                            if !request_has_tools {
+                                yield RuntimeEvent::Failed {
+                                    kind: RunFailureKind::ProviderProtocol,
+                                    message: if checkpoint_turn {
+                                        "provider requested a tool on the tool-free checkpoint turn, which declares none".to_owned()
+                                    } else {
+                                        "provider requested a tool after the request declared no tools".to_owned()
+                                    },
+                                };
+                                return;
+                            }
                             turn_streamed = true;
                             if activity != RunActivity::PreparingToolCall {
                                 activity = RunActivity::PreparingToolCall;
@@ -631,17 +662,6 @@ impl Runtime {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,
                                     message: format!("model requested more than {MAX_TOOL_CALLS_PER_TURN} tools in one turn"),
-                                };
-                                return;
-                            }
-                            // The per-slice ceiling reserves a complete turn
-                            // at the top of the loop; a call arriving on the
-                            // declared tool-free checkpoint turn is a provider
-                            // bug.
-                            if checkpoint_turn {
-                                yield RuntimeEvent::Failed {
-                                    kind: RunFailureKind::ProviderProtocol,
-                                    message: "provider requested a tool on the tool-free checkpoint turn, which declares none".to_owned(),
                                 };
                                 return;
                             }
@@ -1100,11 +1120,7 @@ impl Runtime {
 /// Translates the richer internal runtime stream into the direct public API.
 /// Session execution consumes the internal preparation and tool events
 /// separately so it can persist them before publishing visible state.
-fn public_run_stream(
-    mut events: RuntimeStream,
-    context_window: Option<u32>,
-    max_output_tokens: u32,
-) -> RunStream {
+fn public_run_stream(mut events: RuntimeStream, context_window: Option<u32>) -> RunStream {
     Box::pin(stream! {
         while let Some(event) = events.next().await {
             match event {
@@ -1112,7 +1128,7 @@ fn public_run_stream(
                 RuntimeEvent::Prepared { weight, .. } => {
                     let plan = sessions::context::plan(sessions::context::ContextInput {
                         context_window,
-                        max_output_tokens,
+                        max_output_tokens: weight.max_output_tokens,
                         system_bytes: weight.system_bytes,
                         tool_schema_bytes: weight.tool_schema_bytes,
                         reducible_message_bytes: weight.reducible_message_bytes,
@@ -1120,7 +1136,7 @@ fn public_run_stream(
                         compatible_input_tokens: weight.compatible_input_tokens,
                         // The direct compatibility path has no durable
                         // between-run compaction lifecycle.
-                        compaction_attempted: true,
+                        compaction: sessions::context::CompactionDisposition::Unsupported,
                     });
                     if let Some(message) = sessions::context::rejection_message(plan) {
                         yield RunEvent::Failed {
@@ -3007,6 +3023,76 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_toolless_request_rejects_provider_tool_calls_before_a_second_poll() {
+        struct ToolOnToollessProvider {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Provider for ToolOnToollessProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: "unexpected".to_owned(),
+                        name: "read_file".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted {
+                        id: "unexpected".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+
+        struct DenyAllGate;
+
+        impl ToolGate for DenyAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Deny {
+                    message: "tools disabled".to_owned(),
+                }))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::new(
+            ToolOnToollessProvider {
+                calls: Arc::clone(&calls),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let events = runtime
+            .run_loop_with_spawner(
+                vec![Message::user("summarize")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(DenyAllGate),
+                Arc::new(workspace::FileState::default()),
+                RunCapabilities::user(None).without_tools(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::Failed {
+                kind: RunFailureKind::ProviderProtocol,
+                message,
+            }) if message.contains("declared no tools")
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallStarted { .. }
+                | RuntimeEvent::ToolCallDenied { .. }
+                | RuntimeEvent::ToolCallFinished { .. }
+        )));
     }
 
     #[tokio::test]

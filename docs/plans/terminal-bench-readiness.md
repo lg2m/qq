@@ -1,7 +1,7 @@
 # QQ Harness Reliability, Cost, And Terminal-Bench Readiness
 
 Status: active. Re-baselined against `main` on 2026-08-04. Phase 4 completed
-and qualified on 2026-09-01; Phase 5 is next.
+and qualified on 2026-09-01; Phase 5 implementation is in progress.
 
 This plan turns QQ into a trustworthy autonomous terminal harness before
 optimizing it against Terminal-Bench. It covers the failures found in the
@@ -81,6 +81,7 @@ Passing one regression does not imply that its whole phase is complete.
 | Harbor baseline and failure taxonomy | implemented in `DEV-730` | Repository adapter converts durable per-turn traces to ATIF-v1.7 and passes Harbor 0.20.0 validation; the local smoke task resolves under Harbor; `cargo xtask eval` revision-stamps launches, hashes resolved job/trial locks, rejects mixed identity, and requires identifier-grounded primary categories before reporting | Run the credentialed fixed-model smoke and baseline; no paid public run is performed by repository tests |
 | Slash-invoked commands and skills | implemented in `DEV-731` | Shared runtime resolves explicit repository-local Markdown through the workspace capability, rejects unknown/colliding/oversized sources before provider work, and persists source/content/full-prompt/tool hashes | User-home, managed, and bundled roots stay deferred until explicit server-owned configuration preserves remote equivalence |
 | Immutable resolved-model identity | implemented in the R5 resolved-model slice | The root computes a secret-free versioned route/model/limit/context/pricing/capability descriptor; core persists it once before provider polling, exposes it in run snapshots, and audits turns with the effective route and cap | Context-window planning and core-owned token/dollar/turn outcomes remain Phase 5 work |
+| Provider-aware context admission | implemented in the R5 context-planning slice; final qualification pending | Queued runs reserve without publishing `RunStarted`; the unpublished preparation pointer uses recoverable WAL coordination and restores FULL before every authoritative transition. Asynchronous preparation measures the provider-neutral request, applies model-window plus independent 4 MiB storage policy, and atomically persists the descriptor, prompt identity, measurement, running state, and `RunStarted` before provider polling. Known overflow compacts at most once under an exact durable owner; cancellation, recovery, shutdown, and persistence races fail closed. | Cross-run provider occupancy reuse remains disabled until a secret-free codec/endpoint request-shape identity is persisted. Core-owned budgets, deeper compaction hardening, and final Phase 5 qualification remain open. |
 
 The remaining P0 longevity contract is explicit: every accepted run must reach
 one durable terminal event; every imposed bound must produce a truthful outcome;
@@ -92,8 +93,8 @@ The remaining gaps are material:
 | Area | Current behavior | Consequence |
 | --- | --- | --- |
 | Evaluation export | `DEV-730` supplies the pinned Harbor adapter, ATIF validation fixtures, revision-stamped launcher, fixed-identity scorecard, and grounded failure taxonomy | A real fixed-model baseline still needs credentials, benchmark compute, and deliberate spend |
-| Context budgeting | Automatic compaction uses a fixed 4 MiB budget and a 70% byte trigger | Small-context models may fail before compaction; large-context models may compact and spend unnecessarily |
-| Resolved model consumption | Runs now retain the exact resolved route, provider-visible model, limits, pricing provenance, named organization/profile, and implemented controls | Context planning and core-owned budgets do not yet consume the descriptor's context window and pricing contract |
+| Context budgeting | The R5 context slice plans against the effective model window, output reserve, full request weight, and an independent 4 MiB storage backstop; no percentage trigger remains | Cross-run provider occupancy reuse awaits a persisted codec/request-shape identity, so first-turn estimates remain conservative |
+| Resolved model consumption | Runs retain the exact resolved route, provider-visible model, limits, pricing provenance, named organization/profile, and implemented controls; context admission consumes the effective output/context limits | Core-owned token/dollar/turn budgets do not yet consume the complete pricing contract |
 | Completion behavior | Internal tool slices checkpoint and continue without a terminal event, but caller-requested turn/time/cost budgets still settle through the headless adapter rather than one core-owned outcome | TUI, server, and future clients cannot yet impose and observe the same explicit overall budget contract |
 | Terminal control | `shell` is one-shot with null stdin and no persistent process or PTY handle | Interactive programs and background services are awkward or impossible |
 | Search and editing | Built-in search is bounded literal scanning; edits require exact replacement | Discovery or mutation can consume unnecessary model turns on large repositories |
@@ -764,6 +765,11 @@ diagnostic all passed. Generated raw reports remain ignored and untracked.
 
 Priority: P0 for context correctness, P1 for cost optimization.
 
+Status: in progress. The immutable resolved-model and provider-aware context
+admission slices are implemented; enforced run budgets, cross-run occupancy
+reuse with a persisted codec/request-shape identity, compaction hardening, and
+the full Phase 5 qualification receipt remain open.
+
 ### Resolved Model Contract
 
 Extend the `RuntimeLoader` result so one immutable resolved-model value travels
@@ -813,6 +819,11 @@ Inputs include:
 Do not claim tokenizer exactness where a provider does not supply it. Prefer
 actual reported usage after each turn and a conservative safety margin before
 the next request.
+
+Provider-reported occupancy is currently reused only within the same live run.
+Cross-run reuse is deliberately disabled until the resolved request contract
+persists a secret-free codec/API and endpoint/adapter identity; semantic prompt
+and model equality alone cannot prove tokenization-compatible wire shape.
 
 Automatic compaction triggers when the context plan cannot safely reserve the
 next output, not merely at 70% of 4 MiB. Keep the existing byte cap as a

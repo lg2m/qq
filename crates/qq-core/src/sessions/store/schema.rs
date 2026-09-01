@@ -53,6 +53,8 @@ pub(in crate::sessions) fn open_database(
                  title TEXT NOT NULL,
                  status TEXT NOT NULL,
                  active_run_id TEXT,
+                 preparing_run_id TEXT,
+                 pending_context_overflow_model_json TEXT,
                  queued_prompts INTEGER NOT NULL DEFAULT 0,
                  model TEXT,
                  max_output_tokens INTEGER,
@@ -73,6 +75,8 @@ pub(in crate::sessions) fn open_database(
                   status TEXT NOT NULL,
                   kind TEXT NOT NULL DEFAULT 'prompt',
                   auto_compaction INTEGER NOT NULL DEFAULT 0,
+                  auto_compaction_for_run_id TEXT,
+                  context_compaction_attempted INTEGER NOT NULL DEFAULT 0,
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
                   prompt_identity_json TEXT,
                   resolved_model_json TEXT,
@@ -373,12 +377,12 @@ pub(in crate::sessions) fn open_database(
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12" | "13" | "14" | "15" | "16") => {}
+        Some("10" | "11" | "12" | "13" | "14" | "15" | "16" | "17") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("11" | "12" | "13" | "14" | "15" | "16")
+        Some("11" | "12" | "13" | "14" | "15" | "16" | "17")
     ) {
         let transaction = connection
             .transaction()
@@ -396,7 +400,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("12" | "13" | "14" | "15" | "16")
+        Some("12" | "13" | "14" | "15" | "16" | "17")
     ) {
         let transaction = connection
             .transaction()
@@ -412,7 +416,10 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("13" | "14" | "15" | "16")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("13" | "14" | "15" | "16" | "17")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -427,7 +434,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("14" | "15" | "16")) {
+    if !matches!(schema_version.as_deref(), Some("14" | "15" | "16" | "17")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -443,7 +450,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_model_turn_audit_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("15" | "16")) {
+    if !matches!(schema_version.as_deref(), Some("15" | "16" | "17")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -460,7 +467,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_linear_streaming_schema(&connection)?;
-    if schema_version.as_deref() != Some("16") {
+    if !matches!(schema_version.as_deref(), Some("16" | "17")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -478,6 +485,23 @@ pub(in crate::sessions) fn open_database(
     if !has_column(&connection, "runs", "resolved_model_json")? {
         return Err(SessionRuntimeError::Persistence);
     }
+    if schema_version.as_deref() != Some("17") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_preparing_run_storage(&transaction)?;
+        validate_preparing_run_schema(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '17' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_preparing_run_schema(&connection)?;
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -502,6 +526,132 @@ pub(in crate::sessions) fn open_database(
         }
     };
     Ok((connection, store_id))
+}
+
+fn add_preparing_run_storage(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "sessions", "preparing_run_id")? {
+        connection
+            .execute("ALTER TABLE sessions ADD COLUMN preparing_run_id TEXT", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if !has_column(
+        connection,
+        "sessions",
+        "pending_context_overflow_model_json",
+    )? {
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN pending_context_overflow_model_json TEXT",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if !has_column(connection, "runs", "context_compaction_attempted")? {
+        connection
+            .execute(
+                "ALTER TABLE runs ADD COLUMN context_compaction_attempted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if !has_column(connection, "runs", "auto_compaction_for_run_id")? {
+        connection
+            .execute(
+                "ALTER TABLE runs ADD COLUMN auto_compaction_for_run_id TEXT",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    connection
+        .execute(
+            "UPDATE runs AS compaction
+             SET auto_compaction_for_run_id = (
+                 SELECT queued.id
+                 FROM runs queued
+                 WHERE queued.session_id = compaction.session_id
+                   AND queued.status = 'queued'
+                   AND queued.kind = 'prompt'
+                 ORDER BY queued.created_at_ms, queued.rowid
+                 LIMIT 1
+             )
+             WHERE compaction.status = 'running'
+               AND compaction.kind = 'compaction'
+               AND compaction.auto_compaction = 1
+               AND compaction.auto_compaction_for_run_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM sessions session
+                   WHERE session.id = compaction.session_id
+                     AND session.active_run_id = compaction.id
+               )",
+            [],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    connection
+        .execute(
+            "UPDATE runs
+             SET context_compaction_attempted = 1
+             WHERE id IN (
+                 SELECT auto_compaction_for_run_id
+                 FROM runs
+                 WHERE auto_compaction_for_run_id IS NOT NULL
+             )",
+            [],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(())
+}
+
+fn validate_preparing_run_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    let preparing = column_shape(connection, "sessions", "preparing_run_id")?;
+    if preparing != ("TEXT".to_owned(), false, None, 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let overflow = column_shape(
+        connection,
+        "sessions",
+        "pending_context_overflow_model_json",
+    )?;
+    if overflow != ("TEXT".to_owned(), false, None, 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let attempted = column_shape(connection, "runs", "context_compaction_attempted")?;
+    if attempted != ("INTEGER".to_owned(), true, Some("0".to_owned()), 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let owner = column_shape(connection, "runs", "auto_compaction_for_run_id")?;
+    if owner != ("TEXT".to_owned(), false, None, 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    Ok(())
+}
+
+fn column_shape(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<(String, bool, Option<String>, u8), SessionRuntimeError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, u8>(5)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .find_map(|row| match row {
+            Ok((name, ty, not_null, default_value, primary_key)) if name == column => {
+                Some(Ok((ty, not_null, default_value, primary_key)))
+            }
+            Ok(_) => None,
+            Err(_) => Some(Err(SessionRuntimeError::Persistence)),
+        })
+        .unwrap_or(Err(SessionRuntimeError::Persistence))
 }
 
 /// Existing runs remain explicitly unknown: no current configuration is

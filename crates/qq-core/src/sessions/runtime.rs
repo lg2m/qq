@@ -214,6 +214,7 @@ pub(super) struct SessionRuntimeInner {
     /// exists against this pool. Sized like the root pool so global run
     /// concurrency stays bounded at twice `max_active_runs`.
     pub(super) child_permits: Arc<Semaphore>,
+    pub(super) max_active_runs: usize,
     pub(super) schedule: mpsc::Sender<()>,
     pub(super) cancellations: Mutex<HashMap<RunId, watch::Sender<bool>>>,
     approvals: Mutex<HashMap<ToolCallId, PendingApproval>>,
@@ -346,6 +347,7 @@ impl SessionRuntime {
             approval_reviewer: options.approval_reviewer,
             permits: Arc::new(Semaphore::new(options.max_active_runs)),
             child_permits: Arc::new(Semaphore::new(options.max_active_runs)),
+            max_active_runs: options.max_active_runs,
             schedule,
             cancellations: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
@@ -564,7 +566,10 @@ impl SessionRuntime {
                 return Err(SessionRuntimeError::Unavailable);
             }
             let unfinished = self.inner.store.unfinished_run_ids().await?;
-            if unfinished.is_empty() && *grant_promotion_stopped.borrow() {
+            let preparation_quiescent = self.inner.permits.available_permits()
+                == self.inner.max_active_runs
+                && self.inner.child_permits.available_permits() == self.inner.max_active_runs;
+            if unfinished.is_empty() && preparation_quiescent && *grant_promotion_stopped.borrow() {
                 // The promotion worker publishes `failed` before its stopped
                 // guard fires. Re-read after observing stopped so its failure
                 // cannot race this success boundary.

@@ -1,4 +1,7 @@
 const STORAGE_CONTEXT_BYTES: u64 = 4 * 1024 * 1024;
+const CONSERVATIVE_OUTPUT_BYTES_PER_TOKEN: u64 = 32;
+pub(crate) const COMPACTION_INSTRUCTION_BYTES: usize = 64 * 1024;
+const COMPACTION_STORAGE_ENVELOPE_BYTES: u64 = COMPACTION_INSTRUCTION_BYTES as u64 + 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextConstraint {
@@ -16,7 +19,19 @@ pub(crate) struct ContextTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextRejectReason {
     Irreducible(ContextConstraint),
-    CompactionUnavailable(ContextConstraint),
+    NoReducibleHistory(ContextConstraint),
+    AlreadyAttempted(ContextConstraint),
+    BetweenRunsOnly(ContextConstraint),
+    Unsupported(ContextConstraint),
+    ProviderReportedOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionDisposition {
+    Eligible,
+    AlreadyAttempted,
+    BetweenRunsOnly,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +39,7 @@ pub(crate) struct ContextEstimate {
     pub(crate) input_bytes: u64,
     pub(crate) estimated_input_tokens: u64,
     pub(crate) output_reserve_tokens: u64,
+    pub(crate) storage_reserve_bytes: u64,
     pub(crate) context_window: Option<u32>,
 }
 
@@ -54,7 +70,7 @@ pub(crate) struct ContextInput {
     /// Provider-measured occupancy of a caller-verified compatible prefix,
     /// including a conservative byte upper bound for newly appended input.
     pub(crate) compatible_input_tokens: Option<u64>,
-    pub(crate) compaction_attempted: bool,
+    pub(crate) compaction: CompactionDisposition,
 }
 
 pub(crate) fn plan(input: ContextInput) -> ContextPlan {
@@ -69,16 +85,24 @@ pub(crate) fn plan(input: ContextInput) -> ContextPlan {
     // the deliberately conservative byte upper bound to the unchanged prefix.
     let estimated_input_tokens = input.compatible_input_tokens.unwrap_or(input_bytes);
     let output_tokens = u64::from(input.max_output_tokens);
+    let storage_reserve_bytes = output_tokens
+        .saturating_mul(CONSERVATIVE_OUTPUT_BYTES_PER_TOKEN)
+        .saturating_add(if input.compaction == CompactionDisposition::Eligible {
+            COMPACTION_STORAGE_ENVELOPE_BYTES
+        } else {
+            0
+        });
     let fixed_tokens = fixed_input.saturating_add(output_tokens);
     let required_tokens = estimated_input_tokens.saturating_add(output_tokens);
     let estimate = ContextEstimate {
         input_bytes,
         estimated_input_tokens,
         output_reserve_tokens: output_tokens,
+        storage_reserve_bytes,
         context_window: input.context_window,
     };
 
-    let exceeds_storage = input_bytes > STORAGE_CONTEXT_BYTES;
+    let exceeds_storage = input_bytes.saturating_add(storage_reserve_bytes) > STORAGE_CONTEXT_BYTES;
     let exceeds_window = input
         .context_window
         .is_some_and(|window| required_tokens > u64::from(window));
@@ -94,7 +118,8 @@ pub(crate) fn plan(input: ContextInput) -> ContextPlan {
         && input
             .context_window
             .is_some_and(|window| fixed_tokens > u64::from(window));
-    let irreducible_storage_overflow = fixed_input > STORAGE_CONTEXT_BYTES;
+    let irreducible_storage_overflow =
+        fixed_input.saturating_add(storage_reserve_bytes) > STORAGE_CONTEXT_BYTES;
     if irreducible_window_overflow || irreducible_storage_overflow {
         let constraint = match (irreducible_window_overflow, irreducible_storage_overflow) {
             (true, true) => ContextConstraint::Both,
@@ -122,19 +147,34 @@ pub(crate) fn plan(input: ContextInput) -> ContextPlan {
             ),
             (None, None) | (Some(_), _) => None,
         },
-        max_reducible_input_bytes: STORAGE_CONTEXT_BYTES.saturating_sub(fixed_input),
+        max_reducible_input_bytes: STORAGE_CONTEXT_BYTES
+            .saturating_sub(storage_reserve_bytes)
+            .saturating_sub(fixed_input),
     };
-    if input.reducible_message_bytes > 0 && !input.compaction_attempted {
-        ContextPlan::Compact {
+    if input.reducible_message_bytes == 0 {
+        return ContextPlan::Reject {
+            estimate,
+            reason: ContextRejectReason::NoReducibleHistory(constraint),
+        };
+    }
+    match input.compaction {
+        CompactionDisposition::Eligible => ContextPlan::Compact {
             estimate,
             reason: constraint,
             target,
-        }
-    } else {
-        ContextPlan::Reject {
+        },
+        CompactionDisposition::AlreadyAttempted => ContextPlan::Reject {
             estimate,
-            reason: ContextRejectReason::CompactionUnavailable(constraint),
-        }
+            reason: ContextRejectReason::AlreadyAttempted(constraint),
+        },
+        CompactionDisposition::BetweenRunsOnly => ContextPlan::Reject {
+            estimate,
+            reason: ContextRejectReason::BetweenRunsOnly(constraint),
+        },
+        CompactionDisposition::Unsupported => ContextPlan::Reject {
+            estimate,
+            reason: ContextRejectReason::Unsupported(constraint),
+        },
     }
 }
 
@@ -161,10 +201,27 @@ pub(crate) fn rejection_message(plan: ContextPlan) -> Option<String> {
                     constraint,
                     "the irreducible request cannot fit even after compaction".to_owned(),
                 ),
-                ContextRejectReason::CompactionUnavailable(constraint) => (
+                ContextRejectReason::NoReducibleHistory(constraint) => {
+                    (constraint, "no reducible history remains".to_owned())
+                }
+                ContextRejectReason::AlreadyAttempted(constraint) => (
                     constraint,
-                    "compaction was already attempted or no reducible history remains".to_owned(),
+                    "automatic compaction was already attempted for this prompt".to_owned(),
                 ),
+                ContextRejectReason::BetweenRunsOnly(constraint) => (
+                    constraint,
+                    "automatic compaction is only available between model runs".to_owned(),
+                ),
+                ContextRejectReason::Unsupported(constraint) => (
+                    constraint,
+                    "this direct runtime path does not support automatic compaction".to_owned(),
+                ),
+                ContextRejectReason::ProviderReportedOverflow => {
+                    return Some(format!(
+                        "the provider previously rejected an equivalent request for exceeding its context window, and the single automatic compaction attempt did not produce a usable smaller context; the current provider-neutral estimate is {} input tokens with a {}-token output reserve",
+                        estimate.estimated_input_tokens, estimate.output_reserve_tokens,
+                    ));
+                }
             };
             (estimate, constraint, detail)
         }
@@ -177,16 +234,18 @@ pub(crate) fn rejection_message(plan: ContextPlan) -> Option<String> {
             estimate.context_window.unwrap_or(0),
         ),
         ContextConstraint::StorageBackstop => format!(
-            "provider-neutral context measures {} bytes, exceeding the independent {} MiB storage backstop; {detail}",
+            "provider-neutral context measures {} bytes and reserves {} bytes for bounded output and compaction headroom, exceeding the independent {} MiB storage backstop; {detail}",
             estimate.input_bytes,
+            estimate.storage_reserve_bytes,
             STORAGE_CONTEXT_BYTES / (1024 * 1024),
         ),
         ContextConstraint::Both => format!(
-            "estimated provider-neutral context requires {} input tokens plus a {}-token output reserve against the selected model's {}-token window and measures {} bytes against the independent {} MiB storage backstop; {detail}",
+            "estimated provider-neutral context requires {} input tokens plus a {}-token output reserve against the selected model's {}-token window and measures {} bytes with {} bytes of bounded output and compaction headroom against the independent {} MiB storage backstop; {detail}",
             estimate.estimated_input_tokens,
             estimate.output_reserve_tokens,
             estimate.context_window.unwrap_or(0),
             estimate.input_bytes,
+            estimate.storage_reserve_bytes,
             STORAGE_CONTEXT_BYTES / (1024 * 1024),
         ),
     })
@@ -205,7 +264,7 @@ mod tests {
             reducible_message_bytes: 20,
             irreducible_message_bytes: 20,
             compatible_input_tokens: None,
-            compaction_attempted: false,
+            compaction: CompactionDisposition::Eligible,
         }
     }
 
@@ -235,7 +294,10 @@ mod tests {
         };
         assert_eq!(reason, ContextConstraint::ModelWindow);
         assert_eq!(target.max_reducible_input_tokens, Some(19));
-        assert_eq!(target.max_reducible_input_bytes, STORAGE_CONTEXT_BYTES - 40);
+        assert_eq!(
+            target.max_reducible_input_bytes,
+            STORAGE_CONTEXT_BYTES - 40 - estimate.storage_reserve_bytes
+        );
     }
 
     #[test]
@@ -261,7 +323,7 @@ mod tests {
             reducible_message_bytes: 100,
             irreducible_message_bytes: 20,
             compatible_input_tokens: None,
-            compaction_attempted: false,
+            compaction: CompactionDisposition::Eligible,
         };
         assert_reject(plan(request));
         assert_compact(plan(ContextInput {
@@ -276,19 +338,21 @@ mod tests {
 
     #[test]
     fn unknown_windows_still_obey_the_independent_storage_backstop() {
+        let storage_reserve =
+            COMPACTION_STORAGE_ENVELOPE_BYTES + CONSERVATIVE_OUTPUT_BYTES_PER_TOKEN;
         let exact = ContextInput {
             context_window: None,
-            max_output_tokens: u32::MAX,
+            max_output_tokens: 1,
             system_bytes: 0,
             tool_schema_bytes: 0,
-            reducible_message_bytes: STORAGE_CONTEXT_BYTES - 1,
+            reducible_message_bytes: STORAGE_CONTEXT_BYTES - storage_reserve - 1,
             irreducible_message_bytes: 1,
             compatible_input_tokens: None,
-            compaction_attempted: false,
+            compaction: CompactionDisposition::Eligible,
         };
         assert_send(plan(exact));
         assert_compact(plan(ContextInput {
-            reducible_message_bytes: STORAGE_CONTEXT_BYTES,
+            reducible_message_bytes: STORAGE_CONTEXT_BYTES - storage_reserve,
             ..exact
         }));
         assert_reject(plan(ContextInput {
@@ -299,7 +363,7 @@ mod tests {
         }));
         assert_reject(plan(ContextInput {
             reducible_message_bytes: STORAGE_CONTEXT_BYTES,
-            compaction_attempted: true,
+            compaction: CompactionDisposition::AlreadyAttempted,
             ..exact
         }));
     }
@@ -320,7 +384,7 @@ mod tests {
             reducible_message_bytes: 120,
             irreducible_message_bytes: 20,
             compatible_input_tokens: None,
-            compaction_attempted: false,
+            compaction: CompactionDisposition::Eligible,
         };
         assert_compact(plan(byte_heavy));
         assert_send(plan(ContextInput {
@@ -336,12 +400,12 @@ mod tests {
             reducible_message_bytes: 100,
             irreducible_message_bytes: 0,
             compatible_input_tokens: Some(10),
-            compaction_attempted: true,
+            compaction: CompactionDisposition::AlreadyAttempted,
         };
         assert_send(plan(raw_fixed_prefix_exceeds_the_window));
         let ContextPlan::Compact { target, .. } = plan(ContextInput {
             compatible_input_tokens: Some(70),
-            compaction_attempted: false,
+            compaction: CompactionDisposition::Eligible,
             ..raw_fixed_prefix_exceeds_the_window
         }) else {
             panic!("compatible occupancy cannot prove the reducible prefix is irreducible")
@@ -359,7 +423,7 @@ mod tests {
             reducible_message_bytes: u64::MAX,
             irreducible_message_bytes: u64::MAX,
             compatible_input_tokens: Some(u64::MAX),
-            compaction_attempted: false,
+            compaction: CompactionDisposition::Eligible,
         }));
     }
 }

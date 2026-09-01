@@ -63,21 +63,145 @@ impl ToolGate for CompactionRunGate {
     }
 }
 
+const COMPACTION_OUTPUT_RESERVE_TOKENS: u32 = 2_048;
+
+struct PreparedExecution {
+    events: crate::RuntimeStream,
+    audit: PreparedRunAudit,
+    tool_cancellation: Arc<AtomicBool>,
+}
+
+async fn prepare_execution(
+    inner: &Arc<SessionRuntimeInner>,
+    claimed: &mut ClaimedRun,
+    loaded: &LoadedRuntime,
+    cancellation: &mut watch::Receiver<bool>,
+) -> Result<PreparedExecution, RunOutcome> {
+    let tool_cancellation = Arc::new(AtomicBool::new(false));
+    let internal = claimed.kind == RunKind::Compaction;
+    // Take the only full transcript before cloning run metadata into gates or
+    // spawners. ClaimedRun clones after this point stay scalar/empty instead
+    // of duplicating up to 4 MiB per tool call.
+    let messages = std::mem::take(&mut claimed.messages);
+    let gate: Arc<dyn ToolGate> = if internal {
+        Arc::new(CompactionRunGate)
+    } else {
+        Arc::new(SessionToolGate::new(
+            Arc::clone(inner),
+            claimed.clone(),
+            cancellation.clone(),
+        ))
+    };
+    let file_state = tokio::select! {
+        result = session_file_state_with_retry(inner, claimed.session_id) => match result {
+            Ok(entries) => Arc::new(FileState::with_entries(entries)),
+            Err(error) => {
+                return Err(persistence_failure(
+                    "failed to load the session file state",
+                    &error,
+                ));
+            }
+        },
+        changed = cancellation.changed() => {
+            tool_cancellation.store(true, Ordering::Release);
+            return if changed.is_ok() && *cancellation.borrow() {
+                Err(RunOutcome::Cancelled)
+            } else {
+                Err(RunOutcome::Interrupted)
+            };
+        }
+    };
+    let capabilities = if internal {
+        RunCapabilities::restricted()
+            .without_tools()
+            .with_max_output_tokens(
+                loaded
+                    .resolved_model
+                    .max_output_tokens
+                    .min(COMPACTION_OUTPUT_RESERVE_TOKENS),
+            )
+    } else if !claimed.user_initiated {
+        RunCapabilities::restricted()
+    } else {
+        let spawner = if claimed.child {
+            None
+        } else {
+            Some(Arc::new(SessionSubagentSpawner::new(
+                Arc::clone(inner),
+                claimed.clone(),
+            )) as Arc<dyn SubagentSpawner>)
+        };
+        RunCapabilities::user(spawner)
+    }
+    .with_literal_slash(claimed.literal_slash);
+    let mut events = loaded.runtime.run_loop_with_spawner(
+        messages,
+        PathBuf::from(&claimed.workspace),
+        Arc::clone(&tool_cancellation),
+        gate,
+        file_state,
+        capabilities,
+    );
+    loop {
+        let event = tokio::select! {
+            biased;
+            changed = cancellation.changed() => {
+                tool_cancellation.store(true, Ordering::Release);
+                return if changed.is_ok() && *cancellation.borrow() {
+                    Err(RunOutcome::Cancelled)
+                } else {
+                    Err(RunOutcome::Interrupted)
+                };
+            }
+            event = events.next() => event,
+        };
+        match event {
+            Some(RuntimeEvent::Started) => {}
+            Some(RuntimeEvent::Prepared {
+                turn_ordinal: 1,
+                identity: Some(prompt_identity),
+                weight,
+            }) => {
+                let mut resolved_model = loaded.resolved_model.as_ref().clone();
+                // Internal compaction deliberately reserves a smaller output
+                // budget. Its immutable descriptor records the effective cap
+                // actually sent on every provider turn, not the model's
+                // larger configured ceiling.
+                resolved_model.max_output_tokens = weight.max_output_tokens;
+                return Ok(PreparedExecution {
+                    events,
+                    audit: PreparedRunAudit {
+                        prompt_identity: Arc::new(prompt_identity),
+                        resolved_model: Arc::new(resolved_model),
+                        weight,
+                    },
+                    tool_cancellation,
+                });
+            }
+            Some(RuntimeEvent::Failed { kind, message }) => {
+                return Err(RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind,
+                        message: truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES),
+                    },
+                });
+            }
+            Some(_) | None => {
+                return Err(internal_failure(
+                    "runtime preparation ended without an initial prepared request",
+                ));
+            }
+        }
+    }
+}
+
 pub(super) async fn execute_run(
     inner: Arc<SessionRuntimeInner>,
     mut claimed: ClaimedRun,
     mut cancellation: watch::Receiver<bool>,
 ) {
     if *cancellation.borrow() {
-        finish_run(&inner, &claimed, RunOutcome::Cancelled).await;
-        return;
-    }
-    // The claim already spent its one automatic compaction attempt on this
-    // session; an assembly still past the hard budget fails here — before
-    // any model traffic — with the same policy failure the mid-run budget
-    // check produces.
-    if claimed.over_budget {
-        finish_run(&inner, &claimed, context_budget_failure()).await;
+        finish_reserved_run(&inner, &claimed, RunOutcome::Cancelled).await;
         return;
     }
     let mut load = inner.loader.load(RuntimeLoadRequest {
@@ -88,7 +212,7 @@ pub(super) async fn execute_run(
         result = &mut load => match result {
             Ok(runtime) => runtime,
             Err(error) => {
-                finish_run(&inner, &claimed, RunOutcome::Failed {
+                finish_reserved_run(&inner, &claimed, RunOutcome::Failed {
                     failure: RunFailure {
                         kind: error.kind,
                         message: truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES),
@@ -99,7 +223,7 @@ pub(super) async fn execute_run(
         },
         changed = cancellation.changed() => {
             if changed.is_ok() && *cancellation.borrow() {
-                finish_run(&inner, &claimed, RunOutcome::Cancelled).await;
+                finish_reserved_run(&inner, &claimed, RunOutcome::Cancelled).await;
                 // Runtime construction may be blocking; retain the run permit until it exits.
                 let _ = load.await;
                 return;
@@ -108,7 +232,7 @@ pub(super) async fn execute_run(
         }
     };
     if *cancellation.borrow() {
-        finish_run(&inner, &claimed, RunOutcome::Cancelled).await;
+        finish_reserved_run(&inner, &claimed, RunOutcome::Cancelled).await;
         return;
     }
 
@@ -116,7 +240,7 @@ pub(super) async fn execute_run(
         || loaded.runtime.max_output_tokens != loaded.resolved_model.max_output_tokens
         || loaded.runtime.context_window() != loaded.resolved_model.context_window
     {
-        finish_run(
+        finish_reserved_run(
             &inner,
             &claimed,
             RunOutcome::Failed {
@@ -130,80 +254,566 @@ pub(super) async fn execute_run(
         .await;
         return;
     }
-    if let Err(error) = inner
-        .store
-        .record_resolved_model(&claimed, loaded.resolved_model.as_ref())
-        .await
-    {
+    loop {
+        let prepared =
+            match prepare_execution(&inner, &mut claimed, &loaded, &mut cancellation).await {
+                Ok(prepared) => prepared,
+                Err(outcome) => {
+                    finish_reserved_run(&inner, &claimed, outcome).await;
+                    return;
+                }
+            };
+        let plan = context::plan(context::ContextInput {
+            context_window: loaded.resolved_model.context_window,
+            max_output_tokens: prepared.audit.weight.max_output_tokens,
+            system_bytes: prepared.audit.weight.system_bytes,
+            tool_schema_bytes: prepared.audit.weight.tool_schema_bytes,
+            reducible_message_bytes: prepared.audit.weight.reducible_message_bytes,
+            irreducible_message_bytes: prepared.audit.weight.irreducible_message_bytes,
+            compatible_input_tokens: prepared.audit.weight.compatible_input_tokens,
+            compaction: if claimed.kind == RunKind::Compaction
+                || claimed.context_compaction_attempted
+            {
+                context::CompactionDisposition::AlreadyAttempted
+            } else {
+                context::CompactionDisposition::Eligible
+            },
+        });
+        let repeats_known_overflow = matches!(plan, context::ContextPlan::Send { .. })
+            && claimed
+                .context_overflow_model
+                .as_ref()
+                .is_some_and(|model| {
+                    same_context_request_shape(model.as_ref(), loaded.resolved_model.as_ref())
+                })
+            && claimed.kind == RunKind::Prompt;
+        if repeats_known_overflow {
+            if claimed.context_compaction_attempted {
+                let context::ContextPlan::Send { estimate } = plan else {
+                    unreachable!("known overflow override only applies to a send plan")
+                };
+                finish_prepared_run(
+                    &inner,
+                    &claimed,
+                    &prepared.audit,
+                    planned_context_failure(context::ContextPlan::Reject {
+                        estimate,
+                        reason: context::ContextRejectReason::ProviderReportedOverflow,
+                    }),
+                )
+                .await;
+                return;
+            }
+            let audit = prepared.audit.clone();
+            drop(prepared);
+            if !run_auto_compaction(&inner, &mut claimed, &loaded, audit, &mut cancellation).await {
+                return;
+            }
+            continue;
+        }
+        match plan {
+            context::ContextPlan::Send { .. } => {
+                let started = loop {
+                    if *inner.failed.borrow() {
+                        finish_prepared_run(
+                            &inner,
+                            &claimed,
+                            &prepared.audit,
+                            internal_failure("session runtime failed before run start"),
+                        )
+                        .await;
+                        return;
+                    }
+                    let result = inner
+                        .store
+                        .start_reserved_run(&claimed, prepared.audit.clone())
+                        .await;
+                    if matches!(result, Err(SessionRuntimeError::Overloaded)) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    break result;
+                };
+                let started = match started {
+                    Ok(Some(started)) => started,
+                    Ok(None) => {
+                        finish_reserved_run(
+                            &inner,
+                            &claimed,
+                            internal_failure("run preparation lost its durable reservation"),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(error) => {
+                        finish_reserved_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist prepared run state", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                inner.notify(started.cursor);
+                claimed.model = ModelSelection {
+                    model: Some(prepared.audit.resolved_model.route.clone()),
+                    max_output_tokens: Some(prepared.audit.resolved_model.max_output_tokens),
+                    organization: prepared.audit.resolved_model.organization.clone(),
+                };
+                let cancelled =
+                    match cancellation_requested_with_retry(&inner, claimed.run_id).await {
+                        Ok(cancelled) => cancelled || *cancellation.borrow(),
+                        Err(error) => {
+                            finish_run(
+                                &inner,
+                                &claimed,
+                                persistence_failure("failed to re-read run cancellation", &error),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                if *inner.failed.borrow() {
+                    prepared.tool_cancellation.store(true, Ordering::Release);
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        internal_failure("session runtime failed before provider work"),
+                    )
+                    .await;
+                    return;
+                }
+                if cancelled {
+                    prepared.tool_cancellation.store(true, Ordering::Release);
+                    finish_run(&inner, &claimed, RunOutcome::Cancelled).await;
+                    return;
+                }
+                execute_started_run(
+                    inner,
+                    claimed,
+                    cancellation,
+                    prepared.events,
+                    prepared.tool_cancellation,
+                    prepared.audit.resolved_model,
+                )
+                .await;
+                return;
+            }
+            context::ContextPlan::Compact { .. } if claimed.kind == RunKind::Prompt => {
+                let audit = prepared.audit.clone();
+                drop(prepared);
+                if !run_auto_compaction(&inner, &mut claimed, &loaded, audit, &mut cancellation)
+                    .await
+                {
+                    return;
+                }
+            }
+            plan => {
+                finish_prepared_run(
+                    &inner,
+                    &claimed,
+                    &prepared.audit,
+                    planned_context_failure(plan),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn run_auto_compaction(
+    inner: &Arc<SessionRuntimeInner>,
+    original: &mut ClaimedRun,
+    loaded: &LoadedRuntime,
+    original_audit: PreparedRunAudit,
+    cancellation: &mut watch::Receiver<bool>,
+) -> bool {
+    let messages = loop {
+        if *inner.failed.borrow() {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                internal_failure("session runtime failed before automatic compaction"),
+            )
+            .await;
+            return false;
+        }
+        let result = inner
+            .store
+            .load_auto_compaction_messages(original.session_id)
+            .await;
+        if matches!(result, Err(SessionRuntimeError::Overloaded)) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            continue;
+        }
+        break result;
+    };
+    let messages = match messages {
+        Ok(messages) => messages,
+        Err(error) => {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                persistence_failure("failed to assemble automatic compaction", &error),
+            )
+            .await;
+            return false;
+        }
+    };
+    let mut candidate = original.clone();
+    candidate.run_id = match RunId::generate() {
+        Ok(run_id) => run_id,
+        Err(_) => {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                internal_failure("failed to allocate an automatic compaction run id"),
+            )
+            .await;
+            return false;
+        }
+    };
+    candidate.command_id = match CommandId::generate() {
+        Ok(command_id) => command_id,
+        Err(_) => {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                internal_failure("failed to allocate an automatic compaction command id"),
+            )
+            .await;
+            return false;
+        }
+    };
+    candidate.kind = RunKind::Compaction;
+    candidate.user_initiated = false;
+    candidate.literal_slash = false;
+    candidate.messages = messages;
+    candidate.context_compaction_attempted = true;
+    let prepared = match prepare_execution(inner, &mut candidate, loaded, cancellation).await {
+        Ok(prepared) => prepared,
+        Err(outcome) => {
+            finish_prepared_run(inner, original, &original_audit, outcome).await;
+            return false;
+        }
+    };
+    let plan = context::plan(context::ContextInput {
+        context_window: loaded.resolved_model.context_window,
+        max_output_tokens: prepared.audit.weight.max_output_tokens,
+        system_bytes: prepared.audit.weight.system_bytes,
+        tool_schema_bytes: prepared.audit.weight.tool_schema_bytes,
+        reducible_message_bytes: prepared.audit.weight.reducible_message_bytes,
+        irreducible_message_bytes: prepared.audit.weight.irreducible_message_bytes,
+        compatible_input_tokens: prepared.audit.weight.compatible_input_tokens,
+        compaction: context::CompactionDisposition::AlreadyAttempted,
+    });
+    if !matches!(plan, context::ContextPlan::Send { .. }) {
+        finish_prepared_run(
+            inner,
+            original,
+            &original_audit,
+            planned_context_failure(plan),
+        )
+        .await;
+        return false;
+    }
+    let started = loop {
+        if *inner.failed.borrow() {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                internal_failure("session runtime failed before automatic compaction start"),
+            )
+            .await;
+            return false;
+        }
+        let result = inner
+            .store
+            .start_auto_compaction(original, prepared.audit.clone())
+            .await;
+        if matches!(result, Err(SessionRuntimeError::Overloaded)) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            continue;
+        }
+        break result;
+    };
+    let (mut compaction, started) = match started {
+        Ok(Some(started)) => started,
+        Ok(None) => {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                internal_failure("automatic compaction lost its prompt reservation"),
+            )
+            .await;
+            return false;
+        }
+        Err(error) => {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                persistence_failure("failed to persist automatic compaction start", &error),
+            )
+            .await;
+            return false;
+        }
+    };
+    let (compaction_cancel, compaction_cancellation) = watch::channel(false);
+    if let Ok(mut cancellations) = inner.cancellations.lock() {
+        cancellations.insert(compaction.run_id, compaction_cancel);
+    } else {
+        inner.failed.send_replace(true);
+        let outcome = internal_failure("run cancellation registry is unavailable");
+        finish_run(inner, &compaction, outcome.clone()).await;
+        finish_prepared_run(inner, original, &original_audit, outcome).await;
+        return false;
+    }
+    inner.notify(started.cursor);
+    compaction.model = ModelSelection {
+        model: Some(prepared.audit.resolved_model.route.clone()),
+        max_output_tokens: Some(prepared.audit.resolved_model.max_output_tokens),
+        organization: prepared.audit.resolved_model.organization.clone(),
+    };
+    let cancelled = match cancellation_requested_with_retry(inner, compaction.run_id).await {
+        Ok(cancelled) => cancelled,
+        Err(error) => {
+            let outcome = persistence_failure("failed to re-read compaction cancellation", &error);
+            finish_run(inner, &compaction, outcome.clone()).await;
+            finish_prepared_run(inner, original, &original_audit, outcome).await;
+            return false;
+        }
+    };
+    if *inner.failed.borrow() {
+        prepared.tool_cancellation.store(true, Ordering::Release);
+        let outcome = internal_failure("session runtime failed before compaction provider work");
+        finish_run(inner, &compaction, outcome.clone()).await;
+        finish_prepared_run(inner, original, &original_audit, outcome).await;
+        return false;
+    }
+    let compaction_run_id = compaction.run_id;
+    if cancelled {
+        prepared.tool_cancellation.store(true, Ordering::Release);
+        finish_run(inner, &compaction, RunOutcome::Cancelled).await;
+    } else {
+        execute_started_run(
+            Arc::clone(inner),
+            compaction,
+            compaction_cancellation,
+            prepared.events,
+            prepared.tool_cancellation,
+            Arc::clone(&prepared.audit.resolved_model),
+        )
+        .await;
+    }
+    if *inner.failed.borrow() {
+        return false;
+    }
+    let committed = loop {
+        let result = inner
+            .store
+            .compaction_committed(original.session_id, compaction_run_id)
+            .await;
+        if matches!(result, Err(SessionRuntimeError::Overloaded)) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            continue;
+        }
+        break result;
+    };
+    let compacted = match committed {
+        Ok(compacted) => compacted,
+        Err(error) => {
+            finish_prepared_run(
+                inner,
+                original,
+                &original_audit,
+                persistence_failure("failed to verify automatic compaction", &error),
+            )
+            .await;
+            return false;
+        }
+    };
+    loop {
+        match inner.store.reload_reserved_messages(original).await {
+            Ok(Some((messages, attempted))) => {
+                original.messages = messages;
+                original.context_compaction_attempted = attempted;
+                if compacted {
+                    original.context_overflow_model = None;
+                }
+                return true;
+            }
+            Ok(None) => {
+                clear_run_registration(inner, original.run_id);
+                return false;
+            }
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(error) => {
+                finish_prepared_run(
+                    inner,
+                    original,
+                    &original_audit,
+                    persistence_failure(
+                        "failed to reload the reserved prompt after automatic compaction",
+                        &error,
+                    ),
+                )
+                .await;
+                return false;
+            }
+        }
+    }
+}
+
+async fn cancellation_requested_with_retry(
+    inner: &SessionRuntimeInner,
+    run_id: RunId,
+) -> Result<bool, SessionRuntimeError> {
+    loop {
+        if *inner.failed.borrow() {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        let result = inner.store.cancellation_requested(run_id).await;
+        if *inner.failed.borrow() {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        match result {
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn session_file_state_with_retry(
+    inner: &SessionRuntimeInner,
+    session_id: SessionId,
+) -> Result<Vec<(String, String)>, SessionRuntimeError> {
+    loop {
+        if *inner.failed.borrow() {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        match inner.store.session_file_state(session_id).await {
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn finish_reserved_run(
+    inner: &SessionRuntimeInner,
+    claimed: &ClaimedRun,
+    outcome: RunOutcome,
+) {
+    loop {
+        match inner
+            .store
+            .finish_reserved_run(claimed, outcome.clone())
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    inner.notify(event.cursor);
+                }
+                inner
+                    .settlements
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+                clear_run_registration(inner, claimed.run_id);
+                return;
+            }
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(_) => {
+                inner.failed.send_replace(true);
+                return;
+            }
+        }
+    }
+}
+
+fn clear_run_registration(inner: &SessionRuntimeInner, run_id: RunId) {
+    if let Ok(mut cancellations) = inner.cancellations.lock() {
+        cancellations.remove(&run_id);
+    }
+    inner.clear_run_approvals(run_id);
+}
+
+async fn finish_prepared_run(
+    inner: &SessionRuntimeInner,
+    claimed: &ClaimedRun,
+    audit: &PreparedRunAudit,
+    outcome: RunOutcome,
+) {
+    loop {
+        match inner
+            .store
+            .finish_prepared_run(claimed, audit.clone(), outcome.clone())
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    inner.notify(event.cursor);
+                }
+                inner
+                    .settlements
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+                clear_run_registration(inner, claimed.run_id);
+                return;
+            }
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(error) => {
+                // A trigger or storage failure on one descriptor/identity column
+                // must still terminally settle the queued run without pretending
+                // the failed audit write was durable.
+                finish_reserved_run(
+                    inner,
+                    claimed,
+                    persistence_failure("failed to persist prepared run state", &error),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn execute_started_run(
+    inner: Arc<SessionRuntimeInner>,
+    claimed: ClaimedRun,
+    mut cancellation: watch::Receiver<bool>,
+    mut events: crate::RuntimeStream,
+    tool_cancellation: Arc<AtomicBool>,
+    resolved_model: Arc<ResolvedModel>,
+) {
+    let mut runtime_failed = inner.failed.subscribe();
+    if *runtime_failed.borrow() {
+        tool_cancellation.store(true, Ordering::Release);
         finish_run(
             &inner,
             &claimed,
-            persistence_failure("failed to persist the resolved model", &error),
+            internal_failure("session runtime failed before provider work"),
         )
         .await;
         return;
     }
-    claimed.model = ModelSelection {
-        model: Some(loaded.resolved_model.route.clone()),
-        max_output_tokens: Some(loaded.resolved_model.max_output_tokens),
-        organization: loaded.resolved_model.organization.clone(),
-    };
-
-    let tool_cancellation = Arc::new(AtomicBool::new(false));
     let internal = claimed.kind == RunKind::Compaction;
-    // Internal summarization runs are denied every tool: their instruction
-    // forbids calls and their only product is the summary text.
-    let gate: Arc<dyn ToolGate> = if internal {
-        Arc::new(CompactionRunGate)
-    } else {
-        Arc::new(SessionToolGate::new(
-            Arc::clone(&inner),
-            claimed.clone(),
-            cancellation.clone(),
-        ))
-    };
-    // The session's durable file-state map seeds the run so read-before-write
-    // tracking survives across runs (and server restarts) in one session.
-    let file_state = match inner.store.session_file_state(claimed.session_id).await {
-        Ok(entries) => Arc::new(FileState::with_entries(entries)),
-        Err(error) => {
-            finish_run(
-                &inner,
-                &claimed,
-                persistence_failure("failed to load the session file state", &error),
-            )
-            .await;
-            return;
-        }
-    };
-    // Guidance authority follows the command's durable provenance, not the
-    // session's ancestry: a user may explicitly submit /skill to an existing
-    // child session, while the model-authored prompt that created that child
-    // must not load repository guidance. Spawning remains depth-capped to
-    // root sessions.
-    let capabilities = if internal || !claimed.user_initiated {
-        RunCapabilities::restricted()
-    } else {
-        let spawner = if claimed.child {
-            None
-        } else {
-            Some(Arc::new(SessionSubagentSpawner::new(
-                Arc::clone(&inner),
-                claimed.clone(),
-            )) as Arc<dyn SubagentSpawner>)
-        };
-        RunCapabilities::user(spawner)
-    }
-    .with_literal_slash(claimed.literal_slash);
-    let mut events = loaded.runtime.run_loop_with_spawner(
-        claimed.messages.clone(),
-        PathBuf::from(&claimed.workspace),
-        Arc::clone(&tool_cancellation),
-        gate,
-        file_state,
-        capabilities,
-    );
-    let mut accounting = RunAccountingAccumulator::new(loaded.resolved_model.pricing.clone());
+    let mut accounting = RunAccountingAccumulator::new(resolved_model.pricing.clone());
     let mut pending_text = String::new();
     let mut pending_channel = None;
     let mut reasoning_kind = None;
@@ -230,6 +840,7 @@ pub(super) async fn execute_run(
         let input = if let Some(deadline) = flush_at {
             tokio::select! {
                 biased;
+                _ = runtime_failed.changed() => RunInput::RuntimeFailed,
                 changed = cancellation.changed() => {
                     if changed.is_ok() && *cancellation.borrow() {
                         RunInput::Cancelled
@@ -243,6 +854,7 @@ pub(super) async fn execute_run(
         } else {
             tokio::select! {
                 biased;
+                _ = runtime_failed.changed() => RunInput::RuntimeFailed,
                 changed = cancellation.changed() => {
                     if changed.is_ok() && *cancellation.borrow() {
                         RunInput::Cancelled
@@ -297,7 +909,10 @@ pub(super) async fn execute_run(
             .await;
             return;
         }
-        let stopped = matches!(&input, RunInput::Cancelled | RunInput::Interrupted);
+        let stopped = matches!(
+            &input,
+            RunInput::Cancelled | RunInput::Interrupted | RunInput::RuntimeFailed
+        );
         if !pending_tool_output.is_empty()
             && !continues_tool_output
             && !stopped
@@ -441,9 +1056,54 @@ pub(super) async fn execute_run(
                 finish_run_accounted(&inner, &claimed, outcome, Some(accounting.snapshot())).await;
                 return;
             }
+            RunInput::RuntimeFailed => {
+                tool_cancellation.store(true, Ordering::Release);
+                if let Err(error) = flush_pending_reasoning(
+                    &inner,
+                    &claimed,
+                    &mut pending_reasoning_kind,
+                    &mut pending_reasoning_text,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist reasoning", &error),
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist model output", &error),
+                    )
+                    .await;
+                    return;
+                }
+                finish_run_accounted(
+                    &inner,
+                    &claimed,
+                    internal_failure("session runtime failed during provider work"),
+                    Some(accounting.snapshot()),
+                )
+                .await;
+                return;
+            }
             RunInput::Event(Some(RuntimeEvent::Started)) => {}
             RunInput::Event(Some(RuntimeEvent::Prepared {
-                turn_ordinal,
+                turn_ordinal: _,
                 identity,
                 weight,
             })) => {
@@ -459,8 +1119,8 @@ pub(super) async fn execute_run(
                     return;
                 }
                 let plan = context::plan(context::ContextInput {
-                    context_window: loaded.resolved_model.context_window,
-                    max_output_tokens: loaded.resolved_model.max_output_tokens,
+                    context_window: resolved_model.context_window,
+                    max_output_tokens: weight.max_output_tokens,
                     system_bytes: weight.system_bytes,
                     tool_schema_bytes: weight.tool_schema_bytes,
                     reducible_message_bytes: weight.reducible_message_bytes,
@@ -470,7 +1130,11 @@ pub(super) async fn execute_run(
                     // will turn the first-turn Compact result into a reserved
                     // auto-compaction; later turns and compaction runs must
                     // fail closed without polling the provider.
-                    compaction_attempted: internal || turn_ordinal > 1,
+                    compaction: if internal {
+                        context::CompactionDisposition::AlreadyAttempted
+                    } else {
+                        context::CompactionDisposition::BetweenRunsOnly
+                    },
                 });
                 match plan {
                     context::ContextPlan::Send { .. } => {}
@@ -1085,6 +1749,7 @@ enum RunInput {
     Flush,
     Cancelled,
     Interrupted,
+    RuntimeFailed,
 }
 
 async fn flush_pending_reasoning(
@@ -1210,23 +1875,31 @@ async fn finish_run_accounted(
     outcome: RunOutcome,
     accounting: Option<RunAccounting>,
 ) {
-    match inner.store.finish_run(claimed, outcome, accounting).await {
-        Ok(events) => {
-            for event in events {
-                inner.notify(event.cursor);
+    loop {
+        match inner
+            .store
+            .finish_run(claimed, outcome.clone(), accounting.clone())
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    inner.notify(event.cursor);
+                }
+                inner
+                    .settlements
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+                clear_run_registration(inner, claimed.run_id);
+                return;
             }
-            inner
-                .settlements
-                .send_modify(|generation| *generation = generation.wrapping_add(1));
-        }
-        Err(_) => {
-            inner.failed.send_replace(true);
+            Err(SessionRuntimeError::Overloaded) => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(_) => {
+                inner.failed.send_replace(true);
+                return;
+            }
         }
     }
-    if let Ok(mut cancellations) = inner.cancellations.lock() {
-        cancellations.remove(&claimed.run_id);
-    }
-    inner.clear_run_approvals(claimed.run_id);
 }
 
 #[derive(Clone)]
@@ -1329,7 +2002,7 @@ pub(super) fn internal_failure(message: &str) -> RunOutcome {
 /// context budget surfaces as a user-meaningful policy failure; every other
 /// error is an internal failure that carries the store error rather than
 /// discarding it, since qq-core has no logging facility to record it.
-fn persistence_failure(action: &str, error: &SessionRuntimeError) -> RunOutcome {
+pub(super) fn persistence_failure(action: &str, error: &SessionRuntimeError) -> RunOutcome {
     match error {
         SessionRuntimeError::OutputTooLarge | SessionRuntimeError::ContextTooLarge => {
             context_budget_failure()

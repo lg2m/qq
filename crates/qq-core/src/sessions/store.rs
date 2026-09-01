@@ -31,6 +31,158 @@ struct CommittedCommandHook {
 static COMMITTED_COMMAND_HOOK: Mutex<Option<CommittedCommandHook>> = Mutex::new(None);
 
 #[cfg(test)]
+static CANCELLATION_READ_FAILURES: Mutex<Vec<(RunId, SessionRuntimeError)>> =
+    Mutex::new(Vec::new());
+
+#[cfg(test)]
+static RESERVED_SETTLEMENT_FAILURES: Mutex<Vec<(RunId, SessionRuntimeError)>> =
+    Mutex::new(Vec::new());
+
+#[cfg(test)]
+static PREPARED_SETTLEMENT_FAILURES: Mutex<Vec<(RunId, SessionRuntimeError)>> =
+    Mutex::new(Vec::new());
+
+#[cfg(test)]
+static RESERVED_RELOAD_FAILURES: Mutex<Vec<(RunId, SessionRuntimeError)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+static RESERVED_START_FAILURES: Mutex<Vec<(RunId, SessionRuntimeError)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct CancellationReadHook {
+    run_id: RunId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static CANCELLATION_READ_HOOKS: Mutex<Vec<CancellationReadHook>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct ReservedStartOverloadHook {
+    run_id: RunId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static RESERVED_START_OVERLOAD_HOOKS: Mutex<Vec<ReservedStartOverloadHook>> =
+    Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn fail_cancellation_reads(
+    run_id: RunId,
+    failures: impl IntoIterator<Item = SessionRuntimeError>,
+) {
+    CANCELLATION_READ_FAILURES
+        .lock()
+        .unwrap()
+        .extend(failures.into_iter().map(|failure| (run_id, failure)));
+}
+
+#[cfg(test)]
+pub(super) fn fail_reserved_settlements(
+    run_id: RunId,
+    failures: impl IntoIterator<Item = SessionRuntimeError>,
+) {
+    RESERVED_SETTLEMENT_FAILURES
+        .lock()
+        .unwrap()
+        .extend(failures.into_iter().map(|failure| (run_id, failure)));
+}
+
+#[cfg(test)]
+pub(super) fn fail_prepared_settlements(
+    run_id: RunId,
+    failures: impl IntoIterator<Item = SessionRuntimeError>,
+) {
+    PREPARED_SETTLEMENT_FAILURES
+        .lock()
+        .unwrap()
+        .extend(failures.into_iter().map(|failure| (run_id, failure)));
+}
+
+#[cfg(test)]
+pub(super) fn fail_reserved_reloads(
+    run_id: RunId,
+    failures: impl IntoIterator<Item = SessionRuntimeError>,
+) {
+    RESERVED_RELOAD_FAILURES
+        .lock()
+        .unwrap()
+        .extend(failures.into_iter().map(|failure| (run_id, failure)));
+}
+
+#[cfg(test)]
+pub(super) fn fail_reserved_starts(
+    run_id: RunId,
+    failures: impl IntoIterator<Item = SessionRuntimeError>,
+) {
+    RESERVED_START_FAILURES
+        .lock()
+        .unwrap()
+        .extend(failures.into_iter().map(|failure| (run_id, failure)));
+}
+
+#[cfg(test)]
+pub(super) fn hold_cancellation_read(
+    run_id: RunId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    CANCELLATION_READ_HOOKS
+        .lock()
+        .unwrap()
+        .push(CancellationReadHook {
+            run_id,
+            entered,
+            release: release_rx,
+        });
+    (entered_rx, release)
+}
+
+#[cfg(test)]
+pub(super) fn hold_overloaded_reserved_start(
+    run_id: RunId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    RESERVED_START_OVERLOAD_HOOKS
+        .lock()
+        .unwrap()
+        .push(ReservedStartOverloadHook {
+            run_id,
+            entered,
+            release: release_rx,
+        });
+    (entered_rx, release)
+}
+
+#[cfg(test)]
+fn take_cancellation_read_hook(run_id: RunId) -> Option<CancellationReadHook> {
+    let mut hooks = CANCELLATION_READ_HOOKS.lock().unwrap();
+    let index = hooks.iter().position(|hook| hook.run_id == run_id)?;
+    Some(hooks.remove(index))
+}
+
+#[cfg(test)]
+fn take_reserved_start_overload_hook(run_id: RunId) -> Option<ReservedStartOverloadHook> {
+    let mut hooks = RESERVED_START_OVERLOAD_HOOKS.lock().unwrap();
+    let index = hooks.iter().position(|hook| hook.run_id == run_id)?;
+    Some(hooks.remove(index))
+}
+
+#[cfg(test)]
+fn take_targeted_failure(
+    failures: &Mutex<Vec<(RunId, SessionRuntimeError)>>,
+    run_id: RunId,
+) -> Option<SessionRuntimeError> {
+    let mut failures = failures.lock().unwrap();
+    let index = failures.iter().position(|(target, _)| *target == run_id)?;
+    Some(failures.remove(index).1)
+}
+
+#[cfg(test)]
 pub(super) fn hold_committed_command(
     command_id: CommandId,
 ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -375,25 +527,49 @@ impl Store {
         .await
     }
 
-    /// Claims the next queued run from one of the two scheduling queues:
+    /// Reserves the next queued run from one of the two scheduling queues:
     /// child-session runs when `children` is set, root-session runs
     /// otherwise. The queues are separate because each draws from its own
     /// permit pool.
-    pub(super) async fn claim_next_run(
+    pub(super) async fn reserve_next_run(
         &self,
         children: bool,
     ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
         let store_id = self.store_id;
         self.call(Priority::Control, move |connection| {
-            claim_next_run(connection, store_id, children)
+            reserve_next_run(connection, store_id, children)
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn claim_next_run(
+        &self,
+        children: bool,
+    ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
+        let Some(claimed) = self.reserve_next_run(children).await? else {
+            return Ok(None);
+        };
+        let audit = test_prepared_audit(&claimed);
+        if self.start_reserved_run(&claimed, audit).await?.is_none() {
+            return Err(SessionRuntimeError::Persistence);
+        }
+        Ok(Some(claimed))
     }
 
     pub(super) async fn cancellation_requested(
         &self,
         run_id: RunId,
     ) -> Result<bool, SessionRuntimeError> {
+        #[cfg(test)]
+        if let Some(hook) = take_cancellation_read_hook(run_id) {
+            let _ = hook.entered.send(());
+            let _ = hook.release.await;
+        }
+        #[cfg(test)]
+        if let Some(failure) = take_targeted_failure(&CANCELLATION_READ_FAILURES, run_id) {
+            return Err(failure);
+        }
         self.call(Priority::Control, move |connection| {
             connection
                 .query_row(
@@ -404,6 +580,137 @@ impl Store {
                 .optional()
                 .map_err(|_| SessionRuntimeError::Persistence)?
                 .ok_or(SessionRuntimeError::RunNotFound)
+        })
+        .await
+    }
+
+    pub(super) async fn start_reserved_run(
+        &self,
+        claimed: &ClaimedRun,
+        audit: PreparedRunAudit,
+    ) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
+        #[cfg(test)]
+        if let Some(hook) = take_reserved_start_overload_hook(claimed.run_id) {
+            let _ = hook.entered.send(());
+            let _ = hook.release.await;
+            return Err(SessionRuntimeError::Overloaded);
+        }
+        #[cfg(test)]
+        if let Some(failure) = take_targeted_failure(&RESERVED_START_FAILURES, claimed.run_id) {
+            return Err(failure);
+        }
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Control, move |connection| {
+            start_reserved_run(connection, store_id, &claimed, &audit)
+        })
+        .await
+    }
+
+    pub(super) async fn start_auto_compaction(
+        &self,
+        original: &ClaimedRun,
+        audit: PreparedRunAudit,
+    ) -> Result<Option<(ClaimedRun, SessionEventEnvelope)>, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let original = original.clone();
+        self.call(Priority::Control, move |connection| {
+            start_auto_compaction(connection, store_id, &original, &audit)
+        })
+        .await
+    }
+
+    pub(super) async fn load_auto_compaction_messages(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<Message>, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            load_auto_compaction_messages(connection, session_id)
+        })
+        .await
+    }
+
+    pub(super) async fn reload_reserved_messages(
+        &self,
+        claimed: &ClaimedRun,
+    ) -> Result<Option<(Vec<Message>, bool)>, SessionRuntimeError> {
+        #[cfg(test)]
+        if let Some(failure) = take_targeted_failure(&RESERVED_RELOAD_FAILURES, claimed.run_id) {
+            return Err(failure);
+        }
+        let claimed = claimed.clone();
+        self.call(Priority::Control, move |connection| {
+            reload_reserved_messages(connection, &claimed)
+        })
+        .await
+    }
+
+    pub(super) async fn compaction_committed(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+    ) -> Result<bool, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM session_compactions
+                         WHERE session_id = ?1 AND run_id = ?2
+                     )",
+                    params![session_id.to_string(), run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)
+        })
+        .await
+    }
+
+    pub(super) async fn finish_reserved_run(
+        &self,
+        claimed: &ClaimedRun,
+        outcome: RunOutcome,
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+        #[cfg(test)]
+        if let Some(failure) = take_targeted_failure(&RESERVED_SETTLEMENT_FAILURES, claimed.run_id)
+        {
+            return Err(failure);
+        }
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Control, move |connection| {
+            finish_reserved_run(connection, store_id, &claimed, outcome)
+        })
+        .await
+    }
+
+    pub(super) async fn finish_prepared_run(
+        &self,
+        claimed: &ClaimedRun,
+        audit: PreparedRunAudit,
+        outcome: RunOutcome,
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+        #[cfg(test)]
+        if let Some(failure) = take_targeted_failure(&PREPARED_SETTLEMENT_FAILURES, claimed.run_id)
+        {
+            return Err(failure);
+        }
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Control, move |connection| {
+            finish_prepared_run(connection, store_id, &claimed, &audit, outcome)
+        })
+        .await
+    }
+
+    pub(super) async fn settle_panicked_execution(
+        &self,
+        original: &ClaimedRun,
+        outcome: RunOutcome,
+    ) -> Result<PanickedExecutionSettlement, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let original = original.clone();
+        self.call(Priority::Control, move |connection| {
+            settle_panicked_execution(connection, store_id, &original, outcome)
         })
         .await
     }
@@ -508,35 +815,6 @@ impl Store {
                         claimed.session_id.to_string(),
                         identity,
                     ],
-                )
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            if changed != 1 {
-                return Err(SessionRuntimeError::Persistence);
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// Commits the exact resolved model before the runtime can be polled far
-    /// enough to start provider work.
-    pub(super) async fn record_resolved_model(
-        &self,
-        claimed: &ClaimedRun,
-        resolved_model: &ResolvedModel,
-    ) -> Result<(), SessionRuntimeError> {
-        let run_id = claimed.run_id;
-        let session_id = claimed.session_id;
-        let resolved_model =
-            serde_json::to_string(resolved_model).map_err(|_| SessionRuntimeError::Persistence)?;
-        self.call(Priority::Control, move |connection| {
-            let changed = connection
-                .execute(
-                    "UPDATE runs
-                     SET resolved_model_json = ?3
-                     WHERE id = ?1 AND session_id = ?2 AND status = 'running'
-                       AND (resolved_model_json IS NULL OR resolved_model_json = ?3)",
-                    params![run_id.to_string(), session_id.to_string(), resolved_model,],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             if changed != 1 {

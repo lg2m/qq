@@ -3008,6 +3008,51 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &changed));
     }
 
+    #[tokio::test]
+    async fn direct_runtime_uses_catalog_context_window_before_provider_io() {
+        use futures_util::StreamExt as _;
+
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let request = fixture.request(
+            r#"(
+                version: 1,
+                model: "custom/test-model",
+                providers: {
+                    "custom": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                        models: {
+                            "test-model": (
+                                name: "Test model",
+                                context_window: 1,
+                            ),
+                        },
+                    ),
+                },
+            )"#,
+        );
+        let runtime = factory.runtime_for(&request).unwrap();
+        let mut events = runtime.run_in_workspace(
+            qq_protocol::RunCommand::new("this cannot fit"),
+            fixture.path("work"),
+        );
+        let mut failure = None;
+        while let Some(event) = events.next().await {
+            if let qq_protocol::RunEvent::Failed { kind, message } = event {
+                failure = Some((kind, message));
+                break;
+            }
+        }
+
+        let (kind, message) = failure.expect("the context plan must fail before provider I/O");
+        assert_eq!(kind, RunFailureKind::Policy);
+        assert!(message.contains("context"), "{message}");
+    }
+
     #[test]
     fn constructs_amazon_bedrock_runtimes_for_every_auth_mode_without_network_access() {
         let fixture = RuntimeFixture::new();

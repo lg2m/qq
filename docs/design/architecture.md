@@ -269,14 +269,23 @@ recipe construction independently from provider network latency. End-to-end
 startup and time-to-first-token benchmarks remain the primary performance
 signals.
 
-One run follows a simple loop:
+One durable run follows a guarded loop:
 
-1. Accept and validate a user command.
-2. Persist the command.
-3. Assemble model context and request a response.
-4. Execute requested tools under the session's workspace policy.
-5. Persist resulting messages and events before publishing them.
-6. Repeat until completion, cancellation, or failure.
+1. Accept, validate, and persist the queued user command.
+2. Reserve one queued run without changing its public queued projection or
+   publishing `RunStarted`. This unpublished coordination transaction may use
+   WAL `synchronous=NORMAL`: an OS or power loss may discard only the
+   reservation pointer, while the already-FULL-committed queued run remains
+   eligible. The store restores `synchronous=FULL` before returning.
+3. Prepare the runtime and conservatively plan the complete provider request
+   under the acquired permit; cancellation remains durable and observable.
+4. In one guarded transaction, persist the resolved model, prompt identity,
+   exact request measurement, running/session/message state, and `RunStarted`.
+5. Re-read cancellation, then poll the provider only after that transaction
+   commits and publishes.
+6. Execute requested tools under the session's workspace policy, persisting
+   resulting messages and events before publishing them.
+7. Repeat until completion, cancellation, compaction, or failure.
 
 This ordering makes persisted state authoritative and allows clients to resume
 an event stream without losing output. Each completed model turn also commits

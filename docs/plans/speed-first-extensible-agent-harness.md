@@ -1,8 +1,8 @@
 # Speed-First Extensible Agent Harness Backend
 
 Status: Phase 0 complete 2026-09-01. Phase 1 is in progress: R4 completed and
-qualified on 2026-09-01; R5 and H1 are next. Implementation Phases 2–7 and
-tasks H2–H12 remain proposed.
+qualified on 2026-09-01; R5 implementation is in progress and H1 follows.
+Implementation Phases 2–7 and tasks H2–H12 remain proposed.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -1116,7 +1116,10 @@ design. The reproducible protocol and complete measurement inventory are in
 Complete R4 and R5 through their owning readiness phases, then implement H1.
 Do not copy their implementation contracts into this plan.
 
-Status: in progress. R4 is complete; R5 and H1 remain.
+Status: in progress. R4 is complete. R5 now has immutable resolved-model and
+provider-aware context-admission slices, but remains incomplete until its
+budget, compiled request-shape identity, compaction-hardening, and qualification
+gates close; H1 follows.
 
 #### Imported R4 Completion Receipt — 2026-09-01
 
