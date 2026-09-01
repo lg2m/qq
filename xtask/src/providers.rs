@@ -220,6 +220,8 @@ enum Task {
     Providers(ProvidersArgs),
     /// Run and inspect reproducible Harbor evaluations.
     Eval(Box<crate::eval::EvalArgs>),
+    /// Record and compare deterministic local performance baselines.
+    Perf(crate::perf::PerfArgs),
 }
 
 #[derive(Debug, Args)]
@@ -416,6 +418,8 @@ enum SetupError {
 enum XtaskError {
     #[error(transparent)]
     Eval(#[from] crate::eval::EvalError),
+    #[error(transparent)]
+    Perf(#[from] crate::perf::PerfError),
     #[error("choose one or more --provider values or --all, but not both")]
     InvalidSelection,
     #[error("live provider checks require {LIVE_OPT_IN}=1")]
@@ -453,6 +457,7 @@ async fn try_run(cli: Cli) -> Result<(), XtaskError> {
             },
         },
         Task::Eval(args) => crate::eval::run(*args).await.map_err(Into::into),
+        Task::Perf(args) => crate::perf::run(args).await.map_err(Into::into),
     }
 }
 

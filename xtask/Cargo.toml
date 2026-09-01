@@ -7,17 +7,23 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+async-stream.workspace = true
+cap-std.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 qq-auth.workspace = true
+qq-client.workspace = true
+qq-core.workspace = true
+qq-protocol.workspace = true
 qq-provider.workspace = true
+qq-server.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-qq-protocol.workspace = true
-tempfile.workspace = true

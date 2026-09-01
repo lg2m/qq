@@ -11,8 +11,13 @@ Repository automation for QQ is available through `cargo xtask`.
   category.
 - `cargo xtask eval report ...` verifies fixed trial identity and emits the
   baseline scorecard.
+- `cargo xtask perf baseline ...` records the optimized Linux Phase 0 size,
+  startup, RSS, runtime, replay, tool, streaming, and isolated load profiles.
+- `cargo xtask perf check ...` rejects compatible candidate reports that exceed
+  the checked-in regression budgets.
 
-See `benchmarks/harbor/README.md` for the reproducible evaluation workflow.
+See `benchmarks/harbor/README.md` for the reproducible evaluation workflow and
+`benchmarks/perf/README.md` for the performance protocol and metric inventory.
 
 ```sh
 cargo xtask providers check offline

@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 mod eval;
+mod perf;
 mod providers;
 
 #[tokio::main]
