@@ -518,6 +518,35 @@ impl Store {
         .await
     }
 
+    /// Commits the exact resolved model before the runtime can be polled far
+    /// enough to start provider work.
+    pub(super) async fn record_resolved_model(
+        &self,
+        claimed: &ClaimedRun,
+        resolved_model: &ResolvedModel,
+    ) -> Result<(), SessionRuntimeError> {
+        let run_id = claimed.run_id;
+        let session_id = claimed.session_id;
+        let resolved_model =
+            serde_json::to_string(resolved_model).map_err(|_| SessionRuntimeError::Persistence)?;
+        self.call(Priority::Control, move |connection| {
+            let changed = connection
+                .execute(
+                    "UPDATE runs
+                     SET resolved_model_json = ?3
+                     WHERE id = ?1 AND session_id = ?2 AND status = 'running'
+                       AND (resolved_model_json IS NULL OR resolved_model_json = ?3)",
+                    params![run_id.to_string(), session_id.to_string(), resolved_model,],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            if changed != 1 {
+                return Err(SessionRuntimeError::Persistence);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub(super) async fn append_reasoning(
         &self,
         claimed: &ClaimedRun,

@@ -237,6 +237,18 @@ Provider compilation follows these performance rules:
   allocate another model string.
 - Provider identity must not cause branching in the request hot path.
 
+For each run, the root composition layer also projects effective configuration
+and model metadata into one immutable, secret-free `ResolvedModel`. The value
+records the effective route, provider-visible model, output cap, optional
+context window, pricing provenance, named organization/credential profile, and
+implemented generation/cache controls without leaking configuration or secret
+types into `qq-core`. Core verifies that the runtime's model and output cap
+match the descriptor, persists the descriptor once on the run, and only then
+permits provider polling. Per-turn audit rows retain the effective model
+selection and refer back to the run instead of copying the full descriptor.
+Historical rows remain explicitly unknown rather than being reinterpreted
+through current configuration.
+
 Protocol codecs, request-time authorization, framing, retry policy, and
 transport are internal implementation details. Shared protocol behavior is
 composed from private functions and small structs; do not introduce a

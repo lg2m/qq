@@ -14,9 +14,10 @@ use qq_core::{
     SessionRuntime, SessionRuntimeOptions,
 };
 use qq_protocol::{
-    ApprovalDecision, ApprovalGrant, ApprovalMode, CommandId, CommandOutcome, ModelSelection,
-    RunFailureKind, RunId, RunOutcome, SessionCommand, SessionEvent, SubscribeRequest,
-    ToolCallSnapshot, ToolCallState,
+    ApprovalDecision, ApprovalGrant, ApprovalMode, CapabilitySupport, CommandId, CommandOutcome,
+    GenerationCapabilities, ModelSelection, PromptCacheCapabilities, ResolvedModel,
+    ResolvedModelVersion, RunFailureKind, RunId, RunOutcome, SessionCommand, SessionEvent,
+    SubscribeRequest, ToolCallSnapshot, ToolCallState,
 };
 use qq_provider::{ModelRequest, Provider, ProviderEvent, ProviderStream, ToolSpec};
 
@@ -108,7 +109,25 @@ impl RuntimeLoader for McpLoader {
             )
             .map(|runtime| LoadedRuntime {
                 runtime: Arc::new(runtime.with_mcp_registry(registry)),
-                pricing: None,
+                resolved_model: Arc::new(ResolvedModel {
+                    version: ResolvedModelVersion::new(1).unwrap(),
+                    route: "test/model".to_owned(),
+                    provider_model: "test-model".to_owned(),
+                    organization: None,
+                    credential_profile: None,
+                    max_output_tokens: 256,
+                    context_window: None,
+                    pricing: None,
+                    output_token_control: CapabilitySupport::Native,
+                    generation: GenerationCapabilities {
+                        reasoning_effort: CapabilitySupport::Unsupported,
+                    },
+                    prompt_cache: PromptCacheCapabilities {
+                        control: CapabilitySupport::Unsupported,
+                        cache_read_usage: false,
+                        cache_write_usage: false,
+                    },
+                }),
             })
             .map_err(|error| RuntimeLoadError {
                 kind: RunFailureKind::Configuration,

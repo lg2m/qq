@@ -20,7 +20,8 @@ use qq_core::{
     WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 use qq_protocol::{
-    ApprovalGrant, CommandRequest, ModelCatalogRequest, ModelDescriptor, RunFailureKind,
+    ApprovalGrant, CapabilitySupport, CommandRequest, GenerationCapabilities, ModelCatalogRequest,
+    ModelDescriptor, PromptCacheCapabilities, ResolvedModel, ResolvedModelVersion, RunFailureKind,
     SnapshotRequest, SubscribeRequest, WorkspaceGrantOutcome,
 };
 use qq_provider::{
@@ -435,13 +436,15 @@ impl RuntimeFactory {
         &self,
         snapshot: &ConfigSnapshot,
     ) -> Result<Arc<Runtime>, RuntimeBuildError> {
-        self.runtime_with_key_for_snapshot(snapshot)
+        let resolved_model = self.resolved_model_for_snapshot(snapshot)?;
+        self.runtime_with_key_for_snapshot(snapshot, &resolved_model)
             .map(|(runtime, _)| runtime)
     }
 
     fn runtime_with_key_for_snapshot(
         &self,
         snapshot: &ConfigSnapshot,
+        resolved_model: &ResolvedModel,
     ) -> Result<(Arc<Runtime>, RuntimeKey), RuntimeBuildError> {
         let provider_id = snapshot.model().provider();
         let provider_config = snapshot
@@ -463,8 +466,8 @@ impl RuntimeFactory {
         };
         let key = RuntimeKey::new(
             provider_id,
-            snapshot.model().model(),
-            snapshot.max_output_tokens(),
+            &resolved_model.provider_model,
+            resolved_model.max_output_tokens,
             &provider_key,
             &mcp_key,
         );
@@ -482,8 +485,8 @@ impl RuntimeFactory {
 
         let mut runtime = Runtime::with_provider(
             self.inner.providers.compile(recipe)?,
-            snapshot.model().model(),
-            snapshot.max_output_tokens(),
+            resolved_model.provider_model.clone(),
+            resolved_model.max_output_tokens,
         )?;
         if let Some(registry) = mcp_registry {
             runtime = runtime.with_mcp_registry(registry);
@@ -505,6 +508,89 @@ impl RuntimeFactory {
         Ok((runtime, key))
     }
 
+    fn resolved_model_for_snapshot(
+        &self,
+        snapshot: &ConfigSnapshot,
+    ) -> Result<ResolvedModel, RuntimeBuildError> {
+        let provider_id = snapshot.model().provider();
+        let provider = snapshot
+            .providers()
+            .get(provider_id)
+            .ok_or_else(|| RuntimeBuildError::UnknownProvider(provider_id.to_owned()))?;
+        let access = provider
+            .access()
+            .ok_or_else(|| RuntimeBuildError::IncompleteProvider(provider_id.to_owned()))?;
+        let metadata = provider.models().get(snapshot.model().model());
+        let max_output_tokens = metadata
+            .and_then(qq_config::ModelMetadata::max_output_tokens)
+            .map_or(snapshot.max_output_tokens(), |model_limit| {
+                model_limit.min(snapshot.max_output_tokens())
+            });
+        let api = effective_provider_api(provider, snapshot.model().model(), access);
+        if matches!(
+            api,
+            ProviderApi::GoogleGenerateContent | ProviderApi::BedrockConverse
+        ) && max_output_tokens > i32::MAX as u32
+        {
+            return Err(RuntimeBuildError::UnrepresentableOutputLimit {
+                provider: provider_id.to_owned(),
+                model: snapshot.model().model().to_owned(),
+                limit: max_output_tokens,
+            });
+        }
+        let codex = matches!(
+            access,
+            ProviderAccess::Http(access)
+                if matches!(access.auth(), HttpCredential::OpenAiCodex { .. })
+        );
+        let (cache_read_usage, cache_write_usage) = match api {
+            ProviderApi::OpenAiResponses
+            | ProviderApi::OpenAiChatCompletions
+            | ProviderApi::GoogleGenerateContent => (true, false),
+            ProviderApi::AnthropicMessages | ProviderApi::BedrockConverse => (true, true),
+        };
+        let credential_profile = match access {
+            ProviderAccess::Http(access) => match access.auth() {
+                HttpCredential::OpenAiCodex { profile } | HttpCredential::XAi { profile, .. } => {
+                    Some(profile.as_deref().unwrap_or("default").to_owned())
+                }
+                HttpCredential::Configured(_) | HttpCredential::ApiKey { .. } => None,
+            },
+            ProviderAccess::AmazonBedrock { auth, .. }
+            | ProviderAccess::AmazonBedrockMantle { auth, .. } => match auth {
+                BedrockAuth::Aws(AwsAuth::Profile(profile)) => Some(profile.clone()),
+                BedrockAuth::Aws(AwsAuth::DefaultChain) | BedrockAuth::ApiKey(_) => None,
+            },
+        };
+        Ok(ResolvedModel {
+            version: ResolvedModelVersion::new(1)
+                .expect("resolved-model schema version must be non-zero"),
+            route: snapshot.model().as_str().to_owned(),
+            provider_model: snapshot.model().model().to_owned(),
+            organization: snapshot.organization().map(str::to_owned),
+            credential_profile,
+            max_output_tokens,
+            context_window: metadata.and_then(qq_config::ModelMetadata::context_window),
+            pricing: metadata
+                .and_then(qq_config::ModelMetadata::pricing)
+                .cloned()
+                .map(protocol_model_pricing),
+            output_token_control: if codex {
+                CapabilitySupport::Unsupported
+            } else {
+                CapabilitySupport::Native
+            },
+            generation: GenerationCapabilities {
+                reasoning_effort: CapabilitySupport::Unsupported,
+            },
+            prompt_cache: PromptCacheCapabilities {
+                control: CapabilitySupport::Unsupported,
+                cache_read_usage,
+                cache_write_usage,
+            },
+        })
+    }
+
     fn prepare_provider(
         &self,
         provider_id: &str,
@@ -514,24 +600,13 @@ impl RuntimeFactory {
         let access = config
             .access()
             .ok_or_else(|| RuntimeBuildError::IncompleteProvider(provider_id.to_owned()))?;
+        let api = effective_provider_api(config, model_id, access);
         match access {
-            ProviderAccess::Http(access) => {
-                let api = config
-                    .models()
-                    .get(model_id)
-                    .and_then(|metadata| metadata.api())
-                    .unwrap_or(access.api());
-                self.prepare_http_provider(provider_id, access, api)
-            }
+            ProviderAccess::Http(access) => self.prepare_http_provider(provider_id, access, api),
             ProviderAccess::AmazonBedrock { region, auth } => {
                 self.prepare_bedrock_provider(provider_id, region.as_deref(), auth)
             }
-            ProviderAccess::AmazonBedrockMantle { region, api, auth } => {
-                let api = config
-                    .models()
-                    .get(model_id)
-                    .and_then(|metadata| metadata.api())
-                    .unwrap_or(*api);
+            ProviderAccess::AmazonBedrockMantle { region, auth, .. } => {
                 self.prepare_bedrock_mantle_provider(provider_id, region.as_deref(), api, auth)
             }
         }
@@ -793,6 +868,22 @@ impl RuntimeFactory {
     }
 }
 
+fn effective_provider_api(
+    provider: &ProviderConfig,
+    model: &str,
+    access: &ProviderAccess,
+) -> ProviderApi {
+    let model_api = provider
+        .models()
+        .get(model)
+        .and_then(qq_config::ModelMetadata::api);
+    match access {
+        ProviderAccess::Http(access) => model_api.unwrap_or(access.api()),
+        ProviderAccess::AmazonBedrock { .. } => ProviderApi::BedrockConverse,
+        ProviderAccess::AmazonBedrockMantle { api, .. } => model_api.unwrap_or(*api),
+    }
+}
+
 fn aws_profile_configured(profile: &str) -> bool {
     if profile.is_empty() {
         return false;
@@ -900,13 +991,7 @@ impl RuntimeLoader for RuntimeFactory {
                 }
                 load = load.with_overrides(overrides);
                 let snapshot = factory.load(&load)?;
-                let pricing = snapshot
-                    .providers()
-                    .get(snapshot.model().provider())
-                    .and_then(|provider| provider.models().get(snapshot.model().model()))
-                    .and_then(|metadata| metadata.pricing())
-                    .cloned()
-                    .map(protocol_model_pricing);
+                let resolved_model = Arc::new(factory.resolved_model_for_snapshot(&snapshot)?);
                 let spawn_model_routes = factory
                     .configured_model_options(&snapshot)
                     .into_iter()
@@ -914,12 +999,16 @@ impl RuntimeLoader for RuntimeFactory {
                     .collect();
                 let runtime = Arc::new(
                     factory
-                        .runtime_for_snapshot(&snapshot)?
+                        .runtime_with_key_for_snapshot(&snapshot, &resolved_model)?
+                        .0
                         .as_ref()
                         .clone()
                         .with_spawn_model_routes(spawn_model_routes),
                 );
-                Ok::<_, RuntimeBuildError>(LoadedRuntime { runtime, pricing })
+                Ok::<_, RuntimeBuildError>(LoadedRuntime {
+                    runtime,
+                    resolved_model,
+                })
             })
             .await;
             match build {
@@ -1493,6 +1582,14 @@ pub enum RuntimeBuildError {
     IncompleteProvider(String),
     #[error("provider {provider:?} uses an API that is not available yet: {api:?}")]
     UnsupportedApi { provider: String, api: ProviderApi },
+    #[error(
+        "configured output limit {limit} for {provider}/{model} cannot be represented by its provider codec"
+    )]
+    UnrepresentableOutputLimit {
+        provider: String,
+        model: String,
+        limit: u32,
+    },
     #[error(transparent)]
     Mcp(#[from] qq_mcp::McpConfigError),
     #[error("runtime cache is unavailable")]
@@ -1532,7 +1629,8 @@ impl RuntimeBuildError {
             Self::Runtime(_)
             | Self::UnknownProvider(_)
             | Self::IncompleteProvider(_)
-            | Self::UnsupportedApi { .. } => RunFailureKind::ProviderConfiguration,
+            | Self::UnsupportedApi { .. }
+            | Self::UnrepresentableOutputLimit { .. } => RunFailureKind::ProviderConfiguration,
             Self::CacheUnavailable | Self::CatalogClientUnavailable(_) => RunFailureKind::Server,
         }
     }
@@ -1678,7 +1776,25 @@ mod tests {
             Box::pin(async move {
                 Ok(LoadedRuntime {
                     runtime,
-                    pricing: None,
+                    resolved_model: Arc::new(ResolvedModel {
+                        version: ResolvedModelVersion::new(1).unwrap(),
+                        route: "test/model".to_owned(),
+                        provider_model: "test/model".to_owned(),
+                        organization: None,
+                        credential_profile: None,
+                        max_output_tokens: 256,
+                        context_window: None,
+                        pricing: None,
+                        output_token_control: CapabilitySupport::Native,
+                        generation: GenerationCapabilities {
+                            reasoning_effort: CapabilitySupport::Unsupported,
+                        },
+                        prompt_cache: PromptCacheCapabilities {
+                            control: CapabilitySupport::Unsupported,
+                            cache_read_usage: false,
+                            cache_write_usage: false,
+                        },
+                    }),
                 })
             })
         }
@@ -1908,6 +2024,197 @@ mod tests {
                 provenance: "test catalog".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn resolved_model_caps_output_to_known_metadata_and_preserves_unknown_limits() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let resolve = |model_metadata: &str, configured_limit| {
+            let request = LoadRequest::new(fixture.path("work"))
+                .with_explicit_content(format!(
+                    r#"(
+                        version: 1,
+                        model: "custom/test-model",
+                        providers: {{
+                            "custom": Custom(
+                                connection: (
+                                    base_url: "http://127.0.0.1:1/v1",
+                                    api: OpenAiResponses,
+                                    auth: NoAuth,
+                                ),
+                                models: {{"test-model": ({model_metadata})}},
+                            ),
+                        }},
+                    )"#
+                ))
+                .with_overrides(RuntimeOverrides::new().with_max_output_tokens(configured_limit));
+            let snapshot = factory.load(&request).unwrap();
+            factory.resolved_model_for_snapshot(&snapshot).unwrap()
+        };
+
+        assert_eq!(
+            resolve("name: \"Capped\", max_output_tokens: 64", 128).max_output_tokens,
+            64
+        );
+        assert_eq!(
+            resolve("name: \"Equal\", max_output_tokens: 128", 128).max_output_tokens,
+            128
+        );
+        assert_eq!(resolve("name: \"Unknown\"", 128).max_output_tokens, 128);
+    }
+
+    #[test]
+    fn resolved_model_is_secret_free_and_carries_effective_metadata() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let request = LoadRequest::new(fixture.path("work"))
+            .with_explicit_content(
+                r#"(
+                    version: 1,
+                    organization: "org-a",
+                    model: "custom/test-model",
+                    providers: {
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: OpenAiResponses,
+                                auth: ApiKey(Value("sk-super-secret")),
+                            ),
+                            models: {
+                                "test-model": (
+                                    name: "Test model",
+                                    context_window: 32768,
+                                    max_output_tokens: 64,
+                                    pricing: (
+                                        input_usd_nanos_per_token: 1,
+                                        output_usd_nanos_per_token: 2,
+                                        cache_read_usd_nanos_per_token: 1,
+                                        provenance: "catalog-a",
+                                    ),
+                                ),
+                            },
+                        ),
+                    },
+                )"#,
+            )
+            .with_overrides(RuntimeOverrides::new().with_max_output_tokens(128));
+        let snapshot = factory.load(&request).unwrap();
+
+        let resolved = factory.resolved_model_for_snapshot(&snapshot).unwrap();
+
+        assert_eq!(resolved.version.get(), 1);
+        assert_eq!(resolved.route, "custom/test-model");
+        assert_eq!(resolved.provider_model, "test-model");
+        assert_eq!(resolved.organization.as_deref(), Some("org-a"));
+        assert_eq!(resolved.credential_profile, None);
+        assert_eq!(resolved.max_output_tokens, 64);
+        assert_eq!(resolved.context_window, Some(32_768));
+        assert_eq!(
+            resolved
+                .pricing
+                .as_ref()
+                .map(|pricing| pricing.provenance.as_str()),
+            Some("catalog-a")
+        );
+        assert_eq!(resolved.output_token_control, CapabilitySupport::Native);
+        assert_eq!(
+            resolved.generation.reasoning_effort,
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            resolved.prompt_cache.control,
+            CapabilitySupport::Unsupported
+        );
+        assert!(resolved.prompt_cache.cache_read_usage);
+        assert!(!resolved.prompt_cache.cache_write_usage);
+        let encoded = serde_json::to_string(&resolved).unwrap();
+        assert!(!encoded.contains("sk-super-secret"), "{encoded}");
+        assert!(!encoded.contains("api_key"), "{encoded}");
+    }
+
+    #[test]
+    fn resolved_model_reports_codex_controls_and_named_auth_profiles() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let codex = factory
+            .load(&fixture.request(
+                r#"(
+                    version: 1,
+                    model: "openai-codex/gpt-test",
+                    providers: {
+                        "openai-codex": OpenAiCodex(
+                            profile: "work",
+                            models: {"gpt-test": (name: "Codex test")},
+                        ),
+                    },
+                )"#,
+            ))
+            .unwrap();
+        let codex = factory.resolved_model_for_snapshot(&codex).unwrap();
+        assert_eq!(codex.credential_profile.as_deref(), Some("work"));
+        assert_eq!(codex.output_token_control, CapabilitySupport::Unsupported);
+        assert_eq!(
+            codex.generation.reasoning_effort,
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(codex.prompt_cache.control, CapabilitySupport::Unsupported);
+        assert!(codex.prompt_cache.cache_read_usage);
+        assert!(!codex.prompt_cache.cache_write_usage);
+
+        let bedrock = factory
+            .load(&fixture.request(
+                r#"(
+                    version: 1,
+                    model: "bedrock/test-model",
+                    providers: {
+                        "bedrock": AmazonBedrock(
+                            region: "us-east-1",
+                            auth: Aws(Profile("aws-work")),
+                            models: {"test-model": (name: "Bedrock test")},
+                        ),
+                    },
+                )"#,
+            ))
+            .unwrap();
+        let bedrock = factory.resolved_model_for_snapshot(&bedrock).unwrap();
+        assert_eq!(bedrock.credential_profile.as_deref(), Some("aws-work"));
+        assert!(bedrock.prompt_cache.cache_read_usage);
+        assert!(bedrock.prompt_cache.cache_write_usage);
+    }
+
+    #[test]
+    fn resolved_model_rejects_output_limits_the_codec_cannot_represent() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let request = LoadRequest::new(fixture.path("work"))
+            .with_explicit_content(
+                r#"(
+                    version: 1,
+                    model: "custom/test-model",
+                    providers: {
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: GoogleGenerateContent,
+                                auth: NoAuth,
+                            ),
+                            models: {"test-model": (name: "Google test")},
+                        ),
+                    },
+                )"#,
+            )
+            .with_overrides(RuntimeOverrides::new().with_max_output_tokens(u32::MAX));
+        let snapshot = factory.load(&request).unwrap();
+
+        assert!(matches!(
+            factory.resolved_model_for_snapshot(&snapshot),
+            Err(RuntimeBuildError::UnrepresentableOutputLimit {
+                provider,
+                model,
+                limit: u32::MAX,
+            }) if provider == "custom" && model == "test-model"
+        ));
     }
 
     #[tokio::test]

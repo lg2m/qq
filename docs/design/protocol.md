@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -65,7 +65,10 @@ runs cannot masquerade as the current session context, and added explicit
 direct and inclusive session accounting totals; version 6 added persisted
 run prompt identity (`RunSnapshot.prompt_identity`); version 7 added the
 persisted `model_turn_completed` event so each provider turn records its model,
-usage, and estimated cost before it is published.
+usage, and estimated cost before it is published; version 8 added the optional
+immutable resolved-model descriptor to `RunSnapshot`. Version 8 is required
+because older snapshot decoders reject the new field under
+`deny_unknown_fields`, even though historical runs may omit it.
 
 Clients and servers must agree on this value.
 
@@ -234,7 +237,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 5,
+  "protocol_version": 8,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -864,6 +867,30 @@ it from cumulative run billing.
       "content_hash": "4444444444444444444444444444444444444444444444444444444444444444"
     }
   },
+  "resolved_model": {
+    "version": 1,
+    "route": "xai/grok-4.5",
+    "provider_model": "grok-4.5",
+    "organization": "example-org",
+    "credential_profile": "work",
+    "max_output_tokens": 4096,
+    "context_window": 128000,
+    "pricing": {
+      "input_usd_nanos_per_token": 1250,
+      "output_usd_nanos_per_token": 10000,
+      "cache_read_usd_nanos_per_token": 125,
+      "provenance": "built-in catalog"
+    },
+    "output_token_control": "native",
+    "generation": {
+      "reasoning_effort": "unsupported"
+    },
+    "prompt_cache": {
+      "control": "unsupported",
+      "cache_read_usage": true,
+      "cache_write_usage": false
+    }
+  },
   "usage": null,
   "estimated_cost_usd_nanos": null,
   "context_tokens": null
@@ -885,6 +912,22 @@ pre-provider identity. `prompt_identity` is absent for historical runs and
 runs that failed before prompt preparation; version-6 rows may omit the fields
 added in version 7.
 
+`resolved_model` is the versioned, secret-free execution descriptor committed
+once after runtime resolution and before the provider stream is polled. Its
+`route` is the effective QQ selection, while `provider_model` is the exact
+identifier placed in provider-neutral requests. The output cap is the minimum
+of the configured cap and known model metadata; unknown model metadata leaves
+the configured cap unchanged. Optional organization and named credential
+profile identify the selected non-secret routing/auth context. Credential
+values, API keys, access tokens, and secret hashes are never represented.
+Pricing retains its provenance, and the capability fields describe controls
+and cache-usage accounting that the selected codec actually implements.
+`unsupported` output control (currently Codex Responses) means QQ still bounds
+its provider-neutral request and response processing to
+`max_output_tokens`, but the codec deliberately omits a provider-side output
+parameter. Historical runs and runs that fail before model resolution omit the
+descriptor rather than borrowing current configuration.
+
 `usage` sums every model turn in the run and is the billing figure;
 `context_tokens` is the final completed turn's input-token total (fresh
 input + cache reads + cache writes) for that run. Internal compaction runs
@@ -893,6 +936,9 @@ not a substitute for `SessionSummary.context_tokens`.
 `model_turn_completed` is persisted before any tool dispatch and records every
 provider inference, including tool-only and internal compaction turns, so
 trajectory exporters do not have to infer per-turn model or accounting data.
+Its `model` is the effective route, organization, and output cap from the run's
+descriptor. The event's `run_id` links to the single run-level descriptor;
+pricing and capability metadata are not duplicated into every turn event.
 `run_context_updated` streams measured per-run audit values and is absent for
 unmeasured turns and runs persisted before version 3.
 `session_context_updated` is the live session-meter event. It is emitted only

@@ -136,6 +136,75 @@ pub struct ModelPricingTier {
     pub cache_write_usd_nanos_per_token: Option<u64>,
 }
 
+/// Version of the secret-free resolved-model projection persisted for a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResolvedModelVersion(NonZeroU16);
+
+impl ResolvedModelVersion {
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        match NonZeroU16::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+/// Whether QQ's selected provider codec can express one generation control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Native,
+    Unsupported,
+}
+
+/// Generation controls implemented by the selected provider codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationCapabilities {
+    pub reasoning_effort: CapabilitySupport,
+}
+
+/// Prompt-cache controls and accounting fields implemented by the codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptCacheCapabilities {
+    pub control: CapabilitySupport,
+    pub cache_read_usage: bool,
+    pub cache_write_usage: bool,
+}
+
+/// Immutable, secret-free account of the exact model execution admitted for
+/// one run. `route` is QQ's effective `provider/model` selection while
+/// `provider_model` is the identifier sent to the provider codec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedModel {
+    pub version: ResolvedModelVersion,
+    pub route: String,
+    pub provider_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Non-secret named credential profile when the configured provider has
+    /// one. Literal credentials and credential values are never represented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_profile: Option<String>,
+    pub max_output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+    pub output_token_control: CapabilitySupport,
+    pub generation: GenerationCapabilities,
+    pub prompt_cache: PromptCacheCapabilities,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCatalogRequest {
@@ -503,6 +572,10 @@ pub struct RunSnapshot {
     /// on historical runs and runs that failed before prompt preparation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_identity: Option<Box<RunPromptIdentity>>,
+    /// Exact resolved model admitted before provider work. Absent on
+    /// historical runs and runs that failed before runtime resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<Box<ResolvedModel>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
     /// Input-token total (fresh input + cache reads + cache writes) of the
@@ -1771,6 +1844,32 @@ mod tests {
                     content_hash: "d".repeat(64).parse().unwrap(),
                 })),
             })),
+            resolved_model: Some(Box::new(ResolvedModel {
+                version: ResolvedModelVersion::new(1).unwrap(),
+                route: "provider/model".to_owned(),
+                provider_model: "model".to_owned(),
+                organization: Some("org".to_owned()),
+                credential_profile: Some("work".to_owned()),
+                max_output_tokens: 4096,
+                context_window: Some(128_000),
+                pricing: Some(ModelPricing {
+                    input_usd_nanos_per_token: 1,
+                    output_usd_nanos_per_token: 2,
+                    cache_read_usd_nanos_per_token: Some(3),
+                    cache_write_usd_nanos_per_token: None,
+                    context_tier: None,
+                    provenance: "public catalog".to_owned(),
+                }),
+                output_token_control: CapabilitySupport::Native,
+                generation: GenerationCapabilities {
+                    reasoning_effort: CapabilitySupport::Unsupported,
+                },
+                prompt_cache: PromptCacheCapabilities {
+                    control: CapabilitySupport::Unsupported,
+                    cache_read_usage: true,
+                    cache_write_usage: false,
+                },
+            })),
             usage: Some(TokenUsage {
                 input_tokens: 30,
                 cache_read_input_tokens: 4,
@@ -1783,6 +1882,9 @@ mod tests {
         let encoded = serde_json::to_value(&run).unwrap();
         assert_eq!(encoded["context_tokens"], 16);
         assert_eq!(encoded["prompt_identity"]["version"], 7);
+        assert_eq!(encoded["resolved_model"]["version"], 1);
+        assert_eq!(encoded["resolved_model"]["route"], "provider/model");
+        assert_eq!(encoded["resolved_model"]["max_output_tokens"], 4096);
         assert_eq!(
             encoded["prompt_identity"]["instruction_hash"],
             "a".repeat(64)
@@ -1812,20 +1914,24 @@ mod tests {
         let mut legacy = serde_json::to_value(&run).unwrap();
         legacy.as_object_mut().unwrap().remove("context_tokens");
         legacy.as_object_mut().unwrap().remove("prompt_identity");
+        legacy.as_object_mut().unwrap().remove("resolved_model");
         let decoded = serde_json::from_value::<RunSnapshot>(legacy).unwrap();
         assert_eq!(decoded.context_tokens, None);
         assert_eq!(decoded.prompt_identity, None);
+        assert_eq!(decoded.resolved_model, None);
         assert_eq!(decoded.usage, run.usage);
 
         // Snapshots without a value keep their previous wire shape.
         let bare = RunSnapshot {
             context_tokens: None,
             prompt_identity: None,
+            resolved_model: None,
             ..run.clone()
         };
         let encoded = serde_json::to_value(&bare).unwrap();
         assert!(encoded.get("context_tokens").is_none());
         assert!(encoded.get("prompt_identity").is_none());
+        assert!(encoded.get("resolved_model").is_none());
         assert_eq!(
             serde_json::from_value::<RunSnapshot>(encoded).unwrap(),
             bare
@@ -1839,6 +1945,22 @@ mod tests {
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
         let mut invalid = serde_json::to_value(&run).unwrap();
         invalid["prompt_identity"]["instruction_hash"] = serde_json::json!("A".repeat(64));
+        assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
+
+        let encoded = serde_json::to_string(&run.resolved_model).unwrap();
+        assert!(encoded.contains("credential_profile"));
+        for forbidden in ["sk-super-secret", "literal-api-key", "access-token-value"] {
+            assert!(!encoded.contains(forbidden), "{encoded}");
+        }
+        let mut invalid = serde_json::to_value(&run).unwrap();
+        invalid["resolved_model"]["version"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
+
+        // Adding this snapshot field breaks older `deny_unknown_fields`
+        // clients, so protocol negotiation must reject version 7 peers.
+        assert_eq!(crate::PROTOCOL_VERSION, 8);
+        let mut invalid = serde_json::to_value(&run).unwrap();
+        invalid["resolved_model"]["future_control"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
     }
 }

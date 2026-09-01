@@ -18,9 +18,9 @@ use futures_util::{FutureExt, StreamExt};
 use qq_protocol::{
     AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId,
     CommandOutcome, CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole,
-    MessageSnapshot, MessageState, ModelPricing, ModelSelection, ReasoningEvent, RunActivity,
-    RunFailure, RunFailureKind, RunId, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus,
-    SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
+    MessageSnapshot, MessageState, ModelPricing, ModelSelection, ReasoningEvent, ResolvedModel,
+    RunActivity, RunFailure, RunFailureKind, RunId, RunOutcome, RunPromptIdentity, RunSnapshot,
+    RunStatus, SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
     SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
     SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot,
     ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
@@ -4661,7 +4661,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
     connection
         .query_row(
             "SELECT session_id, status, outcome_json, prompt_identity_json,
-                    usage_json, context_tokens,
+                    resolved_model_json, usage_json, context_tokens,
                     estimated_cost_usd_nanos
              FROM runs WHERE id = ?1",
             [run_id.to_string()],
@@ -4672,14 +4672,24 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<u64>>(5)?,
+                    row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<u64>>(6)?,
+                    row.get::<_, Option<u64>>(7)?,
                 ))
             },
         )
         .map_err(|_| SessionRuntimeError::Persistence)
         .and_then(
-            |(session, status, outcome, prompt_identity, usage, context_tokens, cost)| {
+            |(
+                session,
+                status,
+                outcome,
+                prompt_identity,
+                resolved_model,
+                usage,
+                context_tokens,
+                cost,
+            )| {
                 Ok(RunSnapshot {
                     id: run_id,
                     session_id: parse_id(&session)?,
@@ -4690,6 +4700,12 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                         .transpose()
                         .map_err(|_| SessionRuntimeError::Persistence)?,
                     prompt_identity: prompt_identity
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRuntimeError::Persistence)?
+                        .map(Box::new),
+                    resolved_model: resolved_model
                         .as_deref()
                         .map(serde_json::from_str)
                         .transpose()
@@ -5092,6 +5108,55 @@ mod tests {
         }
     }
 
+    fn loaded_runtime(runtime: Runtime, pricing: Option<ModelPricing>) -> LoadedRuntime {
+        loaded_runtime_for_route(runtime, "test/model", pricing)
+    }
+
+    fn loaded_runtime_for_route(
+        runtime: Runtime,
+        route: impl Into<String>,
+        pricing: Option<ModelPricing>,
+    ) -> LoadedRuntime {
+        let provider_model = runtime.model.to_string();
+        let max_output_tokens = runtime.max_output_tokens;
+        LoadedRuntime {
+            runtime: Arc::new(runtime),
+            resolved_model: Arc::new(test_resolved_model(
+                route,
+                provider_model,
+                max_output_tokens,
+                pricing,
+            )),
+        }
+    }
+
+    fn test_resolved_model(
+        route: impl Into<String>,
+        provider_model: impl Into<String>,
+        max_output_tokens: u32,
+        pricing: Option<ModelPricing>,
+    ) -> ResolvedModel {
+        ResolvedModel {
+            version: qq_protocol::ResolvedModelVersion::new(1).unwrap(),
+            route: route.into(),
+            provider_model: provider_model.into(),
+            organization: None,
+            credential_profile: None,
+            max_output_tokens,
+            context_window: None,
+            pricing,
+            output_token_control: qq_protocol::CapabilitySupport::Native,
+            generation: qq_protocol::GenerationCapabilities {
+                reasoning_effort: qq_protocol::CapabilitySupport::Unsupported,
+            },
+            prompt_cache: qq_protocol::PromptCacheCapabilities {
+                control: qq_protocol::CapabilitySupport::Unsupported,
+                cache_read_usage: false,
+                cache_write_usage: false,
+            },
+        }
+    }
+
     #[test]
     fn accounting_aggregate_sums_known_usage_and_cost() {
         let mut aggregate = AccountingAggregate::known_zero();
@@ -5482,16 +5547,18 @@ mod tests {
         fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             Box::pin(async {
                 Runtime::new(ScriptedProvider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: Some(ModelPricing {
-                            input_usd_nanos_per_token: 1_000,
-                            output_usd_nanos_per_token: 2_000,
-                            cache_read_usd_nanos_per_token: Some(100),
-                            cache_write_usd_nanos_per_token: Some(300),
-                            context_tier: None,
-                            provenance: "test".to_owned(),
-                        }),
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime,
+                            Some(ModelPricing {
+                                input_usd_nanos_per_token: 1_000,
+                                output_usd_nanos_per_token: 2_000,
+                                cache_read_usd_nanos_per_token: Some(100),
+                                cache_write_usd_nanos_per_token: Some(300),
+                                context_tier: None,
+                                provenance: "test".to_owned(),
+                            }),
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -5527,22 +5594,67 @@ mod tests {
         }
     }
 
+    struct MutableResolvedLoader {
+        resolved_model: Arc<StdMutex<ResolvedModel>>,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl RuntimeLoader for MutableResolvedLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let resolved_model = self.resolved_model.lock().unwrap().clone();
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                Runtime::new(
+                    CapturedResolvedProvider { requests },
+                    resolved_model.provider_model.clone(),
+                    resolved_model.max_output_tokens,
+                )
+                .map(|runtime| LoadedRuntime {
+                    runtime: Arc::new(runtime),
+                    resolved_model: Arc::new(resolved_model),
+                })
+                .map_err(|error| RuntimeLoadError {
+                    kind: RunFailureKind::Configuration,
+                    message: error.to_string(),
+                })
+            })
+        }
+    }
+
+    struct CapturedResolvedProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for CapturedResolvedProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "done".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+            ]))
+        }
+    }
+
     struct PricedHangingLoader;
 
     impl RuntimeLoader for PricedHangingLoader {
         fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             Box::pin(async {
                 Runtime::new(HangingProvider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: Some(ModelPricing {
-                            input_usd_nanos_per_token: 1_000,
-                            output_usd_nanos_per_token: 2_000,
-                            cache_read_usd_nanos_per_token: Some(100),
-                            cache_write_usd_nanos_per_token: Some(300),
-                            context_tier: None,
-                            provenance: "test".to_owned(),
-                        }),
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime,
+                            Some(ModelPricing {
+                                input_usd_nanos_per_token: 1_000,
+                                output_usd_nanos_per_token: 2_000,
+                                cache_read_usd_nanos_per_token: Some(100),
+                                cache_write_usd_nanos_per_token: Some(300),
+                                context_tier: None,
+                                provenance: "test".to_owned(),
+                            }),
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -5561,10 +5673,7 @@ mod tests {
             let usage = self.usages.lock().unwrap().remove(0);
             Box::pin(async move {
                 Runtime::new(UsageSequenceProvider { usage }, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -5597,10 +5706,7 @@ mod tests {
             let requests = Arc::clone(&self.requests);
             Box::pin(async move {
                 Runtime::new(ReasoningProvider { requests }, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -5660,10 +5766,7 @@ mod tests {
             let buffered = Arc::clone(&self.buffered);
             Box::pin(async move {
                 Runtime::new(HangingReasoningProvider { buffered }, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -5703,10 +5806,7 @@ mod tests {
         fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             Box::pin(async {
                 Runtime::new(ChunkingProvider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -5740,10 +5840,7 @@ mod tests {
             let requests = Arc::clone(&self.requests);
             Box::pin(async move {
                 Runtime::new(DelayedProvider { requests }, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -5765,10 +5862,7 @@ mod tests {
             let requests = Arc::clone(&self.requests);
             Box::pin(async move {
                 Runtime::new(ToolLoopProvider { requests }, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -5848,16 +5942,18 @@ mod tests {
                     "test-model",
                     256,
                 )
-                .map(|runtime| LoadedRuntime {
-                    runtime: Arc::new(runtime),
-                    pricing: metered_empty_checkpoint.then_some(ModelPricing {
-                        input_usd_nanos_per_token: 1_000,
-                        output_usd_nanos_per_token: 2_000,
-                        cache_read_usd_nanos_per_token: Some(100),
-                        cache_write_usd_nanos_per_token: Some(300),
-                        context_tier: None,
-                        provenance: "test".to_owned(),
-                    }),
+                .map(|runtime| {
+                    loaded_runtime(
+                        runtime,
+                        metered_empty_checkpoint.then_some(ModelPricing {
+                            input_usd_nanos_per_token: 1_000,
+                            output_usd_nanos_per_token: 2_000,
+                            cache_read_usd_nanos_per_token: Some(100),
+                            cache_write_usd_nanos_per_token: Some(300),
+                            context_tier: None,
+                            provenance: "test".to_owned(),
+                        }),
+                    )
                 })
                 .map_err(|error| RuntimeLoadError {
                     kind: RunFailureKind::Configuration,
@@ -5960,10 +6056,7 @@ mod tests {
             let requests = Arc::clone(&self.requests);
             Box::pin(async move {
                 Runtime::new(TurnTextProvider { requests }, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -6057,10 +6150,7 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -6132,10 +6222,7 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -6553,6 +6640,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_model_and_request_limits_survive_config_mutation_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let mut initial = test_resolved_model(
+            "test/model",
+            "wire-model-a",
+            64,
+            Some(ModelPricing {
+                input_usd_nanos_per_token: 1,
+                output_usd_nanos_per_token: 2,
+                cache_read_usd_nanos_per_token: Some(1),
+                cache_write_usd_nanos_per_token: None,
+                context_tier: None,
+                provenance: "catalog-a".to_owned(),
+            }),
+        );
+        initial.organization = Some("org-a".to_owned());
+        initial.credential_profile = Some("profile-a".to_owned());
+        initial.context_window = Some(32_768);
+        initial.prompt_cache.cache_read_usage = true;
+        let configured = Arc::new(StdMutex::new(initial.clone()));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let loader = Arc::new(MutableResolvedLoader {
+            resolved_model: Arc::clone(&configured),
+            requests: Arc::clone(&requests),
+        });
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            loader.clone(),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = submit_prompt_to(&runtime, session_id, "work").await;
+        let observed = collect_through_finished(&mut events).await;
+
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ModelTurnCompleted { model, .. }
+                if model.model.as_deref() == Some("test/model")
+                    && model.max_output_tokens == Some(64)
+                    && model.organization.as_deref() == Some("org-a")
+        )));
+        {
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].model(), initial.provider_model);
+            assert_eq!(captured[0].max_output_tokens(), initial.max_output_tokens);
+        }
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let persisted = snapshot
+            .focused
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .unwrap()
+            .resolved_model
+            .map(|model| *model)
+            .unwrap();
+        assert_eq!(persisted, initial);
+
+        *configured.lock().unwrap() = test_resolved_model("test/changed", "wire-model-b", 32, None);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+
+        let reopened = SessionRuntime::open(SessionRuntimeOptions::new(database_path), loader)
+            .await
+            .unwrap();
+        let snapshot = reopened
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let persisted_after_restart = snapshot
+            .focused
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .unwrap()
+            .resolved_model
+            .map(|model| *model)
+            .unwrap();
+        assert_eq!(persisted_after_restart, initial);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn escaped_slash_is_persisted_as_the_provider_visible_prompt() {
         let mut harness =
             scripted_runs_harness(ApprovalMode::Ask, vec![Vec::new(), Vec::new()]).await;
@@ -6621,10 +6820,7 @@ mod tests {
                                 kind: RunFailureKind::Configuration,
                                 message: error.to_string(),
                             })?;
-                    Ok(LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    Ok(loaded_runtime(runtime, None))
                 })
             }
         }
@@ -6694,6 +6890,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_model_persistence_failure_starts_no_provider_work() {
+        struct CountingLoader {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for CountingLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    Runtime::new(CountingProvider { provider_calls }, "test-model", 256)
+                        .map(|runtime| loaded_runtime(runtime, None))
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        struct CountingProvider {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl Provider for CountingProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                self.provider_calls.fetch_add(1, Ordering::AcqRel);
+                Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                    usage: None,
+                })]))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            Arc::new(CountingLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_resolved_model
+                 BEFORE UPDATE OF resolved_model_json ON runs
+                 WHEN NEW.resolved_model_json IS NOT NULL
+                 BEGIN
+                     SELECT RAISE(FAIL, 'forced resolved model failure');
+                 END;",
+            )
+            .unwrap();
+
+        let run_id = submit_prompt_to(&runtime, session_id, "work").await;
+        let observed = collect_through_finished(&mut events).await;
+
+        assert_eq!(provider_calls.load(Ordering::Acquire), 0);
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id: finished,
+                outcome: RunOutcome::Failed { failure },
+                ..
+            } if *finished == run_id
+                && failure.kind == RunFailureKind::Server
+                && failure.message.contains("failed to persist the resolved model")
+        )));
+        let persisted: Option<String> = Connection::open(&database_path)
+            .unwrap()
+            .query_row(
+                "SELECT resolved_model_json FROM runs WHERE id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, None);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn instruction_hash_tracks_selected_path_and_bytes_deterministically() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("AGENTS.md"), "same\n").unwrap();
@@ -6759,6 +7048,7 @@ mod tests {
 
     impl RuntimeLoader for RecordingApprovalLoader {
         fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let route = request.model.model.clone().unwrap();
             self.models.lock().unwrap().push(request.model.model);
             let provider = ApprovalProvider {
                 requests: Arc::clone(&self.requests),
@@ -6775,10 +7065,7 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime_for_route(runtime, route, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -7284,7 +7571,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(
             !connection
@@ -7411,7 +7698,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -7479,7 +7766,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         let (display_json, result) = connection
             .query_row(
@@ -7538,7 +7825,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -7603,7 +7890,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -7691,7 +7978,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -7747,7 +8034,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -7791,7 +8078,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         for column in [
             "model_json",
@@ -7858,7 +8145,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -7900,11 +8187,90 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
         assert!(has_column(&connection, "runs", "context_increment_bytes").unwrap());
+    }
+
+    #[test]
+    fn version_fifteen_migration_keeps_historical_resolved_model_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let run_id = RunId::generate().unwrap();
+        let command_id = CommandId::generate().unwrap();
+        let user_message_id = MessageId::generate().unwrap();
+        let assistant_message_id = MessageId::generate().unwrap();
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/legacy-resolved-model')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                     id, workspace_id, title, status, approval_mode,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'Legacy', 'idle', 'ask', 1, 2)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(
+                     id, session_id, command_id, user_message_id,
+                     assistant_message_id, status, outcome_json,
+                     created_at_ms, started_at_ms, finished_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'completed', ?6, 1, 1, 2)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    command_id.to_string(),
+                    user_message_id.to_string(),
+                    assistant_message_id.to_string(),
+                    serde_json::to_string(&RunOutcome::Completed).unwrap(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '15' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("ALTER TABLE runs DROP COLUMN resolved_model_json", [])
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "16"
+        );
+        assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT resolved_model_json FROM runs WHERE id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(load_run(&connection, run_id).unwrap().resolved_model, None);
     }
 
     fn rewrite_run_capacity_schema(
@@ -10000,13 +10366,13 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
+                    .map(|runtime| {
                         // Failure-path tests assert on the first error; turn
                         // retry is covered in lib.rs.
-                        runtime: Arc::new(
+                        loaded_runtime(
                             runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
-                        ),
-                        pricing: None,
+                            None,
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -13442,10 +13808,7 @@ mod tests {
         fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             Box::pin(async {
                 Runtime::new(ContextBudgetProvider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -13546,10 +13909,7 @@ mod tests {
                     }
 
                     Runtime::new(PanicOnceProvider { calls }, "test-model", 256)
-                        .map(|runtime| LoadedRuntime {
-                            runtime: Arc::new(runtime),
-                            pricing: None,
-                        })
+                        .map(|runtime| loaded_runtime(runtime, None))
                         .map_err(|error| RuntimeLoadError {
                             kind: RunFailureKind::Configuration,
                             message: error.to_string(),
@@ -16461,15 +16821,15 @@ mod tests {
                 .unwrap_or_else(|| Arc::new(StaticTextProvider));
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(
+                    .map(|runtime| {
+                        loaded_runtime(
                             runtime
                                 .with_spawn_model_routes(spawn_model_routes)
                                 // Failure-path tests assert on the first
                                 // error; turn retry is covered in lib.rs.
                                 .with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
-                        ),
-                        pricing: None,
+                            None,
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -16511,15 +16871,15 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(
+                    .map(|runtime| {
+                        loaded_runtime(
                             runtime
                                 .with_spawn_model_routes(spawn_model_routes)
                                 // Failure-path tests assert on the first
                                 // error; turn retry is covered in lib.rs.
                                 .with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
-                        ),
-                        pricing: None,
+                            None,
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -16549,10 +16909,7 @@ mod tests {
             let provider = Arc::clone(&self.parent);
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: None,
-                    })
+                    .map(|runtime| loaded_runtime(runtime, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -16605,11 +16962,11 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(
+                    .map(|runtime| {
+                        loaded_runtime(
                             runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
-                        ),
-                        pricing: None,
+                            None,
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -16739,19 +17096,21 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime.with_spawn_model_routes(vec![
-                            "test/child-first".to_owned(),
-                            "test/child-second".to_owned(),
-                        ])),
-                        pricing: Some(ModelPricing {
-                            input_usd_nanos_per_token: 1,
-                            output_usd_nanos_per_token: 1,
-                            cache_read_usd_nanos_per_token: Some(1),
-                            cache_write_usd_nanos_per_token: Some(1),
-                            context_tier: None,
-                            provenance: "accounting-test".to_owned(),
-                        }),
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime.with_spawn_model_routes(vec![
+                                "test/child-first".to_owned(),
+                                "test/child-second".to_owned(),
+                            ]),
+                            Some(ModelPricing {
+                                input_usd_nanos_per_token: 1,
+                                output_usd_nanos_per_token: 1,
+                                cache_read_usd_nanos_per_token: Some(1),
+                                cache_write_usd_nanos_per_token: Some(1),
+                                context_tier: None,
+                                provenance: "accounting-test".to_owned(),
+                            }),
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
@@ -18539,10 +18898,7 @@ mod tests {
                 Box::pin(async move {
                     release.notified().await;
                     Runtime::new(StaticTextProvider, "test-model", 256)
-                        .map(|runtime| LoadedRuntime {
-                            runtime: Arc::new(runtime),
-                            pricing: None,
-                        })
+                        .map(|runtime| loaded_runtime(runtime, None))
                         .map_err(|error| RuntimeLoadError {
                             kind: RunFailureKind::Configuration,
                             message: error.to_string(),

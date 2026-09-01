@@ -75,6 +75,7 @@ pub(in crate::sessions) fn open_database(
                   auto_compaction INTEGER NOT NULL DEFAULT 0,
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
                   prompt_identity_json TEXT,
+                  resolved_model_json TEXT,
                    context_base_bytes INTEGER,
                    context_increment_bytes INTEGER NOT NULL DEFAULT 0,
                    outcome_json TEXT,
@@ -372,12 +373,12 @@ pub(in crate::sessions) fn open_database(
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12" | "13" | "14" | "15") => {}
+        Some("10" | "11" | "12" | "13" | "14" | "15" | "16") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("11" | "12" | "13" | "14" | "15")
+        Some("11" | "12" | "13" | "14" | "15" | "16")
     ) {
         let transaction = connection
             .transaction()
@@ -393,7 +394,10 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("12" | "13" | "14" | "15")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("12" | "13" | "14" | "15" | "16")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -408,7 +412,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("13" | "14" | "15")) {
+    if !matches!(schema_version.as_deref(), Some("13" | "14" | "15" | "16")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -423,7 +427,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("14" | "15")) {
+    if !matches!(schema_version.as_deref(), Some("14" | "15" | "16")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -439,7 +443,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_model_turn_audit_schema(&connection)?;
-    if schema_version.as_deref() != Some("15") {
+    if !matches!(schema_version.as_deref(), Some("15" | "16")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -456,6 +460,24 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_linear_streaming_schema(&connection)?;
+    if schema_version.as_deref() != Some("16") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_runs_resolved_model_column(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '16' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if !has_column(&connection, "runs", "resolved_model_json")? {
+        return Err(SessionRuntimeError::Persistence);
+    }
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -480,6 +502,17 @@ pub(in crate::sessions) fn open_database(
         }
     };
     Ok((connection, store_id))
+}
+
+/// Existing runs remain explicitly unknown: no current configuration is
+/// guessed for historical work.
+fn add_runs_resolved_model_column(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "runs", "resolved_model_json")? {
+        connection
+            .execute("ALTER TABLE runs ADD COLUMN resolved_model_json TEXT", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
 }
 
 fn add_linear_streaming_storage(connection: &Connection) -> Result<(), SessionRuntimeError> {

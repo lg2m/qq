@@ -1062,6 +1062,31 @@ mod tests {
 
     use super::*;
 
+    fn loaded_runtime(runtime: Runtime, pricing: Option<ModelPricing>) -> LoadedRuntime {
+        LoadedRuntime {
+            runtime: Arc::new(runtime),
+            resolved_model: Arc::new(qq_protocol::ResolvedModel {
+                version: qq_protocol::ResolvedModelVersion::new(1).unwrap(),
+                route: "test/model".to_owned(),
+                provider_model: "test-model".to_owned(),
+                organization: None,
+                credential_profile: None,
+                max_output_tokens: 256,
+                context_window: None,
+                pricing,
+                output_token_control: qq_protocol::CapabilitySupport::Native,
+                generation: qq_protocol::GenerationCapabilities {
+                    reasoning_effort: qq_protocol::CapabilitySupport::Unsupported,
+                },
+                prompt_cache: qq_protocol::PromptCacheCapabilities {
+                    control: qq_protocol::CapabilitySupport::Unsupported,
+                    cache_read_usage: false,
+                    cache_write_usage: false,
+                },
+            }),
+        }
+    }
+
     /// Builds a fresh provider per claimed run, mirroring how the real
     /// loader compiles a runtime per run.
     struct ProviderLoader<F>(F);
@@ -1075,16 +1100,18 @@ mod tests {
             let provider = (self.0)();
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(runtime),
-                        pricing: Some(ModelPricing {
-                            input_usd_nanos_per_token: 1_000,
-                            output_usd_nanos_per_token: 2_000,
-                            cache_read_usd_nanos_per_token: None,
-                            cache_write_usd_nanos_per_token: None,
-                            context_tier: None,
-                            provenance: "test".to_owned(),
-                        }),
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime,
+                            Some(ModelPricing {
+                                input_usd_nanos_per_token: 1_000,
+                                output_usd_nanos_per_token: 2_000,
+                                cache_read_usd_nanos_per_token: None,
+                                cache_write_usd_nanos_per_token: None,
+                                context_tier: None,
+                                provenance: "test".to_owned(),
+                            }),
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: qq_protocol::RunFailureKind::Configuration,
@@ -1108,18 +1135,18 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
-                    .map(|runtime| LoadedRuntime {
-                        runtime: Arc::new(
+                    .map(|runtime| {
+                        loaded_runtime(
                             runtime.with_spawn_model_routes(vec!["test/child".to_owned()]),
-                        ),
-                        pricing: Some(ModelPricing {
-                            input_usd_nanos_per_token: 1_000,
-                            output_usd_nanos_per_token: 2_000,
-                            cache_read_usd_nanos_per_token: None,
-                            cache_write_usd_nanos_per_token: None,
-                            context_tier: None,
-                            provenance: "test".to_owned(),
-                        }),
+                            Some(ModelPricing {
+                                input_usd_nanos_per_token: 1_000,
+                                output_usd_nanos_per_token: 2_000,
+                                cache_read_usd_nanos_per_token: None,
+                                cache_write_usd_nanos_per_token: None,
+                                context_tier: None,
+                                provenance: "test".to_owned(),
+                            }),
+                        )
                     })
                     .map_err(|error| RuntimeLoadError {
                         kind: qq_protocol::RunFailureKind::Configuration,

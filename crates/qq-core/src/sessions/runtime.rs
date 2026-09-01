@@ -11,7 +11,7 @@ pub type SpawnModelValidationFuture =
 #[derive(Clone)]
 pub struct LoadedRuntime {
     pub runtime: Arc<Runtime>,
-    pub pricing: Option<ModelPricing>,
+    pub resolved_model: Arc<ResolvedModel>,
 }
 
 pub trait RuntimeLoader: Send + Sync + 'static {

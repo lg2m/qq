@@ -65,7 +65,7 @@ impl ToolGate for CompactionRunGate {
 
 pub(super) async fn execute_run(
     inner: Arc<SessionRuntimeInner>,
-    claimed: ClaimedRun,
+    mut claimed: ClaimedRun,
     mut cancellation: watch::Receiver<bool>,
 ) {
     if *cancellation.borrow() {
@@ -111,6 +111,42 @@ pub(super) async fn execute_run(
         finish_run(&inner, &claimed, RunOutcome::Cancelled).await;
         return;
     }
+
+    if loaded.runtime.model.as_ref() != loaded.resolved_model.provider_model.as_str()
+        || loaded.runtime.max_output_tokens != loaded.resolved_model.max_output_tokens
+    {
+        finish_run(
+            &inner,
+            &claimed,
+            RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Configuration,
+                    message: "loaded runtime does not match its resolved model descriptor"
+                        .to_owned(),
+                },
+            },
+        )
+        .await;
+        return;
+    }
+    if let Err(error) = inner
+        .store
+        .record_resolved_model(&claimed, loaded.resolved_model.as_ref())
+        .await
+    {
+        finish_run(
+            &inner,
+            &claimed,
+            persistence_failure("failed to persist the resolved model", &error),
+        )
+        .await;
+        return;
+    }
+    claimed.model = ModelSelection {
+        model: Some(loaded.resolved_model.route.clone()),
+        max_output_tokens: Some(loaded.resolved_model.max_output_tokens),
+        organization: loaded.resolved_model.organization.clone(),
+    };
 
     let tool_cancellation = Arc::new(AtomicBool::new(false));
     let internal = claimed.kind == RunKind::Compaction;
@@ -166,7 +202,7 @@ pub(super) async fn execute_run(
         file_state,
         capabilities,
     );
-    let mut accounting = RunAccountingAccumulator::new(loaded.pricing.clone());
+    let mut accounting = RunAccountingAccumulator::new(loaded.resolved_model.pricing.clone());
     let mut pending_text = String::new();
     let mut pending_channel = None;
     let mut reasoning_kind = None;

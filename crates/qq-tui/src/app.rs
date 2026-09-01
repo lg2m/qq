@@ -3212,6 +3212,7 @@ mod tests {
             status: RunStatus::Completed,
             outcome: Some(RunOutcome::Completed),
             prompt_identity: None,
+            resolved_model: None,
             usage: Some(TokenUsage {
                 input_tokens: 10_000,
                 cache_read_input_tokens: 2_000,
@@ -3329,6 +3330,7 @@ mod tests {
                     status: RunStatus::Queued,
                     outcome: None,
                     prompt_identity: None,
+                    resolved_model: None,
                     usage: None,
                     context_tokens: None,
                     estimated_cost_usd_nanos: None,
@@ -3399,6 +3401,7 @@ mod tests {
             status: RunStatus::Completed,
             outcome: Some(RunOutcome::Completed),
             prompt_identity: None,
+            resolved_model: None,
             usage: Some(TokenUsage {
                 input_tokens: 40_000,
                 cache_read_input_tokens: 12_000,

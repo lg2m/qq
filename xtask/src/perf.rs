@@ -26,9 +26,10 @@ use qq_core::{
     SessionEventStream, SessionRuntime, SessionRuntimeOptions,
 };
 use qq_protocol::{
-    ApprovalMode, CommandId, CommandOutcome, CommandReceipt, CommandRequest, EventCursor,
-    ModelSelection, RunFailureKind, RunId, RunOutcome, SessionCommand, SessionEvent, SessionId,
-    SnapshotRequest, SubscribeRequest, ToolCallState, WorkspaceId,
+    ApprovalMode, CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, CommandRequest,
+    EventCursor, GenerationCapabilities, ModelSelection, PromptCacheCapabilities, ResolvedModel,
+    ResolvedModelVersion, RunFailureKind, RunId, RunOutcome, SessionCommand, SessionEvent,
+    SessionId, SnapshotRequest, SubscribeRequest, ToolCallState, WorkspaceId,
 };
 use qq_provider::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderEvent, ProviderStream,
@@ -1841,7 +1842,25 @@ impl RuntimeLoader for BenchmarkLoader {
             Runtime::new(provider, "benchmark/model", 16_384)
                 .map(|runtime| LoadedRuntime {
                     runtime: Arc::new(runtime),
-                    pricing: None,
+                    resolved_model: Arc::new(ResolvedModel {
+                        version: ResolvedModelVersion::new(1).unwrap(),
+                        route: "benchmark/model".to_owned(),
+                        provider_model: "benchmark/model".to_owned(),
+                        organization: None,
+                        credential_profile: None,
+                        max_output_tokens: 16_384,
+                        context_window: None,
+                        pricing: None,
+                        output_token_control: CapabilitySupport::Native,
+                        generation: GenerationCapabilities {
+                            reasoning_effort: CapabilitySupport::Unsupported,
+                        },
+                        prompt_cache: PromptCacheCapabilities {
+                            control: CapabilitySupport::Unsupported,
+                            cache_read_usage: false,
+                            cache_write_usage: false,
+                        },
+                    }),
                 })
                 .map_err(|error| RuntimeLoadError {
                     kind: RunFailureKind::Configuration,
