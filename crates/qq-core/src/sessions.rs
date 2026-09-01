@@ -8409,6 +8409,7 @@ mod tests {
     #[ignore = "release-mode R4 diagnostic; run with --release --ignored --nocapture"]
     fn r4_append_only_chunk_scaling_diagnostic() {
         const CHILD_BYTES: &str = "QQ_R4_STREAM_DIAGNOSTIC_BYTES";
+        const SAMPLES_PER_SIZE: usize = 3;
         if let Some(bytes) = std::env::var_os(CHILD_BYTES) {
             let measurement =
                 measure_r4_append_only_stream(bytes.to_str().unwrap().parse::<usize>().unwrap());
@@ -8424,6 +8425,7 @@ mod tests {
 
         let executable = std::env::current_exe().unwrap();
         let mut measurements = Vec::new();
+        eprintln!("r4_stream samples_per_size={SAMPLES_PER_SIZE}");
         for bytes in [
             64 * 1024,
             512 * 1024,
@@ -8431,16 +8433,36 @@ mod tests {
             2 * 1024 * 1024,
             4 * 1024 * 1024,
         ] {
-            let output = run_r4_stream_diagnostic_child(&executable, bytes, CHILD_BYTES);
+            let mut samples = Vec::with_capacity(SAMPLES_PER_SIZE);
+            for _ in 0..SAMPLES_PER_SIZE {
+                let output = run_r4_stream_diagnostic_child(&executable, bytes, CHILD_BYTES);
+                assert!(
+                    output.status.success(),
+                    "R4 child failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                let mut combined = output.stdout;
+                combined.extend_from_slice(&output.stderr);
+                samples.push(parse_r4_stream_measurement(&combined));
+            }
+            samples.sort_unstable_by_key(|sample| sample.elapsed_ns);
+            let transactions = samples[0].transactions;
             assert!(
-                output.status.success(),
-                "R4 child failed: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
+                samples
+                    .iter()
+                    .all(|sample| { sample.bytes == bytes && sample.transactions == transactions })
             );
-            let mut combined = output.stdout;
-            combined.extend_from_slice(&output.stderr);
-            let measurement = parse_r4_stream_measurement(&combined);
+            let measurement = R4StreamMeasurement {
+                bytes,
+                transactions,
+                elapsed_ns: samples[SAMPLES_PER_SIZE / 2].elapsed_ns,
+                peak_temporary_rss_bytes: samples
+                    .iter()
+                    .map(|sample| sample.peak_temporary_rss_bytes)
+                    .max()
+                    .unwrap(),
+            };
             eprintln!(
                 "r4_stream bytes={} transactions={} elapsed_ns={} peak_temporary_rss_bytes={}",
                 measurement.bytes,
