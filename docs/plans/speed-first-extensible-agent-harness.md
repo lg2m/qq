@@ -1,6 +1,6 @@
 # Speed-First Extensible Agent Harness Backend
 
-Status: Phase 0 complete 2026-08-31; implementation Phases 1–7 and tasks
+Status: Phase 0 complete 2026-09-01; implementation Phases 1–7 and tasks
 H1–H12 proposed. The performance and reliability prerequisites in the active
 Terminal-Bench roadmap remain ahead of the new extension work in this document.
 
@@ -1030,7 +1030,7 @@ Acceptance:
   throughput-median regressions, and configured p99 or absolute limits; and
 - no later phase can claim speed without naming the affected gate.
 
-#### Phase 0 Completion Receipt — 2026-08-31
+#### Phase 0 Completion Receipt — 2026-09-01
 
 H0 is complete. `cargo xtask perf baseline` now pins the host target, builds the
 default locked release artifact, and re-executes an optimized worker. It
@@ -1061,10 +1061,54 @@ equal `min(session_count, configured_limit)`. Provider network time and model
 quality are excluded. The recorder currently refuses non-Linux hosts until safe
 native path isolation and RSS sampling exist.
 
-The initial full-sample local receipt and verification commands are recorded in
-the implementation handoff for the completing revision. Raw machine samples
-remain untracked by design; the reproducible protocol and measurement inventory
-are documented in
+The clean 100-sample qualification ran from detached revision
+`638330550aa916d9540409a6497128a5ad9a61b9` with `source.dirty = false` on the
+`linux-x86_64-local` machine class: Linux 7.2.0, AMD Ryzen 9 9950X, 32 logical
+CPUs, 64.9 GB RAM, powersave governor, Rust/Cargo 1.97.1. The optimized default
+artifact was 62,599,288 bytes with a 2,761-line dependency tree. The report
+contained all 47 metrics and all 14 correctness receipts passed.
+
+| Selected clean metric | Median | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| Fresh `qq --version` process | 1.722 ms | 2.419 ms | 2.770 ms |
+| Isolated server readiness | 75.442 ms | 79.080 ms | n/a (20 samples) |
+| Idle server RSS | 15.59 MiB | 16.06 MiB | n/a (20 samples) |
+| Durable direct command acknowledgement | 3.211 ms | 3.475 ms | 6.336 ms |
+| Provider delta to committed core event | 6.235 ms | 7.491 ms | 11.710 ms |
+| Cancellation to committed terminal event | 6.360 ms | 9.202 ms | 14.638 ms |
+| 100-session batch | 3.050 s | 7.768 s | n/a (10 batches) |
+| 100-session throughput | 29.710 runs/s | 38.216 runs/s | n/a (10 batches) |
+| 100-session worker peak RSS | 15.54 MiB | 15.75 MiB | n/a (10 batches) |
+| 100-session maximum active runs | 8 | 8 | n/a (10 batches) |
+
+The versioned self-comparison intentionally reported one existing red target:
+the measured 1 MiB/512 KiB durable-stream p95 ratio was `2.292x` against the
+checked-in `2.200x` ceiling. The budget was not weakened. R4 owns the linear
+streaming and fair-persistence repair and must turn this gate green before its
+completion receipt. No other budget failure was reported.
+
+Qualification commands:
+
+```sh
+cargo xtask perf baseline \
+  --machine-class linux-x86_64-local \
+  --samples 100 \
+  --warmups 10 \
+  --output target/qq-perf/phase0-full-r3.json
+cargo xtask perf check \
+  --baseline target/qq-perf/phase0-full-r3.json \
+  --candidate target/qq-perf/phase0-full-r3.json \
+  --budgets benchmarks/perf/budgets-v1.json
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace
+```
+
+The isolated HTTP/SSE cases needed loopback permission outside the restricted
+execution sandbox; provider traffic remained the deterministic in-process fake
+and made no external network request. Raw machine samples remain untracked by
+design. The reproducible protocol and complete measurement inventory are in
 [`benchmarks/perf/README.md`](../../benchmarks/perf/README.md).
 
 ### Phase 1 — Complete Owned Prerequisites And Feature Profiles
