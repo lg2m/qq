@@ -339,7 +339,9 @@ mod tests {
         );
         assert!(!specs.iter().any(|spec| spec.name() == SPAWN_AGENT_TOOL));
         assert_eq!(
-            crate::runtime::tool_schema_hash(&specs).to_string(),
+            crate::runtime::tool_schema_measurement(&specs)
+                .hash
+                .to_string(),
             "cda414df746f71750ae4754828cdca4d00c1c9c78a70b7f7a0182d7c62076ae9"
         );
     }

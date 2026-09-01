@@ -468,6 +468,7 @@ impl RuntimeFactory {
             provider_id,
             &resolved_model.provider_model,
             resolved_model.max_output_tokens,
+            resolved_model.context_window,
             &provider_key,
             &mcp_key,
         );
@@ -487,7 +488,8 @@ impl RuntimeFactory {
             self.inner.providers.compile(recipe)?,
             resolved_model.provider_model.clone(),
             resolved_model.max_output_tokens,
-        )?;
+        )?
+        .with_context_window(resolved_model.context_window);
         if let Some(registry) = mcp_registry {
             runtime = runtime.with_mcp_registry(registry);
         }
@@ -1543,6 +1545,7 @@ impl RuntimeKey {
         provider: &str,
         model: &str,
         max_output_tokens: u32,
+        context_window: Option<u32>,
         provider_key: &[u8],
         mcp_key: &[u8],
     ) -> Self {
@@ -1550,6 +1553,13 @@ impl RuntimeKey {
         update_digest(&mut digest, provider.as_bytes());
         update_digest(&mut digest, model.as_bytes());
         digest.update(max_output_tokens.to_le_bytes());
+        match context_window {
+            Some(context_window) => {
+                digest.update([1]);
+                digest.update(context_window.to_le_bytes());
+            }
+            None => digest.update([0]),
+        }
         update_digest(&mut digest, provider_key);
         update_digest(&mut digest, mcp_key);
         Self(digest.finalize().into())
@@ -2960,6 +2970,42 @@ mod tests {
         let second = factory.runtime_for(&request).unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn runtime_cache_identity_includes_effective_context_window() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let request = |context_window: u32| {
+            fixture.request(format!(
+                r#"(
+                    version: 1,
+                    model: "custom/test-model",
+                    providers: {{
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: OpenAiResponses,
+                                auth: NoAuth,
+                            ),
+                            models: {{
+                                "test-model": (
+                                    name: "Test model",
+                                    context_window: {context_window},
+                                ),
+                            }},
+                        ),
+                    }},
+                )"#,
+            ))
+        };
+
+        let first = factory.runtime_for(&request(32_768)).unwrap();
+        let reused = factory.runtime_for(&request(32_768)).unwrap();
+        let changed = factory.runtime_for(&request(65_536)).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(!Arc::ptr_eq(&first, &changed));
     }
 
     #[test]

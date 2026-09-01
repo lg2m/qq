@@ -114,6 +114,7 @@ pub(super) async fn execute_run(
 
     if loaded.runtime.model.as_ref() != loaded.resolved_model.provider_model.as_str()
         || loaded.runtime.max_output_tokens != loaded.resolved_model.max_output_tokens
+        || loaded.runtime.context_window() != loaded.resolved_model.context_window
     {
         finish_run(
             &inner,
@@ -441,8 +442,14 @@ pub(super) async fn execute_run(
                 return;
             }
             RunInput::Event(Some(RuntimeEvent::Started)) => {}
-            RunInput::Event(Some(RuntimeEvent::Prepared { identity })) => {
-                if let Err(error) = inner.store.record_prompt_identity(&claimed, identity).await {
+            RunInput::Event(Some(RuntimeEvent::Prepared {
+                turn_ordinal,
+                identity,
+                weight,
+            })) => {
+                if let Some(identity) = identity
+                    && let Err(error) = inner.store.record_prompt_identity(&claimed, identity).await
+                {
                     finish_run(
                         &inner,
                         &claimed,
@@ -450,6 +457,27 @@ pub(super) async fn execute_run(
                     )
                     .await;
                     return;
+                }
+                let plan = context::plan(context::ContextInput {
+                    context_window: loaded.resolved_model.context_window,
+                    max_output_tokens: loaded.resolved_model.max_output_tokens,
+                    system_bytes: weight.system_bytes,
+                    tool_schema_bytes: weight.tool_schema_bytes,
+                    reducible_message_bytes: weight.reducible_message_bytes,
+                    irreducible_message_bytes: weight.irreducible_message_bytes,
+                    compatible_input_tokens: weight.compatible_input_tokens,
+                    // Compaction is only legal between runs. The second slice
+                    // will turn the first-turn Compact result into a reserved
+                    // auto-compaction; later turns and compaction runs must
+                    // fail closed without polling the provider.
+                    compaction_attempted: internal || turn_ordinal > 1,
+                });
+                match plan {
+                    context::ContextPlan::Send { .. } => {}
+                    plan => {
+                        finish_run(&inner, &claimed, planned_context_failure(plan)).await;
+                        return;
+                    }
                 }
             }
             RunInput::Event(Some(RuntimeEvent::ActivityChanged { activity })) => {
@@ -1327,6 +1355,18 @@ fn context_budget_failure() -> RunOutcome {
                 "session context reached its {} MiB limit; start a new session to continue",
                 MAX_CONTEXT_BYTES / (1024 * 1024)
             ),
+        },
+    }
+}
+
+fn planned_context_failure(plan: context::ContextPlan) -> RunOutcome {
+    let Some(message) = context::rejection_message(plan) else {
+        return internal_failure("context planner rejected a sendable request");
+    };
+    RunOutcome::Failed {
+        failure: RunFailure {
+            kind: RunFailureKind::Policy,
+            message,
         },
     }
 }

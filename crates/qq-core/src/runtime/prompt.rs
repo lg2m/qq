@@ -87,14 +87,22 @@ pub(crate) fn agent_system_prompt(
     prompt
 }
 
-pub(crate) fn tool_schema_hash(specs: &[ToolSpec]) -> ContentHash {
+pub(crate) struct ToolSchemaMeasurement {
+    pub(crate) hash: ContentHash,
+    pub(crate) bytes: u64,
+}
+
+pub(crate) fn tool_schema_measurement(specs: &[ToolSpec]) -> ToolSchemaMeasurement {
     use sha2::{Digest, Sha256};
 
     let mut digest = Sha256::new();
+    let mut measured_bytes = 0_u64;
     for spec in specs {
         for bytes in [spec.name().as_bytes(), spec.description().as_bytes()] {
             digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
             digest.update(bytes);
+            measured_bytes =
+                measured_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         }
         let schema = spec.input_schema().to_string();
         digest.update(
@@ -103,6 +111,12 @@ pub(crate) fn tool_schema_hash(specs: &[ToolSpec]) -> ContentHash {
                 .to_be_bytes(),
         );
         digest.update(schema.as_bytes());
+        measured_bytes = measured_bytes
+            .saturating_add(u64::try_from(schema.len()).unwrap_or(u64::MAX))
+            .saturating_add(32);
     }
-    ContentHash::from_bytes(digest.finalize().into())
+    ToolSchemaMeasurement {
+        hash: ContentHash::from_bytes(digest.finalize().into()),
+        bytes: measured_bytes,
+    }
 }

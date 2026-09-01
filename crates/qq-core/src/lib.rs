@@ -34,10 +34,10 @@ mod workspace;
 
 pub use runtime::TurnRetryPolicy;
 use runtime::{
-    AGENT_PROMPT_VERSION, GateDecision, PendingToolCall, RuntimeEvent, RuntimeToolCall,
-    SPAWN_UNAVAILABLE_RESULT, SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate,
-    ToolGateFuture, TurnBlock, agent_system_prompt, attempts_message,
-    is_transient_provider_failure, tool_schema_hash,
+    AGENT_PROMPT_VERSION, GateDecision, PendingToolCall, PreparedRequestWeight, RuntimeEvent,
+    RuntimeToolCall, SPAWN_UNAVAILABLE_RESULT, SpawnAgentFuture, SpawnAgentOutcome,
+    SubagentSpawner, ToolGate, ToolGateFuture, TurnBlock, agent_system_prompt, attempts_message,
+    is_transient_provider_failure, tool_schema_measurement,
 };
 
 pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult};
@@ -72,6 +72,8 @@ const MAX_RUN_MODEL_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_REASONING_BYTES: usize = 1024 * 1024;
 const MAX_PARALLEL_READS: usize = 4;
 const SHELL_OUTPUT_QUEUE_CAPACITY: usize = 16;
+const CONTEXT_MESSAGE_FRAMING_BYTES: u64 = 16;
+const CONTEXT_BLOCK_FRAMING_BYTES: u64 = 16;
 struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
@@ -144,6 +146,7 @@ pub struct Runtime {
     provider: Arc<dyn Provider>,
     model: Arc<str>,
     max_output_tokens: u32,
+    context_window: Option<u32>,
     mcp: Option<Arc<dyn McpRegistry>>,
     spawn_model_routes: Arc<[String]>,
     turn_retry: TurnRetryPolicy,
@@ -176,6 +179,7 @@ impl Runtime {
             provider,
             model,
             max_output_tokens,
+            context_window: None,
             mcp: None,
             spawn_model_routes: Arc::from([]),
             turn_retry: TurnRetryPolicy::default(),
@@ -187,6 +191,18 @@ impl Runtime {
     pub fn with_turn_retry_policy(mut self, policy: TurnRetryPolicy) -> Self {
         self.turn_retry = policy;
         self
+    }
+
+    /// Supplies the effective model context window for provider-neutral
+    /// request planning. `None` retains the independent storage backstop.
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: Option<u32>) -> Self {
+        self.context_window = context_window;
+        self
+    }
+
+    pub(crate) const fn context_window(&self) -> Option<u32> {
+        self.context_window
     }
 
     /// Attaches a registry of configuration-declared MCP servers. Its cached
@@ -222,13 +238,19 @@ impl Runtime {
     pub fn run_in_workspace(&self, command: RunCommand, workspace: PathBuf) -> RunStream {
         public_run_stream(
             self.run_messages_in_workspace(vec![Message::user(command.into_prompt())], workspace),
+            self.context_window,
+            self.max_output_tokens,
         )
     }
 
     /// Runs a multi-turn model/tool loop with explicit prior conversation context.
     pub fn run_messages(&self, messages: Vec<Message>) -> RunStream {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        public_run_stream(self.run_messages_in_workspace(messages, workspace))
+        public_run_stream(
+            self.run_messages_in_workspace(messages, workspace),
+            self.context_window,
+            self.max_output_tokens,
+        )
     }
 
     fn run_messages_in_workspace(
@@ -396,19 +418,26 @@ impl Runtime {
                 &workspace_instructions,
                 selected_guidance.as_ref(),
             ));
-            yield RuntimeEvent::Prepared {
-                identity: RunPromptIdentity {
+            let tool_schema = tool_schema_measurement(&tool_specs);
+            let mut prompt_identity = Some(RunPromptIdentity {
                     version: AGENT_PROMPT_VERSION,
                     instruction_hash: workspace_instructions.hash(),
                     system_prompt_hash: Some(ContentHash::from_bytes(
                         Sha256::digest(system.as_bytes()).into(),
                     )),
-                    tool_schema_hash: Some(tool_schema_hash(&tool_specs)),
+                    tool_schema_hash: Some(tool_schema.hash),
                     selected_guidance: selected_guidance
                         .as_ref()
                         .map(|guidance| Box::new(guidance.identity())),
-                },
-            };
+                });
+            // Only the transcript preceding the accepted prompt can be
+            // replaced by a between-run compaction. Everything appended by
+            // this run is irreducible until the run settles.
+            let reducible_messages = messages.len().saturating_sub(1);
+            let reducible_message_bytes = measure_messages(&messages[..reducible_messages]);
+            let mut irreducible_message_bytes =
+                measure_messages(&messages[reducible_messages..]);
+            let mut compatible_request: Option<(Arc<str>, bool, u64, u64)> = None;
 
             let mut slice_tool_calls = 0_usize;
             let mut model_text_bytes = 0_usize;
@@ -424,24 +453,62 @@ impl Runtime {
                     .saturating_add(MAX_TOOL_CALLS_PER_TURN)
                     > MAX_TOOL_CALLS_PER_SLICE;
                 let continuation_turn = std::mem::take(&mut continuing_slice);
+                let request_system: Arc<str> = if checkpoint_turn {
+                    Arc::from(format!("{system}\n\n{SLICE_CHECKPOINT_NOTICE}"))
+                } else if continuation_turn {
+                    Arc::from(format!("{system}\n\n{SLICE_CONTINUATION_NOTICE}"))
+                } else {
+                    Arc::clone(&system)
+                };
+                let request_has_tools = !checkpoint_turn;
+                let system_bytes = u64::try_from(request_system.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(CONTEXT_BLOCK_FRAMING_BYTES);
+                let tool_schema_bytes = if request_has_tools {
+                    tool_schema.bytes
+                } else {
+                    0
+                };
+                let input_bytes = system_bytes
+                    .saturating_add(tool_schema_bytes)
+                    .saturating_add(reducible_message_bytes)
+                    .saturating_add(irreducible_message_bytes);
+                let compatible_input_tokens = compatible_request.as_ref().and_then(
+                    |(previous_system, previous_had_tools, previous_bytes, previous_tokens)| {
+                        (previous_system.as_ref() == request_system.as_ref()
+                            && *previous_had_tools == request_has_tools
+                            && input_bytes >= *previous_bytes)
+                            .then(|| previous_tokens.saturating_add(input_bytes - previous_bytes))
+                    },
+                );
+                yield RuntimeEvent::Prepared {
+                    turn_ordinal,
+                    identity: prompt_identity.take(),
+                    weight: PreparedRequestWeight {
+                        system_bytes,
+                        tool_schema_bytes,
+                        reducible_message_bytes,
+                        irreducible_message_bytes,
+                        compatible_input_tokens,
+                    },
+                };
                 // Transient provider failures (overload, rate limits, dropped
                 // connections) re-issue this turn with backoff instead of
                 // failing the run — but only while nothing user-visible has
                 // streamed, so a retry can never duplicate output.
                 let mut attempt = 1_u32;
                 let (blocks, pending_calls, terminal_usage) = 'turn: loop {
-                let request =
-                    ModelRequest::new(Arc::clone(&model), messages.clone(), max_output_tokens);
-                let request = if checkpoint_turn {
-                    request.with_system(format!("{system}\n\n{SLICE_CHECKPOINT_NOTICE}"))
-                } else if continuation_turn {
+                let request = ModelRequest::new(
+                    Arc::clone(&model),
+                    messages.clone(),
+                    max_output_tokens,
+                );
+                let request = if request_has_tools {
                     request
                         .with_tools(tool_specs.clone())
-                        .with_system(format!("{system}\n\n{SLICE_CONTINUATION_NOTICE}"))
+                        .with_system(Arc::clone(&request_system))
                 } else {
-                    request
-                        .with_tools(tool_specs.clone())
-                        .with_system(Arc::clone(&system))
+                    request.with_system(Arc::clone(&request_system))
                 };
                 let mut activity = RunActivity::WaitingForProvider;
                 if attempt == 1 {
@@ -723,6 +790,18 @@ impl Runtime {
                 break 'turn (blocks, pending_calls, terminal_usage);
                 };
 
+                compatible_request = terminal_usage.map(|usage| {
+                    (
+                        Arc::clone(&request_system),
+                        request_has_tools,
+                        input_bytes,
+                        usage
+                            .input_tokens
+                            .saturating_add(usage.cache_read_input_tokens)
+                            .saturating_add(usage.cache_write_input_tokens),
+                    )
+                });
+
                 let assistant_content = blocks
                     .into_iter()
                     .filter_map(|block| match block {
@@ -787,6 +866,8 @@ impl Runtime {
                     return;
                 }
                 if calls.is_empty() && checkpoint_turn {
+                    irreducible_message_bytes = irreducible_message_bytes
+                        .saturating_add(measure_message(&assistant));
                     messages.push(assistant);
                     slice_tool_calls = 0;
                     continuing_slice = true;
@@ -796,6 +877,8 @@ impl Runtime {
                     yield RuntimeEvent::Completed;
                     return;
                 }
+                irreducible_message_bytes = irreducible_message_bytes
+                    .saturating_add(measure_message(&assistant));
                 messages.push(assistant);
 
                 // Policy resolves sequentially in request order, after the
@@ -1000,7 +1083,10 @@ impl Runtime {
                         }
                     })
                     .collect();
-                messages.push(Message::tool_results(result_blocks));
+                let tool_results = Message::tool_results(result_blocks);
+                irreducible_message_bytes = irreducible_message_bytes
+                    .saturating_add(measure_message(&tool_results));
+                messages.push(tool_results);
             }
 
             yield RuntimeEvent::Failed {
@@ -1014,12 +1100,36 @@ impl Runtime {
 /// Translates the richer internal runtime stream into the direct public API.
 /// Session execution consumes the internal preparation and tool events
 /// separately so it can persist them before publishing visible state.
-fn public_run_stream(mut events: RuntimeStream) -> RunStream {
+fn public_run_stream(
+    mut events: RuntimeStream,
+    context_window: Option<u32>,
+    max_output_tokens: u32,
+) -> RunStream {
     Box::pin(stream! {
         while let Some(event) = events.next().await {
             match event {
                 RuntimeEvent::Started => yield RunEvent::Started,
-                RuntimeEvent::Prepared { .. } => {}
+                RuntimeEvent::Prepared { weight, .. } => {
+                    let plan = sessions::context::plan(sessions::context::ContextInput {
+                        context_window,
+                        max_output_tokens,
+                        system_bytes: weight.system_bytes,
+                        tool_schema_bytes: weight.tool_schema_bytes,
+                        reducible_message_bytes: weight.reducible_message_bytes,
+                        irreducible_message_bytes: weight.irreducible_message_bytes,
+                        compatible_input_tokens: weight.compatible_input_tokens,
+                        // The direct compatibility path has no durable
+                        // between-run compaction lifecycle.
+                        compaction_attempted: true,
+                    });
+                    if let Some(message) = sessions::context::rejection_message(plan) {
+                        yield RunEvent::Failed {
+                            kind: RunFailureKind::Policy,
+                            message,
+                        };
+                        return;
+                    }
+                }
                 RuntimeEvent::ActivityChanged { activity } => {
                     yield RunEvent::ActivityChanged { activity };
                 }
@@ -1057,6 +1167,63 @@ fn public_run_stream(mut events: RuntimeStream) -> RunStream {
             }
         }
     })
+}
+
+fn measure_messages(messages: &[Message]) -> u64 {
+    messages.iter().fold(0_u64, |total, message| {
+        total.saturating_add(measure_message(message))
+    })
+}
+
+fn measure_message(message: &Message) -> u64 {
+    message
+        .content()
+        .iter()
+        .fold(CONTEXT_MESSAGE_FRAMING_BYTES, |total, block| {
+            let content = match block {
+                ContentBlock::Text { text } => u64::try_from(text.len()).unwrap_or(u64::MAX),
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => u64::try_from(id.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
+                    .saturating_add(json_value_bytes(arguments)),
+                ContentBlock::ToolResult {
+                    call_id, content, ..
+                } => u64::try_from(call_id.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(content.len()).unwrap_or(u64::MAX)),
+            };
+            total
+                .saturating_add(CONTEXT_BLOCK_FRAMING_BYTES)
+                .saturating_add(content)
+        })
+}
+
+fn json_value_bytes(value: &serde_json::Value) -> u64 {
+    struct ByteCounter(u64);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        u64::MAX
+    } else {
+        counter.0
+    }
 }
 
 fn append_turn_text(blocks: &mut Vec<TurnBlock>, text: &str) {
@@ -1101,7 +1268,10 @@ pub enum RuntimeConfigError {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -1146,6 +1316,37 @@ mod tests {
                 }),
             ]))
         }
+    }
+
+    #[tokio::test]
+    async fn direct_run_rejects_a_known_context_overflow_before_provider_work() {
+        struct CountingProvider(Arc<AtomicUsize>);
+
+        impl Provider for CountingProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Box::pin(stream::iter([Ok(ProviderEvent::Completed { usage: None })]))
+            }
+        }
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::new(CountingProvider(Arc::clone(&provider_calls)), "test", 1)
+            .unwrap()
+            .with_context_window(Some(1));
+
+        let events = runtime
+            .run(RunCommand::new("work"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(provider_calls.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::Policy,
+                message,
+            }) if message.contains("1-token window")
+        ));
     }
 
     #[tokio::test]

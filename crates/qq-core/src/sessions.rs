@@ -38,6 +38,7 @@ use crate::{
 };
 
 mod approvals;
+pub(crate) mod context;
 mod execution;
 mod runtime;
 mod scheduler;
@@ -5609,6 +5610,7 @@ mod tests {
                     resolved_model.provider_model.clone(),
                     resolved_model.max_output_tokens,
                 )
+                .map(|runtime| runtime.with_context_window(resolved_model.context_window))
                 .map(|runtime| LoadedRuntime {
                     runtime: Arc::new(runtime),
                     resolved_model: Arc::new(resolved_model),
@@ -6979,6 +6981,180 @@ mod tests {
             )
             .unwrap();
         assert_eq!(persisted, None);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn known_first_turn_context_overflow_starts_no_provider_work() {
+        struct TinyContextLoader {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for TinyContextLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    Runtime::new(CountingContextProvider { provider_calls }, "test-model", 1)
+                        .map(|runtime| runtime.with_context_window(Some(1)))
+                        .map(|runtime| {
+                            let mut loaded = loaded_runtime(runtime, None);
+                            Arc::get_mut(&mut loaded.resolved_model)
+                                .unwrap()
+                                .context_window = Some(1);
+                            loaded
+                        })
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        struct CountingContextProvider {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl Provider for CountingContextProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                self.provider_calls.fetch_add(1, Ordering::AcqRel);
+                Box::pin(stream::iter([Ok(qq_provider::ProviderEvent::Completed {
+                    usage: None,
+                })]))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(TinyContextLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        submit_prompt_to(&runtime, session_id, "work").await;
+        let observed = collect_through_finished(&mut events).await;
+
+        assert_eq!(provider_calls.load(Ordering::Acquire), 0);
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Failed { failure },
+                ..
+            } if failure.kind == RunFailureKind::Policy
+        )));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn known_later_turn_context_overflow_starts_no_second_provider_request() {
+        struct LaterTurnLoader {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl RuntimeLoader for LaterTurnLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let provider_calls = Arc::clone(&self.provider_calls);
+                Box::pin(async move {
+                    Runtime::new(LaterTurnProvider { provider_calls }, "test-model", 1)
+                        .map(|runtime| runtime.with_context_window(Some(100_000)))
+                        .map(|runtime| {
+                            let mut loaded = loaded_runtime(runtime, None);
+                            Arc::get_mut(&mut loaded.resolved_model)
+                                .unwrap()
+                                .context_window = Some(100_000);
+                            loaded
+                        })
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        struct LaterTurnProvider {
+            provider_calls: Arc<AtomicUsize>,
+        }
+
+        impl Provider for LaterTurnProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                let call = self.provider_calls.fetch_add(1, Ordering::AcqRel);
+                if call == 0 {
+                    Box::pin(stream::iter(vec![
+                        Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                            id: "list".to_owned(),
+                            name: "list_dir".to_owned(),
+                        }),
+                        Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                            id: "list".to_owned(),
+                            json: r#"{"path":"."}"#.to_owned(),
+                        }),
+                        Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                            id: "list".to_owned(),
+                        }),
+                        Ok(qq_provider::ProviderEvent::Completed {
+                            usage: Some(qq_provider::ProviderUsage {
+                                input_tokens: 99_998,
+                                cache_read_input_tokens: 0,
+                                cache_write_input_tokens: 0,
+                                output_tokens: 1,
+                            }),
+                        }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter(vec![Ok(
+                        qq_provider::ProviderEvent::Completed { usage: None },
+                    )]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(LaterTurnLoader {
+                provider_calls: Arc::clone(&provider_calls),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        submit_prompt_to(&runtime, session_id, "work").await;
+        let observed = collect_through_finished(&mut events).await;
+
+        assert_eq!(provider_calls.load(Ordering::Acquire), 1);
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Failed { failure },
+                ..
+            } if failure.kind == RunFailureKind::Policy
+        )));
         runtime.shutdown().await.unwrap();
     }
 

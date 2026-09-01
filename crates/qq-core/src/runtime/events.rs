@@ -6,11 +6,24 @@ use qq_provider::Message;
 
 use crate::workspace::FileStateUpdate;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedRequestWeight {
+    pub(crate) system_bytes: u64,
+    pub(crate) tool_schema_bytes: u64,
+    pub(crate) reducible_message_bytes: u64,
+    pub(crate) irreducible_message_bytes: u64,
+    /// Provider-measured occupancy of the compatible preceding request plus
+    /// the conservative byte weight appended since that request.
+    pub(crate) compatible_input_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RuntimeEvent {
     Started,
     Prepared {
-        identity: RunPromptIdentity,
+        turn_ordinal: u16,
+        identity: Option<RunPromptIdentity>,
+        weight: PreparedRequestWeight,
     },
     ActivityChanged {
         activity: RunActivity,
