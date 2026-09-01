@@ -1,6 +1,7 @@
 # QQ Harness Reliability, Cost, And Terminal-Bench Readiness
 
-Status: active. Re-baselined against `main` on 2026-08-04.
+Status: active. Re-baselined against `main` on 2026-08-04. Phase 4 completed
+and qualified on 2026-09-01; Phase 5 is next.
 
 This plan turns QQ into a trustworthy autonomous terminal harness before
 optimizing it against Terminal-Bench. It covers the failures found in the
@@ -59,6 +60,9 @@ QQ already has important foundations:
   separate run permits, cancellation propagation, and durable child sessions.
 - Provider usage, cache usage, and estimated cost are normalized and retained.
 - The TUI now preserves and efficiently renders long completed output.
+- Streamed text and tool arguments/results use append-only SQLite chunks with
+  exact incremental capacity accounting, bounded batching, fair persistence,
+  and wake-driven backpressure.
 
 ### 2026-08-03 Recovery Ledger
 
@@ -87,9 +91,6 @@ The remaining gaps are material:
 | Area | Current behavior | Consequence |
 | --- | --- | --- |
 | Evaluation export | `DEV-730` supplies the pinned Harbor adapter, ATIF validation fixtures, revision-stamped launcher, fixed-identity scorecard, and grounded failure taxonomy | A real fixed-model baseline still needs credentials, benchmark compute, and deliberate spend |
-| Streaming persistence | Each text batch reassembles the full context for capacity checks and grows SQLite strings by concatenation | Long output has structurally superlinear persistence work |
-| Reasoning persistence | Provider reasoning deltas commit independently rather than using text batching | High-effort models can create excessive transactions and queue pressure |
-| Store scheduling | The single worker always prefers control traffic; a full output queue is retried by polling every millisecond | Output can be delayed or starved under control load |
 | Context budgeting | Automatic compaction uses a fixed 4 MiB budget and a 70% byte trigger | Small-context models may fail before compaction; large-context models may compact and spend unnecessarily |
 | Resolved model state | Runtime loading returns the runtime and pricing but drops effective context limits and generation capabilities | Core cannot budget, explain, or reproduce the exact model execution |
 | Completion behavior | Internal tool slices checkpoint and continue without a terminal event, but caller-requested turn/time/cost budgets still settle through the headless adapter rather than one core-owned outcome | TUI, server, and future clients cannot yet impose and observe the same explicit overall budget contract |
@@ -614,6 +615,9 @@ median cost faster than successful-task rate improves.
 
 Priority: P0 for long-output correctness and performance.
 
+Status: complete and qualified on 2026-09-01 at `b1cc118` (`ecd42e5` contains
+the implementation; `b1cc118` stabilizes the release diagnostic).
+
 ### Baseline First
 
 Add deterministic benchmarks before changing storage:
@@ -698,6 +702,62 @@ provider-exposed reasoning:
 - Reasoning batching reduces transactions while preserving replay.
 - Cancellation and control requests meet their SLO during eight long streams.
 - Doubling stream size remains within the 2.2x linearity budget.
+
+### Completion Receipt — 2026-09-01
+
+Schema version 15 adds append-only `message_chunks`, persisted per-run base and
+incremental context bytes, and a bounded durable workspace-grant promotion
+outbox. New text, refusal, reasoning, tool-argument, tool-result, and denial
+paths reserve exact capacity transactionally before publication. Readers join
+legacy base text with ordered chunks once. The runtime batches output and
+reasoning at 8 KiB or 8 ms, gives control work a bounded weighted preference,
+uses wake-driven output admission, and explicitly drains accepted work during
+shutdown. Persistence failures settle durably instead of being converted into
+fabricated tool denials.
+
+Compatible adjacent writes are grouped at the producer through bounded
+batching instead of fusing separately acknowledged store jobs into a generic
+worker transaction; this preserves each call's commit and failure boundary.
+The synthetic interrupted tool result used during terminal recovery is the
+deliberate exception to the active-run incremental counter because it closes an
+already interrupted boundary. Every active model-visible append remains
+capacity-checked and atomic.
+
+The clean detached qualification report
+`target/qq-perf/r4-b1cc118-linux-x86_64-local.json` records revision
+`b1cc1189a32bc0361045472bc1a4e338c2e52d06`, `source.dirty = false`, 62 total
+metrics, and 55 passing budgeted metrics. Selected p95 results:
+
+| Boundary | p95 |
+| --- | ---: |
+| One MiB reasoning completion | 474.045 ms |
+| One MiB reasoning payload transactions | 129 |
+| One MiB shell completion | 113.787 ms |
+| Eight-stream batch completion | 999.780 ms |
+| Eight-stream control-call upper bound | 23.521 ms |
+| Cancellation to durable finish under load | 40.819 ms |
+| Maximum persisted same-run output service gap | 50.000 ms |
+| Eight-stream peak temporary RSS | 9.03 MiB |
+| Restart snapshot reconstruction | 2.182 ms |
+| Restart replay reconstruction | 1.861 ms |
+| One MiB / 512 KiB durable-stream ratio | 1.925x |
+
+The Linux-only release diagnostic covers exact direct-store payloads that
+cannot all traverse the public 4 MiB context cap once prompt bytes are present.
+It runs three isolated processes per size, gates median time, takes maximum
+temporary RSS, and passed from 64 KiB through 4 MiB: 24.154 ms, 197.471 ms,
+388.975 ms, 792.254 ms, and 1.595 s; the 4 MiB peak temporary RSS was 13.35
+MiB. Each size committed exactly one transaction per 8 KiB chunk.
+
+Regression coverage includes migration and legacy reconstruction, atomic
+capacity boundaries and injected failures, cancellation inside a pending
+batch, call-versus-close races, output fairness, shell truncation, durable
+promotion recovery/serialization/panic/shutdown, post-commit caller
+cancellation, malformed outbox identity, and concurrent independent config
+loaders. On the same clean commit, `cargo test --workspace`, formatting,
+Clippy with all targets/features and warnings denied, `cargo build --workspace`,
+the 100-sample performance recorder/self-check, and the release scaling
+diagnostic all passed. Generated raw reports remain ignored and untracked.
 
 ## Phase 5: Resolved Model, Context Budget, And Spend Enforcement
 

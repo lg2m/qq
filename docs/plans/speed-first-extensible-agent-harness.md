@@ -1,8 +1,8 @@
 # Speed-First Extensible Agent Harness Backend
 
-Status: Phase 0 complete 2026-09-01; implementation Phases 1–7 and tasks
-H1–H12 proposed. The performance and reliability prerequisites in the active
-Terminal-Bench roadmap remain ahead of the new extension work in this document.
+Status: Phase 0 complete 2026-09-01. Phase 1 is in progress: R4 completed and
+qualified on 2026-09-01; R5 and H1 are next. Implementation Phases 2–7 and
+tasks H2–H12 remain proposed.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -854,11 +854,11 @@ They measure only current, publicly observable default behavior:
 The SQLite commit instant and exact provider-claim/send instant are not exposed
 by current public seams, so Phase 0 labels those observations as proxies rather
 than adding generic runtime instrumentation. Exact commit-to-TUI rendering is
-qualified by its owning readiness work. The complete R4 streaming/fairness
-matrix, compaction/context planning, and sub-agent fan-out, fairness, cost, and
-memory remain owned by R4, R5, and R7 and are imported only when those
-milestones complete. Completing H0 does not complete any of those readiness
-milestones.
+qualified by its owning readiness work. R4's complete streaming/fairness matrix
+is now qualified and imported by the Phase 1 receipt below. Compaction/context
+planning and sub-agent fan-out, fairness, cost, and memory remain owned by R5
+and R7 and are imported only when those milestones complete. Completing H0 did
+not itself complete any readiness milestone.
 
 Use fake providers and temporary stores for deterministic runtime latency.
 Separate provider network latency from QQ latency. Use fixed-model live runs
@@ -1081,11 +1081,11 @@ contained all 47 metrics and all 14 correctness receipts passed.
 | 100-session worker peak RSS | 15.54 MiB | 15.75 MiB | n/a (10 batches) |
 | 100-session maximum active runs | 8 | 8 | n/a (10 batches) |
 
-The versioned self-comparison intentionally reported one existing red target:
-the measured 1 MiB/512 KiB durable-stream p95 ratio was `2.292x` against the
-checked-in `2.200x` ceiling. The budget was not weakened. R4 owns the linear
-streaming and fair-persistence repair and must turn this gate green before its
-completion receipt. No other budget failure was reported.
+The versioned Phase 0 self-comparison intentionally reported one existing red
+target: the measured 1 MiB/512 KiB durable-stream p95 ratio was `2.292x`
+against the checked-in `2.200x` ceiling. The budget was not weakened. R4 later
+turned the same gate green at `1.925x`; the historical Phase 0 report remains
+unchanged. No other Phase 0 budget failure was reported.
 
 Qualification commands:
 
@@ -1115,6 +1115,22 @@ design. The reproducible protocol and complete measurement inventory are in
 
 Complete R4 and R5 through their owning readiness phases, then implement H1.
 Do not copy their implementation contracts into this plan.
+
+Status: in progress. R4 is complete; R5 and H1 remain.
+
+#### Imported R4 Completion Receipt — 2026-09-01
+
+The owning [Terminal-Bench readiness plan](./terminal-bench-readiness.md)
+records the full schema, batching, fairness, capacity, recovery, and
+qualification receipt. Implementation commit `ecd42e5` plus diagnostic commit
+`b1cc118` passed the clean detached 100-sample recorder at exact revision
+`b1cc1189a32bc0361045472bc1a4e338c2e52d06`: 62 metrics, all 55 enforced
+budgets green, a `1.925x` one-MiB/512-KiB scaling ratio, 23.521 ms p95 control
+response, 40.819 ms p95 cancellation, and a 50.000 ms p95 persisted output
+service gap under eight concurrent streams. The three-sample isolated release
+diagnostic also passed exact 64 KiB through 4 MiB direct-store payloads, and
+the clean workspace test, format, Clippy, and build gates passed. Raw reports
+remain ignored and untracked.
 
 Deliverables:
 
