@@ -18,7 +18,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, File as CapFile, OpenOptions as CapOpenOptions},
 };
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use futures_util::{StreamExt, future::join_all, stream};
 use qq_client::SessionClient;
 use qq_core::{
@@ -32,6 +32,7 @@ use qq_protocol::{
 };
 use qq_provider::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderEvent, ProviderStream,
+    ReasoningKind,
 };
 use qq_server::{
     CommandFuture, ServerHandler, ServerHandlerError, ServerOptions, ServerPaths, SnapshotFuture,
@@ -49,7 +50,7 @@ use tokio::{
 };
 
 const REPORT_SCHEMA_VERSION: u16 = 1;
-const FIXTURE_VERSION: u16 = 1;
+const FIXTURE_VERSION: u16 = 2;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(45);
 const METADATA_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -57,6 +58,8 @@ const BUILD_PROCESS_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const WORKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const COMMAND_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const LONG_STREAM_CHUNK_BYTES: usize = 1_024;
+const R4_BATCH_MAX_BYTES: usize = 8 * 1_024;
+const R4_SHELL_OUTPUT_MAX_BYTES: usize = 128 * 1_024;
 const LOAD_PROVIDER_DELAY: Duration = Duration::from_millis(50);
 const PROVIDER_MARK_CAPACITY: usize = 256;
 
@@ -75,6 +78,9 @@ enum PerfCommand {
     /// Internal isolated concurrent-load worker.
     #[command(hide = true)]
     LoadWorker(LoadWorkerArgs),
+    /// Internal isolated R4 qualification worker.
+    #[command(hide = true)]
+    R4Worker(R4WorkerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -83,6 +89,21 @@ struct LoadWorkerArgs {
     sessions: usize,
     #[arg(long)]
     repetitions: u16,
+}
+
+#[derive(Debug, Args)]
+struct R4WorkerArgs {
+    #[arg(long, value_enum)]
+    case: R4Case,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum R4Case {
+    Reasoning,
+    Shell,
+    EightStreams,
+    Restart,
 }
 
 #[derive(Debug, Args)]
@@ -390,6 +411,7 @@ pub async fn run(args: PerfArgs) -> Result<(), PerfError> {
         PerfCommand::Baseline(args) => launch_release_worker(args).await,
         PerfCommand::Check(args) => check_reports(args),
         PerfCommand::LoadWorker(args) => run_load_worker(args).await,
+        PerfCommand::R4Worker(args) => run_r4_worker(args).await,
     }
 }
 
@@ -1739,6 +1761,11 @@ enum ProviderMode {
         total_bytes: usize,
         chunk_bytes: usize,
         delay: Duration,
+        chunk_delay: Duration,
+    },
+    Reasoning {
+        total_bytes: usize,
+        chunk_bytes: usize,
     },
     Hanging,
     Tool {
@@ -1840,10 +1867,12 @@ impl Provider for BenchmarkProvider {
                 total_bytes,
                 chunk_bytes,
                 delay,
+                chunk_delay,
             } => {
                 let total_bytes = *total_bytes;
                 let chunk_bytes = *chunk_bytes;
                 let delay = *delay;
+                let chunk_delay = *chunk_delay;
                 let marks = self.marks.clone();
                 let activity = Arc::clone(&self.activity);
                 Box::pin(async_stream::stream! {
@@ -1866,7 +1895,40 @@ impl Provider for BenchmarkProvider {
                         yield Ok(ProviderEvent::OutputTextDelta {
                             text: "x".repeat(bytes),
                         });
+                        if !chunk_delay.is_zero() && remaining > 0 {
+                            tokio::time::sleep(chunk_delay).await;
+                        }
                     }
+                    yield Ok(ProviderEvent::Completed { usage: None });
+                })
+            }
+            ProviderMode::Reasoning {
+                total_bytes,
+                chunk_bytes,
+            } => {
+                let total_bytes = *total_bytes;
+                let chunk_bytes = *chunk_bytes;
+                let activity = Arc::clone(&self.activity);
+                Box::pin(async_stream::stream! {
+                    let _guard = activity.enter();
+                    yield Ok(ProviderEvent::ReasoningStarted {
+                        kind: ReasoningKind::ExposedThinking,
+                    });
+                    let mut remaining = total_bytes;
+                    while remaining > 0 {
+                        let bytes = remaining.min(chunk_bytes);
+                        remaining -= bytes;
+                        yield Ok(ProviderEvent::ReasoningDelta {
+                            kind: ReasoningKind::ExposedThinking,
+                            text: "r".repeat(bytes),
+                        });
+                    }
+                    yield Ok(ProviderEvent::ReasoningCompleted {
+                        kind: ReasoningKind::ExposedThinking,
+                    });
+                    yield Ok(ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    });
                     yield Ok(ProviderEvent::Completed { usage: None });
                 })
             }
@@ -1920,6 +1982,8 @@ fn send_provider_mark(
 struct RuntimeFixture {
     runtime: SessionRuntime,
     workspace_id: WorkspaceId,
+    workspace_path: PathBuf,
+    database_path: PathBuf,
     initial_cursor: EventCursor,
     marks: mpsc::Receiver<ProviderMark>,
     activity: Arc<ActivityCounter>,
@@ -1938,9 +2002,10 @@ impl RuntimeFixture {
         let (marks, receiver) = mpsc::channel(PROVIDER_MARK_CAPACITY);
         let activity = Arc::new(ActivityCounter::default());
         let resolve_command_id = generate_id("workspace command")?;
+        let database_path = directory.path().join("sessions.sqlite3");
         let runtime = open_session_runtime(
             "open session runtime",
-            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            SessionRuntimeOptions::new(database_path.clone()),
             Arc::new(BenchmarkLoader {
                 mode,
                 marks,
@@ -1976,6 +2041,8 @@ impl RuntimeFixture {
         Ok(Self {
             runtime,
             workspace_id,
+            workspace_path: workspace,
+            database_path,
             initial_cursor,
             marks: receiver,
             activity,
@@ -2091,12 +2158,21 @@ async fn shutdown_session_runtime(
         .map_err(fixture_error(case))
 }
 
+async fn close_session_runtime(
+    case: &'static str,
+    runtime: &SessionRuntime,
+) -> Result<(), PerfError> {
+    with_timeout_for(case, CLEANUP_TIMEOUT, runtime.close())
+        .await?
+        .map_err(fixture_error(case))
+}
+
 async fn finish_runtime_fixture<T>(
     fixture: &RuntimeFixture,
     case: &'static str,
     operation: Result<T, PerfError>,
 ) -> Result<T, PerfError> {
-    let cleanup = shutdown_session_runtime(case, &fixture.runtime).await;
+    let cleanup = close_session_runtime(case, &fixture.runtime).await;
     merge_operation_cleanup(operation, cleanup)
 }
 
@@ -2212,6 +2288,10 @@ async fn run_workloads(
     metrics.extend(stream_metrics);
     checks.extend(stream_checks);
 
+    let (r4_metrics, r4_checks) = r4_workloads(samples).await?;
+    metrics.extend(r4_metrics);
+    checks.extend(r4_checks);
+
     let (load_metrics, load_checks) = load_workloads(samples).await?;
     metrics.extend(load_metrics);
     checks.extend(load_checks);
@@ -2220,7 +2300,7 @@ async fn run_workloads(
         "true page-cache-cold startup requires a fresh machine or privileged cache control; the report records first and repeated fresh-process startup instead".to_owned(),
         "the recorder refuses non-Linux hosts until native path isolation and RSS samplers are implemented".to_owned(),
         "exact SQLite commit instants are not public; provider-delta metrics end at post-commit core or HTTP/SSE observation".to_owned(),
-        "exact commit-to-TUI rendering and the complete streaming/fairness matrix remain owned by readiness milestone R4".to_owned(),
+        "exact SQLite dequeue, commit, and commit-to-TUI rendering instants are not public; R4 reports public call and terminal-observation upper bounds plus persisted event-time service gaps".to_owned(),
         "compaction/context-planning measurements remain owned by readiness milestone R5".to_owned(),
         "sub-agent economics, fan-out, and memory measurements remain owned by readiness milestone R7".to_owned(),
         "provider network latency and live-model quality are deliberately excluded from deterministic Phase 0 latency".to_owned(),
@@ -2464,6 +2544,7 @@ async fn runtime_startup_workloads(
                 total_bytes: 1,
                 chunk_bytes: 1,
                 delay: Duration::ZERO,
+                chunk_delay: Duration::ZERO,
             },
             marks,
             activity: Arc::new(ActivityCounter::default()),
@@ -2534,6 +2615,7 @@ async fn direct_pipeline_workloads(
         total_bytes: 4_096,
         chunk_bytes: 4_096,
         delay: Duration::ZERO,
+        chunk_delay: Duration::ZERO,
     })
     .await?;
     let operation = async {
@@ -2759,6 +2841,7 @@ async fn http_pipeline_workloads(
         total_bytes: 4_096,
         chunk_bytes: 4_096,
         delay: Duration::ZERO,
+        chunk_delay: Duration::ZERO,
     })
     .await?;
     let operation = async {
@@ -3255,6 +3338,7 @@ async fn measure_long_stream(bytes: usize, samples: u16) -> Result<(Vec<u64>, bo
         total_bytes: bytes,
         chunk_bytes: LONG_STREAM_CHUNK_BYTES,
         delay: Duration::ZERO,
+        chunk_delay: Duration::ZERO,
     })
     .await?;
     let operation = async {
@@ -3307,6 +3391,831 @@ async fn measure_long_stream(bytes: usize, samples: u16) -> Result<(Vec<u64>, bo
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct R4WorkerSample {
+    case: R4Case,
+    completion_ns: u64,
+    payload_transactions: u64,
+    peak_temporary_rss_bytes: u64,
+    max_control_queue_wait_upper_bound_ns: u64,
+    cancellation_to_finished_ns: u64,
+    max_output_service_gap_ns: u64,
+    restart_open_to_snapshot_ns: u64,
+    restart_replay_ns: u64,
+}
+
+impl R4WorkerSample {
+    const fn new(case: R4Case) -> Self {
+        Self {
+            case,
+            completion_ns: 0,
+            payload_transactions: 0,
+            peak_temporary_rss_bytes: 0,
+            max_control_queue_wait_upper_bound_ns: 0,
+            cancellation_to_finished_ns: 0,
+            max_output_service_gap_ns: 0,
+            restart_open_to_snapshot_ns: 0,
+            restart_replay_ns: 0,
+        }
+    }
+}
+
+struct R4RunObservation {
+    outcome: RunOutcome,
+    terminal_cursor: EventCursor,
+    digest: String,
+    text_bytes: usize,
+    max_text_delta_bytes: usize,
+    reasoning_bytes: usize,
+    reasoning_transactions: u64,
+    max_reasoning_delta_bytes: usize,
+    reasoning_started_sequence: Option<u64>,
+    first_reasoning_delta_sequence: Option<u64>,
+    reasoning_completed_sequence: Option<u64>,
+    tool_output_bytes: usize,
+    tool_output_transactions: u64,
+    first_tool_output_sequence: Option<u64>,
+    tool_finished_sequence: Option<u64>,
+    tool_result: Option<String>,
+    tool_state: Option<ToolCallState>,
+    tool_is_error: bool,
+}
+
+async fn observe_r4_run(
+    events: &mut SessionEventStream,
+    run_id: RunId,
+) -> Result<R4RunObservation, PerfError> {
+    with_timeout_for("R4 run observation", CLEANUP_TIMEOUT, async {
+        let mut digest = Sha256::new();
+        let mut text_bytes = 0_usize;
+        let mut max_text_delta_bytes = 0_usize;
+        let mut reasoning_bytes = 0_usize;
+        let mut reasoning_transactions = 0_u64;
+        let mut max_reasoning_delta_bytes = 0_usize;
+        let mut reasoning_started_sequence = None;
+        let mut first_reasoning_delta_sequence = None;
+        let mut reasoning_completed_sequence = None;
+        let mut tool_output_bytes = 0_usize;
+        let mut tool_output_transactions = 0_u64;
+        let mut first_tool_output_sequence = None;
+        let mut tool_finished_sequence = None;
+        let mut tool_result = None;
+        let mut tool_state = None;
+        let mut tool_is_error = false;
+        while let Some(event) = events.next().await {
+            let event = event.map_err(fixture_error("read R4 durable event"))?;
+            if event.run_id != Some(run_id) {
+                continue;
+            }
+            let encoded = serde_json::to_vec(&event).map_err(PerfError::Encode)?;
+            digest.update((encoded.len() as u64).to_le_bytes());
+            digest.update(&encoded);
+            match &event.event {
+                SessionEvent::ReasoningStarted { .. } => {
+                    reasoning_started_sequence = Some(event.cursor.sequence);
+                }
+                SessionEvent::ReasoningDelta { text, .. } => {
+                    reasoning_bytes = reasoning_bytes.saturating_add(text.len());
+                    reasoning_transactions = reasoning_transactions.saturating_add(1);
+                    max_reasoning_delta_bytes = max_reasoning_delta_bytes.max(text.len());
+                    first_reasoning_delta_sequence.get_or_insert(event.cursor.sequence);
+                }
+                SessionEvent::ReasoningCompleted { .. } => {
+                    reasoning_completed_sequence = Some(event.cursor.sequence);
+                }
+                SessionEvent::TextAppended { text, .. } => {
+                    text_bytes = text_bytes.saturating_add(text.len());
+                    max_text_delta_bytes = max_text_delta_bytes.max(text.len());
+                }
+                SessionEvent::ToolCallOutputDelta { chunk, .. } => {
+                    tool_output_bytes = tool_output_bytes.saturating_add(chunk.len());
+                    tool_output_transactions = tool_output_transactions.saturating_add(1);
+                    first_tool_output_sequence.get_or_insert(event.cursor.sequence);
+                }
+                SessionEvent::ToolCallFinished { tool_call } => {
+                    tool_finished_sequence = Some(event.cursor.sequence);
+                    tool_result.clone_from(&tool_call.result);
+                    tool_state = Some(tool_call.state);
+                    tool_is_error = tool_call.is_error;
+                }
+                SessionEvent::RunFinished { outcome, .. } => {
+                    return Ok(R4RunObservation {
+                        outcome: outcome.clone(),
+                        terminal_cursor: event.cursor,
+                        digest: format!("{:x}", digest.finalize()),
+                        text_bytes,
+                        max_text_delta_bytes,
+                        reasoning_bytes,
+                        reasoning_transactions,
+                        max_reasoning_delta_bytes,
+                        reasoning_started_sequence,
+                        first_reasoning_delta_sequence,
+                        reasoning_completed_sequence,
+                        tool_output_bytes,
+                        tool_output_transactions,
+                        first_tool_output_sequence,
+                        tool_finished_sequence,
+                        tool_result,
+                        tool_state,
+                        tool_is_error,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Err(PerfError::Fixture(
+            "R4 event stream ended before RunFinished".to_owned(),
+        ))
+    })
+    .await?
+}
+
+fn current_rss() -> Result<u64, PerfError> {
+    process_status_bytes(std::process::id(), "VmRSS")
+        .ok_or_else(|| PerfError::Fixture("read R4 worker VmRSS baseline".to_owned()))
+}
+
+async fn peak_temporary_rss(baseline: u64, sampler: RssSampler) -> Result<u64, PerfError> {
+    sampler
+        .finish()
+        .await?
+        .map(|peak| peak.saturating_sub(baseline))
+        .ok_or_else(|| PerfError::Fixture("R4 worker peak VmRSS was unavailable".to_owned()))
+}
+
+async fn r4_reasoning_sample() -> Result<R4WorkerSample, PerfError> {
+    const BYTES: usize = 1024 * 1024;
+    let fixture = RuntimeFixture::open(ProviderMode::Reasoning {
+        total_bytes: BYTES,
+        chunk_bytes: LONG_STREAM_CHUNK_BYTES,
+    })
+    .await?;
+    let operation = async {
+        let (session_id, cursor) = fixture.create_session(ApprovalMode::ReadOnly).await?;
+        let mut events = fixture.subscribe(cursor)?;
+        let baseline = current_rss()?;
+        let sampler = RssSampler::start(std::process::id());
+        let started = Instant::now();
+        let receipt = session_command(
+            "submit R4 reasoning prompt",
+            &fixture.runtime,
+            generate_id("R4 reasoning command")?,
+            SessionCommand::SubmitPrompt {
+                session_id,
+                prompt: "emit the reasoning fixture".to_owned(),
+            },
+        )
+        .await?;
+        let run_id = prompt_run_id(&receipt)?;
+        let observed = observe_r4_run(&mut events, run_id).await?;
+        let completion_ns = elapsed_ns(started);
+        if !matches!(observed.outcome, RunOutcome::Completed)
+            || observed.reasoning_bytes != BYTES
+            || observed.text_bytes != 4
+            || observed.max_text_delta_bytes > R4_BATCH_MAX_BYTES
+            || !(2..=140).contains(&observed.reasoning_transactions)
+            || observed.max_reasoning_delta_bytes > R4_BATCH_MAX_BYTES
+            || !matches!(
+                (
+                    observed.reasoning_started_sequence,
+                    observed.first_reasoning_delta_sequence,
+                    observed.reasoning_completed_sequence,
+                ),
+                (Some(start), Some(delta), Some(done)) if start < delta && delta < done
+            )
+        {
+            return Err(PerfError::Fixture(
+                "long reasoning bytes, batching, or ordering were invalid".to_owned(),
+            ));
+        }
+        let mut replay = fixture.subscribe(cursor)?;
+        let replayed = observe_r4_run(&mut replay, run_id).await?;
+        if replayed.digest != observed.digest
+            || replayed.terminal_cursor != observed.terminal_cursor
+        {
+            return Err(PerfError::Fixture(
+                "long reasoning replay differed from live durable events".to_owned(),
+            ));
+        }
+        let mut sample = R4WorkerSample::new(R4Case::Reasoning);
+        sample.completion_ns = completion_ns;
+        sample.payload_transactions = observed.reasoning_transactions;
+        sample.peak_temporary_rss_bytes = peak_temporary_rss(baseline, sampler).await?;
+        Ok(sample)
+    }
+    .await;
+    finish_runtime_fixture(&fixture, "close R4 reasoning runtime", operation).await
+}
+
+async fn r4_shell_sample() -> Result<R4WorkerSample, PerfError> {
+    const BYTES: usize = 1024 * 1024;
+    let fixture = RuntimeFixture::open(ProviderMode::Tool {
+        name: "shell",
+        arguments: r#"{"command":"cat long-shell.txt"}"#,
+    })
+    .await?;
+    fs::write(
+        fixture.workspace_path.join("long-shell.txt"),
+        vec![b's'; BYTES],
+    )
+    .map_err(|error| PerfError::Fixture(format!("seed long shell input: {error}")))?;
+    let operation = async {
+        let (session_id, cursor) = fixture.create_session(ApprovalMode::Full).await?;
+        let mut events = fixture.subscribe(cursor)?;
+        let baseline = current_rss()?;
+        let sampler = RssSampler::start(std::process::id());
+        let started = Instant::now();
+        let receipt = session_command(
+            "submit R4 shell prompt",
+            &fixture.runtime,
+            generate_id("R4 shell command")?,
+            SessionCommand::SubmitPrompt {
+                session_id,
+                prompt: "stream the long shell fixture".to_owned(),
+            },
+        )
+        .await?;
+        let run_id = prompt_run_id(&receipt)?;
+        let observed = observe_r4_run(&mut events, run_id).await?;
+        let completion_ns = elapsed_ns(started);
+        let ordered = matches!(
+            (
+                observed.first_tool_output_sequence,
+                observed.tool_finished_sequence,
+            ),
+            (Some(output), Some(finished)) if output < finished
+        );
+        if !matches!(observed.outcome, RunOutcome::Completed)
+            || !(1..=R4_SHELL_OUTPUT_MAX_BYTES).contains(&observed.tool_output_bytes)
+            || !ordered
+            || observed.tool_state != Some(ToolCallState::Completed)
+            || observed.tool_is_error
+            || !observed.tool_result.as_deref().is_some_and(|result| {
+                result.contains("bytes omitted")
+                    && result.ends_with("exit code: 0")
+                    && result.len() <= R4_SHELL_OUTPUT_MAX_BYTES + 256
+            })
+        {
+            return Err(PerfError::Fixture(
+                "long shell streaming or terminal result was invalid".to_owned(),
+            ));
+        }
+        let mut replay = fixture.subscribe(cursor)?;
+        let replayed = observe_r4_run(&mut replay, run_id).await?;
+        if replayed.digest != observed.digest
+            || replayed.terminal_cursor != observed.terminal_cursor
+        {
+            return Err(PerfError::Fixture(
+                "long shell replay differed from live durable events".to_owned(),
+            ));
+        }
+        let mut sample = R4WorkerSample::new(R4Case::Shell);
+        sample.completion_ns = completion_ns;
+        sample.payload_transactions = observed.tool_output_transactions;
+        sample.peak_temporary_rss_bytes = peak_temporary_rss(baseline, sampler).await?;
+        Ok(sample)
+    }
+    .await;
+    finish_runtime_fixture(&fixture, "close R4 shell runtime", operation).await
+}
+
+#[derive(Default)]
+struct R4ConcurrentRun {
+    text_bytes: usize,
+    payload_transactions: u64,
+    max_text_delta_bytes: usize,
+    last_output_occurred_at_ms: Option<u64>,
+    max_output_gap_ns: u64,
+    output_clock_regressed: bool,
+    outcome: Option<RunOutcome>,
+}
+
+fn record_r4_concurrent_event(
+    states: &mut BTreeMap<RunId, R4ConcurrentRun>,
+    event: &qq_protocol::SessionEventEnvelope,
+) {
+    let Some(run_id) = event.run_id else {
+        return;
+    };
+    let Some(state) = states.get_mut(&run_id) else {
+        return;
+    };
+    match &event.event {
+        SessionEvent::TextAppended { text, .. } => {
+            if let Some(previous) = state.last_output_occurred_at_ms {
+                if event.occurred_at_ms < previous {
+                    state.output_clock_regressed = true;
+                } else {
+                    state.max_output_gap_ns = state.max_output_gap_ns.max(
+                        event
+                            .occurred_at_ms
+                            .saturating_sub(previous)
+                            .saturating_mul(1_000_000),
+                    );
+                }
+            }
+            state.last_output_occurred_at_ms = Some(event.occurred_at_ms);
+            state.text_bytes = state.text_bytes.saturating_add(text.len());
+            state.payload_transactions = state.payload_transactions.saturating_add(1);
+            state.max_text_delta_bytes = state.max_text_delta_bytes.max(text.len());
+        }
+        SessionEvent::RunFinished { outcome, .. } => {
+            state.outcome = Some(outcome.clone());
+        }
+        _ => {}
+    }
+}
+
+async fn r4_eight_stream_sample() -> Result<R4WorkerSample, PerfError> {
+    const STREAMS: usize = 8;
+    const BYTES: usize = 256 * 1024;
+    let fixture = RuntimeFixture::open(ProviderMode::Text {
+        total_bytes: BYTES,
+        chunk_bytes: LONG_STREAM_CHUNK_BYTES,
+        delay: Duration::ZERO,
+        chunk_delay: Duration::ZERO,
+    })
+    .await?;
+    let operation = async {
+        let mut sessions = Vec::with_capacity(STREAMS);
+        for _ in 0..STREAMS {
+            sessions.push(fixture.create_session(ApprovalMode::ReadOnly).await?.0);
+        }
+        let mut events = fixture.subscribe(fixture.initial_cursor)?;
+        let baseline = current_rss()?;
+        let sampler = RssSampler::start(std::process::id());
+        let batch_started = Instant::now();
+        let submissions = sessions.iter().copied().map(|session_id| {
+            let runtime = fixture.runtime.clone();
+            async move {
+                let receipt = session_command(
+                    "submit R4 concurrent stream",
+                    &runtime,
+                    generate_id("R4 concurrent stream command")?,
+                    SessionCommand::SubmitPrompt {
+                        session_id,
+                        prompt: "emit the paced stream fixture".to_owned(),
+                    },
+                )
+                .await?;
+                prompt_run_id(&receipt)
+            }
+        });
+        let mut run_ids = Vec::with_capacity(STREAMS);
+        for run_id in join_all(submissions).await {
+            run_ids.push(run_id?);
+        }
+        let mut states = run_ids
+            .iter()
+            .copied()
+            .map(|run_id| (run_id, R4ConcurrentRun::default()))
+            .collect::<BTreeMap<_, _>>();
+        with_timeout("R4 streams reach first durable output", async {
+            while states.values().any(|state| state.payload_transactions == 0) {
+                let event = events
+                    .next()
+                    .await
+                    .ok_or_else(|| PerfError::Fixture("R4 stream ended early".to_owned()))?
+                    .map_err(fixture_error("read R4 concurrent event"))?;
+                record_r4_concurrent_event(&mut states, &event);
+            }
+            Ok::<(), PerfError>(())
+        })
+        .await??;
+
+        let cancelled_run = run_ids[0];
+        let workspace_id = fixture.workspace_id;
+        let cancel_started = Instant::now();
+        let cancel_runtime = fixture.runtime.clone();
+        let cancel = async move {
+            let started = Instant::now();
+            session_command(
+                "cancel R4 concurrent stream",
+                &cancel_runtime,
+                generate_id("R4 concurrent cancellation")?,
+                SessionCommand::CancelRun {
+                    run_id: cancelled_run,
+                },
+            )
+            .await?;
+            Ok::<u64, PerfError>(elapsed_ns(started))
+        };
+        let snapshots = (0..16).map(|index| {
+            let runtime = fixture.runtime.clone();
+            let session_id = sessions[index % sessions.len()];
+            async move {
+                let started = Instant::now();
+                with_timeout(
+                    "R4 concurrent snapshot",
+                    runtime.snapshot(SnapshotRequest {
+                        workspace_id,
+                        focused_session_id: Some(session_id),
+                        session_limit: STREAMS as u16,
+                        message_limit: 8,
+                    }),
+                )
+                .await?
+                .map_err(fixture_error("R4 concurrent snapshot"))?;
+                Ok::<u64, PerfError>(elapsed_ns(started))
+            }
+        });
+        let controls = async move {
+            let (cancel_ack, snapshot_results) = tokio::join!(cancel, join_all(snapshots));
+            let mut max_control = cancel_ack?;
+            for snapshot in snapshot_results {
+                max_control = max_control.max(snapshot?);
+            }
+            Ok::<u64, PerfError>(max_control)
+        };
+        tokio::pin!(controls);
+        let mut max_control = None;
+        let mut cancellation_to_finished_ns = None;
+        with_timeout_for("finish R4 concurrent streams", CLEANUP_TIMEOUT, async {
+            let mut runs_finished = false;
+            while max_control.is_none() || !runs_finished {
+                tokio::select! {
+                    result = &mut controls, if max_control.is_none() => {
+                        max_control = Some(result?);
+                    }
+                    event = events.next(), if !runs_finished => {
+                        let event = event
+                            .ok_or_else(|| PerfError::Fixture("R4 stream ended early".to_owned()))?
+                            .map_err(fixture_error("read R4 concurrent event"))?;
+                        let cancelled_finished = event.run_id == Some(cancelled_run)
+                            && matches!(
+                                &event.event,
+                                SessionEvent::RunFinished {
+                                    outcome: RunOutcome::Cancelled,
+                                    ..
+                                }
+                            );
+                        record_r4_concurrent_event(&mut states, &event);
+                        if cancelled_finished {
+                            cancellation_to_finished_ns = Some(elapsed_ns(cancel_started));
+                        }
+                        runs_finished = states.values().all(|state| state.outcome.is_some());
+                    }
+                }
+            }
+            Ok::<(), PerfError>(())
+        })
+        .await??;
+        let completed = states
+            .iter()
+            .filter(|(run_id, state)| {
+                **run_id != cancelled_run
+                    && matches!(state.outcome, Some(RunOutcome::Completed))
+                    && state.text_bytes == BYTES
+                    && state.payload_transactions > 1
+                    && state.max_text_delta_bytes <= R4_BATCH_MAX_BYTES
+                    && !state.output_clock_regressed
+            })
+            .count();
+        if completed != STREAMS - 1
+            || !matches!(
+                states
+                    .get(&cancelled_run)
+                    .and_then(|state| state.outcome.as_ref()),
+                Some(RunOutcome::Cancelled)
+            )
+            || fixture.activity.maximum() != STREAMS
+        {
+            return Err(PerfError::Fixture(
+                "eight-stream completion, cancellation, or concurrency bound was invalid"
+                    .to_owned(),
+            ));
+        }
+        let mut sample = R4WorkerSample::new(R4Case::EightStreams);
+        sample.completion_ns = elapsed_ns(batch_started);
+        sample.payload_transactions = states
+            .values()
+            .map(|state| state.payload_transactions)
+            .sum();
+        sample.max_control_queue_wait_upper_bound_ns = max_control
+            .ok_or_else(|| PerfError::Fixture("R4 control workload did not complete".to_owned()))?;
+        sample.cancellation_to_finished_ns = cancellation_to_finished_ns.ok_or_else(|| {
+            PerfError::Fixture("cancelled R4 stream had no terminal observation".to_owned())
+        })?;
+        sample.max_output_service_gap_ns = states
+            .values()
+            .map(|state| state.max_output_gap_ns)
+            .max()
+            .unwrap_or_default();
+        sample.peak_temporary_rss_bytes = peak_temporary_rss(baseline, sampler).await?;
+        Ok(sample)
+    }
+    .await;
+    finish_runtime_fixture(&fixture, "close R4 concurrent runtime", operation).await
+}
+
+async fn r4_restart_sample() -> Result<R4WorkerSample, PerfError> {
+    const BYTES: usize = 1024 * 1024;
+    let fixture = RuntimeFixture::open(ProviderMode::Text {
+        total_bytes: BYTES,
+        chunk_bytes: LONG_STREAM_CHUNK_BYTES,
+        delay: Duration::ZERO,
+        chunk_delay: Duration::ZERO,
+    })
+    .await?;
+    let (session_id, cursor) = fixture.create_session(ApprovalMode::ReadOnly).await?;
+    let mut events = fixture.subscribe(cursor)?;
+    let receipt = session_command(
+        "submit R4 restart stream",
+        &fixture.runtime,
+        generate_id("R4 restart command")?,
+        SessionCommand::SubmitPrompt {
+            session_id,
+            prompt: "emit the restart fixture".to_owned(),
+        },
+    )
+    .await?;
+    let run_id = prompt_run_id(&receipt)?;
+    let live = observe_r4_run(&mut events, run_id).await?;
+    let before = fixture
+        .runtime
+        .snapshot(SnapshotRequest {
+            workspace_id: fixture.workspace_id,
+            focused_session_id: Some(session_id),
+            session_limit: 1,
+            message_limit: 8,
+        })
+        .await
+        .map_err(fixture_error("snapshot before R4 restart"))?;
+    fixture
+        .runtime
+        .close()
+        .await
+        .map_err(fixture_error("close before R4 restart"))?;
+
+    let baseline = current_rss()?;
+    let sampler = RssSampler::start(std::process::id());
+    let (marks, _receiver) = mpsc::channel(PROVIDER_MARK_CAPACITY);
+    let reopen_started = Instant::now();
+    let reopened = open_session_runtime(
+        "reopen R4 runtime",
+        SessionRuntimeOptions::new(fixture.database_path.clone()),
+        Arc::new(BenchmarkLoader {
+            mode: ProviderMode::Text {
+                total_bytes: 1,
+                chunk_bytes: 1,
+                delay: Duration::ZERO,
+                chunk_delay: Duration::ZERO,
+            },
+            marks,
+            activity: Arc::new(ActivityCounter::default()),
+        }),
+    )
+    .await?;
+    let operation = async {
+        let after = reopened
+            .snapshot(SnapshotRequest {
+                workspace_id: fixture.workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .map_err(fixture_error("snapshot after R4 restart"))?;
+        let open_to_snapshot = elapsed_ns(reopen_started);
+        let replay_started = Instant::now();
+        let mut replay = reopened
+            .subscribe(SubscribeRequest {
+                workspace_id: fixture.workspace_id,
+                after: cursor,
+            })
+            .map_err(fixture_error("subscribe after R4 restart"))?;
+        let replayed = observe_r4_run(&mut replay, run_id).await?;
+        let replay_ns = elapsed_ns(replay_started);
+        if before != after
+            || live.digest != replayed.digest
+            || live.terminal_cursor != replayed.terminal_cursor
+            || replayed.text_bytes != BYTES
+            || replayed.max_text_delta_bytes > R4_BATCH_MAX_BYTES
+        {
+            return Err(PerfError::Fixture(
+                "restart snapshot or replay reconstruction differed".to_owned(),
+            ));
+        }
+        let mut sample = R4WorkerSample::new(R4Case::Restart);
+        sample.restart_open_to_snapshot_ns = open_to_snapshot;
+        sample.restart_replay_ns = replay_ns;
+        sample.peak_temporary_rss_bytes = peak_temporary_rss(baseline, sampler).await?;
+        Ok(sample)
+    }
+    .await;
+    let cleanup = close_session_runtime("close reopened R4 runtime", &reopened).await;
+    merge_operation_cleanup(operation, cleanup)
+}
+
+async fn run_r4_worker(args: R4WorkerArgs) -> Result<(), PerfError> {
+    if cfg!(debug_assertions) {
+        return Err(PerfError::DebugWorker);
+    }
+    if env::consts::OS != "linux" {
+        return Err(PerfError::UnsupportedHost(env::consts::OS));
+    }
+    let sample = match args.case {
+        R4Case::Reasoning => r4_reasoning_sample().await?,
+        R4Case::Shell => r4_shell_sample().await?,
+        R4Case::EightStreams => r4_eight_stream_sample().await?,
+        R4Case::Restart => r4_restart_sample().await?,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&sample).map_err(PerfError::Encode)?
+    );
+    Ok(())
+}
+
+const fn r4_case_name(case: R4Case) -> &'static str {
+    match case {
+        R4Case::Reasoning => "reasoning",
+        R4Case::Shell => "shell",
+        R4Case::EightStreams => "eight-streams",
+        R4Case::Restart => "restart",
+    }
+}
+
+async fn isolated_r4_sample(case: R4Case) -> Result<R4WorkerSample, PerfError> {
+    let executable = env::current_exe().map_err(|source| PerfError::Launch {
+        command: "resolve optimized R4 worker".to_owned(),
+        source,
+    })?;
+    let mut command = TokioCommand::new(executable);
+    command.args(["perf", "r4-worker", "--case", r4_case_name(case)]);
+    let output = command_bytes_bounded(
+        "isolated R4 qualification worker",
+        Duration::from_secs(2 * 60),
+        &mut command,
+    )
+    .await?;
+    let sample: R4WorkerSample =
+        serde_json::from_slice(&output).map_err(PerfError::DecodeWorker)?;
+    if sample.case != case {
+        return Err(PerfError::Fixture(
+            "isolated R4 worker returned the wrong case".to_owned(),
+        ));
+    }
+    Ok(sample)
+}
+
+async fn r4_workloads(
+    samples: u16,
+) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
+    let repetitions = samples.clamp(5, 10);
+    let mut observed = Vec::with_capacity(usize::from(repetitions) * 4);
+    for case in [
+        R4Case::Reasoning,
+        R4Case::Shell,
+        R4Case::EightStreams,
+        R4Case::Restart,
+    ] {
+        for _ in 0..repetitions {
+            observed.push(isolated_r4_sample(case).await?);
+        }
+    }
+    let values = |case: R4Case, field: fn(&R4WorkerSample) -> u64| {
+        observed
+            .iter()
+            .filter(|sample| sample.case == case)
+            .map(field)
+            .collect::<Vec<_>>()
+    };
+    let metrics = vec![
+        MetricResult::measured(
+            "r4_long_reasoning_1048576_bytes_completion_ns",
+            "ns",
+            "SubmitPrompt through committed RunFinished for one MiB of provider-exposed reasoning",
+            values(R4Case::Reasoning, |sample| sample.completion_ns),
+        )?,
+        MetricResult::measured(
+            "r4_long_reasoning_1048576_bytes_payload_transactions",
+            "transactions",
+            "durable ReasoningDelta event count; one event corresponds to one reasoning payload transaction",
+            values(R4Case::Reasoning, |sample| sample.payload_transactions),
+        )?,
+        MetricResult::measured(
+            "r4_long_reasoning_1048576_bytes_peak_temporary_rss_bytes",
+            "bytes",
+            "fresh optimized worker peak VmRSS minus its pre-run VmRSS",
+            values(R4Case::Reasoning, |sample| sample.peak_temporary_rss_bytes),
+        )?,
+        MetricResult::measured(
+            "r4_long_shell_1048576_input_bytes_completion_ns",
+            "ns",
+            "SubmitPrompt through one-MiB shell stream, bounded result, second provider turn, and committed RunFinished",
+            values(R4Case::Shell, |sample| sample.completion_ns),
+        )?,
+        MetricResult::measured_informational(
+            "r4_long_shell_1048576_input_bytes_payload_transactions",
+            "transactions",
+            "durable ToolCallOutputDelta count; live shell delivery is bounded and best-effort",
+            values(R4Case::Shell, |sample| sample.payload_transactions),
+        )?,
+        MetricResult::measured(
+            "r4_long_shell_1048576_input_bytes_peak_temporary_rss_bytes",
+            "bytes",
+            "fresh optimized worker peak VmRSS minus its pre-run VmRSS",
+            values(R4Case::Shell, |sample| sample.peak_temporary_rss_bytes),
+        )?,
+        MetricResult::measured(
+            "r4_eight_long_streams_batch_ns",
+            "ns",
+            "eight concurrent 256-KiB streams from submission through seven completed and one cancelled RunFinished",
+            values(R4Case::EightStreams, |sample| sample.completion_ns),
+        )?,
+        MetricResult::measured(
+            "r4_eight_long_streams_max_control_queue_wait_upper_bound_ns",
+            "ns",
+            "per-sample maximum public Snapshot or CancelRun call latency; includes SQLite work and reply delivery",
+            values(R4Case::EightStreams, |sample| {
+                sample.max_control_queue_wait_upper_bound_ns
+            }),
+        )?,
+        MetricResult::measured(
+            "r4_eight_long_streams_cancellation_to_finished_ns",
+            "ns",
+            "CancelRun call start through committed cancelled RunFinished observation under eight-stream load",
+            values(R4Case::EightStreams, |sample| {
+                sample.cancellation_to_finished_ns
+            }),
+        )?,
+        MetricResult::measured(
+            "r4_eight_long_streams_max_output_service_gap_ns",
+            "ns",
+            "maximum same-run gap between persisted TextAppended occurred_at_ms values while snapshot and cancellation controls compete",
+            values(R4Case::EightStreams, |sample| {
+                sample.max_output_service_gap_ns
+            }),
+        )?,
+        MetricResult::measured_informational(
+            "r4_eight_long_streams_payload_transactions",
+            "transactions",
+            "TextAppended count across all eight streams; one event corresponds to one assistant payload transaction",
+            values(R4Case::EightStreams, |sample| sample.payload_transactions),
+        )?,
+        MetricResult::measured(
+            "r4_eight_long_streams_peak_temporary_rss_bytes",
+            "bytes",
+            "fresh optimized worker peak VmRSS minus its pre-batch VmRSS",
+            values(R4Case::EightStreams, |sample| {
+                sample.peak_temporary_rss_bytes
+            }),
+        )?,
+        MetricResult::measured(
+            "r4_restart_open_to_snapshot_reconstruction_ns",
+            "ns",
+            "SessionRuntime reopen start through reconstruction of the focused one-MiB snapshot",
+            values(R4Case::Restart, |sample| sample.restart_open_to_snapshot_ns),
+        )?,
+        MetricResult::measured(
+            "r4_restart_replay_reconstruction_ns",
+            "ns",
+            "post-restart subscription through the original terminal cursor with identical durable-event digest",
+            values(R4Case::Restart, |sample| sample.restart_replay_ns),
+        )?,
+        MetricResult::measured(
+            "r4_restart_reconstruction_peak_temporary_rss_bytes",
+            "bytes",
+            "fresh optimized worker peak VmRSS minus its pre-reopen VmRSS while reconstructed data remains live",
+            values(R4Case::Restart, |sample| sample.peak_temporary_rss_bytes),
+        )?,
+    ];
+    Ok((
+        metrics,
+        vec![
+            CorrectnessCheck {
+                name: "r4_long_reasoning_replay_and_batching".to_owned(),
+                passed: true,
+                detail: format!(
+                    "{repetitions} isolated one-MiB reasoning runs preserved lifecycle order, batching, and exact replay"
+                ),
+            },
+            CorrectnessCheck {
+                name: "r4_long_shell_replay_and_bounds".to_owned(),
+                passed: true,
+                detail: format!(
+                    "{repetitions} isolated one-MiB shell runs streamed before bounded terminal results and replayed exactly"
+                ),
+            },
+            CorrectnessCheck {
+                name: "r4_eight_stream_fairness_and_cancellation".to_owned(),
+                passed: true,
+                detail: format!(
+                    "{repetitions} isolated batches reached eight active streams, served controls, and settled one cancellation"
+                ),
+            },
+            CorrectnessCheck {
+                name: "r4_restart_reconstruction".to_owned(),
+                passed: true,
+                detail: format!(
+                    "{repetitions} isolated restarts reconstructed byte-identical snapshots and replay digests"
+                ),
+            },
+        ],
+    ))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct LoadProfileSamples {
     acknowledgements: Vec<u64>,
     completions: Vec<u64>,
@@ -3343,18 +4252,23 @@ impl RssSampler {
     }
 
     async fn finish(mut self) -> Result<Option<u64>, PerfError> {
+        let final_rss = process_status_bytes(std::process::id(), "VmRSS");
         self.stop.store(true, Ordering::Release);
         let worker = self
             .worker
             .take()
             .ok_or_else(|| PerfError::Fixture("RSS sampler worker was absent".to_owned()))?;
-        with_timeout(
+        let sampled = with_timeout(
             "join RSS sidecar sampler",
             tokio::task::spawn_blocking(move || worker.join()),
         )
         .await?
         .map_err(|error| PerfError::Fixture(format!("RSS sampler task failed: {error}")))?
-        .map_err(|_| PerfError::Fixture("RSS sampler thread panicked".to_owned()))
+        .map_err(|_| PerfError::Fixture("RSS sampler thread panicked".to_owned()))?;
+        Ok(match (sampled, final_rss) {
+            (Some(sampled), Some(final_rss)) => Some(sampled.max(final_rss)),
+            (sampled, final_rss) => sampled.or(final_rss),
+        })
     }
 }
 
@@ -3511,6 +4425,7 @@ async fn measure_load_profile(
             total_bytes: 1,
             chunk_bytes: 1,
             delay: LOAD_PROVIDER_DELAY,
+            chunk_delay: Duration::ZERO,
         })
         .await?;
         let operation = async {

@@ -223,12 +223,103 @@ pub(super) struct SessionRuntimeInner {
     pub(super) shutdown: watch::Sender<bool>,
     pub(super) scheduler_stopped: watch::Sender<bool>,
     pub(super) settlements: watch::Sender<u64>,
+    grant_promotions: mpsc::Sender<()>,
+    grant_promotion_stopped: watch::Sender<bool>,
     pub(super) lifecycle: RwLock<()>,
 }
 
 struct PendingApproval {
     run_id: RunId,
     signal: oneshot::Sender<()>,
+}
+
+struct GrantPromotionStopGuard(watch::Sender<bool>);
+
+impl Drop for GrantPromotionStopGuard {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+/// Drains the durable workspace-grant outbox serially. The channel is only a
+/// capacity-one wakeup: accepted work lives in SQLite, survives process loss,
+/// and is deleted only with its persisted fate event.
+async fn run_grant_promotions(
+    inner: std::sync::Weak<SessionRuntimeInner>,
+    mut receiver: mpsc::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
+    stopped: watch::Sender<bool>,
+) {
+    let _stopped = GrantPromotionStopGuard(stopped);
+    loop {
+        let Some(runtime) = inner.upgrade() else {
+            return;
+        };
+        if *runtime.failed.borrow() {
+            return;
+        }
+        let promotion = match runtime.store.next_grant_promotion().await {
+            Ok(promotion) => promotion,
+            Err(_) => {
+                runtime.failed.send_replace(true);
+                return;
+            }
+        };
+        let Some(promotion) = promotion else {
+            drop(runtime);
+            if *shutdown.borrow() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                wake = receiver.recv() => {
+                    if wake.is_none() {
+                        return;
+                    }
+                }
+            }
+            continue;
+        };
+        let outcome = match &runtime.grant_authority {
+            Some(authority) => {
+                match AssertUnwindSafe(async {
+                    authority
+                        .promote_grant(Path::new(&promotion.workspace_path), &promotion.grant)
+                        .await
+                })
+                .catch_unwind()
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => WorkspaceGrantOutcome::Failed {
+                        message: "the workspace grant authority panicked".to_owned(),
+                    },
+                }
+            }
+            None => WorkspaceGrantOutcome::Failed {
+                message: "this server has no workspace grant store; the approval covers this \
+                          session only"
+                    .to_owned(),
+            },
+        };
+        match runtime
+            .store
+            .settle_grant_promotion(promotion, outcome)
+            .await
+        {
+            Ok(Some(event)) => runtime.notify(event.cursor),
+            Ok(None) => {}
+            Err(_) => {
+                runtime.failed.send_replace(true);
+                return;
+            }
+        }
+    }
 }
 
 impl SessionRuntime {
@@ -242,9 +333,11 @@ impl SessionRuntime {
         let store = Store::open(options.database_path).await?;
         let recovered = store.recover_interrupted_runs().await?;
         let (schedule, receiver) = mpsc::channel(1);
+        let (grant_promotions, grant_promotion_receiver) = mpsc::channel(1);
         let (failed, _) = watch::channel(false);
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (scheduler_stopped, _) = watch::channel(false);
+        let (grant_promotion_stopped, _) = watch::channel(false);
         let (settlements, _) = watch::channel(0_u64);
         let inner = Arc::new(SessionRuntimeInner {
             store,
@@ -262,6 +355,8 @@ impl SessionRuntime {
             shutdown,
             scheduler_stopped,
             settlements,
+            grant_promotions,
+            grant_promotion_stopped,
             lifecycle: RwLock::new(()),
         });
         for cursor in recovered {
@@ -270,11 +365,18 @@ impl SessionRuntime {
         tokio::spawn(schedule_runs(
             Arc::downgrade(&inner),
             receiver,
-            shutdown_receiver,
+            shutdown_receiver.clone(),
             inner.scheduler_stopped.clone(),
+        ));
+        tokio::spawn(run_grant_promotions(
+            Arc::downgrade(&inner),
+            grant_promotion_receiver,
+            shutdown_receiver,
+            inner.grant_promotion_stopped.clone(),
         ));
         let runtime = Self { inner };
         runtime.request_schedule();
+        runtime.request_grant_promotions();
         Ok(runtime)
     }
 
@@ -316,9 +418,13 @@ impl SessionRuntime {
         let applied = self
             .inner
             .store
-            .command_with_seed(command_id, command, seed)
+            .command_with_seed(
+                command_id,
+                command,
+                seed,
+                Some(self.inner.grant_promotions.clone()),
+            )
             .await?;
-        drop(lifecycle);
         self.inner.notify(applied.receipt.committed_through);
 
         if let Some(run_id) = signal_run {
@@ -330,39 +436,14 @@ impl SessionRuntime {
         if let Some(tool_call_id) = signal_approval {
             self.inner.resolve_approval(tool_call_id);
         }
-        if let Some(promotion) = applied.promotion {
-            self.spawn_grant_promotion(promotion);
+        if applied.grant_promotion_pending {
+            self.request_grant_promotions();
         }
+        drop(lifecycle);
         if should_schedule || applied.schedule {
             self.request_schedule();
         }
         Ok(applied.receipt)
-    }
-
-    /// Carries an approve-for-workspace promotion to its durable conclusion
-    /// in the background. The approval's session grant is already committed,
-    /// so nothing here can fail it: whatever the write's fate, it is
-    /// published as a persisted `workspace_grant_promoted` event — the same
-    /// events-out channel every other asynchronous outcome uses.
-    fn spawn_grant_promotion(&self, promotion: PendingGrantPromotion) {
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            let outcome = match &inner.grant_authority {
-                Some(authority) => {
-                    authority
-                        .promote_grant(Path::new(&promotion.workspace_path), &promotion.grant)
-                        .await
-                }
-                None => WorkspaceGrantOutcome::Failed {
-                    message: "this server has no workspace grant store; the approval covers \
-                              this session only"
-                        .to_owned(),
-                },
-            };
-            if let Ok(event) = inner.store.record_grant_promotion(promotion, outcome).await {
-                inner.notify(event.cursor);
-            }
-        });
     }
 
     pub async fn snapshot(
@@ -458,6 +539,7 @@ impl SessionRuntime {
         }
 
         let mut settlements = self.inner.settlements.subscribe();
+        let mut grant_promotion_stopped = self.inner.grant_promotion_stopped.subscribe();
         for run_id in self.inner.store.unfinished_run_ids().await? {
             let command_id = CommandId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
             let applied = self
@@ -467,6 +549,7 @@ impl SessionRuntime {
                     command_id,
                     SessionCommand::CancelRun { run_id },
                     WorkspaceGrantSeed::default(),
+                    None,
                 )
                 .await?;
             self.inner.notify(applied.receipt.committed_through);
@@ -477,17 +560,37 @@ impl SessionRuntime {
         }
 
         loop {
-            if self.inner.store.unfinished_run_ids().await?.is_empty() {
-                return Ok(());
-            }
             if *self.inner.failed.borrow() {
                 return Err(SessionRuntimeError::Unavailable);
             }
-            tokio::time::timeout_at(deadline, settlements.changed())
-                .await
-                .map_err(|_| SessionRuntimeError::ShutdownTimedOut)?
-                .map_err(|_| SessionRuntimeError::Unavailable)?;
+            let unfinished = self.inner.store.unfinished_run_ids().await?;
+            if unfinished.is_empty() && *grant_promotion_stopped.borrow() {
+                // The promotion worker publishes `failed` before its stopped
+                // guard fires. Re-read after observing stopped so its failure
+                // cannot race this success boundary.
+                if *self.inner.failed.borrow() {
+                    return Err(SessionRuntimeError::Unavailable);
+                }
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, async {
+                tokio::select! {
+                    changed = settlements.changed() => changed,
+                    changed = grant_promotion_stopped.changed() => changed,
+                }
+            })
+            .await
+            .map_err(|_| SessionRuntimeError::ShutdownTimedOut)?
+            .map_err(|_| SessionRuntimeError::Unavailable)?;
         }
+    }
+
+    /// Settles all accepted work and then closes the durable store worker.
+    /// Unlike [`Self::shutdown`], snapshots and subscriptions are unavailable
+    /// after this final owner-lifecycle operation completes.
+    pub async fn close(&self) -> Result<(), SessionRuntimeError> {
+        self.shutdown().await?;
+        self.inner.store.close().await
     }
 
     pub(super) fn request_schedule(&self) {
@@ -495,6 +598,15 @@ impl SessionRuntime {
             return;
         }
         let _ = self.inner.schedule.try_send(());
+    }
+
+    fn request_grant_promotions(&self) {
+        match self.inner.grant_promotions.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.inner.failed.send_replace(true);
+            }
+        }
     }
 }
 

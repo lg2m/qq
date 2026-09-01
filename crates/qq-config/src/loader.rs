@@ -923,7 +923,10 @@ fn validate_private_secret_file(_path: &Path) -> Result<(), ConfigError> {
 }
 
 #[cfg(unix)]
-fn validate_private_file_mode(path: &Path, metadata: &fs::Metadata) -> Result<(), ConfigError> {
+pub(super) fn validate_private_file_mode(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ConfigError> {
     use std::os::unix::fs::PermissionsExt;
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(ConfigError::InsecureSecretFile {

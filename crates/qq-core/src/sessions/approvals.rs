@@ -31,12 +31,9 @@ impl ToolGate for SessionToolGate {
         let call = call.clone();
         let mut cancellation = self.cancellation.clone();
         Box::pin(async move {
-            let internal_denial = || GateDecision::Deny {
-                message: "Tool approval state could not be persisted; the call was denied."
-                    .to_owned(),
-            };
-            let Ok((mode, grants)) = inner.store.approval_policy(claimed.session_id).await else {
-                return internal_denial();
+            let (mode, grants) = match inner.store.approval_policy(claimed.session_id).await {
+                Ok(policy) => policy,
+                Err(error) => return approval_persistence_failure(error),
             };
             let class = approval::classify(&call.name, &call.arguments);
             match approval::evaluate(mode, &call.name, &class, &grants) {
@@ -52,7 +49,7 @@ impl ToolGate for SessionToolGate {
                             inner.notify(event.cursor);
                             GateDecision::Deny { message }
                         }
-                        Err(_) => internal_denial(),
+                        Err(error) => approval_persistence_failure(error),
                     }
                 }
                 approval::PolicyDecision::RequireApproval => {
@@ -72,9 +69,9 @@ impl ToolGate for SessionToolGate {
                         .await
                     {
                         Ok(event) => inner.notify(event.cursor),
-                        Err(_) => {
+                        Err(error) => {
                             inner.remove_approval(call.id);
-                            return internal_denial();
+                            return approval_persistence_failure(error);
                         }
                     }
                     // The reviewer adjudicates only under Auto — the mode
@@ -165,11 +162,30 @@ impl ToolGate for SessionToolGate {
                             }
                             GateDecision::Deny { message }
                         }
-                        Ok(ConcludedApproval::StillWaiting) | Err(_) => internal_denial(),
+                        Ok(ConcludedApproval::StillWaiting) => GateDecision::Fail {
+                            kind: RunFailureKind::Server,
+                            message:
+                                "tool approval resolution disappeared before it could be applied"
+                                    .to_owned(),
+                        },
+                        Err(error) => approval_persistence_failure(error),
                     }
                 }
             }
         })
+    }
+}
+
+fn approval_persistence_failure(error: SessionRuntimeError) -> GateDecision {
+    match error {
+        SessionRuntimeError::OutputTooLarge => GateDecision::Fail {
+            kind: RunFailureKind::Policy,
+            message: "the tool result would exceed the run's context capacity".to_owned(),
+        },
+        error => GateDecision::Fail {
+            kind: RunFailureKind::Server,
+            message: format!("tool approval state could not be persisted: {error}"),
+        },
     }
 }
 

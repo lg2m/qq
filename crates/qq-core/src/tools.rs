@@ -639,7 +639,7 @@ mod tests {
         workspace: Workspace,
         arguments: &'static str,
         cancelled: Arc<AtomicBool>,
-        output: Option<mpsc::UnboundedSender<String>>,
+        output: Option<mpsc::Sender<String>>,
     ) -> ToolExecutionResult {
         execute(
             workspace,
@@ -688,7 +688,7 @@ mod tests {
     async fn shell_runs_commands_streams_output_and_reports_the_exit_code() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = mpsc::channel::<String>(16);
 
         let result = run_shell_tool(
             workspace.clone(),
@@ -824,11 +824,64 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn saturated_live_output_never_masks_the_shell_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let (sender, _receiver) = mpsc::channel::<String>(1);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_shell_tool(
+                workspace,
+                r#"{"command":"while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done","timeout_seconds":1}"#,
+                Arc::new(AtomicBool::new(false)),
+                Some(sender),
+            ),
+        )
+        .await
+        .expect("a full live-output queue must not stall the shell deadline");
+
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out"), "{}", result.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saturated_live_output_never_masks_shell_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel::<String>(1);
+        let execution = tokio::spawn(run_shell_tool(
+            workspace,
+            r#"{"command":"while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done"}"#,
+            Arc::clone(&cancelled),
+            Some(sender),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while receiver.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the live-output queue must become saturated");
+        cancelled.store(true, Ordering::Release);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), execution)
+            .await
+            .expect("cancellation must remain live with a full output queue")
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.content, "tool execution was cancelled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn shell_cancellation_kills_the_process_group() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(directory.path()).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = mpsc::channel::<String>(16);
 
         let execution = tokio::spawn(run_shell_tool(
             workspace.clone(),

@@ -37,7 +37,7 @@ pub(crate) async fn execute(
     name: String,
     arguments: String,
     cancelled: Arc<AtomicBool>,
-    output: Option<mpsc::UnboundedSender<String>>,
+    output: Option<mpsc::Sender<String>>,
 ) -> ToolExecutionResult {
     if arguments.len() > MAX_ARGUMENT_BYTES {
         return ToolExecutionResult::error("tool arguments exceed the 64 KiB limit");

@@ -26,7 +26,7 @@ use qq_protocol::{
     ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
@@ -100,6 +100,7 @@ const OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(8);
 const MAX_PERSISTED_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_GRANT_BYTES: usize = 256;
 const MAX_SESSION_GRANTS: u32 = 256;
+const MAX_PENDING_GRANT_PROMOTIONS: u32 = 256;
 const MAX_SESSION_FILES: u32 = 4_096;
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -194,10 +195,9 @@ struct AppliedCommand {
     /// command: an auto-compaction made unnecessary by its queued prompt, or
     /// running child work durably owned by a cancelled parent.
     cascade_cancels: Vec<RunId>,
-    /// Set when a first-applied approve-for-workspace decision needs its
-    /// grant promoted into workspace configuration. Idempotent replays never
-    /// set it: retried commands must not re-run the config write.
-    promotion: Option<PendingGrantPromotion>,
+    /// Wakes the single promotion worker when this command has durable outbox
+    /// work. Replays retain the signal while the same row remains pending.
+    grant_promotion_pending: bool,
 }
 
 struct CreatedChildRun {
@@ -209,6 +209,7 @@ struct CreatedChildRun {
 /// One approve-for-workspace promotion carried out of the command
 /// transaction. The durable config write happens after the approval commits,
 /// so a promotion failure can never fail the approval that requested it.
+#[derive(Debug, Serialize, Deserialize)]
 struct PendingGrantPromotion {
     workspace_id: WorkspaceId,
     workspace_path: String,
@@ -401,7 +402,16 @@ fn execute_command(
                 SessionCommand::CancelRun { run_id } => owned_running_run_ids(connection, *run_id)?,
                 _ => Vec::new(),
             },
-            promotion: None,
+            grant_promotion_pending: connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM pending_workspace_grant_promotions
+                         WHERE command_id = ?1
+                     )",
+                    [command_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?,
         });
     }
     let command_count: u32 = connection
@@ -415,7 +425,7 @@ fn execute_command(
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let now = now_ms();
-    let mut promotion = None;
+    let mut grant_promotion_pending = false;
     let mut cascade_cancels = Vec::new();
     let (receipt, schedule) = match command {
         SessionCommand::ResolveWorkspace { path } => {
@@ -785,15 +795,17 @@ fn execute_command(
             tool_call_id,
             decision,
         } => {
-            let (call_run, state, resolution) = transaction
+            let (call_run, state, resolution, provider_call_id) = transaction
                 .query_row(
-                    "SELECT run_id, state, approval_resolution FROM tool_calls WHERE id = ?1",
+                    "SELECT run_id, state, approval_resolution, provider_call_id
+                     FROM tool_calls WHERE id = ?1",
                     [tool_call_id.to_string()],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
@@ -865,6 +877,13 @@ fn execute_command(
                             .map_err(|_| SessionRuntimeError::Persistence)?;
                     }
                     ApprovalDecision::Deny => {
+                        reserve_context_capacity(
+                            &transaction,
+                            run_id,
+                            provider_call_id
+                                .len()
+                                .saturating_add(approval::USER_DENIED_RESULT.len()),
+                        )?;
                         transaction
                             .execute(
                                 "UPDATE tool_calls
@@ -923,14 +942,35 @@ fn execute_command(
                             |row| row.get(0),
                         )
                         .map_err(|_| SessionRuntimeError::Persistence)?;
-                    promotion = Some(PendingGrantPromotion {
+                    let promotion = PendingGrantPromotion {
                         workspace_id,
                         workspace_path,
                         session_id,
                         run_id,
                         command_id,
                         grant: grant.clone(),
-                    });
+                    };
+                    let pending_count: u32 = transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM pending_workspace_grant_promotions",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    if pending_count >= MAX_PENDING_GRANT_PROMOTIONS {
+                        return Err(SessionRuntimeError::Overloaded);
+                    }
+                    let promotion_json = serde_json::to_string(&promotion)
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO pending_workspace_grant_promotions(
+                                 command_id, created_at_ms, promotion_json
+                             ) VALUES (?1, ?2, ?3)",
+                            params![command_id.to_string(), now, promotion_json],
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    grant_promotion_pending = true;
                 }
                 let tool_call = load_tool_call(&transaction, tool_call_id)?;
                 let event = append_event(
@@ -1193,7 +1233,7 @@ fn execute_command(
         receipt,
         schedule,
         cascade_cancels,
-        promotion,
+        grant_promotion_pending,
     })
 }
 
@@ -1375,6 +1415,16 @@ fn claim_next_run(
             context
         }
     };
+    let context_base_bytes =
+        i64::try_from(context_bytes(&messages)).map_err(|_| SessionRuntimeError::OutputTooLarge)?;
+    transaction
+        .execute(
+            "UPDATE runs
+             SET context_base_bytes = ?2, context_increment_bytes = 0
+             WHERE id = ?1 AND status = 'running'",
+            params![run_id.to_string(), context_base_bytes],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
     let summary = load_session_summary(&transaction, session_id)?;
     let started = append_event(
         &transaction,
@@ -1527,6 +1577,15 @@ fn claim_auto_compaction(
         &transaction,
         session_id,
     )?));
+    let context_base_bytes =
+        i64::try_from(context_bytes(&context)).map_err(|_| SessionRuntimeError::OutputTooLarge)?;
+    transaction
+        .execute(
+            "UPDATE runs SET context_base_bytes = ?2, context_increment_bytes = 0
+             WHERE id = ?1 AND status = 'running'",
+            params![run_id.to_string(), context_base_bytes],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
     let summary = load_session_summary(&transaction, session_id)?;
     let started = append_event(
         &transaction,
@@ -1585,7 +1644,7 @@ fn begin_assistant_message(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    ensure_context_capacity(&transaction, claimed.session_id, text.len())?;
+    reserve_context_capacity(&transaction, claimed.run_id, text.len())?;
     let now = now_ms();
     let ordinal: u64 = transaction
         .query_row(
@@ -1628,14 +1687,7 @@ fn begin_assistant_message(
         },
         SessionEvent::AssistantMessageStarted { message },
     )?;
-    let column = match channel {
-        TextChannel::Output => "output",
-        TextChannel::Refusal => "refusal",
-    };
-    let sql = format!("UPDATE messages SET {column} = ?2 WHERE id = ?1");
-    transaction
-        .execute(&sql, params![message_id.to_string(), text])
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    insert_message_chunk(&transaction, message_id, channel, text)?;
     let appended = append_event(
         &transaction,
         EventContext {
@@ -1672,20 +1724,19 @@ fn append_text(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    ensure_context_capacity(&transaction, claimed.session_id, text.len())?;
-    let column = match channel {
-        TextChannel::Output => "output",
-        TextChannel::Refusal => "refusal",
-    };
-    let sql = format!(
-        "UPDATE messages SET {column} = {column} || ?2 WHERE id = ?1 AND state = 'streaming'"
-    );
-    let updated = transaction
-        .execute(&sql, params![message_id.to_string(), text])
+    reserve_context_capacity(&transaction, claimed.run_id, text.len())?;
+    let streaming = transaction
+        .query_row(
+            "SELECT 1 FROM messages WHERE id = ?1 AND state = 'streaming'",
+            [message_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    if updated != 1 {
+    if streaming.is_none() {
         return Err(SessionRuntimeError::Unavailable);
     }
+    insert_message_chunk(&transaction, message_id, channel, &text)?;
     let event = append_event(
         &transaction,
         EventContext {
@@ -1706,6 +1757,27 @@ fn append_text(
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(event)
+}
+
+fn insert_message_chunk(
+    transaction: &Transaction<'_>,
+    message_id: MessageId,
+    channel: TextChannel,
+    text: &str,
+) -> Result<(), SessionRuntimeError> {
+    let channel = match channel {
+        TextChannel::Output => "output",
+        TextChannel::Refusal => "refusal",
+    };
+    transaction
+        .execute(
+            "INSERT INTO message_chunks(message_id, channel, chunk_ordinal, text)
+             SELECT ?1, ?2, COALESCE(MAX(chunk_ordinal), 0) + 1, ?3
+             FROM message_chunks WHERE message_id = ?1 AND channel = ?2",
+            params![message_id.to_string(), channel, text],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(())
 }
 
 fn persist_model_turn(
@@ -1753,10 +1825,23 @@ fn persist_model_turn(
     } else {
         &[]
     };
-    let argument_bytes = persisted_calls.iter().fold(0_usize, |total, call| {
-        total.saturating_add(call.arguments.len())
+    let non_text_bytes = message.content().iter().fold(0_usize, |total, block| {
+        total.saturating_add(match block {
+            ContentBlock::Text { .. } => 0,
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => id
+                .len()
+                .saturating_add(name.len())
+                .saturating_add(arguments.to_string().len()),
+            ContentBlock::ToolResult {
+                call_id, content, ..
+            } => call_id.len().saturating_add(content.len()),
+        })
     });
-    ensure_context_capacity(&transaction, claimed.session_id, argument_bytes)?;
+    reserve_context_capacity(&transaction, claimed.run_id, non_text_bytes)?;
     // Completing the turn's message in the same transaction as the turn row
     // keeps message state and turn persistence atomic: after a crash, a
     // streaming message always identifies exactly the turn that never
@@ -2121,9 +2206,24 @@ fn finish_tool_call(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    let provider_call_id = transaction
+        .query_row(
+            "SELECT provider_call_id FROM tool_calls
+             WHERE id = ?1 AND run_id = ?2 AND state = 'running'",
+            params![tool_call_id.to_string(), claimed.run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::ToolCallNotFound)?;
     // The display payload is deliberately absent from the capacity check: it
-    // never enters model context, so it cannot crowd the context budget.
-    ensure_context_capacity(&transaction, claimed.session_id, result.len())?;
+    // never enters model context, so it cannot crowd the context budget. The
+    // provider call id does enter the next ToolResult block and is counted.
+    reserve_context_capacity(
+        &transaction,
+        claimed.run_id,
+        provider_call_id.len().saturating_add(result.len()),
+    )?;
     let now = now_ms();
     let state = if is_error { "failed" } else { "completed" };
     let display_json = display
@@ -2290,6 +2390,21 @@ fn deny_tool_call(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    let provider_call_id = transaction
+        .query_row(
+            "SELECT provider_call_id FROM tool_calls
+             WHERE id = ?1 AND run_id = ?2 AND state = 'requested'",
+            params![tool_call_id.to_string(), claimed.run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::ToolCallNotFound)?;
+    reserve_context_capacity(
+        &transaction,
+        claimed.run_id,
+        provider_call_id.len().saturating_add(message.len()),
+    )?;
     let now = now_ms();
     let updated = transaction
         .execute(
@@ -2435,9 +2550,9 @@ fn conclude_tool_approval(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let (state, resolution, result) = transaction
+    let (state, resolution, result, provider_call_id) = transaction
         .query_row(
-            "SELECT state, approval_resolution, result FROM tool_calls
+            "SELECT state, approval_resolution, result, provider_call_id FROM tool_calls
              WHERE id = ?1 AND run_id = ?2",
             params![tool_call_id.to_string(), claimed.run_id.to_string()],
             |row| {
@@ -2445,6 +2560,7 @@ fn conclude_tool_approval(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
@@ -2470,6 +2586,13 @@ fn conclude_tool_approval(
     if !timed_out || state != "awaiting_approval" {
         return Ok(ConcludedApproval::StillWaiting);
     }
+    reserve_context_capacity(
+        &transaction,
+        claimed.run_id,
+        provider_call_id
+            .len()
+            .saturating_add(approval::TIMEOUT_DENIED_RESULT.len()),
+    )?;
     let now = now_ms();
     transaction
         .execute(
@@ -2510,12 +2633,38 @@ fn conclude_tool_approval(
     })
 }
 
-fn record_grant_promotion(
+fn next_grant_promotion(
+    connection: &mut Connection,
+) -> Result<Option<PendingGrantPromotion>, SessionRuntimeError> {
+    let row = connection
+        .query_row(
+            "SELECT command_id, promotion_json
+             FROM pending_workspace_grant_promotions
+             ORDER BY created_at_ms, command_id
+             LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let Some((command_id, promotion)) = row else {
+        return Ok(None);
+    };
+    let row_command_id = parse_id::<CommandId>(&command_id)?;
+    let promotion = serde_json::from_str::<PendingGrantPromotion>(&promotion)
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if promotion.command_id != row_command_id {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    Ok(Some(promotion))
+}
+
+fn settle_grant_promotion(
     connection: &mut Connection,
     store_id: StoreId,
     promotion: &PendingGrantPromotion,
     outcome: WorkspaceGrantOutcome,
-) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
     let outcome = match outcome {
         WorkspaceGrantOutcome::Failed { message } => WorkspaceGrantOutcome::Failed {
             message: truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES),
@@ -2523,8 +2672,21 @@ fn record_grant_promotion(
         outcome => outcome,
     };
     let transaction = connection
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    let pending: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pending_workspace_grant_promotions
+                 WHERE command_id = ?1
+             )",
+            [promotion.command_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if !pending {
+        return Ok(None);
+    }
     // Only the workspace's event log is touched: the promotion outcome stays
     // publishable even when the session was deleted in the meantime.
     let event = append_event(
@@ -2542,26 +2704,58 @@ fn record_grant_promotion(
             outcome,
         },
     )?;
+    let deleted = transaction
+        .execute(
+            "DELETE FROM pending_workspace_grant_promotions WHERE command_id = ?1",
+            [promotion.command_id.to_string()],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if deleted != 1 {
+        return Err(SessionRuntimeError::Persistence);
+    }
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    Ok(event)
+    Ok(Some(event))
 }
 
-fn ensure_context_capacity(
+fn reserve_context_capacity(
     transaction: &Transaction<'_>,
-    session_id: SessionId,
+    run_id: RunId,
     additional: usize,
 ) -> Result<(), SessionRuntimeError> {
-    // The budget measures the assembled context — after the compaction
-    // cutoff and with stale read-only results pruned — because that is what
-    // the next request actually carries; raw persisted rows may be far
-    // larger without ever reaching the provider.
-    let assembled = assembled_context_bytes(transaction, session_id)?;
-    if assembled.saturating_add(additional) > MAX_CONTEXT_BYTES {
-        return Err(SessionRuntimeError::OutputTooLarge);
+    if additional == 0 {
+        return Ok(());
     }
-    Ok(())
+    let additional = i64::try_from(additional).map_err(|_| SessionRuntimeError::OutputTooLarge)?;
+    let maximum = i64::try_from(MAX_CONTEXT_BYTES).expect("context limit fits SQLite integer");
+    let updated = transaction
+        .execute(
+            "UPDATE runs
+             SET context_increment_bytes = context_increment_bytes + ?2
+             WHERE id = ?1 AND status = 'running' AND context_base_bytes IS NOT NULL
+               AND context_base_bytes + context_increment_bytes + ?2 <= ?3",
+            params![run_id.to_string(), additional, maximum],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if updated == 1 {
+        return Ok(());
+    }
+    let active: bool = transaction
+        .query_row(
+            "SELECT status = 'running' AND context_base_bytes IS NOT NULL
+             FROM runs WHERE id = ?1",
+            [run_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .unwrap_or(false);
+    if active {
+        Err(SessionRuntimeError::OutputTooLarge)
+    } else {
+        Err(SessionRuntimeError::Unavailable)
+    }
 }
 
 fn append_parent_session_update(
@@ -2641,7 +2835,19 @@ fn complete_compaction(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     // A cancel that raced the summarizer's completion wins: the run settles
     // cancelled and no marker is committed.
-    let outcome = cancellation_wins(&transaction, claimed.run_id, RunOutcome::Completed)?;
+    let mut outcome = cancellation_wins(&transaction, claimed.run_id, RunOutcome::Completed)?;
+    let replacement_bytes = COMPACTION_SUMMARY_PREAMBLE
+        .len()
+        .saturating_add(2)
+        .saturating_add(summary.len());
+    if matches!(outcome, RunOutcome::Completed) && replacement_bytes > MAX_CONTEXT_BYTES {
+        outcome = RunOutcome::Failed {
+            failure: RunFailure {
+                kind: RunFailureKind::Policy,
+                message: "compaction summary exceeds the 4 MiB session context limit".to_owned(),
+            },
+        };
+    }
     let mut events = Vec::with_capacity(2);
     if matches!(outcome, RunOutcome::Completed) {
         let now = now_ms();
@@ -3831,7 +4037,7 @@ fn load_message(
     connection: &Connection,
     message_id: MessageId,
 ) -> Result<MessageSnapshot, SessionRuntimeError> {
-    connection
+    let (session, run, turn_ordinal, role, state, output, refusal, created) = connection
         .query_row(
             "SELECT session_id, run_id, turn_ordinal, role, state, output, refusal, created_at_ms
              FROM messages WHERE id = ?1",
@@ -3849,22 +4055,61 @@ fn load_message(
                 ))
             },
         )
-        .map_err(|_| SessionRuntimeError::Persistence)
-        .and_then(
-            |(session, run, turn_ordinal, role, state, output, refusal, created)| {
-                Ok(MessageSnapshot {
-                    id: message_id,
-                    session_id: parse_id(&session)?,
-                    run_id: parse_id(&run)?,
-                    turn_ordinal,
-                    role: parse_message_role(&role)?,
-                    state: parse_message_state(&state)?,
-                    output,
-                    refusal,
-                    created_at_ms: created,
-                })
-            },
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let (output, refusal) = load_message_text(connection, message_id, output, refusal)?;
+    Ok(MessageSnapshot {
+        id: message_id,
+        session_id: parse_id(&session)?,
+        run_id: parse_id(&run)?,
+        turn_ordinal,
+        role: parse_message_role(&role)?,
+        state: parse_message_state(&state)?,
+        output,
+        refusal,
+        created_at_ms: created,
+    })
+}
+
+fn load_message_text(
+    connection: &Connection,
+    message_id: MessageId,
+    mut output: String,
+    mut refusal: String,
+) -> Result<(String, String), SessionRuntimeError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT channel, text FROM message_chunks
+             WHERE message_id = ?1 ORDER BY channel, chunk_ordinal",
         )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let chunks = statement
+        .query_map([message_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let (output_bytes, refusal_bytes) = chunks.iter().fold(
+        (0_usize, 0_usize),
+        |(output_bytes, refusal_bytes), (channel, text)| match channel.as_str() {
+            "output" => (output_bytes.saturating_add(text.len()), refusal_bytes),
+            "refusal" => (output_bytes, refusal_bytes.saturating_add(text.len())),
+            _ => (usize::MAX, usize::MAX),
+        },
+    );
+    if output_bytes == usize::MAX || refusal_bytes == usize::MAX {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    output.reserve(output_bytes);
+    refusal.reserve(refusal_bytes);
+    for (channel, text) in chunks {
+        match channel.as_str() {
+            "output" => output.push_str(&text),
+            "refusal" => refusal.push_str(&text),
+            _ => return Err(SessionRuntimeError::Persistence),
+        }
+    }
+    Ok((output, refusal))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4039,20 +4284,24 @@ fn append_legacy_run_messages(
 ) -> Result<(), SessionRuntimeError> {
     let mut statement = connection
         .prepare(
-            "SELECT output, refusal FROM messages
+            "SELECT id FROM messages
              WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
              ORDER BY turn_ordinal, ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let messages = statement
-        .query_map([run_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+    let message_ids = statement
+        .query_map([run_id.to_string()], |row| row.get::<_, String>(0))
         .map_err(|_| SessionRuntimeError::Persistence)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    for (output, refusal) in messages {
-        let content = if output.is_empty() { refusal } else { output };
+    drop(statement);
+    for message_id in message_ids {
+        let message = load_message(connection, parse_id(&message_id)?)?;
+        let content = if message.output.is_empty() {
+            message.refusal
+        } else {
+            message.output
+        };
         if !content.trim().is_empty() {
             context.push(Message::assistant(content));
         }
@@ -4220,9 +4469,15 @@ fn assembled_context_bytes(
     let context = load_model_context(transaction, session_id, u64::MAX)?;
     let streaming_bytes: u64 = transaction
         .query_row(
-            "SELECT COALESCE(SUM(
-                 length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
-             ), 0) FROM messages WHERE session_id = ?1 AND state = 'streaming'",
+            "SELECT
+                 (SELECT COALESCE(SUM(
+                      length(CAST(output AS BLOB)) + length(CAST(refusal AS BLOB))
+                  ), 0) FROM messages WHERE session_id = ?1 AND state = 'streaming')
+                 +
+                 (SELECT COALESCE(SUM(length(CAST(c.text AS BLOB))), 0)
+                  FROM message_chunks c
+                  JOIN messages m ON m.id = c.message_id
+                  WHERE m.session_id = ?1 AND m.state = 'streaming')",
             [session_id.to_string()],
             |row| row.get(0),
         )
@@ -5361,22 +5616,84 @@ mod tests {
     impl Provider for ReasoningProvider {
         fn stream(&self, request: ModelRequest) -> ProviderStream {
             self.requests.lock().unwrap().push(request);
-            Box::pin(stream::iter([
-                Ok(qq_provider::ProviderEvent::ReasoningStarted {
-                    kind: qq_provider::ReasoningKind::Summary,
-                }),
+            let mut events = vec![Ok(qq_provider::ProviderEvent::ReasoningStarted {
+                kind: qq_provider::ReasoningKind::Summary,
+            })];
+            events.extend((0..64).map(|_| {
                 Ok(qq_provider::ProviderEvent::ReasoningDelta {
                     kind: qq_provider::ReasoningKind::Summary,
-                    text: "private rationale".to_owned(),
-                }),
+                    text: "private rationale ".to_owned(),
+                })
+            }));
+            events.extend([
                 Ok(qq_provider::ProviderEvent::ReasoningCompleted {
                     kind: qq_provider::ReasoningKind::Summary,
                 }),
                 Ok(qq_provider::ProviderEvent::OutputTextDelta {
-                    text: "answer".to_owned(),
+                    text: "ans".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: "wer".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::ReasoningStarted {
+                    kind: qq_provider::ReasoningKind::ExposedThinking,
+                }),
+                Ok(qq_provider::ProviderEvent::ReasoningDelta {
+                    kind: qq_provider::ReasoningKind::ExposedThinking,
+                    text: "late rationale".to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::ReasoningCompleted {
+                    kind: qq_provider::ReasoningKind::ExposedThinking,
                 }),
                 Ok(qq_provider::ProviderEvent::Completed { usage: None }),
-            ]))
+            ]);
+            Box::pin(stream::iter(events))
+        }
+    }
+
+    struct HangingReasoningLoader {
+        buffered: Arc<tokio::sync::Notify>,
+    }
+
+    impl RuntimeLoader for HangingReasoningLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let buffered = Arc::clone(&self.buffered);
+            Box::pin(async move {
+                Runtime::new(HangingReasoningProvider { buffered }, "test-model", 256)
+                    .map(|runtime| LoadedRuntime {
+                        runtime: Arc::new(runtime),
+                        pricing: None,
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct HangingReasoningProvider {
+        buffered: Arc<tokio::sync::Notify>,
+    }
+
+    impl Provider for HangingReasoningProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let buffered = Arc::clone(&self.buffered);
+            Box::pin(async_stream! {
+                yield Ok(qq_provider::ProviderEvent::ReasoningStarted {
+                    kind: qq_provider::ReasoningKind::Summary,
+                });
+                yield Ok(qq_provider::ProviderEvent::ReasoningDelta {
+                    kind: qq_provider::ReasoningKind::Summary,
+                    text: "first".to_owned(),
+                });
+                yield Ok(qq_provider::ProviderEvent::ReasoningDelta {
+                    kind: qq_provider::ReasoningKind::Summary,
+                    text: "buffered".to_owned(),
+                });
+                buffered.notify_one();
+                std::future::pending::<()>().await;
+            })
         }
     }
 
@@ -6751,6 +7068,7 @@ mod tests {
             "sessions",
             "runs",
             "messages",
+            "message_chunks",
             "tool_calls",
             "model_turns",
             "session_grants",
@@ -6966,7 +7284,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         assert!(
             !connection
@@ -7093,7 +7411,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -7161,7 +7479,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         let (display_json, result) = connection
             .query_row(
@@ -7220,7 +7538,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -7285,7 +7603,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -7373,7 +7691,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -7429,7 +7747,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -7473,7 +7791,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "14"
+            "15"
         );
         for column in [
             "model_json",
@@ -7484,6 +7802,664 @@ mod tests {
             assert!(
                 has_column(&connection, "model_turns", column).unwrap(),
                 "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_fourteen_migration_adds_chunks_and_incremental_capacity_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata VALUES ('schema_version', '14');
+                 CREATE TABLE runs (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     command_id TEXT NOT NULL UNIQUE,
+                     user_message_id TEXT NOT NULL,
+                     assistant_message_id TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     kind TEXT NOT NULL DEFAULT 'prompt',
+                     auto_compaction INTEGER NOT NULL DEFAULT 0,
+                     cancel_requested INTEGER NOT NULL DEFAULT 0,
+                     prompt_identity_json TEXT,
+                     outcome_json TEXT,
+                     usage_json TEXT,
+                     context_tokens INTEGER,
+                     estimated_cost_usd_nanos INTEGER,
+                     created_at_ms INTEGER NOT NULL,
+                     started_at_ms INTEGER,
+                     finished_at_ms INTEGER
+                 );
+                 CREATE TABLE model_turns (
+                     run_id TEXT NOT NULL,
+                     turn_ordinal INTEGER NOT NULL,
+                     assistant_content_json TEXT NOT NULL,
+                     model_json TEXT,
+                     usage_json TEXT,
+                     estimated_cost_usd_nanos INTEGER,
+                     completed_at_ms INTEGER,
+                     PRIMARY KEY(run_id, turn_ordinal)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "15"
+        );
+        assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
+        assert!(has_column(&connection, "message_chunks", "text").unwrap());
+        assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
+        assert!(has_column(&connection, "runs", "context_increment_bytes").unwrap());
+        assert!(
+            has_column(
+                &connection,
+                "pending_workspace_grant_promotions",
+                "promotion_json"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn partially_applied_version_fourteen_linear_migration_completes_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '14' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("ALTER TABLE runs DROP COLUMN context_increment_bytes", [])
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "15"
+        );
+        assert!(has_column(&connection, "message_chunks", "text").unwrap());
+        assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
+        assert!(has_column(&connection, "runs", "context_increment_bytes").unwrap());
+    }
+
+    fn rewrite_run_capacity_schema(
+        path: &Path,
+        base_declaration: &str,
+        increment_declaration: &str,
+    ) {
+        let connection = Connection::open(path).unwrap();
+        let schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let schema = schema
+            .replacen("context_base_bytes INTEGER", base_declaration, 1)
+            .replacen(
+                "context_increment_bytes INTEGER NOT NULL DEFAULT 0",
+                increment_declaration,
+                1,
+            );
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 PRAGMA legacy_alter_table = ON;
+                 ALTER TABLE runs RENAME TO runs_valid;
+                 DROP TABLE runs_valid;",
+            )
+            .unwrap();
+        connection.execute_batch(&schema).unwrap();
+    }
+
+    #[test]
+    fn version_fifteen_store_with_malformed_capacity_columns_is_rejected() {
+        for (base, increment) in [
+            (
+                "context_base_bytes TEXT",
+                "context_increment_bytes INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "context_base_bytes INTEGER NOT NULL",
+                "context_increment_bytes INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "context_base_bytes INTEGER",
+                "context_increment_bytes INTEGER",
+            ),
+            (
+                "context_base_bytes INTEGER",
+                "context_increment_bytes INTEGER NOT NULL DEFAULT 1",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("sessions.sqlite3");
+            drop(open_database(&path).unwrap());
+            rewrite_run_capacity_schema(&path, base, increment);
+
+            assert!(matches!(
+                open_database(&path),
+                Err(SessionRuntimeError::Persistence)
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_version_fourteen_capacity_validation_never_advances_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '14' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        rewrite_run_capacity_schema(
+            &path,
+            "context_base_bytes INTEGER",
+            "context_increment_bytes INTEGER",
+        );
+
+        assert!(matches!(
+            open_database(&path),
+            Err(SessionRuntimeError::Persistence)
+        ));
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "14"
+        );
+    }
+
+    #[test]
+    fn version_fifteen_store_missing_a_linear_streaming_column_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute("ALTER TABLE message_chunks DROP COLUMN text", [])
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            open_database(&path),
+            Err(SessionRuntimeError::Persistence)
+        ));
+    }
+
+    #[test]
+    fn version_fifteen_store_with_malformed_promotion_outbox_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "ALTER TABLE pending_workspace_grant_promotions DROP COLUMN promotion_json",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            open_database(&path),
+            Err(SessionRuntimeError::Persistence)
+        ));
+    }
+
+    #[test]
+    fn message_loading_concatenates_legacy_base_and_ordered_chunks_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let session_id = SessionId::from_bytes([2; 16]);
+        let run_id = RunId::from_bytes([3; 16]);
+        let message_id = MessageId::from_bytes([4; 16]);
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path, next_sequence) VALUES (?1, '/w', 0)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'S', 'idle', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id, session_id, command_id, user_message_id,
+                                  assistant_message_id, status, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'completed', 1)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    CommandId::from_bytes([5; 16]).to_string(),
+                    message_id.to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(id, session_id, run_id, ordinal, role, state,
+                                      output, refusal, created_at_ms)
+                 VALUES (?1, ?2, ?3, 1, 'assistant', 'complete', 'legacy-', 'old-', 1)",
+                params![
+                    message_id.to_string(),
+                    session_id.to_string(),
+                    run_id.to_string(),
+                ],
+            )
+            .unwrap();
+        for (channel, ordinal, text) in [
+            ("output", 2, "two"),
+            ("output", 1, "one"),
+            ("refusal", 1, "new"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message_chunks(message_id, channel, chunk_ordinal, text)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![message_id.to_string(), channel, ordinal, text],
+                )
+                .unwrap();
+        }
+
+        let message = load_message(&connection, message_id).unwrap();
+
+        assert_eq!(message.output, "legacy-onetwo");
+        assert_eq!(message.refusal, "old-new");
+    }
+
+    #[test]
+    fn version_fourteen_migration_preserves_legacy_snapshot_and_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (mut connection, store_id) = open_database(&path).unwrap();
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let session_id = SessionId::from_bytes([2; 16]);
+        let run_id = RunId::from_bytes([3; 16]);
+        let user_message_id = MessageId::from_bytes([4; 16]);
+        let assistant_message_id = MessageId::from_bytes([5; 16]);
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path, next_sequence) VALUES (?1, '/w', 0)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, model,
+                                      created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'Legacy', 'idle', 'test/model', 1, 2)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id, session_id, command_id, user_message_id,
+                                  assistant_message_id, status, outcome_json,
+                                  created_at_ms, started_at_ms, finished_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'completed', ?6, 1, 1, 2)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    CommandId::from_bytes([6; 16]).to_string(),
+                    user_message_id.to_string(),
+                    assistant_message_id.to_string(),
+                    serde_json::to_string(&RunOutcome::Completed).unwrap(),
+                ],
+            )
+            .unwrap();
+        for (id, ordinal, role, output) in [
+            (user_message_id, 1, "user", "legacy prompt"),
+            (assistant_message_id, 2, "assistant", "legacy answer"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO messages(id, session_id, run_id, ordinal, role, state,
+                                          output, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'complete', ?6, 1)",
+                    params![
+                        id.to_string(),
+                        session_id.to_string(),
+                        run_id.to_string(),
+                        ordinal,
+                        role,
+                        output,
+                    ],
+                )
+                .unwrap();
+        }
+        let request = SnapshotRequest {
+            workspace_id,
+            focused_session_id: Some(session_id),
+            session_limit: 1,
+            message_limit: 8,
+        };
+        let before_snapshot = load_snapshot(&mut connection, store_id, request).unwrap();
+        let transaction = connection.transaction().unwrap();
+        let before_context = load_model_context(&transaction, session_id, u64::MAX).unwrap();
+        transaction.rollback().unwrap();
+        connection
+            .execute_batch(
+                "UPDATE metadata SET value = '14' WHERE key = 'schema_version';
+                 DROP TABLE message_chunks;
+                 ALTER TABLE runs DROP COLUMN context_base_bytes;
+                 ALTER TABLE runs DROP COLUMN context_increment_bytes;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (mut connection, reopened_store_id) = open_database(&path).unwrap();
+        assert_eq!(reopened_store_id, store_id);
+        let after_snapshot = load_snapshot(&mut connection, reopened_store_id, request).unwrap();
+        let transaction = connection.transaction().unwrap();
+        let after_context = load_model_context(&transaction, session_id, u64::MAX).unwrap();
+
+        assert_eq!(after_snapshot, before_snapshot);
+        assert_eq!(after_context, before_context);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct R4StreamMeasurement {
+        bytes: usize,
+        transactions: u64,
+        elapsed_ns: u128,
+        peak_temporary_rss_bytes: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct R4RssSampler {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<u64>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl R4RssSampler {
+        fn start() -> Self {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_stop = std::sync::Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                let mut peak = r4_current_rss_bytes();
+                while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    peak = peak.max(r4_current_rss_bytes());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                peak.max(r4_current_rss_bytes())
+            });
+            Self {
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn finish(mut self) -> u64 {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for R4RssSampler {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r4_current_rss_bytes() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let kib = line.strip_prefix("VmRSS:")?.split_whitespace().next()?;
+                kib.parse::<u64>().ok()
+            })
+            .unwrap()
+            .saturating_mul(1024)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn measure_r4_append_only_stream(bytes: usize) -> R4StreamMeasurement {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (mut connection, _) = open_database(&path).unwrap();
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let session_id = SessionId::from_bytes([2; 16]);
+        let run_id = RunId::from_bytes([3; 16]);
+        let message_id = MessageId::from_bytes([4; 16]);
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path, next_sequence) VALUES (?1, '/w', 0)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                     id, workspace_id, title, status, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'S', 'idle', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(
+                     id, session_id, command_id, user_message_id,
+                     assistant_message_id, status, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, 'completed', 1)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    CommandId::from_bytes([5; 16]).to_string(),
+                    message_id.to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(
+                     id, session_id, run_id, ordinal, turn_ordinal, role, state,
+                     output, refusal, created_at_ms
+                 ) VALUES (?1, ?2, ?3, 1, 1, 'assistant', 'complete', '', '', 1)",
+                params![
+                    message_id.to_string(),
+                    session_id.to_string(),
+                    run_id.to_string(),
+                ],
+            )
+            .unwrap();
+        let baseline_rss = r4_current_rss_bytes();
+        let sampler = R4RssSampler::start();
+        let content = "x".repeat(bytes);
+        let started = std::time::Instant::now();
+        let mut transactions = 0_u64;
+        for chunk in content.as_bytes().chunks(OUTPUT_BATCH_BYTES) {
+            let transaction = connection.transaction().unwrap();
+            insert_message_chunk(
+                &transaction,
+                message_id,
+                TextChannel::Output,
+                std::str::from_utf8(chunk).unwrap(),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            transactions += 1;
+        }
+        let message = load_message(&connection, message_id).unwrap();
+        let elapsed_ns = started.elapsed().as_nanos();
+        let peak_temporary_rss_bytes = sampler.finish().saturating_sub(baseline_rss);
+        assert_eq!(message.output, content);
+        assert_eq!(
+            transactions,
+            u64::try_from(bytes.div_ceil(OUTPUT_BATCH_BYTES)).unwrap()
+        );
+        R4StreamMeasurement {
+            bytes,
+            transactions,
+            elapsed_ns,
+            peak_temporary_rss_bytes,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_r4_stream_measurement(output: &[u8]) -> R4StreamMeasurement {
+        let output = String::from_utf8_lossy(output);
+        let line = output
+            .lines()
+            .find(|line| line.starts_with("r4_stream "))
+            .unwrap_or_else(|| panic!("R4 child produced no measurement: {output}"));
+        let mut fields = line.split_whitespace().skip(1).map(|field| {
+            let (name, value) = field.split_once('=').unwrap();
+            (name, value)
+        });
+        let bytes = fields.next().unwrap();
+        let transactions = fields.next().unwrap();
+        let elapsed = fields.next().unwrap();
+        let rss = fields.next().unwrap();
+        assert_eq!(bytes.0, "bytes");
+        assert_eq!(transactions.0, "transactions");
+        assert_eq!(elapsed.0, "elapsed_ns");
+        assert_eq!(rss.0, "peak_temporary_rss_bytes");
+        assert!(fields.next().is_none());
+        R4StreamMeasurement {
+            bytes: bytes.1.parse().unwrap(),
+            transactions: transactions.1.parse().unwrap(),
+            elapsed_ns: elapsed.1.parse().unwrap(),
+            peak_temporary_rss_bytes: rss.1.parse().unwrap(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_r4_stream_diagnostic_child(
+        executable: &Path,
+        bytes: usize,
+        child_bytes: &str,
+    ) -> std::process::Output {
+        let mut child = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "sessions::tests::r4_append_only_chunk_scaling_diagnostic",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(child_bytes, bytes.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "R4 child timed out: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "release-mode R4 diagnostic; run with --release --ignored --nocapture"]
+    fn r4_append_only_chunk_scaling_diagnostic() {
+        const CHILD_BYTES: &str = "QQ_R4_STREAM_DIAGNOSTIC_BYTES";
+        if let Some(bytes) = std::env::var_os(CHILD_BYTES) {
+            let measurement =
+                measure_r4_append_only_stream(bytes.to_str().unwrap().parse::<usize>().unwrap());
+            eprintln!(
+                "r4_stream bytes={} transactions={} elapsed_ns={} peak_temporary_rss_bytes={}",
+                measurement.bytes,
+                measurement.transactions,
+                measurement.elapsed_ns,
+                measurement.peak_temporary_rss_bytes,
+            );
+            return;
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        let mut measurements = Vec::new();
+        for bytes in [
+            64 * 1024,
+            512 * 1024,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            4 * 1024 * 1024,
+        ] {
+            let output = run_r4_stream_diagnostic_child(&executable, bytes, CHILD_BYTES);
+            assert!(
+                output.status.success(),
+                "R4 child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let mut combined = output.stdout;
+            combined.extend_from_slice(&output.stderr);
+            let measurement = parse_r4_stream_measurement(&combined);
+            eprintln!(
+                "r4_stream bytes={} transactions={} elapsed_ns={} peak_temporary_rss_bytes={}",
+                measurement.bytes,
+                measurement.transactions,
+                measurement.elapsed_ns,
+                measurement.peak_temporary_rss_bytes,
+            );
+            measurements.push(measurement);
+        }
+        for pair in measurements[1..].windows(2) {
+            let smaller = pair[0].elapsed_ns;
+            let larger = pair[1].elapsed_ns;
+            assert!(
+                larger.saturating_mul(1_000) <= smaller.saturating_mul(2_200),
+                "doubling {} to {} bytes exceeded the 2.2x R4 limit: {:?} -> {:?}",
+                pair[0].bytes,
+                pair[1].bytes,
+                pair[0].elapsed_ns,
+                pair[1].elapsed_ns,
             );
         }
     }
@@ -7694,6 +8670,714 @@ mod tests {
             applied.receipt.outcome,
             CommandOutcome::PromptQueued { .. }
         ));
+    }
+
+    #[derive(Clone, Copy)]
+    enum DenialCapacityPath {
+        Policy,
+        Client,
+        Timeout,
+    }
+
+    impl DenialCapacityPath {
+        const fn initial_state(self) -> &'static str {
+            match self {
+                Self::Policy => "requested",
+                Self::Client | Self::Timeout => "awaiting_approval",
+            }
+        }
+
+        const fn result(self) -> &'static str {
+            match self {
+                Self::Policy => approval::POLICY_DENIED_RESULT,
+                Self::Client => approval::USER_DENIED_RESULT,
+                Self::Timeout => approval::TIMEOUT_DENIED_RESULT,
+            }
+        }
+    }
+
+    fn denial_capacity_fixture(
+        path: DenialCapacityPath,
+        context_base_bytes: usize,
+    ) -> (TempDir, Connection, StoreId, ClaimedRun, ToolCallId, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let (connection, store_id) = open_database(&database_path).unwrap();
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let session_id = SessionId::from_bytes([2; 16]);
+        let run_id = RunId::from_bytes([3; 16]);
+        let command_id = CommandId::from_bytes([4; 16]);
+        let tool_call_id = ToolCallId::from_bytes([5; 16]);
+        let provider_call_id = "provider-call".to_owned();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path, next_sequence) VALUES (?1, '/w', 0)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, active_run_id,
+                                      created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'S', 'running', ?3, 1, 1)",
+                params![
+                    session_id.to_string(),
+                    workspace_id.to_string(),
+                    run_id.to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id, session_id, command_id, user_message_id,
+                                  assistant_message_id, status, context_base_bytes,
+                                  context_increment_bytes, created_at_ms, started_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, 0, 1, 1)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    command_id.to_string(),
+                    MessageId::from_bytes([6; 16]).to_string(),
+                    MessageId::from_bytes([7; 16]).to_string(),
+                    context_base_bytes,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tool_calls(
+                     id, run_id, turn_ordinal, call_ordinal, provider_call_id, name,
+                     arguments_json, state, requested_at_ms
+                 ) VALUES (?1, ?2, 1, 1, ?3, 'shell', '{}', ?4, 1)",
+                params![
+                    tool_call_id.to_string(),
+                    run_id.to_string(),
+                    provider_call_id,
+                    path.initial_state(),
+                ],
+            )
+            .unwrap();
+        let started = SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id,
+                workspace_id,
+                sequence: 0,
+            },
+            session_id,
+            run_id: Some(run_id),
+            caused_by: Some(command_id),
+            occurred_at_ms: 1,
+            event: SessionEvent::RunStarted {
+                session: load_session_summary(&connection, session_id).unwrap(),
+                run_id,
+            },
+        };
+        let claimed = ClaimedRun {
+            workspace_id,
+            workspace: "/w".to_owned(),
+            session_id,
+            run_id,
+            command_id,
+            kind: RunKind::Prompt,
+            child: false,
+            user_initiated: true,
+            literal_slash: false,
+            model: ModelSelection::default(),
+            messages: Vec::new(),
+            started,
+            over_budget: false,
+        };
+        (
+            directory,
+            connection,
+            store_id,
+            claimed,
+            tool_call_id,
+            provider_call_id,
+        )
+    }
+
+    fn apply_denial_capacity_path(
+        connection: &mut Connection,
+        store_id: StoreId,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+        path: DenialCapacityPath,
+    ) -> Result<(), SessionRuntimeError> {
+        match path {
+            DenialCapacityPath::Policy => deny_tool_call(
+                connection,
+                store_id,
+                claimed,
+                tool_call_id,
+                approval::POLICY_DENIED_RESULT,
+            )
+            .map(|_| ()),
+            DenialCapacityPath::Client => execute_command(
+                connection,
+                store_id,
+                CommandId::from_bytes([8; 16]),
+                SessionCommand::RespondToolApproval {
+                    run_id: claimed.run_id,
+                    tool_call_id,
+                    decision: ApprovalDecision::Deny,
+                },
+                &WorkspaceGrantSeed::default(),
+            )
+            .map(|_| ()),
+            DenialCapacityPath::Timeout => {
+                conclude_tool_approval(connection, store_id, claimed, tool_call_id, true)
+                    .map(|_| ())
+            }
+        }
+    }
+
+    fn denial_capacity_state(
+        connection: &Connection,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    ) -> (u64, String, Option<String>, u64, u64) {
+        let increment = connection
+            .query_row(
+                "SELECT context_increment_bytes FROM runs WHERE id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (state, result) = connection
+            .query_row(
+                "SELECT state, result FROM tool_calls WHERE id = ?1",
+                [tool_call_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let events = connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let commands = connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        (increment, state, result, events, commands)
+    }
+
+    #[test]
+    fn denial_results_reserve_exact_capacity_and_overflow_rolls_back() {
+        for path in [
+            DenialCapacityPath::Policy,
+            DenialCapacityPath::Client,
+            DenialCapacityPath::Timeout,
+        ] {
+            let result_bytes = "provider-call".len().saturating_add(path.result().len());
+            let (_directory, mut connection, store_id, claimed, tool_call_id, _) =
+                denial_capacity_fixture(path, MAX_CONTEXT_BYTES - result_bytes);
+            apply_denial_capacity_path(&mut connection, store_id, &claimed, tool_call_id, path)
+                .unwrap();
+            let (increment, state, result, events, commands) =
+                denial_capacity_state(&connection, claimed.run_id, tool_call_id);
+            assert_eq!(increment, u64::try_from(result_bytes).unwrap());
+            assert_eq!(state, "denied");
+            assert_eq!(result.as_deref(), Some(path.result()));
+            assert_eq!(events, 1);
+            assert_eq!(
+                commands,
+                u64::from(matches!(path, DenialCapacityPath::Client))
+            );
+
+            let (_directory, mut connection, store_id, claimed, tool_call_id, _) =
+                denial_capacity_fixture(path, MAX_CONTEXT_BYTES - result_bytes + 1);
+            assert_eq!(
+                apply_denial_capacity_path(
+                    &mut connection,
+                    store_id,
+                    &claimed,
+                    tool_call_id,
+                    path,
+                )
+                .unwrap_err(),
+                SessionRuntimeError::OutputTooLarge
+            );
+            assert_eq!(
+                denial_capacity_state(&connection, claimed.run_id, tool_call_id),
+                (0, path.initial_state().to_owned(), None, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_capacity_accepts_the_exact_limit_and_rolls_back_overflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (mut connection, _) = open_database(&path).unwrap();
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let session_id = SessionId::from_bytes([2; 16]);
+        let run_id = RunId::from_bytes([3; 16]);
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path, next_sequence) VALUES (?1, '/w', 0)",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'S', 'running', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id, session_id, command_id, user_message_id,
+                                  assistant_message_id, status, context_base_bytes,
+                                  context_increment_bytes, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, 0, 1)",
+                params![
+                    run_id.to_string(),
+                    session_id.to_string(),
+                    CommandId::from_bytes([4; 16]).to_string(),
+                    MessageId::from_bytes([5; 16]).to_string(),
+                    MessageId::from_bytes([6; 16]).to_string(),
+                    MAX_CONTEXT_BYTES - 3,
+                ],
+            )
+            .unwrap();
+
+        let transaction = connection.transaction().unwrap();
+        reserve_context_capacity(&transaction, run_id, 3).unwrap();
+        transaction.commit().unwrap();
+
+        let transaction = connection.transaction().unwrap();
+        assert_eq!(
+            reserve_context_capacity(&transaction, run_id, 1).unwrap_err(),
+            SessionRuntimeError::OutputTooLarge
+        );
+        transaction.commit().unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT context_increment_bytes FROM runs WHERE id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            3
+        );
+    }
+
+    async fn claimed_store_fixture() -> (TempDir, Store, ClaimedRun) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "x".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        (directory, store, claimed)
+    }
+
+    async fn streaming_transaction_state(
+        store: &Store,
+        run_id: RunId,
+    ) -> (u64, u64, u64, u64, u64) {
+        store
+            .call(Priority::Control, move |connection| {
+                let increment = connection
+                    .query_row(
+                        "SELECT context_increment_bytes FROM runs WHERE id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let assistant_messages = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages
+                         WHERE run_id = ?1 AND role = 'assistant'",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let chunks = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM message_chunks c
+                         JOIN messages m ON m.id = c.message_id WHERE m.run_id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let turns = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM model_turns WHERE run_id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let events = connection
+                    .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok((increment, assistant_messages, chunks, turns, events))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn chunk_and_event_failures_roll_back_the_entire_streaming_transaction() {
+        for trigger in [
+            "CREATE TRIGGER reject_message_chunk BEFORE INSERT ON message_chunks
+             BEGIN SELECT RAISE(ABORT, 'injected chunk failure'); END;",
+            r#"CREATE TRIGGER reject_text_event BEFORE INSERT ON events
+               WHEN NEW.envelope_json LIKE '%"type":"text_appended"%'
+               BEGIN SELECT RAISE(ABORT, 'injected event failure'); END;"#,
+        ] {
+            let (_directory, store, claimed) = claimed_store_fixture().await;
+            let before = streaming_transaction_state(&store, claimed.run_id).await;
+            store
+                .call(Priority::Control, move |connection| {
+                    connection
+                        .execute_batch(trigger)
+                        .map_err(|_| SessionRuntimeError::Persistence)
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .begin_assistant_message(
+                        &claimed,
+                        MessageId::generate().unwrap(),
+                        1,
+                        TextChannel::Output,
+                        "chunk".to_owned(),
+                    )
+                    .await
+                    .unwrap_err(),
+                SessionRuntimeError::Persistence
+            );
+            assert_eq!(
+                streaming_transaction_state(&store, claimed.run_id).await,
+                before
+            );
+            store.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_and_event_failures_roll_back_message_counter_turn_and_tool_rows() {
+        for trigger in [
+            "CREATE TRIGGER reject_model_turn BEFORE INSERT ON model_turns
+             BEGIN SELECT RAISE(ABORT, 'injected turn failure'); END;",
+            r#"CREATE TRIGGER reject_tool_event BEFORE INSERT ON events
+               WHEN NEW.envelope_json LIKE '%"type":"tool_call_requested"%'
+               BEGIN SELECT RAISE(ABORT, 'injected event failure'); END;"#,
+        ] {
+            let (_directory, store, claimed) = claimed_store_fixture().await;
+            let message_id = MessageId::generate().unwrap();
+            store
+                .begin_assistant_message(
+                    &claimed,
+                    message_id,
+                    1,
+                    TextChannel::Output,
+                    "answer".to_owned(),
+                )
+                .await
+                .unwrap();
+            let before = streaming_transaction_state(&store, claimed.run_id).await;
+            store
+                .call(Priority::Control, move |connection| {
+                    connection
+                        .execute_batch(trigger)
+                        .map_err(|_| SessionRuntimeError::Persistence)
+                })
+                .await
+                .unwrap();
+            let tool_call_id = ToolCallId::generate().unwrap();
+            let call = RuntimeToolCall {
+                id: tool_call_id,
+                turn_ordinal: 1,
+                call_ordinal: 1,
+                provider_call_id: "provider-call".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"note.txt"}"#.to_owned(),
+                argument_error: None,
+            };
+            assert_eq!(
+                store
+                    .persist_model_turn(
+                        &claimed,
+                        ModelTurnCommit {
+                            turn_ordinal: 1,
+                            message: Message::new(
+                                Role::Assistant,
+                                vec![ContentBlock::ToolCall {
+                                    id: call.provider_call_id.clone(),
+                                    name: call.name.clone(),
+                                    arguments: serde_json::from_str(&call.arguments).unwrap(),
+                                }],
+                            ),
+                            calls: vec![call],
+                            turn_message: Some(message_id),
+                            context_tokens: None,
+                            usage: None,
+                            estimated_cost_usd_nanos: None,
+                            accounting: None,
+                        },
+                    )
+                    .await
+                    .unwrap_err(),
+                SessionRuntimeError::Persistence
+            );
+            assert_eq!(
+                streaming_transaction_state(&store, claimed.run_id).await,
+                before
+            );
+            let (message_state, tool_calls): (String, u64) = store
+                .call(Priority::Control, move |connection| {
+                    let message_state = connection
+                        .query_row(
+                            "SELECT state FROM messages WHERE id = ?1",
+                            [message_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    let tool_calls = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM tool_calls WHERE run_id = ?1",
+                            [claimed.run_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    Ok((message_state, tool_calls))
+                })
+                .await
+                .unwrap();
+            assert_eq!(message_state, "streaming");
+            assert_eq!(tool_calls, 0);
+            store.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_chunks_replay_in_committed_order_after_restart() {
+        let (directory, store, claimed) = claimed_store_fixture().await;
+        let database_path = directory.path().join("sessions.sqlite3");
+        let message_id = MessageId::generate().unwrap();
+        let started = store
+            .begin_assistant_message(
+                &claimed,
+                message_id,
+                1,
+                TextChannel::Output,
+                "first|".to_owned(),
+            )
+            .await
+            .unwrap();
+        let after = started.last().unwrap().cursor.sequence;
+        let appends = (0..32_u8).map(|ordinal| {
+            let store = store.clone();
+            let claimed = claimed.clone();
+            async move {
+                store
+                    .append_text(
+                        &claimed,
+                        message_id,
+                        TextChannel::Output,
+                        format!("{ordinal:02}|"),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        let mut committed = futures_util::future::join_all(appends).await;
+        committed.sort_by_key(|event| event.cursor.sequence);
+        let mut expected = "first|".to_owned();
+        for event in &committed {
+            let SessionEvent::TextAppended { text, .. } = &event.event else {
+                panic!("append returned a non-text event")
+            };
+            expected.push_str(text);
+        }
+        let workspace_id = claimed.workspace_id;
+        let session_id = claimed.session_id;
+        store.close().await.unwrap();
+        drop(store);
+
+        let reopened = Store::open(database_path).await.unwrap();
+        let replay = reopened
+            .events_after(workspace_id, after, 64)
+            .await
+            .unwrap();
+        assert_eq!(replay, committed);
+        let snapshot = reopened
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(session_id),
+                session_limit: 1,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let assistant = snapshot
+            .focused
+            .unwrap()
+            .messages
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        assert_eq!(assistant.output, expected);
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overflowing_text_append_persists_no_counter_chunk_or_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let resolved = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::ResolveWorkspace {
+                    path: directory.path().to_str().unwrap().to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        let created = store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.receipt.outcome else {
+            panic!("unexpected receipt")
+        };
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "x".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_run(false).await.unwrap().unwrap();
+        let message_id = MessageId::generate().unwrap();
+        store
+            .begin_assistant_message(&claimed, message_id, 1, TextChannel::Output, "x".to_owned())
+            .await
+            .unwrap();
+        let run_id = claimed.run_id;
+        let before = store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .execute(
+                        "UPDATE runs SET context_base_bytes = ?2,
+                                         context_increment_bytes = 1
+                         WHERE id = ?1",
+                        params![run_id.to_string(), MAX_CONTEXT_BYTES - 1],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let chunks = connection
+                    .query_row("SELECT COUNT(*) FROM message_chunks", [], |row| {
+                        row.get::<_, u64>(0)
+                    })
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let events = connection
+                    .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                        row.get::<_, u64>(0)
+                    })
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok((chunks, events))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .append_text(&claimed, message_id, TextChannel::Output, "y".to_owned(),)
+                .await
+                .unwrap_err(),
+            SessionRuntimeError::OutputTooLarge
+        );
+
+        let after = store
+            .call(Priority::Control, move |connection| {
+                let increment = connection
+                    .query_row(
+                        "SELECT context_increment_bytes FROM runs WHERE id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let chunks = connection
+                    .query_row("SELECT COUNT(*) FROM message_chunks", [], |row| {
+                        row.get::<_, u64>(0)
+                    })
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let events = connection
+                    .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                        row.get::<_, u64>(0)
+                    })
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok((increment, chunks, events))
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, (1, before.0, before.1));
     }
 
     #[test]
@@ -8161,7 +9845,10 @@ mod tests {
             })
             .unwrap();
         assert!(before_bytes > 0);
-        assert!(after_bytes > 0);
+        assert_eq!(
+            after_bytes,
+            (COMPACTION_SUMMARY_PREAMBLE.len() + 2 + "hello".len()) as u64
+        );
         assert_eq!(summary_excerpt.as_deref(), Some("hello"));
         assert_eq!(context_tokens, None);
 
@@ -8530,14 +10217,18 @@ mod tests {
 
         // The run row records automatic provenance.
         let connection = Connection::open(harness.workspace_path.join("sessions.sqlite3")).unwrap();
-        let auto: bool = connection
-            .query_row(
-                "SELECT auto_compaction FROM runs WHERE id = ?1",
-                [compaction.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let (auto, context_base_bytes, context_increment_bytes): (bool, Option<i64>, i64) =
+            connection
+                .query_row(
+                    "SELECT auto_compaction, context_base_bytes, context_increment_bytes
+                 FROM runs WHERE id = ?1",
+                    [compaction.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
         assert!(auto);
+        assert!(context_base_bytes.is_some_and(|bytes| bytes > 0));
+        assert_eq!(context_increment_bytes, 0);
 
         // No re-trigger: the assembly shrank below the threshold, so the
         // next prompt runs directly.
@@ -8688,6 +10379,47 @@ mod tests {
             } if message.contains("4 MiB limit")
         ));
         assert_eq!(harness.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_compaction_summary_fails_without_committing_a_marker() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("seed answer".to_owned()),
+            AutoCompactScript::Text("s".repeat(MAX_CONTEXT_BYTES)),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "seed".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+
+        let compaction = compact_session(&harness.runtime, harness.session_id).await;
+        let observed = collect_until(&mut harness.events, finished_for(compaction)).await;
+
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::Policy,
+                        message,
+                    },
+                },
+                ..
+            } if *run_id == compaction && message.contains("4 MiB")
+        )));
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        let connection =
+            Connection::open(harness._directory.path().join("sessions.sqlite3")).unwrap();
+        let markers: u64 = connection
+            .query_row("SELECT COUNT(*) FROM session_compactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(markers, 0);
     }
 
     #[tokio::test]
@@ -9081,18 +10813,55 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            reasoning,
-            vec![
-                ("started", qq_provider::ReasoningKind::Summary, None),
-                (
-                    "delta",
-                    qq_provider::ReasoningKind::Summary,
-                    Some("private rationale")
-                ),
-                ("completed", qq_provider::ReasoningKind::Summary, None),
-            ]
+        assert_eq!(reasoning.first().unwrap().0, "started");
+        assert_eq!(reasoning.last().unwrap().0, "completed");
+        let reasoning_deltas = reasoning
+            .iter()
+            .filter_map(|(event, kind, text)| {
+                if *event == "delta" {
+                    Some((*kind, text.unwrap()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning_deltas.len(), 3);
+        assert!(
+            reasoning_deltas[..2]
+                .iter()
+                .all(|(kind, _)| *kind == qq_provider::ReasoningKind::Summary)
         );
+        assert_eq!(
+            reasoning_deltas[..2]
+                .iter()
+                .map(|(_, text)| *text)
+                .collect::<String>(),
+            "private rationale ".repeat(64)
+        );
+        assert_eq!(
+            reasoning_deltas[2],
+            (
+                qq_provider::ReasoningKind::ExposedThinking,
+                "late rationale"
+            )
+        );
+        let buffered_text = observed
+            .iter()
+            .position(|event| matches!(&event.event, SessionEvent::TextAppended { text, .. } if text == "wer"))
+            .unwrap();
+        let later_reasoning = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.event,
+                    SessionEvent::ReasoningStarted {
+                        kind: qq_provider::ReasoningKind::ExposedThinking,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(buffered_text < later_reasoning);
 
         let snapshot = runtime
             .snapshot(SnapshotRequest {
@@ -9155,6 +10924,72 @@ mod tests {
                 .iter()
                 .all(|text| !text.contains("private rationale"))
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_flushes_the_final_bounded_reasoning_batch_before_settlement() {
+        let directory = tempfile::tempdir().unwrap();
+        let buffered = Arc::new(tokio::sync::Notify::new());
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(HangingReasoningLoader {
+                buffered: Arc::clone(&buffered),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt: "reason until cancelled".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        buffered.notified().await;
+        runtime.inner.cancel(run_id);
+
+        let observed = collect_until(&mut events, finished_for(run_id)).await;
+        let reasoning = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning, ["first", "buffered"]);
+        let buffered = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::ReasoningDelta { text, .. } if text == "buffered"),
+        );
+        let finished = position_of(&observed, |event| {
+            matches!(
+                event,
+                SessionEvent::RunFinished {
+                    run_id: finished,
+                    outcome: RunOutcome::Cancelled,
+                    ..
+                } if *finished == run_id
+            )
+        });
+        assert!(buffered < finished);
+        runtime.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -9317,6 +11152,54 @@ mod tests {
         );
         assert_eq!(cost, 20_500);
         assert!(completed > 0);
+        let (assistant_message, legacy_output, legacy_refusal, chunk_count): (
+            String,
+            String,
+            String,
+            u64,
+        ) = connection
+            .query_row(
+                "SELECT m.id, m.output, m.refusal, COUNT(c.chunk_ordinal)
+                 FROM messages m
+                 LEFT JOIN message_chunks c ON c.message_id = m.id
+                 WHERE m.role = 'assistant'
+                 GROUP BY m.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_output, "");
+        assert_eq!(legacy_refusal, "");
+        assert_eq!(chunk_count, 2);
+        let mut statement = connection
+            .prepare(
+                "SELECT text FROM message_chunks
+                 WHERE message_id = ?1 AND channel = 'output'
+                 ORDER BY chunk_ordinal",
+            )
+            .unwrap();
+        let chunks = statement
+            .query_map([assistant_message], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        assert_eq!(chunks, ["hel", "lo"]);
+        let (base, increment): (u64, u64) = connection
+            .query_row(
+                "SELECT context_base_bytes, context_increment_bytes FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(base, "Say hello".len() as u64);
+        assert_eq!(increment, "hello".len() as u64);
+        let transaction = connection.unchecked_transaction().unwrap();
+        assert_eq!(
+            base + increment,
+            assembled_context_bytes(&transaction, session_id).unwrap() as u64
+        );
+        transaction.rollback().unwrap();
         assert!(snapshot.cursor.sequence > initial.sequence);
     }
 
@@ -9540,6 +11423,22 @@ mod tests {
         );
         assert_eq!(focused.runs[0].context_tokens, Some(6));
         assert_eq!(focused.summary.context_tokens, Some(6));
+        let completed_run = focused.runs[0].id;
+        let connection = Connection::open(directory.path().join("sessions.sqlite3")).unwrap();
+        let (base, increment): (u64, u64) = connection
+            .query_row(
+                "SELECT context_base_bytes, context_increment_bytes
+                 FROM runs WHERE id = ?1",
+                [completed_run.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        assert_eq!(
+            base + increment,
+            assembled_context_bytes(&transaction, session_id).unwrap() as u64
+        );
+        transaction.rollback().unwrap();
 
         runtime
             .command(
@@ -10218,6 +12117,7 @@ mod tests {
             .unwrap();
         let finished = store.finish_run(&claimed, outcome, None).await.unwrap();
         let after = finished.last().unwrap().cursor;
+        store.close().await.unwrap();
         drop(store);
         let connection = Connection::open(&database_path).unwrap();
         connection
@@ -10433,6 +12333,7 @@ mod tests {
             )
             .await
             .unwrap();
+        store.close().await.unwrap();
         drop(store);
 
         let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -10541,6 +12442,7 @@ mod tests {
             )
             .await
             .unwrap();
+        store.close().await.unwrap();
         drop(store);
 
         let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -10676,6 +12578,7 @@ mod tests {
             .await
             .unwrap();
         let after = finished.last().unwrap().cursor;
+        store.close().await.unwrap();
         drop(store);
 
         let connection = Connection::open(&database_path).unwrap();
@@ -10829,6 +12732,7 @@ mod tests {
             .await
             .unwrap();
         let after = finished.last().unwrap().cursor;
+        store.close().await.unwrap();
         drop(store);
         let connection = Connection::open(&database_path).unwrap();
         connection
@@ -11196,6 +13100,7 @@ mod tests {
             )
             .await
             .unwrap();
+        store.close().await.unwrap();
         drop(store);
 
         let runtime = SessionRuntime::open(
@@ -11317,6 +13222,7 @@ mod tests {
             .await
             .unwrap();
         let started = store.start_tool_call(&claimed, tool_call_id).await.unwrap();
+        store.close().await.unwrap();
         drop(store);
 
         let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -11459,6 +13365,7 @@ mod tests {
             )
             .await
             .unwrap();
+        store.close().await.unwrap();
         drop(store);
 
         let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -12566,6 +14473,69 @@ mod tests {
         }
     }
 
+    struct BlockingGrantAuthority {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl WorkspaceGrantAuthority for BlockingGrantAuthority {
+        fn seed_grants(&self, _workspace: &Path) -> GrantSeedFuture {
+            Box::pin(std::future::ready(WorkspaceGrantSeed::default()))
+        }
+
+        fn promote_grant(&self, _workspace: &Path, _grant: &ApprovalGrant) -> GrantPromotionFuture {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                WorkspaceGrantOutcome::Written {
+                    path: "/w/.qq/config.ron".to_owned(),
+                }
+            })
+        }
+    }
+
+    struct ObservedBlockingGrantAuthority {
+        entered: mpsc::UnboundedSender<ApprovalGrant>,
+        release: Arc<Semaphore>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl WorkspaceGrantAuthority for ObservedBlockingGrantAuthority {
+        fn seed_grants(&self, _workspace: &Path) -> GrantSeedFuture {
+            Box::pin(std::future::ready(WorkspaceGrantSeed::default()))
+        }
+
+        fn promote_grant(&self, _workspace: &Path, grant: &ApprovalGrant) -> GrantPromotionFuture {
+            let _ = self.entered.send(grant.clone());
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            let release = Arc::clone(&self.release);
+            let active = Arc::clone(&self.active);
+            Box::pin(async move {
+                release.acquire().await.unwrap().forget();
+                active.fetch_sub(1, Ordering::AcqRel);
+                WorkspaceGrantOutcome::Written {
+                    path: "/w/.qq/config.ron".to_owned(),
+                }
+            })
+        }
+    }
+
+    struct PanickingGrantAuthority;
+
+    impl WorkspaceGrantAuthority for PanickingGrantAuthority {
+        fn seed_grants(&self, _workspace: &Path) -> GrantSeedFuture {
+            Box::pin(std::future::ready(WorkspaceGrantSeed::default()))
+        }
+
+        fn promote_grant(&self, _workspace: &Path, _grant: &ApprovalGrant) -> GrantPromotionFuture {
+            Box::pin(async { panic!("injected workspace grant authority panic") })
+        }
+    }
+
     /// The `workspace_grant_promoted` event for a responded approval. It is
     /// published by a background task, so it may land before or after the
     /// run's terminal event: check what was already collected, then poll.
@@ -12742,6 +14712,508 @@ mod tests {
         let retried = harness.runtime.command(command_id, command).await.unwrap();
         assert_eq!(retried, receipt);
         assert_eq!(authority.promotions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_command_future_cannot_lose_a_committed_promotion_wake() {
+        let authority = ScriptedGrantAuthority::new(
+            WorkspaceGrantSeed::default(),
+            WorkspaceGrantOutcome::Written {
+                path: "/w/.qq/config.ron".to_owned(),
+            },
+        );
+        let mut harness = approval_harness_with_authority(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+            Some(authority.clone()),
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let command_id = CommandId::generate().unwrap();
+        let command = SessionCommand::RespondToolApproval {
+            run_id: harness.run_id,
+            tool_call_id: tool_call.id,
+            decision: ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        };
+        let (committed, release) = store::hold_committed_command(command_id);
+        let runtime = harness.runtime.clone();
+        let submitted = command.clone();
+        let command_task =
+            tokio::spawn(async move { runtime.command(command_id, submitted).await });
+        tokio::time::timeout(Duration::from_secs(2), committed)
+            .await
+            .unwrap()
+            .unwrap();
+        command_task.abort();
+        assert!(command_task.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+
+        let promoted = grant_promotion_event(&[], &mut harness.events).await;
+        assert_eq!(promoted.caused_by, Some(command_id));
+        assert!(matches!(
+            promoted.event,
+            SessionEvent::WorkspaceGrantPromoted {
+                outcome: WorkspaceGrantOutcome::Written { .. },
+                ..
+            }
+        ));
+        assert_eq!(authority.promotions.lock().unwrap().len(), 1);
+
+        // Replaying the durable command releases the original tool waiter but
+        // cannot enqueue or execute the already-settled promotion again.
+        harness.runtime.command(command_id, command).await.unwrap();
+        collect_through_finished(&mut harness.events).await;
+        assert_eq!(authority.promotions.lock().unwrap().len(), 1);
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promotion_outbox_rejects_a_mismatched_embedded_command_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let row_command_id = CommandId::generate().unwrap();
+        let promotion = PendingGrantPromotion {
+            workspace_id: WorkspaceId::generate().unwrap(),
+            workspace_path: "/w".to_owned(),
+            session_id: SessionId::generate().unwrap(),
+            run_id: RunId::generate().unwrap(),
+            command_id: CommandId::generate().unwrap(),
+            grant: ApprovalGrant::Tool {
+                name: "__test_mutate".to_owned(),
+            },
+        };
+        let promotion_json = serde_json::to_string(&promotion).unwrap();
+        store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .execute(
+                        "INSERT INTO pending_workspace_grant_promotions(
+                             command_id, created_at_ms, promotion_json
+                         ) VALUES (?1, 1, ?2)",
+                        params![row_command_id.to_string(), promotion_json],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.next_grant_promotion().await.unwrap_err(),
+            SessionRuntimeError::Persistence
+        );
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_promotion_outbox_is_atomic_with_the_approval() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, |connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER reject_workspace_promotion_outbox
+                         BEFORE INSERT ON pending_workspace_grant_promotions
+                         BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        let command_id = CommandId::generate().unwrap();
+        let error = harness
+            .runtime
+            .command(
+                command_id,
+                SessionCommand::RespondToolApproval {
+                    run_id: harness.run_id,
+                    tool_call_id: tool_call.id,
+                    decision: ApprovalDecision::ApproveForWorkspace {
+                        grant: ApprovalGrant::Tool {
+                            name: "__test_mutate".to_owned(),
+                        },
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, SessionRuntimeError::Persistence);
+
+        let session_id = harness.session_id;
+        let tool_call_id = tool_call.id;
+        let state = harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                let call = connection
+                    .query_row(
+                        "SELECT state, approval_resolution FROM tool_calls WHERE id = ?1",
+                        [tool_call_id.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let grants: u32 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM session_grants WHERE session_id = ?1",
+                        [session_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let commands: u32 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM commands WHERE id = ?1",
+                        [command_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let pending: u32 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_workspace_grant_promotions",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok((call, grants, commands, pending))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, (("awaiting_approval".to_owned(), None), 0, 0, 0));
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_grant_promotions_are_serialized() {
+        let (entered, mut entries) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let authority = Arc::new(ObservedBlockingGrantAuthority {
+            entered,
+            release: Arc::clone(&release),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::clone(&max_active),
+        });
+        let mut harness = scripted_runs_harness_with_authority(
+            ApprovalMode::Ask,
+            vec![vec![
+                ("__test_mutate", "{}".to_owned()),
+                ("mcp__notes__write", "{}".to_owned()),
+            ]],
+            Some(authority),
+        )
+        .await;
+        let run_id = submit_prompt(&harness, "perform both writes").await;
+
+        let (_, first) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            first.id,
+            ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            entries.recv().await,
+            Some(ApprovalGrant::Tool { name }) if name == "__test_mutate"
+        ));
+
+        let (_, second) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            second.id,
+            ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "mcp__notes__write".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), entries.recv())
+                .await
+                .is_err(),
+            "the second authority call must wait behind the first"
+        );
+
+        release.add_permits(1);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), entries.recv())
+                .await
+                .unwrap(),
+            Some(ApprovalGrant::Tool { name }) if name == "mcp__notes__write"
+        ));
+        release.add_permits(1);
+        collect_through_finished(&mut harness.events).await;
+        harness.runtime.shutdown().await.unwrap();
+        assert_eq!(max_active.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_an_accepted_workspace_grant_promotion() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let authority = Arc::new(BlockingGrantAuthority {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut harness = approval_harness_with_authority(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+            Some(authority),
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        entered.notified().await;
+        let observed = collect_through_finished(&mut harness.events).await;
+
+        let runtime = harness.runtime.clone();
+        let shutdown = tokio::spawn(async move { runtime.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release.notify_one();
+
+        shutdown.await.unwrap().unwrap();
+        let promoted = grant_promotion_event(&observed, &mut harness.events).await;
+        assert!(matches!(
+            promoted.event,
+            SessionEvent::WorkspaceGrantPromoted {
+                outcome: WorkspaceGrantOutcome::Written { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_an_accepted_grant_promotion_persistence_failure() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let authority = Arc::new(BlockingGrantAuthority {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut harness = approval_harness_with_authority(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+            Some(authority),
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        entered.notified().await;
+        collect_through_finished(&mut harness.events).await;
+        harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, |connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER reject_grant_promotion_event
+                         BEFORE INSERT ON events
+                         WHEN NEW.envelope_json LIKE '%workspace_grant_promoted%'
+                         BEGIN SELECT RAISE(ABORT, 'injected promotion failure'); END;",
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+
+        let runtime = harness.runtime.clone();
+        let shutdown = tokio::spawn(async move { runtime.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release.notify_one();
+
+        assert_eq!(
+            shutdown.await.unwrap().unwrap_err(),
+            SessionRuntimeError::Unavailable
+        );
+        let pending: u32 = harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, |connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_workspace_grant_promotions",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pending, 1,
+            "a failed fate commit must retain its outbox row"
+        );
+
+        harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, |connection| {
+                connection
+                    .execute("DROP TRIGGER reject_grant_promotion_event", [])
+                    .map(|_| ())
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        let database_path = harness._directory.path().join("sessions.sqlite3");
+        let store_id = harness.runtime.inner.store.store_id();
+        harness.runtime.inner.store.close().await.unwrap();
+
+        let recovered_authority = ScriptedGrantAuthority::new(
+            WorkspaceGrantSeed::default(),
+            WorkspaceGrantOutcome::AlreadyPresent {
+                path: "/w/.qq/config.ron".to_owned(),
+            },
+        );
+        let mut options = SessionRuntimeOptions::new(database_path);
+        options.grant_authority = Some(recovered_authority.clone());
+        let recovered = SessionRuntime::open(options, Arc::new(ScriptedLoader))
+            .await
+            .unwrap();
+        let mut recovered_events = recovered
+            .subscribe(SubscribeRequest {
+                workspace_id: harness.workspace_id,
+                after: EventCursor {
+                    store_id,
+                    workspace_id: harness.workspace_id,
+                    sequence: 0,
+                },
+            })
+            .unwrap();
+        let promoted = grant_promotion_event(&[], &mut recovered_events).await;
+        assert!(matches!(
+            promoted.event,
+            SessionEvent::WorkspaceGrantPromoted {
+                outcome: WorkspaceGrantOutcome::AlreadyPresent { .. },
+                ..
+            }
+        ));
+        assert_eq!(recovered_authority.promotions.lock().unwrap().len(), 1);
+        let remaining: u32 = recovered
+            .inner
+            .store
+            .call(Priority::Control, |connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_workspace_grant_promotions",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        recovered.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_panicking_grant_authority_persists_a_failed_promotion_fate() {
+        let mut harness = approval_harness_with_authority(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+            Some(Arc::new(PanickingGrantAuthority)),
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForWorkspace {
+                grant: ApprovalGrant::Tool {
+                    name: "__test_mutate".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let observed = collect_through_finished(&mut harness.events).await;
+        let promoted = grant_promotion_event(&observed, &mut harness.events).await;
+        assert!(matches!(
+            promoted.event,
+            SessionEvent::WorkspaceGrantPromoted {
+                outcome: WorkspaceGrantOutcome::Failed { ref message },
+                ..
+            } if message == "the workspace grant authority panicked"
+        ));
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_never_reports_success_after_the_runtime_has_failed() {
+        let (_directory, runtime) = test_runtime().await;
+        runtime.inner.failed.send_replace(true);
+
+        assert_eq!(
+            runtime.shutdown().await.unwrap_err(),
+            SessionRuntimeError::Unavailable
+        );
     }
 
     #[tokio::test]
@@ -13368,6 +15840,101 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_with_buffered_tool_output_drops_it_before_terminal_settlement() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "shell",
+            r#"{"command":"printf buffered-output; sleep 30"}"#,
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (mut observed, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let (buffered, release) = execution::hold_buffered_tool_output(tool_call.id);
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveOnce,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), buffered)
+            .await
+            .expect("shell output must enter the bounded batch")
+            .unwrap();
+
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun {
+                    run_id: harness.run_id,
+                },
+            )
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        observed.extend(collect_through_finished_generously(&mut harness.events).await);
+
+        assert!(
+            !observed.iter().any(|event| matches!(
+                &event.event,
+                SessionEvent::ToolCallOutputDelta { tool_call_id, .. }
+                    if *tool_call_id == tool_call.id
+            )),
+            "a partial live batch must not publish after cancellation"
+        );
+        let started = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::ToolCallStarted { tool_call: started }
+                        if started.id == tool_call.id
+                )
+            })
+            .unwrap();
+        let cancelled = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::CancellationRequested { run_id, .. }
+                        if *run_id == harness.run_id
+                )
+            })
+            .unwrap();
+        let interrupted = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::ToolCallFinished { tool_call: finished }
+                        if finished.id == tool_call.id
+                            && finished.state == ToolCallState::Interrupted
+                            && finished.result.as_deref() == Some(INTERRUPTED_TOOL_RESULT)
+                )
+            })
+            .unwrap();
+        let finished = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.event,
+                    SessionEvent::RunFinished {
+                        run_id,
+                        outcome: RunOutcome::Cancelled,
+                        ..
+                    } if *run_id == harness.run_id
+                )
+            })
+            .unwrap();
+        assert!(started < cancelled && cancelled < interrupted && interrupted < finished);
+    }
+
     #[tokio::test]
     async fn edit_approvals_carry_the_diff_preview_and_apply_after_approval() {
         let mut harness = scripted_runs_harness(
@@ -13772,6 +16339,7 @@ mod tests {
             .request_tool_approval(&claimed, tool_call_id, None, None)
             .await
             .unwrap();
+        store.close().await.unwrap();
         drop(store);
 
         let runtime = SessionRuntime::open(
@@ -14953,6 +17521,7 @@ mod tests {
             )
             .await
             .unwrap();
+        store.close().await.unwrap();
         drop(store);
 
         let requests = Arc::new(StdMutex::new(Vec::new()));

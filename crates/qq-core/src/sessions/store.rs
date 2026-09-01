@@ -1,8 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crossbeam_channel::{Sender, TrySendError};
 use rusqlite::Connection;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use super::*;
 use worker::WorkerMessage;
@@ -15,6 +18,50 @@ pub(super) use schema::{has_column, open_database};
 
 const CONTROL_QUEUE_CAPACITY: usize = 256;
 const OUTPUT_QUEUE_CAPACITY: usize = 1024;
+const CONTROL_BURST_LIMIT: usize = 4;
+
+#[cfg(test)]
+struct CommittedCommandHook {
+    command_id: CommandId,
+    entered: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static COMMITTED_COMMAND_HOOK: Mutex<Option<CommittedCommandHook>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn hold_committed_command(
+    command_id: CommandId,
+) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    *COMMITTED_COMMAND_HOOK.lock().unwrap() = Some(CommittedCommandHook {
+        command_id,
+        entered,
+        release: release_rx,
+    });
+    (entered_rx, release)
+}
+
+#[cfg(test)]
+fn pause_after_committed_command(command_id: CommandId) {
+    let hook = {
+        let mut hook = COMMITTED_COMMAND_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|hook| hook.command_id == command_id)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.entered.send(());
+        let _ = hook.release.recv();
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Store {
@@ -25,6 +72,11 @@ pub(super) struct Store {
 struct StoreInner {
     control: Sender<WorkerMessage>,
     output: Sender<WorkerMessage>,
+    output_slots: Arc<Semaphore>,
+    shutdown: Sender<()>,
+    closed: watch::Receiver<bool>,
+    closing: AtomicBool,
+    admission: Mutex<()>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -36,12 +88,9 @@ pub(super) enum Priority {
 
 impl Drop for StoreInner {
     fn drop(&mut self) {
-        let _ = self.control.send(WorkerMessage::Shutdown);
-        if let Ok(worker) = self.worker.get_mut()
-            && let Some(worker) = worker.take()
-        {
-            let _ = worker.join();
-        }
+        self.closing.store(true, Ordering::Release);
+        self.output_slots.close();
+        let _ = self.shutdown.try_send(());
     }
 }
 
@@ -56,6 +105,11 @@ impl Store {
             inner: Arc::new(StoreInner {
                 control: started.control,
                 output: started.output,
+                output_slots: Arc::new(Semaphore::new(OUTPUT_QUEUE_CAPACITY)),
+                shutdown: started.shutdown,
+                closed: started.closed,
+                closing: AtomicBool::new(false),
+                admission: Mutex::new(()),
                 worker: Mutex::new(Some(started.worker)),
             }),
             store_id,
@@ -75,28 +129,92 @@ impl Store {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, SessionRuntimeError> + Send + 'static,
     {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        let output_permit = match priority {
+            Priority::Control => None,
+            Priority::Output => Some(
+                Arc::clone(&self.inner.output_slots)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| SessionRuntimeError::Unavailable)?,
+            ),
+        };
         let (reply, response) = oneshot::channel();
-        let mut message = WorkerMessage::Run(Box::new(move |connection| {
-            let _ = reply.send(operation(connection));
-        }));
+        let message = WorkerMessage::Run {
+            job: Box::new(move |connection| {
+                let _ = reply.send(operation(connection));
+            }),
+            _output_permit: output_permit,
+        };
         let sender = match priority {
             Priority::Control => &self.inner.control,
             Priority::Output => &self.inner.output,
         };
-        loop {
-            match sender.try_send(message) {
-                Ok(()) => break,
-                Err(TrySendError::Full(returned)) if matches!(priority, Priority::Output) => {
-                    message = returned;
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Err(TrySendError::Full(_)) => return Err(SessionRuntimeError::Overloaded),
-                Err(TrySendError::Disconnected(_)) => return Err(SessionRuntimeError::Unavailable),
+        // Enqueue and close share this short, synchronous admission boundary.
+        // If this call wins, the worker must drain it; if close wins, this
+        // call cannot enter a queue after the shutdown signal.
+        let admission = self
+            .inner
+            .admission
+            .lock()
+            .map_err(|_| SessionRuntimeError::Unavailable)?;
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        match sender.try_send(message) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(SessionRuntimeError::Overloaded),
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(SessionRuntimeError::Unavailable);
             }
         }
+        drop(admission);
         response
             .await
             .map_err(|_| SessionRuntimeError::Unavailable)?
+    }
+
+    /// Stops the database worker without synchronously joining it from an
+    /// async executor thread. Runtime settlement remains a separate operation;
+    /// after final close, every store call fails as unavailable.
+    pub(super) async fn close(&self) -> Result<(), SessionRuntimeError> {
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .map_err(|_| SessionRuntimeError::Unavailable)?;
+            self.inner.closing.store(true, Ordering::Release);
+            self.inner.output_slots.close();
+            let _ = self.inner.shutdown.try_send(());
+        }
+        let mut closed = self.inner.closed.clone();
+        tokio::time::timeout(SHUTDOWN_GRACE, async {
+            while !*closed.borrow() {
+                closed
+                    .changed()
+                    .await
+                    .map_err(|_| SessionRuntimeError::Unavailable)?;
+            }
+            Ok::<(), SessionRuntimeError>(())
+        })
+        .await
+        .map_err(|_| SessionRuntimeError::ShutdownTimedOut)??;
+        let worker = self
+            .inner
+            .worker
+            .lock()
+            .map_err(|_| SessionRuntimeError::Unavailable)?
+            .take();
+        if let Some(worker) = worker {
+            tokio::task::spawn_blocking(move || worker.join())
+                .await
+                .map_err(|_| SessionRuntimeError::Unavailable)?
+                .map_err(|_| SessionRuntimeError::Unavailable)?;
+        }
+        Ok(())
     }
 
     pub(super) async fn recover_interrupted_runs(
@@ -138,7 +256,7 @@ impl Store {
         command_id: CommandId,
         command: SessionCommand,
     ) -> Result<AppliedCommand, SessionRuntimeError> {
-        self.command_with_seed(command_id, command, WorkspaceGrantSeed::default())
+        self.command_with_seed(command_id, command, WorkspaceGrantSeed::default(), None)
             .await
     }
 
@@ -147,10 +265,24 @@ impl Store {
         command_id: CommandId,
         command: SessionCommand,
         seed: WorkspaceGrantSeed,
+        promotion_wakeup: Option<mpsc::Sender<()>>,
     ) -> Result<AppliedCommand, SessionRuntimeError> {
         let store_id = self.store_id;
         self.call(Priority::Control, move |connection| {
-            execute_command(connection, store_id, command_id, command, &seed)
+            let applied = execute_command(connection, store_id, command_id, command, &seed)?;
+            if applied.grant_promotion_pending
+                && let Some(wakeup) = promotion_wakeup
+            {
+                match wakeup.try_send(()) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+                    // The outbox row remains authoritative and will be
+                    // recovered when a healthy runtime next opens the store.
+                    Err(mpsc::error::TrySendError::Closed(())) => {}
+                }
+            }
+            #[cfg(test)]
+            pause_after_committed_command(command_id);
+            Ok(applied)
         })
         .await
     }
@@ -197,16 +329,25 @@ impl Store {
         .await
     }
 
-    /// Persists and publishes the fate of one approve-for-workspace
-    /// promotion, after the fact and outside any command transaction.
-    pub(super) async fn record_grant_promotion(
+    /// Returns the oldest accepted workspace promotion without removing it.
+    /// SQLite is the queue; the runtime channel only coalesces wakeups.
+    pub(super) async fn next_grant_promotion(
+        &self,
+    ) -> Result<Option<PendingGrantPromotion>, SessionRuntimeError> {
+        self.call(Priority::Output, next_grant_promotion).await
+    }
+
+    /// Persists the fate of one approve-for-workspace promotion and removes
+    /// its outbox row in the same transaction. A missing row means another
+    /// runtime already settled the idempotent external write.
+    pub(super) async fn settle_grant_promotion(
         &self,
         promotion: PendingGrantPromotion,
         outcome: WorkspaceGrantOutcome,
-    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    ) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
         let store_id = self.store_id;
         self.call(Priority::Output, move |connection| {
-            record_grant_promotion(connection, store_id, &promotion, outcome)
+            settle_grant_promotion(connection, store_id, &promotion, outcome)
         })
         .await
     }
@@ -595,9 +736,9 @@ impl Store {
         run_id: RunId,
     ) -> Result<String, SessionRuntimeError> {
         self.call(Priority::Control, move |connection| {
-            let final_turn = connection
+            let final_turn_message = connection
                 .query_row(
-                    "SELECT m.output, m.refusal
+                    "SELECT m.id
                      FROM model_turns t
                      LEFT JOIN messages m
                        ON m.run_id = t.run_id
@@ -608,31 +749,29 @@ impl Store {
                      ORDER BY t.turn_ordinal DESC, m.ordinal DESC
                      LIMIT 1",
                     [run_id.to_string()],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                        ))
-                    },
+                    |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
-            let (output, refusal) = match final_turn {
-                Some((output, refusal)) => {
-                    (output.unwrap_or_default(), refusal.unwrap_or_default())
-                }
+            let message_id = match final_turn_message {
+                Some(message_id) => message_id,
                 None => connection
                     .query_row(
-                        "SELECT output, refusal FROM messages
+                        "SELECT id FROM messages
                          WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
                          ORDER BY turn_ordinal DESC, ordinal DESC LIMIT 1",
                         [run_id.to_string()],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        |row| row.get::<_, String>(0),
                     )
                     .optional()
-                    .map_err(|_| SessionRuntimeError::Persistence)?
-                    .unwrap_or_default(),
+                    .map_err(|_| SessionRuntimeError::Persistence)?,
             };
+            let Some(message_id) = message_id else {
+                return Ok(String::new());
+            };
+            let message = load_message(connection, parse_id(&message_id)?)?;
+            let output = message.output;
+            let refusal = message.refusal;
             if output.is_empty() {
                 return Ok(refusal);
             }
@@ -646,7 +785,9 @@ impl Store {
 
     #[cfg(test)]
     pub(super) fn stop_worker_for_test(&self) -> Option<std::thread::JoinHandle<()>> {
-        let _ = self.inner.control.send(WorkerMessage::Shutdown);
+        self.inner.closing.store(true, Ordering::Release);
+        self.inner.output_slots.close();
+        let _ = self.inner.shutdown.try_send(());
         self.inner.worker.lock().ok()?.take()
     }
 }
@@ -659,6 +800,13 @@ mod tests {
     };
 
     use super::*;
+
+    fn control_message(job: impl FnOnce(&mut Connection) + Send + 'static) -> WorkerMessage {
+        WorkerMessage::Run {
+            job: Box::new(job),
+            _output_permit: None,
+        }
+    }
 
     #[tokio::test]
     async fn saturated_control_queue_reports_overload() {
@@ -685,7 +833,7 @@ mod tests {
             store
                 .inner
                 .control
-                .try_send(WorkerMessage::Run(Box::new(|_| {})))
+                .try_send(control_message(|_| {}))
                 .unwrap();
         }
         let error = store.call(Priority::Control, |_| Ok(())).await.unwrap_err();
@@ -696,7 +844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_is_prioritized_while_output_submission_backpressures() {
+    async fn saturated_output_submission_waits_for_a_capacity_wake() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("sessions.sqlite3"))
             .await
@@ -717,36 +865,219 @@ mod tests {
         entered_rx.await.unwrap();
 
         for _ in 0..OUTPUT_QUEUE_CAPACITY {
+            let permit = Arc::clone(&store.inner.output_slots)
+                .try_acquire_owned()
+                .unwrap();
             store
                 .inner
                 .output
-                .try_send(WorkerMessage::Run(Box::new(|_| {})))
+                .try_send(WorkerMessage::Run {
+                    job: Box::new(|_| {}),
+                    _output_permit: Some(permit),
+                })
                 .unwrap();
         }
-        let order = Arc::new(AtomicUsize::new(0));
-        let output_order = Arc::clone(&order);
         let output_store = store.clone();
-        let output = tokio::spawn(async move {
-            output_store
-                .call(Priority::Output, move |_| {
-                    Ok(output_order.fetch_add(1, Ordering::SeqCst))
-                })
-                .await
-        });
+        let output =
+            tokio::spawn(async move { output_store.call(Priority::Output, |_| Ok(7)).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!output.is_finished());
 
-        let control_order = Arc::clone(&order);
-        store
-            .inner
-            .control
-            .try_send(WorkerMessage::Run(Box::new(move |_| {
-                control_order.fetch_add(1, Ordering::SeqCst);
-            })))
-            .unwrap();
         release_tx.send(()).unwrap();
 
         blocked.await.unwrap().unwrap();
-        assert_eq!(output.await.unwrap().unwrap(), 1);
+        assert_eq!(output.await.unwrap().unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn queued_output_receives_service_after_a_bounded_control_burst() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_store = store.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_store
+                .call(Priority::Control, move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv()
+                        .map_err(|_| SessionRuntimeError::Unavailable)
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        let controls = Arc::new(AtomicUsize::new(0));
+        for _ in 0..CONTROL_BURST_LIMIT * 3 {
+            let controls = Arc::clone(&controls);
+            store
+                .inner
+                .control
+                .try_send(control_message(move |_| {
+                    controls.fetch_add(1, Ordering::SeqCst);
+                }))
+                .unwrap();
+        }
+        let permit = Arc::clone(&store.inner.output_slots)
+            .try_acquire_owned()
+            .unwrap();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let output_controls = Arc::clone(&controls);
+        store
+            .inner
+            .output
+            .try_send(WorkerMessage::Run {
+                job: Box::new(move |_| {
+                    let _ = observed_tx.send(output_controls.load(Ordering::SeqCst));
+                }),
+                _output_permit: Some(permit),
+            })
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(1), observed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(observed <= CONTROL_BURST_LIMIT);
+        blocked.await.unwrap().unwrap();
+        store.call(Priority::Control, |_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn final_close_waits_without_blocking_the_async_executor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_store = store.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_store
+                .call(Priority::Control, move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv()
+                        .map_err(|_| SessionRuntimeError::Unavailable)
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        let closing_store = store.clone();
+        let close = tokio::spawn(async move { closing_store.close().await });
+        tokio::task::yield_now().await;
+        assert!(!close.is_finished());
+        release_tx.send(()).unwrap();
+
+        blocked.await.unwrap().unwrap();
+        close.await.unwrap().unwrap();
+        assert_eq!(
+            store.call(Priority::Control, |_| Ok(())).await.unwrap_err(),
+            SessionRuntimeError::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn final_close_drains_every_job_accepted_before_admission_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_store = store.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_store
+                .call(Priority::Control, move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv()
+                        .map_err(|_| SessionRuntimeError::Unavailable)
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let accepted_store = store.clone();
+        let accepted = tokio::spawn(async move {
+            accepted_store
+                .call(Priority::Control, move |_| {
+                    let _ = accepted_tx.send(());
+                    Ok(())
+                })
+                .await
+        });
+        while store.inner.control.is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        let closing_store = store.clone();
+        let close = tokio::spawn(async move { closing_store.close().await });
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+
+        blocked.await.unwrap().unwrap();
+        accepted.await.unwrap().unwrap();
+        close.await.unwrap().unwrap();
+        accepted_rx
+            .await
+            .expect("an accepted job must execute before close returns");
+    }
+
+    #[tokio::test]
+    async fn final_close_drains_every_output_call_accepted_before_admission_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_store = store.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_store
+                .call(Priority::Control, move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv()
+                        .map_err(|_| SessionRuntimeError::Unavailable)
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let accepted_store = store.clone();
+        let accepted = tokio::spawn(async move {
+            accepted_store
+                .call(Priority::Output, move |_| {
+                    let _ = accepted_tx.send(());
+                    Ok(())
+                })
+                .await
+        });
+        while store.inner.output.is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        let closing_store = store.clone();
+        let close = tokio::spawn(async move { closing_store.close().await });
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+
+        blocked.await.unwrap().unwrap();
+        accepted.await.unwrap().unwrap();
+        close.await.unwrap().unwrap();
+        accepted_rx
+            .await
+            .expect("an accepted output call must execute before close returns");
+        assert_eq!(
+            store.call(Priority::Output, |_| Ok(())).await.unwrap_err(),
+            SessionRuntimeError::Unavailable
+        );
     }
 }

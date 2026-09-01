@@ -7,7 +7,12 @@
 //! declare the grant before anything is written, and the write itself is
 //! atomic (temp file + rename).
 
-use std::{fs, path::Path};
+use std::{
+    fs::{self, File, OpenOptions},
+    path::Path,
+};
+
+use sha2::{Digest, Sha256};
 
 use super::{
     ConfigError, ConfigLoader, GrantPromotion, PromotionOutcome, SourceIdentity, SourceKind,
@@ -21,6 +26,7 @@ pub(super) fn promote_workspace_grant(
 ) -> Result<GrantPromotion, ConfigError> {
     validate_grant(grant)?;
     refuse_if_managed_denies(config_loader, grant)?;
+    let _workspace_lock = WorkspaceGrantLock::acquire(config_loader, workspace_dir)?;
 
     let directory = workspace_dir.join(".qq");
     let path = directory.join("config.ron");
@@ -64,6 +70,65 @@ pub(super) fn promote_workspace_grant(
     loader::atomic_write(&path, content.as_bytes())?;
     record_trust(config_loader, &path, &document, prior_sensitive_digest)?;
     Ok(GrantPromotion::new(path, PromotionOutcome::Added))
+}
+
+/// Serializes the complete workspace-config read-modify-write across loader
+/// instances and processes. The lock lives in QQ's private data directory so
+/// granting a capability never leaves an untracked lock file in the project.
+struct WorkspaceGrantLock(File);
+
+impl WorkspaceGrantLock {
+    fn acquire(config_loader: &ConfigLoader, workspace_dir: &Path) -> Result<Self, ConfigError> {
+        let data_dir = config_loader.paths().data_dir();
+        loader::ensure_data_directory(data_dir)?;
+        let canonical = fs::canonicalize(workspace_dir).map_err(|error| ConfigError::Io {
+            path: workspace_dir.to_owned(),
+            error,
+        })?;
+        let digest = Sha256::digest(canonical.as_os_str().to_string_lossy().as_bytes());
+        let path = data_dir.join(format!("workspace-grant-{digest:x}.lock"));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ConfigError::SymlinkSource { path });
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(ConfigError::NotRegularFile { path });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ConfigError::Io { path, error }),
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|error| ConfigError::Io {
+            path: path.clone(),
+            error,
+        })?;
+        #[cfg(unix)]
+        loader::validate_private_file_mode(
+            &path,
+            &file.metadata().map_err(|error| ConfigError::Io {
+                path: path.clone(),
+                error,
+            })?,
+        )?;
+        file.lock().map_err(|error| ConfigError::Io {
+            path: path.clone(),
+            error,
+        })?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for WorkspaceGrantLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Trusts the file's new sensitive digest when the promotion itself is the

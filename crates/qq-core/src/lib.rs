@@ -71,6 +71,7 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_RUN_MODEL_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RUN_REASONING_BYTES: usize = 1024 * 1024;
 const MAX_PARALLEL_READS: usize = 4;
+const SHELL_OUTPUT_QUEUE_CAPACITY: usize = 16;
 struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
@@ -817,6 +818,10 @@ impl Runtime {
                             });
                             yield RuntimeEvent::ToolCallDenied { id: call.id, message };
                         }
+                        GateDecision::Fail { kind, message } => {
+                            yield RuntimeEvent::Failed { kind, message };
+                            return;
+                        }
                     }
                 }
                 let approved = calls
@@ -831,7 +836,7 @@ impl Runtime {
 
                 let execute_one = |call: RuntimeToolCall,
                                    output: Option<
-                    tokio::sync::mpsc::UnboundedSender<String>,
+                    tokio::sync::mpsc::Sender<String>,
                 >| {
                     let workspace = workspace.clone();
                     let file_state = Arc::clone(&file_state);
@@ -933,7 +938,7 @@ impl Runtime {
                         // commands render as they print.
                         let call_id = call.id;
                         let (delta_sender, mut deltas) =
-                            tokio::sync::mpsc::unbounded_channel::<String>();
+                            tokio::sync::mpsc::channel::<String>(SHELL_OUTPUT_QUEUE_CAPACITY);
                         let mut execution = Box::pin(execute_one(call, Some(delta_sender)));
                         let (call, result) = loop {
                             tokio::select! {

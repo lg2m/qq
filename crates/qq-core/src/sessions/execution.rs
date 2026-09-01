@@ -8,6 +8,52 @@ use super::{
 /// nothing.
 struct CompactionRunGate;
 
+#[cfg(test)]
+struct BufferedToolOutputHook {
+    tool_call_id: ToolCallId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static BUFFERED_TOOL_OUTPUT_HOOK: Mutex<Option<BufferedToolOutputHook>> = Mutex::new(None);
+
+/// Holds the execution loop immediately after one call's live output enters
+/// the bounded batch. Tests use this exact handoff to make cancellation-versus-
+/// timer ordering deterministic without adding production sleeps or hooks.
+#[cfg(test)]
+pub(super) fn hold_buffered_tool_output(
+    tool_call_id: ToolCallId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    *BUFFERED_TOOL_OUTPUT_HOOK.lock().unwrap() = Some(BufferedToolOutputHook {
+        tool_call_id,
+        entered,
+        release: release_rx,
+    });
+    (entered_rx, release)
+}
+
+#[cfg(test)]
+async fn pause_after_buffering_tool_output(tool_call_id: ToolCallId) {
+    let hook = {
+        let mut hook = BUFFERED_TOOL_OUTPUT_HOOK.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|hook| hook.tool_call_id == tool_call_id)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.entered.send(());
+        let _ = hook.release.await;
+    }
+}
+
 impl ToolGate for CompactionRunGate {
     fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
         Box::pin(std::future::ready(GateDecision::Deny {
@@ -123,6 +169,10 @@ pub(super) async fn execute_run(
     let mut accounting = RunAccountingAccumulator::new(loaded.pricing.clone());
     let mut pending_text = String::new();
     let mut pending_channel = None;
+    let mut reasoning_kind = None;
+    let mut reasoning_delta_persisted = false;
+    let mut pending_reasoning_kind = None;
+    let mut pending_reasoning_text = String::new();
     let mut flush_at = None;
     // One assistant message per model turn: the message row is created
     // lazily at the turn's first text delta (so call-only turns persist no
@@ -166,8 +216,112 @@ pub(super) async fn execute_run(
                 event = events.next() => RunInput::Event(event),
             }
         };
+        let (continues_text, continues_tool_output, continues_reasoning) = match &input {
+            RunInput::Event(Some(event)) => (
+                matches!(
+                    event,
+                    RuntimeEvent::OutputTextDelta { .. }
+                        if pending_channel == Some(TextChannel::Output)
+                ) || matches!(
+                    event,
+                    RuntimeEvent::RefusalDelta { .. }
+                        if pending_channel == Some(TextChannel::Refusal)
+                ),
+                matches!(
+                    event,
+                    RuntimeEvent::ToolCallOutputDelta { id, .. }
+                        if pending_tool_call == Some(*id)
+                ),
+                matches!(
+                    event,
+                    RuntimeEvent::ReasoningDelta { kind, .. }
+                        if pending_reasoning_kind == Some(*kind)
+                ),
+            ),
+            _ => (false, false, false),
+        };
+        if !pending_text.is_empty()
+            && !continues_text
+            && let Err(error) = flush_pending_text(
+                &inner,
+                &claimed,
+                current_turn,
+                &mut current_message,
+                &mut pending_channel,
+                &mut pending_text,
+            )
+            .await
+        {
+            finish_run(
+                &inner,
+                &claimed,
+                persistence_failure("failed to persist model output", &error),
+            )
+            .await;
+            return;
+        }
+        let stopped = matches!(&input, RunInput::Cancelled | RunInput::Interrupted);
+        if !pending_tool_output.is_empty()
+            && !continues_tool_output
+            && !stopped
+            && let Err(error) = flush_pending_tool_output(
+                &inner,
+                &claimed,
+                &mut pending_tool_call,
+                &mut pending_tool_output,
+            )
+            .await
+        {
+            finish_run(
+                &inner,
+                &claimed,
+                persistence_failure("failed to persist tool output", &error),
+            )
+            .await;
+            return;
+        }
+        if !pending_reasoning_text.is_empty()
+            && !continues_reasoning
+            && let Err(error) = flush_pending_reasoning(
+                &inner,
+                &claimed,
+                &mut pending_reasoning_kind,
+                &mut pending_reasoning_text,
+            )
+            .await
+        {
+            finish_run(
+                &inner,
+                &claimed,
+                persistence_failure("failed to persist reasoning", &error),
+            )
+            .await;
+            return;
+        }
+        if pending_text.is_empty()
+            && pending_tool_output.is_empty()
+            && pending_reasoning_text.is_empty()
+        {
+            flush_at = None;
+        }
         match input {
             RunInput::Flush => {
+                if let Err(error) = flush_pending_reasoning(
+                    &inner,
+                    &claimed,
+                    &mut pending_reasoning_kind,
+                    &mut pending_reasoning_text,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist reasoning", &error),
+                    )
+                    .await;
+                    return;
+                }
                 if let Err(error) = flush_pending_text(
                     &inner,
                     &claimed,
@@ -206,6 +360,22 @@ pub(super) async fn execute_run(
             }
             stopped @ (RunInput::Cancelled | RunInput::Interrupted) => {
                 tool_cancellation.store(true, Ordering::Release);
+                if let Err(error) = flush_pending_reasoning(
+                    &inner,
+                    &claimed,
+                    &mut pending_reasoning_kind,
+                    &mut pending_reasoning_text,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist reasoning", &error),
+                    )
+                    .await;
+                    return;
+                }
                 if let Err(error) = flush_pending_text(
                     &inner,
                     &claimed,
@@ -267,6 +437,8 @@ pub(super) async fn execute_run(
                 if internal {
                     continue;
                 }
+                reasoning_kind = Some(kind);
+                reasoning_delta_persisted = false;
                 match inner
                     .store
                     .append_reasoning(&claimed, ReasoningEvent::Started { kind })
@@ -288,13 +460,46 @@ pub(super) async fn execute_run(
                 if internal || text.is_empty() {
                     continue;
                 }
-                match inner
-                    .store
-                    .append_reasoning(&claimed, ReasoningEvent::Delta { kind, text })
+                if reasoning_kind != Some(kind) {
+                    reasoning_kind = Some(kind);
+                    reasoning_delta_persisted = false;
+                }
+                if !reasoning_delta_persisted {
+                    match inner
+                        .store
+                        .append_reasoning(&claimed, ReasoningEvent::Delta { kind, text })
+                        .await
+                    {
+                        Ok(event) => inner.notify(event.cursor),
+                        Err(error) => {
+                            finish_run(
+                                &inner,
+                                &claimed,
+                                persistence_failure("failed to persist reasoning", &error),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    reasoning_delta_persisted = true;
+                    continue;
+                }
+                if pending_reasoning_text.is_empty() {
+                    pending_reasoning_kind = Some(kind);
+                    if flush_at.is_none() {
+                        flush_at = Some(tokio::time::Instant::now() + OUTPUT_BATCH_DELAY);
+                    }
+                }
+                pending_reasoning_text.push_str(&text);
+                if pending_reasoning_text.len() >= OUTPUT_BATCH_BYTES {
+                    if let Err(error) = flush_pending_reasoning(
+                        &inner,
+                        &claimed,
+                        &mut pending_reasoning_kind,
+                        &mut pending_reasoning_text,
+                    )
                     .await
-                {
-                    Ok(event) => inner.notify(event.cursor),
-                    Err(error) => {
+                    {
                         finish_run(
                             &inner,
                             &claimed,
@@ -302,6 +507,9 @@ pub(super) async fn execute_run(
                         )
                         .await;
                         return;
+                    }
+                    if pending_text.is_empty() && pending_tool_output.is_empty() {
+                        flush_at = None;
                     }
                 }
             }
@@ -325,6 +533,8 @@ pub(super) async fn execute_run(
                         return;
                     }
                 }
+                reasoning_kind = None;
+                reasoning_delta_persisted = false;
             }
             RunInput::Event(Some(RuntimeEvent::AssistantTurnCompleted {
                 turn_ordinal,
@@ -510,6 +720,8 @@ pub(super) async fn execute_run(
                     }
                 }
                 pending_tool_output.push_str(&chunk);
+                #[cfg(test)]
+                pause_after_buffering_tool_output(id).await;
                 if pending_tool_output.len() >= OUTPUT_BATCH_BYTES {
                     if let Err(error) = flush_pending_tool_output(
                         &inner,
@@ -757,6 +969,22 @@ pub(super) async fn execute_run(
                 return;
             }
             RunInput::Event(None) => {
+                if let Err(error) = flush_pending_reasoning(
+                    &inner,
+                    &claimed,
+                    &mut pending_reasoning_kind,
+                    &mut pending_reasoning_text,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist reasoning", &error),
+                    )
+                    .await;
+                    return;
+                }
                 if let Err(error) = flush_pending_text(
                     &inner,
                     &claimed,
@@ -793,6 +1021,27 @@ enum RunInput {
     Flush,
     Cancelled,
     Interrupted,
+}
+
+async fn flush_pending_reasoning(
+    inner: &SessionRuntimeInner,
+    claimed: &ClaimedRun,
+    kind: &mut Option<qq_provider::ReasoningKind>,
+    text: &mut String,
+) -> Result<(), SessionRuntimeError> {
+    let Some(kind) = kind.take() else {
+        return Ok(());
+    };
+    let text = std::mem::take(text);
+    if text.is_empty() {
+        return Ok(());
+    }
+    let event = inner
+        .store
+        .append_reasoning(claimed, ReasoningEvent::Delta { kind, text })
+        .await?;
+    inner.notify(event.cursor);
+    Ok(())
 }
 
 async fn flush_pending_text(

@@ -18,8 +18,10 @@ The Linux-only recorder resolves and pins the Rust host target, builds `qq` with
 `cargo build --locked --release --bin qq --target <host>`, then
 re-executes the benchmark worker from the optimized `xtask` binary. It defaults
 to 10 requested warmups and 100 requested samples. Expensive process, tool,
-stream, replay, and load cases use fixture-versioned caps; every metric records
-its effective sample count. Use a stable, descriptive machine class for reports
+stream, replay, R4, and load cases use fixture-versioned caps; every metric
+records its effective sample count. Each R4 sample runs in a fresh optimized
+worker so allocator retention from another case cannot contaminate
+temporary-RSS evidence. Use a stable, descriptive machine class for reports
 that will be compared. A quick local smoke run can reduce the sample count, but
 `--samples` must be at least five:
 
@@ -108,15 +110,33 @@ source control.
 | Tools | `read_file` and one-shot `shell` two-turn runs | Durable prompt through tool dispatch and final completion |
 | Cancellation | cancel call through committed terminal event | Hanging deterministic provider, bounded by the runtime timeout |
 | Stream scaling | 64 KiB, 512 KiB, 1 MiB and 1 MiB/512 KiB ratio | 1 KiB fake-provider deltas through durable completion |
+| Long reasoning | completion, durable payload transactions, temporary RSS | One MiB of provider-exposed reasoning with exact lifecycle order and replay digest |
+| Long shell | completion, live-output transactions, temporary RSS | One MiB workspace file through bounded shell streaming, terminal result, and exact replay digest |
+| Streaming fairness | eight-stream batch, control-call upper bound, cancellation, persisted output-service gap, transactions, temporary RSS | Eight concurrent 256 KiB streams with 16 snapshots and one cancellation; the service gap uses stored event times so replay delivery cannot compress a backlog |
+| Restart reconstruction | open-to-snapshot, replay, temporary RSS | Byte-identical one MiB snapshot and exact event-envelope digest after final close and reopen |
 | Load | ack, completion, batch, spread, throughput, active runs, RSS for 1/10/100 sessions | Concurrent admitted sessions with the default eight-run cap |
 
+A full 4 MiB assistant payload cannot traverse the public runtime because the
+same 4 MiB storage backstop must also hold the submitted prompt and other
+irreducible context. R4 therefore qualifies the schema hot path at 64 KiB,
+512 KiB, 1 MiB, 2 MiB, and the exact 4 MiB cap with a release-only direct-store
+Linux-only diagnostic. Every size runs in an isolated test process with a
+30-second timeout and records wall time, exact payload-transaction count,
+reconstruction correctness, and peak temporary RSS:
+
+```sh
+cargo test -p qq-core --release \
+  r4_append_only_chunk_scaling_diagnostic -- --ignored --nocapture
+```
+
 Exact claim/send and SQLite-commit instants are not public, so the provider
-handoff and durable-stream metrics are explicitly upper-bound proxies. Exact
-commit-to-TUI rendering, the full R4 long-stream/fairness suite, resolved-model
-context planning/compaction, and sub-agent economics remain owned by their
-readiness milestones. H0 does not mark those milestones complete. Live-provider
-network latency and model quality are deliberately outside this deterministic
-baseline.
+handoff and durable-stream metrics are explicitly upper-bound proxies. The R4
+control metric includes SQLite work and reply delivery. Its output-service gap
+uses persisted millisecond event times rather than subscriber receive times;
+exact dequeue, commit, and commit-to-TUI instants remain unavailable through
+public seams. Resolved-model context planning/compaction and sub-agent economics
+remain owned by later readiness milestones. Live-provider network latency and
+model quality are deliberately outside this deterministic baseline.
 
 ## Measurement Discipline
 

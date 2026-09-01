@@ -516,7 +516,9 @@ fields stay managed-only:
 - **Promotion.** The approval prompt's workspace-lifetime choice appends
   the grant to `.qq/config.ron` by targeted text insertion — comments
   and formatting survive — with an atomic temp-and-rename write that
-  must reparse before it lands. Promotion refuses grants the managed
+  must reparse before it lands. The complete read-modify-write and trust
+  update are serialized across processes by a workspace-keyed file lock in
+  QQ's private data directory. Promotion refuses grants the managed
   layer denies. Because the write is the user's own decision, the file's
   new trust digest is recorded immediately — but only when the file was
   already trusted (or had no sensitive content) beforehand, so promotion

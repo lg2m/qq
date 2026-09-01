@@ -1366,6 +1366,71 @@ fn promotes_grants_into_a_fresh_workspace_config() {
 }
 
 #[test]
+fn concurrent_loader_instances_preserve_distinct_workspace_promotions() {
+    let tree = TempTree::new();
+    let workspace = tree.path("work");
+    let start = Arc::new(std::sync::Barrier::new(3));
+
+    let tool_loader = tree.loader();
+    let tool_workspace = workspace.clone();
+    let tool_start = Arc::clone(&start);
+    let tool = std::thread::spawn(move || {
+        tool_start.wait();
+        tool_loader.promote_workspace_grant(
+            &tool_workspace,
+            &WorkspaceGrant::Tool("edit_file".to_owned()),
+        )
+    });
+    let shell_loader = tree.loader();
+    let shell_workspace = workspace.clone();
+    let shell_start = Arc::clone(&start);
+    let shell = std::thread::spawn(move || {
+        shell_start.wait();
+        shell_loader.promote_workspace_grant(
+            &shell_workspace,
+            &WorkspaceGrant::ShellPrefix("cargo test".to_owned()),
+        )
+    });
+    start.wait();
+
+    assert_eq!(
+        tool.join().unwrap().unwrap().outcome(),
+        PromotionOutcome::Added
+    );
+    assert_eq!(
+        shell.join().unwrap().unwrap().outcome(),
+        PromotionOutcome::Added
+    );
+    let content = fs::read_to_string(workspace.join(".qq/config.ron")).unwrap();
+    assert!(content.contains("edit_file"), "{content}");
+    assert!(content.contains("cargo test"), "{content}");
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_promotion_rejects_a_symlinked_lock_file() {
+    use sha2::Digest as _;
+
+    let tree = TempTree::new();
+    let workspace = fs::canonicalize(tree.path("work")).unwrap();
+    let digest = sha2::Sha256::digest(workspace.as_os_str().to_string_lossy().as_bytes());
+    let lock = tree
+        .path("data")
+        .join(format!("workspace-grant-{digest:x}.lock"));
+    let outside = tree.write("outside-lock", "do not follow");
+    std::os::unix::fs::symlink(outside, &lock).unwrap();
+
+    assert!(matches!(
+        tree.loader().promote_workspace_grant(
+            &workspace,
+            &WorkspaceGrant::Tool("edit_file".to_owned())
+        ),
+        Err(ConfigError::SymlinkSource { path }) if path == lock
+    ));
+    assert!(!workspace.join(".qq/config.ron").exists());
+}
+
+#[test]
 fn promotion_preserves_unrelated_content_and_existing_policy() {
     let tree = TempTree::new();
     let loader = tree.loader();

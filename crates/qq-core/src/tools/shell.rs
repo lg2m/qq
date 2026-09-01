@@ -39,7 +39,7 @@ pub(super) async fn run_shell(
     workspace: &Workspace,
     arguments: &ShellArgs,
     cancelled: &AtomicBool,
-    output: Option<&mpsc::UnboundedSender<String>>,
+    output: Option<&mpsc::Sender<String>>,
 ) -> ToolExecutionResult {
     if cancelled.load(Ordering::Acquire) {
         return ToolExecutionResult::error("tool execution was cancelled");
@@ -101,6 +101,12 @@ pub(super) async fn run_shell(
     let outcome = loop {
         tokio::select! {
             biased;
+            () = tokio::time::sleep_until(deadline) => break ShellOutcome::TimedOut,
+            _ = cancel_poll.tick() => {
+                if cancelled.load(Ordering::Acquire) {
+                    break ShellOutcome::Cancelled;
+                }
+            }
             read = read_from(&mut stdout, &mut stdout_buffer), if stdout.is_some() => {
                 match read {
                     Ok(0) | Err(_) => stdout = None,
@@ -129,12 +135,6 @@ pub(super) async fn run_shell(
                 // as detached as the timeout policy requires.
                 guard.disarm();
                 break ShellOutcome::Exited(status);
-            }
-            () = tokio::time::sleep_until(deadline) => break ShellOutcome::TimedOut,
-            _ = cancel_poll.tick() => {
-                if cancelled.load(Ordering::Acquire) {
-                    break ShellOutcome::Cancelled;
-                }
             }
         }
     };
@@ -193,19 +193,24 @@ where
 
 /// Forwards one raw output chunk as a lossy UTF-8 delta, bounded by the same
 /// budget as the captured result so a runaway command cannot flood clients.
-fn forward_shell_chunk(
-    output: Option<&mpsc::UnboundedSender<String>>,
-    streamed: &mut usize,
-    bytes: &[u8],
-) {
+fn forward_shell_chunk(output: Option<&mpsc::Sender<String>>, streamed: &mut usize, bytes: &[u8]) {
     let Some(sender) = output else {
         return;
     };
     if *streamed >= MAX_SHELL_OUTPUT_BYTES {
         return;
     }
-    *streamed += bytes.len();
-    let _ = sender.send(String::from_utf8_lossy(bytes).into_owned());
+    let remaining = MAX_SHELL_OUTPUT_BYTES - *streamed;
+    let bytes = &bytes[..bytes.len().min(remaining)];
+    let chunk = String::from_utf8_lossy(bytes).into_owned();
+    match sender.try_send(chunk) {
+        Ok(()) => *streamed += bytes.len(),
+        // Live output is a best-effort view of the same bounded bytes carried
+        // by the terminal result. A slow renderer may miss deltas, but it can
+        // never stall process timeout, cancellation, or final persistence.
+        Err(mpsc::error::TrySendError::Full(_)) => *streamed += bytes.len(),
+        Err(mpsc::error::TrySendError::Closed(_)) => *streamed = MAX_SHELL_OUTPUT_BYTES,
+    }
 }
 
 fn shell_result(capture: BoundedCapture, status: std::process::ExitStatus) -> ToolExecutionResult {

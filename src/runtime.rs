@@ -967,11 +967,9 @@ impl WorkspaceGrantAuthority for RuntimeFactory {
             ApprovalGrant::ShellPrefix { prefix } => WorkspaceGrant::ShellPrefix(prefix.clone()),
         };
         Box::pin(async move {
+            let config = factory.inner.config.clone();
             let written = tokio::task::spawn_blocking(move || {
-                factory
-                    .inner
-                    .config
-                    .promote_workspace_grant(&workspace, &grant)
+                config.promote_workspace_grant(&workspace, &grant)
             })
             .await;
             match written {
@@ -1278,6 +1276,13 @@ impl RuntimeHandler {
     /// stopped accepting new requests.
     pub async fn shutdown(&self) -> Result<(), RuntimeHandlerError> {
         self.durable.shutdown().await?;
+        Ok(())
+    }
+
+    /// Finalizes the runtime after every serving adapter has drained its
+    /// snapshot and event responses.
+    pub async fn close(&self) -> Result<(), RuntimeHandlerError> {
+        self.durable.close().await?;
         Ok(())
     }
 }
@@ -2357,6 +2362,61 @@ mod tests {
         };
         let outcome = WorkspaceGrantAuthority::promote_grant(&factory, &workspace, &denied).await;
         assert!(matches!(outcome, WorkspaceGrantOutcome::Failed { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_factories_preserve_concurrent_workspace_grant_updates() {
+        let fixture = RuntimeFixture::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::create_dir_all(fixture.path("work")).unwrap();
+        let workspace = fs::canonicalize(fixture.path("work")).unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let tool_factory = fixture.factory();
+        let tool_workspace = workspace.clone();
+        let tool_start = Arc::clone(&start);
+        let tool = tokio::spawn(async move {
+            tool_start.wait().await;
+            WorkspaceGrantAuthority::promote_grant(
+                &tool_factory,
+                &tool_workspace,
+                &ApprovalGrant::Tool {
+                    name: "edit_file".to_owned(),
+                },
+            )
+            .await
+        });
+        let shell_factory = fixture.factory();
+        let shell_workspace = workspace.clone();
+        let shell_start = Arc::clone(&start);
+        let shell = tokio::spawn(async move {
+            shell_start.wait().await;
+            WorkspaceGrantAuthority::promote_grant(
+                &shell_factory,
+                &shell_workspace,
+                &ApprovalGrant::ShellPrefix {
+                    prefix: "cargo test".to_owned(),
+                },
+            )
+            .await
+        });
+        start.wait().await;
+
+        assert!(matches!(
+            tool.await.unwrap(),
+            WorkspaceGrantOutcome::Written { .. }
+        ));
+        assert!(matches!(
+            shell.await.unwrap(),
+            WorkspaceGrantOutcome::Written { .. }
+        ));
+        let content = fs::read_to_string(workspace.join(".qq/config.ron")).unwrap();
+        assert!(content.contains("edit_file"), "{content}");
+        assert!(content.contains("cargo test"), "{content}");
     }
 
     #[test]

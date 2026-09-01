@@ -75,6 +75,8 @@ pub(in crate::sessions) fn open_database(
                   auto_compaction INTEGER NOT NULL DEFAULT 0,
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
                   prompt_identity_json TEXT,
+                   context_base_bytes INTEGER,
+                   context_increment_bytes INTEGER NOT NULL DEFAULT 0,
                    outcome_json TEXT,
                    usage_json TEXT,
                    context_tokens INTEGER,
@@ -96,6 +98,13 @@ pub(in crate::sessions) fn open_database(
                  created_at_ms INTEGER NOT NULL,
                  UNIQUE(session_id, ordinal)
              );
+             CREATE TABLE IF NOT EXISTS message_chunks (
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 channel TEXT NOT NULL CHECK(channel IN ('output', 'refusal')),
+                 chunk_ordinal INTEGER NOT NULL CHECK(chunk_ordinal > 0),
+                 text TEXT NOT NULL,
+                 PRIMARY KEY(message_id, channel, chunk_ordinal)
+             );
              CREATE TABLE IF NOT EXISTS events (
                  workspace_id TEXT NOT NULL REFERENCES workspaces(id),
                  sequence INTEGER NOT NULL,
@@ -107,6 +116,11 @@ pub(in crate::sessions) fn open_database(
                  request_json TEXT NOT NULL,
                  receipt_json TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS pending_workspace_grant_promotions (
+                 command_id TEXT NOT NULL PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 promotion_json TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS sessions_workspace_updated
                  ON sessions(workspace_id, updated_at_ms DESC);
               CREATE INDEX IF NOT EXISTS runs_ready
@@ -114,7 +128,9 @@ pub(in crate::sessions) fn open_database(
               CREATE INDEX IF NOT EXISTS runs_session_started
                   ON runs(session_id, started_at_ms);
              CREATE INDEX IF NOT EXISTS messages_session_ordinal
-                 ON messages(session_id, ordinal);",
+                 ON messages(session_id, ordinal);
+             CREATE INDEX IF NOT EXISTS pending_workspace_grant_promotions_fifo
+                 ON pending_workspace_grant_promotions(created_at_ms, command_id);",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let schema_version = connection
@@ -356,10 +372,13 @@ pub(in crate::sessions) fn open_database(
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12" | "13" | "14") => {}
+        Some("10" | "11" | "12" | "13" | "14" | "15") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
-    if !matches!(schema_version.as_deref(), Some("11" | "12" | "13" | "14")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("11" | "12" | "13" | "14" | "15")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -374,7 +393,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("12" | "13" | "14")) {
+    if !matches!(schema_version.as_deref(), Some("12" | "13" | "14" | "15")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -389,7 +408,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("13" | "14")) {
+    if !matches!(schema_version.as_deref(), Some("13" | "14" | "15")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -404,7 +423,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if schema_version.as_deref() != Some("14") {
+    if !matches!(schema_version.as_deref(), Some("14" | "15")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -420,6 +439,23 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_model_turn_audit_schema(&connection)?;
+    if schema_version.as_deref() != Some("15") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_linear_streaming_storage(&transaction)?;
+        validate_linear_streaming_schema(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '15' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_linear_streaming_schema(&connection)?;
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -444,6 +480,224 @@ pub(in crate::sessions) fn open_database(
         }
     };
     Ok((connection, store_id))
+}
+
+fn add_linear_streaming_storage(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_chunks (
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 channel TEXT NOT NULL CHECK(channel IN ('output', 'refusal')),
+                 chunk_ordinal INTEGER NOT NULL CHECK(chunk_ordinal > 0),
+                 text TEXT NOT NULL,
+                 PRIMARY KEY(message_id, channel, chunk_ordinal)
+             );
+             CREATE TABLE IF NOT EXISTS pending_workspace_grant_promotions (
+                 command_id TEXT NOT NULL PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 promotion_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS pending_workspace_grant_promotions_fifo
+                 ON pending_workspace_grant_promotions(created_at_ms, command_id);",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if !has_column(connection, "runs", "context_base_bytes")? {
+        connection
+            .execute("ALTER TABLE runs ADD COLUMN context_base_bytes INTEGER", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if !has_column(connection, "runs", "context_increment_bytes")? {
+        connection
+            .execute(
+                "ALTER TABLE runs ADD COLUMN context_increment_bytes INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+fn validate_linear_streaming_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    for (table, column) in [
+        ("message_chunks", "message_id"),
+        ("message_chunks", "channel"),
+        ("message_chunks", "chunk_ordinal"),
+        ("message_chunks", "text"),
+        ("runs", "context_base_bytes"),
+        ("runs", "context_increment_bytes"),
+        ("pending_workspace_grant_promotions", "command_id"),
+        ("pending_workspace_grant_promotions", "created_at_ms"),
+        ("pending_workspace_grant_promotions", "promotion_json"),
+    ] {
+        if !has_column(connection, table, column)? {
+            return Err(SessionRuntimeError::Persistence);
+        }
+    }
+    let mut columns = connection
+        .prepare("PRAGMA table_info(message_chunks)")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let columns = columns
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, u8>(5)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let expected = [
+        ("message_id", "TEXT", true, 1_u8),
+        ("channel", "TEXT", true, 2_u8),
+        ("chunk_ordinal", "INTEGER", true, 3_u8),
+        ("text", "TEXT", true, 0_u8),
+    ];
+    if columns.len() != expected.len()
+        || columns
+            .iter()
+            .zip(expected)
+            .any(|((name, ty, not_null, primary_key), expected)| {
+                (name.as_str(), ty.as_str(), *not_null, *primary_key) != expected
+            })
+    {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let mut run_columns = connection
+        .prepare("PRAGMA table_info(runs)")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let run_columns = run_columns
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, u8>(5)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .filter_map(|column| match column {
+            Ok(column)
+                if matches!(
+                    column.0.as_str(),
+                    "context_base_bytes" | "context_increment_bytes"
+                ) =>
+            {
+                Some(Ok(column))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let expected_run_columns = [
+        ("context_base_bytes", "INTEGER", false, None, 0_u8),
+        ("context_increment_bytes", "INTEGER", true, Some("0"), 0_u8),
+    ];
+    if run_columns.len() != expected_run_columns.len()
+        || run_columns.iter().zip(expected_run_columns).any(
+            |((name, ty, not_null, default_value, primary_key), expected)| {
+                (
+                    name.as_str(),
+                    ty.as_str(),
+                    *not_null,
+                    default_value.as_deref(),
+                    *primary_key,
+                ) != expected
+            },
+        )
+    {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let mut foreign_keys = connection
+        .prepare("PRAGMA foreign_key_list(message_chunks)")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let foreign_keys = foreign_keys
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if foreign_keys
+        != [(
+            "messages".to_owned(),
+            "message_id".to_owned(),
+            "id".to_owned(),
+            "CASCADE".to_owned(),
+        )]
+    {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let schema_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'message_chunks'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let schema_sql = schema_sql
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if !schema_sql.contains("check(channel in ('output', 'refusal'))")
+        || !schema_sql.contains("check(chunk_ordinal > 0)")
+    {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let mut promotion_columns = connection
+        .prepare("PRAGMA table_info(pending_workspace_grant_promotions)")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let promotion_columns = promotion_columns
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, u8>(5)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let expected_promotion_columns = [
+        ("command_id", "TEXT", true, 1_u8),
+        ("created_at_ms", "INTEGER", true, 0_u8),
+        ("promotion_json", "TEXT", true, 0_u8),
+    ];
+    if promotion_columns.len() != expected_promotion_columns.len()
+        || promotion_columns
+            .iter()
+            .zip(expected_promotion_columns)
+            .any(|((name, ty, not_null, primary_key), expected)| {
+                (name.as_str(), ty.as_str(), *not_null, *primary_key) != expected
+            })
+    {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let promotion_index: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE type = 'index'
+                   AND name = 'pending_workspace_grant_promotions_fifo'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if !promotion_index {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    Ok(())
 }
 
 fn create_tool_tables(connection: &Connection) -> Result<(), SessionRuntimeError> {

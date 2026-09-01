@@ -116,10 +116,10 @@ async fn headless_run(args: cli::RunArgs, overrides: &CliOverrides) -> ExitCode 
                 headless::run(&sessions, options, interrupt, &mut stdout, &mut stderr).await;
             drop(stdout);
             drop(stderr);
-            match sessions.shutdown().await {
+            match sessions.close().await {
                 Ok(()) => status.exit_code(),
                 Err(error) => {
-                    eprintln!("error: could not settle the session runtime: {error}");
+                    eprintln!("error: could not close the session runtime: {error}");
                     headless::HeadlessStatus::HarnessFailure.exit_code()
                 }
             }
@@ -275,6 +275,11 @@ impl EmbeddedRuntime {
         server.begin_shutdown();
         let runtime_result = handler.shutdown().await;
         let server_result = server.shutdown().await;
+        let runtime_result = if runtime_result.is_ok() {
+            handler.close().await
+        } else {
+            runtime_result
+        };
         match (server_result, runtime_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(source), Ok(())) => Err(EmbeddedShutdownError::Server { source }),

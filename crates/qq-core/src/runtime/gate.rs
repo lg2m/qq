@@ -1,5 +1,7 @@
 use std::{future::Future, pin::Pin};
 
+use qq_protocol::RunFailureKind;
+
 use super::RuntimeToolCall;
 
 /// The runtime's answer for one requested tool call after policy and, when
@@ -7,7 +9,13 @@ use super::RuntimeToolCall;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GateDecision {
     Execute,
-    Deny { message: String },
+    Deny {
+        message: String,
+    },
+    Fail {
+        kind: RunFailureKind,
+        message: String,
+    },
 }
 
 pub(crate) type ToolGateFuture = Pin<Box<dyn Future<Output = GateDecision> + Send + 'static>>;

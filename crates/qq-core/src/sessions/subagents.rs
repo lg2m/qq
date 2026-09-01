@@ -221,6 +221,7 @@ impl Drop for CancelChildOnDrop {
                     command_id,
                     SessionCommand::CancelRun { run_id },
                     WorkspaceGrantSeed::default(),
+                    None,
                 )
                 .await
             else {

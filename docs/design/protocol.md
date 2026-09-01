@@ -443,8 +443,9 @@ Resolution values: `approved_once`, `approved_for_session`,
 transaction, so the waiting run proceeds immediately — and additionally
 requests that the grant be written into the workspace's `.qq/config.ron`
 policy section. That durable write happens after the approval commits and
-its fate arrives as a separate `workspace_grant_promoted` event carrying
-one of:
+is first recorded in a bounded SQLite outbox in the same transaction. One
+serial worker drains that outbox and atomically removes each entry with its
+separate `workspace_grant_promoted` fate event, carrying one of:
 
 ```json
 { "type": "written", "path": "/repo/.qq/config.ron" }
@@ -455,7 +456,10 @@ one of:
 A `failed` outcome (managed-layer deny, IO error) is informational only:
 the approval stands and the session grant remains in force. Retrying the
 `respond_tool_approval` command with the same `command_id` replays the
-original receipt and does not re-run the promotion.
+original receipt and does not enqueue a duplicate promotion. If the process
+stops after accepting the approval, startup resumes the existing outbox entry;
+the configuration write is idempotent, so recovery normally observes
+`already_present` when the file write landed before the interruption.
 
 ### `POST /v1/sessions/approval-mode`
 
