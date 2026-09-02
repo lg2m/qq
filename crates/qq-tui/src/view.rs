@@ -13,7 +13,7 @@ use crossterm::{
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
-    terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
+    terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use qq_protocol::{
@@ -578,8 +578,10 @@ impl<'a> VirtualBody<'a> {
 }
 
 impl FrameRenderer {
-    pub fn draw(&mut self, app: &mut App) -> io::Result<Vec<u8>> {
-        let actual_size = terminal::size()?;
+    /// Render one frame for a terminal of `actual_size` columns and rows and
+    /// return the bytes that bring the terminal from the previous frame to
+    /// this one. Only changed rows are emitted unless the size changed.
+    pub fn draw(&mut self, app: &mut App, actual_size: (u16, u16)) -> io::Result<Vec<u8>> {
         let width = actual_size.0.clamp(1, MAX_RENDER_WIDTH);
         let height = actual_size.1.clamp(1, MAX_RENDER_HEIGHT);
         let frame = self.frame(app, usize::from(width), usize::from(height));
@@ -4831,84 +4833,6 @@ mod tests {
             .map(|span| span.text.len())
             .sum::<usize>();
         assert!(emitted_bytes <= MAX_PLAIN_TEXT_ROW_BYTES + 3);
-    }
-
-    #[test]
-    #[ignore = "manual rendering benchmark; run in release mode with --ignored --nocapture"]
-    fn completed_transcript_render_benchmark() {
-        use std::{hint::black_box, time::Instant};
-
-        let mut worst_case = app_with_messages(1);
-        let message = &mut worst_case
-            .sessions
-            .get_mut(&worst_case.focused.unwrap())
-            .unwrap()
-            .messages
-            .as_mut()
-            .unwrap()[0];
-        message.output = "output row\n".repeat(700_000);
-        message.refusal = "refusal row\n".repeat(600_000);
-
-        let mut renderer = FrameRenderer::default();
-        let started = Instant::now();
-        let rows = {
-            let body = renderer.transcript(&worst_case, 120);
-            black_box(body.rows)
-        };
-        let completion = started.elapsed();
-
-        let iterations = 1_000_u32;
-        let started = Instant::now();
-        for _ in 0..iterations {
-            let body = renderer.transcript(&worst_case, 120);
-            black_box(body.viewport(&worst_case, 40, 0));
-        }
-        let viewport = started.elapsed() / iterations;
-
-        let mut snapshot = app_with_messages(MAX_VISIBLE_MESSAGES as u8);
-        for message in snapshot
-            .sessions
-            .get_mut(&snapshot.focused.unwrap())
-            .unwrap()
-            .messages
-            .as_mut()
-            .unwrap()
-        {
-            message.output = "snapshot row\n".repeat(12_000);
-        }
-        let mut snapshot_renderer = FrameRenderer::default();
-        let started = Instant::now();
-        let snapshot_rows = {
-            let body = snapshot_renderer.transcript(&snapshot, 120);
-            black_box(body.rows)
-        };
-        let initial_snapshot = started.elapsed();
-
-        let mut zero_width = app_with_messages(1);
-        zero_width
-            .sessions
-            .get_mut(&zero_width.focused.unwrap())
-            .unwrap()
-            .messages
-            .as_mut()
-            .unwrap()[0]
-            .output = format!("a{}", "\u{0301}".repeat(512 * 1024));
-        let mut zero_width_renderer = FrameRenderer::default();
-        let started = Instant::now();
-        let zero_width_rows = {
-            let body = zero_width_renderer.transcript(&zero_width, 120);
-            let viewport = body.viewport(&zero_width, 40, 0);
-            black_box(viewport);
-            black_box(body.rows)
-        };
-        let zero_width_completion = started.elapsed();
-
-        println!(
-            "worst_completion={completion:?} rows={rows}; \
-             steady_viewport={viewport:?}; \
-             initial_64_message_snapshot={initial_snapshot:?} rows={snapshot_rows}; \
-             zero_width_completion={zero_width_completion:?} rows={zero_width_rows}"
-        );
     }
 
     #[test]

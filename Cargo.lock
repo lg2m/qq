@@ -2759,6 +2759,7 @@ dependencies = [
  "pulldown-cmark",
  "qq-client",
  "qq-protocol",
+ "qq-tui",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",

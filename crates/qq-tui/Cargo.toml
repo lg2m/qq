@@ -29,3 +29,16 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
 tree-sitter-yaml = "0.7"
 unicode-width = "0.2"
+
+[features]
+# Exposes deterministic fixtures and a frame driver to this package's own
+# render benchmark via the self dev-dependency below. Not a public API.
+bench-support = []
+
+[dev-dependencies]
+qq-tui = { path = ".", features = ["bench-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "render"
+harness = false

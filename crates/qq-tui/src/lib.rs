@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod app;
+#[cfg(feature = "bench-support")]
+pub mod bench_support;
 mod composer;
 mod settings;
 mod terminal;

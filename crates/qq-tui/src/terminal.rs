@@ -1,19 +1,22 @@
-use std::io::{self, stdout};
+use std::{
+    future::Future,
+    io::{self, stdout},
+};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Attribute, Print, ResetColor, SetAttribute},
     terminal::{self, Clear, ClearType, EndSynchronizedUpdate},
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncWrite, AsyncWriteExt},
     time::{Duration, MissedTickBehavior, interval},
 };
 
@@ -23,7 +26,11 @@ use crate::{
     view::FrameRenderer,
 };
 
-pub async fn run<P>(mut client: P, mut app: App) -> Result<(), TuiError>
+/// Interval between frame ticks. Frames are only drawn when state changed.
+pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(8);
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(125);
+
+pub async fn run<P>(client: P, app: App) -> Result<(), TuiError>
 where
     P: ClientPort,
 {
@@ -36,11 +43,35 @@ where
     }
 
     let _terminal = TerminalGuard::enter()?;
-    let mut terminal_events = EventStream::new();
-    let mut output = tokio::io::stdout();
+    let events = EventStream::new();
+    let output = tokio::io::stdout();
+    run_loop(client, app, events, output, terminal::size, shutdown)
+        .await
+        .map(drop)
+}
+
+/// The event loop with every terminal dependency injected so it runs without a
+/// TTY in tests and benchmarks. Returns the final application state so callers
+/// can inspect it after the loop exits.
+pub(crate) async fn run_loop<P, E, W, S, F>(
+    mut client: P,
+    mut app: App,
+    mut terminal_events: E,
+    mut output: W,
+    mut size: S,
+    shutdown: F,
+) -> Result<App, TuiError>
+where
+    P: ClientPort,
+    E: Stream<Item = io::Result<Event>> + Unpin,
+    W: AsyncWrite + Unpin,
+    S: FnMut() -> io::Result<(u16, u16)>,
+    F: Future<Output = io::Result<()>>,
+{
+    tokio::pin!(shutdown);
     let mut renderer = FrameRenderer::default();
-    let mut frame_tick = interval(Duration::from_millis(8));
-    let mut animation_tick = interval(Duration::from_millis(125));
+    let mut frame_tick = interval(FRAME_INTERVAL);
+    let mut animation_tick = interval(ANIMATION_INTERVAL);
     frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     animation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -82,7 +113,7 @@ where
                 dirty |= app.advance_animation();
             }
             _ = frame_tick.tick(), if dirty => {
-                let bytes = renderer.draw(&mut app)?;
+                let bytes = renderer.draw(&mut app, size()?)?;
                 output.write_all(&bytes).await?;
                 output.flush().await?;
                 dirty = false;
@@ -92,7 +123,7 @@ where
             break;
         }
     }
-    Ok(())
+    Ok(app)
 }
 
 fn apply_send_failure(app: &mut App, request: ClientRequest, error: crate::ClientFailure) -> bool {
@@ -186,7 +217,239 @@ async fn shutdown_signal() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use qq_protocol::{
+        EventCursor, MessageId, MessageRole, MessageSnapshot, MessageState, RunId, SessionEvent,
+        SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SessionSummary, StoreId,
+        TextChannel, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    };
+    use tokio::sync::mpsc;
+
     use super::*;
+    use crate::{ClientFailure, ConnectionState, TuiOptions};
+
+    /// Deterministic `ClientPort`: updates are fed from a channel, requests are
+    /// recorded, and `try_send` fails once the configured capacity is reached.
+    struct FakePort {
+        updates: mpsc::UnboundedReceiver<ClientUpdate>,
+        sent: Arc<Mutex<Vec<ClientRequest>>>,
+        capacity: usize,
+    }
+
+    impl ClientPort for FakePort {
+        fn try_send(&self, request: ClientRequest) -> Result<(), ClientFailure> {
+            let mut sent = self.sent.lock().expect("request log lock");
+            if sent.len() >= self.capacity {
+                return Err(ClientFailure::new("request queue is full"));
+            }
+            sent.push(request);
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Option<ClientUpdate> {
+            self.updates.recv().await
+        }
+    }
+
+    /// A shared async byte sink that records every frame written by the loop.
+    #[derive(Clone, Default)]
+    struct FrameLog(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl FrameLog {
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.0.lock().expect("frame log lock").clone()
+        }
+    }
+
+    impl AsyncWrite for FrameLog {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().expect("frame log lock").push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Adapts an unbounded receiver into the `Stream` the loop expects.
+    struct EventQueue(mpsc::UnboundedReceiver<io::Result<Event>>);
+
+    impl Stream for EventQueue {
+        type Item = io::Result<Event>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    struct Harness {
+        updates: mpsc::UnboundedSender<ClientUpdate>,
+        events: mpsc::UnboundedSender<io::Result<Event>>,
+        sent: Arc<Mutex<Vec<ClientRequest>>>,
+        frames: FrameLog,
+        port: Option<FakePort>,
+        event_stream: Option<EventQueue>,
+    }
+
+    impl Harness {
+        fn new(capacity: usize) -> Self {
+            let (updates, update_rx) = mpsc::unbounded_channel();
+            let (events, event_rx) = mpsc::unbounded_channel();
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            Self {
+                updates,
+                events,
+                sent: Arc::clone(&sent),
+                frames: FrameLog::default(),
+                port: Some(FakePort {
+                    updates: update_rx,
+                    sent,
+                    capacity,
+                }),
+                event_stream: Some(EventQueue(event_rx)),
+            }
+        }
+
+        fn key(&self, code: KeyCode, modifiers: KeyModifiers) {
+            self.events
+                .send(Ok(Event::Key(KeyEvent::new(code, modifiers))))
+                .expect("event channel open");
+        }
+
+        fn update(&self, update: ClientUpdate) {
+            self.updates.send(update).expect("update channel open");
+        }
+
+        /// Spawn the loop on the paused runtime. Test steps then interleave
+        /// sends with [`Harness::settle`] so ordering is explicit rather than a
+        /// consequence of `select!` bias.
+        fn spawn(&mut self, app: App) -> tokio::task::JoinHandle<Result<App, TuiError>> {
+            let port = self.port.take().expect("harness runs once");
+            let events = self.event_stream.take().expect("harness runs once");
+            let frames = self.frames.clone();
+            tokio::spawn(run_loop(
+                port,
+                app,
+                events,
+                frames,
+                || Ok((100, 30)),
+                std::future::pending(),
+            ))
+        }
+
+        /// Advance paused time far enough for pending input to be handled and
+        /// any dirty frame to be drawn.
+        async fn settle(&self) {
+            tokio::time::advance(FRAME_INTERVAL * 3).await;
+            tokio::task::yield_now().await;
+        }
+
+        fn quit(&self) {
+            self.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        }
+
+        fn sent(&self) -> Vec<ClientRequest> {
+            self.sent.lock().expect("request log lock").clone()
+        }
+    }
+
+    fn workspace_id() -> WorkspaceId {
+        WorkspaceId::from_bytes([1; 16])
+    }
+
+    fn session_id() -> SessionId {
+        SessionId::from_bytes([2; 16])
+    }
+
+    fn summary() -> SessionSummary {
+        SessionSummary {
+            id: session_id(),
+            workspace_id: workspace_id(),
+            parent_id: None,
+            title: "Session".to_owned(),
+            status: SessionStatus::Idle,
+            active_run_id: None,
+            queued_prompts: 0,
+            model: Some("openai/gpt-test".to_owned()),
+            context_tokens: None,
+            accounting: None,
+            estimated_cost_usd_nanos: Some(0),
+            updated_at_ms: 1,
+            last_outcome: None,
+        }
+    }
+
+    fn snapshot(sequence: u64, messages: Vec<MessageSnapshot>) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            cursor: EventCursor {
+                store_id: StoreId::from_bytes([3; 16]),
+                workspace_id: workspace_id(),
+                sequence,
+            },
+            workspace: WorkspaceSummary {
+                id: workspace_id(),
+                path: "/workspace".to_owned(),
+            },
+            sessions: vec![summary()],
+            focused: Some(SessionSnapshot {
+                summary: summary(),
+                messages,
+                runs: Vec::new(),
+                tool_calls: Vec::new(),
+                has_older_tool_calls: false,
+                has_older_messages: false,
+            }),
+            has_older_sessions: false,
+        }
+    }
+
+    fn assistant_message(byte: u8, output: &str) -> MessageSnapshot {
+        MessageSnapshot {
+            id: MessageId::from_bytes([byte; 16]),
+            session_id: session_id(),
+            run_id: RunId::from_bytes([9; 16]),
+            turn_ordinal: 1,
+            role: MessageRole::Assistant,
+            state: MessageState::Streaming,
+            output: output.to_owned(),
+            refusal: String::new(),
+            created_at_ms: 1,
+        }
+    }
+
+    fn envelope(sequence: u64, event: SessionEvent) -> SessionEventEnvelope {
+        SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: StoreId::from_bytes([3; 16]),
+                workspace_id: workspace_id(),
+                sequence,
+            },
+            session_id: session_id(),
+            run_id: Some(RunId::from_bytes([9; 16])),
+            caused_by: None,
+            occurred_at_ms: 1,
+            event,
+        }
+    }
+
+    fn frame_text(frame: &[u8]) -> String {
+        String::from_utf8_lossy(frame).into_owned()
+    }
 
     #[test]
     fn terminal_input_modes_enable_and_restore_keyboard_mouse_and_paste() {
@@ -205,5 +468,138 @@ mod tests {
         assert!(restored.contains("\x1b[?1000l"));
         assert!(restored.contains("\x1b[?2004l"));
         assert!(restored.contains("\x1b[<1u"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_draws_first_frame_then_only_when_state_changes() {
+        let mut harness = Harness::new(64);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        harness.settle().await;
+        assert_eq!(harness.frames.frames().len(), 1, "initial frame");
+
+        // Idle: many ticks pass and nothing is redrawn.
+        tokio::time::advance(FRAME_INTERVAL * 20).await;
+        tokio::task::yield_now().await;
+        assert_eq!(harness.frames.frames().len(), 1, "no redraw while idle");
+
+        // A state change redraws exactly once.
+        harness.update(ClientUpdate::Connection(ConnectionState::Live));
+        harness.settle().await;
+        let frames = harness.frames.frames();
+        assert_eq!(frames.len(), 2, "one frame per dirty interval");
+        assert!(frame_text(&frames[0]).contains("connecting"));
+        assert!(!frame_text(&frames[1]).contains("connecting"));
+
+        harness.quit();
+        let app = task.await.expect("loop task").expect("loop exits cleanly");
+        assert!(app.quit);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_records_send_failures_as_local_updates() {
+        // Capacity zero: every outbound request fails at the port, which the
+        // loop must turn into a local failure update instead of dropping it.
+        let mut harness = Harness::new(0);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        harness.update(ClientUpdate::Snapshot(snapshot(1, Vec::new())));
+        harness.update(ClientUpdate::Connection(ConnectionState::Live));
+        harness.settle().await;
+
+        harness.key(KeyCode::Char('h'), KeyModifiers::NONE);
+        harness.key(KeyCode::Char('i'), KeyModifiers::NONE);
+        harness.key(KeyCode::Enter, KeyModifiers::NONE);
+        harness.settle().await;
+        harness.quit();
+        let app = task.await.expect("loop task").expect("loop exits cleanly");
+
+        assert!(harness.sent().is_empty());
+        // The rejected submit is restored into the composer for the user.
+        assert_eq!(app.composer.text, "hi");
+        let (status, _) = app.visible_status().expect("failure notice is shown");
+        assert!(status.contains("request queue is full"), "{status}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_sends_requests_when_the_port_accepts_them() {
+        let mut harness = Harness::new(64);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        harness.update(ClientUpdate::Snapshot(snapshot(1, Vec::new())));
+        harness.update(ClientUpdate::Connection(ConnectionState::Live));
+        harness.settle().await;
+
+        harness.key(KeyCode::Char('h'), KeyModifiers::NONE);
+        harness.key(KeyCode::Enter, KeyModifiers::NONE);
+        harness.settle().await;
+        harness.quit();
+        let app = task.await.expect("loop task").expect("loop exits cleanly");
+
+        let sent = harness.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(matches!(sent[0], ClientRequest::Command(_)));
+        assert!(app.composer.text.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_marks_replaying_on_sequence_gap_and_recovers_from_reset_snapshot() {
+        let mut harness = Harness::new(64);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        harness.update(ClientUpdate::Snapshot(snapshot(1, Vec::new())));
+        harness.update(ClientUpdate::Connection(ConnectionState::Live));
+        harness.update(ClientUpdate::Event(envelope(
+            2,
+            SessionEvent::AssistantMessageStarted {
+                message: assistant_message(7, ""),
+            },
+        )));
+        // Sequence 3 is missing: the loop must surface a replay state rather
+        // than silently render a transcript with a hole in it.
+        harness.update(ClientUpdate::Event(envelope(
+            4,
+            SessionEvent::TextAppended {
+                message_id: MessageId::from_bytes([7; 16]),
+                channel: TextChannel::Output,
+                text: "late".to_owned(),
+            },
+        )));
+        harness.settle().await;
+        let frames = harness.frames.frames();
+        assert!(
+            frames
+                .last()
+                .is_some_and(|frame| frame_text(frame).contains("reconnecting")),
+            "the latest frame should show the replay state"
+        );
+
+        // The client recovers by replacing every loaded body with a reset
+        // snapshot at the new cursor.
+        let mut complete = assistant_message(7, "late");
+        complete.state = MessageState::Complete;
+        harness.update(ClientUpdate::ResetSnapshot(snapshot(4, vec![complete])));
+        harness.update(ClientUpdate::Connection(ConnectionState::Live));
+        harness.settle().await;
+        harness.quit();
+        let app = task.await.expect("loop task").expect("loop exits cleanly");
+
+        assert_eq!(app.connection, ConnectionState::Live);
+        let session = app.sessions.get(&session_id()).expect("session loaded");
+        let messages = session.messages.as_ref().expect("body loaded");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].output, "late");
+        assert_eq!(messages[0].state, MessageState::Complete);
+        assert!(
+            !frame_text(harness.frames.frames().last().expect("frame")).contains("reconnecting")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_reports_client_stop() {
+        let mut harness = Harness::new(64);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        drop(std::mem::replace(
+            &mut harness.updates,
+            mpsc::unbounded_channel().0,
+        ));
+        let result = task.await.expect("loop task");
+        assert!(matches!(result, Err(TuiError::ClientStopped)));
     }
 }

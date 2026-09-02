@@ -1,0 +1,132 @@
+//! TUI render-path benchmark.
+//!
+//! Measures the cost of building and diffing one frame in the situations the
+//! TUI rearchitecture plan budgets: a steady transcript, one streaming message,
+//! many background streaming sessions, and a keystroke echo. Every case runs
+//! fully in memory with a fixed 160x48 terminal; no TTY or client transport is
+//! involved. Run with `cargo bench -p qq-tui --bench render`.
+
+use std::{hint::black_box, time::Instant};
+
+use qq_tui::bench_support::BenchHarness;
+
+const SIZE: (u16, u16) = (160, 48);
+const DEFAULT_ITERATIONS: u32 = 2_000;
+const WARMUP: u32 = 200;
+const STEADY_MESSAGES: u8 = 64;
+const BACKGROUND_SESSIONS: u8 = 8;
+const DELTA: &str = "streamed text that keeps arriving in small pieces ";
+
+fn main() {
+    let iterations = std::env::var("QQ_BENCH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_ITERATIONS);
+
+    steady_state(iterations);
+    streaming_focused(iterations);
+    streaming_background(iterations);
+    keystroke_echo(iterations);
+}
+
+/// Sixty-four completed messages, no changes between frames. Measures the
+/// fixed per-frame cost of rebuilding the frame model and diffing it.
+fn steady_state(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    let first = timed(|| harness.draw());
+    report("steady_state_first_frame", first.0, 1, first.1);
+    let samples = collect(iterations, || harness.draw().len());
+    report_samples("steady_state_frame", &samples);
+}
+
+/// One streaming message in the focused session receiving one delta per frame.
+fn streaming_focused(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    let message = harness.start_stream(0);
+    black_box(harness.draw());
+    let samples = collect(iterations, || {
+        harness.append(0, message, DELTA);
+        harness.draw().len()
+    });
+    report_samples("streaming_focused_delta_to_frame", &samples);
+}
+
+/// Eight unfocused sessions each receiving one delta per frame while the
+/// focused session is idle. Today those deltas only touch summaries; the plan
+/// requires the cost to stay within 1.2x of the single-session case once they
+/// feed live status.
+fn streaming_background(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, BACKGROUND_SESSIONS + 1, STEADY_MESSAGES);
+    let messages: Vec<_> = (1..=BACKGROUND_SESSIONS)
+        .map(|index| (index, harness.start_stream(index)))
+        .collect();
+    black_box(harness.draw());
+    let samples = collect(iterations, || {
+        for (index, message) in &messages {
+            harness.append(*index, *message, DELTA);
+        }
+        harness.draw().len()
+    });
+    report_samples("streaming_background_8_delta_to_frame", &samples);
+}
+
+/// One typed character followed by a frame. This is the latency a user feels
+/// most directly.
+fn keystroke_echo(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    black_box(harness.draw());
+    let mut alphabet = ('a'..='z').cycle();
+    let samples = collect(iterations, || {
+        let character = alphabet.next().expect("cycle is infinite");
+        harness.keystroke(character);
+        harness.draw().len()
+    });
+    report_samples("keystroke_to_frame", &samples);
+}
+
+fn timed<T>(mut work: impl FnMut() -> T) -> (u128, T) {
+    let started = Instant::now();
+    let value = work();
+    (started.elapsed().as_nanos(), value)
+}
+
+fn collect(iterations: u32, mut work: impl FnMut() -> usize) -> Vec<u128> {
+    for _ in 0..WARMUP {
+        black_box(work());
+    }
+    (0..iterations)
+        .map(|_| {
+            let started = Instant::now();
+            black_box(work());
+            started.elapsed().as_nanos()
+        })
+        .collect()
+}
+
+fn report_samples(name: &str, samples: &[u128]) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let percentile = |fraction: f64| {
+        let index = ((sorted.len() as f64 - 1.0) * fraction).round() as usize;
+        sorted[index]
+    };
+    println!(
+        "{name}: median={} p95={} p99={} ({} samples)",
+        micros(percentile(0.5)),
+        micros(percentile(0.95)),
+        micros(percentile(0.99)),
+        sorted.len()
+    );
+}
+
+fn report(name: &str, nanos: u128, samples: usize, bytes: Vec<u8>) {
+    println!(
+        "{name}: {} ({samples} sample, {} frame bytes)",
+        micros(nanos),
+        bytes.len()
+    );
+}
+
+fn micros(nanos: u128) -> String {
+    format!("{:.1} us", nanos as f64 / 1_000.0)
+}
