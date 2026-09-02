@@ -1,32 +1,42 @@
+//! Frame assembly: composes chrome, transcript, and overlays into the lines
+//! the renderer diffs against the previous frame.
+
+mod markdown;
+mod wrap;
+
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io,
-    io::Write,
     ops::Range,
-    sync::OnceLock,
 };
 
 use crossterm::{
     cursor::MoveTo,
     queue,
-    style::{
-        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    },
+    style::{Attribute, ResetColor, SetAttribute},
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use qq_protocol::{
     MessageId, MessageRole, MessageSnapshot, MessageState, SessionId, SessionStatus,
     ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
 };
-use tree_sitter::Language;
-use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
     Layout,
     app::{App, ToolDetail, terminal_safe_character},
+    input::{Mode, SessionConfirm},
+    render::{
+        Line, Style, accent, brand, diff_line_style, failure, muted, normal, warning, write_line,
+    },
+};
+use markdown::markdown_lines;
+#[cfg(test)]
+use wrap::transcript_viewport;
+use wrap::{
+    bounded_tail, fit_height, indent_lines, preview, selection_viewport, truncate_line, wrap_line,
+    wrap_line_chars,
 };
 
 const MAX_RENDER_WIDTH: u16 = 320;
@@ -57,184 +67,6 @@ const MAX_LIVE_TAIL_ROWS: usize = 6;
 const TOOL_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Style {
-    color: Option<Color>,
-    background: Option<Color>,
-    bold: bool,
-    dim: bool,
-    italic: bool,
-}
-
-impl Style {
-    const fn color(color: Color) -> Self {
-        Self {
-            color: Some(color),
-            background: None,
-            bold: false,
-            dim: false,
-            italic: false,
-        }
-    }
-
-    const fn on(mut self, background: Color) -> Self {
-        self.background = Some(background);
-        self
-    }
-
-    const fn bold(mut self) -> Self {
-        self.bold = true;
-        self
-    }
-
-    const fn dim(mut self) -> Self {
-        self.dim = true;
-        self
-    }
-
-    const fn italic(mut self) -> Self {
-        self.italic = true;
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Span {
-    text: String,
-    style: Style,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Line {
-    spans: Vec<Span>,
-}
-
-impl Line {
-    fn styled(text: impl Into<String>, style: Style) -> Self {
-        Self {
-            spans: vec![Span {
-                text: text.into(),
-                style,
-            }],
-        }
-    }
-
-    fn push(&mut self, text: impl Into<String>, style: Style) {
-        let text = text.into();
-        if text.is_empty() {
-            return;
-        }
-        if let Some(last) = self.spans.last_mut()
-            && last.style == style
-        {
-            last.text.push_str(&text);
-            return;
-        }
-        self.spans.push(Span { text, style });
-    }
-
-    fn width(&self) -> usize {
-        self.spans
-            .iter()
-            .flat_map(|span| span.text.chars())
-            .map(|character| UnicodeWidthChar::width(character).unwrap_or_default())
-            .sum()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.spans.iter().all(|span| span.text.is_empty())
-    }
-}
-
-fn normal() -> Style {
-    Style::color(Color::White)
-}
-
-fn muted() -> Style {
-    Style::color(Color::DarkGrey).dim()
-}
-
-fn accent() -> Style {
-    Style::color(Color::Cyan)
-}
-
-fn brand() -> Style {
-    Style::color(Color::Rgb {
-        r: 255,
-        g: 159,
-        b: 67,
-    })
-}
-
-fn warning() -> Style {
-    Style::color(Color::Yellow)
-}
-
-fn failure() -> Style {
-    Style::color(Color::Red)
-}
-
-fn success() -> Style {
-    Style::color(Color::Green)
-}
-
-/// Dark surface tint behind code-block panels, distinct from the terminal
-/// background so a padded block reads as one solid slab.
-const SURFACE_COLOR: Color = Color::Rgb {
-    r: 38,
-    g: 40,
-    b: 48,
-};
-
-fn surface(style: Style) -> Style {
-    style.on(SURFACE_COLOR)
-}
-
-/// Syntax palette for highlighted code panels: restrained named colors that
-/// stay readable on the dark surface tint. Anything a grammar leaves
-/// uncaptured keeps the plain panel text style.
-fn code_keyword() -> Style {
-    Style::color(Color::Magenta)
-}
-
-fn code_string() -> Style {
-    Style::color(Color::Green)
-}
-
-fn code_comment() -> Style {
-    Style::color(Color::DarkGrey).italic()
-}
-
-fn code_function() -> Style {
-    Style::color(Color::Cyan)
-}
-
-fn code_type() -> Style {
-    Style::color(Color::Yellow)
-}
-
-fn code_constant() -> Style {
-    Style::color(Color::DarkYellow)
-}
-
-fn code_property() -> Style {
-    Style::color(Color::Blue)
-}
-
-/// Unified-diff line coloring: additions green, removals red, hunk headers in
-/// the muted accent, context lines normal. Diff lines never reflow.
-fn diff_line_style(line: &str) -> Style {
-    if line.starts_with("@@") {
-        accent().dim()
-    } else if line.starts_with('+') {
-        success()
-    } else if line.starts_with('-') {
-        failure()
-    } else {
-        normal()
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct FrameRenderer {
@@ -645,31 +477,30 @@ impl FrameRenderer {
         let body_height = height
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(composer_lines.len());
-        let overlay = app.model_picker.is_some()
-            || app.session_picker.is_some()
-            || app.pending_approval().is_some();
-        let mut body = if overlay {
-            self.prune_markdown(app);
-            if app.model_picker.is_some() {
-                model_picker(app, width, body_height)
-            } else if app.session_picker.is_some() {
-                session_picker(app, width, body_height)
-            } else {
-                approval_prompt(app, width, body_height)
+        let mode = app.mode();
+        let mut body = match mode {
+            Mode::Models | Mode::Sessions | Mode::Approval => {
+                self.prune_markdown(app);
+                match mode {
+                    Mode::Models => model_picker(app, width, body_height),
+                    Mode::Sessions => session_picker(app, width, body_height),
+                    Mode::Approval | Mode::Compose => approval_prompt(app, width, body_height),
+                }
             }
-        } else {
-            let body = match app.layout {
-                Layout::Threadline => self.threadline(app, width),
-                Layout::FoldFocus => self.fold_focus(app, width),
-            };
-            app.update_transcript_viewport(body.rows, body_height, body.preserve_tail_anchor);
-            let live_message_ranges = body.live_message_ranges.clone();
-            let viewport = body.viewport(app, body_height, app.transcript_scroll_offset());
-            drop(body);
-            self.live_message_ranges = live_message_ranges.into_iter().collect();
-            viewport
+            Mode::Compose => {
+                let body = match app.layout {
+                    Layout::Threadline => self.threadline(app, width),
+                    Layout::FoldFocus => self.fold_focus(app, width),
+                };
+                app.update_transcript_viewport(body.rows, body_height, body.preserve_tail_anchor);
+                let live_message_ranges = body.live_message_ranges.clone();
+                let viewport = body.viewport(app, body_height, app.transcript_scroll_offset());
+                drop(body);
+                self.live_message_ranges = live_message_ranges.into_iter().collect();
+                viewport
+            }
         };
-        if !overlay {
+        if mode == Mode::Compose {
             overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
         }
         lines.extend(body);
@@ -681,10 +512,7 @@ impl FrameRenderer {
     }
 
     fn prune_markdown(&mut self, app: &App) {
-        let visible = if app.session_picker.is_none()
-            && app.model_picker.is_none()
-            && app.pending_approval().is_none()
-        {
+        let visible = if app.mode() == Mode::Compose {
             app.focused
                 .and_then(|session_id| app.sessions.get(&session_id))
                 .and_then(|session| {
@@ -1650,41 +1478,32 @@ fn status_notice(app: &App, width: usize) -> Vec<Line> {
 }
 
 fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
-    let picker = app.session_picker.as_ref().expect("session picker is open");
+    let query = app
+        .overlay
+        .as_ref()
+        .map_or("", |overlay| overlay.picker().query.as_str());
+    let confirm = app.session_picker_confirm();
+    let selected = app.session_picker_selected();
     let filtered = app.filtered_sessions();
     let mut lines = vec![section(
         "SESSIONS",
-        if picker.confirm.is_some() {
+        if confirm.is_some() {
             "y confirms, n or Esc cancels"
         } else {
             "type to search, Enter focuses, Ctrl-D deletes, Ctrl-P prunes empty, Esc closes"
         },
     )];
-    lines.push(Line::styled(
-        format!(
-            "  search: {}",
-            if picker.query.is_empty() {
-                "all sessions"
-            } else {
-                &picker.query
-            }
-        ),
-        if picker.query.is_empty() {
-            muted()
-        } else {
-            accent()
-        },
-    ));
-    if let Some(confirm) = picker.confirm {
+    lines.push(search_line(query, "all sessions"));
+    if let Some(confirm) = confirm {
         let question = match confirm {
-            crate::app::SessionPickerConfirm::Delete(session_id) => {
+            SessionConfirm::Delete(session_id) => {
                 let title = app
                     .sessions
                     .get(&session_id)
                     .map_or("this session", |session| session.summary.title.as_str());
                 format!("  ◇ delete '{title}'? y deletes, n keeps")
             }
-            crate::app::SessionPickerConfirm::Prune => {
+            SessionConfirm::Prune => {
                 "  ◇ delete every empty session in this workspace? y deletes, n keeps".to_owned()
             }
         };
@@ -1710,14 +1529,14 @@ fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     let mut selected_row = 0;
     for session_id in filtered {
         let depth = app.depth(session_id);
-        let selected = picker.selected == Some(session_id);
-        if selected {
+        let is_selected = selected == Some(session_id);
+        if is_selected {
             selected_row = results.len();
         }
         let prefix = format!(
             "  {}{} ",
             "  ".repeat(depth),
-            if selected { ">" } else { " " }
+            if is_selected { ">" } else { " " }
         );
         results.push(session_line(app, session_id, width, &prefix));
     }
@@ -1730,8 +1549,22 @@ fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     fit_height(lines, height)
 }
 
+/// The `search:` row shared by every picker.
+fn search_line(query: &str, placeholder: &str) -> Line {
+    Line::styled(
+        format!(
+            "  search: {}",
+            if query.is_empty() { placeholder } else { query }
+        ),
+        if query.is_empty() { muted() } else { accent() },
+    )
+}
+
 fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
-    let picker = app.model_picker.as_ref().expect("model picker is open");
+    let picker = match &app.overlay {
+        Some(overlay) => overlay.picker(),
+        None => return fit_height(Vec::new(), height),
+    };
     let filtered = app.filtered_models();
     let mut lines = vec![section(
         "MODELS",
@@ -1741,21 +1574,7 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
             "type to search, Up/Down select, Enter creates session, Esc closes"
         },
     )];
-    lines.push(Line::styled(
-        format!(
-            "  search: {}",
-            if picker.query.is_empty() {
-                "all models"
-            } else {
-                &picker.query
-            }
-        ),
-        if picker.query.is_empty() {
-            muted()
-        } else {
-            accent()
-        },
-    ));
+    lines.push(search_line(&picker.query, "all models"));
     lines.push(Line::default());
     if filtered.is_empty() {
         lines.push(Line::styled("  No matching models.", muted().italic()));
@@ -1765,6 +1584,7 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     let mut results = Vec::new();
     let mut selected_row = 0;
     let mut provider = None;
+    let selected_position = picker.selected(filtered.len());
     for (position, index) in filtered.iter().enumerate() {
         let option = &app.models[*index];
         if provider != Some(option.provider.as_str()) {
@@ -1774,7 +1594,7 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
                 accent().bold(),
             ));
         }
-        let selected = position == picker.selected.min(filtered.len() - 1);
+        let selected = position == selected_position;
         if selected {
             selected_row = results.len();
         }
@@ -2047,7 +1867,7 @@ fn footer_workspace(app: &App, width: usize) -> Line {
 
 fn slash_autocomplete(app: &App, width: usize, height: usize) -> Vec<Line> {
     let commands = app.filtered_slash_commands();
-    let selected = app.slash_selected().min(commands.len().saturating_sub(1));
+    let selected = app.slash_selected(commands.len());
     let visible = height.min(commands.len());
     let start = selected
         .saturating_sub(visible.saturating_sub(1))
@@ -2067,7 +1887,7 @@ fn slash_autocomplete(app: &App, width: usize, height: usize) -> Vec<Line> {
                     normal()
                 },
             );
-            line.push(format!("  {}", command.description), muted());
+            line.push(format!("  {}", command.title), muted());
             truncate_line(line, width)
         })
         .collect()
@@ -2129,726 +1949,6 @@ fn status_style(state: MessageState) -> Style {
         MessageState::Failed => failure(),
     }
 }
-
-/// Lays markdown out as styled lines. `highlight` enables tree-sitter syntax
-/// coloring inside fenced code panels; it is only worth paying for content
-/// that renders once (terminal-state messages on the cached path), so
-/// streaming render paths pass `false` and get plain panels.
-fn markdown_lines(source: &str, width: usize, highlight: bool) -> Vec<Line> {
-    if source.is_empty() {
-        return Vec::new();
-    }
-    let mut lines = vec![Line::default()];
-    // Lines marked literal (code blocks, laid-out tables) keep character
-    // wrapping so column alignment survives; prose lines wrap at words.
-    let mut literal = vec![false];
-    let mut styles = vec![normal()];
-    let mut list_depth = 0_usize;
-    let mut table: Option<TableBuffer> = None;
-    let mut code_block: Option<CodeBlockBuffer> = None;
-    let parser = Parser::new_ext(source, Options::all());
-    for event in parser {
-        match event {
-            Event::Start(tag) => match tag {
-                Tag::Paragraph => {}
-                Tag::Heading { .. } => {
-                    ensure_line(&mut lines);
-                    // A blank line above the heading separates it from the
-                    // preceding block; a leading heading stays flush.
-                    if lines.len() > 1 {
-                        lines.push(Line::default());
-                    }
-                    styles.push(accent().bold());
-                }
-                Tag::Strong => {
-                    let mut style = *styles.last().expect("base style remains");
-                    style.bold = true;
-                    styles.push(style);
-                }
-                Tag::Emphasis => {
-                    let mut style = *styles.last().expect("base style remains");
-                    style.italic = true;
-                    styles.push(style);
-                }
-                Tag::CodeBlock(kind) => {
-                    ensure_line(&mut lines);
-                    code_block = Some(CodeBlockBuffer::new(&kind));
-                }
-                Tag::List(_) => list_depth += 1,
-                Tag::Item => {
-                    ensure_line(&mut lines);
-                    lines.last_mut().expect("line exists").push(
-                        format!("{}- ", "  ".repeat(list_depth.saturating_sub(1))),
-                        accent(),
-                    );
-                }
-                Tag::BlockQuote(_) => {
-                    ensure_line(&mut lines);
-                    lines.last_mut().expect("line exists").push("> ", muted());
-                }
-                Tag::Table(_) => table = Some(TableBuffer::default()),
-                Tag::TableHead => {
-                    if let Some(buffer) = table.as_mut() {
-                        buffer.has_header = true;
-                        buffer.begin_row();
-                    }
-                    let mut style = *styles.last().expect("base style remains");
-                    style.bold = true;
-                    styles.push(style);
-                }
-                Tag::TableRow => {
-                    if let Some(buffer) = table.as_mut() {
-                        buffer.begin_row();
-                    }
-                }
-                Tag::TableCell => {
-                    if let Some(buffer) = table.as_mut() {
-                        buffer.begin_cell();
-                    }
-                }
-                Tag::Link { .. }
-                | Tag::Image { .. }
-                | Tag::FootnoteDefinition(_)
-                | Tag::HtmlBlock
-                | Tag::DefinitionList
-                | Tag::DefinitionListTitle
-                | Tag::DefinitionListDefinition
-                | Tag::Strikethrough
-                | Tag::Subscript
-                | Tag::Superscript
-                | Tag::MetadataBlock(_) => {}
-            },
-            Event::End(tag) => match tag {
-                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::BlockQuote(_) => {
-                    ensure_line(&mut lines);
-                    if matches!(tag, TagEnd::Heading(_)) {
-                        styles.pop();
-                    }
-                }
-                TagEnd::CodeBlock => {
-                    if let Some(buffer) = code_block.take() {
-                        let rendered = layout_code_panel(&buffer, width.max(1), highlight);
-                        if lines.last().is_some_and(Line::is_empty) {
-                            lines.pop();
-                            literal.pop();
-                        }
-                        literal.resize(lines.len(), false);
-                        lines.extend(rendered);
-                        literal.resize(lines.len(), true);
-                        lines.push(Line::default());
-                    }
-                }
-                TagEnd::Strong | TagEnd::Emphasis => {
-                    styles.pop();
-                }
-                TagEnd::List(_) => list_depth = list_depth.saturating_sub(1),
-                TagEnd::Item => ensure_line(&mut lines),
-                TagEnd::Table => {
-                    if let Some(mut buffer) = table.take() {
-                        buffer.end_row();
-                        let rendered = layout_table(&buffer.rows, buffer.has_header, width.max(1));
-                        if !rendered.is_empty() {
-                            if lines.last().is_some_and(Line::is_empty) {
-                                lines.pop();
-                                literal.pop();
-                            }
-                            literal.resize(lines.len(), false);
-                            lines.extend(rendered);
-                            literal.resize(lines.len(), true);
-                            lines.push(Line::default());
-                        }
-                    }
-                }
-                TagEnd::TableHead => {
-                    styles.pop();
-                    if let Some(buffer) = table.as_mut() {
-                        buffer.end_row();
-                    }
-                }
-                TagEnd::TableRow => {
-                    if let Some(buffer) = table.as_mut() {
-                        buffer.end_row();
-                    }
-                }
-                TagEnd::Link
-                | TagEnd::Image
-                | TagEnd::FootnoteDefinition
-                | TagEnd::HtmlBlock
-                | TagEnd::DefinitionList
-                | TagEnd::DefinitionListTitle
-                | TagEnd::DefinitionListDefinition
-                | TagEnd::Strikethrough
-                | TagEnd::Subscript
-                | TagEnd::Superscript
-                | TagEnd::TableCell
-                | TagEnd::MetadataBlock(_) => {}
-            },
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                if let Some(buffer) = code_block.as_mut() {
-                    buffer.text.push_str(&text);
-                } else {
-                    let style = *styles.last().expect("base style remains");
-                    match table.as_mut() {
-                        Some(buffer) => buffer.append(&text, style),
-                        None => append_safe_text(&mut lines, &text, style),
-                    }
-                }
-            }
-            Event::Code(code) => {
-                push_inline(table.as_mut(), &mut lines, &code, warning().bold());
-            }
-            // A soft break is a source-formatting line break: render it as a
-            // space so paragraphs reflow to the terminal width.
-            Event::SoftBreak => {
-                push_inline(
-                    table.as_mut(),
-                    &mut lines,
-                    " ",
-                    *styles.last().expect("base style remains"),
-                );
-            }
-            Event::HardBreak => match table.as_mut() {
-                Some(buffer) => buffer.append(" ", normal()),
-                None => lines.push(Line::default()),
-            },
-            Event::Rule => {
-                ensure_line(&mut lines);
-                lines.push(Line::styled("------------", muted()));
-                lines.push(Line::default());
-            }
-            Event::TaskListMarker(checked) => push_inline(
-                table.as_mut(),
-                &mut lines,
-                if checked { "[x] " } else { "[ ] " },
-                accent(),
-            ),
-            Event::FootnoteReference(reference) => push_inline(
-                table.as_mut(),
-                &mut lines,
-                &format!("[{reference}]"),
-                accent(),
-            ),
-            Event::InlineMath(math) | Event::DisplayMath(math) => {
-                push_inline(table.as_mut(), &mut lines, &format!("${math}$"), warning());
-            }
-        }
-        literal.resize(lines.len(), false);
-    }
-    while lines.last().is_some_and(Line::is_empty) {
-        lines.pop();
-        literal.pop();
-    }
-    lines
-        .into_iter()
-        .zip(literal)
-        .flat_map(|(line, literal)| {
-            if literal {
-                wrap_line_chars(line, width.max(1))
-            } else {
-                wrap_line(line, width.max(1))
-            }
-        })
-        .collect()
-}
-
-/// Routes inline content to the open table cell when one exists, otherwise to
-/// the current transcript line.
-fn push_inline(table: Option<&mut TableBuffer>, lines: &mut [Line], text: &str, style: Style) {
-    match table {
-        Some(buffer) => buffer.append(text, style),
-        None => lines
-            .last_mut()
-            .expect("line exists")
-            .push(text.to_owned(), style),
-    }
-}
-
-/// Narrowest useful column; below this per column the table stacks instead.
-const TABLE_MIN_COLUMN_WIDTH: usize = 3;
-/// Display width of the " │ " column separator.
-const TABLE_SEPARATOR_WIDTH: usize = 3;
-
-/// Buffers one table's rows of styled cells while the parser walks it, so the
-/// layout can size columns from complete content.
-#[derive(Default)]
-struct TableBuffer {
-    rows: Vec<Vec<Line>>,
-    row: Option<Vec<Line>>,
-    has_header: bool,
-}
-
-impl TableBuffer {
-    fn begin_row(&mut self) {
-        self.end_row();
-        self.row = Some(Vec::new());
-    }
-
-    fn end_row(&mut self) {
-        if let Some(row) = self.row.take()
-            && !row.is_empty()
-        {
-            self.rows.push(row);
-        }
-    }
-
-    fn begin_cell(&mut self) {
-        self.row.get_or_insert_default().push(Line::default());
-    }
-
-    /// Appends inline content to the current cell, creating row and cell on
-    /// demand so malformed or partial input never panics.
-    fn append(&mut self, text: &str, style: Style) {
-        let row = self.row.get_or_insert_default();
-        if row.is_empty() {
-            row.push(Line::default());
-        }
-        let safe = text
-            .chars()
-            .filter_map(terminal_safe_character)
-            .collect::<String>();
-        row.last_mut().expect("cell exists").push(safe, style);
-    }
-}
-
-/// Lays a buffered table out as aligned columns sized from content. When the
-/// natural table overflows the width, columns shrink proportionally and cells
-/// wrap within their column; when even minimum columns cannot fit, rows stack
-/// as `header: value` lines.
-fn layout_table(rows: &[Vec<Line>], has_header: bool, width: usize) -> Vec<Line> {
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    if columns == 0 {
-        return Vec::new();
-    }
-    let overhead = TABLE_SEPARATOR_WIDTH * (columns - 1);
-    let available = width.saturating_sub(overhead);
-    if available < columns * TABLE_MIN_COLUMN_WIDTH {
-        return layout_table_stacked(rows, has_header, width);
-    }
-    let natural = (0..columns)
-        .map(|column| {
-            rows.iter()
-                .map(|row| row.get(column).map_or(0, Line::width))
-                .max()
-                .unwrap_or(0)
-                .max(1)
-        })
-        .collect::<Vec<_>>();
-    let mut widths = natural.clone();
-    if natural.iter().sum::<usize>() > available {
-        // Columns already within their fair share keep their natural width;
-        // repeat because each fixed column raises the fair share of the rest.
-        let mut remaining = available;
-        let mut flexible = (0..columns).collect::<Vec<_>>();
-        loop {
-            let fair = remaining / flexible.len().max(1);
-            let (fits, wide): (Vec<usize>, Vec<usize>) = flexible
-                .into_iter()
-                .partition(|column| natural[*column] <= fair);
-            if fits.is_empty() || wide.is_empty() {
-                flexible = if wide.is_empty() { fits } else { wide };
-                break;
-            }
-            for column in fits {
-                remaining = remaining.saturating_sub(natural[column]);
-            }
-            flexible = wide;
-        }
-        // The overflowing columns split the remaining space proportionally.
-        let flexible_total = flexible
-            .iter()
-            .map(|column| natural[*column])
-            .sum::<usize>()
-            .max(1);
-        for column in flexible {
-            widths[column] = (natural[column] * remaining / flexible_total)
-                .max(TABLE_MIN_COLUMN_WIDTH)
-                .min(natural[column].max(TABLE_MIN_COLUMN_WIDTH));
-        }
-        // Rounding and minimums can leave a small excess; take it back from
-        // the widest columns so the sum fits `available` again.
-        while widths.iter().sum::<usize>() > available {
-            let Some((index, _)) = widths
-                .iter()
-                .enumerate()
-                .filter(|(_, allocated)| **allocated > TABLE_MIN_COLUMN_WIDTH)
-                .max_by_key(|(_, allocated)| **allocated)
-            else {
-                break;
-            };
-            widths[index] -= 1;
-        }
-    }
-    let mut output = Vec::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        let cells = (0..columns)
-            .map(|column| wrap_line(row.get(column).cloned().unwrap_or_default(), widths[column]))
-            .collect::<Vec<_>>();
-        let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
-        for cell_row in 0..height {
-            let mut line = Line::default();
-            for (column, cell) in cells.iter().enumerate() {
-                if column > 0 {
-                    line.push(" │ ", muted());
-                }
-                let content = cell.get(cell_row).cloned().unwrap_or_default();
-                let content_width = content.width();
-                for span in content.spans {
-                    line.push(span.text, span.style);
-                }
-                if column + 1 < columns {
-                    line.push(
-                        " ".repeat(widths[column].saturating_sub(content_width)),
-                        muted(),
-                    );
-                }
-            }
-            output.push(line);
-        }
-        if row_index == 0 && has_header && rows.len() > 1 {
-            let mut rule = Line::default();
-            for (column, column_width) in widths.iter().enumerate() {
-                if column > 0 {
-                    rule.push("─┼─", muted());
-                }
-                rule.push("─".repeat(*column_width), muted());
-            }
-            output.push(rule);
-        }
-    }
-    output
-}
-
-/// Very-narrow fallback: each data row becomes `header: value` lines with a
-/// muted divider between rows.
-fn layout_table_stacked(rows: &[Vec<Line>], has_header: bool, width: usize) -> Vec<Line> {
-    let (header, data) = if has_header && rows.len() > 1 {
-        (rows.first(), &rows[1..])
-    } else {
-        (None, rows)
-    };
-    let mut output = Vec::new();
-    for (row_index, row) in data.iter().enumerate() {
-        if row_index > 0 {
-            output.push(Line::styled("---", muted()));
-        }
-        for (column, cell) in row.iter().enumerate() {
-            let mut line = Line::default();
-            if let Some(title) = header.and_then(|header| header.get(column)) {
-                for span in &title.spans {
-                    line.push(span.text.clone(), span.style);
-                }
-                line.push(": ", muted());
-            }
-            for span in &cell.spans {
-                line.push(span.text.clone(), span.style);
-            }
-            output.extend(wrap_line(line, width.max(1)));
-        }
-    }
-    output
-}
-
-/// The panel's left border glyph plus one cell of padding.
-const CODE_PANEL_GUTTER: &str = "│ ";
-/// Display width of [`CODE_PANEL_GUTTER`].
-const CODE_PANEL_GUTTER_WIDTH: usize = 2;
-
-/// Bytes past which a code block skips tree-sitter and renders plain;
-/// highlighting must never stall a frame.
-const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
-
-/// A recognized highlight capture name paired with its theme style.
-type HighlightCapture = (&'static str, fn() -> Style);
-
-/// Highlight capture names recognized in grammar queries, each mapped to a
-/// theme style. `HighlightConfiguration::configure` resolves query captures
-/// against these by longest dotted prefix, so `keyword.control.repeat` lands
-/// on `keyword`; captures matching nothing keep the plain panel style.
-const HIGHLIGHT_CAPTURES: &[HighlightCapture] = &[
-    ("attribute", code_constant),
-    ("comment", code_comment),
-    ("constant", code_constant),
-    ("constructor", code_type),
-    ("escape", code_constant),
-    ("function", code_function),
-    ("keyword", code_keyword),
-    ("label", code_constant),
-    ("number", code_constant),
-    ("property", code_property),
-    ("string", code_string),
-    ("string.special.key", code_property),
-    ("tag", code_function),
-    ("type", code_type),
-    ("variable.builtin", code_keyword),
-];
-
-/// Builds one grammar's highlight configuration on first use. Compiling the
-/// highlight query is the expensive step, so each grammar pays it once; a
-/// grammar whose query fails to compile stays `None` and its blocks render
-/// plain forever rather than retrying every frame.
-fn highlight_configuration(
-    cell: &'static OnceLock<Option<HighlightConfiguration>>,
-    name: &str,
-    language: Language,
-    highlights: &str,
-) -> Option<&'static HighlightConfiguration> {
-    cell.get_or_init(|| {
-        let mut configuration =
-            HighlightConfiguration::new(language, name, highlights, "", "").ok()?;
-        let names = HIGHLIGHT_CAPTURES
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>();
-        configuration.configure(&names);
-        Some(configuration)
-    })
-    .as_ref()
-}
-
-/// Maps a fence tag (with common aliases) to a bundled grammar's highlight
-/// configuration. Unknown or absent tags return `None` and render plain.
-/// TypeScript, TSX, JSX, and C++ queries only extend their base language's
-/// query, so those arms concatenate the extension ahead of the base (earlier
-/// patterns win in tree-sitter queries).
-fn fence_highlight_configuration(tag: &str) -> Option<&'static HighlightConfiguration> {
-    macro_rules! grammar {
-        ($name:literal, $language:expr, $highlights:expr) => {{
-            static CELL: OnceLock<Option<HighlightConfiguration>> = OnceLock::new();
-            highlight_configuration(&CELL, $name, $language.into(), $highlights)
-        }};
-    }
-    match tag.to_ascii_lowercase().as_str() {
-        "rust" | "rs" => grammar!(
-            "rust",
-            tree_sitter_rust::LANGUAGE,
-            tree_sitter_rust::HIGHLIGHTS_QUERY
-        ),
-        "toml" => grammar!(
-            "toml",
-            tree_sitter_toml_ng::LANGUAGE,
-            tree_sitter_toml_ng::HIGHLIGHTS_QUERY
-        ),
-        "json" | "jsonc" | "json5" => grammar!(
-            "json",
-            tree_sitter_json::LANGUAGE,
-            tree_sitter_json::HIGHLIGHTS_QUERY
-        ),
-        "yaml" | "yml" => grammar!(
-            "yaml",
-            tree_sitter_yaml::LANGUAGE,
-            tree_sitter_yaml::HIGHLIGHTS_QUERY
-        ),
-        "bash" | "sh" | "shell" | "zsh" => grammar!(
-            "bash",
-            tree_sitter_bash::LANGUAGE,
-            tree_sitter_bash::HIGHLIGHT_QUERY
-        ),
-        "python" | "py" | "python3" => grammar!(
-            "python",
-            tree_sitter_python::LANGUAGE,
-            tree_sitter_python::HIGHLIGHTS_QUERY
-        ),
-        "javascript" | "js" | "mjs" | "cjs" => grammar!(
-            "javascript",
-            tree_sitter_javascript::LANGUAGE,
-            tree_sitter_javascript::HIGHLIGHT_QUERY
-        ),
-        "jsx" => grammar!(
-            "jsx",
-            tree_sitter_javascript::LANGUAGE,
-            &format!(
-                "{}\n{}",
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-                tree_sitter_javascript::HIGHLIGHT_QUERY
-            )
-        ),
-        "typescript" | "ts" => grammar!(
-            "typescript",
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-            &format!(
-                "{}\n{}",
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                tree_sitter_javascript::HIGHLIGHT_QUERY
-            )
-        ),
-        "tsx" => grammar!(
-            "tsx",
-            tree_sitter_typescript::LANGUAGE_TSX,
-            &format!(
-                "{}\n{}\n{}",
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-                tree_sitter_javascript::HIGHLIGHT_QUERY
-            )
-        ),
-        "go" | "golang" => grammar!(
-            "go",
-            tree_sitter_go::LANGUAGE,
-            tree_sitter_go::HIGHLIGHTS_QUERY
-        ),
-        "c" | "h" => grammar!("c", tree_sitter_c::LANGUAGE, tree_sitter_c::HIGHLIGHT_QUERY),
-        "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hh" => grammar!(
-            "cpp",
-            tree_sitter_cpp::LANGUAGE,
-            &format!(
-                "{}\n{}",
-                tree_sitter_cpp::HIGHLIGHT_QUERY,
-                tree_sitter_c::HIGHLIGHT_QUERY
-            )
-        ),
-        _ => None,
-    }
-}
-
-/// Runs tree-sitter highlighting over one code block, returning one styled
-/// line per source line. Tree-sitter is error-tolerant, so partial or invalid
-/// code still highlights; any highlighter failure returns `None` and the
-/// caller falls back to plain panel text.
-fn highlighted_code_lines(configuration: &HighlightConfiguration, text: &str) -> Option<Vec<Line>> {
-    let mut highlighter = Highlighter::new();
-    let events = highlighter
-        .highlight(configuration, text.as_bytes(), None, |_| None)
-        .ok()?;
-    let mut lines = vec![Line::default()];
-    let mut active: Vec<Highlight> = Vec::new();
-    for event in events {
-        match event.ok()? {
-            HighlightEvent::HighlightStart(highlight) => active.push(highlight),
-            HighlightEvent::HighlightEnd => {
-                active.pop();
-            }
-            HighlightEvent::Source { start, end } => {
-                let style = active
-                    .last()
-                    .and_then(|highlight| HIGHLIGHT_CAPTURES.get(highlight.0))
-                    .map_or_else(normal, |(_, style)| style());
-                for (index, part) in text.get(start..end)?.split('\n').enumerate() {
-                    if index > 0 {
-                        lines.push(Line::default());
-                    }
-                    let safe = part
-                        .chars()
-                        .filter_map(terminal_safe_character)
-                        .collect::<String>();
-                    lines
-                        .last_mut()
-                        .expect("lines starts populated")
-                        .push(safe, style);
-                }
-            }
-        }
-    }
-    // The block's trailing newline would otherwise read as an extra empty
-    // content row that the plain `str::lines` path never produces.
-    if text.ends_with('\n') && lines.last().is_some_and(Line::is_empty) {
-        lines.pop();
-    }
-    Some(lines)
-}
-
-/// Buffers one code block's text while the parser walks it, so the panel can
-/// be laid out from complete content. Streamed partial input closes the block
-/// at end of input, so an unterminated fence still renders as a panel.
-struct CodeBlockBuffer {
-    language: Option<String>,
-    text: String,
-}
-
-impl CodeBlockBuffer {
-    fn new(kind: &CodeBlockKind) -> Self {
-        let language = match kind {
-            CodeBlockKind::Fenced(info) => info
-                .split([',', ' ', '\t'])
-                .next()
-                .filter(|token| !token.is_empty())
-                .map(str::to_owned),
-            CodeBlockKind::Indented => None,
-        };
-        Self {
-            language,
-            text: String::new(),
-        }
-    }
-}
-
-/// Lays a buffered code block out as a full-width tinted panel: a padding row
-/// carrying the right-aligned language label, character-wrapped content rows,
-/// and a closing padding row. Every row is padded to `width` so the tint
-/// reads as one solid panel rather than ragged highlights.
-///
-/// With `highlight` set, a recognized fence tag colors the content through
-/// its tree-sitter grammar; diff fences keep their dedicated coloring, and
-/// oversized blocks or highlighter failures fall back to plain text.
-fn layout_code_panel(block: &CodeBlockBuffer, width: usize, highlight: bool) -> Vec<Line> {
-    let diff = block.language.as_deref() == Some("diff");
-    let content_width = width.saturating_sub(CODE_PANEL_GUTTER_WIDTH).max(1);
-    let mut top = Line::default();
-    if let Some(language) = block.language.as_deref() {
-        let label = language
-            .chars()
-            .filter_map(terminal_safe_character)
-            .collect::<String>();
-        let mut labelled = Line::styled(label, muted());
-        let label_width = labelled.width();
-        if label_width > 0 && label_width <= content_width {
-            top.push(" ".repeat(content_width - label_width), muted());
-            top.spans.append(&mut labelled.spans);
-        }
-    }
-    let mut output = vec![code_panel_row(top, width)];
-    let highlighted = if highlight && !diff && block.text.len() <= MAX_HIGHLIGHT_BYTES {
-        block
-            .language
-            .as_deref()
-            .and_then(fence_highlight_configuration)
-            .and_then(|configuration| highlighted_code_lines(configuration, &block.text))
-    } else {
-        None
-    };
-    match highlighted {
-        Some(content) => {
-            for line in content {
-                for wrapped in wrap_line_chars(line, content_width) {
-                    output.push(code_panel_row(wrapped, width));
-                }
-            }
-        }
-        None => {
-            for source_line in block.text.lines() {
-                let safe = source_line
-                    .chars()
-                    .filter_map(terminal_safe_character)
-                    .collect::<String>();
-                let style = if diff {
-                    diff_line_style(&safe)
-                } else {
-                    normal()
-                };
-                for wrapped in wrap_line_chars(Line::styled(safe, style), content_width) {
-                    output.push(code_panel_row(wrapped, width));
-                }
-            }
-        }
-    }
-    output.push(code_panel_row(Line::default(), width));
-    output
-}
-
-/// One physical panel row: the bordered gutter, the content, and enough
-/// trailing padding to carry the background tint to the full width.
-fn code_panel_row(content: Line, width: usize) -> Line {
-    let mut row = Line::styled(CODE_PANEL_GUTTER, surface(accent().dim()));
-    let content_width = content.width();
-    for span in content.spans {
-        row.push(span.text, surface(span.style));
-    }
-    row.push(
-        " ".repeat(width.saturating_sub(CODE_PANEL_GUTTER_WIDTH + content_width)),
-        surface(normal()),
-    );
-    row
-}
-
 fn live_markdown_lines(source: MessageText<'_>, width: usize) -> Vec<Line> {
     let source_was_truncated = source.len() > MAX_LIVE_MARKDOWN_BYTES;
     let tail = source.bounded_tail(MAX_LIVE_MARKDOWN_BYTES);
@@ -2897,201 +1997,6 @@ fn pending_markdown_lines(source: &str, width: usize) -> Vec<Line> {
     lines
 }
 
-fn append_safe_text(lines: &mut Vec<Line>, text: &str, style: Style) {
-    for (index, part) in text.split('\n').enumerate() {
-        if index > 0 {
-            lines.push(Line::default());
-        }
-        let safe = part
-            .chars()
-            .filter_map(terminal_safe_character)
-            .collect::<String>();
-        lines.last_mut().expect("line exists").push(safe, style);
-    }
-}
-
-fn ensure_line(lines: &mut Vec<Line>) {
-    if !lines.last().is_none_or(Line::is_empty) {
-        lines.push(Line::default());
-    }
-}
-
-/// A run of characters that wraps as one unit: either whitespace or a word.
-struct WrapToken {
-    whitespace: bool,
-    width: usize,
-    characters: Vec<(char, Style)>,
-}
-
-/// Wraps prose at whitespace, preserving span styles across breaks. A single
-/// token wider than the width falls back to character breaking, and the
-/// whitespace a break lands on is dropped rather than carried over.
-fn wrap_line(line: Line, width: usize) -> Vec<Line> {
-    if line.width() <= width {
-        return vec![line];
-    }
-    let mut tokens: Vec<WrapToken> = Vec::new();
-    for span in line.spans {
-        for character in span.text.chars() {
-            let whitespace = character.is_whitespace();
-            let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
-            match tokens.last_mut() {
-                Some(token) if token.whitespace == whitespace => {
-                    token.width += character_width;
-                    token.characters.push((character, span.style));
-                }
-                _ => tokens.push(WrapToken {
-                    whitespace,
-                    width: character_width,
-                    characters: vec![(character, span.style)],
-                }),
-            }
-        }
-    }
-    let mut output = vec![Line::default()];
-    let mut used = 0_usize;
-    for token in tokens {
-        if used + token.width <= width {
-            let line = output.last_mut().expect("output starts populated");
-            for (character, style) in token.characters {
-                line.push(character.to_string(), style);
-            }
-            used += token.width;
-        } else if token.whitespace {
-            if used > 0 {
-                output.push(Line::default());
-                used = 0;
-            }
-        } else if token.width <= width {
-            output.push(Line::default());
-            let line = output.last_mut().expect("output starts populated");
-            for (character, style) in token.characters {
-                line.push(character.to_string(), style);
-            }
-            used = token.width;
-        } else {
-            for (character, style) in token.characters {
-                let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
-                if used > 0 && used + character_width > width {
-                    output.push(Line::default());
-                    used = 0;
-                }
-                output
-                    .last_mut()
-                    .expect("output starts populated")
-                    .push(character.to_string(), style);
-                used += character_width;
-            }
-        }
-    }
-    while output.len() > 1 && output.last().is_some_and(Line::is_empty) {
-        output.pop();
-    }
-    output
-}
-
-/// Character wrapping for literal content (code blocks, table rows) where
-/// dropping or moving whitespace would break alignment.
-fn wrap_line_chars(line: Line, width: usize) -> Vec<Line> {
-    let mut output = vec![Line::default()];
-    let mut current_width = 0;
-    for span in line.spans {
-        for character in span.text.chars() {
-            let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
-            if current_width > 0 && current_width + character_width > width {
-                output.push(Line::default());
-                current_width = 0;
-            }
-            output
-                .last_mut()
-                .expect("output starts populated")
-                .push(character.to_string(), span.style);
-            current_width += character_width;
-        }
-    }
-    output
-}
-
-fn indent_lines(lines: Vec<Line>, prefix: &str, prefix_style: Style, width: usize) -> Vec<Line> {
-    lines
-        .into_iter()
-        .map(|line| {
-            let mut indented = Line::styled(prefix, prefix_style);
-            for span in line.spans {
-                indented.push(span.text, span.style);
-            }
-            truncate_line(indented, width)
-        })
-        .collect()
-}
-
-fn truncate_line(line: Line, width: usize) -> Line {
-    if line.width() <= width {
-        return line;
-    }
-    if width <= 3 {
-        return Line::styled(".".repeat(width), muted());
-    }
-    let mut output = Line::default();
-    let mut used = 0_usize;
-    let content_width = width - 3;
-    for span in line.spans {
-        let mut text = String::new();
-        for character in span.text.chars() {
-            let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
-            if used + character_width > content_width {
-                break;
-            }
-            text.push(character);
-            used += character_width;
-        }
-        output.push(text, span.style);
-        if used >= content_width {
-            break;
-        }
-    }
-    output.push("...", muted());
-    output
-}
-
-fn selection_viewport(lines: Vec<Line>, height: usize, selected_row: usize) -> Vec<Line> {
-    let start = selected_row
-        .saturating_sub(height / 2)
-        .min(lines.len().saturating_sub(height));
-    lines.into_iter().skip(start).take(height).collect()
-}
-
-#[cfg(test)]
-fn transcript_viewport(mut lines: Vec<Line>, height: usize, offset: usize) -> Vec<Line> {
-    let offset = offset.min(lines.len().saturating_sub(height));
-    let end = lines.len().saturating_sub(offset);
-    let start = end.saturating_sub(height);
-    lines.drain(end..);
-    lines.drain(..start);
-    fit_height(lines, height)
-}
-
-fn fit_height(mut lines: Vec<Line>, height: usize) -> Vec<Line> {
-    lines.resize(height, Line::default());
-    lines.truncate(height);
-    lines
-}
-
-fn preview(text: &str, width: usize) -> String {
-    let plain = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if plain.chars().count() <= width {
-        plain
-    } else {
-        format!(
-            "{}...",
-            plain
-                .chars()
-                .take(width.saturating_sub(3))
-                .collect::<String>()
-        )
-    }
-}
-
 fn next_plain_text_row(
     source: MessageText<'_>,
     start: usize,
@@ -3122,45 +2027,6 @@ fn next_plain_text_row(
     Some((start..source.len(), source.len()))
 }
 
-fn bounded_tail(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut start = text.len() - max_bytes;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
-}
-
-fn write_line(output: &mut impl Write, line: &Line) -> io::Result<()> {
-    for span in &line.spans {
-        queue!(output, SetAttribute(Attribute::Reset), ResetColor)?;
-        if let Some(color) = span.style.color {
-            queue!(output, SetForegroundColor(color))?;
-        }
-        if let Some(background) = span.style.background {
-            queue!(output, SetBackgroundColor(background))?;
-        }
-        if span.style.bold {
-            queue!(output, SetAttribute(Attribute::Bold))?;
-        }
-        if span.style.dim {
-            queue!(output, SetAttribute(Attribute::Dim))?;
-        }
-        if span.style.italic {
-            queue!(output, SetAttribute(Attribute::Italic))?;
-        }
-        let safe = span
-            .text
-            .chars()
-            .filter_map(terminal_safe_character)
-            .collect::<String>();
-        queue!(output, Print(safe))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
@@ -3171,7 +2037,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ClientUpdate, ModelOption, TuiOptions};
+    use crate::{
+        ClientUpdate, ModelOption, TuiOptions,
+        render::{SURFACE_COLOR, code_keyword, success, surface},
+        view::markdown::{code_panel_row, tests::style_of},
+    };
 
     fn completed_message(byte: u8, output: String) -> MessageSnapshot {
         MessageSnapshot {
@@ -3261,373 +2131,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_rows_remain_within_the_render_width() {
-        let lines = markdown_lines("**Streaming** text remains narrow and readable.", 9, false);
-        assert!(lines.iter().all(|line| line.width() <= 9));
-    }
-
-    #[test]
-    fn tables_render_aligned_columns_with_a_header_separator() {
-        let source =
-            "| Order | Source |\n| --- | --- |\n| 1 | Built-in defaults |\n| 2 | Cached manifest |";
-        let lines = markdown_lines(source, 60, false);
-        let rows = frame_rows(&lines);
-
-        assert_eq!(
-            rows,
-            [
-                "Order │ Source".to_owned(),
-                format!("{}─┼─{}", "─".repeat(5), "─".repeat(17)),
-                "1     │ Built-in defaults".to_owned(),
-                "2     │ Cached manifest".to_owned(),
-            ]
-        );
-        assert!(lines[0].spans[0].style.bold, "header row renders bold");
-    }
-
-    #[test]
-    fn wide_tables_wrap_cell_content_within_columns() {
-        let source = "| Key | Description |\n| --- | --- |\n| alpha | a very long description that must wrap inside its own column |";
-        let width = 32;
-        let lines = markdown_lines(source, width, false);
-        let rows = frame_rows(&lines);
-
-        assert!(lines.iter().all(|line| line.width() <= width));
-        // The oversized description wraps into multiple physical rows.
-        assert!(rows.iter().filter(|row| row.contains('│')).count() > 2);
-        // Every column separator sits at the same display position.
-        let positions = rows
-            .iter()
-            .filter(|row| row.contains('│') || row.contains('┼'))
-            .map(|row| {
-                row.chars()
-                    .take_while(|character| *character != '│' && *character != '┼')
-                    .map(|character| UnicodeWidthChar::width(character).unwrap_or_default())
-                    .sum::<usize>()
-            })
-            .collect::<Vec<_>>();
-        assert!(!positions.is_empty());
-        assert!(positions.iter().all(|position| *position == positions[0]));
-    }
-
-    #[test]
-    fn very_narrow_tables_stack_rows_as_header_value_lines() {
-        let source = "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n| 4 | 5 | 6 |";
-        let rows = frame_rows(&markdown_lines(source, 10, false));
-
-        assert_eq!(
-            rows,
-            ["A: 1", "B: 2", "C: 3", "---", "A: 4", "B: 5", "C: 6"]
-        );
-    }
-
-    #[test]
-    fn cjk_table_content_aligns_by_display_width() {
-        let source = "| 名前 | 説明 |\n| --- | --- |\n| 短い | 長い説明テキスト |";
-        let lines = markdown_lines(source, 40, false);
-        let rows = frame_rows(&lines);
-
-        assert!(lines.iter().all(|line| line.width() <= 40));
-        let positions = rows
-            .iter()
-            .map(|row| {
-                row.chars()
-                    .take_while(|character| *character != '│' && *character != '┼')
-                    .map(|character| UnicodeWidthChar::width(character).unwrap_or_default())
-                    .sum::<usize>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(positions, [5, 5, 5]);
-    }
-
-    #[test]
-    fn partial_streaming_table_input_never_panics_and_stays_bounded() {
-        let fragments = [
-            "| Order | Source",
-            "| Order | Source |\n| ---",
-            "| Order | Source |\n| --- | --- |\n| 1 | Built",
-            "| a |\n| --- |\n| b |\n\ntext after",
-            "| |\n| --- |\n| |",
-        ];
-        for fragment in fragments {
-            for width in 0..48 {
-                let lines = markdown_lines(fragment, width, false);
-                assert!(lines.iter().all(|line| line.width() <= width.max(1)));
-            }
-        }
-    }
-
-    #[test]
-    fn word_wrap_breaks_at_whitespace_and_preserves_styles() {
-        let mut line = Line::default();
-        line.push("manage ", normal().bold());
-        line.push("daemons cleanly", normal());
-
-        let wrapped = wrap_line(line, 10);
-
-        assert_eq!(frame_rows(&wrapped), ["manage ", "daemons ", "cleanly"]);
-        assert_eq!(wrapped[0].spans[0].style, normal().bold());
-        assert_eq!(wrapped[1].spans[0].style, normal());
-    }
-
-    #[test]
-    fn overlong_tokens_fall_back_to_character_breaks() {
-        let mut line = Line::default();
-        line.push("ab", normal().bold());
-        line.push("cdefgh", normal());
-
-        let wrapped = wrap_line(line, 4);
-
-        assert_eq!(frame_rows(&wrapped), ["abcd", "efgh"]);
-        assert_eq!(wrapped[0].spans.len(), 2);
-        assert_eq!(wrapped[0].spans[0].style, normal().bold());
-        assert_eq!(wrapped[0].spans[1].style, normal());
-    }
-
-    #[test]
-    fn soft_breaks_reflow_paragraphs_to_the_render_width() {
-        // A source-wrapped paragraph joins into one row when it fits...
-        assert_eq!(
-            frame_rows(&markdown_lines("alpha beta\ngamma delta", 40, false)),
-            ["alpha beta gamma delta"]
-        );
-        // ...and rewraps at the terminal width, not the source width.
-        assert_eq!(
-            frame_rows(&markdown_lines("alpha beta\ngamma delta", 12, false)),
-            ["alpha beta ", "gamma delta"]
-        );
-        // A hard break still forces an explicit line break.
-        assert_eq!(
-            frame_rows(&markdown_lines("alpha  \nbeta", 40, false)),
-            ["alpha", "beta"]
-        );
-    }
-
-    #[test]
-    fn code_blocks_keep_character_wrapping() {
-        let rows = frame_rows(&markdown_lines(
-            "```\nlet answer_value = 42;\n```",
-            12,
-            false,
-        ));
-
-        assert_eq!(
-            rows,
-            [
-                "│           ",
-                "│ let answer",
-                "│ _value = 4",
-                "│ 2;        ",
-                "│           ",
-            ]
-        );
-    }
-
-    #[test]
-    fn fenced_code_renders_as_a_tinted_panel_with_a_language_label() {
-        let width = 24;
-        let lines = markdown_lines("```rust\nlet x = 1;\n```", width, false);
-        let rows = frame_rows(&lines);
-
-        assert_eq!(
-            rows,
-            [
-                format!("│ {}rust", " ".repeat(18)),
-                format!("│ let x = 1;{}", " ".repeat(12)),
-                format!("│{}", " ".repeat(23)),
-            ]
-        );
-        // Every row is padded to the full width with the surface tint so the
-        // panel reads as one solid slab.
-        assert!(lines.iter().all(|line| line.width() == width));
-        assert!(
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .all(|span| span.style.background == Some(SURFACE_COLOR))
-        );
-        assert_eq!(lines[0].spans[0].style, surface(accent().dim()));
-        assert_eq!(lines[0].spans[1].style, surface(muted()));
-    }
-
-    #[test]
-    fn diff_fenced_blocks_color_lines_inside_the_panel() {
-        let source = "```diff\n@@ -1,2 +1,2 @@\n-old line\n+new line\n context\n```";
-        let lines = markdown_lines(source, 30, false);
-
-        let style_of = |needle: &str| {
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .find(|span| span.text.contains(needle))
-                .map(|span| span.style)
-        };
-        assert_eq!(style_of("@@ -1,2 +1,2 @@"), Some(surface(accent().dim())));
-        assert_eq!(style_of("-old line"), Some(surface(failure())));
-        assert_eq!(style_of("+new line"), Some(surface(success())));
-        assert_eq!(style_of(" context"), Some(surface(normal())));
-        assert!(lines.iter().all(|line| line.width() == 30));
-    }
-
-    #[test]
-    fn unterminated_fences_render_panels_safely_mid_stream() {
-        let fragments = [
-            "```",
-            "```rust",
-            "```rust\nfn main() {",
-            "prose\n\n```diff\n+partial",
-        ];
-        for fragment in fragments {
-            for width in 0..48 {
-                for highlight in [false, true] {
-                    let lines = markdown_lines(fragment, width, highlight);
-                    assert!(lines.iter().all(|line| line.width() <= width.max(1)));
-                }
-            }
-        }
-        // A fence still streaming renders as a panel with the text so far.
-        let rows = frame_rows(&markdown_lines("```rust\nfn main() {", 24, false));
-        assert!(rows.iter().any(|row| row.starts_with("│ fn main() {")));
-    }
-
-    /// Finds the style of the first span whose text contains `needle`.
-    fn style_of(lines: &[Line], needle: &str) -> Option<Style> {
-        lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.text.contains(needle))
-            .map(|span| span.style)
-    }
-
-    #[test]
-    fn fence_tags_map_to_bundled_grammars_including_aliases() {
-        for tag in [
-            "rust",
-            "toml",
-            "json",
-            "yaml",
-            "bash",
-            "python",
-            "javascript",
-            "typescript",
-            "tsx",
-            "jsx",
-            "go",
-            "c",
-            "cpp",
-        ] {
-            assert!(
-                fence_highlight_configuration(tag).is_some(),
-                "{tag} maps to a grammar with a compiling query"
-            );
-        }
-        for (alias, canonical) in [
-            ("rs", "rust"),
-            ("Rust", "rust"),
-            ("sh", "bash"),
-            ("shell", "bash"),
-            ("zsh", "bash"),
-            ("py", "python"),
-            ("js", "javascript"),
-            ("ts", "typescript"),
-            ("yml", "yaml"),
-            ("golang", "go"),
-            ("c++", "cpp"),
-            ("jsonc", "json"),
-        ] {
-            let (alias_configuration, canonical_configuration) = (
-                fence_highlight_configuration(alias).expect("alias resolves"),
-                fence_highlight_configuration(canonical).expect("canonical resolves"),
-            );
-            assert!(
-                std::ptr::eq(alias_configuration, canonical_configuration),
-                "{alias} shares {canonical}'s configuration"
-            );
-        }
-        // Unknown tags render plain; diff keeps its dedicated coloring and
-        // ron has no maintained grammar crate.
-        for tag in ["", "diff", "ron", "console", "brainfuck"] {
-            assert!(fence_highlight_configuration(tag).is_none(), "{tag} plain");
-        }
-    }
-
-    #[test]
-    fn highlighted_rust_panels_style_keywords_strings_and_comments() {
-        let source = "```rust\n// note\nlet x = \"hi\";\n```";
-        let width = 40;
-        let lines = markdown_lines(source, width, true);
-
-        assert_eq!(style_of(&lines, "// note"), Some(surface(code_comment())));
-        assert_eq!(style_of(&lines, "let"), Some(surface(code_keyword())));
-        assert_eq!(style_of(&lines, "\"hi\""), Some(surface(code_string())));
-        // Every highlighted span still carries the panel tint, every row pads
-        // to the full width, and the panel structure (label row, gutter,
-        // padding rows) matches the plain rendering exactly.
-        assert!(lines.iter().all(|line| line.width() == width));
-        assert!(
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .all(|span| span.style.background == Some(SURFACE_COLOR))
-        );
-        assert_eq!(
-            frame_rows(&lines),
-            frame_rows(&markdown_lines(source, width, false))
-        );
-        assert_eq!(lines[0].spans[0].style, surface(accent().dim()));
-        assert_eq!(lines[0].spans[1].style, surface(muted()));
-    }
-
-    #[test]
-    fn highlighted_long_lines_keep_character_wrapping_and_span_styles() {
-        let source = "```rust\nlet answer = \"abcdefghijklmnopqrst\";\n```";
-        let width = 16;
-        let lines = markdown_lines(source, width, true);
-
-        assert!(lines.iter().all(|line| line.width() == width));
-        // Character wrapping, not reflow: the rows match the plain panel.
-        assert_eq!(
-            frame_rows(&lines),
-            frame_rows(&markdown_lines(source, width, false))
-        );
-        // The wrapped string literal keeps its style on every row it spans.
-        let string_rows = lines
-            .iter()
-            .filter(|line| {
-                line.spans
-                    .iter()
-                    .any(|span| span.style == surface(code_string()))
-            })
-            .count();
-        assert!(string_rows >= 2, "string literal spans wrapped rows");
-    }
-
-    #[test]
-    fn oversized_code_blocks_fall_back_to_plain_panel_text() {
-        let source = format!(
-            "```rust\nlet x = 1;\n{}```",
-            "// pad\n".repeat(MAX_HIGHLIGHT_BYTES / 7 + 1)
-        );
-        let lines = markdown_lines(&source, 40, true);
-
-        assert_eq!(style_of(&lines, "let"), Some(surface(normal())));
-        assert_eq!(style_of(&lines, "// pad"), Some(surface(normal())));
-    }
-
-    #[test]
-    fn diff_fences_keep_diff_coloring_when_highlighting_is_enabled() {
-        let source = "```diff\n@@ -1 +1 @@\n-old line\n+new line\n```";
-        let lines = markdown_lines(source, 30, true);
-
-        assert_eq!(
-            style_of(&lines, "@@ -1 +1 @@"),
-            Some(surface(accent().dim()))
-        );
-        assert_eq!(style_of(&lines, "-old line"), Some(surface(failure())));
-        assert_eq!(style_of(&lines, "+new line"), Some(surface(success())));
-    }
-
-    #[test]
     fn streaming_messages_render_code_plain_and_highlight_on_completion() {
         let mut renderer = FrameRenderer::default();
         let mut message = completed_message(1, "```rust\nlet x = 1;\n```".to_owned());
@@ -3671,27 +2174,6 @@ mod tests {
         let complete_text = frame_text(&complete);
         assert!(complete_text.contains("BEGIN-LIVE-MESSAGE"));
         assert!(complete_text.contains("END-LIVE-MESSAGE"));
-    }
-
-    #[test]
-    fn headings_get_a_blank_line_above_and_lists_stay_tight() {
-        let rows = frame_rows(&markdown_lines(
-            "intro\n# Title\n- alpha\n- beta",
-            40,
-            false,
-        ));
-
-        assert_eq!(rows, ["intro", "", "Title", "- alpha", "- beta"]);
-    }
-
-    #[test]
-    fn markdown_entities_cannot_emit_terminal_controls() {
-        let lines = markdown_lines("&#27;]52;c;Y2xpcGJvYXJk&#7;", 80, false);
-        assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
-            span.text
-                .chars()
-                .all(|character| terminal_safe_character(character) == Some(character))
-        }));
     }
 
     fn tool_call_snapshot(
@@ -4550,14 +3032,6 @@ mod tests {
     }
 
     #[test]
-    fn truncated_rows_never_exceed_the_terminal_width() {
-        for width in 0..10 {
-            let line = truncate_line(Line::styled("a long row", normal()), width);
-            assert!(line.width() <= width);
-        }
-    }
-
-    #[test]
     fn completed_markdown_cache_is_bounded_and_keeps_one_width() {
         let mut renderer = FrameRenderer::default();
         let message = completed_message(1, "hello".to_owned());
@@ -4753,17 +3227,14 @@ mod tests {
             ),
         ));
         let live_offset = app.transcript_scroll_offset();
-        app.model_picker = Some(crate::app::ModelPicker {
-            query: String::new(),
-            selected: 0,
-        });
+        app.overlay = Some(crate::input::Overlay::models());
         renderer.frame(&mut app, 80, 24);
 
         let session = app.sessions.get_mut(&session_id).unwrap();
         session.messages.as_mut().unwrap()[0].state = MessageState::Complete;
         session.loaded_through += 1;
         renderer.frame(&mut app, 80, 24);
-        app.model_picker = None;
+        app.overlay = None;
         renderer.frame(&mut app, 80, 24);
 
         assert_eq!(app.transcript_scroll_offset(), live_offset);
@@ -5021,11 +3492,7 @@ mod tests {
                 event: SessionEvent::SessionCreated { session: summary },
             }));
         }
-        app.session_picker = Some(crate::app::SessionPicker {
-            query: String::new(),
-            selected,
-            confirm: None,
-        });
+        app.overlay = Some(crate::input::Overlay::sessions("", selected, None));
 
         let frame = FrameRenderer::default().frame(&mut app, 80, 12);
         let text = frame_text(&frame);
@@ -5038,11 +3505,7 @@ mod tests {
     #[test]
     fn session_picker_renders_an_empty_search_result() {
         let mut app = app_with_messages(0);
-        app.session_picker = Some(crate::app::SessionPicker {
-            query: "missing".to_owned(),
-            selected: None,
-            confirm: None,
-        });
+        app.overlay = Some(crate::input::Overlay::sessions("missing", None, None));
 
         let frame = FrameRenderer::default().frame(&mut app, 80, 12);
         let text = frame_text(&frame);
@@ -5055,25 +3518,27 @@ mod tests {
     fn session_picker_renders_delete_and_prune_confirmations() {
         let mut app = app_with_messages(0);
         let session_id = SessionId::from_bytes([1; 16]);
-        app.session_picker = Some(crate::app::SessionPicker {
-            query: String::new(),
-            selected: Some(session_id),
-            confirm: Some(crate::app::SessionPickerConfirm::Delete(session_id)),
-        });
+        app.overlay = Some(crate::input::Overlay::sessions(
+            "",
+            Some(session_id),
+            Some(SessionConfirm::Delete(session_id)),
+        ));
 
         let frame = FrameRenderer::default().frame(&mut app, 100, 12);
         let text = frame_text(&frame);
         assert!(text.contains("y confirms, n or Esc cancels"));
         assert!(text.contains("delete 'Session'? y deletes, n keeps"));
 
-        app.session_picker.as_mut().unwrap().confirm =
-            Some(crate::app::SessionPickerConfirm::Prune);
+        app.overlay
+            .as_mut()
+            .unwrap()
+            .set_confirm(Some(SessionConfirm::Prune));
         let frame = FrameRenderer::default().frame(&mut app, 100, 12);
         let text = frame_text(&frame);
         assert!(text.contains("delete every empty session in this workspace?"));
 
         // Without a pending confirmation the hint advertises both actions.
-        app.session_picker.as_mut().unwrap().confirm = None;
+        app.overlay.as_mut().unwrap().set_confirm(None);
         let frame = FrameRenderer::default().frame(&mut app, 100, 12);
         let text = frame_text(&frame);
         assert!(text.contains("Ctrl-D deletes, Ctrl-P prunes empty"));
@@ -5093,10 +3558,7 @@ mod tests {
                 organization: None,
             },
         });
-        app.model_picker = Some(crate::app::ModelPicker {
-            query: String::new(),
-            selected: 0,
-        });
+        app.overlay = Some(crate::input::Overlay::models());
 
         let frame = FrameRenderer::default().frame(&mut app, 100, 12);
         let text = frame_text(&frame);

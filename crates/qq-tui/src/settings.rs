@@ -47,6 +47,11 @@ impl Action {
         Self::CreateChildSession,
         Self::CancelRun,
     ];
+
+    /// Every bindable action.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::ALL.into_iter()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

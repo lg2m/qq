@@ -1,7 +1,7 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phase T0 is complete (receipt below). Phases
-T1–T7 are proposed.
+Status: proposed 2026-09-02. Phases T0 and T1 are complete (receipts below).
+Phases T2–T7 are proposed.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -188,6 +188,38 @@ Acceptance:
 - Existing tests pass with unchanged behavior.
 - The three pickers share one implementation.
 - Adding a command touches one table row.
+
+#### T1 Completion Receipt — 2026-09-02
+
+Landed without user-visible behavior change; all 135 pre-existing tests pass
+unmodified in intent, plus seven new unit tests.
+
+- `commands.rs`: `Command` enum and `COMMANDS` table (title, category, slash
+  aliases, bound `Action`). `App::execute(Command)` is the single dispatch
+  point for keybindings, slash entries, and Ctrl-C/Ctrl-O. A parity test
+  asserts the table's slash names equal
+  `qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS` as sets, replacing the old
+  index coupling.
+- `input.rs`: `Overlay { Models, Sessions }` and `Mode { Models, Sessions,
+  Approval, Compose }`. `App::mode()` replaces the if-chains in
+  `handle_key`, `frame`, and `prune_markdown`; the approval prompt stays
+  derived from session data.
+- `picker.rs`: one `Picker` (query, clamped cursor, bounded query bytes,
+  case-insensitive match, `preserve` across refresh) shared by the model
+  picker, session picker, and slash autocomplete.
+- Module split, no `mod.rs`: `render.rs` (Style/Span/Line, writer),
+  `view/markdown.rs` (markdown, tables, code panels, tree-sitter),
+  `view/wrap.rs` (wrapping, truncation, viewport slicing), `app/reduce.rs`
+  (`reduce_event` and transcript mutation). Markdown and wrap tests moved
+  with their code. `view.rs` went from 5,258 to 3,645 lines and `app.rs`
+  from 4,343 to 3,830.
+- Render bench after T1 matched the T0 baseline within noise once slash
+  autocomplete stopped rebuilding its list on ordinary typing
+  (keystroke-to-frame p95 41.4 µs vs 41.6 µs baseline).
+
+Deferred from T1 to T2: removing the remaining `expect`s in the approval
+renderer and the transcript viewport path, and moving reduce-focused tests
+out of `app.rs`.
 
 ### T2 — Hot Path
 

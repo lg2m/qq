@@ -5,7 +5,11 @@
 mod app;
 #[cfg(feature = "bench-support")]
 pub mod bench_support;
+mod commands;
 mod composer;
+mod input;
+mod picker;
+mod render;
 mod settings;
 mod terminal;
 mod view;
