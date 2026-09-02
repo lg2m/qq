@@ -397,6 +397,7 @@ async fn load_tui_models(
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: None,
+            include_sessions: Vec::new(),
             session_limit: 1,
             message_limit: 1,
         })
@@ -431,6 +432,7 @@ async fn load_tui_models(
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: Some(session_id),
+            include_sessions: Vec::new(),
             session_limit: 512,
             message_limit: 256,
         })
@@ -451,6 +453,7 @@ async fn bootstrap_tui(
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: None,
+            include_sessions: Vec::new(),
             session_limit: 512,
             message_limit: 256,
         })
@@ -480,6 +483,7 @@ async fn bootstrap_tui(
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: Some(focused),
+            include_sessions: Vec::new(),
             session_limit: 512,
             message_limit: 256,
         })
@@ -576,6 +580,7 @@ fn dispatch_tui_request(
                 .snapshot(SnapshotRequest {
                     workspace_id,
                     focused_session_id: Some(session_id),
+                    include_sessions: Vec::new(),
                     session_limit: 512,
                     message_limit: 256,
                 })

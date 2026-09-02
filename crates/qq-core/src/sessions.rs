@@ -22,8 +22,8 @@ use qq_protocol::{
     ModelSelection, ReasoningEvent, ResolvedModel, RunActivity, RunFailure, RunFailureKind, RunId,
     RunLimits, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus, SessionAccounting,
     SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
-    SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest, TextChannel,
-    TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
+    SessionSummary, ShellCommandPreview, SnapshotRequest, SpawnOrigin, StoreId, SubscribeRequest,
+    TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
     WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
@@ -548,6 +548,8 @@ struct ChildRunParent {
     workspace_id: WorkspaceId,
     session_id: SessionId,
     run_id: RunId,
+    /// The `spawn_agent` call that requested the child, when known.
+    tool_call_id: Option<ToolCallId>,
 }
 
 fn create_child_run(
@@ -562,6 +564,7 @@ fn create_child_run(
         workspace_id,
         session_id: parent_session_id,
         run_id: parent_run_id,
+        tool_call_id: spawned_by_tool_call_id,
     } = parent;
     validate_model_selection(&model)?;
     validate_run_limits(&limits)?;
@@ -620,10 +623,10 @@ fn create_child_run(
     transaction
         .execute(
             "INSERT INTO sessions(
-                id, workspace_id, parent_id, owner_run_id, title, status, queued_prompts,
-                model, max_output_tokens, organization, approval_mode,
+                id, workspace_id, parent_id, owner_run_id, spawned_by_tool_call_id, title,
+                status, queued_prompts, model, max_output_tokens, organization, approval_mode,
                 created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 1, ?6, ?7, ?8, 'read_only', ?9, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?10, ?5, 'queued', 1, ?6, ?7, ?8, 'read_only', ?9, ?9)",
             params![
                 session_id.to_string(),
                 workspace_id.to_string(),
@@ -634,6 +637,7 @@ fn create_child_run(
                 model.max_output_tokens,
                 model.organization,
                 now,
+                spawned_by_tool_call_id.map(|id| id.to_string()),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -4741,6 +4745,26 @@ fn load_snapshot(
             load_session_snapshot(&transaction, session_id, request.message_limit)
         })
         .transpose()?;
+    // Extra bodies are best-effort: a session that left the workspace or was
+    // deleted since the client asked is skipped rather than failing the
+    // whole snapshot. The focused body keeps its strict contract above.
+    let mut included = Vec::with_capacity(request.include_sessions.len());
+    for session_id in &request.include_sessions {
+        if Some(*session_id) == request.focused_session_id {
+            continue;
+        }
+        match session_workspace(&transaction, *session_id) {
+            Ok(workspace_id) if workspace_id == request.workspace_id => {
+                included.push(load_session_snapshot(
+                    &transaction,
+                    *session_id,
+                    request.message_limit,
+                )?);
+            }
+            Ok(_) | Err(SessionRuntimeError::SessionNotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -4756,6 +4780,7 @@ fn load_snapshot(
         },
         sessions,
         focused,
+        included,
         has_older_sessions,
     })
 }
@@ -5068,7 +5093,8 @@ fn load_session_summary(
                      s.queued_prompts, s.model, s.context_tokens, s.updated_at_ms,
                      (SELECT outcome_json FROM runs
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
-                      ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1)
+                      ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1),
+                     s.owner_run_id, s.spawned_by_tool_call_id
               FROM sessions s WHERE s.id = ?1",
             [session_id.to_string()],
             |row| {
@@ -5083,6 +5109,8 @@ fn load_session_summary(
                     row.get::<_, Option<u64>>(7)?,
                     row.get::<_, u64>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
@@ -5101,15 +5129,31 @@ fn load_session_summary(
                 context_tokens,
                 updated,
                 last_outcome,
+                owner_run,
+                spawned_by_call,
             )| {
                 let direct_cost = accounting.direct.estimated_cost_usd_nanos;
+                let active_run_id: Option<RunId> = active.as_deref().map(parse_id).transpose()?;
+                let activity = match active_run_id {
+                    Some(run_id) => load_run_activity(connection, session_id, run_id)?,
+                    None => None,
+                };
+                let spawned_by = match owner_run {
+                    Some(owner_run) => Some(SpawnOrigin {
+                        run_id: parse_id(&owner_run)?,
+                        tool_call_id: spawned_by_call.as_deref().map(parse_id).transpose()?,
+                    }),
+                    None => None,
+                };
                 Ok(SessionSummary {
                     id: session_id,
                     workspace_id: parse_id(&workspace)?,
                     parent_id: parent.as_deref().map(parse_id).transpose()?,
+                    spawned_by,
                     title,
                     status: parse_session_status(&status)?,
-                    active_run_id: active.as_deref().map(parse_id).transpose()?,
+                    active_run_id,
+                    activity,
                     queued_prompts: queued,
                     model,
                     context_tokens,
@@ -5124,6 +5168,45 @@ fn load_session_summary(
                 })
             },
         )
+}
+
+/// The latest `RunActivityChanged` recorded for `run_id`, if any. Activity is
+/// only ever persisted as an event, so this scans the session's recent events
+/// newest-first and stops at the first activity or terminal run event.
+fn load_run_activity(
+    connection: &Connection,
+    session_id: SessionId,
+    run_id: RunId,
+) -> Result<Option<RunActivity>, SessionRuntimeError> {
+    // Bounded: one running turn emits a handful of activity changes between
+    // text deltas, so the answer is within the newest few hundred events.
+    const SCAN_LIMIT: usize = 512;
+    let mut statement = connection
+        .prepare(
+            "SELECT envelope_json FROM events
+             WHERE workspace_id = (SELECT workspace_id FROM sessions WHERE id = ?1)
+             ORDER BY sequence DESC LIMIT ?2",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let rows = statement
+        .query_map(params![session_id.to_string(), SCAN_LIMIT as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    for envelope in rows {
+        let envelope = envelope.map_err(|_| SessionRuntimeError::Persistence)?;
+        let envelope: SessionEventEnvelope =
+            serde_json::from_str(&envelope).map_err(|_| SessionRuntimeError::Persistence)?;
+        if envelope.session_id != session_id || envelope.run_id != Some(run_id) {
+            continue;
+        }
+        match envelope.event {
+            SessionEvent::RunActivityChanged { activity, .. } => return Ok(Some(activity)),
+            SessionEvent::RunStarted { .. } | SessionEvent::RunFinished { .. } => return Ok(None),
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 fn load_message(
@@ -8199,6 +8282,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 32,
             })
@@ -8253,6 +8337,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 32,
             })
@@ -8334,6 +8419,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -8362,6 +8448,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -8419,6 +8506,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 32,
             })
@@ -8796,6 +8884,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 2,
             })
@@ -9201,6 +9290,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -9420,6 +9510,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: None,
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 8,
             })
@@ -9536,6 +9627,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: None,
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 8,
             })
@@ -9612,7 +9704,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(
             !connection
@@ -9739,7 +9831,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -9807,7 +9899,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         let (display_json, result) = connection
             .query_row(
@@ -9866,7 +9958,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -9931,7 +10023,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -10019,7 +10111,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -10075,7 +10167,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -10119,7 +10211,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         for column in [
             "model_json",
@@ -10186,7 +10278,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -10260,7 +10352,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         let command_id_not_null: bool = connection
             .query_row(
@@ -10299,7 +10391,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -10369,7 +10461,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -10461,7 +10553,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         let preparing_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -10584,7 +10676,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         let occupancy_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -10690,7 +10782,7 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                "19"
+                "20"
             );
         }
     }
@@ -10753,6 +10845,82 @@ mod tests {
     }
 
     #[test]
+    fn version_twenty_migration_adds_spawn_call_ownership_without_guessing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let parent_id = SessionId::generate().unwrap();
+        let child_id = SessionId::generate().unwrap();
+        let owner_run = RunId::generate().unwrap();
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/v19-spawn')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'Parent', 'idle', 1, 1)",
+                params![parent_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                     id, workspace_id, parent_id, owner_run_id, title, status,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'Child', 'idle', 2, 2)",
+                params![
+                    child_id.to_string(),
+                    workspace_id.to_string(),
+                    parent_id.to_string(),
+                    owner_run.to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '19' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN spawned_by_tool_call_id",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "20"
+        );
+        // A historical child keeps its parent run but has no recorded call:
+        // the summary says so explicitly instead of inventing one.
+        let child = load_session_summary(&connection, child_id).unwrap();
+        assert_eq!(
+            child.spawned_by,
+            Some(SpawnOrigin {
+                run_id: owner_run,
+                tool_call_id: None,
+            })
+        );
+        let parent = load_session_summary(&connection, parent_id).unwrap();
+        assert_eq!(parent.spawned_by, None);
+        assert_eq!(parent.activity, None);
+    }
+
+    #[test]
     fn version_nineteen_migration_keeps_historical_runs_unlimited() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sessions.sqlite3");
@@ -10803,7 +10971,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
         let shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -10885,7 +11053,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "19"
+            "20"
         );
     }
 
@@ -11287,10 +11455,11 @@ mod tests {
         let request = SnapshotRequest {
             workspace_id,
             focused_session_id: Some(session_id),
+            include_sessions: Vec::new(),
             session_limit: 1,
             message_limit: 8,
         };
-        let before_snapshot = load_snapshot(&mut connection, store_id, request).unwrap();
+        let before_snapshot = load_snapshot(&mut connection, store_id, request.clone()).unwrap();
         let transaction = connection.transaction().unwrap();
         let before_context = load_model_context(&transaction, session_id, u64::MAX).unwrap();
         transaction.rollback().unwrap();
@@ -12148,6 +12317,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_summaries_carry_the_latest_run_activity_while_running() {
+        let (_directory, store, claimed) = claimed_store_fixture().await;
+        let request = SnapshotRequest::new(claimed.workspace_id, Some(claimed.session_id), 4, 4);
+        let idle = store.snapshot(request.clone()).await.unwrap();
+        assert_eq!(idle.focused.unwrap().summary.activity, None);
+
+        store
+            .append_run_activity(&claimed, RunActivity::Reasoning)
+            .await
+            .unwrap();
+        store
+            .append_run_activity(&claimed, RunActivity::GeneratingResponse)
+            .await
+            .unwrap();
+        let live = store.snapshot(request).await.unwrap();
+        let summary = live.focused.unwrap().summary;
+        assert_eq!(summary.active_run_id, Some(claimed.run_id));
+        assert_eq!(summary.activity, Some(RunActivity::GeneratingResponse));
+        assert!(
+            live.sessions
+                .iter()
+                .any(|session| session.activity == Some(RunActivity::GeneratingResponse))
+        );
+    }
+
+    #[tokio::test]
     async fn measured_occupancy_basis_persists_atomically_and_reloads_with_the_reservation() {
         let (directory, store, claimed) = claimed_store_fixture().await;
         let model = test_resolved_model("test/model", "test/model", 256, None);
@@ -12622,6 +12817,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -13168,6 +13364,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 32,
             })
@@ -13253,6 +13450,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 32,
             })
@@ -13859,6 +14057,7 @@ mod tests {
                 .snapshot(SnapshotRequest {
                     workspace_id: harness.workspace_id,
                     focused_session_id: Some(harness.session_id),
+                    include_sessions: Vec::new(),
                     session_limit: 1,
                     message_limit: 8,
                 })
@@ -14892,6 +15091,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(child_id),
+                include_sessions: Vec::new(),
                 session_limit: 32,
                 message_limit: 32,
             })
@@ -14900,6 +15100,68 @@ mod tests {
 
         assert_eq!(snapshot.sessions.len(), 2);
         assert_eq!(snapshot.focused.unwrap().summary.parent_id, Some(root_id));
+    }
+
+    #[tokio::test]
+    async fn snapshots_include_extra_session_bodies_without_evicting_the_focus() {
+        let (directory, runtime) = test_runtime().await;
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let CommandOutcome::SessionCreated { session_id } =
+                create_session(&runtime, workspace_id, None).await.outcome
+            else {
+                panic!("unexpected receipt")
+            };
+            ids.push(session_id);
+        }
+        let (other_directory, _) = (tempfile::tempdir().unwrap(), ());
+        let (other_workspace, _) = resolve_workspace(&runtime, other_directory.path()).await;
+        let CommandOutcome::SessionCreated {
+            session_id: foreign,
+        } = create_session(&runtime, other_workspace, None)
+            .await
+            .outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let missing = SessionId::from_bytes([0xee; 16]);
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: Some(ids[0]),
+                // The focused id is skipped in `included`; foreign and unknown
+                // sessions are dropped rather than failing the request.
+                include_sessions: vec![ids[2], ids[0], foreign, missing, ids[1]],
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.focused.as_ref().unwrap().summary.id, ids[0]);
+        assert_eq!(
+            snapshot
+                .included
+                .iter()
+                .map(|body| body.summary.id)
+                .collect::<Vec<_>>(),
+            vec![ids[2], ids[1]]
+        );
+
+        let too_many = runtime
+            .snapshot(SnapshotRequest {
+                workspace_id,
+                focused_session_id: None,
+                include_sessions: vec![ids[0]; qq_protocol::MAX_INCLUDED_SESSIONS + 1],
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await;
+        assert!(matches!(
+            too_many,
+            Err(SessionRuntimeError::InvalidPageLimit)
+        ));
     }
 
     #[tokio::test]
@@ -14929,6 +15191,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 4,
             })
@@ -15065,6 +15328,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -15303,6 +15567,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 32,
                 message_limit: 32,
             })
@@ -15476,6 +15741,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -15617,6 +15883,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -15760,6 +16027,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 16,
             })
@@ -16004,6 +16272,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 16,
             })
@@ -16683,6 +16952,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -16986,6 +17256,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -17142,6 +17413,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -17193,6 +17465,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -17348,6 +17621,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -17496,6 +17770,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 4,
             })
@@ -17985,6 +18260,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 4,
             })
@@ -18124,6 +18400,7 @@ mod tests {
                 .snapshot(SnapshotRequest {
                     workspace_id,
                     focused_session_id: Some(session_id),
+                    include_sessions: Vec::new(),
                     session_limit: 1,
                     message_limit: 1,
                 })
@@ -19025,6 +19302,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 4,
             })
@@ -19827,6 +20105,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 4,
             })
@@ -19991,6 +20270,7 @@ mod tests {
                 .snapshot(SnapshotRequest {
                     workspace_id: first_workspace,
                     focused_session_id: Some(session_id),
+                    include_sessions: Vec::new(),
                     session_limit: 32,
                     message_limit: 32,
                 })
@@ -20003,6 +20283,7 @@ mod tests {
                 .snapshot(SnapshotRequest {
                     workspace_id: first_workspace,
                     focused_session_id: None,
+                    include_sessions: Vec::new(),
                     session_limit: MAX_SNAPSHOT_SESSIONS + 1,
                     message_limit: 1,
                 })
@@ -20245,6 +20526,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -20298,6 +20580,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -22097,6 +22380,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })
@@ -22965,6 +23249,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 32,
             })
@@ -23063,6 +23348,41 @@ mod tests {
         assert_eq!(child_session.status, SessionStatus::Queued);
         assert_eq!(child_session.queued_prompts, 1);
         assert_eq!(child_session.title, "/review Survey the widget inventory");
+        // The child names the parent run and the exact `spawn_agent` call that
+        // created it, so clients can render it under that call.
+        let spawn_call = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::ToolCallRequested { tool_call }
+                    if tool_call.run_id == run_id && tool_call.name == "spawn_agent" =>
+                {
+                    Some(tool_call.id)
+                }
+                _ => None,
+            })
+            .expect("the parent requested a spawn_agent call");
+        assert_eq!(
+            child_session.spawned_by,
+            Some(SpawnOrigin {
+                run_id,
+                tool_call_id: Some(spawn_call),
+            })
+        );
+        // A snapshot taken later reports the same origin from the persisted row.
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest::new(
+                harness.workspace_id,
+                Some(child_session.id),
+                8,
+                8,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.focused.unwrap().summary.spawned_by,
+            child_session.spawned_by
+        );
         let created_event = observed
             .iter()
             .find(|event| {
@@ -23219,6 +23539,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(child_session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 8,
             })
@@ -23312,6 +23633,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 4,
             })
@@ -23358,6 +23680,7 @@ mod tests {
                             workspace_id: create_parent.workspace_id,
                             session_id: create_parent.session_id,
                             run_id: create_parent.run_id,
+                            tool_call_id: None,
                         },
                         ModelSelection {
                             model: Some("test/child".to_owned()),
@@ -23426,6 +23749,7 @@ mod tests {
         let rejected = store
             .create_child_run(
                 &cancelling_parent,
+                ToolCallId::from_bytes([0x5a; 16]),
                 ModelSelection {
                     model: Some("test/child".to_owned()),
                     max_output_tokens: Some(256),
@@ -23453,6 +23777,7 @@ mod tests {
         let child = store
             .create_child_run(
                 &parent,
+                ToolCallId::from_bytes([0x5a; 16]),
                 ModelSelection {
                     model: Some("test/child".to_owned()),
                     max_output_tokens: Some(256),
@@ -23497,6 +23822,7 @@ mod tests {
         let child = store
             .create_child_run(
                 &parent,
+                ToolCallId::from_bytes([0x5a; 16]),
                 ModelSelection {
                     model: Some("test/child".to_owned()),
                     max_output_tokens: Some(256),
@@ -23562,6 +23888,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(child.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 4,
             })
@@ -23632,6 +23959,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(parent_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 8,
             })
@@ -23677,6 +24005,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(parent_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 8,
             })
@@ -23843,6 +24172,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 32,
                 message_limit: 32,
             })
@@ -23939,6 +24269,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 32,
                 message_limit: 32,
             })
@@ -24393,6 +24724,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(child_session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 4,
             })
@@ -24472,6 +24804,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(child_session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 4,
             })
@@ -24563,6 +24896,7 @@ mod tests {
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),
             parent,
+            ToolCallId::from_bytes([0x5a; 16]),
             Arc::new(Semaphore::new(1)),
             Arc::new(AtomicUsize::new(0)),
             "research".to_owned(),
@@ -24588,6 +24922,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 8,
                 message_limit: 1,
             })
@@ -24956,6 +25291,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id: harness.workspace_id,
                 focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 16,
             })

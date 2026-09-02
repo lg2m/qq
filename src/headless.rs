@@ -739,6 +739,7 @@ async fn run_prompt_identity(
         .snapshot(SnapshotRequest {
             workspace_id: handle.workspace_id,
             focused_session_id: Some(handle.session_id),
+            include_sessions: Vec::new(),
             session_limit: 1,
             message_limit: 1,
         })
@@ -1500,6 +1501,7 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: None,
+                include_sessions: Vec::new(),
                 session_limit: 16,
                 message_limit: 16,
             })
@@ -1521,6 +1523,7 @@ mod tests {
                 .snapshot(SnapshotRequest {
                     workspace_id: snapshot.workspace.id,
                     focused_session_id: Some(session.id),
+                    include_sessions: Vec::new(),
                     session_limit: 1,
                     message_limit: 1,
                 })

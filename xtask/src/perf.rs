@@ -2898,6 +2898,7 @@ async fn direct_pipeline_workloads(
             fixture.runtime.snapshot(SnapshotRequest {
                 workspace_id: fixture.workspace_id,
                 focused_session_id: None,
+                include_sessions: Vec::new(),
                 session_limit: 512,
                 message_limit: 256,
             }),
@@ -3609,6 +3610,7 @@ async fn measure_long_stream(bytes: usize, samples: u16) -> Result<(Vec<u64>, bo
             fixture.runtime.snapshot(SnapshotRequest {
                 workspace_id: fixture.workspace_id,
                 focused_session_id: latest_session,
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             }),
@@ -4048,6 +4050,7 @@ async fn r4_eight_stream_sample() -> Result<R4WorkerSample, PerfError> {
                     runtime.snapshot(SnapshotRequest {
                         workspace_id,
                         focused_session_id: Some(session_id),
+                        include_sessions: Vec::new(),
                         session_limit: STREAMS as u16,
                         message_limit: 8,
                     }),
@@ -4175,6 +4178,7 @@ async fn r4_restart_sample() -> Result<R4WorkerSample, PerfError> {
         .snapshot(SnapshotRequest {
             workspace_id: fixture.workspace_id,
             focused_session_id: Some(session_id),
+            include_sessions: Vec::new(),
             session_limit: 1,
             message_limit: 8,
         })
@@ -4210,6 +4214,7 @@ async fn r4_restart_sample() -> Result<R4WorkerSample, PerfError> {
             .snapshot(SnapshotRequest {
                 workspace_id: fixture.workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })

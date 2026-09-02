@@ -310,6 +310,7 @@ impl App {
                     .push(ClientRequest::Snapshot(SnapshotRequest {
                         workspace_id,
                         focused_session_id: Some(next),
+                        include_sessions: Vec::new(),
                         session_limit: SNAPSHOT_SESSION_LIMIT,
                         message_limit: SNAPSHOT_MESSAGE_LIMIT,
                     }));

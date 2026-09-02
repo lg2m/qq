@@ -21,17 +21,17 @@ pub use sessions::{
     BudgetExhaustion, BudgetLimitKind, CapabilitySupport, CommandOutcome, CommandReceipt,
     CommandRequest, ContentHash, ContentHashError, CursorError, EditPreview, EventCursor,
     GenerationCapabilities, GuidanceIdentity, GuidanceKind, InstructionHash, InstructionHashError,
-    MessageRole, MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
-    ModelPricingTier, ModelSelection, PromptCacheCapabilities, PromptVersion,
-    ProviderRequestShapeIdentity, ProviderRequestShapeVersion, ResolvedModel, ResolvedModelVersion,
-    RunActivity, RunFailure, RunLimits, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus,
-    SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionSnapshot,
-    SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, SubscribeRequest,
-    TextChannel, TokenUsage, ToolCallDisplay, ToolCallSnapshot, ToolCallState,
-    WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
+    MAX_INCLUDED_SESSIONS, MessageRole, MessageSnapshot, MessageState, ModelCatalogRequest,
+    ModelDescriptor, ModelPricing, ModelPricingTier, ModelSelection, PromptCacheCapabilities,
+    PromptVersion, ProviderRequestShapeIdentity, ProviderRequestShapeVersion, ResolvedModel,
+    ResolvedModelVersion, RunActivity, RunFailure, RunLimits, RunOutcome, RunPromptIdentity,
+    RunSnapshot, RunStatus, SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope,
+    SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest,
+    SpawnOrigin, SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallSnapshot,
+    ToolCallState, WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// Slash commands owned by interactive clients rather than the shared
 /// runtime. Keeping this vocabulary in the transport-neutral protocol avoids

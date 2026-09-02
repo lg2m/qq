@@ -1224,6 +1224,7 @@ impl App {
             vec![ClientRequest::Snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: SNAPSHOT_SESSION_LIMIT,
                 message_limit: SNAPSHOT_MESSAGE_LIMIT,
             })],
@@ -1833,6 +1834,7 @@ mod tests {
         let workspace_id = id(1, WorkspaceId::from_bytes);
         let session_id = id(2, SessionId::from_bytes);
         WorkspaceSnapshot {
+            included: Vec::new(),
             cursor: EventCursor {
                 store_id: id(3, StoreId::from_bytes),
                 workspace_id,
@@ -1843,6 +1845,8 @@ mod tests {
                 path: "/workspace".to_owned(),
             },
             sessions: vec![SessionSummary {
+                activity: None,
+                spawned_by: None,
                 id: session_id,
                 workspace_id,
                 parent_id: None,
@@ -1859,6 +1863,8 @@ mod tests {
             }],
             focused: Some(SessionSnapshot {
                 summary: SessionSummary {
+                    activity: None,
+                    spawned_by: None,
                     id: session_id,
                     workspace_id,
                     parent_id: None,
@@ -2438,6 +2444,8 @@ mod tests {
         initial.sessions[0].title = "Deploy API".to_owned();
         initial.focused.as_mut().unwrap().summary.title = "Deploy API".to_owned();
         initial.sessions.push(SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: target,
             workspace_id,
             parent_id: None,
@@ -2573,6 +2581,8 @@ mod tests {
         let deleted = initial.sessions[0].id;
         let neighbor = id(9, SessionId::from_bytes);
         initial.sessions.push(SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: neighbor,
             workspace_id,
             parent_id: None,
@@ -3572,6 +3582,8 @@ mod tests {
         let old_focus = initial.focused.as_ref().unwrap().summary.id;
         let new_focus = id(9, SessionId::from_bytes);
         initial.sessions.push(SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: new_focus,
             workspace_id: initial.workspace.id,
             parent_id: None,

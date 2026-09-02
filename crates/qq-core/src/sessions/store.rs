@@ -442,6 +442,7 @@ impl Store {
     pub(super) async fn create_child_run(
         &self,
         parent: &ClaimedRun,
+        call_id: ToolCallId,
         model: ModelSelection,
         task: String,
         limits: RunLimits,
@@ -451,6 +452,7 @@ impl Store {
             workspace_id: parent.workspace_id,
             session_id: parent.session_id,
             run_id: parent.run_id,
+            tool_call_id: Some(call_id),
         };
         self.call(Priority::Control, move |connection| {
             create_child_run(connection, store_id, parent, model, task, limits)

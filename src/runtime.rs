@@ -1921,6 +1921,7 @@ mod tests {
                     .snapshot(SnapshotRequest {
                         workspace_id,
                         focused_session_id: Some(session_id),
+                        include_sessions: Vec::new(),
                         session_limit: 8,
                         message_limit: 32,
                     })

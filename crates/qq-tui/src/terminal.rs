@@ -424,6 +424,8 @@ mod tests {
 
     fn summary() -> SessionSummary {
         SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: session_id(),
             workspace_id: workspace_id(),
             parent_id: None,
@@ -442,6 +444,7 @@ mod tests {
 
     fn snapshot(sequence: u64, messages: Vec<MessageSnapshot>) -> WorkspaceSnapshot {
         WorkspaceSnapshot {
+            included: Vec::new(),
             cursor: EventCursor {
                 store_id: StoreId::from_bytes([3; 16]),
                 workspace_id: workspace_id(),

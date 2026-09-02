@@ -2229,6 +2229,8 @@ mod tests {
         let workspace_id = WorkspaceId::from_bytes([3; 16]);
         let session_id = SessionId::from_bytes([1; 16]);
         let summary = SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: session_id,
             workspace_id,
             parent_id: None,
@@ -2245,6 +2247,7 @@ mod tests {
         };
         let mut app = App::new(TuiOptions::default());
         app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
+            included: Vec::new(),
             cursor: EventCursor {
                 store_id: StoreId::from_bytes([4; 16]),
                 workspace_id,
@@ -3666,6 +3669,8 @@ mod tests {
                 selected = Some(session_id);
             }
             let summary = SessionSummary {
+                activity: None,
+                spawned_by: None,
                 id: session_id,
                 workspace_id,
                 parent_id: None,

@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -76,7 +76,13 @@ optional `submit_prompt.limits` request field, `RunSnapshot.limits`, the
 Older clients reject both the new outcome tag and the new snapshot field.
 Version 11 added compaction rollback: the `rollback_compaction` command, the
 `compaction_rolled_back` outcome, and the `session_compaction_rolled_back`
-event. Older clients reject the new command and event tags.
+event. Older clients reject the new command and event tags. Version 12 added
+optional multi-session client support: `SessionSummary.spawned_by` (the parent
+run and `spawn_agent` call that created a child), `SessionSummary.activity`
+(the active run's latest liveness state), and `SnapshotRequest.include_sessions`
+with the matching `WorkspaceSnapshot.included` bodies. Every addition defaults
+when absent, but older `deny_unknown_fields` decoders reject summaries that
+carry the new fields.
 
 Clients and servers must agree on this value.
 
@@ -721,6 +727,7 @@ Not a command. Request:
 {
   "workspace_id": "...",
   "focused_session_id": null,
+  "include_sessions": [],
   "session_limit": 512,
   "message_limit": 256
 }
@@ -731,6 +738,7 @@ Not a command. Request:
 | `session_limit` | Required, `1..=512` |
 | `message_limit` | Required, `1..=256` in current runtime bounds |
 | `focused_session_id` | Optional; when set, include full session detail |
+| `include_sessions` | Optional, at most 16 ids; bodies for each are returned in `included` (request order). Ids equal to `focused_session_id`, outside the workspace, or unknown are skipped rather than rejected |
 
 Response `WorkspaceSnapshot`:
 
@@ -747,6 +755,7 @@ Response `WorkspaceSnapshot`:
     "has_older_tool_calls": false,
     "has_older_messages": false
   },
+  "included": [ /* SessionSnapshot per include_sessions entry, omitted when empty */ ],
   "has_older_sessions": false
 }
 ```
@@ -909,9 +918,11 @@ round trip:
   "id": "...",
   "workspace_id": "...",
   "parent_id": null,
+  "spawned_by": null,
   "title": "New session",
   "status": "running",
   "active_run_id": "...",
+  "activity": "generating_response",
   "queued_prompts": 0,
   "model": "provider/model",
   "context_tokens": 12500,
@@ -922,6 +933,13 @@ round trip:
 ```
 
 Session status: `idle`, `queued`, `running`.
+
+`spawned_by` is set on children created by a parent run's `spawn_agent` call:
+`{ "run_id": "...", "tool_call_id": "..." }`. `tool_call_id` is absent for
+children persisted before the call was recorded. `activity` mirrors the latest
+`run_activity_changed` for `active_run_id` and is absent when idle or unknown,
+so a client that loads mid-run shows the right label without waiting for the
+next event.
 
 `context_tokens` is the latest exact prompt-turn input total measured for the
 session. It is absent when unknown. A successful compaction or a model change

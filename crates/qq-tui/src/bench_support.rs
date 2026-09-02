@@ -54,6 +54,7 @@ impl BenchHarness {
         };
         let mut app = App::new(TuiOptions::default());
         app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
+            included: Vec::new(),
             cursor: EventCursor {
                 store_id: StoreId::from_bytes([3; 16]),
                 workspace_id,
@@ -182,6 +183,8 @@ fn run_id(index: u8) -> RunId {
 
 fn summary(workspace_id: WorkspaceId, id: SessionId, status: SessionStatus) -> SessionSummary {
     SessionSummary {
+        activity: None,
+        spawned_by: None,
         id,
         workspace_id,
         parent_id: None,

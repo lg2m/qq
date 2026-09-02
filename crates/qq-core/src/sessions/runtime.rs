@@ -459,6 +459,7 @@ impl SessionRuntime {
             || request.session_limit > MAX_SNAPSHOT_SESSIONS
             || request.message_limit == 0
             || request.message_limit > MAX_SNAPSHOT_MESSAGES
+            || request.include_sessions.len() > qq_protocol::MAX_INCLUDED_SESSIONS
         {
             return Err(SessionRuntimeError::InvalidPageLimit);
         }
