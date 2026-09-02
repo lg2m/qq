@@ -28,6 +28,14 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_ITERATIONS);
+    // Highlighting schedules onto the Tokio blocking pool exactly as the
+    // event loop does; the frame path itself stays synchronous.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let _guard = runtime.enter();
 
     steady_state(iterations);
     streaming_focused(iterations);
@@ -37,11 +45,35 @@ fn main() {
 }
 
 /// Sixty-four completed messages, no changes between frames. Measures the
-/// fixed per-frame cost of rebuilding the frame model and diffing it.
+/// fixed per-frame cost of rebuilding the frame model and diffing it. The
+/// first frame is drawn plain; highlighting lands off-tick and is settled
+/// before the steady samples so they reflect the highlighted cache.
 fn steady_state(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
     let first = timed(|| harness.draw());
-    report("steady_state_first_frame", first.0, 1, first.1);
+    report("steady_state_first_frame_plain", first.0, 1, first.1);
+    let started = Instant::now();
+    let mut frames = 1;
+    loop {
+        let applied = harness.apply_finished_highlights();
+        if applied > 0 {
+            black_box(harness.draw());
+            frames += 1;
+        }
+        if !harness.highlights_pending() && applied == 0 {
+            // Idle: request any highlights that were skipped while the
+            // pool was saturated by drawing once more, then re-check.
+            black_box(harness.draw());
+            if !harness.highlights_pending() {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    println!(
+        "steady_state_fully_highlighted: {} after {frames} frames",
+        micros(started.elapsed().as_nanos())
+    );
     let samples = collect(iterations, || harness.draw().len());
     report_samples("steady_state_frame", &samples);
 }

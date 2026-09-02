@@ -50,9 +50,24 @@ where
         .map(drop)
 }
 
+/// When the next frame is drawn relative to pending state changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Redraw {
+    /// Nothing changed since the last frame.
+    Clean,
+    /// Streamed or background changes; coalesce until the frame tick.
+    Scheduled,
+    /// User input; draw before waiting on anything else so typing echoes
+    /// without a tick's latency.
+    Immediate,
+}
+
 /// The event loop with every terminal dependency injected so it runs without a
 /// TTY in tests and benchmarks. Returns the final application state so callers
 /// can inspect it after the loop exits.
+///
+/// `size` is queried once at start and again after each `Resize` event rather
+/// than every frame.
 pub(crate) async fn run_loop<P, E, W, S, F>(
     mut client: P,
     mut app: App,
@@ -74,9 +89,19 @@ where
     let mut animation_tick = interval(ANIMATION_INTERVAL);
     frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     animation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut dirty = true;
+    let mut terminal_size = size()?;
+    let mut redraw = Redraw::Immediate;
 
     loop {
+        if redraw == Redraw::Immediate {
+            let bytes = renderer.draw(&mut app, terminal_size)?;
+            output.write_all(&bytes).await?;
+            output.flush().await?;
+            redraw = Redraw::Clean;
+            // The tick would otherwise fire right after this frame for a
+            // change already drawn.
+            frame_tick.reset();
+        }
         tokio::select! {
             biased;
             result = &mut shutdown => {
@@ -86,11 +111,18 @@ where
             event = terminal_events.next() => {
                 match event {
                     Some(Ok(event)) => {
+                        if let Event::Resize(columns, rows) = event {
+                            terminal_size = (columns, rows);
+                        }
                         let (changed, requests) = app.handle_terminal_event(event);
-                        dirty |= changed;
+                        if changed {
+                            redraw = Redraw::Immediate;
+                        }
                         for request in requests {
-                            if let Err(error) = client.try_send(request.clone()) {
-                                dirty |= apply_send_failure(&mut app, request, error);
+                            if let Err(error) = client.try_send(request.clone())
+                                && apply_send_failure(&mut app, request, error)
+                            {
+                                redraw = Redraw::Immediate;
                             }
                         }
                     }
@@ -102,21 +134,32 @@ where
                 let Some(update) = update else {
                     return Err(TuiError::ClientStopped);
                 };
-                dirty |= app.apply_client_update(update);
+                if app.apply_client_update(update) {
+                    redraw = redraw.max(Redraw::Scheduled);
+                }
                 for request in app.take_requests() {
-                    if let Err(error) = client.try_send(request.clone()) {
-                        dirty |= apply_send_failure(&mut app, request, error);
+                    if let Err(error) = client.try_send(request.clone())
+                        && apply_send_failure(&mut app, request, error)
+                    {
+                        redraw = redraw.max(Redraw::Scheduled);
                     }
                 }
             }
-            _ = animation_tick.tick(), if app.has_activity() => {
-                dirty |= app.advance_animation();
+            highlighted = renderer.highlighter.next() => {
+                if renderer.apply_highlight(highlighted) {
+                    redraw = redraw.max(Redraw::Scheduled);
+                }
             }
-            _ = frame_tick.tick(), if dirty => {
-                let bytes = renderer.draw(&mut app, size()?)?;
+            _ = animation_tick.tick(), if app.has_activity() => {
+                if app.advance_animation() {
+                    redraw = redraw.max(Redraw::Scheduled);
+                }
+            }
+            _ = frame_tick.tick(), if redraw != Redraw::Clean => {
+                let bytes = renderer.draw(&mut app, terminal_size)?;
                 output.write_all(&bytes).await?;
                 output.flush().await?;
-                dirty = false;
+                redraw = Redraw::Clean;
             }
         }
         if app.quit {
@@ -355,6 +398,9 @@ mod tests {
         /// Advance paused time far enough for pending input to be handled and
         /// any dirty frame to be drawn.
         async fn settle(&self) {
+            // Let the loop consume queued input, then let a frame tick fire,
+            // then let it draw.
+            tokio::task::yield_now().await;
             tokio::time::advance(FRAME_INTERVAL * 3).await;
             tokio::task::yield_now().await;
         }
@@ -601,5 +647,39 @@ mod tests {
         ));
         let result = task.await.expect("loop task");
         assert!(matches!(result, Err(TuiError::ClientStopped)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_upgrades_completed_code_to_highlighted_off_the_render_path() {
+        let mut harness = Harness::new(64);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        let mut message = assistant_message(7, "```rust\nlet x = 1;\n```");
+        message.state = MessageState::Complete;
+        harness.update(ClientUpdate::Snapshot(snapshot(1, vec![message])));
+        harness.update(ClientUpdate::Connection(ConnectionState::Live));
+
+        // Real time here: the highlight runs on the blocking pool. Poll until a
+        // frame carries the keyword color (crossterm encodes `Magenta` as
+        // `38;5;13`), bounded so a regression fails fast. Frames are row
+        // diffs, so the upgraded frame holds only the code row.
+        let keyword = "\x1b[38;5;13m\x1b[48;2;38;40;48mlet";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut plain_seen = false;
+        let mut highlighted_seen = false;
+        while std::time::Instant::now() < deadline && !highlighted_seen {
+            tokio::time::sleep(FRAME_INTERVAL).await;
+            for frame in harness.frames.frames() {
+                let text = frame_text(&frame);
+                if text.contains(keyword) {
+                    highlighted_seen = true;
+                } else if text.contains("let x = 1;") {
+                    plain_seen = true;
+                }
+            }
+        }
+        harness.quit();
+        task.await.expect("loop task").expect("loop exits cleanly");
+        assert!(plain_seen, "a plain frame should have been drawn first");
+        assert!(highlighted_seen, "the highlighted frame never arrived");
     }
 }

@@ -1,6 +1,7 @@
 //! Frame assembly: composes chrome, transcript, and overlays into the lines
 //! the renderer diffs against the previous frame.
 
+mod highlight;
 mod markdown;
 mod wrap;
 
@@ -31,7 +32,9 @@ use crate::{
         Line, Style, accent, brand, diff_line_style, failure, muted, normal, warning, write_line,
     },
 };
-use markdown::{markdown_lines, settled_prefix_end};
+use highlight::HighlightKey;
+pub(crate) use highlight::{Highlighted, Highlighter};
+use markdown::{has_fenced_code, markdown_lines, settled_prefix_end};
 #[cfg(test)]
 use wrap::transcript_viewport;
 use wrap::{
@@ -73,6 +76,8 @@ pub(crate) struct FrameRenderer {
     previous: Vec<Line>,
     size: Option<(u16, u16)>,
     markdown: HashMap<MessageId, CachedMarkdown>,
+    /// Off-tick syntax highlighting for cached completed messages.
+    pub(crate) highlighter: Highlighter,
     /// Settled rows of messages still streaming, keyed by message. Each entry
     /// holds the layout of the message's block-boundary-settled prefix so a
     /// frame only lays out the trailing open block.
@@ -95,6 +100,21 @@ struct CachedMarkdown {
     refusal_bytes: usize,
     loaded_through: u64,
     body: CachedMessageBody,
+    /// A highlighted layout has been requested or applied; `false` means a
+    /// later frame should try again once the highlighter has capacity.
+    highlight_requested: bool,
+}
+
+impl CachedMarkdown {
+    fn key(&self, message_id: MessageId) -> HighlightKey {
+        HighlightKey {
+            message_id,
+            width: self.width,
+            output_bytes: self.output_bytes,
+            refusal_bytes: self.refusal_bytes,
+            loaded_through: self.loaded_through,
+        }
+    }
 }
 
 enum CachedMessageBody {
@@ -676,21 +696,36 @@ impl FrameRenderer {
     }
 
     fn cache_message(&mut self, message: &MessageSnapshot, width: usize, loaded_through: u64) {
-        if self.markdown.get(&message.id).is_some_and(|cached| {
-            cached.width == width
-                && cached.output_bytes == message.output.len()
-                && cached.refusal_bytes == message.refusal.len()
-                && cached.loaded_through == loaded_through
-        }) {
+        if let Some(cached) = self.markdown.get_mut(&message.id)
+            && cached.width == width
+            && cached.output_bytes == message.output.len()
+            && cached.refusal_bytes == message.refusal.len()
+            && cached.loaded_through == loaded_through
+        {
+            // Layout is current; retry a highlight request that was skipped
+            // because the highlighter was saturated.
+            if !cached.highlight_requested {
+                let key = cached.key(message.id);
+                cached.highlight_requested = Self::request_highlight(
+                    &mut self.highlighter,
+                    key,
+                    MessageText::new(message),
+                    message.role,
+                );
+            }
             return;
         }
         let source = MessageText::new(message);
         let content_width = width.saturating_sub(3).max(1);
         let (prefix, prefix_style, _, _) = message_presentation(message.role);
+        // Plain layout first so the frame never waits on tree-sitter; the
+        // highlighted layout replaces it when the blocking job finishes.
+        let mut needs_highlight = false;
         let body = if source.len() <= MAX_FULL_MARKDOWN_BYTES {
             let content = source.as_cow();
-            let lines = markdown_lines(&content, content_width, true);
+            let lines = markdown_lines(&content, content_width, false);
             if lines.len() <= MAX_FULL_MARKDOWN_ROWS {
+                needs_highlight = has_fenced_code(&content);
                 CachedMessageBody::Markdown(indent_lines(lines, prefix, prefix_style, width))
             } else {
                 CachedMessageBody::Plain(PlainTextIndex::new(source, content_width))
@@ -704,16 +739,60 @@ impl FrameRenderer {
         {
             self.markdown.remove(&stale);
         }
-        self.markdown.insert(
-            message.id,
-            CachedMarkdown {
+        let cached = CachedMarkdown {
+            width,
+            output_bytes: message.output.len(),
+            refusal_bytes: message.refusal.len(),
+            loaded_through,
+            body,
+            highlight_requested: !needs_highlight,
+        };
+        let key = cached.key(message.id);
+        let mut cached = cached;
+        if needs_highlight {
+            cached.highlight_requested =
+                Self::request_highlight(&mut self.highlighter, key, source, message.role);
+        }
+        self.markdown.insert(message.id, cached);
+    }
+
+    fn request_highlight(
+        highlighter: &mut Highlighter,
+        key: HighlightKey,
+        source: MessageText<'_>,
+        role: MessageRole,
+    ) -> bool {
+        let content = source.as_cow().into_owned();
+        let content_width = key.width.saturating_sub(3).max(1);
+        let width = key.width;
+        let (prefix, prefix_style, _, _) = message_presentation(role);
+        highlighter.request(key, move || {
+            indent_lines(
+                markdown_lines(&content, content_width, true),
+                prefix,
+                prefix_style,
                 width,
-                output_bytes: message.output.len(),
-                refusal_bytes: message.refusal.len(),
-                loaded_through,
-                body,
-            },
-        );
+            )
+        })
+    }
+
+    /// Install a finished highlight layout. Returns whether the frame changed;
+    /// stale results for a message that was re-laid-out or evicted are
+    /// dropped.
+    pub(crate) fn apply_highlight(&mut self, result: Highlighted) -> bool {
+        let Some(cached) = self.markdown.get_mut(&result.key.message_id) else {
+            return false;
+        };
+        if cached.key(result.key.message_id) != result.key {
+            return false;
+        }
+        match &mut cached.body {
+            CachedMessageBody::Markdown(lines) => {
+                *lines = result.lines;
+                true
+            }
+            CachedMessageBody::Plain(_) => false,
+        }
     }
 
     fn threadline<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
@@ -2209,8 +2288,8 @@ mod tests {
         body.viewport(app, body.rows, 0)
     }
 
-    #[test]
-    fn streaming_messages_render_code_plain_and_highlight_on_completion() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn completed_messages_render_plain_then_upgrade_to_highlighted() {
         let mut renderer = FrameRenderer::default();
         let mut message = completed_message(1, "```rust\nlet x = 1;\n```".to_owned());
         message.state = MessageState::Streaming;
@@ -2220,12 +2299,45 @@ mod tests {
         // Re-rendered every frame while streaming: plain panel, no cache.
         assert_eq!(style_of(&streaming, "let"), Some(surface(normal())));
         assert!(renderer.markdown.is_empty());
+        assert_eq!(renderer.highlighter.in_flight(), 0);
 
+        // Completion caches a plain layout immediately and schedules
+        // highlighting off the render path.
         message.state = MessageState::Complete;
         let complete = renderer.render_message(&message, 40);
-
-        assert_eq!(style_of(&complete, "let"), Some(surface(code_keyword())));
+        assert_eq!(style_of(&complete, "let"), Some(surface(normal())));
         assert!(renderer.markdown.contains_key(&message.id));
+        assert_eq!(renderer.highlighter.in_flight(), 1);
+
+        let highlighted = renderer.highlighter.next().await;
+        assert!(renderer.apply_highlight(highlighted));
+        let upgraded = renderer.render_message(&message, 40);
+        assert_eq!(style_of(&upgraded, "let"), Some(surface(code_keyword())));
+
+        // A stale result (different width) is dropped, not installed.
+        let stale = Highlighted {
+            key: HighlightKey {
+                message_id: message.id,
+                width: 41,
+                output_bytes: message.output.len(),
+                refusal_bytes: 0,
+                loaded_through: 0,
+            },
+            lines: Vec::new(),
+        };
+        assert!(!renderer.apply_highlight(stale));
+        assert_eq!(
+            style_of(&renderer.render_message(&message, 40), "let"),
+            Some(surface(code_keyword()))
+        );
+    }
+
+    #[test]
+    fn prose_only_messages_do_not_request_highlighting() {
+        let mut renderer = FrameRenderer::default();
+        let message = completed_message(1, "plain **prose** without code".to_owned());
+        renderer.render_message(&message, 40);
+        assert_eq!(renderer.highlighter.in_flight(), 0);
     }
 
     #[test]

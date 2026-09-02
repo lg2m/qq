@@ -1255,3 +1255,12 @@ mod settled_prefix_tests {
         }
     }
 }
+
+/// Whether `source` contains a fenced code block that highlighting could
+/// color. Cheap line scan; false positives only cost one skipped job.
+pub(crate) fn has_fenced_code(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    })
+}

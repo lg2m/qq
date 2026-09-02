@@ -132,6 +132,23 @@ impl BenchHarness {
             .expect("in-memory frame rendering cannot fail")
     }
 
+    /// Install any finished off-tick highlight results, as the event loop
+    /// would between frames. Returns how many were applied.
+    pub fn apply_finished_highlights(&mut self) -> usize {
+        let mut applied = 0;
+        while let Some(result) = self.renderer.highlighter.try_next() {
+            if self.renderer.apply_highlight(result) {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    /// Whether highlight jobs are still running.
+    pub fn highlights_pending(&self) -> bool {
+        self.renderer.highlighter.in_flight() > 0
+    }
+
     fn apply(&mut self, index: u8, event: SessionEvent) -> bool {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
