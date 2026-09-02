@@ -91,17 +91,200 @@ pub enum TuiError {
     ClientStopped,
 }
 
+/// Warm transcript bodies kept loaded at once. The focused session is always
+/// warm; the rest are the most recently focused sessions so switching back
+/// costs no round trip.
+const WARM_BODY_LIMIT: usize = 8;
+/// Bytes of assistant text retained per session for the live status tail.
+const LIVE_TAIL_BYTES: usize = 256;
+
+/// Cheap per-session liveness reduced from every event, whether or not the
+/// session's transcript body is loaded. This is what a sidebar or session
+/// list shows for the sessions the user is not looking at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveStatus {
+    /// Last bytes of the newest assistant message, whitespace-collapsed.
+    pub tail: String,
+    /// The previous append ended in whitespace that has not yet been emitted
+    /// as a separator.
+    tail_space_pending: bool,
+    /// Name of the tool call currently running or awaiting approval.
+    pub active_tool: Option<String>,
+    /// Tool calls awaiting an approval answer. A set rather than a count so
+    /// replayed or repeated events cannot drift it.
+    pub awaiting_approval: std::collections::BTreeSet<qq_protocol::ToolCallId>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionView {
     pub summary: SessionSummary,
+    /// `Some` only while the body is warm; `None` means summary-only.
     pub messages: Option<Vec<MessageSnapshot>>,
     pub tool_calls: Option<Vec<ToolCallSnapshot>>,
     pub context_window: Option<u32>,
-    /// Latest replaceable liveness state for the active run. Snapshots do not
-    /// currently carry it, so reconnects fall back to a generic running label
-    /// until the next live activity event arrives.
+    /// Latest replaceable liveness state for the active run, seeded from the
+    /// summary on load and replaced by `RunActivityChanged` events.
     pub activity: Option<(RunId, RunActivity)>,
+    pub live: LiveStatus,
+    /// Focus clock at the last time this session was focused; orders warm
+    /// body eviction. Zero for never-focused sessions.
+    pub(crate) last_focused: u64,
     pub(crate) loaded_through: u64,
+}
+
+impl SessionView {
+    pub(super) fn summary_only(
+        summary: SessionSummary,
+        context_window: Option<u32>,
+        loaded_through: u64,
+    ) -> Self {
+        let activity = summary.active_run_id.zip(summary.activity);
+        Self {
+            summary,
+            messages: None,
+            tool_calls: None,
+            context_window,
+            activity,
+            live: LiveStatus::default(),
+            last_focused: 0,
+            loaded_through,
+        }
+    }
+
+    /// Refresh the summary in place. Activity follows the summary when the
+    /// summary carries it or the run changed; a live event already applied
+    /// for the same run is kept when the summary is silent.
+    pub(super) fn set_summary(&mut self, summary: SessionSummary, context_window: Option<u32>) {
+        match (summary.active_run_id, summary.activity) {
+            (Some(run_id), Some(activity)) => self.activity = Some((run_id, activity)),
+            (Some(run_id), None) => {
+                if self.activity.is_some_and(|(active, _)| active != run_id) {
+                    self.activity = None;
+                }
+            }
+            (None, _) => self.activity = None,
+        }
+        self.summary = summary;
+        self.context_window = context_window;
+    }
+
+    pub(crate) fn is_warm(&self) -> bool {
+        self.messages.is_some()
+    }
+}
+
+impl LiveStatus {
+    /// Derive status from a loaded body, as after a snapshot.
+    fn from_body(messages: &[MessageSnapshot], tool_calls: &[ToolCallSnapshot]) -> Self {
+        let mut live = Self::default();
+        if let Some(message) = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == qq_protocol::MessageRole::Assistant)
+        {
+            live.set_tail(&message.output);
+        }
+        for call in tool_calls {
+            live.note_tool_call(call);
+        }
+        live
+    }
+
+    /// Replace the tail with the last [`LIVE_TAIL_BYTES`] of `text`, with
+    /// whitespace collapsed to single spaces so it fits one row.
+    pub(super) fn set_tail(&mut self, text: &str) {
+        let mut start = text.len().saturating_sub(LIVE_TAIL_BYTES);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        self.tail.clear();
+        self.tail_space_pending = false;
+        self.push_collapsed(&text[start..]);
+    }
+
+    fn push_collapsed(&mut self, text: &str) {
+        for character in text.chars() {
+            if character.is_whitespace() {
+                self.tail_space_pending = !self.tail.is_empty();
+            } else if let Some(character) = terminal_safe_character(character) {
+                if self.tail_space_pending {
+                    self.tail.push(' ');
+                    self.tail_space_pending = false;
+                }
+                self.tail.push(character);
+            }
+        }
+    }
+
+    /// Append streamed text and trim the front back to the byte bound.
+    pub(super) fn append_tail(&mut self, text: &str) {
+        if text.len() >= LIVE_TAIL_BYTES {
+            self.set_tail(text);
+            return;
+        }
+        self.push_collapsed(text);
+        if self.tail.len() > LIVE_TAIL_BYTES {
+            let mut start = self.tail.len() - LIVE_TAIL_BYTES;
+            while !self.tail.is_char_boundary(start) {
+                start += 1;
+            }
+            self.tail.drain(..start);
+        }
+    }
+
+    pub(super) fn note_tool_call(&mut self, call: &ToolCallSnapshot) {
+        match call.state {
+            ToolCallState::AwaitingApproval => {
+                self.awaiting_approval.insert(call.id);
+                self.active_tool = Some(call.name.clone());
+            }
+            ToolCallState::Running | ToolCallState::Requested => {
+                self.awaiting_approval.remove(&call.id);
+                self.active_tool = Some(call.name.clone());
+            }
+            ToolCallState::Completed
+            | ToolCallState::Failed
+            | ToolCallState::Denied
+            | ToolCallState::Interrupted => {
+                self.awaiting_approval.remove(&call.id);
+                if self.active_tool.as_deref() == Some(call.name.as_str()) {
+                    self.active_tool = None;
+                }
+            }
+        }
+    }
+}
+
+/// Whether the live session tree renders beside the transcript.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Sidebar {
+    /// Visible when the terminal is at least [`SIDEBAR_AUTO_WIDTH`] columns.
+    #[default]
+    Auto,
+    Shown,
+    Hidden,
+}
+
+/// Terminal width at which `Sidebar::Auto` shows the sidebar.
+pub(crate) const SIDEBAR_AUTO_WIDTH: usize = 120;
+
+impl Sidebar {
+    #[must_use]
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::Auto | Self::Shown => Self::Hidden,
+            Self::Hidden => Self::Shown,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn visible(self, width: usize) -> bool {
+        match self {
+            Self::Auto => width >= SIDEBAR_AUTO_WIDTH,
+            Self::Shown => true,
+            Self::Hidden => false,
+        }
+    }
 }
 
 /// How much of each tool call the transcript shows. Session-local because the
@@ -165,6 +348,8 @@ pub(crate) struct App {
     pub workspace_path: String,
     pub sessions: HashMap<SessionId, SessionView>,
     pub focused: Option<SessionId>,
+    /// Monotonic counter bumped on every focus change; stamps `last_focused`.
+    focus_clock: u64,
     /// The open overlay, if any. At most one overlay owns input at a time.
     pub overlay: Option<Overlay>,
     pub composer: Composer,
@@ -184,6 +369,9 @@ pub(crate) struct App {
     pub animation_tick: usize,
     pub quit: bool,
     pub tool_detail: ToolDetail,
+    /// Session sidebar visibility. `Auto` shows it when the terminal is wide
+    /// enough; the toggle command cycles through explicit on and off.
+    pub sidebar: Sidebar,
     transcript_viewport: TranscriptViewport,
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
@@ -212,6 +400,7 @@ impl App {
             workspace_path: String::new(),
             sessions: HashMap::new(),
             focused: None,
+            focus_clock: 0,
             overlay: None,
             composer: Composer::default(),
             prompt_history: HashMap::new(),
@@ -226,6 +415,7 @@ impl App {
             animation_tick: 0,
             quit: false,
             tool_detail: ToolDetail::default(),
+            sidebar: Sidebar::default(),
             transcript_viewport: TranscriptViewport::default(),
             last_sequence: 0,
             recent_events: VecDeque::new(),
@@ -287,7 +477,7 @@ impl App {
                                 .as_ref()
                                 .is_some_and(|intent| matches!(intent, PendingIntent::Create))
                         {
-                            self.focused = Some(session_id);
+                            self.adopt_created_session(session_id);
                         }
                         if let Some(PendingIntent::Cancel { session_id }) = intent.as_ref() {
                             self.set_info_for(
@@ -448,29 +638,33 @@ impl App {
         if initial || snapshot_sequence >= self.last_sequence {
             for summary in snapshot.sessions {
                 let context_window = model_context_window(&self.models, summary.model.as_deref());
-                self.sessions
-                    .entry(summary.id)
-                    .and_modify(|session| {
-                        session.summary = summary.clone();
-                        session.context_window = context_window;
-                    })
-                    .or_insert(SessionView {
-                        summary,
-                        messages: None,
-                        tool_calls: None,
-                        context_window,
-                        activity: None,
-                        loaded_through: snapshot_sequence,
-                    });
+                match self.sessions.entry(summary.id) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().set_summary(summary, context_window);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(SessionView::summary_only(
+                            summary,
+                            context_window,
+                            snapshot_sequence,
+                        ));
+                    }
+                }
             }
+        }
+        for body in snapshot.included {
+            self.install_session_snapshot(body, snapshot_sequence);
         }
         if let Some(focused) = snapshot.focused {
             let focused_id = focused.summary.id;
             self.install_session_snapshot(focused, snapshot_sequence);
-            self.focused = Some(focused_id);
-        } else if self.focused.is_none() {
-            self.focused = self.root_sessions().first().copied();
+            self.set_focus(focused_id);
+        } else if self.focused.is_none()
+            && let Some(first) = self.root_sessions().first().copied()
+        {
+            self.set_focus(first);
         }
+        self.evict_cold_bodies();
         if initial {
             self.last_sequence = snapshot_sequence;
         }
@@ -489,14 +683,26 @@ impl App {
         true
     }
 
+    /// Load one session's transcript body. Other warm bodies are untouched;
+    /// `evict_cold_bodies` enforces the warm limit afterwards.
     fn install_session_snapshot(&mut self, snapshot: SessionSnapshot, loaded_through: u64) {
-        for session in self.sessions.values_mut() {
-            session.messages = None;
-            session.tool_calls = None;
-        }
-        // A snapshot replaces live per-call state wholesale; buffered output
-        // for calls it no longer reports as running would render forever.
-        self.live_tool_output.clear();
+        let session_id = snapshot.summary.id;
+        // Live tool output for calls this body no longer reports as running
+        // would render forever; drop this session's buffers.
+        let running: std::collections::HashSet<_> = snapshot
+            .tool_calls
+            .iter()
+            .filter(|call| call.state == ToolCallState::Running)
+            .map(|call| call.id)
+            .collect();
+        self.live_tool_output.retain(|id, _| {
+            running.contains(id)
+                || self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.tool_calls.as_ref())
+                    .is_none_or(|calls| !calls.iter().any(|call| call.id == *id))
+        });
         let mut messages = snapshot.messages;
         retain_recent_messages(&mut messages);
         let history = messages
@@ -506,7 +712,7 @@ impl App {
             .filter(|prompt| !prompt.trim().is_empty())
             .collect::<VecDeque<_>>();
         self.prompt_history.insert(
-            snapshot.summary.id,
+            session_id,
             history
                 .into_iter()
                 .rev()
@@ -517,17 +723,69 @@ impl App {
         let mut tool_calls = snapshot.tool_calls;
         retain_recent_tool_calls(&mut tool_calls);
         let context_window = model_context_window(&self.models, snapshot.summary.model.as_deref());
-        self.sessions.insert(
-            snapshot.summary.id,
-            SessionView {
-                summary: snapshot.summary,
-                messages: Some(messages),
-                tool_calls: Some(tool_calls),
-                context_window,
-                activity: None,
-                loaded_through,
-            },
-        );
+        let last_focused = self
+            .sessions
+            .get(&session_id)
+            .map_or(0, |session| session.last_focused);
+        let mut view = SessionView::summary_only(snapshot.summary, context_window, loaded_through);
+        view.live = LiveStatus::from_body(&messages, &tool_calls);
+        view.messages = Some(messages);
+        view.tool_calls = Some(tool_calls);
+        view.last_focused = last_focused;
+        self.sessions.insert(session_id, view);
+    }
+
+    /// A session this client just created has an empty transcript by
+    /// construction, so it is warm immediately: focus moves in this frame and
+    /// no snapshot round trip is needed before the user can type.
+    pub(super) fn adopt_created_session(&mut self, session_id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&session_id)
+            && !session.is_warm()
+        {
+            session.messages = Some(Vec::new());
+            session.tool_calls = Some(Vec::new());
+        }
+        self.set_focus(session_id);
+        self.reset_history_browse();
+        self.evict_cold_bodies();
+    }
+
+    /// Point focus at `session_id` and stamp it so warm-body eviction keeps
+    /// the most recently viewed sessions. Does not request anything.
+    fn set_focus(&mut self, session_id: SessionId) {
+        self.focus_clock += 1;
+        self.focused = Some(session_id);
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.last_focused = self.focus_clock;
+        }
+    }
+
+    /// Drop transcript bodies beyond the warm limit, least recently focused
+    /// first. The focused session is never evicted. Summaries and live status
+    /// stay, so the sidebar and pickers keep working for cold sessions.
+    fn evict_cold_bodies(&mut self) {
+        let mut warm: Vec<(u64, SessionId)> = self
+            .sessions
+            .values()
+            .filter(|session| session.is_warm() && Some(session.summary.id) != self.focused)
+            .map(|session| (session.last_focused, session.summary.id))
+            .collect();
+        let keep = WARM_BODY_LIMIT.saturating_sub(usize::from(self.focused.is_some()));
+        if warm.len() <= keep {
+            return;
+        }
+        warm.sort_unstable();
+        let evict = warm.len() - keep;
+        for (_, session_id) in warm.into_iter().take(evict) {
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(calls) = session.tool_calls.take() {
+                    for call in calls {
+                        self.live_tool_output.remove(&call.id);
+                    }
+                }
+                session.messages = None;
+            }
+        }
     }
 
     fn apply_live_event(&mut self, event: SessionEventEnvelope) -> bool {
@@ -708,6 +966,11 @@ impl App {
         {
             return self.execute(Command::ToggleToolDetail);
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('b' | 'B'))
+        {
+            return self.execute(Command::ToggleSidebar);
+        }
         match key.code {
             KeyCode::Esc => {
                 // A sticky error notice dismisses first: acknowledging the
@@ -874,6 +1137,10 @@ impl App {
             }
             Command::ToggleToolDetail => {
                 self.tool_detail = self.tool_detail.next();
+                (true, Vec::new())
+            }
+            Command::ToggleSidebar => {
+                self.sidebar = self.sidebar.next();
                 (true, Vec::new())
             }
             Command::Quit => {
@@ -1213,9 +1480,19 @@ impl App {
         self.set_session_picker_selection(first);
     }
 
+    /// Focus a session. A warm body renders immediately with no request; a
+    /// cold one shows its summary and live tail while its body is fetched.
     fn focus_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
-        self.focused = Some(session_id);
+        self.set_focus(session_id);
         self.reset_history_browse();
+        self.evict_cold_bodies();
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(SessionView::is_warm)
+        {
+            return (true, Vec::new());
+        }
         let Some(workspace_id) = self.workspace_id else {
             return (true, Vec::new());
         };
@@ -1820,8 +2097,8 @@ mod tests {
     use crossterm::event::MouseEvent;
     use qq_protocol::{
         EventCursor, MessageId, MessageRole, MessageState, RunId, RunOutcome, RunSnapshot,
-        RunStatus, SessionEvent, SessionStatus, StoreId, TokenUsage, ToolCallId, ToolCallState,
-        WorkspaceGrantOutcome, WorkspaceSummary,
+        RunStatus, SessionEvent, SessionStatus, StoreId, TextChannel, TokenUsage, ToolCallId,
+        ToolCallState, WorkspaceGrantOutcome, WorkspaceSummary,
     };
 
     use super::*;
@@ -3868,5 +4145,270 @@ mod tests {
         assert!(!app.handle_terminal_event(wheel).0);
         assert!(!app.handle_terminal_event(page).0);
         assert_eq!(app.transcript_scroll_offset(), 0);
+    }
+
+    fn summary_named(byte: u8, workspace_id: WorkspaceId, title: &str) -> SessionSummary {
+        SessionSummary {
+            id: id(byte, SessionId::from_bytes),
+            workspace_id,
+            parent_id: None,
+            spawned_by: None,
+            title: title.to_owned(),
+            status: SessionStatus::Idle,
+            active_run_id: None,
+            activity: None,
+            queued_prompts: 0,
+            model: Some("openai/gpt-test".to_owned()),
+            context_tokens: None,
+            accounting: None,
+            estimated_cost_usd_nanos: Some(0),
+            updated_at_ms: u64::from(byte),
+            last_outcome: None,
+        }
+    }
+
+    fn body_for(summary: &SessionSummary, output: &str) -> SessionSnapshot {
+        SessionSnapshot {
+            summary: summary.clone(),
+            messages: vec![MessageSnapshot {
+                id: id(summary.id.as_bytes()[0], MessageId::from_bytes),
+                session_id: summary.id,
+                run_id: id(0xaa, RunId::from_bytes),
+                turn_ordinal: 1,
+                role: MessageRole::Assistant,
+                state: MessageState::Complete,
+                output: output.to_owned(),
+                refusal: String::new(),
+                created_at_ms: 1,
+            }],
+            runs: Vec::new(),
+            tool_calls: Vec::new(),
+            has_older_tool_calls: false,
+            has_older_messages: false,
+        }
+    }
+
+    #[test]
+    fn creating_a_session_adopts_it_without_a_snapshot_round_trip() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        let workspace_id = app.workspace_id.unwrap();
+        let (_, requests) = app.execute(Command::NewRootSession);
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one create command, got {requests:?}");
+        };
+        let created = id(0x42, SessionId::from_bytes);
+        let mut summary = summary_named(0x42, workspace_id, "New session");
+        summary.updated_at_ms = 99;
+
+        // The durable event arrives first (the SSE stream is usually ahead of
+        // the HTTP receipt); focus moves and the body is already warm.
+        let changed = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: id(3, StoreId::from_bytes),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: created,
+            run_id: None,
+            caused_by: Some(request.command_id),
+            occurred_at_ms: 1,
+            event: SessionEvent::SessionCreated {
+                session: summary.clone(),
+            },
+        }));
+        assert!(changed);
+        assert_eq!(app.focused, Some(created));
+        assert!(app.sessions[&created].is_warm());
+        assert!(app.take_requests().is_empty(), "no snapshot after create");
+
+        // The receipt confirms without changing anything or requesting more.
+        app.apply_client_update(ClientUpdate::CommandResult {
+            command_id: request.command_id,
+            result: Ok(qq_protocol::CommandReceipt {
+                command_id: request.command_id,
+                outcome: CommandOutcome::SessionCreated {
+                    session_id: created,
+                },
+                committed_through: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id,
+                    sequence: 2,
+                },
+            }),
+        });
+        assert_eq!(app.focused, Some(created));
+        assert!(app.take_requests().is_empty());
+        // The previously focused session keeps its body warm.
+        let previous = snapshot().sessions[0].id;
+        assert!(app.sessions[&previous].is_warm());
+    }
+
+    #[test]
+    fn switching_to_a_warm_session_needs_no_request_and_a_cold_one_does() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let warm = summary_named(0x51, workspace_id, "warm");
+        let cold = summary_named(0x52, workspace_id, "cold");
+        initial.sessions.push(warm.clone());
+        initial.sessions.push(cold.clone());
+        initial.included.push(body_for(&warm, "warm body"));
+        app.apply_snapshot(initial);
+        let first = snapshot().sessions[0].id;
+        assert_eq!(app.focused, Some(first));
+        assert!(app.sessions[&warm.id].is_warm());
+        assert!(!app.sessions[&cold.id].is_warm());
+
+        let (changed, requests) = app.focus_session(warm.id);
+        assert!(changed);
+        assert!(requests.is_empty(), "warm switch must not request");
+        assert_eq!(app.focused, Some(warm.id));
+        assert!(app.sessions[&first].is_warm(), "leaving does not evict");
+
+        let (_, requests) = app.focus_session(cold.id);
+        assert!(matches!(
+            requests.as_slice(),
+            [ClientRequest::Snapshot(SnapshotRequest {
+                focused_session_id: Some(id),
+                ..
+            })] if *id == cold.id
+        ));
+        assert_eq!(app.focused, Some(cold.id));
+    }
+
+    #[test]
+    fn warm_bodies_are_bounded_and_evict_least_recently_focused() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let ids: Vec<SessionId> = (0x60..0x60 + (WARM_BODY_LIMIT as u8) + 2)
+            .map(|byte| {
+                let summary = summary_named(byte, workspace_id, "s");
+                initial.sessions.push(summary.clone());
+                summary.id
+            })
+            .collect();
+        app.apply_snapshot(initial);
+        // Focus each in turn, loading a body every time.
+        for session_id in &ids {
+            app.focus_session(*session_id);
+            let summary = app.sessions[session_id].summary.clone();
+            app.apply_snapshot(WorkspaceSnapshot {
+                focused: Some(body_for(&summary, "body")),
+                ..snapshot()
+            });
+        }
+        let warm: Vec<_> = app.sessions.values().filter(|s| s.is_warm()).collect();
+        assert_eq!(warm.len(), WARM_BODY_LIMIT);
+        // The most recent WARM_BODY_LIMIT are warm; the earliest two are not.
+        assert!(!app.sessions[&ids[0]].is_warm());
+        assert!(!app.sessions[&ids[1]].is_warm());
+        assert!(app.sessions[ids.last().unwrap()].is_warm());
+        // Cold sessions keep their summary and status.
+        assert_eq!(app.sessions[&ids[0]].summary.title, "s");
+    }
+
+    #[test]
+    fn live_status_tracks_cold_sessions_and_activity_seeds_from_snapshots() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let mut child = summary_named(0x71, workspace_id, "child");
+        child.parent_id = Some(initial.sessions[0].id);
+        child.status = SessionStatus::Running;
+        child.active_run_id = Some(id(0x72, RunId::from_bytes));
+        child.activity = Some(RunActivity::Reasoning);
+        initial.sessions.push(child.clone());
+        app.apply_snapshot(initial);
+        assert!(!app.sessions[&child.id].is_warm());
+        assert_eq!(
+            app.sessions[&child.id].activity,
+            Some((id(0x72, RunId::from_bytes), RunActivity::Reasoning))
+        );
+
+        let mut sequence = 1;
+        let mut event = |event: SessionEvent| {
+            sequence += 1;
+            ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id,
+                    sequence,
+                },
+                session_id: child.id,
+                run_id: child.active_run_id,
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event,
+            })
+        };
+        let message = MessageSnapshot {
+            id: id(0x73, MessageId::from_bytes),
+            session_id: child.id,
+            run_id: child.active_run_id.unwrap(),
+            turn_ordinal: 1,
+            role: MessageRole::Assistant,
+            state: MessageState::Streaming,
+            output: String::new(),
+            refusal: String::new(),
+            created_at_ms: 1,
+        };
+        app.apply_client_update(event(SessionEvent::AssistantMessageStarted { message }));
+        app.apply_client_update(event(SessionEvent::TextAppended {
+            message_id: id(0x73, MessageId::from_bytes),
+            channel: TextChannel::Output,
+            text: "Reading   the\nrepository ".to_owned(),
+        }));
+        app.apply_client_update(event(SessionEvent::TextAppended {
+            message_id: id(0x73, MessageId::from_bytes),
+            channel: TextChannel::Output,
+            text: "layout".to_owned(),
+        }));
+        let call = ToolCallSnapshot {
+            id: id(0x74, ToolCallId::from_bytes),
+            session_id: child.id,
+            run_id: child.active_run_id.unwrap(),
+            turn_ordinal: 1,
+            call_ordinal: 0,
+            provider_call_id: "c".to_owned(),
+            name: "search".to_owned(),
+            arguments: "{}".to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+            display: None,
+        };
+        app.apply_client_update(event(SessionEvent::ToolApprovalRequested {
+            tool_call: call.clone(),
+            shell: None,
+            edit: None,
+        }));
+
+        let live = &app.sessions[&child.id].live;
+        assert_eq!(live.tail, "Reading the repository layout");
+        assert_eq!(live.active_tool.as_deref(), Some("search"));
+        assert_eq!(live.awaiting_approval.len(), 1);
+        // Still cold: deltas did not create a body.
+        assert!(!app.sessions[&child.id].is_warm());
+
+        let finished = ToolCallSnapshot {
+            state: ToolCallState::Completed,
+            ..call
+        };
+        app.apply_client_update(event(SessionEvent::ToolCallFinished {
+            tool_call: finished,
+        }));
+        let live = &app.sessions[&child.id].live;
+        assert_eq!(live.active_tool, None);
+        assert!(live.awaiting_approval.is_empty());
+
+        // A long stream keeps the tail bounded.
+        app.apply_client_update(event(SessionEvent::TextAppended {
+            message_id: id(0x73, MessageId::from_bytes),
+            channel: TextChannel::Output,
+            text: "x".repeat(LIVE_TAIL_BYTES * 3),
+        }));
+        assert!(app.sessions[&child.id].live.tail.len() <= LIVE_TAIL_BYTES);
     }
 }

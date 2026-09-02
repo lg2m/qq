@@ -21,13 +21,13 @@ impl App {
     pub(super) fn reduce_event(&mut self, envelope: &SessionEventEnvelope) {
         match &envelope.event {
             SessionEvent::SessionCreated { session } => {
-                self.upsert_summary(session.clone());
-                if envelope
+                let mine = envelope
                     .caused_by
                     .and_then(|id| self.pending.get(&id))
-                    .is_some_and(|intent| matches!(intent, PendingIntent::Create))
-                {
-                    self.focused = Some(session.id);
+                    .is_some_and(|intent| matches!(intent, PendingIntent::Create));
+                self.upsert_summary(session.clone());
+                if mine {
+                    self.adopt_created_session(session.id);
                 }
             }
             SessionEvent::SessionUpdated { session } => {
@@ -78,6 +78,9 @@ impl App {
                     message.run_id,
                     message.turn_ordinal.saturating_sub(1),
                 );
+                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    session.live.set_tail(&message.output);
+                }
                 self.push_message(message.clone());
             }
             SessionEvent::TextAppended {
@@ -85,6 +88,13 @@ impl App {
                 channel,
                 text,
             } => {
+                // Live status reduces for every session, warm or cold, so the
+                // sidebar tracks children the user is not looking at.
+                if *channel == qq_protocol::TextChannel::Output
+                    && let Some(session) = self.sessions.get_mut(&envelope.session_id)
+                {
+                    session.live.append_tail(text);
+                }
                 if let Some(message) = self.message_mut(envelope.session_id, *message_id) {
                     match channel {
                         qq_protocol::TextChannel::Output => message.output.push_str(text),
@@ -100,6 +110,9 @@ impl App {
                 }
                 if let Some(edit) = edit {
                     self.edit_previews.insert(tool_call.id, edit.clone());
+                }
+                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    session.live.note_tool_call(tool_call);
                 }
                 self.upsert_tool_call(tool_call.clone());
             }
@@ -132,6 +145,9 @@ impl App {
                 if tool_call_state_is_terminal(tool_call.state) {
                     // The persisted bounded result takes over from the tail.
                     self.live_tool_output.remove(&tool_call.id);
+                }
+                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    session.live.note_tool_call(tool_call);
                 }
                 self.upsert_tool_call(tool_call.clone());
             }
@@ -191,6 +207,8 @@ impl App {
                 self.upsert_summary(session.clone());
                 if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
                     view.activity = None;
+                    view.live.active_tool = None;
+                    view.live.awaiting_approval.clear();
                 }
                 if let Some(messages) = self
                     .sessions
@@ -240,20 +258,14 @@ impl App {
 
     pub(super) fn upsert_summary(&mut self, summary: SessionSummary) {
         let context_window = model_context_window(&self.models, summary.model.as_deref());
-        self.sessions
-            .entry(summary.id)
-            .and_modify(|session| {
-                session.summary = summary.clone();
-                session.context_window = context_window;
-            })
-            .or_insert(SessionView {
-                summary,
-                messages: None,
-                tool_calls: None,
-                context_window,
-                activity: None,
-                loaded_through: 0,
-            });
+        match self.sessions.entry(summary.id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().set_summary(summary, context_window);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(SessionView::summary_only(summary, context_window, 0));
+            }
+        }
     }
 
     /// Drops a deleted session from every client map, mirroring the server's

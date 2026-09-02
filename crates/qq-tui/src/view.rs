@@ -68,6 +68,8 @@ const MAX_TOOL_RESULT_ROWS: usize = 12;
 /// Rows of live streamed output shown under a running call's one-liner.
 const MAX_LIVE_TAIL_ROWS: usize = 6;
 const TOOL_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+/// Columns the session sidebar occupies, including its left border.
+const SIDEBAR_WIDTH: usize = 36;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
 
@@ -520,20 +522,28 @@ impl FrameRenderer {
         let body_height = height
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(composer_lines.len());
+        // The sidebar takes a fixed column on the right; the body renders in
+        // what remains so its cache keys see one stable width per layout.
+        let sidebar_width = if app.sidebar.visible(width) {
+            SIDEBAR_WIDTH
+        } else {
+            0
+        };
+        let body_width = width.saturating_sub(sidebar_width);
         let mode = app.mode();
         let mut body = match mode {
             Mode::Models | Mode::Sessions | Mode::Approval => {
                 self.prune_markdown(app);
                 match mode {
-                    Mode::Models => model_picker(app, width, body_height),
-                    Mode::Sessions => session_picker(app, width, body_height),
-                    Mode::Approval | Mode::Compose => approval_prompt(app, width, body_height),
+                    Mode::Models => model_picker(app, body_width, body_height),
+                    Mode::Sessions => session_picker(app, body_width, body_height),
+                    Mode::Approval | Mode::Compose => approval_prompt(app, body_width, body_height),
                 }
             }
             Mode::Compose => {
                 let body = match app.layout {
-                    Layout::Threadline => self.threadline(app, width),
-                    Layout::FoldFocus => self.fold_focus(app, width),
+                    Layout::Threadline => self.threadline(app, body_width),
+                    Layout::FoldFocus => self.fold_focus(app, body_width),
                 };
                 app.update_transcript_viewport(body.rows, body_height, body.preserve_tail_anchor);
                 let live_message_ranges = body.live_message_ranges.clone();
@@ -544,7 +554,18 @@ impl FrameRenderer {
             }
         };
         if mode == Mode::Compose {
-            overlay_slash_autocomplete(&mut body, slash_autocomplete(app, width, body_height));
+            overlay_slash_autocomplete(&mut body, slash_autocomplete(app, body_width, body_height));
+        }
+        if sidebar_width > 0 {
+            let sidebar = sidebar(app, sidebar_width, body_height);
+            body = fit_height(body, body_height);
+            for (row, column) in body.iter_mut().zip(sidebar) {
+                pad_line(row, body_width);
+                for span in column.spans {
+                    row.push(span.text, span.style);
+                }
+                pad_line(row, width);
+            }
         }
         lines.extend(body);
         lines.extend(status_lines);
@@ -1923,6 +1944,98 @@ fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) ->
         line.push(format!("  {} queued", session.queued_prompts), warning());
     }
     truncate_line(line, width)
+}
+
+/// Right-hand session tree with live status for every session, warm or cold.
+/// Each session takes one row (title) plus one row of status when it has
+/// anything to say: the active tool, an approval waiting, or the newest
+/// assistant text. Always `height` rows so it zips against the body.
+fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let inner = width.saturating_sub(2);
+    let mut lines = Vec::with_capacity(height);
+    let mut header = Line::styled("│ ", muted());
+    header.push("SESSIONS", accent().bold());
+    let running = app
+        .sessions
+        .values()
+        .filter(|session| session.summary.status == SessionStatus::Running)
+        .count();
+    if running > 0 {
+        header.push(format!("  {running} running"), accent());
+    }
+    lines.push(truncate_line(header, width));
+    lines.push(Line::styled("│", muted()));
+    let order = app.thread_order();
+    let mut rows: Vec<Line> = Vec::new();
+    let mut focused_row = 0;
+    for session_id in order {
+        let depth = app.depth(session_id);
+        let indent = "  ".repeat(depth.min(4));
+        if app.focused == Some(session_id) {
+            focused_row = rows.len();
+        }
+        rows.push(session_line(app, session_id, width, &format!("│ {indent}")));
+        if let Some(status) = sidebar_status(app, session_id) {
+            let mut line = Line::styled(format!("│ {indent}   "), muted());
+            let used = line.width();
+            let (text, style) = status;
+            line.push(preview(&text, inner.saturating_sub(used)), style);
+            rows.push(truncate_line(line, width));
+        }
+    }
+    if rows.is_empty() {
+        rows.push(Line::styled("│   no sessions yet", muted().italic()));
+    }
+    let available = height.saturating_sub(lines.len());
+    lines.extend(selection_viewport(rows, available, focused_row));
+    while lines.len() < height {
+        lines.push(Line::styled("│", muted()));
+    }
+    lines.truncate(height);
+    lines
+}
+
+/// One-line status for a sidebar row, most urgent first.
+fn sidebar_status(app: &App, session_id: SessionId) -> Option<(String, Style)> {
+    let session = app.sessions.get(&session_id)?;
+    let live = &session.live;
+    if !live.awaiting_approval.is_empty() {
+        let tool = live.active_tool.as_deref().unwrap_or("tool");
+        return Some((format!("? approve {tool}"), warning().bold()));
+    }
+    if session.summary.status == SessionStatus::Running {
+        if let Some(tool) = &live.active_tool {
+            return Some((format!("> {tool}"), accent()));
+        }
+        if !live.tail.is_empty() {
+            return Some((live.tail.clone(), muted()));
+        }
+        let label = match session.activity.map(|(_, activity)| activity) {
+            Some(qq_protocol::RunActivity::WaitingForProvider) | None => "waiting for provider",
+            Some(qq_protocol::RunActivity::Reasoning) => "reasoning",
+            Some(qq_protocol::RunActivity::GeneratingResponse) => "responding",
+            Some(qq_protocol::RunActivity::PreparingToolCall) => "preparing a tool call",
+        };
+        return Some((label.to_owned(), muted().italic()));
+    }
+    if session.summary.queued_prompts > 0 {
+        return Some((
+            format!("{} queued", session.summary.queued_prompts),
+            warning(),
+        ));
+    }
+    if app.focused != Some(session_id) && !live.tail.is_empty() {
+        return Some((live.tail.clone(), muted()));
+    }
+    None
+}
+
+/// Extend `line` with spaces to exactly `width` display columns.
+fn pad_line(line: &mut Line, width: usize) {
+    let used = line.width();
+    if used < width {
+        line.push(" ".repeat(width - used), normal());
+    }
 }
 
 fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
@@ -3847,5 +3960,118 @@ mod tests {
         assert!(frame_text(&tail).contains("END-LONG-MESSAGE"));
         assert!(!frame_text(&tail).contains("BEGIN-LONG-MESSAGE"));
         assert!(frame_text(&top).contains("BEGIN-LONG-MESSAGE"));
+    }
+
+    #[test]
+    fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
+        let mut app = app_with_messages(1);
+        app.connection = crate::ConnectionState::Live;
+        let workspace_id = app.workspace_id.unwrap();
+        let parent = app.focused.unwrap();
+        let child_id = SessionId::from_bytes([7; 16]);
+        let run_id = RunId::from_bytes([8; 16]);
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: StoreId::from_bytes([4; 16]),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: child_id,
+            run_id: Some(run_id),
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::SessionCreated {
+                session: SessionSummary {
+                    id: child_id,
+                    workspace_id,
+                    parent_id: Some(parent),
+                    spawned_by: None,
+                    title: "Survey callers".to_owned(),
+                    status: SessionStatus::Running,
+                    active_run_id: Some(run_id),
+                    activity: Some(qq_protocol::RunActivity::GeneratingResponse),
+                    queued_prompts: 0,
+                    model: None,
+                    context_tokens: None,
+                    accounting: None,
+                    estimated_cost_usd_nanos: None,
+                    updated_at_ms: 2,
+                    last_outcome: None,
+                },
+            },
+        }));
+        // The child is cold (no body) but streams text; the sidebar must
+        // still show its tail.
+        let message = MessageSnapshot {
+            id: MessageId::from_bytes([9; 16]),
+            session_id: child_id,
+            run_id,
+            turn_ordinal: 1,
+            role: MessageRole::Assistant,
+            state: MessageState::Streaming,
+            output: String::new(),
+            refusal: String::new(),
+            created_at_ms: 3,
+        };
+        for (sequence, event) in [
+            (3, SessionEvent::AssistantMessageStarted { message }),
+            (
+                4,
+                SessionEvent::TextAppended {
+                    message_id: MessageId::from_bytes([9; 16]),
+                    channel: qq_protocol::TextChannel::Output,
+                    text: "Found twelve call sites".to_owned(),
+                },
+            ),
+        ] {
+            app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: StoreId::from_bytes([4; 16]),
+                    workspace_id,
+                    sequence,
+                },
+                session_id: child_id,
+                run_id: Some(run_id),
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event,
+            }));
+        }
+        assert!(!app.sessions[&child_id].is_warm());
+
+        let rows_at = |app: &mut App, width| {
+            frame_rows(&FrameRenderer::default().frame(app, width, 24)).join("\n")
+        };
+        let narrow = rows_at(&mut app, 100);
+        assert!(
+            !narrow.contains("SESSIONS  1 running"),
+            "auto-hidden when narrow"
+        );
+
+        let wide_frame = FrameRenderer::default().frame(&mut app, 160, 24);
+        let wide = frame_rows(&wide_frame).join("\n");
+        assert!(wide.contains("SESSIONS  1 running"), "{wide}");
+        assert!(wide.contains("Survey callers"));
+        assert!(wide.contains("Found twelve call sites"));
+        // With the sidebar glued on, every body row is exactly the terminal
+        // width: the border column lines up and nothing overflows.
+        for row in &wide_frame[2..wide_frame.len() - 4] {
+            assert_eq!(
+                row.width(),
+                160,
+                "{:?}",
+                frame_rows(std::slice::from_ref(row))
+            );
+        }
+
+        // Ctrl-B hides it even when wide; a second press shows it again.
+        let toggle = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        app.handle_terminal_event(toggle.clone());
+        assert!(!rows_at(&mut app, 160).contains("SESSIONS  1 running"));
+        app.handle_terminal_event(toggle);
+        assert!(
+            rows_at(&mut app, 100).contains("SESSIONS  1 running"),
+            "explicitly shown wins over width"
+        );
     }
 }

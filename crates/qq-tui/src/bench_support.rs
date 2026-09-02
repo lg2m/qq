@@ -145,6 +145,16 @@ impl BenchHarness {
         applied
     }
 
+    /// Force the session sidebar on regardless of width.
+    pub fn show_sidebar(&mut self) {
+        self.app.sidebar = crate::app::Sidebar::Shown;
+    }
+
+    /// Force the session sidebar off regardless of width.
+    pub fn hide_sidebar(&mut self) {
+        self.app.sidebar = crate::app::Sidebar::Hidden;
+    }
+
     /// Whether highlight jobs are still running.
     pub fn highlights_pending(&self) -> bool {
         self.renderer.highlighter.in_flight() > 0

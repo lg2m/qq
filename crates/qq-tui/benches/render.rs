@@ -38,9 +38,11 @@ fn main() {
     let _guard = runtime.enter();
 
     steady_state(iterations);
+    steady_state_with_sidebar(iterations);
     streaming_focused(iterations);
     streaming_run_on(iterations);
     streaming_background(iterations);
+    children_with_sidebar(iterations);
     keystroke_echo(iterations);
 }
 
@@ -50,6 +52,7 @@ fn main() {
 /// before the steady samples so they reflect the highlighted cache.
 fn steady_state(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     let first = timed(|| harness.draw());
     report("steady_state_first_frame_plain", first.0, 1, first.1);
     let started = Instant::now();
@@ -78,11 +81,21 @@ fn steady_state(iterations: u32) {
     report_samples("steady_state_frame", &samples);
 }
 
+/// Steady state with the sidebar visible and eight idle sessions listed.
+fn steady_state_with_sidebar(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 9, STEADY_MESSAGES);
+    harness.show_sidebar();
+    black_box(harness.draw());
+    let samples = collect(iterations, || harness.draw().len());
+    report_samples("steady_state_with_sidebar_frame", &samples);
+}
+
 /// One long streaming message in the focused session receiving one delta per
 /// frame. Measures the settled-prefix cache: cost should track the open block,
 /// not the message.
 fn streaming_focused(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     let message = harness.start_stream(0);
     for _ in 0..LIVE_PREFILL {
         harness.append(0, message, DELTA);
@@ -99,6 +112,7 @@ fn streaming_focused(iterations: u32) {
 /// re-lays-out the whole 32 KiB live tail. This is the ceiling, not the norm.
 fn streaming_run_on(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     let message = harness.start_stream(0);
     for _ in 0..LIVE_PREFILL * 2 {
         harness.append(0, message, RUN_ON_DELTA);
@@ -112,11 +126,12 @@ fn streaming_run_on(iterations: u32) {
 }
 
 /// Eight unfocused sessions each receiving one delta per frame while the
-/// focused session is idle. Today those deltas only touch summaries; the plan
-/// requires the cost to stay within 1.2x of the single-session case once they
-/// feed live status.
+/// focused session is idle. Each delta updates that session's live status
+/// (sidebar hidden here, so the frame itself does not change); the plan
+/// requires this to stay within 1.2x of the steady single-session frame.
 fn streaming_background(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, BACKGROUND_SESSIONS + 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     let messages: Vec<_> = (1..=BACKGROUND_SESSIONS)
         .map(|index| (index, harness.start_stream(index)))
         .collect();
@@ -130,10 +145,30 @@ fn streaming_background(iterations: u32) {
     report_samples("streaming_background_8_delta_to_frame", &samples);
 }
 
+/// Twenty child sessions of the focused root streaming concurrently with the
+/// sidebar visible. Every delta updates a live tail that the sidebar renders,
+/// so this is the many-agents case the plan is for.
+fn children_with_sidebar(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 21, STEADY_MESSAGES);
+    harness.show_sidebar();
+    let messages: Vec<_> = (1..=20)
+        .map(|index| (index, harness.start_stream(index)))
+        .collect();
+    black_box(harness.draw());
+    let samples = collect(iterations, || {
+        for (index, message) in &messages {
+            harness.append(*index, *message, DELTA);
+        }
+        harness.draw().len()
+    });
+    report_samples("children_20_with_sidebar_delta_to_frame", &samples);
+}
+
 /// One typed character followed by a frame. This is the latency a user feels
 /// most directly.
 fn keystroke_echo(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     black_box(harness.draw());
     let mut alphabet = ('a'..='z').cycle();
     let samples = collect(iterations, || {

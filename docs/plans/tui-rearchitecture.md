@@ -1,7 +1,7 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phases T0–T2 are complete (receipts below).
-Phases T3–T7 are proposed.
+Status: proposed 2026-09-02. Phases T0–T3 are complete (receipts below).
+Phases T4–T7 are proposed.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -329,6 +329,59 @@ Acceptance:
   with the fake port).
 - Twenty concurrent children render live status.
 - Memory is bounded by the warm LRU and live-status caps.
+
+#### T3 Completion Receipt — 2026-09-02
+
+Commits `181597e` (protocol and core) and the TUI/client commit that follows.
+All workspace gates green; 154 TUI tests, 23 protocol tests, 324 core tests.
+
+Protocol version 12 (additive, every field defaults when absent):
+
+- `SessionSummary.spawned_by: Option<SpawnOrigin { run_id, tool_call_id }>`.
+  Core threads the spawning `ToolCallId` through `SubagentSpawner::spawn` and
+  persists it in `sessions.spawned_by_tool_call_id` (schema version 20).
+  Historical children report the owner run with no call.
+- `SessionSummary.activity: Option<RunActivity>`, read from the newest
+  `run_activity_changed` for the active run at snapshot time.
+- `SnapshotRequest.include_sessions` (at most 16) and
+  `WorkspaceSnapshot.included`. Foreign or unknown ids are skipped; over-limit
+  requests fail with `InvalidPageLimit`.
+
+TUI session store:
+
+- `SessionView` bodies are warm (`Some`) or cold (`None`). Loading a body no
+  longer evicts every other body; `evict_cold_bodies` keeps the eight most
+  recently focused (`WARM_BODY_LIMIT`), never the focused one.
+- `LiveStatus` (256-byte collapsed assistant tail, active tool, awaiting
+  approval set) reduces from every event for every session, warm or cold.
+  Activity seeds from the summary and is replaced by live events.
+- Fast create: a `SessionCreated` for this client's `PendingIntent::Create`
+  adopts the session as warm-and-empty and moves focus in the same frame,
+  whether the SSE event or the HTTP receipt arrives first. The client's
+  auto-snapshot after create is removed. Zero requests are asserted.
+- Fast switch: warm sessions focus with zero requests; cold sessions show
+  their summary and live tail while one focused snapshot fills the body.
+  Bootstrap pre-warms the four most recent other sessions via
+  `include_sessions`.
+- Sidebar (`Ctrl-B`; auto at 120 columns): the session tree with a status
+  row per session showing approval waits, the active tool, the live tail, or
+  the run activity label. Body width is `width - 36` when visible so caches
+  key on one stable width per layout.
+
+| Case | median / p95 |
+| --- | ---: |
+| Steady state (sidebar hidden, unchanged from T2) | 22.3 µs / 32.5 µs |
+| Steady state with sidebar, nine sessions | 34.3 µs / 50.4 µs |
+| Eight background sessions streaming (now reducing live status) | 21.5 µs / 22.4 µs |
+| Twenty children streaming with the sidebar visible | 51.9 µs / 54.8 µs |
+| Keystroke to frame | 24.0 µs / 28.4 µs |
+
+The eight-background case stays at 0.97x the steady frame, within the 1.2x
+gate, now that the deltas do real work. The sidebar costs about 12 µs per
+frame for nine rows; twenty streaming children cost 30 µs over steady.
+
+Deferred to T4: rendering `spawned_by` inline under the `spawn_agent` call,
+parent/child navigation commands, and workspace-wide approval routing.
 
 ### T4 — Children And Approvals Across The Workspace
 

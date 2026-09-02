@@ -95,12 +95,14 @@ impl Highlighter {
     }
 
     /// Non-blocking drain used by tests and benchmarks.
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn try_next(&mut self) -> Option<Highlighted> {
         let result = self.inbox.try_recv().ok()?;
         self.in_flight -= 1;
         Some(result)
     }
 
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn in_flight(&self) -> usize {
         self.in_flight
     }

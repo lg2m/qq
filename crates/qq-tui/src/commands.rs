@@ -22,6 +22,7 @@ pub(crate) enum Command {
     NextLayout,
     PreviousLayout,
     ToggleToolDetail,
+    ToggleSidebar,
     Quit,
 }
 
@@ -48,7 +49,7 @@ pub(crate) struct CommandSpec {
 }
 
 /// Presentation order is invocation frequency, not alphabetical.
-pub(crate) const COMMANDS: [CommandSpec; 13] = [
+pub(crate) const COMMANDS: [CommandSpec; 14] = [
     CommandSpec {
         command: Command::OpenModels,
         title: "choose a model",
@@ -129,6 +130,13 @@ pub(crate) const COMMANDS: [CommandSpec; 13] = [
     CommandSpec {
         command: Command::ToggleToolDetail,
         title: "toggle tool call detail",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::ToggleSidebar,
+        title: "toggle the session sidebar",
         category: Category::View,
         slash: &[],
         action: None,
