@@ -9133,6 +9133,77 @@ mod tests {
     }
 
     #[test]
+    fn version_fourteen_store_with_implicit_primary_key_outbox_migrates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata VALUES ('schema_version', '14');
+                 CREATE TABLE runs (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     command_id TEXT NOT NULL UNIQUE,
+                     user_message_id TEXT NOT NULL,
+                     assistant_message_id TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     kind TEXT NOT NULL DEFAULT 'prompt',
+                     auto_compaction INTEGER NOT NULL DEFAULT 0,
+                     cancel_requested INTEGER NOT NULL DEFAULT 0,
+                     prompt_identity_json TEXT,
+                     outcome_json TEXT,
+                     usage_json TEXT,
+                     context_tokens INTEGER,
+                     estimated_cost_usd_nanos INTEGER,
+                     created_at_ms INTEGER NOT NULL,
+                     started_at_ms INTEGER,
+                     finished_at_ms INTEGER
+                 );
+                 CREATE TABLE model_turns (
+                     run_id TEXT NOT NULL,
+                     turn_ordinal INTEGER NOT NULL,
+                     assistant_content_json TEXT NOT NULL,
+                     model_json TEXT,
+                     usage_json TEXT,
+                     estimated_cost_usd_nanos INTEGER,
+                     completed_at_ms INTEGER,
+                     PRIMARY KEY(run_id, turn_ordinal)
+                 );
+                 CREATE TABLE pending_workspace_grant_promotions (
+                     command_id TEXT PRIMARY KEY,
+                     created_at_ms INTEGER NOT NULL,
+                     promotion_json TEXT NOT NULL
+                 );
+                 CREATE INDEX pending_workspace_grant_promotions_fifo
+                     ON pending_workspace_grant_promotions(created_at_ms, command_id);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "17"
+        );
+        let command_id_not_null: bool = connection
+            .query_row(
+                "SELECT [notnull] FROM pragma_table_info('pending_workspace_grant_promotions')
+                 WHERE name = 'command_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(command_id_not_null);
+    }
+
+    #[test]
     fn partially_applied_version_fourteen_linear_migration_completes_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sessions.sqlite3");
@@ -9642,6 +9713,48 @@ mod tests {
             open_database(&path),
             Err(SessionRuntimeError::Persistence)
         ));
+    }
+
+    #[test]
+    fn version_fifteen_store_with_implicit_primary_key_outbox_migrates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE pending_workspace_grant_promotions;
+                 CREATE TABLE pending_workspace_grant_promotions (
+                     command_id TEXT PRIMARY KEY,
+                     created_at_ms INTEGER NOT NULL,
+                     promotion_json TEXT NOT NULL
+                 );
+                 CREATE INDEX pending_workspace_grant_promotions_fifo
+                     ON pending_workspace_grant_promotions(created_at_ms, command_id);
+                 INSERT INTO pending_workspace_grant_promotions
+                 VALUES ('legacy-command', 1, '{}');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        let command_id_not_null: bool = connection
+            .query_row(
+                "SELECT [notnull] FROM pragma_table_info('pending_workspace_grant_promotions')
+                 WHERE name = 'command_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(command_id_not_null);
+        let promotion_json: String = connection
+            .query_row(
+                "SELECT promotion_json FROM pending_workspace_grant_promotions
+                 WHERE command_id = 'legacy-command'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(promotion_json, "{}");
     }
 
     #[test]

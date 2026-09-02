@@ -465,6 +465,19 @@ pub(in crate::sessions) fn open_database(
         transaction
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
+    } else if column_shape(
+        &connection,
+        "pending_workspace_grant_promotions",
+        "command_id",
+    )? != ("TEXT".to_owned(), true, None, 1)
+    {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        normalize_promotion_outbox(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_linear_streaming_schema(&connection)?;
     if !matches!(schema_version.as_deref(), Some("16" | "17")) {
@@ -697,7 +710,41 @@ fn add_linear_streaming_storage(connection: &Connection) -> Result<(), SessionRu
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
+    normalize_promotion_outbox(connection)?;
     Ok(())
+}
+
+/// SQLite treats `TEXT PRIMARY KEY` as nullable. Stores created before the
+/// explicit `NOT NULL` declaration fail the later shape check unless rewritten.
+fn normalize_promotion_outbox(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    let command_id = column_shape(
+        connection,
+        "pending_workspace_grant_promotions",
+        "command_id",
+    )?;
+    if command_id == ("TEXT".to_owned(), true, None, 1) {
+        return Ok(());
+    }
+    if command_id != ("TEXT".to_owned(), false, None, 1) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE pending_workspace_grant_promotions_normalized (
+                 command_id TEXT NOT NULL PRIMARY KEY,
+                 created_at_ms INTEGER NOT NULL,
+                 promotion_json TEXT NOT NULL
+             );
+             INSERT INTO pending_workspace_grant_promotions_normalized
+             SELECT command_id, created_at_ms, promotion_json
+             FROM pending_workspace_grant_promotions;
+             DROP TABLE pending_workspace_grant_promotions;
+             ALTER TABLE pending_workspace_grant_promotions_normalized
+             RENAME TO pending_workspace_grant_promotions;
+             CREATE INDEX IF NOT EXISTS pending_workspace_grant_promotions_fifo
+                 ON pending_workspace_grant_promotions(created_at_ms, command_id);",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)
 }
 
 fn validate_linear_streaming_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
