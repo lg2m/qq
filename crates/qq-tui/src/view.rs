@@ -31,7 +31,7 @@ use crate::{
         Line, Style, accent, brand, diff_line_style, failure, muted, normal, warning, write_line,
     },
 };
-use markdown::markdown_lines;
+use markdown::{markdown_lines, settled_prefix_end};
 #[cfg(test)]
 use wrap::transcript_viewport;
 use wrap::{
@@ -73,8 +73,20 @@ pub(crate) struct FrameRenderer {
     previous: Vec<Line>,
     size: Option<(u16, u16)>,
     markdown: HashMap<MessageId, CachedMarkdown>,
+    /// Settled rows of messages still streaming, keyed by message. Each entry
+    /// holds the layout of the message's block-boundary-settled prefix so a
+    /// frame only lays out the trailing open block.
+    live: HashMap<MessageId, LiveMarkdown>,
     live_message_ranges: HashMap<MessageId, Range<usize>>,
     preserve_tail_anchor: bool,
+}
+
+struct LiveMarkdown {
+    width: usize,
+    /// Bytes of the combined output+refusal text covered by `rows`.
+    settled_bytes: usize,
+    /// Rendered, indented rows for the settled prefix.
+    rows: Vec<Line>,
 }
 
 struct CachedMarkdown {
@@ -549,11 +561,13 @@ impl FrameRenderer {
         match visible {
             Some(visible) => {
                 self.markdown.retain(|id, _| visible.contains(id));
+                self.live.retain(|id, _| visible.contains(id));
                 self.live_message_ranges
                     .retain(|id, _| visible.contains(id));
             }
             None => {
                 self.markdown.clear();
+                self.live.clear();
                 // An overlay temporarily hides the transcript but must not
                 // erase its live-row anchors. A completion received behind the
                 // overlay still needs to preserve the user's prior viewport
@@ -575,6 +589,7 @@ impl FrameRenderer {
         };
         for message in messages.iter().rev().take(limit) {
             if message_is_terminal(message) {
+                self.live.remove(&message.id);
                 if self
                     .live_message_ranges
                     .remove(&message.id)
@@ -585,6 +600,7 @@ impl FrameRenderer {
                 self.cache_message(message, width, session.loaded_through);
             } else {
                 self.markdown.remove(&message.id);
+                self.refresh_live(message, width);
             }
         }
         if app.layout == Layout::FoldFocus
@@ -600,6 +616,7 @@ impl FrameRenderer {
                 .any(|visible| visible.id == message.id)
         {
             if message_is_terminal(message) {
+                self.live.remove(&message.id);
                 if self
                     .live_message_ranges
                     .remove(&message.id)
@@ -610,7 +627,51 @@ impl FrameRenderer {
                 self.cache_message(message, width, session.loaded_through);
             } else {
                 self.markdown.remove(&message.id);
+                self.refresh_live(message, width);
             }
+        }
+    }
+
+    /// Extend the settled-prefix layout of a streaming message. Only the bytes
+    /// past the previous settled boundary are examined, and only blocks that
+    /// became settled since the last frame are laid out.
+    fn refresh_live(&mut self, message: &MessageSnapshot, width: usize) {
+        let source = MessageText::new(message);
+        let content_width = width.saturating_sub(3).max(1);
+        let (prefix, prefix_style, _, _) = message_presentation(message.role);
+        let entry = self.live.entry(message.id).or_insert(LiveMarkdown {
+            width,
+            settled_bytes: 0,
+            rows: Vec::new(),
+        });
+        if entry.width != width || entry.settled_bytes > source.len() {
+            entry.width = width;
+            entry.settled_bytes = 0;
+            entry.rows.clear();
+        }
+        // The live view shows at most the last MAX_LIVE_MARKDOWN_BYTES; a
+        // settled prefix beyond that is never displayed, so skip ahead rather
+        // than lay out rows that would be dropped.
+        let visible_start = source.len().saturating_sub(MAX_LIVE_MARKDOWN_BYTES);
+        if entry.settled_bytes < visible_start {
+            entry.settled_bytes = 0;
+            entry.rows.clear();
+        }
+        let scan_from = entry.settled_bytes;
+        let text = source.collect_range(scan_from..source.len(), false);
+        let settled = settled_prefix_end(&text);
+        if settled == 0 {
+            return;
+        }
+        let rows = markdown_lines(&text[..settled], content_width, false);
+        entry
+            .rows
+            .extend(indent_lines(rows, prefix, prefix_style, width));
+        entry.settled_bytes = scan_from + settled;
+        // Rows past the display bound are never shown again while streaming.
+        let excess = entry.rows.len().saturating_sub(MAX_LIVE_MARKDOWN_ROWS);
+        if excess > 0 {
+            entry.rows.drain(..excess);
         }
     }
 
@@ -979,26 +1040,75 @@ impl FrameRenderer {
                 }
             }
         } else {
-            // Still streaming: rendered every frame, so skip tree-sitter and
-            // keep panels plain and the per-frame work bounded until the
-            // message reaches a terminal state. Any hidden live prefix becomes
-            // reachable through the sparse completed-message index.
-            let lines =
-                live_markdown_lines(MessageText::new(message), width.saturating_sub(3).max(1));
+            // Still streaming: the settled prefix comes from the live cache and
+            // only the open trailing block is laid out this frame. Tree-sitter
+            // stays off so per-frame work is bounded by one block, not the
+            // message. Any hidden live prefix becomes reachable through the
+            // completed-message cache once the message settles.
+            let lines = self.live_lines(message, width);
             if lines.is_empty() {
                 body.push_line(message_ellipsis(prefix, prefix_style));
             } else {
-                body.extend_owned(indent_lines(lines, prefix, prefix_style, width));
+                body.extend_owned(lines);
             }
             body.live_message_ranges
                 .push((message.id, content_start..body.rows));
         }
     }
 
+    /// Rows for a streaming message: cached settled rows followed by the
+    /// freshly laid-out open tail, bounded to the live display budget with a
+    /// marker when earlier rows were dropped.
+    fn live_lines(&self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
+        let source = MessageText::new(message);
+        let content_width = width.saturating_sub(3).max(1);
+        let (prefix, prefix_style, _, _) = message_presentation(message.role);
+        let (settled_bytes, settled_rows) = match self.live.get(&message.id) {
+            Some(live) if live.width == width && live.settled_bytes <= source.len() => {
+                (live.settled_bytes, live.rows.as_slice())
+            }
+            Some(_) | None => (0, &[][..]),
+        };
+        let visible_start = source.len().saturating_sub(MAX_LIVE_MARKDOWN_BYTES);
+        let tail_start = settled_bytes.max(visible_start);
+        let tail = if tail_start == settled_bytes {
+            source.collect_range(tail_start..source.len(), false)
+        } else {
+            source.bounded_tail(MAX_LIVE_MARKDOWN_BYTES).into_owned()
+        };
+        let tail_rows = indent_lines(
+            markdown_lines(&tail, content_width, false),
+            prefix,
+            prefix_style,
+            width,
+        );
+        let total = settled_rows.len() + tail_rows.len();
+        let truncated = tail_start > settled_bytes || total > MAX_LIVE_MARKDOWN_ROWS;
+        let budget = MAX_LIVE_MARKDOWN_ROWS.saturating_sub(usize::from(truncated));
+        let mut lines = Vec::with_capacity(total.min(budget) + 1);
+        if truncated {
+            lines.push(truncate_line(
+                Line::styled(
+                    "... earlier output remains available when this message completes",
+                    muted().italic(),
+                ),
+                width,
+            ));
+        }
+        let drop = total.saturating_sub(budget);
+        let drop_settled = drop.min(settled_rows.len());
+        lines.extend_from_slice(&settled_rows[drop_settled..]);
+        lines.extend(tail_rows.into_iter().skip(drop - drop_settled));
+        lines
+    }
+
     #[cfg(test)]
     fn render_message(&mut self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
         if message_is_terminal(message) {
+            self.live.remove(&message.id);
             self.cache_message(message, width, 0);
+        } else {
+            self.refresh_live(message, width);
         }
         let (prefix, prefix_style, role, role_style) = message_presentation(message.role);
         let mut header = Line::styled(prefix, prefix_style);
@@ -1022,12 +1132,7 @@ impl FrameRenderer {
                 )),
             }
         } else {
-            lines.extend(indent_lines(
-                live_markdown_lines(MessageText::new(message), width.saturating_sub(3).max(1)),
-                prefix,
-                prefix_style,
-                width,
-            ));
+            lines.extend(self.live_lines(message, width));
         }
         if lines.len() == 1 {
             lines.push(message_ellipsis(prefix, prefix_style));
@@ -1949,32 +2054,6 @@ fn status_style(state: MessageState) -> Style {
         MessageState::Failed => failure(),
     }
 }
-fn live_markdown_lines(source: MessageText<'_>, width: usize) -> Vec<Line> {
-    let source_was_truncated = source.len() > MAX_LIVE_MARKDOWN_BYTES;
-    let tail = source.bounded_tail(MAX_LIVE_MARKDOWN_BYTES);
-    let mut lines = markdown_lines(&tail, width, false);
-    let reserved_marker = usize::from(source_was_truncated || lines.len() > MAX_LIVE_MARKDOWN_ROWS);
-    let excess = lines
-        .len()
-        .saturating_sub(MAX_LIVE_MARKDOWN_ROWS.saturating_sub(reserved_marker));
-    if excess > 0 {
-        lines.drain(..excess);
-    }
-    if reserved_marker > 0 {
-        lines.insert(
-            0,
-            truncate_line(
-                Line::styled(
-                    "... earlier output remains available when this message completes",
-                    muted().italic(),
-                ),
-                width,
-            ),
-        );
-    }
-    lines
-}
-
 fn pending_markdown_lines(source: &str, width: usize) -> Vec<Line> {
     let source_was_truncated = source.len() > MAX_LIVE_MARKDOWN_BYTES;
     let mut lines = markdown_lines(bounded_tail(source, MAX_LIVE_MARKDOWN_BYTES), width, false);

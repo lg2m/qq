@@ -6,71 +6,111 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::render::{Line, Style, muted};
 
-/// A run of characters that wraps as one unit: either whitespace or a word.
+/// One whitespace or word run inside a single span: a byte range plus its
+/// display width. Tokens never cross span boundaries so styles are preserved
+/// by construction; a word spanning two spans becomes two tokens that the
+/// fitter treats as one group.
 struct WrapToken {
+    span: usize,
+    range: std::ops::Range<usize>,
     whitespace: bool,
     width: usize,
-    characters: Vec<(char, Style)>,
 }
 
 /// Wraps prose at whitespace, preserving span styles across breaks. A single
-/// token wider than the width falls back to character breaking, and the
+/// word wider than the width falls back to character breaking, and the
 /// whitespace a break lands on is dropped rather than carried over.
 pub(crate) fn wrap_line(line: Line, width: usize) -> Vec<Line> {
     if line.width() <= width {
         return vec![line];
     }
+    let spans = line.spans;
     let mut tokens: Vec<WrapToken> = Vec::new();
-    for span in line.spans {
-        for character in span.text.chars() {
+    for (span_index, span) in spans.iter().enumerate() {
+        let mut start = 0;
+        let mut kind = None;
+        let mut token_width = 0;
+        for (offset, character) in span.text.char_indices() {
             let whitespace = character.is_whitespace();
             let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
-            match tokens.last_mut() {
-                Some(token) if token.whitespace == whitespace => {
-                    token.width += character_width;
-                    token.characters.push((character, span.style));
+            match kind {
+                Some(current) if current == whitespace => token_width += character_width,
+                Some(current) => {
+                    tokens.push(WrapToken {
+                        span: span_index,
+                        range: start..offset,
+                        whitespace: current,
+                        width: token_width,
+                    });
+                    start = offset;
+                    kind = Some(whitespace);
+                    token_width = character_width;
                 }
-                _ => tokens.push(WrapToken {
-                    whitespace,
-                    width: character_width,
-                    characters: vec![(character, span.style)],
-                }),
+                None => {
+                    kind = Some(whitespace);
+                    token_width = character_width;
+                }
             }
         }
+        if let Some(whitespace) = kind {
+            tokens.push(WrapToken {
+                span: span_index,
+                range: start..span.text.len(),
+                whitespace,
+                width: token_width,
+            });
+        }
     }
+
     let mut output = vec![Line::default()];
     let mut used = 0_usize;
-    for token in tokens {
-        if used + token.width <= width {
+    let mut index = 0;
+    while index < tokens.len() {
+        let whitespace = tokens[index].whitespace;
+        let mut end = index + 1;
+        let mut group_width = tokens[index].width;
+        while end < tokens.len() && tokens[end].whitespace == whitespace {
+            group_width += tokens[end].width;
+            end += 1;
+        }
+        let group = &tokens[index..end];
+        index = end;
+        if used + group_width <= width {
             let line = output.last_mut().expect("output starts populated");
-            for (character, style) in token.characters {
-                line.push(character.to_string(), style);
+            for token in group {
+                let span = &spans[token.span];
+                line.push(&span.text[token.range.clone()], span.style);
             }
-            used += token.width;
-        } else if token.whitespace {
+            used += group_width;
+        } else if whitespace {
             if used > 0 {
                 output.push(Line::default());
                 used = 0;
             }
-        } else if token.width <= width {
+        } else if group_width <= width {
             output.push(Line::default());
             let line = output.last_mut().expect("output starts populated");
-            for (character, style) in token.characters {
-                line.push(character.to_string(), style);
+            for token in group {
+                let span = &spans[token.span];
+                line.push(&span.text[token.range.clone()], span.style);
             }
-            used = token.width;
+            used = group_width;
         } else {
-            for (character, style) in token.characters {
-                let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
-                if used > 0 && used + character_width > width {
-                    output.push(Line::default());
-                    used = 0;
+            for token in group {
+                let span = &spans[token.span];
+                for character in span.text[token.range.clone()].chars() {
+                    let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
+                    if used > 0 && used + character_width > width {
+                        output.push(Line::default());
+                        used = 0;
+                    }
+                    let mut encoded = [0; 4];
+                    output
+                        .last_mut()
+                        .expect("output starts populated")
+                        .push(&*character.encode_utf8(&mut encoded), span.style);
+                    used += character_width;
                 }
-                output
-                    .last_mut()
-                    .expect("output starts populated")
-                    .push(character.to_string(), style);
-                used += character_width;
             }
         }
     }
@@ -86,18 +126,24 @@ pub(crate) fn wrap_line_chars(line: Line, width: usize) -> Vec<Line> {
     let mut output = vec![Line::default()];
     let mut current_width = 0;
     for span in line.spans {
-        for character in span.text.chars() {
+        let mut start = 0;
+        for (offset, character) in span.text.char_indices() {
             let character_width = UnicodeWidthChar::width(character).unwrap_or_default();
             if current_width > 0 && current_width + character_width > width {
+                output
+                    .last_mut()
+                    .expect("output starts populated")
+                    .push(&span.text[start..offset], span.style);
                 output.push(Line::default());
                 current_width = 0;
+                start = offset;
             }
-            output
-                .last_mut()
-                .expect("output starts populated")
-                .push(character.to_string(), span.style);
             current_width += character_width;
         }
+        output
+            .last_mut()
+            .expect("output starts populated")
+            .push(&span.text[start..], span.style);
     }
     output
 }

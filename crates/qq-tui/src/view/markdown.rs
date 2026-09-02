@@ -16,6 +16,59 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use tree_sitter::Language;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 
+/// Byte offset where a streaming markdown source can be split so the prefix
+/// renders the same whether laid out alone or as part of the whole.
+///
+/// The split lands after a blank line that is neither inside an open fenced
+/// code block nor directly below an indented (four-space) code line, because
+/// pulldown-cmark treats such a blank line as a hard block boundary: nothing
+/// after it changes how earlier blocks lay out. The blank line stays with the
+/// prefix so it ends at a block end. Returns 0 when no boundary exists yet.
+/// Link reference definitions are the one construct this ignores; a reference
+/// defined after the split renders literally until the message completes.
+pub(crate) fn settled_prefix_end(source: &str) -> usize {
+    let mut settled = 0;
+    let mut in_fence: Option<(u8, usize)> = None;
+    let mut previous_indented = false;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let blank = line.trim().is_empty();
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let fence_len = trimmed
+            .bytes()
+            .take_while(|byte| *byte == b'`' || *byte == b'~')
+            .count();
+        if fence_len >= 3 && line.len() - trimmed.len() < 4 {
+            let marker = trimmed.as_bytes()[0];
+            let uniform = trimmed.as_bytes()[..fence_len]
+                .iter()
+                .all(|byte| *byte == marker);
+            match in_fence {
+                None if uniform => in_fence = Some((marker, fence_len)),
+                Some((open_marker, open_len))
+                    if uniform
+                        && marker == open_marker
+                        && fence_len >= open_len
+                        && trimmed[fence_len..].trim().is_empty() =>
+                {
+                    in_fence = None;
+                }
+                None | Some(_) => {}
+            }
+        }
+        offset += line.len();
+        if blank {
+            if in_fence.is_none() && !previous_indented && line.ends_with('\n') {
+                settled = offset;
+            }
+        } else {
+            previous_indented =
+                in_fence.is_none() && (line.starts_with("    ") || line.starts_with('\t'));
+        }
+    }
+    settled
+}
+
 /// Lays markdown out as styled lines. `highlight` enables tree-sitter syntax
 /// coloring inside fenced code panels; it is only worth paying for content
 /// that renders once (terminal-state messages on the cached path), so
@@ -1126,5 +1179,79 @@ pub(super) mod tests {
                 .chars()
                 .all(|character| terminal_safe_character(character) == Some(character))
         }));
+    }
+}
+
+#[cfg(test)]
+mod settled_prefix_tests {
+    use super::*;
+
+    /// Render the prefix and suffix independently and concatenate them the
+    /// way the live renderer does.
+    fn split_render(source: &str, width: usize) -> Vec<Line> {
+        let split = settled_prefix_end(source);
+        let mut lines = markdown_lines(&source[..split], width, false);
+        lines.extend(markdown_lines(&source[split..], width, false));
+        lines
+    }
+
+    const CORPUS: &[&str] = &[
+        "plain paragraph without a boundary",
+        "first paragraph\n\nsecond paragraph",
+        "first paragraph\n\nsecond paragraph\n\nthird",
+        "# Heading\n\ntext\n\n- item one\n- item two\n\n```rust\nfn main() {}\n```\n\ntail",
+        "```rust\nlet x = 1;\n\nlet y = 2;\n```\n\nafter",
+        "```\nunterminated\n\nstill code",
+        "~~~\ntilde fence\n\n~~~\n\nafter tilde",
+        "````\n```\nnested\n```\n````\n\nafter nested",
+        "| a | b |\n| - | - |\n| 1 | 2 |\n\nafter table",
+        "> quoted\n> more\n\nafter quote",
+        "    indented code\n\n    still code\n\nafter",
+        "1. one\n2. two\n\n   continued\n\nafter list",
+        "trailing blank\n\n",
+        "\n\nleading blank",
+        "a\n\n\n\nb",
+        "text **bold\n\nstill open",
+    ];
+
+    #[test]
+    fn splitting_at_the_settled_prefix_does_not_change_layout() {
+        for source in CORPUS {
+            for width in [12, 40, 80] {
+                let whole = markdown_lines(source, width, false);
+                let split = split_render(source, width);
+                assert_eq!(split, whole, "source={source:?} width={width}");
+            }
+        }
+    }
+
+    #[test]
+    fn settled_prefix_never_splits_inside_a_fence() {
+        let source = "```\ncode\n\nmore code\n";
+        assert_eq!(settled_prefix_end(source), 0);
+        let source = "before\n\n```\ncode\n\nmore\n```\n\nafter";
+        assert_eq!(
+            &source[..settled_prefix_end(source)],
+            "before\n\n```\ncode\n\nmore\n```\n\n"
+        );
+    }
+
+    #[test]
+    fn settled_prefix_grows_monotonically_as_text_streams() {
+        let full =
+            "# Heading\n\npara one\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\npara two\n\nlast";
+        let mut previous = 0;
+        for end in 0..=full.len() {
+            if !full.is_char_boundary(end) {
+                continue;
+            }
+            let settled = settled_prefix_end(&full[..end]);
+            assert!(
+                settled >= previous,
+                "end={end} settled={settled} previous={previous}"
+            );
+            assert!(settled <= end);
+            previous = settled;
+        }
     }
 }

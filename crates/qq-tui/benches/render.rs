@@ -15,7 +15,13 @@ const DEFAULT_ITERATIONS: u32 = 2_000;
 const WARMUP: u32 = 200;
 const STEADY_MESSAGES: u8 = 64;
 const BACKGROUND_SESSIONS: u8 = 8;
-const DELTA: &str = "streamed text that keeps arriving in small pieces ";
+/// Prose with paragraph breaks, as models actually emit it. Every ~100 bytes a
+/// blank line settles the preceding block.
+const DELTA: &str = "streamed text that keeps arriving in small pieces and eventually forms a paragraph of prose.\n\n";
+/// Worst case: one paragraph with no block boundary, so no prefix ever settles.
+const RUN_ON_DELTA: &str = "streamed text that keeps arriving in small pieces ";
+/// Deltas appended before measuring so the live message is already long.
+const LIVE_PREFILL: usize = 340;
 
 fn main() {
     let iterations = std::env::var("QQ_BENCH_ITERATIONS")
@@ -25,6 +31,7 @@ fn main() {
 
     steady_state(iterations);
     streaming_focused(iterations);
+    streaming_run_on(iterations);
     streaming_background(iterations);
     keystroke_echo(iterations);
 }
@@ -39,16 +46,37 @@ fn steady_state(iterations: u32) {
     report_samples("steady_state_frame", &samples);
 }
 
-/// One streaming message in the focused session receiving one delta per frame.
+/// One long streaming message in the focused session receiving one delta per
+/// frame. Measures the settled-prefix cache: cost should track the open block,
+/// not the message.
 fn streaming_focused(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
     let message = harness.start_stream(0);
+    for _ in 0..LIVE_PREFILL {
+        harness.append(0, message, DELTA);
+    }
     black_box(harness.draw());
     let samples = collect(iterations, || {
         harness.append(0, message, DELTA);
         harness.draw().len()
     });
     report_samples("streaming_focused_delta_to_frame", &samples);
+}
+
+/// Same as above with a run-on paragraph that never settles, so every frame
+/// re-lays-out the whole 32 KiB live tail. This is the ceiling, not the norm.
+fn streaming_run_on(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    let message = harness.start_stream(0);
+    for _ in 0..LIVE_PREFILL * 2 {
+        harness.append(0, message, RUN_ON_DELTA);
+    }
+    black_box(harness.draw());
+    let samples = collect(iterations, || {
+        harness.append(0, message, RUN_ON_DELTA);
+        harness.draw().len()
+    });
+    report_samples("streaming_run_on_32kb_delta_to_frame", &samples);
 }
 
 /// Eight unfocused sessions each receiving one delta per frame while the
