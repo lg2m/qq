@@ -55,12 +55,14 @@ pub(in crate::sessions) fn open_database(
                  active_run_id TEXT,
                  preparing_run_id TEXT,
                  pending_context_overflow_model_json TEXT,
+                 pending_context_overflow_basis_json TEXT,
                  queued_prompts INTEGER NOT NULL DEFAULT 0,
                  model TEXT,
                  max_output_tokens INTEGER,
                  organization TEXT,
                  approval_mode TEXT NOT NULL DEFAULT 'ask',
                  context_tokens INTEGER,
+                 context_occupancy_json TEXT,
                  estimated_cost_usd_nanos INTEGER NOT NULL DEFAULT 0,
                  cost_known INTEGER NOT NULL DEFAULT 1,
                  created_at_ms INTEGER NOT NULL,
@@ -86,6 +88,7 @@ pub(in crate::sessions) fn open_database(
                    usage_json TEXT,
                    context_tokens INTEGER,
                    estimated_cost_usd_nanos INTEGER,
+                   limits_json TEXT,
                  created_at_ms INTEGER NOT NULL,
                  started_at_ms INTEGER,
                  finished_at_ms INTEGER
@@ -377,12 +380,12 @@ pub(in crate::sessions) fn open_database(
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12" | "13" | "14" | "15" | "16" | "17") => {}
+        Some("10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19") => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("11" | "12" | "13" | "14" | "15" | "16" | "17")
+        Some("11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19")
     ) {
         let transaction = connection
             .transaction()
@@ -400,7 +403,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("12" | "13" | "14" | "15" | "16" | "17")
+        Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19")
     ) {
         let transaction = connection
             .transaction()
@@ -418,7 +421,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("13" | "14" | "15" | "16" | "17")
+        Some("13" | "14" | "15" | "16" | "17" | "18" | "19")
     ) {
         let transaction = connection
             .transaction()
@@ -434,7 +437,10 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("14" | "15" | "16" | "17")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("14" | "15" | "16" | "17" | "18" | "19")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -450,7 +456,10 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_model_turn_audit_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("15" | "16" | "17")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("15" | "16" | "17" | "18" | "19")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -480,7 +489,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_linear_streaming_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("16" | "17")) {
+    if !matches!(schema_version.as_deref(), Some("16" | "17" | "18" | "19")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -498,7 +507,7 @@ pub(in crate::sessions) fn open_database(
     if !has_column(&connection, "runs", "resolved_model_json")? {
         return Err(SessionRuntimeError::Persistence);
     }
-    if schema_version.as_deref() != Some("17") {
+    if !matches!(schema_version.as_deref(), Some("17" | "18" | "19")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -515,6 +524,40 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_preparing_run_schema(&connection)?;
+    if !matches!(schema_version.as_deref(), Some("18" | "19")) {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_context_occupancy_storage(&transaction)?;
+        validate_context_occupancy_schema(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '18' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_context_occupancy_schema(&connection)?;
+    if schema_version.as_deref() != Some("19") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_run_limits_storage(&transaction)?;
+        validate_run_limits_schema(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '19' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_run_limits_schema(&connection)?;
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -539,6 +582,65 @@ pub(in crate::sessions) fn open_database(
         }
     };
     Ok((connection, store_id))
+}
+
+fn add_run_limits_storage(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "runs", "limits_json")? {
+        connection
+            .execute("ALTER TABLE runs ADD COLUMN limits_json TEXT", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+/// Historical runs carry NULL: they were admitted without caller limits and
+/// must never be reinterpreted under current defaults.
+fn validate_run_limits_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if column_shape(connection, "runs", "limits_json")? != ("TEXT".to_owned(), false, None, 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    Ok(())
+}
+
+fn add_context_occupancy_storage(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "sessions", "context_occupancy_json")? {
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN context_occupancy_json TEXT",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if !has_column(
+        connection,
+        "sessions",
+        "pending_context_overflow_basis_json",
+    )? {
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN pending_context_overflow_basis_json TEXT",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+fn validate_context_occupancy_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if column_shape(connection, "sessions", "context_occupancy_json")?
+        != ("TEXT".to_owned(), false, None, 0)
+    {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    if column_shape(
+        connection,
+        "sessions",
+        "pending_context_overflow_basis_json",
+    )? != ("TEXT".to_owned(), false, None, 0)
+    {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    Ok(())
 }
 
 fn add_preparing_run_storage(connection: &Connection) -> Result<(), SessionRuntimeError> {

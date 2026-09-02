@@ -1,7 +1,7 @@
 # Speed-First Extensible Agent Harness Backend
 
-Status: Phase 0 complete 2026-09-01. Phase 1 is in progress: R4 completed and
-qualified on 2026-09-01; R5 implementation is in progress and H1 follows.
+Status: Phase 0 complete 2026-09-01. Phase 1 complete 2026-09-02: R4 qualified
+2026-09-01, R5 qualified 2026-09-02, H1 feature profiles landed and measured.
 Implementation Phases 2–7 and tasks H2–H12 remain proposed.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
@@ -240,7 +240,7 @@ The critical gaps already recorded in the active readiness plan are:
 | Store scheduling | Control work is always preferred and full output queues poll | Output can be delayed or starved |
 | Context planning | Fixed byte budget and trigger | Incorrect behavior across small and large context windows |
 | Resolved model state | Runtime loading drops effective limits/capabilities | Core cannot reproduce or budget the actual execution |
-| Run limits | Some limits settle only through headless adapters | TUI/server clients lack one core-owned outcome contract |
+| Run limits | Core-owned `RunLimits` and typed `budget_exhausted` outcome shipped in R5 | Clients other than `qq run` do not yet surface the limits they may impose |
 | Terminal | `shell` is one-shot without stdin or a durable handle | Interactive and long-running processes are awkward |
 | Search/edit | Literal scan and exact replacement | Additional model turns and I/O on large repositories |
 | Retry ownership | Provider and core retries can amplify | Duplicate spend and unclear delivery certainty |
@@ -717,17 +717,17 @@ failure coupling, and unbounded authority.
 ### Provider Footprint
 
 Keep the current provider crate and public `Provider::stream` seam. Feature-gate
-adapter families internally, for example:
+adapter families internally. The H1 audit settled on one feature:
 
 ```text
-provider-http
-provider-bedrock
-provider-test-support
+provider-bedrock   (default; owns the seven optional AWS SDK crates)
+test-support       (loopback fixtures; not a public API)
 ```
 
-The exact feature names require a Cargo feature audit. The shipped full `qq`
-binary may enable all supported providers, while embedders compile only the
-families they use. Neutral request, model, pricing, event, and compiler types
+The HTTP families need no feature because they add no dependency beyond the
+shared reqwest transport, so a `provider-http` flag would gate nothing. The
+shipped full `qq` binary enables all supported providers, while embedders build
+`--no-default-features` and compile only the HTTP families. Neutral request, model, pricing, event, and compiler types
 remain available without pulling every vendor SDK.
 
 Do not introduce one-provider-per-crate organization. Wire-format differences
@@ -1116,10 +1116,89 @@ design. The reproducible protocol and complete measurement inventory are in
 Complete R4 and R5 through their owning readiness phases, then implement H1.
 Do not copy their implementation contracts into this plan.
 
-Status: in progress. R4 is complete. R5 now has immutable resolved-model and
-provider-aware context-admission slices, but remains incomplete until its
-budget, compiled request-shape identity, compaction-hardening, and qualification
-gates close; H1 follows.
+Status: complete 2026-09-02. R4, R5, and H1 receipts follow.
+
+#### Imported R5 Completion Receipt — 2026-09-02
+
+The owning [Terminal-Bench readiness plan](./terminal-bench-readiness.md)
+records the Phase 5 receipt: immutable resolved-model identity, provider-aware
+context admission with exact cross-run occupancy reuse (schema 18), core-owned
+`RunLimits` with the typed `budget_exhausted` outcome (schema 19, protocol 10),
+and compaction hardening — validated summaries, three-row bounded history,
+`rollback_compaction`, and the `search_history` recall tool (protocol 11). The
+clean detached 100-sample recorder at exact revision
+`42f16c6168fef9b008e7427ed581511abb3b2760` reported 62 metrics with all 55
+budgets green: a `1.931x` one-MiB/512-KiB scaling ratio, 23.410 ms p95
+control response, 59.109 ms p95 cancellation, and a 49.000 ms p95 persisted
+output service gap under eight concurrent streams. A first attempt on a loaded
+host failed the service-gap budget by one 52 ms sample and was rerun without
+weakening the budget. The live provider cache-ratio check is deferred for
+credentials and is not counted as passed. Clean workspace test, format,
+Clippy, and build gates passed.
+
+#### H1 Completion Receipt — 2026-09-02
+
+Dependency audit: of `qq-provider`'s dependencies only the seven AWS SDK crates
+(`aws-config`, `aws-credential-types`, `aws-sdk-bedrockruntime`, `aws-sigv4`,
+`aws-smithy-http-client`, `aws-smithy-runtime-api`, `aws-smithy-types`) are
+adapter-specific; they were used by `aws.rs`, `providers/bedrock.rs`, and
+`providers/mantle.rs` only. Everything else (reqwest, SSE framing, redaction,
+construction, compilation, the neutral request/model/pricing/event types) is
+shared by the HTTP families and stays unconditional. `aws-lc-rs` appears in
+both profiles as rustls's crypto backend, not as an SDK dependency.
+
+Feature manifest (commit `8ccba84`): `qq-provider` gains `provider-bedrock`
+(default on) owning the seven optional AWS crates; the HTTP families need no
+feature because they add no dependency. `BedrockAuth` moved to a neutral
+module so `ProviderRecipe` is constructible and digestible in every profile;
+without the feature `ProviderCompiler` returns a configuration error
+(`BEDROCK_FAMILY_UNAVAILABLE_MESSAGE`) before any SDK or network work. The root
+`qq` package mirrors it: `default = ["provider-bedrock"]` is the full binary,
+`--no-default-features` is the minimal embedding profile. `xtask` pins the full
+profile for canaries. The provider self dev-dependency drops default features so
+the minimal profile is genuinely tested rather than re-unified by Cargo.
+
+Acceptance:
+
+- the readiness plan marks R4 and R5 complete (receipts above);
+- the shared interface fixtures (`crates/qq-provider/tests/interface`, nine
+  cases across OpenAI Responses, Chat Completions, Anthropic, Google, and the
+  canary path) pass under both `--features provider-bedrock` (186 lib tests)
+  and `--no-default-features` (142 lib tests; the 44 gated tests are AWS
+  configuration, Bedrock, and Mantle adapter tests);
+  `bedrock_recipes_compile_only_with_the_provider_bedrock_feature` asserts the
+  refusal path;
+- the minimal closure links none of the seven AWS crates, asserted by the
+  recorder's `minimal_profile_excludes_heavy_provider_dependencies` receipt
+  (272 distinct crates against 326 for the full profile);
+- no neutral type, request path, or event changed shape; the gate sits at
+  recipe compilation and in one `RequestAuthorizer` field;
+- budgets are enforced: `qq_release_binary_bytes` ≤ 70 MB,
+  `qq_minimal_release_binary_bytes` ≤ 56 MB, and
+  `qq_minimal_dependency_closure_crates` ≤ 300 are absolute ceilings, with
+  relative regression limits on both profiles' startup, readiness, and RSS
+  metrics (`benchmarks/perf/budgets-v1.json`, fixture 3); and
+- no provider-per-crate split or parallel provider interface was introduced.
+
+Measurements from the clean detached 100-sample recorder at exact revision
+`8ccba84d31fe5bc1ab37587268bc716dcada1a5f` (69 metrics, all 61 budgets green):
+
+| Boundary | Full | Minimal |
+| --- | ---: | ---: |
+| Release binary | 63.99 MB | 51.88 MB |
+| Distinct dependency-closure crates | 326 | 272 |
+| Repeated `qq --version` p95 | 2.274 ms | 2.124 ms |
+| Isolated `qq serve` readiness p95 | 111.988 ms | 120.846 ms |
+| Idle server RSS p95 | 17.96 MB | 15.98 MB |
+| Idle server peak RSS p95 | 17.97 MB | 15.98 MB |
+
+The minimal profile removes 12.1 MB (19%) of binary and 54 crates; idle RSS
+drops ~2 MB. Startup and readiness are within noise of each other, so the
+AWS closure was a size and build-time cost rather than a startup cost. The R4
+fairness metrics stayed green on this run (23.987 ms control upper bound,
+50.000 ms output service gap at its limit, 1.951x scaling ratio).
+
+Phase 1 is complete.
 
 #### Imported R4 Completion Receipt — 2026-09-01
 

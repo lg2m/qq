@@ -1,9 +1,10 @@
 # Context Compaction
 
-Status: steps 1–3 of the sequencing are implemented (result pruning in
+Status: all five sequencing steps are implemented (result pruning in
 assembly; `CompactSession` + `/compact` with summary/marker storage;
-auto-compact thresholds replacing the hard budget failure); step 4 is
-direction.
+auto-compact thresholds replacing the hard budget failure; `search_history`
+recall; summary validation and `RollbackCompaction`). See
+`terminal-bench-readiness.md` "Compaction Hardening" for the shipped bounds.
 
 Long sessions outgrow model context. Today the runtime fails the run
 when the assembled context exceeds the session budget; compaction
@@ -75,8 +76,13 @@ Produced by a dedicated summarization run against the session's model
   the run internal: its messages do not join the session transcript;
   its product is the summary row.
 - Persistence: summary + marker commit atomically; assembly reads the
-  latest marker. Compaction history is retained (small, bounded count)
-  so a bad compaction can be rolled back to the prior one.
+  latest marker. Three compactions are retained per session and
+  `RollbackCompaction` (idle-only) steps back through them to the
+  verbatim transcript.
+- Validation: a summary must be non-empty, fit the session context limit,
+  carry every required section heading, and shrink the measured assembly
+  (above a small floor). Failing summaries settle the internal run as a
+  policy failure and leave the prior compaction in force.
 - The recency window (last K model turns kept verbatim, default small)
   and the pruning window are configuration alongside the context
   budget.
@@ -92,3 +98,4 @@ Produced by a dedicated summarization run against the session's model
 2. Summary + marker storage, `CompactSession`, manual `/compact`.
 3. Auto-compact thresholds replacing the hard budget failure.
 4. `search_history` recall tool.
+5. Summary validation, bounded history, rollback.

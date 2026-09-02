@@ -537,6 +537,7 @@ fn router(handler: Arc<dyn ServerHandler>, connection: ServerConnection) -> Rout
         .route("/v1/sessions/delete", post(delete_session))
         .route("/v1/sessions/prune", post(prune_sessions))
         .route("/v1/sessions/compact", post(compact_session))
+        .route("/v1/sessions/compact/rollback", post(rollback_compaction))
         .route("/v1/runs/cancel", post(cancel_run))
         .route("/v1/tools/approvals", post(respond_tool_approval))
         .route(
@@ -670,6 +671,16 @@ async fn compact_session(
 ) -> Response {
     session_command(state, body, |command| {
         matches!(command, SessionCommand::CompactSession { .. })
+    })
+    .await
+}
+
+async fn rollback_compaction(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::RollbackCompaction { .. })
     })
     .await
 }
@@ -1582,6 +1593,7 @@ mod tests {
             command: SessionCommand::SubmitPrompt {
                 session_id,
                 prompt: "/review focus on cancellation".to_owned(),
+                limits: qq_protocol::RunLimits::default(),
             },
         };
 

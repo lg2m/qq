@@ -1,0 +1,404 @@
+use std::time::Duration;
+
+use qq_protocol::{BudgetExhaustion, BudgetLimitKind, ModelPricing, RunLimits, TokenUsage};
+use tokio::time::Instant;
+
+/// The final tool-free turn a run is granted once its work budget is spent.
+pub(crate) const BUDGET_FINAL_RESPONSE_NOTICE: &str = "The run's budget is exhausted, so no \
+tools are available for this reply. Report concisely what was accomplished, what remains, and \
+the exact next step. This is the final response of the run.";
+
+/// Core-owned accounting of one run against its caller-imposed `RunLimits`.
+///
+/// The meter charges turns, tool calls, tokens, and cost as the runtime
+/// observes them and answers one question before every model turn: may the
+/// run keep working, must it spend its reserved final response, or must it
+/// settle now. Charges saturate; an exceeded bound is reported exactly once.
+pub(crate) struct BudgetMeter {
+    limits: RunLimits,
+    pricing: Option<ModelPricing>,
+    started: Instant,
+    turns: u16,
+    tool_calls: u32,
+    /// Total input plus output tokens across every turn, `None` once a turn
+    /// omitted usage while a token or cost bound was imposed.
+    tokens: Option<u64>,
+    /// Estimated spend, `None` once unmeasurable under a cost bound.
+    cost_usd_nanos: Option<u64>,
+    /// The limit that spent the work budget once the reserved final response
+    /// has been requested; the next check settles with it instead of
+    /// requesting another.
+    final_response_requested: Option<BudgetLimitKind>,
+}
+
+/// What the meter permits before the next provider turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BudgetDecision {
+    /// Work may continue with tools.
+    Continue,
+    /// The work budget is spent but one tool-free response can be afforded.
+    FinalResponse(BudgetLimitKind),
+    /// Nothing more can be afforded, or the final response was already spent.
+    Exhausted(BudgetExhaustion),
+}
+
+impl BudgetMeter {
+    pub(crate) fn new(limits: RunLimits, pricing: Option<ModelPricing>, started: Instant) -> Self {
+        Self {
+            limits,
+            pricing,
+            started,
+            turns: 0,
+            tool_calls: 0,
+            tokens: Some(0),
+            cost_usd_nanos: Some(0),
+            final_response_requested: None,
+        }
+    }
+
+    /// The instant the wall-clock budget elapses, when one was imposed.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.limits
+            .max_duration_ms
+            .map(|ms| self.started + Duration::from_millis(ms))
+    }
+
+    /// Charges one completed provider turn. A missing usage report makes
+    /// tokens and cost unknown for the rest of the run.
+    pub(crate) fn charge_turn(&mut self, usage: Option<TokenUsage>) {
+        self.turns = self.turns.saturating_add(1);
+        match usage {
+            Some(usage) => {
+                self.tokens = self.tokens.map(|total| {
+                    total
+                        .saturating_add(usage.input_tokens)
+                        .saturating_add(usage.cache_read_input_tokens)
+                        .saturating_add(usage.cache_write_input_tokens)
+                        .saturating_add(usage.output_tokens)
+                });
+                self.cost_usd_nanos = self.cost_usd_nanos.and_then(|total| {
+                    let pricing = self.pricing.as_ref()?;
+                    let cost = crate::sessions::run_cost(usage, pricing)?;
+                    total.checked_add(cost)
+                });
+            }
+            None => {
+                self.tokens = None;
+                self.cost_usd_nanos = None;
+            }
+        }
+    }
+
+    pub(crate) fn charge_tool_calls(&mut self, count: usize) {
+        self.tool_calls = self
+            .tool_calls
+            .saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
+    }
+
+    /// Charges sub-agent spend that the parent run is accountable for. An
+    /// unknown child cost makes the parent's cost unknown too.
+    pub(crate) fn charge_child(&mut self, cost_usd_nanos: Option<u64>) {
+        self.cost_usd_nanos = match (self.cost_usd_nanos, cost_usd_nanos) {
+            (Some(total), Some(cost)) => total.checked_add(cost),
+            _ => None,
+        };
+    }
+
+    /// Whether a limit has already been exceeded by observed work, checked
+    /// after each turn commits. `None` means every imposed bound still holds.
+    pub(crate) fn exceeded(&self, now: Instant) -> Option<BudgetLimitKind> {
+        let limits = &self.limits;
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
+            return Some(BudgetLimitKind::Duration);
+        }
+        if limits.max_cost_usd_nanos.is_some() && self.cost_usd_nanos.is_none() {
+            return Some(BudgetLimitKind::CostUnknown);
+        }
+        if let (Some(limit), Some(cost)) = (limits.max_cost_usd_nanos, self.cost_usd_nanos)
+            && cost > limit
+        {
+            return Some(BudgetLimitKind::Cost);
+        }
+        if let Some(limit) = limits.max_total_tokens {
+            match self.tokens {
+                Some(tokens) if tokens > limit => return Some(BudgetLimitKind::TotalTokens),
+                // Token accounting lost without a cost bound: fail closed on
+                // the token bound the caller did impose.
+                None => return Some(BudgetLimitKind::TotalTokens),
+                Some(_) => {}
+            }
+        }
+        if limits
+            .max_tool_calls
+            .is_some_and(|limit| self.tool_calls > limit)
+        {
+            return Some(BudgetLimitKind::ToolCalls);
+        }
+        if limits
+            .max_model_turns
+            .is_some_and(|limit| self.turns > limit)
+        {
+            return Some(BudgetLimitKind::ModelTurns);
+        }
+        None
+    }
+
+    /// Decides the next turn. The work budget is spent when the next ordinary
+    /// turn could not be completed within a bound (turn or tool-call caps
+    /// reserve one turn for the final response; the other bounds trip once
+    /// observed work crosses them).
+    pub(crate) fn before_turn(&mut self, now: Instant, next_turn_tools: usize) -> BudgetDecision {
+        let limits = &self.limits;
+        if let Some(spent) = self.final_response_requested {
+            // The reserve has been used; whatever tripped since is secondary.
+            let kind = self.exceeded(now).unwrap_or(spent);
+            return BudgetDecision::Exhausted(self.exhaustion(kind, true, now));
+        }
+        if let Some(kind) = self.exceeded(now) {
+            return self.settle(kind, now);
+        }
+        // Turn and tool caps reserve their final response from within the
+        // cap: the last permitted turn is the tool-free status reply, so the
+        // provider is never asked for more turns than the caller allowed.
+        let turns_spent = limits
+            .max_model_turns
+            .is_some_and(|limit| self.turns.saturating_add(1) >= limit);
+        let tools_spent = limits.max_tool_calls.is_some_and(|limit| {
+            self.tool_calls
+                .saturating_add(u32::try_from(next_turn_tools).unwrap_or(u32::MAX))
+                > limit
+        });
+        let kind = if turns_spent {
+            Some(BudgetLimitKind::ModelTurns)
+        } else if tools_spent {
+            Some(BudgetLimitKind::ToolCalls)
+        } else {
+            None
+        };
+        match kind {
+            None => BudgetDecision::Continue,
+            Some(kind) => self.settle(kind, now),
+        }
+    }
+
+    fn settle(&mut self, kind: BudgetLimitKind, now: Instant) -> BudgetDecision {
+        // The reserve is one more provider turn. A tripped wall clock or an
+        // unmeasurable cost cannot afford it; the countable bounds can.
+        let affordable = match kind {
+            BudgetLimitKind::Duration | BudgetLimitKind::CostUnknown => false,
+            BudgetLimitKind::Cost | BudgetLimitKind::TotalTokens => {
+                // Cost and tokens are only observed after a turn; permitting
+                // the final response bounds the overshoot to one tool-free
+                // reply, which the caller accepted by imposing the cap.
+                true
+            }
+            BudgetLimitKind::ModelTurns | BudgetLimitKind::ToolCalls => true,
+        };
+        if !affordable {
+            return BudgetDecision::Exhausted(self.exhaustion(kind, false, now));
+        }
+        self.final_response_requested = Some(kind);
+        BudgetDecision::FinalResponse(kind)
+    }
+
+    /// The typed outcome for a limit that settled the run.
+    pub(crate) fn exhaustion(
+        &self,
+        kind: BudgetLimitKind,
+        final_response: bool,
+        now: Instant,
+    ) -> BudgetExhaustion {
+        let limits = &self.limits;
+        let message = match kind {
+            BudgetLimitKind::Duration => format!(
+                "the run exceeded its {} ms wall-clock budget after {} ms",
+                limits.max_duration_ms.unwrap_or_default(),
+                now.saturating_duration_since(self.started).as_millis()
+            ),
+            BudgetLimitKind::ModelTurns => format!(
+                "the run exhausted its {} model turn budget",
+                limits.max_model_turns.unwrap_or_default()
+            ),
+            BudgetLimitKind::ToolCalls => format!(
+                "the run exhausted its {} tool call budget after {} calls",
+                limits.max_tool_calls.unwrap_or_default(),
+                self.tool_calls
+            ),
+            BudgetLimitKind::TotalTokens => match self.tokens {
+                Some(tokens) => format!(
+                    "the run's {tokens} total tokens exceeded its {} token budget",
+                    limits.max_total_tokens.unwrap_or_default()
+                ),
+                None => "the run's token usage became unknown, so its token budget could not \
+                         be enforced"
+                    .to_owned(),
+            },
+            BudgetLimitKind::Cost => format!(
+                "the run's estimated cost exceeded its budget ({} > {} USD nanos)",
+                self.cost_usd_nanos.unwrap_or_default(),
+                limits.max_cost_usd_nanos.unwrap_or_default()
+            ),
+            BudgetLimitKind::CostUnknown => {
+                "the run's cost became unknown, so its hard cost budget could not be enforced"
+                    .to_owned()
+            }
+        };
+        BudgetExhaustion {
+            limit: kind,
+            final_response,
+            message,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: output,
+        }
+    }
+
+    fn pricing() -> ModelPricing {
+        ModelPricing {
+            input_usd_nanos_per_token: 1_000,
+            output_usd_nanos_per_token: 2_000,
+            cache_read_usd_nanos_per_token: None,
+            cache_write_usd_nanos_per_token: None,
+            context_tier: None,
+            provenance: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn unlimited_meter_always_continues() {
+        let now = Instant::now();
+        let mut meter = BudgetMeter::new(RunLimits::default(), None, now);
+        for _ in 0..1_000 {
+            meter.charge_turn(None);
+            meter.charge_tool_calls(16);
+            assert_eq!(meter.before_turn(now, 16), BudgetDecision::Continue);
+        }
+        assert_eq!(meter.deadline(), None);
+    }
+
+    #[test]
+    fn turn_budget_reserves_the_last_turn_as_the_final_response_then_settles() {
+        let now = Instant::now();
+        let limits = RunLimits {
+            max_model_turns: Some(3),
+            ..RunLimits::default()
+        };
+        let mut meter = BudgetMeter::new(limits, None, now);
+        assert_eq!(meter.before_turn(now, 0), BudgetDecision::Continue);
+        meter.charge_turn(None);
+        assert_eq!(meter.before_turn(now, 0), BudgetDecision::Continue);
+        meter.charge_turn(None);
+        // Turn three is the last permitted turn: it must be the final response.
+        assert_eq!(
+            meter.before_turn(now, 0),
+            BudgetDecision::FinalResponse(BudgetLimitKind::ModelTurns)
+        );
+        meter.charge_turn(None);
+        let BudgetDecision::Exhausted(exhaustion) = meter.before_turn(now, 0) else {
+            panic!("a second exhausted check must settle")
+        };
+        assert_eq!(exhaustion.limit, BudgetLimitKind::ModelTurns);
+        assert!(exhaustion.final_response);
+    }
+
+    #[test]
+    fn tool_call_budget_reserves_room_for_the_next_turn() {
+        let now = Instant::now();
+        let limits = RunLimits {
+            max_tool_calls: Some(20),
+            ..RunLimits::default()
+        };
+        let mut meter = BudgetMeter::new(limits, None, now);
+        meter.charge_tool_calls(10);
+        assert_eq!(meter.before_turn(now, 10), BudgetDecision::Continue);
+        assert_eq!(
+            meter.before_turn(now, 11),
+            BudgetDecision::FinalResponse(BudgetLimitKind::ToolCalls)
+        );
+    }
+
+    #[test]
+    fn deadline_cannot_afford_a_final_response() {
+        let start = Instant::now();
+        let limits = RunLimits {
+            max_duration_ms: Some(100),
+            ..RunLimits::default()
+        };
+        let mut meter = BudgetMeter::new(limits, None, start);
+        assert_eq!(meter.deadline(), Some(start + Duration::from_millis(100)));
+        assert_eq!(
+            meter.before_turn(start + Duration::from_millis(99), 0),
+            BudgetDecision::Continue
+        );
+        let BudgetDecision::Exhausted(exhaustion) =
+            meter.before_turn(start + Duration::from_millis(100), 0)
+        else {
+            panic!("an elapsed deadline must settle immediately")
+        };
+        assert_eq!(exhaustion.limit, BudgetLimitKind::Duration);
+        assert!(!exhaustion.final_response);
+    }
+
+    #[test]
+    fn cost_budget_trips_on_spend_and_fails_closed_when_usage_goes_missing() {
+        let now = Instant::now();
+        let limits = RunLimits {
+            max_cost_usd_nanos: Some(10_000),
+            ..RunLimits::default()
+        };
+        let mut meter = BudgetMeter::new(limits, Some(pricing()), now);
+        meter.charge_turn(Some(usage(4, 2))); // 4_000 + 4_000
+        assert_eq!(meter.before_turn(now, 0), BudgetDecision::Continue);
+        meter.charge_turn(Some(usage(4, 2)));
+        assert_eq!(
+            meter.before_turn(now, 0),
+            BudgetDecision::FinalResponse(BudgetLimitKind::Cost)
+        );
+
+        let mut unmetered = BudgetMeter::new(limits, Some(pricing()), now);
+        unmetered.charge_turn(Some(usage(1, 1)));
+        unmetered.charge_turn(None);
+        let BudgetDecision::Exhausted(exhaustion) = unmetered.before_turn(now, 0) else {
+            panic!("unknown cost under a cost cap must settle")
+        };
+        assert_eq!(exhaustion.limit, BudgetLimitKind::CostUnknown);
+        assert!(!exhaustion.final_response);
+
+        let mut child = BudgetMeter::new(limits, Some(pricing()), now);
+        child.charge_child(None);
+        assert_eq!(
+            child.exceeded(now),
+            Some(BudgetLimitKind::CostUnknown),
+            "an unmetered child makes the parent's cost unknown"
+        );
+    }
+
+    #[test]
+    fn token_budget_counts_every_turn_and_child_free() {
+        let now = Instant::now();
+        let limits = RunLimits {
+            max_total_tokens: Some(100),
+            ..RunLimits::default()
+        };
+        let mut meter = BudgetMeter::new(limits, None, now);
+        meter.charge_turn(Some(usage(60, 30)));
+        assert_eq!(meter.exceeded(now), None);
+        meter.charge_turn(Some(usage(10, 5)));
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::TotalTokens));
+        // Cost stays unknown without pricing, but no cost cap was imposed.
+        let mut priceless = BudgetMeter::new(limits, None, now);
+        priceless.charge_turn(Some(usage(1, 1)));
+        assert_eq!(priceless.exceeded(now), None);
+    }
+}

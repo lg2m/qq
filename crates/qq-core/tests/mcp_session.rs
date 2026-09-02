@@ -111,6 +111,7 @@ impl RuntimeLoader for McpLoader {
                 runtime: Arc::new(runtime.with_mcp_registry(registry)),
                 resolved_model: Arc::new(ResolvedModel {
                     version: ResolvedModelVersion::new(1).unwrap(),
+                    request_shape: None,
                     route: "test/model".to_owned(),
                     provider_model: "test-model".to_owned(),
                     organization: None,
@@ -151,6 +152,7 @@ async fn submit_prompt(runtime: &SessionRuntime, session_id: qq_protocol::Sessio
         SessionCommand::SubmitPrompt {
             session_id,
             prompt: "ping the server".to_owned(),
+            limits: qq_protocol::RunLimits::default(),
         },
     )
     .await;

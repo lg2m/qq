@@ -704,6 +704,10 @@ pub enum SessionRuntimeError {
     EmptyPrompt,
     #[error("prompt exceeds the session limit")]
     PromptTooLarge,
+    #[error("run limits must be greater than zero")]
+    InvalidRunLimits,
+    #[error("session has no compaction to roll back")]
+    NoCompactionToRollBack,
     #[error("workspace was not found")]
     WorkspaceNotFound,
     #[error("workspace limit reached")]

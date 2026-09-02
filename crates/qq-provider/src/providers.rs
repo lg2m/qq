@@ -1,8 +1,10 @@
 //! Concrete provider adapters and their protocol-side support kit.
 
 pub(crate) mod anthropic;
+#[cfg(feature = "provider-bedrock")]
 pub(crate) mod bedrock;
 pub(crate) mod google;
+#[cfg(feature = "provider-bedrock")]
 pub(crate) mod mantle;
 pub(crate) mod openai;
 pub(crate) mod openai_chat;

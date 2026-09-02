@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use qq_protocol::{
-    ReasoningKind, RunActivity, RunFailureKind, RunPromptIdentity, TokenUsage, ToolCallDisplay,
-    ToolCallId,
+    BudgetExhaustion, ContentHash, ReasoningKind, RunActivity, RunFailureKind, RunPromptIdentity,
+    TokenUsage, ToolCallDisplay, ToolCallId,
 };
 use qq_provider::Message;
+use sha2::{Digest, Sha256};
 
 use crate::workspace::FileStateUpdate;
 
@@ -18,12 +21,45 @@ pub(crate) struct PreparedRequestWeight {
     pub(crate) compatible_input_tokens: Option<u64>,
 }
 
+impl PreparedRequestWeight {
+    pub(crate) const fn input_bytes(self) -> u64 {
+        self.system_bytes
+            .saturating_add(self.tool_schema_bytes)
+            .saturating_add(self.reducible_message_bytes)
+            .saturating_add(self.irreducible_message_bytes)
+    }
+}
+
+/// Identity of the exact immutable prefix placed before the conversation for
+/// one provider turn. Tool-free checkpoint and compaction turns intentionally
+/// differ from ordinary turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct PreparedStaticPrefix(ContentHash);
+
+impl PreparedStaticPrefix {
+    pub(crate) fn new(system: ContentHash, tools: Option<ContentHash>) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"qq-prepared-static-prefix-v1");
+        digest.update(system.as_bytes());
+        match tools {
+            Some(tools) => {
+                digest.update([1]);
+                digest.update(tools.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+        Self(ContentHash::from_bytes(digest.finalize().into()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RuntimeEvent {
     Started,
     Prepared {
         turn_ordinal: u16,
-        identity: Option<RunPromptIdentity>,
+        identity: Option<Arc<RunPromptIdentity>>,
+        static_prefix: PreparedStaticPrefix,
         weight: PreparedRequestWeight,
     },
     ActivityChanged {
@@ -84,6 +120,12 @@ pub(crate) enum RuntimeEvent {
     Failed {
         kind: RunFailureKind,
         message: String,
+    },
+    /// A caller-imposed limit settled the run. Emitted after the reserved
+    /// final response turn (if any) has been persisted via
+    /// `AssistantTurnCompleted`.
+    BudgetExhausted {
+        exhaustion: BudgetExhaustion,
     },
 }
 

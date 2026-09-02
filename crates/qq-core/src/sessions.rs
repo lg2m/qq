@@ -16,24 +16,28 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use qq_protocol::{
-    AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId,
-    CommandOutcome, CommandReceipt, EditPreview, EventCursor, MessageId, MessageRole,
-    MessageSnapshot, MessageState, ModelPricing, ModelSelection, ReasoningEvent, ResolvedModel,
-    RunActivity, RunFailure, RunFailureKind, RunId, RunOutcome, RunPromptIdentity, RunSnapshot,
-    RunStatus, SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId,
-    SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot,
-    ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution,
+    CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, ContentHash, EditPreview,
+    EventCursor, MessageId, MessageRole, MessageSnapshot, MessageState, ModelPricing,
+    ModelSelection, ReasoningEvent, ResolvedModel, RunActivity, RunFailure, RunFailureKind, RunId,
+    RunLimits, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus, SessionAccounting,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
+    SessionSummary, ShellCommandPreview, SnapshotRequest, StoreId, SubscribeRequest, TextChannel,
+    TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
+    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
-    GateDecision, PreparedRequestWeight, RunCapabilities, Runtime, RuntimeEvent, RuntimeToolCall,
-    SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, approval,
+    GateDecision, PreparedRequestWeight, PreparedStaticPrefix, RunCapabilities, Runtime,
+    RuntimeEvent, RuntimeToolCall, SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate,
+    ToolGateFuture, approval,
+    runtime::{HistoryMatch, HistorySearchFuture, HistorySearcher, excerpt_around},
     workspace::{FileState, FileStateUpdate},
 };
 
@@ -74,6 +78,10 @@ const CONTEXT_PRUNE_STUB_ARGUMENT_BYTES: usize = 256;
 /// Compaction summaries retained per session, newest first. History is kept
 /// (not deleted eagerly) so a bad compaction can be rolled back later.
 const COMPACTION_HISTORY_ROWS: u32 = 3;
+/// Assemblies at or below this size are compacted without a shrinkage check:
+/// the structured summary's fixed framing can legitimately exceed a tiny
+/// transcript that a small model window still could not fit.
+const COMPACTION_SHRINKAGE_FLOOR_BYTES: usize = 16 * 1024;
 /// Longest summary excerpt carried on the `SessionCompacted` event.
 const MAX_EVENT_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_PROMPT_BYTES: usize = 128 * 1024;
@@ -110,7 +118,7 @@ const RUNTIME_NOTICE_GUIDANCE: &str = "Continue from the committed history above
 /// Read-only built-in tools whose results context assembly may replace with
 /// stubs: the agent can re-derive them on demand. Mutating, shell, and MCP
 /// results are never pruned — their outputs are not re-derivable.
-const PRUNABLE_READ_ONLY_TOOLS: [&str; 3] = ["read_file", "list_dir", "search"];
+const PRUNABLE_READ_ONLY_TOOLS: [&str; 4] = ["read_file", "list_dir", "search", "search_history"];
 /// Prefixes the latest compaction summary when assembly replays it as the
 /// conversation's opening message.
 const COMPACTION_SUMMARY_PREAMBLE: &str = "The earlier part of this conversation was compacted \
@@ -131,6 +139,61 @@ missing.\n\
 6. User messages: every user message, preserved verbatim or near-verbatim.\n\
 If the conversation begins with a prior compaction summary, fold it into these sections rather \
 than referring to it.";
+/// The section headings `COMPACTION_INSTRUCTION` demands, in order. A summary
+/// missing any of them is rejected before it can replace the transcript.
+const COMPACTION_REQUIRED_SECTIONS: [&str; 6] = [
+    "Intent",
+    "Decisions and constraints",
+    "Work state",
+    "Files touched",
+    "Errors",
+    "User messages",
+];
+
+/// Structural validation of a summarizer reply. Shrinkage is measured
+/// separately against the real assembly inside the compaction transaction.
+fn validate_compaction_summary(summary: &str) -> Result<(), String> {
+    if summary.trim().is_empty() {
+        return Err("compaction produced an empty summary".to_owned());
+    }
+    let replacement_bytes = COMPACTION_SUMMARY_PREAMBLE
+        .len()
+        .saturating_add(2)
+        .saturating_add(summary.len());
+    if replacement_bytes > MAX_CONTEXT_BYTES {
+        return Err("compaction summary exceeds the 4 MiB session context limit".to_owned());
+    }
+    // A heading is a line that starts with the section name (optionally
+    // numbered or marked up) followed by a colon. Matching is per line so
+    // body text mentioning "errors:" cannot satisfy the requirement.
+    let missing = COMPACTION_REQUIRED_SECTIONS
+        .iter()
+        .filter(|section| {
+            !summary.lines().any(|line| {
+                let line = line
+                    .trim_start()
+                    .trim_start_matches(|c: char| {
+                        c.is_ascii_digit() || matches!(c, '.' | ')' | '#' | '*' | '-' | ' ')
+                    })
+                    .trim_start_matches(['*', '_']);
+                line.get(..section.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(section))
+                    && line[section.len()..]
+                        .trim_start_matches(['*', '_'])
+                        .trim_start()
+                        .starts_with(':')
+            })
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "compaction summary is missing required sections: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
 
 /// What a run row exists for. Prompt runs answer a user message and their
 /// output joins the transcript; compaction runs are internal — their request
@@ -147,6 +210,31 @@ fn parse_run_kind(value: &str) -> Result<RunKind, SessionRuntimeError> {
         "prompt" => Ok(RunKind::Prompt),
         "compaction" => Ok(RunKind::Compaction),
         _ => Err(SessionRuntimeError::Persistence),
+    }
+}
+
+/// A zero limit is a caller mistake, not "no work": rejecting it keeps every
+/// accepted bound meaningful and avoids a run that settles before starting.
+fn validate_run_limits(limits: &RunLimits) -> Result<(), SessionRuntimeError> {
+    let zero = limits.max_duration_ms == Some(0)
+        || limits.max_model_turns == Some(0)
+        || limits.max_tool_calls == Some(0)
+        || limits.max_total_tokens == Some(0)
+        || limits.max_cost_usd_nanos == Some(0);
+    if zero {
+        return Err(SessionRuntimeError::InvalidRunLimits);
+    }
+    Ok(())
+}
+
+/// NULL is the historical unlimited run; stored JSON is authoritative and a
+/// malformed row is a persistence fault rather than a silent default.
+fn parse_run_limits(encoded: Option<&str>) -> Result<RunLimits, SessionRuntimeError> {
+    match encoded {
+        None => Ok(RunLimits::default()),
+        Some(encoded) => {
+            serde_json::from_str(encoded).map_err(|_| SessionRuntimeError::Persistence)
+        }
     }
 }
 
@@ -170,10 +258,17 @@ struct ClaimedRun {
     /// message was normalized before `PromptQueued`, so preparation must not
     /// reinterpret the resulting leading slash.
     literal_slash: bool,
+    /// Exact optional selection read from the session row at reservation.
+    /// `model` becomes the effective resolved selection before provider work.
+    session_model: ModelSelection,
     model: ModelSelection,
     messages: Vec<Message>,
     context_compaction_attempted: bool,
-    context_overflow_model: Option<Arc<ResolvedModel>>,
+    context_overflow_basis: Option<ContextOccupancyBasis>,
+    context_occupancy: Option<ContextOccupancy>,
+    /// Caller-imposed budgets persisted with the run row. Compaction runs and
+    /// historical rows carry the empty set.
+    limits: RunLimits,
 }
 
 impl ClaimedRun {
@@ -191,10 +286,13 @@ impl ClaimedRun {
             child: self.child,
             user_initiated: self.user_initiated,
             literal_slash: self.literal_slash,
+            session_model: self.session_model.clone(),
             model: self.model.clone(),
             messages: Vec::new(),
             context_compaction_attempted: self.context_compaction_attempted,
-            context_overflow_model: None,
+            context_overflow_basis: None,
+            context_occupancy: None,
+            limits: RunLimits::default(),
         }
     }
 }
@@ -203,32 +301,191 @@ impl ClaimedRun {
 struct PreparedRunAudit {
     prompt_identity: Arc<RunPromptIdentity>,
     resolved_model: Arc<ResolvedModel>,
+    context_shape: ContextRequestShape,
     weight: PreparedRequestWeight,
+    static_prefix: PreparedStaticPrefix,
 }
 
-/// Whether two immutable descriptors produce the same provider request shape
-/// for context occupancy. Pricing/provenance can refresh independently and
-/// must not make a known provider overflow look safe to resend.
-fn same_context_request_shape(left: &ResolvedModel, right: &ResolvedModel) -> bool {
-    left.route == right.route
-        && left.provider_model == right.provider_model
-        && left.organization == right.organization
-        && left.credential_profile == right.credential_profile
-        && left.max_output_tokens == right.max_output_tokens
-        && left.context_window == right.context_window
-        && left.output_token_control == right.output_token_control
-        && left.generation == right.generation
-        && left.prompt_cache.control == right.prompt_cache.control
+const CONTEXT_OCCUPANCY_BASIS_VERSION: u16 = 1;
+
+/// The wire-affecting identity of one run's provider requests.
+///
+/// With a known secret-free provider identity the digest names the exact
+/// codec/endpoint/adapter shape, which is enough to reuse a measured token
+/// count. Without one (custom or LiteLLM endpoints, dynamic AWS region
+/// chains, historical descriptors) the digest covers only the route-level
+/// fields; that still proves a previously overflowing request repeats, but
+/// cannot prove tokenization-compatible wire shape for occupancy reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextRequestShape {
+    digest: ContentHash,
+    provider_identity: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextOccupancyBasis {
+    version: u16,
+    shape: ContentHash,
+    static_prefix: PreparedStaticPrefix,
+    request_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextOccupancy {
+    context_tokens: u64,
+    basis: ContextOccupancyBasis,
+}
+
+fn context_request_shape(model: &ResolvedModel) -> ContextRequestShape {
+    let provider = model
+        .request_shape
+        .filter(|provider| model.version.get() == 2 && provider.version.get() == 1);
+    let mut digest = Sha256::new();
+    // Distinct domains keep an exact identity from ever matching a
+    // route-level fallback for the same route.
+    match provider {
+        Some(provider) => {
+            context_shape_update(&mut digest, b"qq-context-request-shape-v1");
+            digest.update(provider.version.get().to_be_bytes());
+            context_shape_update(&mut digest, provider.digest.as_bytes());
+        }
+        None => context_shape_update(&mut digest, b"qq-context-route-shape-v1"),
+    }
+    context_shape_update(&mut digest, model.route.as_bytes());
+    context_shape_update(&mut digest, model.provider_model.as_bytes());
+    context_shape_update_optional(&mut digest, model.organization.as_deref());
+    context_shape_update_optional(&mut digest, model.credential_profile.as_deref());
+    digest.update(model.max_output_tokens.to_be_bytes());
+    match model.context_window {
+        Some(window) => {
+            digest.update([1]);
+            digest.update(window.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update([capability_byte(model.output_token_control)]);
+    digest.update([capability_byte(model.generation.reasoning_effort)]);
+    digest.update([capability_byte(model.prompt_cache.control)]);
+    digest.update([
+        u8::from(model.prompt_cache.cache_read_usage),
+        u8::from(model.prompt_cache.cache_write_usage),
+    ]);
+    ContextRequestShape {
+        digest: ContentHash::from_bytes(digest.finalize().into()),
+        provider_identity: provider.is_some(),
+    }
+}
+
+fn context_occupancy_basis(
+    shape: ContentHash,
+    static_prefix: PreparedStaticPrefix,
+    request_bytes: u64,
+) -> ContextOccupancyBasis {
+    ContextOccupancyBasis {
+        version: CONTEXT_OCCUPANCY_BASIS_VERSION,
+        shape,
+        static_prefix,
+        request_bytes,
+    }
+}
+
+/// Seeds the next request's occupancy from a measured one. Requires a known
+/// provider identity, the exact shape and static prefix, and an append-only
+/// (byte-monotonic) transcript; the growth is charged conservatively at one
+/// token per byte.
+fn compatible_context_tokens(
+    occupancy: ContextOccupancy,
+    shape: ContextRequestShape,
+    static_prefix: PreparedStaticPrefix,
+    request_bytes: u64,
+) -> Option<u64> {
+    let basis = occupancy.basis;
+    (shape.provider_identity
+        && repeats_context_basis(basis, shape, static_prefix)
+        && request_bytes >= basis.request_bytes)
+        .then(|| {
+            occupancy
+                .context_tokens
+                .saturating_add(request_bytes - basis.request_bytes)
+        })
+}
+
+/// Whether a request with this shape and static prefix repeats the request
+/// that produced `basis`. Deliberately independent of request bytes: the
+/// transcript only shrinks through assembly-time pruning, and an uncertain
+/// repeat of a provider-reported overflow must compact rather than poll.
+fn repeats_context_basis(
+    basis: ContextOccupancyBasis,
+    shape: ContextRequestShape,
+    static_prefix: PreparedStaticPrefix,
+) -> bool {
+    basis.version == CONTEXT_OCCUPANCY_BASIS_VERSION
+        && basis.shape == shape.digest
+        && basis.static_prefix == static_prefix
+}
+
+fn context_shape_update(digest: &mut Sha256, value: &[u8]) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+fn context_shape_update_optional(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            context_shape_update(digest, value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+const fn capability_byte(capability: CapabilitySupport) -> u8 {
+    match capability {
+        CapabilitySupport::Native => 1,
+        CapabilitySupport::Unsupported => 2,
+    }
 }
 
 #[cfg(test)]
 fn test_prepared_audit(claimed: &ClaimedRun) -> PreparedRunAudit {
+    test_prepared_audit_with_identity(claimed, true)
+}
+
+#[cfg(test)]
+fn test_prepared_audit_with_identity(
+    claimed: &ClaimedRun,
+    provider_identity: bool,
+) -> PreparedRunAudit {
     let route = claimed
         .model
         .model
         .clone()
         .unwrap_or_else(|| "test/test-model".to_owned());
     let max_output_tokens = claimed.model.max_output_tokens.unwrap_or(256);
+    let resolved_model = Arc::new(ResolvedModel {
+        version: qq_protocol::ResolvedModelVersion::new(2).unwrap(),
+        request_shape: provider_identity.then(|| qq_protocol::ProviderRequestShapeIdentity {
+            version: qq_protocol::ProviderRequestShapeVersion::new(1).unwrap(),
+            digest: ContentHash::from_bytes([1; 32]),
+        }),
+        route: route.clone(),
+        provider_model: route,
+        organization: claimed.model.organization.clone(),
+        credential_profile: None,
+        max_output_tokens,
+        context_window: None,
+        pricing: None,
+        output_token_control: qq_protocol::CapabilitySupport::Native,
+        generation: qq_protocol::GenerationCapabilities {
+            reasoning_effort: qq_protocol::CapabilitySupport::Unsupported,
+        },
+        prompt_cache: qq_protocol::PromptCacheCapabilities {
+            control: qq_protocol::CapabilitySupport::Unsupported,
+            cache_read_usage: false,
+            cache_write_usage: false,
+        },
+    });
     PreparedRunAudit {
         prompt_identity: Arc::new(RunPromptIdentity {
             version: qq_protocol::PromptVersion::new(1).unwrap(),
@@ -237,25 +494,8 @@ fn test_prepared_audit(claimed: &ClaimedRun) -> PreparedRunAudit {
             tool_schema_hash: Some(qq_protocol::ContentHash::from_bytes([0; 32])),
             selected_guidance: None,
         }),
-        resolved_model: Arc::new(ResolvedModel {
-            version: qq_protocol::ResolvedModelVersion::new(1).unwrap(),
-            route: route.clone(),
-            provider_model: route,
-            organization: claimed.model.organization.clone(),
-            credential_profile: None,
-            max_output_tokens,
-            context_window: None,
-            pricing: None,
-            output_token_control: qq_protocol::CapabilitySupport::Native,
-            generation: qq_protocol::GenerationCapabilities {
-                reasoning_effort: qq_protocol::CapabilitySupport::Unsupported,
-            },
-            prompt_cache: qq_protocol::PromptCacheCapabilities {
-                control: qq_protocol::CapabilitySupport::Unsupported,
-                cache_read_usage: false,
-                cache_write_usage: false,
-            },
-        }),
+        context_shape: context_request_shape(resolved_model.as_ref()),
+        resolved_model,
         weight: PreparedRequestWeight {
             max_output_tokens,
             system_bytes: 0,
@@ -264,6 +504,10 @@ fn test_prepared_audit(claimed: &ClaimedRun) -> PreparedRunAudit {
             irreducible_message_bytes: 0,
             compatible_input_tokens: None,
         },
+        static_prefix: PreparedStaticPrefix::new(
+            ContentHash::from_bytes([0; 32]),
+            Some(ContentHash::from_bytes([0; 32])),
+        ),
     }
 }
 
@@ -298,16 +542,34 @@ struct PendingGrantPromotion {
     grant: ApprovalGrant,
 }
 
+/// The durable identity of the run that owns a new child.
+#[derive(Clone, Copy)]
+struct ChildRunParent {
+    workspace_id: WorkspaceId,
+    session_id: SessionId,
+    run_id: RunId,
+}
+
 fn create_child_run(
     connection: &mut Connection,
     store_id: StoreId,
-    workspace_id: WorkspaceId,
-    parent_session_id: SessionId,
-    parent_run_id: RunId,
+    parent: ChildRunParent,
     model: ModelSelection,
     task: String,
+    limits: RunLimits,
 ) -> Result<CreatedChildRun, SessionRuntimeError> {
+    let ChildRunParent {
+        workspace_id,
+        session_id: parent_session_id,
+        run_id: parent_run_id,
+    } = parent;
     validate_model_selection(&model)?;
+    validate_run_limits(&limits)?;
+    let limits_json = if limits.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&limits).map_err(|_| SessionRuntimeError::Persistence)?)
+    };
     let task = task.trim().to_owned();
     if task.is_empty() {
         return Err(SessionRuntimeError::EmptyPrompt);
@@ -379,8 +641,8 @@ fn create_child_run(
         .execute(
             "INSERT INTO runs(
                 id, session_id, command_id, user_message_id, assistant_message_id,
-                status, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+                status, created_at_ms, limits_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
             params![
                 run_id.to_string(),
                 session_id.to_string(),
@@ -388,6 +650,7 @@ fn create_child_run(
                 user_message_id.to_string(),
                 assistant_message_id.to_string(),
                 now,
+                limits_json,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -638,7 +901,11 @@ fn execute_command(
                 false,
             )
         }
-        SessionCommand::SubmitPrompt { session_id, prompt } => {
+        SessionCommand::SubmitPrompt {
+            session_id,
+            prompt,
+            limits,
+        } => {
             let prompt = prompt.trim().to_owned();
             if prompt.is_empty() {
                 return Err(SessionRuntimeError::EmptyPrompt);
@@ -646,6 +913,7 @@ fn execute_command(
             if prompt.len() > MAX_PROMPT_BYTES {
                 return Err(SessionRuntimeError::PromptTooLarge);
             }
+            validate_run_limits(&limits)?;
             let prompt = prompt
                 .strip_prefix("//")
                 .map_or(prompt.clone(), |literal| format!("/{literal}"));
@@ -688,12 +956,20 @@ fn execute_command(
                     |row| row.get(0),
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
+            // Limits are persisted with the run row so a restart enforces the
+            // bound the caller accepted, never a later default. An empty
+            // set stores NULL, matching historical unlimited runs.
+            let limits_json = if limits.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&limits).map_err(|_| SessionRuntimeError::Persistence)?)
+            };
             transaction
                 .execute(
                     "INSERT INTO runs(
                         id, session_id, command_id, user_message_id, assistant_message_id,
-                        status, created_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+                        status, created_at_ms, limits_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
                     params![
                         run_id.to_string(),
                         session_id.to_string(),
@@ -701,6 +977,7 @@ fn execute_command(
                         message_id.to_string(),
                         assistant_message_id.to_string(),
                         now,
+                        limits_json,
                     ],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1121,6 +1398,11 @@ fn execute_command(
                      SET context_tokens = CASE
                              WHEN model IS ?2 THEN context_tokens ELSE NULL
                          END,
+                         context_occupancy_json = CASE
+                             WHEN model IS ?2 AND max_output_tokens IS ?3
+                                  AND organization IS ?4
+                             THEN context_occupancy_json ELSE NULL
+                         END,
                          model = ?2, max_output_tokens = ?3, organization = ?4,
                          updated_at_ms = ?5
                      WHERE id = ?1",
@@ -1313,6 +1595,90 @@ fn execute_command(
                 true,
             )
         }
+        SessionCommand::RollbackCompaction { session_id } => {
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            let (status, active_run, preparing_run, queued): (
+                String,
+                Option<String>,
+                Option<String>,
+                u16,
+            ) = transaction
+                .query_row(
+                    "SELECT status, active_run_id, preparing_run_id, queued_prompts
+                     FROM sessions WHERE id = ?1",
+                    [session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::SessionNotFound)?;
+            // Same idle requirement as compaction: an active run keeps the
+            // assembly it started with, and a queued prompt must not race the
+            // marker change.
+            if status != "idle" || active_run.is_some() || preparing_run.is_some() || queued > 0 {
+                return Err(SessionRuntimeError::SessionActive);
+            }
+            let removed = transaction
+                .execute(
+                    "DELETE FROM session_compactions
+                     WHERE session_id = ?1 AND rowid = (
+                         SELECT MAX(rowid) FROM session_compactions WHERE session_id = ?1
+                     )",
+                    [session_id.to_string()],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            if removed != 1 {
+                return Err(SessionRuntimeError::NoCompactionToRollBack);
+            }
+            let remaining: u16 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM session_compactions WHERE session_id = ?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            // The assembly changed under the meter: the last measured turn
+            // saw the discarded summary, so the session is unknown until the
+            // next prompt turn measures the restored context.
+            transaction
+                .execute(
+                    "UPDATE sessions
+                     SET context_tokens = NULL,
+                         context_occupancy_json = NULL,
+                         pending_context_overflow_basis_json = NULL,
+                         updated_at_ms = ?2
+                     WHERE id = ?1",
+                    params![session_id.to_string(), now],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let summary = load_session_summary(&transaction, session_id)?;
+            let event = append_event(
+                &transaction,
+                EventContext {
+                    store_id,
+                    workspace_id,
+                    session_id,
+                    run_id: None,
+                    caused_by: Some(command_id),
+                    occurred_at_ms: now,
+                },
+                SessionEvent::SessionCompactionRolledBack {
+                    session: summary,
+                    remaining,
+                },
+            )?;
+            (
+                CommandReceipt {
+                    command_id,
+                    committed_through: event.cursor,
+                    outcome: CommandOutcome::CompactionRolledBack {
+                        session_id,
+                        remaining,
+                    },
+                },
+                false,
+            )
+        }
     };
     let receipt_json =
         serde_json::to_string(&receipt).map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1370,7 +1736,8 @@ fn reserve_next_run_recoverable(
                     s.workspace_id, w.path, s.model, s.max_output_tokens, s.organization,
                     r.context_compaction_attempted,
                     (SELECT c.request_json FROM commands c WHERE c.id = r.command_id),
-                    s.pending_context_overflow_model_json
+                    s.pending_context_overflow_basis_json,
+                    s.context_tokens, s.context_occupancy_json, r.limits_json
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
@@ -1400,6 +1767,9 @@ fn reserve_next_run_recoverable(
                     row.get::<_, bool>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<u64>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
                 ))
             },
         )
@@ -1418,11 +1788,15 @@ fn reserve_next_run_recoverable(
         organization,
         context_compaction_attempted,
         command_request,
-        pending_context_overflow_model,
+        pending_context_overflow_basis_json,
+        context_tokens,
+        context_occupancy_json,
+        limits_json,
     )) = row
     else {
         return Ok(None);
     };
+    let limits = parse_run_limits(limits_json.as_deref())?;
     let run_id: RunId = parse_id(&run)?;
     let session_id: SessionId = parse_id(&session)?;
     let command_id: CommandId = parse_id(&command)?;
@@ -1457,7 +1831,7 @@ fn reserve_next_run_recoverable(
     if reserved != 1 {
         return Ok(None);
     }
-    let messages = match kind {
+    let (messages, context_rewritten) = match kind {
         RunKind::Prompt => {
             let user_ordinal: u64 = transaction
                 .query_row(
@@ -1473,10 +1847,13 @@ fn reserve_next_run_recoverable(
                     |row| row.get(0),
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
-            let mut context =
-                load_model_context(&transaction, session_id, user_ordinal.saturating_sub(1))?;
+            let (mut context, context_rewritten) = load_model_context_with_rewrite_status(
+                &transaction,
+                session_id,
+                user_ordinal.saturating_sub(1),
+            )?;
             context.push(Message::user(prompt));
-            context
+            (context, context_rewritten)
         }
         RunKind::Compaction => {
             // The summarization request is the session's assembled context —
@@ -1488,20 +1865,64 @@ fn reserve_next_run_recoverable(
                 &transaction,
                 session_id,
             )?));
-            context
+            (context, false)
         }
     };
-    let context_overflow_model = if kind == RunKind::Prompt {
-        pending_context_overflow_model
-            .map(|model| {
-                serde_json::from_str(&model)
-                    .map(Arc::new)
-                    .map_err(|_| SessionRuntimeError::Persistence)
-            })
-            .transpose()?
+    // Malformed or foreign-version state is treated as absent and cleared
+    // below rather than failing the run: both columns are advisory caches of
+    // a measurement, never authoritative history.
+    let decode_basis = |encoded: &str| {
+        serde_json::from_str::<ContextOccupancyBasis>(encoded)
+            .ok()
+            .filter(|basis| basis.version == CONTEXT_OCCUPANCY_BASIS_VERSION)
+    };
+    // Overflow evidence survives assembly-time pruning: a shrunken request
+    // might fit, but an uncertain repeat must compact rather than poll.
+    let context_overflow_basis = if kind == RunKind::Prompt {
+        pending_context_overflow_basis_json
+            .as_deref()
+            .and_then(decode_basis)
     } else {
         None
     };
+    // Occupancy reuse does not: pruning breaks the append-only transcript
+    // the byte-delta seed depends on.
+    let context_occupancy = if kind == RunKind::Prompt && !context_rewritten {
+        context_tokens
+            .zip(context_occupancy_json.as_deref())
+            .and_then(|(context_tokens, encoded)| {
+                decode_basis(encoded).map(|basis| ContextOccupancy {
+                    context_tokens,
+                    basis,
+                })
+            })
+    } else {
+        None
+    };
+    let clear_context_occupancy = kind == RunKind::Prompt
+        && !context_rewritten
+        && context_occupancy_json.is_some()
+        && context_occupancy.is_none();
+    let clear_context_overflow = kind == RunKind::Prompt
+        && pending_context_overflow_basis_json.is_some()
+        && context_overflow_basis.is_none();
+    if clear_context_occupancy || clear_context_overflow {
+        transaction
+            .execute(
+                "UPDATE sessions
+                 SET context_occupancy_json = CASE WHEN ?2 THEN NULL ELSE context_occupancy_json END,
+                     pending_context_overflow_basis_json = CASE
+                         WHEN ?3 THEN NULL ELSE pending_context_overflow_basis_json
+                     END
+                 WHERE id = ?1",
+                params![
+                    session_id.to_string(),
+                    clear_context_occupancy,
+                    clear_context_overflow,
+                ],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1515,10 +1936,13 @@ fn reserve_next_run_recoverable(
         child: children,
         user_initiated,
         literal_slash,
+        session_model: model.clone(),
         model,
         messages,
         context_compaction_attempted,
-        context_overflow_model,
+        context_overflow_basis,
+        context_occupancy,
+        limits,
     }))
 }
 
@@ -1729,10 +2153,13 @@ fn start_auto_compaction(
             child: original.child,
             user_initiated: false,
             literal_slash: false,
+            session_model: original.session_model.clone(),
             model: original.model.clone(),
             messages: Vec::new(),
             context_compaction_attempted: true,
-            context_overflow_model: None,
+            context_overflow_basis: None,
+            context_occupancy: None,
+            limits: RunLimits::default(),
         },
         started,
     )))
@@ -1987,6 +2414,7 @@ fn persist_model_turn(
         calls,
         turn_message,
         context_tokens,
+        occupancy_basis,
         usage,
         estimated_cost_usd_nanos,
         accounting,
@@ -2133,6 +2561,11 @@ fn persist_model_turn(
         .as_ref()
         .and_then(|accounting| accounting.estimated_cost_usd_nanos)
         .and_then(|cost| i64::try_from(cost).ok());
+    let occupancy_basis_json = occupancy_basis
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
     // Persist-before-publish like every other event. A missing provider value
     // clears the previous turn's audit value instead of leaving stale data.
     transaction
@@ -2168,12 +2601,17 @@ fn persist_model_turn(
     let session_context_updated = if claimed.kind == RunKind::Prompt {
         transaction
             .execute(
-                "UPDATE sessions SET context_tokens = ?2
-                 WHERE id = ?1 AND model IS ?3",
+                "UPDATE sessions
+                 SET context_tokens = ?2, context_occupancy_json = ?4
+                 WHERE id = ?1 AND model IS ?3
+                       AND max_output_tokens IS ?5 AND organization IS ?6",
                 params![
                     claimed.session_id.to_string(),
                     context_tokens,
-                    &claimed.model.model,
+                    &claimed.session_model.model,
+                    occupancy_basis_json,
+                    claimed.session_model.max_output_tokens,
+                    &claimed.session_model.organization,
                 ],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?
@@ -3082,15 +3520,13 @@ fn complete_compaction(
     // A cancel that raced the summarizer's completion wins: the run settles
     // cancelled and no marker is committed.
     let mut outcome = cancellation_wins(&transaction, claimed.run_id, RunOutcome::Completed)?;
-    let replacement_bytes = COMPACTION_SUMMARY_PREAMBLE
-        .len()
-        .saturating_add(2)
-        .saturating_add(summary.len());
-    if matches!(outcome, RunOutcome::Completed) && replacement_bytes > MAX_CONTEXT_BYTES {
+    if matches!(outcome, RunOutcome::Completed)
+        && let Err(reason) = validate_compaction_summary(&summary)
+    {
         outcome = RunOutcome::Failed {
             failure: RunFailure {
                 kind: RunFailureKind::Policy,
-                message: "compaction summary exceeds the 4 MiB session context limit".to_owned(),
+                message: reason,
             },
         };
     }
@@ -3110,6 +3546,10 @@ fn complete_compaction(
                 |row| row.get(0),
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
+        // Insert the candidate marker, then measure the assembly it
+        // produces. A summary that does not shrink the assembly is rejected
+        // and the row removed within this transaction, so the prior usable
+        // compaction stays authoritative.
         transaction
             .execute(
                 "INSERT INTO session_compactions(
@@ -3126,8 +3566,51 @@ fn complete_compaction(
                 ],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
-        // With the marker in place, assembly is the summary alone.
         let after_bytes = assembled_context_bytes(&transaction, claimed.session_id)?;
+        // Shrinkage is the point of compaction. A short transcript is the one
+        // exception: the structured summary's fixed framing can exceed it,
+        // yet compacting it is still correct when the provider reported
+        // overflow. Above that floor a summary that fails to shrink the
+        // assembly is rejected outright.
+        let shrinkage_required = before_bytes > COMPACTION_SHRINKAGE_FLOOR_BYTES;
+        if shrinkage_required && after_bytes >= before_bytes {
+            transaction
+                .execute(
+                    "DELETE FROM session_compactions WHERE session_id = ?1 AND run_id = ?2",
+                    params![claimed.session_id.to_string(), claimed.run_id.to_string()],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let failed = RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Policy,
+                    message: format!(
+                        "compaction summary did not shrink the assembled context \
+                         ({after_bytes} bytes after, {before_bytes} before); the prior \
+                         compaction, if any, remains in effect"
+                    ),
+                },
+            };
+            events.push(finalize_run(
+                &transaction,
+                store_id,
+                claimed,
+                failed,
+                accounting,
+            )?);
+            append_parent_session_update(
+                &transaction,
+                store_id,
+                claimed.workspace_id,
+                claimed.session_id,
+                claimed.command_id,
+                now_ms(),
+                &mut events,
+            )?;
+            transaction
+                .commit()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            return Ok(events);
+        }
         transaction
             .execute(
                 "UPDATE session_compactions SET after_bytes = ?3
@@ -3158,7 +3641,8 @@ fn complete_compaction(
             .execute(
                 "UPDATE sessions
                  SET context_tokens = NULL,
-                     pending_context_overflow_model_json = NULL
+                     context_occupancy_json = NULL,
+                     pending_context_overflow_basis_json = NULL
                  WHERE id = ?1",
                 [claimed.session_id.to_string()],
             )
@@ -3250,7 +3734,7 @@ fn finalize_run(
     let saw_turn = accounting
         .as_ref()
         .is_some_and(|accounting| accounting.saw_turn);
-    let pending_context_overflow_model = if claimed.kind == RunKind::Prompt
+    let pending_context_overflow_basis = if claimed.kind == RunKind::Prompt
         && matches!(
             &outcome,
             RunOutcome::Failed {
@@ -3260,16 +3744,11 @@ fn finalize_run(
                 }
             }
         ) {
-        Some(
-            transaction
-                .query_row(
-                    "SELECT resolved_model_json FROM runs WHERE id = ?1",
-                    [claimed.run_id.to_string()],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .map_err(|_| SessionRuntimeError::Persistence)?
-                .ok_or(SessionRuntimeError::Persistence)?,
-        )
+        accounting
+            .as_ref()
+            .map(|accounting| serde_json::to_string(&accounting.request_basis))
+            .transpose()
+            .map_err(|_| SessionRuntimeError::Persistence)?
     } else {
         None
     };
@@ -3330,8 +3809,8 @@ fn finalize_run(
                       THEN ?8
                       ELSE context_tokens
                   END,
-                  pending_context_overflow_model_json = COALESCE(
-                      ?10, pending_context_overflow_model_json
+                  pending_context_overflow_basis_json = COALESCE(
+                      ?10, pending_context_overflow_basis_json
                   ),
                   updated_at_ms = ?2
              WHERE id = ?1 AND active_run_id = ?3",
@@ -3345,7 +3824,7 @@ fn finalize_run(
                 saw_turn,
                 reported_context_tokens,
                 &claimed.model.model,
-                pending_context_overflow_model,
+                pending_context_overflow_basis,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3686,10 +4165,13 @@ fn settle_panicked_execution(
                 child: original.child,
                 user_initiated: false,
                 literal_slash: false,
+                session_model: original.session_model.clone(),
                 model: original.model.clone(),
                 messages: Vec::new(),
                 context_compaction_attempted: true,
-                context_overflow_model: None,
+                context_overflow_basis: None,
+                context_occupancy: None,
+                limits: RunLimits::default(),
             };
             events.push(complete_run_in_transaction(
                 &transaction,
@@ -4037,10 +4519,13 @@ fn recover_interrupted_runs(
             child: false,
             user_initiated: false,
             literal_slash: false,
+            session_model: ModelSelection::default(),
             model: ModelSelection::default(),
             messages: Vec::new(),
             context_compaction_attempted: false,
-            context_overflow_model: None,
+            context_overflow_basis: None,
+            context_occupancy: None,
+            limits: RunLimits::default(),
         };
         let event =
             complete_run_in_transaction(&transaction, store_id, &claimed, RunOutcome::Interrupted)?;
@@ -4138,6 +4623,9 @@ fn interrupt_active_tool_calls(
         RunOutcome::Completed => return Err(SessionRuntimeError::Persistence),
         RunOutcome::Cancelled => "Tool execution did not start before the run was cancelled.",
         RunOutcome::Interrupted => "Tool execution did not start before the run was interrupted.",
+        RunOutcome::BudgetExhausted { .. } => {
+            "Tool execution did not start before the run exhausted its budget."
+        }
         RunOutcome::Failed { .. } => "Tool execution did not start before the run failed.",
     };
     for (id, execution_started) in ids {
@@ -4199,6 +4687,7 @@ fn outcome_states(outcome: &RunOutcome) -> (&'static str, &'static str) {
         RunOutcome::Completed => ("completed", "complete"),
         RunOutcome::Cancelled => ("cancelled", "cancelled"),
         RunOutcome::Interrupted => ("interrupted", "interrupted"),
+        RunOutcome::BudgetExhausted { .. } => ("budget_exhausted", "interrupted"),
         RunOutcome::Failed { .. } => ("failed", "failed"),
     }
 }
@@ -4796,6 +5285,15 @@ fn load_model_context(
     session_id: SessionId,
     through_ordinal: u64,
 ) -> Result<Vec<Message>, SessionRuntimeError> {
+    load_model_context_with_rewrite_status(transaction, session_id, through_ordinal)
+        .map(|(context, _)| context)
+}
+
+fn load_model_context_with_rewrite_status(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    through_ordinal: u64,
+) -> Result<(Vec<Message>, bool), SessionRuntimeError> {
     let compaction = latest_compaction(transaction, session_id)?;
     let cutoff_ordinal = compaction
         .as_ref()
@@ -4877,8 +5375,8 @@ fn load_model_context(
             }
         }
     }
-    prune_stale_tool_results(&mut context);
-    Ok(context)
+    let context_rewritten = prune_stale_tool_results(&mut context);
+    Ok((context, context_rewritten))
 }
 
 fn append_legacy_run_messages(
@@ -4918,6 +5416,10 @@ fn runtime_notice(outcome: &RunOutcome) -> Option<String> {
         RunOutcome::Completed => return None,
         RunOutcome::Cancelled => "The previous run was cancelled.".to_owned(),
         RunOutcome::Interrupted => "The previous run was interrupted before completion.".to_owned(),
+        RunOutcome::BudgetExhausted { exhaustion } => format!(
+            "The previous run stopped when its budget ran out: {}",
+            exhaustion.message
+        ),
         RunOutcome::Failed { failure } => format!("The previous run failed: {}", failure.message),
     };
     Some(format!(
@@ -4958,7 +5460,7 @@ fn latest_compaction(
 /// not. The window keeps the last [`CONTEXT_PRUNE_KEEP_TURNS`] model turns
 /// (assistant messages) verbatim. `is_error` is preserved so an error result
 /// stays an error stub.
-fn prune_stale_tool_results(context: &mut [Message]) {
+fn prune_stale_tool_results(context: &mut [Message]) -> bool {
     let assistant_positions = context
         .iter()
         .enumerate()
@@ -4970,7 +5472,7 @@ fn prune_stale_tool_results(context: &mut [Message]) {
         .checked_sub(CONTEXT_PRUNE_KEEP_TURNS)
         .and_then(|index| assistant_positions.get(index))
     else {
-        return;
+        return false;
     };
     // Map provider call ids to the tool that produced them; the ToolResult
     // block alone does not name its tool.
@@ -4987,6 +5489,7 @@ fn prune_stale_tool_results(context: &mut [Message]) {
             }
         }
     }
+    let mut rewritten = false;
     for message in &mut context[..window_start] {
         let needs_pruning = message.content().iter().any(|block| {
             matches!(block, ContentBlock::ToolResult { call_id, content, .. }
@@ -5015,7 +5518,9 @@ fn prune_stale_tool_results(context: &mut [Message]) {
             })
             .collect();
         *message = Message::new(message.role(), content);
+        rewritten = true;
     }
+    rewritten
 }
 
 /// The stub replacing a prunable read-only result, or `None` when the result
@@ -5060,6 +5565,138 @@ fn context_bytes(messages: &[Message]) -> usize {
             } => call_id.len() + content.len(),
         })
         .fold(0_usize, usize::saturating_add)
+}
+
+/// Searches the session's complete durable transcript for a case-insensitive
+/// literal, in transcript order: each user prompt, then that run's assistant
+/// turns and tool results. Compaction markers and assembly-time pruning are
+/// deliberately ignored — this is the recall path that makes aggressive
+/// compaction safe. Each match yields one bounded excerpt with a citation
+/// naming its durable coordinates; at most `limit` matches are returned. The
+/// calling run is excluded: its own `search_history` arguments would
+/// otherwise match every query.
+fn search_session_history(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    calling_run: RunId,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<HistoryMatch>, SessionRuntimeError> {
+    let needle = query.to_lowercase();
+    let mut matches = Vec::new();
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, ordinal, run_id FROM messages
+             WHERE session_id = ?1 AND role = 'user' AND run_id != ?2
+               AND state IN ('complete', 'cancelled', 'failed', 'interrupted')
+             ORDER BY ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let prompts = statement
+        .query_map(
+            params![session_id.to_string(), calling_run.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+
+    let record = |matches: &mut Vec<HistoryMatch>, citation: String, text: &str| {
+        if matches.len() >= limit {
+            return;
+        }
+        let lowered = text.to_lowercase();
+        if let Some(excerpt) = excerpt_around(text, &lowered, &needle) {
+            matches.push(HistoryMatch { citation, excerpt });
+        }
+    };
+
+    for (message_id, ordinal, run_id) in prompts {
+        if matches.len() >= limit {
+            break;
+        }
+        let prompt = load_message(transaction, parse_id(&message_id)?)?;
+        record(
+            &mut matches,
+            format!("user message #{ordinal}"),
+            &prompt.output,
+        );
+        let run_id: RunId = parse_id(&run_id)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT turn_ordinal, assistant_content_json FROM model_turns
+                 WHERE run_id = ?1 ORDER BY turn_ordinal",
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let turns = statement
+            .query_map([run_id.to_string()], |row| {
+                Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        drop(statement);
+        for (turn_ordinal, content_json) in turns {
+            if matches.len() >= limit {
+                break;
+            }
+            let content = serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            for block in content {
+                match ContentBlock::from(block) {
+                    ContentBlock::Text { text } => record(
+                        &mut matches,
+                        format!("assistant, user message #{ordinal} turn {turn_ordinal}"),
+                        &text,
+                    ),
+                    ContentBlock::ToolCall {
+                        name, arguments, ..
+                    } => record(
+                        &mut matches,
+                        format!("tool call {name}, user message #{ordinal} turn {turn_ordinal}"),
+                        &arguments.to_string(),
+                    ),
+                    ContentBlock::ToolResult { .. } => {}
+                }
+            }
+            let mut statement = transaction
+                .prepare(
+                    "SELECT name, call_ordinal, result FROM tool_calls
+                     WHERE run_id = ?1 AND turn_ordinal = ?2 AND result IS NOT NULL
+                     ORDER BY call_ordinal",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let results = statement
+                .query_map(params![run_id.to_string(), turn_ordinal], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u16>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            drop(statement);
+            for (name, call_ordinal, result) in results {
+                record(
+                    &mut matches,
+                    format!(
+                        "{name} result, user message #{ordinal} turn {turn_ordinal} call {call_ordinal}"
+                    ),
+                    &result,
+                );
+            }
+        }
+    }
+    Ok(matches)
 }
 
 /// Measures the session's context as the next run would assemble it —
@@ -5278,7 +5915,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
         .query_row(
             "SELECT session_id, status, outcome_json, prompt_identity_json,
                     resolved_model_json, usage_json, context_tokens,
-                    estimated_cost_usd_nanos
+                    estimated_cost_usd_nanos, limits_json
              FROM runs WHERE id = ?1",
             [run_id.to_string()],
             |row| {
@@ -5291,6 +5928,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<u64>>(6)?,
                     row.get::<_, Option<u64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
@@ -5305,6 +5943,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                 usage,
                 context_tokens,
                 cost,
+                limits,
             )| {
                 Ok(RunSnapshot {
                     id: run_id,
@@ -5334,12 +5973,16 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                         .map_err(|_| SessionRuntimeError::Persistence)?,
                     context_tokens,
                     estimated_cost_usd_nanos: cost,
+                    limits: {
+                        let limits = parse_run_limits(limits.as_deref())?;
+                        (!limits.is_empty()).then(|| Box::new(limits))
+                    },
                 })
             },
         )
 }
 
-fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
+pub(crate) fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
     let total_input = usage
         .input_tokens
         .checked_add(usage.cache_read_input_tokens)?
@@ -5574,6 +6217,7 @@ fn parse_run_status(value: &str) -> Result<RunStatus, SessionRuntimeError> {
         "cancelled" => Ok(RunStatus::Cancelled),
         "failed" => Ok(RunStatus::Failed),
         "interrupted" => Ok(RunStatus::Interrupted),
+        "budget_exhausted" => Ok(RunStatus::BudgetExhausted),
         _ => Err(SessionRuntimeError::Persistence),
     }
 }
@@ -5730,6 +6374,7 @@ mod tests {
 
     use async_stream::stream as async_stream;
     use futures_util::{StreamExt, stream};
+    use qq_protocol::{BudgetExhaustion, BudgetLimitKind};
     use qq_provider::{ModelRequest, Provider, ProviderStream};
     use tempfile::TempDir;
 
@@ -5773,7 +6418,11 @@ mod tests {
         pricing: Option<ModelPricing>,
     ) -> ResolvedModel {
         ResolvedModel {
-            version: qq_protocol::ResolvedModelVersion::new(1).unwrap(),
+            version: qq_protocol::ResolvedModelVersion::new(2).unwrap(),
+            request_shape: Some(qq_protocol::ProviderRequestShapeIdentity {
+                version: qq_protocol::ProviderRequestShapeVersion::new(1).unwrap(),
+                digest: ContentHash::from_bytes([1; 32]),
+            }),
             route: route.into(),
             provider_model: provider_model.into(),
             organization: None,
@@ -5791,6 +6440,281 @@ mod tests {
                 cache_write_usage: false,
             },
         }
+    }
+
+    fn test_static_prefix(system: u8, tools: Option<u8>) -> PreparedStaticPrefix {
+        PreparedStaticPrefix::new(
+            ContentHash::from_bytes([system; 32]),
+            tools.map(|tools| ContentHash::from_bytes([tools; 32])),
+        )
+    }
+
+    #[test]
+    fn occupancy_reuse_requires_exact_shape_prefix_and_monotonic_request_bytes() {
+        let model = test_resolved_model("test/model", "wire-model", 256, None);
+        let shape = context_request_shape(&model);
+        let prefix = test_static_prefix(2, Some(3));
+        let basis = context_occupancy_basis(shape.digest, prefix, 1_000);
+        let occupancy = ContextOccupancy {
+            context_tokens: 100,
+            basis,
+        };
+        assert_eq!(
+            compatible_context_tokens(occupancy, shape, prefix, 1_024),
+            Some(124)
+        );
+        assert_eq!(
+            compatible_context_tokens(occupancy, shape, prefix, 999),
+            None
+        );
+        assert_eq!(
+            compatible_context_tokens(occupancy, shape, test_static_prefix(4, Some(3)), 1_024),
+            None
+        );
+        assert_eq!(
+            compatible_context_tokens(occupancy, shape, test_static_prefix(2, None), 1_024),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_provider_identity_repeats_overflow_but_never_seeds_occupancy() {
+        let mut model = test_resolved_model("test/model", "wire-model", 256, None);
+        model.request_shape = None;
+        let shape = context_request_shape(&model);
+        assert!(!shape.provider_identity);
+        let prefix = test_static_prefix(2, Some(3));
+        let basis = context_occupancy_basis(shape.digest, prefix, 1_000);
+
+        // Overflow suppression: the same route-level shape and prefix repeat
+        // the known overflow even when pruning shrank the request.
+        assert!(repeats_context_basis(basis, shape, prefix));
+        assert!(repeats_context_basis(
+            context_occupancy_basis(shape.digest, prefix, 5_000),
+            shape,
+            prefix
+        ));
+        assert!(!repeats_context_basis(
+            basis,
+            shape,
+            test_static_prefix(4, Some(3))
+        ));
+        let mut other_route = model.clone();
+        other_route.route = "other/model".to_owned();
+        assert!(!repeats_context_basis(
+            basis,
+            context_request_shape(&other_route),
+            prefix
+        ));
+
+        // Reuse: a route-level identity cannot prove tokenization shape.
+        let occupancy = ContextOccupancy {
+            context_tokens: 100,
+            basis,
+        };
+        assert_eq!(
+            compatible_context_tokens(occupancy, shape, prefix, 1_024),
+            None
+        );
+
+        // A known identity for the same route lives in a different digest
+        // domain: neither direction can match the other.
+        let exact =
+            context_request_shape(&test_resolved_model("test/model", "wire-model", 256, None));
+        assert!(exact.provider_identity);
+        assert_ne!(exact.digest, shape.digest);
+        assert!(!repeats_context_basis(basis, exact, prefix));
+    }
+
+    #[test]
+    fn occupancy_shape_excludes_pricing_but_invalidates_wire_affecting_changes() {
+        let base = test_resolved_model("test/model", "wire-model", 256, None);
+        let base_shape = context_request_shape(&base);
+        assert!(base_shape.provider_identity);
+        let mut priced = base.clone();
+        priced.pricing = Some(ModelPricing {
+            input_usd_nanos_per_token: 7,
+            output_usd_nanos_per_token: 11,
+            cache_read_usd_nanos_per_token: None,
+            cache_write_usd_nanos_per_token: None,
+            context_tier: None,
+            provenance: "refreshed catalog".to_owned(),
+        });
+        assert_eq!(context_request_shape(&priced), base_shape);
+
+        let mut variants = Vec::new();
+        let mut changed = base.clone();
+        changed.request_shape.as_mut().unwrap().digest = ContentHash::from_bytes([9; 32]);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.route = "other/model".to_owned();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.provider_model = "other-wire-model".to_owned();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.organization = Some("other-org".to_owned());
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.credential_profile = Some("other-profile".to_owned());
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.max_output_tokens += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.context_window = Some(32_768);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.generation.reasoning_effort = CapabilitySupport::Native;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.prompt_cache.control = CapabilitySupport::Native;
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(context_request_shape(&changed).digest, base_shape.digest);
+        }
+        // Historical and foreign-version identities degrade to the
+        // route-level fallback instead of vanishing.
+        let mut historical = base.clone();
+        historical.version = qq_protocol::ResolvedModelVersion::new(1).unwrap();
+        let historical_shape = context_request_shape(&historical);
+        assert!(!historical_shape.provider_identity);
+        assert_ne!(historical_shape.digest, base_shape.digest);
+        let mut future_identity = base;
+        future_identity.request_shape.as_mut().unwrap().version =
+            qq_protocol::ProviderRequestShapeVersion::new(2).unwrap();
+        let future_shape = context_request_shape(&future_identity);
+        assert!(!future_shape.provider_identity);
+        assert_eq!(future_shape.digest, historical_shape.digest);
+    }
+
+    #[tokio::test]
+    async fn compatible_occupancy_seeds_the_first_turn_after_restart_and_pricing_refresh() {
+        struct OccupancyLoader {
+            calls: Arc<AtomicUsize>,
+            pricing: Arc<StdMutex<Option<ModelPricing>>>,
+        }
+
+        impl RuntimeLoader for OccupancyLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let calls = Arc::clone(&self.calls);
+                let pricing = self.pricing.lock().unwrap().clone();
+                Box::pin(async move {
+                    struct OccupancyProvider(Arc<AtomicUsize>);
+
+                    impl Provider for OccupancyProvider {
+                        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                            let call = self.0.fetch_add(1, Ordering::SeqCst);
+                            let text = if call == 0 {
+                                "x".repeat(190_000)
+                            } else {
+                                "done".to_owned()
+                            };
+                            Box::pin(stream::iter([
+                                Ok(qq_provider::ProviderEvent::OutputTextDelta { text }),
+                                Ok(qq_provider::ProviderEvent::Completed {
+                                    usage: Some(qq_provider::ProviderUsage {
+                                        input_tokens: if call == 0 { 1_000 } else { 191_000 },
+                                        cache_read_input_tokens: 0,
+                                        cache_write_input_tokens: 0,
+                                        output_tokens: 1,
+                                    }),
+                                }),
+                            ]))
+                        }
+                    }
+
+                    Runtime::new(OccupancyProvider(calls), "test-model", 1)
+                        .map(|runtime| runtime.with_context_window(Some(200_000)))
+                        .map(|runtime| {
+                            let mut loaded = loaded_runtime(runtime, pricing);
+                            Arc::get_mut(&mut loaded.resolved_model)
+                                .unwrap()
+                                .context_window = Some(200_000);
+                            loaded
+                        })
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pricing = Arc::new(StdMutex::new(Some(ModelPricing {
+            input_usd_nanos_per_token: 1,
+            output_usd_nanos_per_token: 2,
+            cache_read_usd_nanos_per_token: None,
+            cache_write_usd_nanos_per_token: None,
+            context_tier: None,
+            provenance: "first catalog".to_owned(),
+        })));
+        let loader = Arc::new(OccupancyLoader {
+            calls: Arc::clone(&calls),
+            pricing: Arc::clone(&pricing),
+        });
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            loader.clone(),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        submit_prompt_to(&runtime, session_id, "first").await;
+        let first = collect_through_finished(&mut events).await;
+        let after_first = first.last().unwrap().cursor;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+
+        *pricing.lock().unwrap() = Some(ModelPricing {
+            input_usd_nanos_per_token: 11,
+            output_usd_nanos_per_token: 13,
+            cache_read_usd_nanos_per_token: None,
+            cache_write_usd_nanos_per_token: None,
+            context_tier: None,
+            provenance: "refreshed catalog".to_owned(),
+        });
+        let reopened = SessionRuntime::open(SessionRuntimeOptions::new(database_path), loader)
+            .await
+            .unwrap();
+        let mut events = reopened
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: after_first,
+            })
+            .unwrap();
+        submit_prompt_to(&reopened, session_id, "second").await;
+        let second = collect_through_finished(&mut events).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            second
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+        assert!(second.iter().any(|event| matches!(
+            event.event,
+            SessionEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        )));
+        reopened.shutdown().await.unwrap();
     }
 
     #[test]
@@ -6207,7 +7131,28 @@ mod tests {
     struct ScriptedProvider;
 
     impl Provider for ScriptedProvider {
-        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            // A compaction request ends with the summarization instruction;
+            // answer it with a structurally valid summary so validation
+            // passes, and everything else with "hello".
+            let summarizing = request_texts(&request)
+                .last()
+                .is_some_and(|text| text.starts_with("Summarize this conversation"));
+            if summarizing {
+                return Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: valid_summary("hello"),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed {
+                        usage: Some(qq_provider::ProviderUsage {
+                            input_tokens: 10,
+                            cache_read_input_tokens: 2,
+                            cache_write_input_tokens: 1,
+                            output_tokens: 5,
+                        }),
+                    }),
+                ]));
+            }
             Box::pin(stream::iter([
                 Ok(qq_provider::ProviderEvent::OutputTextDelta {
                     text: "hel".to_owned(),
@@ -6788,11 +7733,14 @@ mod tests {
 
     impl Provider for DelayedProvider {
         fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let summarizing = request_texts(&request)
+                .last()
+                .is_some_and(|text| text.starts_with("Summarize this conversation"));
             self.requests.lock().unwrap().push(request);
             Box::pin(async_stream! {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 yield Ok(qq_provider::ProviderEvent::OutputTextDelta {
-                    text: "answer".to_owned(),
+                    text: if summarizing { valid_summary("answer") } else { "answer".to_owned() },
                 });
                 yield Ok(qq_provider::ProviderEvent::Completed { usage: None });
             })
@@ -6908,7 +7856,18 @@ mod tests {
 
     impl Provider for ScriptedRunProvider {
         fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let summarizing = request_texts(&request)
+                .last()
+                .is_some_and(|text| text.starts_with("Summarize this conversation"));
             self.requests.lock().unwrap().push(request);
+            if summarizing {
+                return Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: valid_summary("done"),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]));
+            }
             let mut turn = self.turn.lock().unwrap();
             let current = *turn;
             *turn += 1;
@@ -7020,6 +7979,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: prompt.to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -7132,6 +8092,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "mutate something".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -7795,6 +8756,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "known overflow".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -8102,6 +9064,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "first run".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -8148,6 +9111,17 @@ mod tests {
                 if *session_id == harness.session_id
                     && model.model.as_deref() == Some("test/model-b")
         ));
+        let connection =
+            Connection::open(harness.directory.path().join("sessions.sqlite3")).unwrap();
+        let stored_basis: Option<String> = connection
+            .query_row(
+                "SELECT context_occupancy_json FROM sessions WHERE id = ?1",
+                [harness.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_basis, None);
+        drop(connection);
         let updated = harness.events.next().await.unwrap().unwrap();
         assert!(matches!(
             &updated.event,
@@ -8194,6 +9168,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "second run".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -8251,6 +9226,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_run_cannot_restore_occupancy_after_same_route_shape_change() {
+        let mut harness = session_management_harness().await;
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SetSessionModel {
+                    session_id: harness.session_id,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: None,
+                        organization: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let updated = harness.events.next().await.unwrap().unwrap();
+        assert!(matches!(updated.event, SessionEvent::SessionUpdated { .. }));
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "first run".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let connection =
+            Connection::open(harness.directory.path().join("sessions.sqlite3")).unwrap();
+        let stored_basis: Option<String> = connection
+            .query_row(
+                "SELECT context_occupancy_json FROM sessions WHERE id = ?1",
+                [harness.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored_basis.is_some());
+        drop(connection);
+
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SetSessionModel {
+                    session_id: harness.session_id,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(512),
+                        organization: Some("changed-organization".to_owned()),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let updated = harness.events.next().await.unwrap().unwrap();
+        assert!(matches!(updated.event, SessionEvent::SessionUpdated { .. }));
+
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            tool_call.id,
+            ApprovalDecision::Deny,
+        )
+        .await
+        .unwrap();
+        let finished = collect_through_finished(&mut harness.events).await;
+        assert!(
+            finished
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::SessionContextUpdated { .. }))
+        );
+
+        let connection =
+            Connection::open(harness.directory.path().join("sessions.sqlite3")).unwrap();
+        let stored_basis: Option<String> = connection
+            .query_row(
+                "SELECT context_occupancy_json FROM sessions WHERE id = ?1",
+                [harness.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_basis, None);
+    }
+
+    #[tokio::test]
     async fn delete_session_is_refused_while_running_then_cascades_completely() {
         let mut harness = session_management_harness().await;
         let queued = harness
@@ -8260,6 +9328,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "do work".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -8425,6 +9494,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: kept,
                     prompt: "keep me".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -8542,7 +9612,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(
             !connection
@@ -8669,7 +9739,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -8737,7 +9807,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         let (display_json, result) = connection
             .query_row(
@@ -8796,7 +9866,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -8861,7 +9931,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -8949,7 +10019,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -9005,7 +10075,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -9049,7 +10119,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         for column in [
             "model_json",
@@ -9116,7 +10186,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -9190,7 +10260,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         let command_id_not_null: bool = connection
             .query_row(
@@ -9229,7 +10299,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -9299,7 +10369,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -9391,7 +10461,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
         let preparing_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -9447,6 +10517,336 @@ mod tests {
     }
 
     #[test]
+    fn version_eighteen_migration_adds_unknown_occupancy_basis_without_losing_the_meter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let mut legacy_model = test_resolved_model("test/model", "test-model", 256, None);
+        legacy_model.version = qq_protocol::ResolvedModelVersion::new(1).unwrap();
+        legacy_model.request_shape = None;
+        let legacy_overflow = serde_json::to_string(&legacy_model).unwrap();
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/v17-occupancy')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                     id, workspace_id, title, status, context_tokens,
+                     pending_context_overflow_model_json,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'Measured', 'idle', 12500, ?3, 1, 1)",
+                params![
+                    session_id.to_string(),
+                    workspace_id.to_string(),
+                    legacy_overflow,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '17' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN context_occupancy_json",
+                [],
+            )
+            .unwrap();
+        if has_column(
+            &connection,
+            "sessions",
+            "pending_context_overflow_basis_json",
+        )
+        .unwrap()
+        {
+            connection
+                .execute(
+                    "ALTER TABLE sessions DROP COLUMN pending_context_overflow_basis_json",
+                    [],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "19"
+        );
+        let occupancy_shape: (String, bool, Option<String>) = connection
+            .query_row(
+                "SELECT type, [notnull], dflt_value
+                 FROM pragma_table_info('sessions')
+                 WHERE name = 'context_occupancy_json'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(occupancy_shape, ("TEXT".to_owned(), false, None));
+        let overflow_basis_shape: (String, bool, Option<String>) = connection
+            .query_row(
+                "SELECT type, [notnull], dflt_value
+                 FROM pragma_table_info('sessions')
+                 WHERE name = 'pending_context_overflow_basis_json'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(overflow_basis_shape, ("TEXT".to_owned(), false, None));
+        let measured: (u64, Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT context_tokens, context_occupancy_json,
+                        pending_context_overflow_basis_json,
+                        pending_context_overflow_model_json
+                 FROM sessions WHERE id = ?1",
+                [session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(measured.0, 12_500);
+        assert_eq!(measured.1, None);
+        assert_eq!(measured.2, None);
+        assert_eq!(
+            serde_json::from_str::<ResolvedModel>(measured.3.as_deref().unwrap()).unwrap(),
+            legacy_model
+        );
+    }
+
+    #[test]
+    fn malformed_version_eighteen_context_basis_schema_is_rejected() {
+        for column in [
+            "context_occupancy_json",
+            "pending_context_overflow_basis_json",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("sessions.sqlite3");
+            let (connection, _) = open_database(&path).unwrap();
+            connection
+                .execute(&format!("ALTER TABLE sessions DROP COLUMN {column}"), [])
+                .unwrap();
+            connection
+                .execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                    [],
+                )
+                .unwrap();
+            drop(connection);
+
+            assert!(matches!(
+                open_database(&path),
+                Err(SessionRuntimeError::Persistence)
+            ));
+        }
+    }
+
+    #[test]
+    fn partially_applied_version_eighteen_migration_completes_atomically() {
+        for missing in [
+            "context_occupancy_json",
+            "pending_context_overflow_basis_json",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("sessions.sqlite3");
+            let (connection, _) = open_database(&path).unwrap();
+            connection
+                .execute(
+                    "UPDATE metadata SET value = '17' WHERE key = 'schema_version'",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(&format!("ALTER TABLE sessions DROP COLUMN {missing}"), [])
+                .unwrap();
+            drop(connection);
+
+            let (connection, _) = open_database(&path).unwrap();
+            assert!(has_column(&connection, "sessions", "context_occupancy_json").unwrap());
+            assert!(
+                has_column(
+                    &connection,
+                    "sessions",
+                    "pending_context_overflow_basis_json"
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "19"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_version_eighteen_validation_rolls_back_schema_and_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '17' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN pending_context_overflow_basis_json",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN context_occupancy_json",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN context_occupancy_json
+                 INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            open_database(&path),
+            Err(SessionRuntimeError::Persistence)
+        ));
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "17"
+        );
+        assert!(
+            !has_column(
+                &connection,
+                "sessions",
+                "pending_context_overflow_basis_json"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn version_nineteen_migration_keeps_historical_runs_unlimited() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let run_id = RunId::generate().unwrap();
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/v18-limits')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'Historical', 'idle', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(
+                     id, session_id, command_id, user_message_id, assistant_message_id,
+                     status, outcome_json, created_at_ms
+                 ) VALUES (?1, ?2, 'cmd', 'user', 'assistant', 'completed',
+                           '{\"type\":\"completed\"}', 1)",
+                params![run_id.to_string(), session_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = '18' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("ALTER TABLE runs DROP COLUMN limits_json", [])
+            .unwrap();
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "19"
+        );
+        let shape: (String, bool, Option<String>) = connection
+            .query_row(
+                "SELECT type, [notnull], dflt_value FROM pragma_table_info('runs')
+                 WHERE name = 'limits_json'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(shape, ("TEXT".to_owned(), false, None));
+        let historical = load_run(&connection, run_id).unwrap();
+        assert_eq!(historical.limits, None);
+        assert_eq!(historical.outcome, Some(RunOutcome::Completed));
+
+        // A malformed shape and a malformed stored row are both persistence
+        // faults, never silently reinterpreted under current defaults.
+        connection
+            .execute(
+                "UPDATE runs SET limits_json = '{not-json' WHERE id = ?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            load_run(&connection, run_id),
+            Err(SessionRuntimeError::Persistence)
+        ));
+        connection
+            .execute("ALTER TABLE runs DROP COLUMN limits_json", [])
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE runs ADD COLUMN limits_json INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            open_database(&path),
+            Err(SessionRuntimeError::Persistence)
+        ));
+    }
+
+    #[test]
     fn partially_applied_version_seventeen_migration_completes_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sessions.sqlite3");
@@ -9485,7 +10885,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "17"
+            "19"
         );
     }
 
@@ -10257,7 +11657,7 @@ mod tests {
         ];
         let before = context_bytes(&context);
 
-        prune_stale_tool_results(&mut context);
+        assert!(prune_stale_tool_results(&mut context));
 
         let results = context
             .iter()
@@ -10401,6 +11801,7 @@ mod tests {
             SessionCommand::SubmitPrompt {
                 session_id,
                 prompt: "continue".to_owned(),
+                limits: qq_protocol::RunLimits::default(),
             },
             &WorkspaceGrantSeed::default(),
         )
@@ -10506,10 +11907,13 @@ mod tests {
             child: false,
             user_initiated: true,
             literal_slash: false,
+            session_model: ModelSelection::default(),
             model: ModelSelection::default(),
             messages: Vec::new(),
             context_compaction_attempted: false,
-            context_overflow_model: None,
+            context_overflow_basis: None,
+            context_occupancy: None,
+            limits: RunLimits::default(),
         };
         (
             directory,
@@ -10734,12 +12138,141 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "x".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
             .unwrap();
         let claimed = store.claim_next_run(false).await.unwrap().unwrap();
         (directory, store, claimed)
+    }
+
+    #[tokio::test]
+    async fn measured_occupancy_basis_persists_atomically_and_reloads_with_the_reservation() {
+        let (directory, store, claimed) = claimed_store_fixture().await;
+        let model = test_resolved_model("test/model", "test/model", 256, None);
+        let shape = context_request_shape(&model);
+        let static_prefix = test_static_prefix(2, Some(3));
+        let basis = context_occupancy_basis(shape.digest, static_prefix, 1_000);
+        store
+            .persist_model_turn(
+                &claimed,
+                ModelTurnCommit {
+                    turn_ordinal: 1,
+                    message: Message::assistant("measured"),
+                    calls: Vec::new(),
+                    turn_message: None,
+                    context_tokens: Some(100),
+                    occupancy_basis: Some(basis),
+                    usage: Some(usage(100, 1)),
+                    estimated_cost_usd_nanos: None,
+                    accounting: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .finish_run(&claimed, RunOutcome::Completed, None)
+            .await
+            .unwrap();
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: claimed.session_id,
+                    prompt: "continue".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        store.close().await.unwrap();
+        drop(store);
+
+        let reopened = Store::open(database_path).await.unwrap();
+        let reserved = reopened.reserve_next_run(false).await.unwrap().unwrap();
+        let occupancy = reserved
+            .context_occupancy
+            .expect("the next reservation loads occupancy in its existing query");
+        assert_eq!(occupancy.context_tokens, 100);
+        assert_eq!(occupancy.basis, basis);
+        assert_eq!(
+            compatible_context_tokens(occupancy, shape, static_prefix, 1_024),
+            Some(124)
+        );
+        reopened
+            .finish_reserved_run(&reserved, RunOutcome::Cancelled)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_context_bases_are_cleared_while_reserving_instead_of_failing_the_run() {
+        let (directory, store, claimed) = claimed_store_fixture().await;
+        store
+            .finish_run(&claimed, RunOutcome::Completed, None)
+            .await
+            .unwrap();
+        store
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: claimed.session_id,
+                    prompt: "continue".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let session_id = claimed.session_id;
+        store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .execute(
+                        "UPDATE sessions
+                         SET context_tokens = 100,
+                             context_occupancy_json = '{not-json',
+                             pending_context_overflow_basis_json = '{also-not-json'
+                         WHERE id = ?1",
+                        [session_id.to_string()],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        store.close().await.unwrap();
+        drop(store);
+
+        let reopened = Store::open(database_path).await.unwrap();
+        let reserved = reopened.reserve_next_run(false).await.unwrap().unwrap();
+        assert_eq!(reserved.context_occupancy, None);
+        let stored = reopened
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT context_occupancy_json,
+                                pending_context_overflow_basis_json
+                         FROM sessions WHERE id = ?1",
+                        [session_id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, (None, None));
+        reopened
+            .finish_reserved_run(&reserved, RunOutcome::Cancelled)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -10815,6 +12348,7 @@ mod tests {
                         calls: vec![call],
                         turn_message: Some(message_id),
                         context_tokens: None,
+                        occupancy_basis: None,
                         usage: None,
                         estimated_cost_usd_nanos: None,
                         accounting: None,
@@ -10993,6 +12527,7 @@ mod tests {
                             calls: vec![call],
                             turn_message: Some(message_id),
                             context_tokens: None,
+                            occupancy_basis: None,
                             usage: None,
                             estimated_cost_usd_nanos: None,
                             accounting: None,
@@ -11146,6 +12681,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "x".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -11444,6 +12980,15 @@ mod tests {
         .unwrap()
     }
 
+    /// A structurally valid summarizer reply carrying `body` under every
+    /// required section, so validation passes and tests can still grep for it.
+    fn valid_summary(body: &str) -> String {
+        format!(
+            "1. Intent: {body}\n2. Decisions and constraints: {body}\n3. Work state: {body}\n\
+             4. Files touched: {body}\n5. Errors: {body}\n6. User messages: {body}"
+        )
+    }
+
     async fn compact_session(runtime: &SessionRuntime, session_id: SessionId) -> RunId {
         let receipt = runtime
             .command(
@@ -11521,6 +13066,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "do work".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -11612,6 +13158,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "say hello".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -11695,9 +13242,9 @@ mod tests {
         assert!(before_bytes > 0);
         assert_eq!(
             after_bytes,
-            (COMPACTION_SUMMARY_PREAMBLE.len() + 2 + "hello".len()) as u64
+            (COMPACTION_SUMMARY_PREAMBLE.len() + 2 + valid_summary("hello").len()) as u64
         );
-        assert_eq!(summary_excerpt.as_deref(), Some("hello"));
+        assert_eq!(summary_excerpt, Some(valid_summary("hello")));
         assert_eq!(context_tokens, None);
 
         // The transcript is untouched: no new message rows, one more run,
@@ -11718,6 +13265,15 @@ mod tests {
         assert_eq!(focused.summary.context_tokens, None);
         assert_eq!(focused.runs[1].context_tokens, Some(13));
         assert!(focused.summary.estimated_cost_usd_nanos.unwrap() > cost_before);
+        let connection = Connection::open(directory.path().join("sessions.sqlite3")).unwrap();
+        let stored_basis: Option<String> = connection
+            .query_row(
+                "SELECT context_occupancy_json FROM sessions WHERE id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_basis, None);
     }
 
     #[tokio::test]
@@ -11796,6 +13352,12 @@ mod tests {
     enum AutoCompactScript {
         /// Streams the text and completes.
         Text(String),
+        /// Reads `note.txt` on the first turn, then streams the text: seeds a
+        /// prunable read-only result into the transcript.
+        ReadNoteThenText(String),
+        /// Calls `search_history` with the query on the first turn, then
+        /// streams the text.
+        SearchHistoryThenText(String, String),
         /// Fails the model stream with a transport error.
         Fail,
         /// Fails the model stream with a context-window overflow.
@@ -11812,6 +13374,9 @@ mod tests {
         loads: StdMutex<usize>,
         context_window: Option<u32>,
         max_output_tokens: u32,
+        /// Whether the resolved model carries a secret-free provider identity.
+        /// Custom/LiteLLM deployments and dynamic AWS region chains do not.
+        provider_identity: bool,
     }
 
     impl RuntimeLoader for AutoCompactLoader {
@@ -11830,6 +13395,7 @@ mod tests {
             };
             let context_window = self.context_window;
             let max_output_tokens = self.max_output_tokens;
+            let provider_identity = self.provider_identity;
             Box::pin(async move {
                 Runtime::new(provider, "test-model", max_output_tokens)
                     .map(|runtime| runtime.with_context_window(context_window))
@@ -11840,7 +13406,11 @@ mod tests {
                             runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
                             None,
                         );
-                        Arc::make_mut(&mut loaded.resolved_model).context_window = context_window;
+                        let resolved = Arc::make_mut(&mut loaded.resolved_model);
+                        resolved.context_window = context_window;
+                        if !provider_identity {
+                            resolved.request_shape = None;
+                        }
                         loaded
                     })
                     .map_err(|error| RuntimeLoadError {
@@ -11858,12 +13428,66 @@ mod tests {
 
     impl Provider for AutoCompactProvider {
         fn stream(&self, request: ModelRequest) -> ProviderStream {
+            // The turn following this run's own tool call ends with the
+            // tool result; earlier runs' results sit before the new prompt.
+            let already_read = request.messages().last().is_some_and(|message| {
+                message
+                    .content()
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            });
             self.requests.lock().unwrap().push(request);
             match &self.script {
                 AutoCompactScript::Text(text) => Box::pin(stream::iter([
                     Ok(qq_provider::ProviderEvent::OutputTextDelta { text: text.clone() }),
                     Ok(qq_provider::ProviderEvent::Completed { usage: None }),
                 ])),
+                AutoCompactScript::ReadNoteThenText(text) => {
+                    if already_read {
+                        Box::pin(stream::iter([
+                            Ok(qq_provider::ProviderEvent::OutputTextDelta { text: text.clone() }),
+                            Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                        ]))
+                    } else {
+                        Box::pin(stream::iter([
+                            Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                                id: "call_read".to_owned(),
+                                name: "read_file".to_owned(),
+                            }),
+                            Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                                id: "call_read".to_owned(),
+                                json: r#"{"path":"note.txt"}"#.to_owned(),
+                            }),
+                            Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                                id: "call_read".to_owned(),
+                            }),
+                            Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                        ]))
+                    }
+                }
+                AutoCompactScript::SearchHistoryThenText(query, text) => {
+                    if already_read {
+                        Box::pin(stream::iter([
+                            Ok(qq_provider::ProviderEvent::OutputTextDelta { text: text.clone() }),
+                            Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                        ]))
+                    } else {
+                        Box::pin(stream::iter([
+                            Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                                id: "call_history".to_owned(),
+                                name: crate::runtime::SEARCH_HISTORY_TOOL.to_owned(),
+                            }),
+                            Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                                id: "call_history".to_owned(),
+                                json: serde_json::json!({ "query": query, "limit": 2 }).to_string(),
+                            }),
+                            Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                                id: "call_history".to_owned(),
+                            }),
+                            Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                        ]))
+                    }
+                }
                 AutoCompactScript::Fail => Box::pin(stream::iter([Err(
                     qq_provider::ProviderError::Transport("scripted model failure".to_owned()),
                 )])),
@@ -11905,17 +13529,23 @@ mod tests {
         context_window: Option<u32>,
         max_output_tokens: u32,
     ) -> AutoCompactHarness {
+        auto_compact_harness_with_loader(AutoCompactLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            scripts,
+            loads: StdMutex::new(0),
+            context_window,
+            max_output_tokens,
+            provider_identity: true,
+        })
+        .await
+    }
+
+    async fn auto_compact_harness_with_loader(loader: AutoCompactLoader) -> AutoCompactHarness {
         let directory = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let requests = Arc::clone(&loader.requests);
         let runtime = SessionRuntime::open(
             SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
-            Arc::new(AutoCompactLoader {
-                requests: Arc::clone(&requests),
-                scripts,
-                loads: StdMutex::new(0),
-                context_window,
-                max_output_tokens,
-            }),
+            Arc::new(loader),
         )
         .await
         .unwrap();
@@ -11950,7 +13580,11 @@ mod tests {
         let queued = runtime
             .command(
                 CommandId::generate().unwrap(),
-                SessionCommand::SubmitPrompt { session_id, prompt },
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt,
+                    limits: qq_protocol::RunLimits::default(),
+                },
             )
             .await
             .unwrap();
@@ -12071,7 +13705,7 @@ mod tests {
     async fn storage_overflow_compacts_before_the_queued_prompt() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::Text(over_threshold_output()),
-            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text(valid_summary("the summary")),
             AutoCompactScript::Text("done".to_owned()),
             AutoCompactScript::Text("done again".to_owned()),
         ])
@@ -12157,7 +13791,7 @@ mod tests {
             i64::try_from(
                 crate::CONTEXT_MESSAGE_FRAMING_BYTES
                     + crate::CONTEXT_BLOCK_FRAMING_BYTES
-                    + "the summary".len() as u64,
+                    + valid_summary("the summary").len() as u64,
             )
             .unwrap()
         );
@@ -12179,7 +13813,7 @@ mod tests {
             let mut harness = auto_compact_harness_with_limits(
                 vec![
                     AutoCompactScript::Text(over_threshold_output()),
-                    AutoCompactScript::Text("the summary".to_owned()),
+                    AutoCompactScript::Text(valid_summary("the summary")),
                     AutoCompactScript::Text("done".to_owned()),
                 ],
                 None,
@@ -12246,7 +13880,7 @@ mod tests {
     async fn overloaded_reserved_reload_retries_after_auto_compaction() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::Text(over_threshold_output()),
-            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text(valid_summary("the summary")),
             AutoCompactScript::Text("done".to_owned()),
         ])
         .await;
@@ -12262,6 +13896,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "y".repeat(MAX_PROMPT_BYTES),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -12294,7 +13929,7 @@ mod tests {
     async fn permanent_reserved_reload_failure_settles_only_that_prompt() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::Text(over_threshold_output()),
-            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text(valid_summary("the summary")),
             AutoCompactScript::Text("next completed".to_owned()),
         ])
         .await;
@@ -12310,6 +13945,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "y".repeat(MAX_PROMPT_BYTES),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -12358,7 +13994,7 @@ mod tests {
         // hitting the same wall.
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::ContextOverflow,
-            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text(valid_summary("the summary")),
             AutoCompactScript::Text("recovered".to_owned()),
         ])
         .await;
@@ -12408,11 +14044,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_provider_identity_still_compacts_a_known_overflow_before_the_retry() {
+        // Custom/LiteLLM deployments and dynamic AWS region chains resolve
+        // without a request-shape identity. That disables occupancy reuse,
+        // but a provider-reported overflow must still compact exactly once
+        // instead of re-sending the same request every retry.
+        let mut harness = auto_compact_harness_with_loader(AutoCompactLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            scripts: vec![
+                AutoCompactScript::ContextOverflow,
+                AutoCompactScript::Text(valid_summary("the summary")),
+                AutoCompactScript::Text("recovered".to_owned()),
+            ],
+            loads: StdMutex::new(0),
+            context_window: None,
+            max_output_tokens: 256,
+            provider_identity: false,
+        })
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "big ask".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(first)).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed { failure },
+                ..
+            } if *run_id == first && failure.kind == RunFailureKind::ProviderContextExceeded
+        )));
+
+        let second = queue_prompt(&harness.runtime, harness.session_id, "retry".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        let compacted = position_of(&observed, |event| {
+            matches!(event, SessionEvent::SessionCompacted { .. })
+        });
+        let prompt_started = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == second),
+        );
+        assert!(compacted < prompt_started);
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { run_id, outcome: RunOutcome::Completed, .. }
+                if *run_id == second
+        )));
+        assert_eq!(
+            harness.requests.lock().unwrap().len(),
+            3,
+            "overflow, compaction, retry: the known overflow is never re-sent"
+        );
+
+        // Reuse stays disabled: no occupancy basis is persisted for an
+        // unknown identity even after a measured turn.
+        let connection = Connection::open(harness.workspace_path.join("sessions.sqlite3")).unwrap();
+        let (occupancy, pending): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT context_occupancy_json, pending_context_overflow_basis_json
+                 FROM sessions WHERE id = ?1",
+                [harness.session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(occupancy, None);
+        assert_eq!(pending, None);
+    }
+
+    #[tokio::test]
+    async fn pruned_history_still_compacts_a_known_overflow_before_the_retry() {
+        // Once the transcript holds more than CONTEXT_PRUNE_KEEP_TURNS
+        // assistant turns, assembly stubs old read-only results. That
+        // rewrite makes byte-monotonic occupancy reuse impossible, but the
+        // pruned request is still an uncertain repeat of a provider-reported
+        // overflow and must compact rather than poll.
+        let mut scripts = vec![AutoCompactScript::ReadNoteThenText("read it".to_owned())];
+        scripts.extend(
+            (0..CONTEXT_PRUNE_KEEP_TURNS).map(|_| AutoCompactScript::Text("ok".to_owned())),
+        );
+        scripts.extend([
+            AutoCompactScript::ContextOverflow,
+            AutoCompactScript::Text(valid_summary("the summary")),
+            AutoCompactScript::Text("recovered".to_owned()),
+        ]);
+        let mut harness = auto_compact_harness(scripts).await;
+        std::fs::write(harness.workspace_path.join("note.txt"), "n".repeat(600)).unwrap();
+
+        for prompt in std::iter::once("read the note")
+            .chain(std::iter::repeat_n("more", CONTEXT_PRUNE_KEEP_TURNS))
+        {
+            let run = queue_prompt(&harness.runtime, harness.session_id, prompt.to_owned()).await;
+            collect_until(&mut harness.events, finished_for(run)).await;
+        }
+        let overflow =
+            queue_prompt(&harness.runtime, harness.session_id, "big ask".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(overflow)).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed { failure },
+                ..
+            } if *run_id == overflow && failure.kind == RunFailureKind::ProviderContextExceeded
+        )));
+        let requests_before_retry = harness.requests.lock().unwrap().len();
+        {
+            let requests = harness.requests.lock().unwrap();
+            let overflowing = requests.last().unwrap();
+            assert!(
+                overflowing
+                    .messages()
+                    .iter()
+                    .flat_map(Message::content)
+                    .any(|block| matches!(
+                        block,
+                        ContentBlock::ToolResult { content, .. } if content.starts_with("[pruned")
+                    )),
+                "the overflowing request must already carry pruned history"
+            );
+        }
+
+        let retry = queue_prompt(&harness.runtime, harness.session_id, "retry".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(retry)).await;
+        let compacted = position_of(&observed, |event| {
+            matches!(event, SessionEvent::SessionCompacted { .. })
+        });
+        let prompt_started = position_of(
+            &observed,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == retry),
+        );
+        assert!(compacted < prompt_started);
+        assert_eq!(
+            harness.requests.lock().unwrap().len(),
+            requests_before_retry + 2,
+            "compaction then the retry: the known overflow is never re-sent"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_manual_compaction_does_not_mask_provider_overflow_evidence() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::ContextOverflow,
             AutoCompactScript::Fail,
-            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text(valid_summary("the summary")),
             AutoCompactScript::Text("recovered".to_owned()),
         ])
         .await;
@@ -12451,7 +14223,7 @@ mod tests {
     async fn cancelled_queued_prompt_does_not_mask_provider_overflow_evidence() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::ContextOverflow,
-            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text(valid_summary("the summary")),
             AutoCompactScript::Text("recovered".to_owned()),
         ])
         .await;
@@ -12467,6 +14239,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "cancel this".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -12520,7 +14293,7 @@ mod tests {
         let connection = Connection::open(&database_path).unwrap();
         let pending: Option<String> = connection
             .query_row(
-                "SELECT pending_context_overflow_model_json FROM sessions WHERE id = ?1",
+                "SELECT pending_context_overflow_basis_json FROM sessions WHERE id = ?1",
                 [session_id.to_string()],
                 |row| row.get(0),
             )
@@ -12534,12 +14307,13 @@ mod tests {
             Arc::new(AutoCompactLoader {
                 requests: Arc::clone(&requests),
                 scripts: vec![
-                    AutoCompactScript::Text("the summary".to_owned()),
+                    AutoCompactScript::Text(valid_summary("the summary")),
                     AutoCompactScript::Text("recovered".to_owned()),
                 ],
                 loads: StdMutex::new(0),
                 context_window: None,
                 max_output_tokens: 256,
+                provider_identity: true,
             }),
         )
         .await
@@ -12565,7 +14339,7 @@ mod tests {
         let connection = Connection::open(harness.workspace_path.join("sessions.sqlite3")).unwrap();
         let pending: Option<String> = connection
             .query_row(
-                "SELECT pending_context_overflow_model_json FROM sessions WHERE id = ?1",
+                "SELECT pending_context_overflow_basis_json FROM sessions WHERE id = ?1",
                 [session_id.to_string()],
                 |row| row.get(0),
             )
@@ -12682,7 +14456,7 @@ mod tests {
     async fn exceeding_the_hard_budget_compacts_once_and_the_prompt_proceeds() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::Text("x".repeat(MAX_CONTEXT_BYTES - 100 * 1024)),
-            AutoCompactScript::Text("the summary".to_owned()),
+            AutoCompactScript::Text(valid_summary("the summary")),
             AutoCompactScript::Text("done".to_owned()),
         ])
         .await;
@@ -12718,9 +14492,9 @@ mod tests {
             vec![
                 AutoCompactScript::Text("x".repeat(20 * 1024)),
                 // Pathological summarizer: the summary is as large as the
-                // transcript it replaces, so the retry is still past the model
-                // window.
-                AutoCompactScript::Text("s".repeat(20 * 1024)),
+                // transcript it replaces. Validation rejects it, so no marker
+                // commits and the retry is still past the model window.
+                AutoCompactScript::Text(valid_summary(&"s".repeat(20 * 1024))),
             ],
             Some(32 * 1024),
         )
@@ -12731,12 +14505,20 @@ mod tests {
         let second =
             queue_prompt(&harness.runtime, harness.session_id, "y".repeat(10 * 1024)).await;
         let observed = collect_until(&mut harness.events, finished_for(second)).await;
-        // The one attempt happened...
+        // The one attempt happened and was rejected for not shrinking...
         assert!(
-            observed
+            !observed
                 .iter()
                 .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
         );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished {
+                run_id,
+                outcome: RunOutcome::Failed { failure: RunFailure { kind: RunFailureKind::Policy, message } },
+                ..
+            } if *run_id != second && message.contains("did not shrink")
+        )));
         // ...and the prompt then fails with the context policy failure
         // without reaching the model.
         let outcome = observed
@@ -12764,7 +14546,11 @@ mod tests {
     async fn oversized_compaction_summary_fails_without_committing_a_marker() {
         let mut harness = auto_compact_harness(vec![
             AutoCompactScript::Text("seed answer".to_owned()),
-            AutoCompactScript::Text("s".repeat(MAX_CONTEXT_BYTES)),
+            AutoCompactScript::Text(format!(
+                "{}\n{}",
+                valid_summary("oversized"),
+                "s".repeat(MAX_CONTEXT_BYTES)
+            )),
         ])
         .await;
         let first = queue_prompt(&harness.runtime, harness.session_id, "seed".to_owned()).await;
@@ -12862,7 +14648,7 @@ mod tests {
                 AutoCompactScript::Text("x".repeat(20 * 1024)),
                 // The summary itself stays past the threshold: the guard must
                 // reject the prompt after the single attempt.
-                AutoCompactScript::Text("s".repeat(20 * 1024)),
+                AutoCompactScript::Text(valid_summary(&"s".repeat(20 * 1024))),
                 AutoCompactScript::Text("done".to_owned()),
             ],
             Some(32 * 1024),
@@ -13132,6 +14918,7 @@ mod tests {
                     SessionCommand::SubmitPrompt {
                         session_id,
                         prompt: prompt.to_owned(),
+                        limits: qq_protocol::RunLimits::default(),
                     },
                 )
                 .await
@@ -13207,6 +14994,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "first prompt".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -13319,6 +15107,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "second prompt".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -13365,6 +15154,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "reason until cancelled".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -13423,6 +15213,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "Say hello".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -13695,6 +15486,21 @@ mod tests {
         assert_eq!(focused.runs.len(), 2);
         assert_eq!(focused.runs[0].context_tokens, Some(54_400));
         assert_eq!(focused.runs[1].context_tokens, None);
+        let stored_basis = runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT context_occupancy_json FROM sessions WHERE id = ?1",
+                        [session_id.to_string()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored_basis, None);
     }
 
     #[tokio::test]
@@ -13775,6 +15581,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "inspect the note".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -13853,6 +15660,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "what did you read?".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14279,6 +16087,7 @@ mod tests {
                     SessionCommand::SubmitPrompt {
                         session_id,
                         prompt: "inspect the note".to_owned(),
+                        limits: qq_protocol::RunLimits::default(),
                     },
                 )
                 .await
@@ -14310,6 +16119,7 @@ mod tests {
                         calls: vec![call],
                         turn_message: None,
                         context_tokens: None,
+                        occupancy_basis: None,
                         usage: None,
                         estimated_cost_usd_nanos: None,
                         accounting: None,
@@ -14340,6 +16150,7 @@ mod tests {
                     SessionCommand::SubmitPrompt {
                         session_id,
                         prompt: "continue".to_owned(),
+                        limits: qq_protocol::RunLimits::default(),
                     },
                 )
                 .await
@@ -14426,6 +16237,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "inspect the tool boundaries".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14492,6 +16304,7 @@ mod tests {
                     calls,
                     turn_message: None,
                     context_tokens: None,
+                    occupancy_basis: None,
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
@@ -14555,6 +16368,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "continue safely".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14589,6 +16403,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "continue safely".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14726,6 +16541,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "this prompt never started".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14764,6 +16580,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "continue after cancellation".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14834,6 +16651,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "begin the task".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14886,6 +16704,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "continue from durable work".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -14956,6 +16775,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "legacy prompt".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15019,6 +16839,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "continue from the legacy store".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15089,6 +16910,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "finish the migration".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15113,6 +16935,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "grow the context".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15127,6 +16950,7 @@ mod tests {
                     calls: Vec::new(),
                     turn_message: None,
                     context_tokens: None,
+                    occupancy_basis: None,
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
@@ -15219,6 +17043,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "y".repeat(MAX_PROMPT_BYTES),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15267,6 +17092,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "inspect the note".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15427,6 +17253,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "read".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15476,6 +17303,7 @@ mod tests {
                     calls: vec![call],
                     turn_message: Some(first_message),
                     context_tokens: None,
+                    occupancy_basis: None,
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
@@ -15588,6 +17416,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "read".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15621,6 +17450,7 @@ mod tests {
                     calls: vec![call],
                     turn_message: None,
                     context_tokens: None,
+                    occupancy_basis: None,
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
@@ -15682,6 +17512,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "continue".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15742,6 +17573,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "read".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15765,6 +17597,7 @@ mod tests {
                     calls: Vec::new(),
                     turn_message: None,
                     context_tokens: None,
+                    occupancy_basis: None,
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
@@ -15797,6 +17630,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "continue".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -15875,6 +17709,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "fill the context".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16171,6 +18006,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "too late".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16199,6 +18035,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "converge".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16253,6 +18090,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "persist me".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16329,6 +18167,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "retry the read".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16400,6 +18239,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
                     prompt: "fail initialization".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16418,6 +18258,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: second_session,
                     prompt: "must not load".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16545,6 +18386,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
                     prompt: "wait at start".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16564,6 +18406,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: second_session,
                     prompt: "fail initialization".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16684,6 +18527,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: started_session,
                     prompt: "start but do not poll".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16703,6 +18547,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: failing_session,
                     prompt: "fail settlement".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16818,6 +18663,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "poisoned registry".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -16917,6 +18763,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "recover me".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17056,6 +18903,7 @@ mod tests {
                     SessionCommand::SubmitPrompt {
                         session_id,
                         prompt: prompt.to_owned(),
+                        limits: qq_protocol::RunLimits::default(),
                     },
                 )
                 .await
@@ -17131,6 +18979,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "wait".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17144,6 +18993,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "later".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17319,6 +19169,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "old".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17341,6 +19192,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "new".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17408,7 +19260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_interrupts_active_auto_compaction_without_spending_a_second_attempt() {
+    async fn recovery_ignores_legacy_overflow_evidence_without_spending_a_second_attempt() {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("sessions.sqlite3");
         let store = Store::open(database_path.clone()).await.unwrap();
@@ -17449,6 +19301,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "known provider overflow".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17457,9 +19310,14 @@ mod tests {
             panic!("unexpected receipt")
         };
         let original = store.reserve_next_run(false).await.unwrap().unwrap();
-        let pending =
-            serde_json::to_string(&test_resolved_model("test/model", "test-model", 256, None))
-                .unwrap();
+        let audit = test_prepared_audit(&original);
+        // Version 17 stored only a resolved model here. It lacks the exact
+        // static-prefix/request-byte basis required by version 18 and must
+        // not suppress a provider request after recovery.
+        let mut legacy_model = test_resolved_model("test/model", "test-model", 256, None);
+        legacy_model.version = qq_protocol::ResolvedModelVersion::new(1).unwrap();
+        legacy_model.request_shape = None;
+        let pending = serde_json::to_string(&legacy_model).unwrap();
         store
             .call(Priority::Control, move |connection| {
                 connection
@@ -17475,7 +19333,7 @@ mod tests {
             .await
             .unwrap();
         let (compaction, started) = store
-            .start_auto_compaction(&original, test_prepared_audit(&original))
+            .start_auto_compaction(&original, audit)
             .await
             .unwrap()
             .unwrap();
@@ -17507,28 +19365,22 @@ mod tests {
                 ..
             } if finished == compaction.run_id
         )));
-        assert!(observed.iter().any(|event| matches!(
-            &event.event,
-            SessionEvent::RunFinished {
-                run_id: finished,
-                outcome: RunOutcome::Failed {
-                    failure: RunFailure {
-                        kind: RunFailureKind::Policy,
-                        message,
-                    }
-                },
-                ..
-            } if *finished == run_id && message.contains("provider previously rejected")
-        )));
         assert!(
-            observed
-                .iter()
-                .all(|event| !matches!(event.event, SessionEvent::RunStarted { .. }))
+            observed.iter().any(|event| matches!(
+                event.event,
+                SessionEvent::RunFinished {
+                    run_id: finished,
+                    outcome: RunOutcome::Completed,
+                    ..
+                } if finished == run_id
+            )),
+            "unknown legacy overflow evidence must fall back to provider execution"
         );
-        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
-        let (attempted, auto_runs, preparing, pending): (
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        let (attempted, auto_runs, preparing, legacy_pending, basis_pending): (
             bool,
             u32,
+            Option<String>,
             Option<String>,
             Option<String>,
         ) = runtime
@@ -17541,11 +19393,20 @@ mod tests {
                                 (SELECT COUNT(*) FROM runs c
                                  WHERE c.auto_compaction_for_run_id = r.id),
                                 s.preparing_run_id,
-                                s.pending_context_overflow_model_json
+                                s.pending_context_overflow_model_json,
+                                s.pending_context_overflow_basis_json
                          FROM runs r JOIN sessions s ON s.id = r.session_id
                          WHERE r.id = ?1",
                         [run_id.to_string()],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
                     )
                     .map_err(|_| SessionRuntimeError::Persistence)
             })
@@ -17554,7 +19415,8 @@ mod tests {
         assert!(attempted);
         assert_eq!(auto_runs, 1);
         assert_eq!(preparing, None);
-        assert!(pending.is_some());
+        assert!(legacy_pending.is_some());
+        assert_eq!(basis_pending, None);
     }
 
     #[tokio::test]
@@ -17599,6 +19461,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "resume after legacy crash".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17790,6 +19653,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
                     prompt: "first".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17808,6 +19672,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: second_session,
                     prompt: "second".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -17932,6 +19797,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "block during load".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -18080,6 +19946,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "large".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -18190,6 +20057,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
                     prompt: "first-a".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -18210,6 +20078,7 @@ mod tests {
                     SessionCommand::SubmitPrompt {
                         session_id,
                         prompt: prompt.to_owned(),
+                        limits: qq_protocol::RunLimits::default(),
                     },
                 )
                 .await
@@ -20145,6 +22014,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "now edit it".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -20303,6 +22173,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
                     prompt: "mutate again".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -20399,6 +22270,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "mutate".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -20430,6 +22302,7 @@ mod tests {
                     calls: vec![call],
                     turn_message: None,
                     context_tokens: None,
+                    occupancy_basis: None,
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
@@ -20997,6 +22870,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "delegate work".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -21067,6 +22941,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: prompt.to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -21479,15 +23354,18 @@ mod tests {
                     let result = create_child_run(
                         connection,
                         store_id,
-                        create_parent.workspace_id,
-                        create_parent.session_id,
-                        create_parent.run_id,
+                        ChildRunParent {
+                            workspace_id: create_parent.workspace_id,
+                            session_id: create_parent.session_id,
+                            run_id: create_parent.run_id,
+                        },
                         ModelSelection {
                             model: Some("test/child".to_owned()),
                             max_output_tokens: Some(256),
                             organization: None,
                         },
                         "queued child task".to_owned(),
+                        RunLimits::default(),
                     );
                     let _ = created_tx.send(result.as_ref().ok().map(|created| {
                         (
@@ -21519,7 +23397,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.run_outcome(child_run).await.unwrap(),
+            store
+                .run_outcome(child_run)
+                .await
+                .unwrap()
+                .map(|(outcome, _)| outcome),
             Some(RunOutcome::Cancelled)
         );
         assert!(store.claim_next_run(true).await.unwrap().is_none());
@@ -21550,6 +23432,7 @@ mod tests {
                     organization: None,
                 },
                 "too late".to_owned(),
+                RunLimits::default(),
             )
             .await;
         assert!(matches!(rejected, Err(SessionRuntimeError::RunNotFound)));
@@ -21576,6 +23459,7 @@ mod tests {
                     organization: None,
                 },
                 "running child task".to_owned(),
+                RunLimits::default(),
             )
             .await
             .unwrap();
@@ -21619,6 +23503,7 @@ mod tests {
                     organization: None,
                 },
                 "queued child task".to_owned(),
+                RunLimits::default(),
             )
             .await
             .unwrap();
@@ -22659,6 +24544,11 @@ mod tests {
             child: false,
             user_initiated: true,
             literal_slash: false,
+            session_model: ModelSelection {
+                model: Some("test/model".to_owned()),
+                max_output_tokens: Some(256),
+                organization: None,
+            },
             model: ModelSelection {
                 model: Some("test/model".to_owned()),
                 max_output_tokens: Some(256),
@@ -22666,7 +24556,9 @@ mod tests {
             },
             messages: Vec::new(),
             context_compaction_attempted: false,
-            context_overflow_model: None,
+            context_overflow_basis: None,
+            context_occupancy: None,
+            limits: RunLimits::default(),
         };
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),
@@ -22856,5 +24748,1025 @@ mod tests {
             finished_outcome(&observed, second_run),
             Some(RunOutcome::Completed)
         ));
+    }
+
+    /// Loops one `read_file` call per turn until stopped; each turn reports
+    /// the configured usage (or none). Text turns (when the request declares
+    /// no tools) stream a final status line.
+    struct BudgetLoopLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        usage: Option<TokenUsage>,
+        pricing: Option<ModelPricing>,
+        hang: bool,
+    }
+
+    impl RuntimeLoader for BudgetLoopLoader {
+        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = BudgetLoopProvider {
+                requests: Arc::clone(&self.requests),
+                usage: self.usage,
+                hang: self.hang,
+                turn: AtomicUsize::new(0),
+            };
+            let pricing = self.pricing.clone();
+            Box::pin(async move {
+                Runtime::new(provider, "test-model", 256)
+                    .map(|runtime| loaded_runtime(runtime, pricing))
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct BudgetLoopProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        usage: Option<TokenUsage>,
+        hang: bool,
+        turn: AtomicUsize,
+    }
+
+    impl Provider for BudgetLoopProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let has_tools = !request.tools().is_empty();
+            self.requests.lock().unwrap().push(request);
+            if self.hang {
+                return Box::pin(stream::pending());
+            }
+            let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+            if has_tools {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                        id: format!("call_{turn}"),
+                        name: "read_file".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                        id: format!("call_{turn}"),
+                        json: r#"{"path":"note.txt"}"#.to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::ToolCallCompleted {
+                        id: format!("call_{turn}"),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed {
+                        usage: self.usage.map(provider_usage_of),
+                    }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "final status".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed {
+                        usage: self.usage.map(provider_usage_of),
+                    }),
+                ]))
+            }
+        }
+    }
+
+    fn provider_usage_of(usage: TokenUsage) -> qq_provider::ProviderUsage {
+        qq_provider::ProviderUsage {
+            input_tokens: usage.input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
+            output_tokens: usage.output_tokens,
+        }
+    }
+
+    fn budget_pricing() -> ModelPricing {
+        ModelPricing {
+            input_usd_nanos_per_token: 1_000,
+            output_usd_nanos_per_token: 2_000,
+            cache_read_usd_nanos_per_token: None,
+            cache_write_usd_nanos_per_token: None,
+            context_tier: None,
+            provenance: "test".to_owned(),
+        }
+    }
+
+    struct BudgetHarness {
+        _directory: TempDir,
+        runtime: SessionRuntime,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        events: SessionEventStream,
+        database_path: PathBuf,
+    }
+
+    async fn budget_harness(loader: BudgetLoopLoader) -> BudgetHarness {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "note").unwrap();
+        let requests = Arc::clone(&loader.requests);
+        let database_path = directory.path().join("sessions.sqlite3");
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            Arc::new(loader),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created =
+            create_session_with_mode(&runtime, workspace_id, None, ApprovalMode::Auto).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        BudgetHarness {
+            _directory: directory,
+            runtime,
+            requests,
+            workspace_id,
+            session_id,
+            events,
+            database_path,
+        }
+    }
+
+    async fn queue_limited_prompt(harness: &BudgetHarness, limits: RunLimits) -> RunId {
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "loop".to_owned(),
+                    limits,
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        run_id
+    }
+
+    fn exhaustion_of(observed: &[SessionEventEnvelope], run_id: RunId) -> BudgetExhaustion {
+        match finished_outcome(observed, run_id) {
+            Some(RunOutcome::BudgetExhausted { exhaustion }) => *exhaustion,
+            other => panic!("expected a budget_exhausted outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_budget_grants_one_final_response_then_settles_as_budget_exhausted() {
+        let mut harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: None,
+            pricing: None,
+            hang: false,
+        })
+        .await;
+        let run_id = queue_limited_prompt(
+            &harness,
+            RunLimits {
+                max_model_turns: Some(2),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+        let exhaustion = exhaustion_of(&observed, run_id);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::ModelTurns);
+        assert!(exhaustion.final_response);
+        assert!(exhaustion.message.contains("2 model turn"));
+
+        // One working turn, then the last permitted turn is the tool-free final
+        // response whose text is persisted as the run's last assistant message.
+        {
+            let requests = harness.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(!requests[0].tools().is_empty());
+            assert!(requests[1].tools().is_empty());
+            assert!(
+                requests[1]
+                    .system()
+                    .is_some_and(|system| system.contains(crate::BUDGET_FINAL_RESPONSE_NOTICE))
+            );
+        }
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                session_limit: 1,
+                message_limit: 16,
+            })
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        let run = focused.runs.iter().find(|run| run.id == run_id).unwrap();
+        assert_eq!(run.status, RunStatus::BudgetExhausted);
+        assert_eq!(
+            run.limits
+                .as_deref()
+                .and_then(|limits| limits.max_model_turns),
+            Some(2)
+        );
+        assert!(focused.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.output == "final status"
+                && message.state == MessageState::Complete
+        }));
+        assert_eq!(
+            focused.summary.status,
+            SessionStatus::Idle,
+            "a settled budget leaves no active run"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_budget_reserves_the_final_turn_before_the_cap() {
+        let mut harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: None,
+            pricing: None,
+            hang: false,
+        })
+        .await;
+        // Each turn issues one call, but a turn may issue sixteen: the meter
+        // must reserve room for a full turn, so three calls fit and the
+        // fourth turn becomes the final response.
+        let run_id = queue_limited_prompt(
+            &harness,
+            RunLimits {
+                max_tool_calls: Some(3 + crate::MAX_TOOL_CALLS_PER_TURN as u32),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+        let exhaustion = exhaustion_of(&observed, run_id);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::ToolCalls);
+        assert!(exhaustion.final_response);
+        let requests = harness.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests.last().unwrap().tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wall_clock_budget_settles_a_hanging_provider_without_a_final_response() {
+        let mut harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: None,
+            pricing: None,
+            hang: true,
+        })
+        .await;
+        let run_id = queue_limited_prompt(
+            &harness,
+            RunLimits {
+                max_duration_ms: Some(100),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = tokio::time::timeout(
+            Duration::from_secs(5),
+            collect_until(&mut harness.events, finished_for(run_id)),
+        )
+        .await
+        .expect("the deadline must settle a provider that never streams");
+        let exhaustion = exhaustion_of(&observed, run_id);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::Duration);
+        assert!(!exhaustion.final_response);
+        assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cost_budget_settles_on_spend_and_fails_closed_when_usage_goes_missing() {
+        let mut harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: Some(usage(2, 1)), // 4_000 nanos per turn
+            pricing: Some(budget_pricing()),
+            hang: false,
+        })
+        .await;
+        let run_id = queue_limited_prompt(
+            &harness,
+            RunLimits {
+                max_cost_usd_nanos: Some(7_000),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+        let exhaustion = exhaustion_of(&observed, run_id);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::Cost);
+        assert!(exhaustion.final_response);
+        // Two working turns overran 7_000; the final response is the third.
+        assert_eq!(harness.requests.lock().unwrap().len(), 3);
+        let finished_cost = observed.iter().find_map(|event| match &event.event {
+            SessionEvent::RunFinished {
+                run_id: finished,
+                session,
+                ..
+            } if *finished == run_id => Some(session.estimated_cost_usd_nanos),
+            _ => None,
+        });
+        assert_eq!(finished_cost, Some(Some(12_000)));
+
+        let mut unmetered = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: None,
+            pricing: Some(budget_pricing()),
+            hang: false,
+        })
+        .await;
+        let run_id = queue_limited_prompt(
+            &unmetered,
+            RunLimits {
+                max_cost_usd_nanos: Some(1_000_000),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until(&mut unmetered.events, finished_for(run_id)).await;
+        let exhaustion = exhaustion_of(&observed, run_id);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::CostUnknown);
+        assert!(!exhaustion.final_response);
+        assert_eq!(
+            unmetered.requests.lock().unwrap().len(),
+            1,
+            "unknown spend under a cost cap stops before any further provider work"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_budget_without_pricing_is_rejected_before_provider_work() {
+        let mut harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: Some(usage(1, 1)),
+            pricing: None,
+            hang: false,
+        })
+        .await;
+        let run_id = queue_limited_prompt(
+            &harness,
+            RunLimits {
+                max_cost_usd_nanos: Some(1_000),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+        match finished_outcome(&observed, run_id) {
+            Some(RunOutcome::Failed { failure }) => {
+                assert_eq!(failure.kind, RunFailureKind::Configuration);
+                assert!(failure.message.contains("no configured pricing"));
+            }
+            other => panic!("expected a configuration failure, got {other:?}"),
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event.event, SessionEvent::RunStarted { .. })),
+            "rejection happens before the run starts"
+        );
+        assert!(harness.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_budget_settles_a_completed_overrun_as_exhausted_not_completed() {
+        let mut harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: Some(usage(50, 10)),
+            pricing: None,
+            hang: false,
+        })
+        .await;
+        let run_id = queue_limited_prompt(
+            &harness,
+            RunLimits {
+                max_total_tokens: Some(100),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until(&mut harness.events, finished_for(run_id)).await;
+        let exhaustion = exhaustion_of(&observed, run_id);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::TotalTokens);
+        assert!(exhaustion.final_response);
+        assert!(exhaustion.message.contains("180 total tokens"));
+    }
+
+    #[tokio::test]
+    async fn zero_limits_are_rejected_at_submission() {
+        let harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            usage: None,
+            pricing: None,
+            hang: false,
+        })
+        .await;
+        let result = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    prompt: "loop".to_owned(),
+                    limits: RunLimits {
+                        max_model_turns: Some(0),
+                        ..RunLimits::default()
+                    },
+                },
+            )
+            .await;
+        assert_eq!(result, Err(SessionRuntimeError::InvalidRunLimits));
+    }
+
+    #[tokio::test]
+    async fn run_limits_survive_restart_and_bound_the_recovered_run() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = budget_harness(BudgetLoopLoader {
+            requests: Arc::clone(&requests),
+            usage: None,
+            pricing: None,
+            hang: true,
+        })
+        .await;
+        let limits = RunLimits {
+            max_model_turns: Some(1),
+            ..RunLimits::default()
+        };
+        // Queue while a hanging run occupies the session so the limited run
+        // is still queued at shutdown.
+        let hanging = queue_limited_prompt(&harness, RunLimits::default()).await;
+        let limited = queue_limited_prompt(&harness, limits).await;
+        let mut events = harness.events;
+        collect_until(
+            &mut events,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == hanging),
+        )
+        .await;
+        // An unclean stop (no shutdown) leaves the hanging run interrupted and
+        // the limited run queued; recovery must enforce its persisted limits.
+        drop(events);
+        drop(harness.runtime);
+        let connection = Connection::open(&harness.database_path).unwrap();
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT limits_json FROM runs WHERE id = ?1",
+                [limited.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RunLimits>(stored.as_deref().unwrap()).unwrap(),
+            limits
+        );
+        let after = EventCursor {
+            store_id: connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'store_id'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .parse()
+                .unwrap(),
+            workspace_id: harness.workspace_id,
+            sequence: 0,
+        };
+        drop(connection);
+
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(harness.database_path.clone()),
+            Arc::new(BudgetLoopLoader {
+                requests: Arc::clone(&requests),
+                usage: None,
+                pricing: None,
+                hang: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id: harness.workspace_id,
+                after,
+            })
+            .unwrap();
+        let observed = collect_until(&mut events, finished_for(limited)).await;
+        let exhaustion = exhaustion_of(&observed, limited);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::ModelTurns);
+        assert_eq!(
+            exhaustion.message,
+            "the run exhausted its 1 model turn budget"
+        );
+        runtime.close().await.unwrap();
+    }
+
+    #[test]
+    fn compaction_summary_validation_requires_every_section_heading() {
+        assert!(validate_compaction_summary(&valid_summary("ok")).is_ok());
+        assert!(
+            validate_compaction_summary(
+                "## Intent: x\n**Decisions and constraints:** y\n- Work state: z\n\
+                 FILES TOUCHED: a\n5) Errors: none\nUser messages: hello"
+            )
+            .is_ok(),
+            "numbering, markdown markup, and case are tolerated"
+        );
+        assert_eq!(
+            validate_compaction_summary("   \n"),
+            Err("compaction produced an empty summary".to_owned())
+        );
+        let missing = validate_compaction_summary("1. Intent: x\n2. Work state: y").unwrap_err();
+        assert!(missing.contains("Decisions and constraints"));
+        assert!(missing.contains("Files touched"));
+        assert!(missing.contains("Errors"));
+        assert!(missing.contains("User messages"));
+        assert!(!missing.contains("Intent"));
+        // Body text mentioning a heading word does not satisfy the section.
+        let prose = validate_compaction_summary(
+            "1. Intent: fix the errors: they matter\n2. Decisions and constraints: none\n\
+             3. Work state: done\n4. Files touched: none\n6. User messages: hi",
+        )
+        .unwrap_err();
+        assert_eq!(
+            prose,
+            "compaction summary is missing required sections: Errors"
+        );
+        assert!(
+            validate_compaction_summary(&format!(
+                "{}\n{}",
+                valid_summary("x"),
+                "s".repeat(MAX_CONTEXT_BYTES)
+            ))
+            .unwrap_err()
+            .contains("4 MiB")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_summary_fails_compaction_and_retains_the_prior_compaction() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("first answer".to_owned()),
+            AutoCompactScript::Text(valid_summary("good summary")),
+            AutoCompactScript::Text("second answer".to_owned()),
+            // No section headings: rejected before any marker is written.
+            AutoCompactScript::Text("just some prose about the work".to_owned()),
+            AutoCompactScript::Text("third answer".to_owned()),
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "one".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+        let good = compact_session(&harness.runtime, harness.session_id).await;
+        collect_through_compacted(&mut harness.events).await;
+        let second = queue_prompt(&harness.runtime, harness.session_id, "two".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(second)).await;
+
+        let bad = compact_session(&harness.runtime, harness.session_id).await;
+        let observed = collect_until(&mut harness.events, finished_for(bad)).await;
+        match finished_outcome(&observed, bad) {
+            Some(RunOutcome::Failed { failure }) => {
+                assert_eq!(failure.kind, RunFailureKind::Policy);
+                assert!(failure.message.contains("missing required sections"));
+            }
+            other => panic!("expected a policy failure, got {other:?}"),
+        }
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SessionCompacted { .. }))
+        );
+
+        // The prior compaction still governs assembly: the next prompt sees
+        // the good summary and the verbatim span after its marker.
+        let third = queue_prompt(&harness.runtime, harness.session_id, "three".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(third)).await;
+        let requests = harness.requests.lock().unwrap();
+        let texts = request_texts(requests.last().unwrap());
+        assert!(texts[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
+        assert!(texts[0].contains("good summary"));
+        assert!(texts.iter().any(|text| text == "two"));
+        assert!(!texts.iter().any(|text| text == "one"));
+        drop(requests);
+        let connection = Connection::open(harness.workspace_path.join("sessions.sqlite3")).unwrap();
+        let (count, run): (u32, String) = connection
+            .query_row(
+                "SELECT COUNT(*), MAX(run_id) FROM session_compactions WHERE session_id = ?1",
+                [harness.session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(run, good.to_string());
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_the_prior_compaction_then_the_verbatim_transcript() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("first answer".to_owned()),
+            AutoCompactScript::Text(valid_summary("summary one")),
+            AutoCompactScript::Text("second answer".to_owned()),
+            AutoCompactScript::Text(valid_summary("summary two")),
+            AutoCompactScript::Text("after first rollback".to_owned()),
+            AutoCompactScript::Text("after second rollback".to_owned()),
+        ])
+        .await;
+        for prompt in ["one", "two"] {
+            let run = queue_prompt(&harness.runtime, harness.session_id, prompt.to_owned()).await;
+            collect_until(&mut harness.events, finished_for(run)).await;
+            let _ = compact_session(&harness.runtime, harness.session_id).await;
+            collect_through_compacted(&mut harness.events).await;
+        }
+
+        async fn rollback(
+            harness: &AutoCompactHarness,
+        ) -> Result<CommandReceipt, SessionRuntimeError> {
+            harness
+                .runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::RollbackCompaction {
+                        session_id: harness.session_id,
+                    },
+                )
+                .await
+        }
+        let receipt = rollback(&harness).await.unwrap();
+        assert_eq!(
+            receipt.outcome,
+            CommandOutcome::CompactionRolledBack {
+                session_id: harness.session_id,
+                remaining: 1,
+            }
+        );
+        let observed = collect_until(&mut harness.events, |event| {
+            matches!(event, SessionEvent::SessionCompactionRolledBack { .. })
+        })
+        .await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::SessionCompactionRolledBack { session, remaining: 1 }
+                if session.context_tokens.is_none()
+        )));
+        let third = queue_prompt(&harness.runtime, harness.session_id, "three".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(third)).await;
+        {
+            let requests = harness.requests.lock().unwrap();
+            let texts = request_texts(requests.last().unwrap());
+            assert!(texts[0].contains("summary one"), "{texts:?}");
+            assert!(!texts[0].contains("summary two"));
+            assert!(texts.iter().any(|text| text == "two"));
+            assert!(texts.iter().any(|text| text == "three"));
+        }
+
+        let receipt = rollback(&harness).await.unwrap();
+        assert_eq!(
+            receipt.outcome,
+            CommandOutcome::CompactionRolledBack {
+                session_id: harness.session_id,
+                remaining: 0,
+            }
+        );
+        let fourth = queue_prompt(&harness.runtime, harness.session_id, "four".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(fourth)).await;
+        {
+            let requests = harness.requests.lock().unwrap();
+            let texts = request_texts(requests.last().unwrap());
+            assert!(!texts[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
+            assert!(texts.iter().any(|text| text == "one"), "{texts:?}");
+            assert!(texts.iter().any(|text| text == "four"));
+        }
+        assert_eq!(
+            rollback(&harness).await,
+            Err(SessionRuntimeError::NoCompactionToRollBack)
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_is_refused_while_the_session_is_not_idle() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::Text("first answer".to_owned()),
+            AutoCompactScript::Text(valid_summary("summary")),
+            AutoCompactScript::Stall,
+        ])
+        .await;
+        let first = queue_prompt(&harness.runtime, harness.session_id, "one".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+        let _ = compact_session(&harness.runtime, harness.session_id).await;
+        collect_through_compacted(&mut harness.events).await;
+        let stalled = queue_prompt(&harness.runtime, harness.session_id, "stall".to_owned()).await;
+        collect_until(
+            &mut harness.events,
+            |event| matches!(event, SessionEvent::RunStarted { run_id, .. } if *run_id == stalled),
+        )
+        .await;
+        assert_eq!(
+            harness
+                .runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::RollbackCompaction {
+                        session_id: harness.session_id,
+                    },
+                )
+                .await,
+            Err(SessionRuntimeError::SessionActive)
+        );
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id: stalled },
+            )
+            .await
+            .unwrap();
+        collect_until(&mut harness.events, finished_for(stalled)).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_compactions_preserve_seeded_facts_and_bound_history() {
+        // A summarizer that folds the prior summary and the verbatim span
+        // faithfully: every user message, exact path, decision, and error
+        // string it is shown reappears under its section. Repeated
+        // compactions must keep those seeded facts reachable through the
+        // latest summary alone, and never retain more than the bounded
+        // history.
+        struct FoldingLoader {
+            requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        }
+
+        impl RuntimeLoader for FoldingLoader {
+            fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let requests = Arc::clone(&self.requests);
+                Box::pin(async move {
+                    Runtime::new(FoldingProvider { requests }, "test-model", 4_096)
+                        .map(|runtime| loaded_runtime(runtime, None))
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        struct FoldingProvider {
+            requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for FoldingProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let texts = request_texts(&request);
+                self.requests.lock().unwrap().push(request);
+                let summarizing = texts
+                    .last()
+                    .is_some_and(|text| text.starts_with("Summarize this conversation"));
+                let text = if summarizing {
+                    // Fold: carry forward every fact line from the prior
+                    // summary and every verbatim user message.
+                    let mut facts = Vec::new();
+                    for text in &texts[..texts.len() - 1] {
+                        for line in text.lines() {
+                            if line.starts_with("FACT ") || line.starts_with("- FACT ") {
+                                facts.push(line.trim_start_matches("- ").to_owned());
+                            }
+                        }
+                        if text.starts_with("USER ") {
+                            facts.push(format!("FACT {text}"));
+                        }
+                    }
+                    facts.sort();
+                    facts.dedup();
+                    let body = facts
+                        .iter()
+                        .map(|fact| format!("- {fact}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "1. Intent: see below\n{body}\n2. Decisions and constraints: see below\n\
+                         {body}\n3. Work state: folded\n4. Files touched: see below\n{body}\n\
+                         5. Errors: see below\n{body}\n6. User messages: see below\n{body}"
+                    )
+                } else {
+                    "ack".to_owned()
+                };
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta { text }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(FoldingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+
+        let seeded = [
+            "USER constraint: never touch src/legacy/parser.rs",
+            "USER decision: use --features minimal for embedders",
+            "USER error: E0433 failed to resolve: use of undeclared type `RunLimits`",
+            "USER verification: cargo test --workspace passed",
+        ];
+        let rounds = COMPACTION_HISTORY_ROWS as usize + 2;
+        for round in 0..rounds {
+            let prompt = seeded[round % seeded.len()].to_owned();
+            let run = queue_prompt(&runtime, session_id, prompt).await;
+            collect_until(&mut events, finished_for(run)).await;
+            let compaction = compact_session(&runtime, session_id).await;
+            let observed = collect_through_compacted(&mut events).await;
+            assert_eq!(
+                finished_outcome(&observed, compaction),
+                Some(RunOutcome::Completed),
+                "round {round} must compact"
+            );
+        }
+
+        let probe = queue_prompt(&runtime, session_id, "USER probe".to_owned()).await;
+        collect_until(&mut events, finished_for(probe)).await;
+        let requests = requests.lock().unwrap();
+        let texts = request_texts(requests.last().unwrap());
+        assert!(texts[0].starts_with(COMPACTION_SUMMARY_PREAMBLE));
+        for fact in seeded {
+            assert!(
+                texts[0].contains(fact),
+                "seeded fact {fact:?} must survive {rounds} compactions; got {}",
+                texts[0]
+            );
+        }
+        // Only the latest summary and the verbatim span are assembled: no
+        // earlier user message appears verbatim outside the summary.
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.starts_with("USER "))
+                .count(),
+            1
+        );
+        drop(requests);
+
+        let connection = Connection::open(directory.path().join("sessions.sqlite3")).unwrap();
+        let retained: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_compactions WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, COMPACTION_HISTORY_ROWS);
+    }
+
+    #[tokio::test]
+    async fn compaction_shrinks_a_tool_heavy_assembly_at_least_eightfold() {
+        // Phase 5 acceptance: a compaction of a transcript dominated by tool
+        // traffic must shrink the measured assembly by at least 8x, and the
+        // published before/after bytes must agree with the next assembly.
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::ReadNoteThenText("read it".to_owned()),
+            AutoCompactScript::ReadNoteThenText("read it again".to_owned()),
+            AutoCompactScript::Text(valid_summary("the note repeats one line")),
+            AutoCompactScript::Text("after".to_owned()),
+        ])
+        .await;
+        let line = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        std::fs::write(harness.workspace_path.join("note.txt"), line.repeat(1_500)).unwrap();
+        for prompt in ["one", "two"] {
+            let run = queue_prompt(&harness.runtime, harness.session_id, prompt.to_owned()).await;
+            collect_until(&mut harness.events, finished_for(run)).await;
+        }
+        let compaction = compact_session(&harness.runtime, harness.session_id).await;
+        let observed = collect_through_compacted(&mut harness.events).await;
+        assert_eq!(
+            finished_outcome(&observed, compaction),
+            Some(RunOutcome::Completed)
+        );
+        let (before, after) = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCompacted {
+                    before_bytes,
+                    after_bytes,
+                    ..
+                } => Some((*before_bytes, *after_bytes)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            before > COMPACTION_SHRINKAGE_FLOOR_BYTES as u64,
+            "the fixture must exceed the shrinkage floor: {before}"
+        );
+        assert!(
+            before >= after * 8,
+            "compaction must shrink at least 8x: {before} -> {after}"
+        );
+
+        let run = queue_prompt(&harness.runtime, harness.session_id, "three".to_owned()).await;
+        collect_until(&mut harness.events, finished_for(run)).await;
+        let requests = harness.requests.lock().unwrap();
+        let texts = request_texts(requests.last().unwrap());
+        assert!(texts[0].contains("the note repeats one line"), "{texts:?}");
+        assert!(!texts.iter().any(|text| text.contains(line.trim())));
+    }
+
+    #[tokio::test]
+    async fn search_history_recalls_compacted_transcript_with_bounded_citations() {
+        let mut harness = auto_compact_harness(vec![
+            AutoCompactScript::ReadNoteThenText(
+                "noted: the parser lives at src/legacy/parser.rs".to_owned(),
+            ),
+            AutoCompactScript::Text(valid_summary("folded")),
+            AutoCompactScript::SearchHistoryThenText(
+                "LEGACY/PARSER".to_owned(),
+                "recalled".to_owned(),
+            ),
+            AutoCompactScript::SearchHistoryThenText("zzz-absent".to_owned(), "none".to_owned()),
+        ])
+        .await;
+        std::fs::write(
+            harness.workspace_path.join("note.txt"),
+            "keep src/legacy/parser.rs untouched\n",
+        )
+        .unwrap();
+        let first = queue_prompt(
+            &harness.runtime,
+            harness.session_id,
+            "never touch src/legacy/parser.rs".to_owned(),
+        )
+        .await;
+        collect_until(&mut harness.events, finished_for(first)).await;
+        let _ = compact_session(&harness.runtime, harness.session_id).await;
+        collect_through_compacted(&mut harness.events).await;
+
+        let second = queue_prompt(&harness.runtime, harness.session_id, "recall".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(second)).await;
+        let (result, is_error) = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::ToolCallFinished { tool_call }
+                    if tool_call.name == crate::runtime::SEARCH_HISTORY_TOOL =>
+                {
+                    Some((tool_call.result.clone().unwrap(), tool_call.is_error))
+                }
+                _ => None,
+            })
+            .expect("search_history must dispatch in a session run");
+        assert!(!is_error, "{result}");
+        // Limit 2 caps the three transcript hits (prompt, tool result,
+        // assistant text), in transcript order.
+        assert!(result.starts_with("2 history match(es)"), "{result}");
+        assert!(
+            result.contains("[user message #1]\nnever touch"),
+            "{result}"
+        );
+        assert!(
+            result.contains("[read_file result, user message #1 turn 1 call 1]\nkeep"),
+            "{result}"
+        );
+        assert!(!result.contains("noted: the parser"), "{result}");
+        {
+            let requests = harness.requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert!(
+                request
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.name() == crate::runtime::SEARCH_HISTORY_TOOL),
+                "session runs declare search_history"
+            );
+            // The compacted assembly no longer carries the verbatim fact; the
+            // tool result is the only route back to it.
+            let texts = request_texts(request);
+            assert!(texts[0].contains("folded"), "{texts:?}");
+            assert!(!texts[0].contains("legacy/parser"), "{texts:?}");
+        }
+
+        let third = queue_prompt(&harness.runtime, harness.session_id, "again".to_owned()).await;
+        let observed = collect_until(&mut harness.events, finished_for(third)).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolCallFinished { tool_call }
+                if tool_call.name == crate::runtime::SEARCH_HISTORY_TOOL
+                    && tool_call.result.as_deref()
+                        == Some("No history matches for \"zzz-absent\".")
+        )));
     }
 }

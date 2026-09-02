@@ -19,8 +19,8 @@ use std::{
 use futures_util::StreamExt;
 use qq_core::{SessionRuntime, SessionRuntimeError};
 use qq_protocol::{
-    ApprovalDecision, ApprovalMode, CommandId, CommandOutcome, CommandReceipt, MessageId,
-    MessageRole, ModelSelection, RunActivity, RunId, RunOutcome, RunPromptIdentity,
+    ApprovalDecision, ApprovalMode, BudgetLimitKind, CommandId, CommandOutcome, CommandReceipt,
+    MessageId, MessageRole, ModelSelection, RunId, RunLimits, RunOutcome, RunPromptIdentity,
     SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
     SnapshotRequest, SubscribeRequest, TokenUsage, ToolCallState, WorkspaceId,
 };
@@ -242,13 +242,6 @@ impl Failure {
             message: message.into(),
         }
     }
-}
-
-/// Why this invocation asked the runtime to cancel the run.
-enum CancelReason {
-    Timeout,
-    Budget(String),
-    Interrupt,
 }
 
 #[derive(Clone)]
@@ -488,11 +481,22 @@ async fn submit(
         ));
     };
 
+    // Budgets are core-owned: the runtime enforces them and settles the run
+    // with a typed outcome, so this adapter only relays and renders.
     let queued = send(
         sessions,
         SessionCommand::SubmitPrompt {
             session_id,
             prompt: options.prompt.clone(),
+            limits: RunLimits {
+                max_duration_ms: options
+                    .timeout
+                    .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                max_model_turns: options.max_turns,
+                max_tool_calls: None,
+                max_total_tokens: None,
+                max_cost_usd_nanos: options.max_cost_usd_nanos,
+            },
         },
     )
     .await?;
@@ -513,9 +517,10 @@ async fn submit(
     })
 }
 
-/// Streams durable events to completion, answering approvals, enforcing the
-/// timeout and budgets through the ordinary idempotent cancellation command,
-/// and rendering output per the selected format.
+/// Streams durable events to completion, answering approvals, relaying an
+/// interrupt through the ordinary idempotent cancellation command, and
+/// rendering output per the selected format. Time and budget bounds are
+/// enforced by the core runtime and arrive as typed run outcomes.
 async fn stream_run(
     sessions: &SessionRuntime,
     options: &HeadlessOptions,
@@ -535,18 +540,15 @@ async fn stream_run(
             message: format!("could not subscribe to session events: {error}"),
         })?;
 
-    let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
     let mut interrupt = pin!(interrupt);
     let mut interrupt_armed = true;
-    let mut cancel: Option<CancelReason> = None;
+    let mut interrupted = false;
     let mut shutdown_at: Option<Instant> = None;
 
     // The final answer is the text of the last assistant message that starts
     // streaming; earlier turns are progress, not the answer.
     let mut answer = String::new();
     let mut answer_message: Option<MessageId> = None;
-    let mut observed_turns = 0_u16;
-    let mut child_sessions = Vec::new();
     let text = options.format == HeadlessFormat::Text;
 
     loop {
@@ -554,22 +556,13 @@ async fn stream_run(
             biased;
             () = interrupt.as_mut(), if interrupt_armed => {
                 interrupt_armed = false;
-                if cancel.is_none() {
+                if !interrupted {
                     request_cancel(sessions, handle.run_id).await?;
-                    cancel = Some(CancelReason::Interrupt);
+                    interrupted = true;
                     shutdown_at = Some(Instant::now() + SHUTDOWN_GRACE);
                     if text {
                         let _ = writeln!(stderr, "[run] interrupt received; cancelling");
                     }
-                }
-            }
-            () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
-                if deadline.is_some() && cancel.is_none() => {
-                request_cancel(sessions, handle.run_id).await?;
-                cancel = Some(CancelReason::Timeout);
-                shutdown_at = Some(Instant::now() + SHUTDOWN_GRACE);
-                if text {
-                    let _ = writeln!(stderr, "[run] timeout reached; cancelling");
                 }
             }
             () = tokio::time::sleep_until(shutdown_at.unwrap_or_else(Instant::now)),
@@ -600,45 +593,13 @@ async fn stream_run(
                     })?;
 
                 let ours = envelope.session_id == handle.session_id;
-                if let SessionEvent::SessionCreated { session } = &envelope.event
-                    && session.parent_id == Some(handle.session_id)
-                    && !child_sessions.contains(&session.id)
-                {
-                    child_sessions.push(session.id);
-                }
-                let related = ours || child_sessions.contains(&envelope.session_id);
-                let mut over_turn_budget = false;
-                let mut check_cost = false;
                 match &envelope.event {
-                    SessionEvent::RunActivityChanged {
-                        run_id,
-                        activity: RunActivity::WaitingForProvider,
-                    } if *run_id == handle.run_id => {
-                        observed_turns = observed_turns.saturating_add(1);
-                        // Every waiting boundary after the first follows a
-                        // completed turn, including a call-free internal
-                        // checkpoint whose provider omitted usage.
-                        check_cost = observed_turns > 1;
-                        over_turn_budget = options
-                            .max_turns
-                            .is_some_and(|limit| observed_turns > limit);
-                    }
-                    SessionEvent::RunActivityChanged {
-                        activity: RunActivity::WaitingForProvider,
-                        ..
-                    } if related => {
-                        // Child turns contribute to the selected session's
-                        // inclusive hard-cost budget even though their turn
-                        // count does not consume the parent's turn budget.
-                        check_cost = true;
-                    }
                     SessionEvent::AssistantMessageStarted { message } if ours => {
                         if message.role == MessageRole::Assistant {
                             answer_message = Some(message.id);
                             answer.clear();
                             answer.push_str(&message.output);
                         }
-                        over_turn_budget = beyond_turn_budget(options, message.turn_ordinal);
                     }
                     SessionEvent::TextAppended { message_id, text: chunk, .. } if ours => {
                         if Some(*message_id) == answer_message {
@@ -668,16 +629,6 @@ async fn stream_run(
                             };
                             let _ = writeln!(stderr, "[tool] {} {verdict}", tool_call.name);
                         }
-                    }
-                    SessionEvent::ToolCallRequested { tool_call } if related => {
-                        if ours {
-                            over_turn_budget = beyond_turn_budget(options, tool_call.turn_ordinal);
-                        }
-                        // Tool requests commit atomically with the turn's
-                        // cumulative accounting, including an explicit
-                        // unknown value when provider usage was absent. Child
-                        // accounting is included in the parent snapshot.
-                        check_cost = true;
                     }
                     SessionEvent::ToolApprovalRequested { tool_call, .. } => {
                         // The headless invocation is the approval client.
@@ -717,14 +668,6 @@ async fn stream_run(
                                 .await;
                         }
                     }
-                    SessionEvent::RunContextUpdated { .. } if related => {
-                        check_cost = true;
-                    }
-                    SessionEvent::SessionContextUpdated { .. }
-                    | SessionEvent::SessionUpdated { .. }
-                        if related => {
-                        check_cost = true;
-                    }
                     SessionEvent::RunFinished { session, run_id, outcome, usage, .. }
                         if *run_id == handle.run_id => {
                         let usage = inclusive_usage(session.accounting, *usage);
@@ -732,14 +675,15 @@ async fn stream_run(
                             session.accounting,
                             session.estimated_cost_usd_nanos,
                         );
-                        let (status, message) = if matches!(outcome, RunOutcome::Completed)
-                            && let Some(limit) = options.max_cost_usd_nanos
-                            && let Some(message) = cost_budget_violation(limit, cost)
+                        let (status, message) = settle(outcome, interrupted);
+                        if text
+                            && matches!(
+                                status,
+                                HeadlessStatus::BudgetExhausted | HeadlessStatus::TimedOut
+                            )
                         {
-                            (HeadlessStatus::BudgetExhausted, Some(message))
-                        } else {
-                            settle(outcome, cancel.as_ref())
-                        };
+                            let _ = writeln!(stderr, "[run] {}", status.as_str());
+                        }
                         let prompt_identity = run_prompt_identity(sessions, handle).await?;
                         return Ok(RunEnd {
                             status,
@@ -750,54 +694,10 @@ async fn stream_run(
                             answer,
                         });
                     }
-                    SessionEvent::RunFinished { .. } if related => {
-                        check_cost = true;
-                    }
                     _ => {}
-                }
-
-                if over_turn_budget && cancel.is_none() {
-                    let limit = options.max_turns.unwrap_or_default();
-                    request_cancel(sessions, handle.run_id).await?;
-                    cancel = Some(CancelReason::Budget(format!(
-                        "the run exceeded its {limit} model turn budget"
-                    )));
-                    shutdown_at = Some(Instant::now() + SHUTDOWN_GRACE);
-                    if text {
-                        let _ = writeln!(stderr, "[run] model turn budget exhausted; cancelling");
-                    }
-                }
-                if check_cost && cancel.is_none() && let Some(limit) = options.max_cost_usd_nanos {
-                    let cost = session_cost(sessions, handle).await?;
-                    if let Some(message) = cost_budget_violation(limit, cost) {
-                        request_cancel(sessions, handle.run_id).await?;
-                        cancel = Some(CancelReason::Budget(message));
-                        shutdown_at = Some(Instant::now() + SHUTDOWN_GRACE);
-                        if text {
-                            let _ = writeln!(stderr, "[run] cost budget exhausted; cancelling");
-                        }
-                    }
                 }
             }
         }
-    }
-}
-
-fn beyond_turn_budget(options: &HeadlessOptions, turn_ordinal: u16) -> bool {
-    options.max_turns.is_some_and(|limit| turn_ordinal > limit)
-}
-
-fn cost_budget_violation(limit: u64, cost: Option<u64>) -> Option<String> {
-    match cost {
-        Some(cost) if cost > limit => Some(format!(
-            "the run's estimated cost exceeded its budget \
-             ({cost} > {limit} USD nanos)"
-        )),
-        Some(_) => None,
-        None => Some(
-            "the run's cost became unknown, so its hard cost budget could not be enforced"
-                .to_owned(),
-        ),
     }
 }
 
@@ -854,9 +754,11 @@ async fn run_prompt_identity(
         .ok_or_else(|| Failure::harness("the terminal run is missing from its session snapshot"))
 }
 
-/// Maps the run's durable outcome plus this invocation's cancellation intent
-/// to a terminal status.
-fn settle(outcome: &RunOutcome, cancel: Option<&CancelReason>) -> (HeadlessStatus, Option<String>) {
+/// Maps the run's durable outcome plus this invocation's interrupt intent to
+/// a terminal status. Budget outcomes are core-owned: the wall-clock bound
+/// keeps its historical `timed_out` status; every other bound is
+/// `budget_exhausted`.
+fn settle(outcome: &RunOutcome, interrupted: bool) -> (HeadlessStatus, Option<String>) {
     match outcome {
         RunOutcome::Completed => (HeadlessStatus::Completed, None),
         RunOutcome::Failed { failure } => {
@@ -866,55 +768,30 @@ fn settle(outcome: &RunOutcome, cancel: Option<&CancelReason>) -> (HeadlessStatu
             };
             (status, Some(failure.message.clone()))
         }
-        RunOutcome::Cancelled => match cancel {
-            Some(CancelReason::Timeout) => (
-                HeadlessStatus::TimedOut,
-                Some("the run was cancelled after its timeout elapsed".to_owned()),
-            ),
-            Some(CancelReason::Budget(message)) => {
-                (HeadlessStatus::BudgetExhausted, Some(message.clone()))
-            }
-            Some(CancelReason::Interrupt) => (
-                HeadlessStatus::Interrupted,
-                Some("the run was cancelled by an interrupt".to_owned()),
-            ),
-            None => (
-                HeadlessStatus::HarnessFailure,
-                Some("the run was cancelled outside this invocation".to_owned()),
-            ),
-        },
+        RunOutcome::BudgetExhausted { exhaustion } => {
+            let status = match exhaustion.limit {
+                BudgetLimitKind::Duration => HeadlessStatus::TimedOut,
+                BudgetLimitKind::ModelTurns
+                | BudgetLimitKind::ToolCalls
+                | BudgetLimitKind::TotalTokens
+                | BudgetLimitKind::Cost
+                | BudgetLimitKind::CostUnknown => HeadlessStatus::BudgetExhausted,
+            };
+            (status, Some(exhaustion.message.clone()))
+        }
+        RunOutcome::Cancelled if interrupted => (
+            HeadlessStatus::Interrupted,
+            Some("the run was cancelled by an interrupt".to_owned()),
+        ),
+        RunOutcome::Cancelled => (
+            HeadlessStatus::HarnessFailure,
+            Some("the run was cancelled outside this invocation".to_owned()),
+        ),
         RunOutcome::Interrupted => (
             HeadlessStatus::HarnessFailure,
             Some("the run was interrupted before reaching a terminal outcome".to_owned()),
         ),
     }
-}
-
-/// The session's inclusive estimated cost, including durable in-progress run
-/// accounting, read through the ordinary snapshot operation. `None` means the
-/// total is unknown, never zero.
-async fn session_cost(
-    sessions: &SessionRuntime,
-    handle: &RunHandle,
-) -> Result<Option<u64>, Failure> {
-    let snapshot = sessions
-        .snapshot(SnapshotRequest {
-            workspace_id: handle.workspace_id,
-            focused_session_id: Some(handle.session_id),
-            session_limit: 1,
-            message_limit: 1,
-        })
-        .await
-        .map_err(|error| Failure {
-            status: status_for_error(&error),
-            message: format!("could not read the session snapshot: {error}"),
-        })?;
-    Ok(snapshot.focused.and_then(|session| {
-        inclusive_cost(
-            session.summary.accounting,
-            session.summary.estimated_cost_usd_nanos,
-        )
-    }))
 }
 
 /// Sends the ordinary idempotent cancellation command. A run that already
@@ -1023,6 +900,7 @@ const fn status_for_error(error: &SessionRuntimeError) -> HeadlessStatus {
         | SessionRuntimeError::InvalidWorkspace
         | SessionRuntimeError::EmptyPrompt
         | SessionRuntimeError::PromptTooLarge
+        | SessionRuntimeError::InvalidRunLimits
         | SessionRuntimeError::InvalidModelSelection => HeadlessStatus::InvalidConfiguration,
         _ => HeadlessStatus::HarnessFailure,
     }
@@ -1067,6 +945,7 @@ mod tests {
             runtime: Arc::new(runtime),
             resolved_model: Arc::new(qq_protocol::ResolvedModel {
                 version: qq_protocol::ResolvedModelVersion::new(1).unwrap(),
+                request_shape: None,
                 route: "test/model".to_owned(),
                 provider_model: "test-model".to_owned(),
                 organization: None,
@@ -1653,7 +1532,10 @@ mod tests {
                 assert!(
                     matches!(
                         run.status,
-                        RunStatus::Completed | RunStatus::Cancelled | RunStatus::Failed
+                        RunStatus::Completed
+                            | RunStatus::Cancelled
+                            | RunStatus::Failed
+                            | RunStatus::BudgetExhausted
                     ),
                     "run {run:?} must be terminal"
                 );
@@ -1764,7 +1646,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1, "exactly one terminal outcome");
         assert_eq!(outcomes[0]["status"], "completed");
         assert_eq!(outcomes[0]["exit_code"], 0);
-        assert_eq!(outcomes[0]["prompt_identity"]["version"], 7);
+        assert_eq!(outcomes[0]["prompt_identity"]["version"], 8);
         assert!(outcomes[0]["prompt_identity"]["system_prompt_hash"].is_string());
         assert!(outcomes[0]["prompt_identity"]["tool_schema_hash"].is_string());
         assert_eq!(

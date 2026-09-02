@@ -143,7 +143,10 @@ xtask/
   model-provider adapters. `lib.rs`, `model.rs`, and `compiler.rs` form its
   public facade; concrete adapters live privately under `providers/`. It also
   owns the provider-neutral secret-reference vocabulary shared by config and
-  auth.
+  auth. The Amazon Bedrock family is the one feature-gated adapter
+  (`provider-bedrock`, default on) because it alone carries the AWS SDK
+  closure; recipes and neutral types compile in every profile and the
+  compiler refuses that family with a configuration error when it is absent.
 - `qq-protocol` contains shared identifiers, commands, events, and versioned
   wire types, plus the redacted local-server connection capability shared by
   the server and client adapters. It does not depend on an HTTP client or
@@ -249,6 +252,33 @@ selection and refer back to the run instead of copying the full descriptor.
 Historical rows remain explicitly unknown rather than being reinterpreted
 through current configuration.
 
+Version-2 resolved models also carry an optional opaque provider request-shape
+identity built once by the root from the effective adapter, API, endpoint mode,
+safe normalized endpoint, explicit region, and non-secret authorization shape.
+An AWS provider-chain region that can change across restart stays unknown. The
+root rejects Custom and LiteLLM endpoint provenance before hashing any URL
+bytes because an arbitrary path may carry credentials. Built-in deployments
+also stay unknown when endpoint userinfo, query, fragment, or custom static
+headers prevent a secret-free identity. Core combines a
+known provider identity with the provider-visible model, organization,
+generation/cache/output controls, and exact system/tool prefix. After a
+measured prompt turn, it persists that versioned basis, request byte count, and
+`context_tokens` atomically in the existing model-turn transaction. The next
+run's existing reservation query loads the basis without another store call.
+Only an exact shape/prefix match with monotonically growing request bytes may
+seed the conservative context estimate. Pricing-only refreshes are compatible;
+missing usage, model changes, successful compaction, malformed/unsupported or
+assembly-rewritten history, or any wire/prefix mismatch clear or disable reuse.
+Provider-overflow suppression is deliberately weaker than reuse: when the
+provider identity is unknown (Custom/LiteLLM, dynamic AWS region chains,
+historical descriptors), core falls back to a route-level shape in a separate
+digest domain, and pruned history does not discard the evidence. A repeated
+shape and static prefix therefore always compacts once before polling again,
+while an unknown identity never persists an occupancy basis for reuse.
+Schema version 18 stores that overflow basis in its own additive column; the
+version-17 resolved-model overflow column remains legacy state and is ignored
+because it lacks the static-prefix identity and measured request byte count.
+
 Protocol codecs, request-time authorization, framing, retry policy, and
 transport are internal implementation details. Shared protocol behavior is
 composed from private functions and small structs; do not introduce a
@@ -289,10 +319,20 @@ One durable run follows a guarded loop:
 
 This ordering makes persisted state authoritative and allows clients to resume
 an event stream without losing output. Each completed model turn also commits
-the run's cumulative usage and estimated cost, so a live budget observes the
-same durable boundary as the work it may cancel. If a provider omits usage
-after a hard cost budget was accepted, the headless runner cancels with an
-explicit budget outcome instead of continuing under an unmeasurable limit.
+the run's cumulative usage and estimated cost.
+
+Caller budgets are core-owned. `submit_prompt.limits` carries a versioned
+`RunLimits` (wall clock, model turns, tool calls, total tokens, cost) that is
+validated at admission, persisted with the run row, and metered by the runtime
+loop: every provider turn is decided at the turn boundary and the wall clock
+also bounds a provider stream that never yields. A cost cap without configured
+pricing is rejected before provider work. When the countable budget is nearly
+spent the last permitted turn becomes a tool-free final status response; an
+elapsed wall clock or a provider turn that omits usage under a cost cap settles
+immediately. Every bound produces the typed `budget_exhausted` outcome, never a
+provider failure, so the TUI, server, and headless adapter observe one
+contract. Sub-agents inherit the parent's wall clock and cost cap and charge
+their settled (or unknown) spend back to the parent's meter.
 
 A run may cross multiple bounded internal execution slices. The strict
 256-tool-call ceiling is a runaway-loop backstop for one slice, not a
@@ -333,6 +373,16 @@ child when it interrupts the owning parent. Parent cancellation uses the same
 durable ownership link for in-process children. Once a child completes, only
 its final committed model turn's text or refusal is returned to the parent;
 earlier turns remain visible in the child's authoritative transcript.
+
+Compaction is a property of that projection, not an edit to the transcript: a
+validated summary row and cutoff marker commit atomically with the internal
+summarization run, three compactions are retained per session for
+`RollbackCompaction`, and a summary that is empty, missing a required section,
+or fails to shrink the measured assembly settles as a policy failure while the
+prior compaction stays in force. `search_history` is the recall path that makes
+aggressive compaction safe: session runs may search the complete durable
+transcript, including spans compaction replaced, for bounded cited excerpts.
+Direct runs have no durable transcript and do not see the tool.
 
 Future model requests, capacity accounting, and compaction all consume the same
 provider-neutral projection of that durable state. The projection retains

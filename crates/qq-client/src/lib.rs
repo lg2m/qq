@@ -71,6 +71,7 @@ impl SessionClient {
             SessionCommand::DeleteSession { .. } => "/v1/sessions/delete",
             SessionCommand::PruneSessions { .. } => "/v1/sessions/prune",
             SessionCommand::CompactSession { .. } => "/v1/sessions/compact",
+            SessionCommand::RollbackCompaction { .. } => "/v1/sessions/compact/rollback",
         };
         self.post_json(
             path,

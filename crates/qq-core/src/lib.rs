@@ -16,8 +16,8 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
 use qq_protocol::{
-    ApprovalMode, ContentHash, RunActivity, RunCommand, RunEvent, RunFailureKind,
-    RunPromptIdentity, TokenUsage, ToolCallId,
+    ApprovalMode, BudgetLimitKind, ContentHash, ModelPricing, RunActivity, RunCommand, RunEvent,
+    RunFailureKind, RunLimits, RunPromptIdentity, TokenUsage, ToolCallId,
 };
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
@@ -34,10 +34,12 @@ mod workspace;
 
 pub use runtime::TurnRetryPolicy;
 use runtime::{
-    AGENT_PROMPT_VERSION, GateDecision, PendingToolCall, PreparedRequestWeight, RuntimeEvent,
-    RuntimeToolCall, SPAWN_UNAVAILABLE_RESULT, SpawnAgentFuture, SpawnAgentOutcome,
-    SubagentSpawner, ToolGate, ToolGateFuture, TurnBlock, agent_system_prompt, attempts_message,
-    is_transient_provider_failure, tool_schema_measurement,
+    AGENT_PROMPT_VERSION, BUDGET_FINAL_RESPONSE_NOTICE, BudgetDecision, BudgetMeter, GateDecision,
+    HistorySearcher, PendingToolCall, PreparedRequestWeight, PreparedStaticPrefix, RuntimeEvent,
+    RuntimeToolCall, SEARCH_HISTORY_TOOL, SPAWN_UNAVAILABLE_RESULT, SearchHistoryArgs,
+    SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, TurnBlock,
+    agent_system_prompt, attempts_message, is_transient_provider_failure, render_history_matches,
+    search_history_spec, tool_schema_measurement,
 };
 
 pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult};
@@ -91,6 +93,14 @@ pub(crate) struct RunCapabilities {
     slash_is_literal: bool,
     allow_tools: bool,
     max_output_tokens: Option<u32>,
+    /// Caller-imposed budgets and the pricing that makes the cost bound
+    /// measurable. Admission rejects a cost cap without pricing before this
+    /// struct is built.
+    limits: RunLimits,
+    pricing: Option<ModelPricing>,
+    /// Full-transcript recall for `search_history`. Session runs install one;
+    /// direct runs have no durable history to search.
+    history: Option<Arc<dyn HistorySearcher>>,
 }
 
 impl RunCapabilities {
@@ -101,6 +111,9 @@ impl RunCapabilities {
             slash_is_literal: false,
             allow_tools: true,
             max_output_tokens: None,
+            limits: RunLimits::default(),
+            pricing: None,
+            history: None,
         }
     }
 
@@ -122,6 +135,17 @@ impl RunCapabilities {
         self
     }
 
+    pub(crate) fn with_limits(mut self, limits: RunLimits, pricing: Option<ModelPricing>) -> Self {
+        self.limits = limits;
+        self.pricing = pricing;
+        self
+    }
+
+    pub(crate) fn with_history(mut self, history: Arc<dyn HistorySearcher>) -> Self {
+        self.history = Some(history);
+        self
+    }
+
     pub(crate) const fn restricted() -> Self {
         Self {
             spawner: None,
@@ -129,6 +153,15 @@ impl RunCapabilities {
             slash_is_literal: false,
             allow_tools: true,
             max_output_tokens: None,
+            limits: RunLimits {
+                max_duration_ms: None,
+                max_model_turns: None,
+                max_tool_calls: None,
+                max_total_tokens: None,
+                max_cost_usd_nanos: None,
+            },
+            pricing: None,
+            history: None,
         }
     }
 }
@@ -347,10 +380,16 @@ impl Runtime {
                 slash_is_literal,
                 allow_tools,
                 max_output_tokens,
+                limits,
+                pricing,
+                history,
             } = capabilities;
             let max_output_tokens = max_output_tokens
                 .unwrap_or(model_max_output_tokens)
                 .min(model_max_output_tokens);
+            // The wall clock starts at admission, before workspace preparation
+            // and provider selection, so caller time bounds mean what they say.
+            let mut budget = BudgetMeter::new(limits, pricing, tokio::time::Instant::now());
             let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
             yield RuntimeEvent::Started;
 
@@ -421,6 +460,10 @@ impl Runtime {
             if allow_tools && spawner.is_some() {
                 tool_specs.push(tools::spawn_agent_spec(&spawn_model_routes));
             }
+            // Full-transcript recall exists only for durable session runs.
+            if allow_tools && history.is_some() {
+                tool_specs.push(search_history_spec());
+            }
             if allow_tools && let Some(registry) = &mcp {
                 for spec in registry.tool_specs().await {
                     if spec.name().starts_with(MCP_TOOL_PREFIX)
@@ -438,17 +481,16 @@ impl Runtime {
                 selected_guidance.as_ref(),
             ));
             let tool_schema = tool_schema_measurement(&tool_specs);
-            let mut prompt_identity = Some(RunPromptIdentity {
+            let system_prompt_hash = ContentHash::from_bytes(Sha256::digest(system.as_bytes()).into());
+            let mut prompt_identity = Some(Arc::new(RunPromptIdentity {
                     version: AGENT_PROMPT_VERSION,
                     instruction_hash: workspace_instructions.hash(),
-                    system_prompt_hash: Some(ContentHash::from_bytes(
-                        Sha256::digest(system.as_bytes()).into(),
-                    )),
+                    system_prompt_hash: Some(system_prompt_hash),
                     tool_schema_hash: Some(tool_schema.hash),
                     selected_guidance: selected_guidance
                         .as_ref()
                         .map(|guidance| Box::new(guidance.identity())),
-                });
+                }));
             // Only the transcript preceding the accepted prompt can be
             // replaced by a between-run compaction. Everything appended by
             // this run is irreducible until the run settles.
@@ -462,24 +504,47 @@ impl Runtime {
             let mut model_text_bytes = 0_usize;
             let mut continuing_slice = false;
             for turn_ordinal in 1..=u16::MAX {
+                // Caller budgets are decided at the turn boundary, before any
+                // provider request. A spent work budget grants one tool-free
+                // final response; a second spent check, an elapsed wall
+                // clock, or unmeasurable cost settles the run here.
+                let budget_final_turn = match budget.before_turn(
+                    tokio::time::Instant::now(),
+                    if allow_tools { MAX_TOOL_CALLS_PER_TURN } else { 0 },
+                ) {
+                    BudgetDecision::Continue => false,
+                    BudgetDecision::FinalResponse(_) => true,
+                    BudgetDecision::Exhausted(exhaustion) => {
+                        yield RuntimeEvent::BudgetExhausted { exhaustion };
+                        return;
+                    }
+                };
                 // Reserve enough capacity for the largest valid provider
                 // turn. Without this reservation, a slice at (for example)
                 // 255 calls could accept a 16-call turn and overshoot its
                 // strict ceiling before reaching the next turn boundary.
                 // The tool-free checkpoint is persisted but is not the run's
                 // terminal outcome; the next turn starts a new slice.
-                let checkpoint_turn = slice_tool_calls
-                    .saturating_add(MAX_TOOL_CALLS_PER_TURN)
-                    > MAX_TOOL_CALLS_PER_SLICE;
+                let checkpoint_turn = !budget_final_turn
+                    && slice_tool_calls
+                        .saturating_add(MAX_TOOL_CALLS_PER_TURN)
+                        > MAX_TOOL_CALLS_PER_SLICE;
                 let continuation_turn = std::mem::take(&mut continuing_slice);
-                let request_system: Arc<str> = if checkpoint_turn {
+                let request_system: Arc<str> = if budget_final_turn {
+                    Arc::from(format!("{system}\n\n{BUDGET_FINAL_RESPONSE_NOTICE}"))
+                } else if checkpoint_turn {
                     Arc::from(format!("{system}\n\n{SLICE_CHECKPOINT_NOTICE}"))
                 } else if continuation_turn {
                     Arc::from(format!("{system}\n\n{SLICE_CONTINUATION_NOTICE}"))
                 } else {
                     Arc::clone(&system)
                 };
-                let request_has_tools = allow_tools && !checkpoint_turn;
+                let request_has_tools = allow_tools && !checkpoint_turn && !budget_final_turn;
+                let request_system_hash = if budget_final_turn || checkpoint_turn || continuation_turn {
+                    ContentHash::from_bytes(Sha256::digest(request_system.as_bytes()).into())
+                } else {
+                    system_prompt_hash
+                };
                 let system_bytes = u64::try_from(request_system.len())
                     .unwrap_or(u64::MAX)
                     .saturating_add(CONTEXT_BLOCK_FRAMING_BYTES);
@@ -503,6 +568,10 @@ impl Runtime {
                 yield RuntimeEvent::Prepared {
                     turn_ordinal,
                     identity: prompt_identity.take(),
+                    static_prefix: PreparedStaticPrefix::new(
+                        request_system_hash,
+                        request_has_tools.then_some(tool_schema.hash),
+                    ),
                     weight: PreparedRequestWeight {
                         max_output_tokens,
                         system_bytes,
@@ -543,8 +612,31 @@ impl Runtime {
                 let mut reasoning_bytes = 0_usize;
                 let mut open_reasoning = None;
                 let mut turn_streamed = false;
+                let deadline = budget.deadline();
 
-                while let Some(event) = provider_events.next().await {
+                loop {
+                    // The wall clock bounds a hanging provider too: an
+                    // elapsed deadline settles the run without waiting for a
+                    // stream event that may never arrive.
+                    let event = match deadline {
+                        Some(deadline) => tokio::select! {
+                            biased;
+                            () = tokio::time::sleep_until(deadline) => {
+                                let exhaustion = budget.exhaustion(
+                                    BudgetLimitKind::Duration,
+                                    false,
+                                    tokio::time::Instant::now(),
+                                );
+                                yield RuntimeEvent::BudgetExhausted { exhaustion };
+                                return;
+                            }
+                            event = provider_events.next() => event,
+                        },
+                        None => provider_events.next().await,
+                    };
+                    let Some(event) = event else {
+                        break;
+                    };
                     match event {
                         Ok(ProviderEvent::ReasoningStarted { kind }) => {
                             if open_reasoning.is_some() {
@@ -628,6 +720,20 @@ impl Runtime {
                             yield RuntimeEvent::RefusalDelta { text };
                         }
                         Ok(ProviderEvent::ToolCallStarted { id, name }) => {
+                            if budget_final_turn {
+                                // The model ignored the tool-free final
+                                // response request. The budget still settles
+                                // the run: exhaustion is never a provider
+                                // failure, and no more work may be spent.
+                                let BudgetDecision::Exhausted(mut exhaustion) = budget
+                                    .before_turn(tokio::time::Instant::now(), 0)
+                                else {
+                                    unreachable!("a requested final response always settles the run")
+                                };
+                                exhaustion.final_response = false;
+                                yield RuntimeEvent::BudgetExhausted { exhaustion };
+                                return;
+                            }
                             if !request_has_tools {
                                 yield RuntimeEvent::Failed {
                                     kind: RunFailureKind::ProviderProtocol,
@@ -877,6 +983,37 @@ impl Runtime {
                     usage: terminal_usage,
                     calls: calls.clone(),
                 };
+                budget.charge_turn(terminal_usage);
+                budget.charge_tool_calls(calls.len());
+
+                if budget_final_turn {
+                    // The reserved final response has been persisted; the
+                    // run settles with the limit that spent its budget.
+                    let BudgetDecision::Exhausted(exhaustion) = budget.before_turn(
+                        tokio::time::Instant::now(),
+                        0,
+                    ) else {
+                        unreachable!("a requested final response always settles the run")
+                    };
+                    yield RuntimeEvent::BudgetExhausted { exhaustion };
+                    return;
+                }
+                // Cost and token bounds are only observable after a turn. A
+                // completed run that overran them settles as exhausted, not
+                // completed, so no client can mistake the overrun for success.
+                if calls.is_empty()
+                    && let Some(kind) = budget.exceeded(tokio::time::Instant::now())
+                    && matches!(
+                        kind,
+                        BudgetLimitKind::Cost
+                            | BudgetLimitKind::CostUnknown
+                            | BudgetLimitKind::TotalTokens
+                    )
+                {
+                    let exhaustion = budget.exhaustion(kind, false, tokio::time::Instant::now());
+                    yield RuntimeEvent::BudgetExhausted { exhaustion };
+                    return;
+                }
 
                 if checkpoint_turn && !assistant.has_content() {
                     yield RuntimeEvent::Failed {
@@ -946,7 +1083,11 @@ impl Runtime {
                     let cancelled = Arc::clone(&cancelled);
                     let mcp = mcp.clone();
                     let spawner = spawner.clone();
+                    let history = history.clone();
                     async move {
+                        // `Some` when a sub-agent ran: its spend (or unknown
+                        // spend) is charged to the parent's cost budget.
+                        let mut child_cost: Option<Option<u64>> = None;
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
                                 content: error,
@@ -983,6 +1124,7 @@ impl Runtime {
                                             let outcome = spawner
                                                 .spawn(arguments.task, arguments.model)
                                                 .await;
+                                            child_cost = Some(outcome.cost_usd_nanos);
                                             tools::bounded_result(
                                                 outcome.content,
                                                 outcome.is_error,
@@ -998,6 +1140,31 @@ impl Runtime {
                                     tools::bounded_result(SPAWN_UNAVAILABLE_RESULT.to_owned(), true)
                                 }
                             },
+                            // Full-transcript recall dispatches to the session
+                            // layer; the tool is declared only when a searcher
+                            // exists, so a guessed call is simply unknown here.
+                            None if call.name == SEARCH_HISTORY_TOOL && history.is_some() => {
+                                let history = history.expect("the history searcher was just checked");
+                                match serde_json::from_str::<SearchHistoryArgs>(&call.arguments) {
+                                    Ok(arguments) if arguments.query.trim().is_empty() => {
+                                        tools::bounded_result("query must not be empty".to_owned(), true)
+                                    }
+                                    Ok(arguments) => {
+                                        let limit = arguments.limit.clamp(1, crate::runtime::MAX_HISTORY_MATCHES);
+                                        match history.search(arguments.query.clone(), limit).await {
+                                            Ok(matches) => tools::bounded_result(
+                                                render_history_matches(&arguments.query, &matches),
+                                                false,
+                                            ),
+                                            Err(error) => tools::bounded_result(error, true),
+                                        }
+                                    }
+                                    Err(error) => tools::bounded_result(
+                                        format!("invalid arguments: {error}"),
+                                        true,
+                                    ),
+                                }
+                            }
                             // MCP calls dispatch to the shared registry; the
                             // outcome flows through the same bounded-result
                             // truncation as built-in tools, so an MCP call is
@@ -1021,7 +1188,7 @@ impl Runtime {
                                 .await
                             }
                         };
-                        (call, result)
+                        (call, result, child_cost)
                     }
                 };
                 // Read-only turns overlap under a small bound; a turn with any
@@ -1043,7 +1210,7 @@ impl Runtime {
                         let (delta_sender, mut deltas) =
                             tokio::sync::mpsc::channel::<String>(SHELL_OUTPUT_QUEUE_CAPACITY);
                         let mut execution = Box::pin(execute_one(call, Some(delta_sender)));
-                        let (call, result) = loop {
+                        let (call, result, child_cost) = loop {
                             tokio::select! {
                                 biased;
                                 chunk = deltas.recv() => match chunk {
@@ -1062,6 +1229,9 @@ impl Runtime {
                         while let Ok(chunk) = deltas.try_recv() {
                             yield RuntimeEvent::ToolCallOutputDelta { id: call_id, chunk };
                         }
+                        if let Some(cost) = child_cost {
+                            budget.charge_child(cost);
+                        }
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                         let display = (!result.is_error)
                             .then(|| approval::edit_result_display(&call.name, &call.arguments))
@@ -1079,7 +1249,10 @@ impl Runtime {
                         approved.into_iter().map(|call| execute_one(call, None)),
                     )
                         .buffer_unordered(MAX_PARALLEL_READS);
-                    while let Some((call, result)) = executions.next().await {
+                    while let Some((call, result, child_cost)) = executions.next().await {
+                        if let Some(cost) = child_cost {
+                            budget.charge_child(cost);
+                        }
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                         yield RuntimeEvent::ToolCallFinished {
                             id: call.id,
@@ -1178,6 +1351,15 @@ fn public_run_stream(mut events: RuntimeStream, context_window: Option<u32>) -> 
                 }
                 RuntimeEvent::Failed { kind, message } => {
                     yield RunEvent::Failed { kind, message };
+                    return;
+                }
+                // The direct compatibility path imposes no caller limits, so
+                // this cannot occur; surface it truthfully rather than panic.
+                RuntimeEvent::BudgetExhausted { exhaustion } => {
+                    yield RunEvent::Failed {
+                        kind: RunFailureKind::Policy,
+                        message: exhaustion.message,
+                    };
                     return;
                 }
             }
@@ -4025,6 +4207,14 @@ mod tests {
         );
         let system = requests[0].system().unwrap();
         assert!(!system.contains("Delegation:"));
+        // Direct runs have no durable transcript, so history recall is
+        // withheld the same way.
+        assert!(
+            !requests[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == SEARCH_HISTORY_TOOL)
+        );
     }
 
     #[tokio::test]
@@ -4043,6 +4233,7 @@ mod tests {
             outcome: SpawnAgentOutcome {
                 content: "x".repeat(tools::MAX_TOOL_RESULT_BYTES + 1024),
                 is_error: false,
+                cost_usd_nanos: Some(0),
             },
             tasks: Arc::clone(&tasks),
         });
@@ -4115,6 +4306,7 @@ mod tests {
                 outcome: SpawnAgentOutcome {
                     content: "child answer".to_owned(),
                     is_error: false,
+                    cost_usd_nanos: Some(0),
                 },
                 tasks: Arc::clone(&tasks),
             });

@@ -6,7 +6,11 @@ use std::{pin::Pin, sync::Arc};
 
 use futures_core::Stream;
 
+// The AWS SDK family is the only heavy optional dependency closure; recipes
+// and neutral types stay available without it.
+#[cfg(feature = "provider-bedrock")]
 mod aws;
+mod bedrock_auth;
 pub mod compiler;
 mod construction;
 mod credentials;
@@ -22,7 +26,7 @@ mod sse;
 #[doc(hidden)]
 pub mod test_support;
 
-pub use aws::BedrockAuth;
+pub use bedrock_auth::BedrockAuth;
 pub use compiler::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderRecipe,
 };

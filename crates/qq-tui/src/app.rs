@@ -762,6 +762,13 @@ impl App {
                     ),
                 );
             }
+            SessionEvent::SessionCompactionRolledBack { session, remaining } => {
+                self.upsert_summary(session.clone());
+                self.set_info_for(
+                    Some(envelope.session_id),
+                    format!("compaction rolled back; {remaining} retained"),
+                );
+            }
             // Run-level audit updates are not session state. In particular,
             // old persisted events may predate the authoritative session
             // field, so replaying one must not repopulate the meter.
@@ -789,7 +796,9 @@ impl App {
                     let state = match outcome {
                         RunOutcome::Completed => MessageState::Complete,
                         RunOutcome::Cancelled => MessageState::Cancelled,
-                        RunOutcome::Interrupted => MessageState::Interrupted,
+                        RunOutcome::Interrupted | RunOutcome::BudgetExhausted { .. } => {
+                            MessageState::Interrupted
+                        }
                         RunOutcome::Failed { .. } => MessageState::Failed,
                     };
                     for message in messages
@@ -812,8 +821,14 @@ impl App {
                         }
                     }
                 }
-                if let RunOutcome::Failed { failure } = outcome {
-                    self.set_error_for(Some(envelope.session_id), failure.message.clone());
+                match outcome {
+                    RunOutcome::Failed { failure } => {
+                        self.set_error_for(Some(envelope.session_id), failure.message.clone());
+                    }
+                    RunOutcome::BudgetExhausted { exhaustion } => {
+                        self.set_error_for(Some(envelope.session_id), exhaustion.message.clone());
+                    }
+                    RunOutcome::Completed | RunOutcome::Cancelled | RunOutcome::Interrupted => {}
                 }
             }
         }
@@ -1803,7 +1818,11 @@ impl App {
             true,
             vec![ClientRequest::Command(CommandRequest {
                 command_id,
-                command: SessionCommand::SubmitPrompt { session_id, prompt },
+                command: SessionCommand::SubmitPrompt {
+                    session_id,
+                    prompt,
+                    limits: qq_protocol::RunLimits::default(),
+                },
             })],
         )
     }
@@ -2779,6 +2798,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: _,
                     prompt,
+                    limits: _,
                 },
             ..
         }) = &requests[0]
@@ -3221,6 +3241,7 @@ mod tests {
             }),
             context_tokens: Some(9_000),
             estimated_cost_usd_nanos: Some(1),
+            limits: None,
         });
         initial.focused.as_mut().unwrap().summary.context_tokens = Some(9_000);
         let mut summary = initial.focused.as_ref().unwrap().summary.clone();
@@ -3334,6 +3355,7 @@ mod tests {
                     usage: None,
                     context_tokens: None,
                     estimated_cost_usd_nanos: None,
+                    limits: None,
                 },
                 queue_position: 1,
             },
@@ -3410,6 +3432,7 @@ mod tests {
             }),
             context_tokens: None,
             estimated_cost_usd_nanos: Some(1),
+            limits: None,
         });
         let workspace_id = initial.workspace.id;
         let store_id = initial.cursor.store_id;

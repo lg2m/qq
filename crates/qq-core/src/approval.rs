@@ -159,7 +159,11 @@ pub(crate) fn classify(name: &str, arguments: &str) -> ToolClass {
         // spawn_agent is read-only: its child session runs in read-only
         // approval mode, so the call carries no mutation authority and never
         // needs an approval prompt.
-        "read_file" | "list_dir" | "search" | crate::tools::SPAWN_AGENT_TOOL => ToolClass::ReadOnly,
+        "read_file"
+        | "list_dir"
+        | "search"
+        | crate::tools::SPAWN_AGENT_TOOL
+        | crate::runtime::SEARCH_HISTORY_TOOL => ToolClass::ReadOnly,
         "edit_file" | "write_file" => ToolClass::Mutating,
         "shell" => shell_class(arguments),
         #[cfg(test)]

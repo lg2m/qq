@@ -21,7 +21,8 @@ use qq_core::{
 };
 use qq_protocol::{
     ApprovalGrant, CapabilitySupport, CommandRequest, GenerationCapabilities, ModelCatalogRequest,
-    ModelDescriptor, PromptCacheCapabilities, ResolvedModel, ResolvedModelVersion, RunFailureKind,
+    ModelDescriptor, PromptCacheCapabilities, ProviderRequestShapeIdentity,
+    ProviderRequestShapeVersion, ResolvedModel, ResolvedModelVersion, RunFailureKind,
     SnapshotRequest, SubscribeRequest, WorkspaceGrantOutcome,
 };
 use qq_provider::{
@@ -565,8 +566,9 @@ impl RuntimeFactory {
             },
         };
         Ok(ResolvedModel {
-            version: ResolvedModelVersion::new(1)
+            version: ResolvedModelVersion::new(2)
                 .expect("resolved-model schema version must be non-zero"),
+            request_shape: provider_request_shape_identity(provider_id, provider, access, api),
             route: snapshot.model().as_str().to_owned(),
             provider_model: snapshot.model().model().to_owned(),
             organization: snapshot.organization().map(str::to_owned),
@@ -1430,6 +1432,8 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> ServerHandlerError {
         | SessionRuntimeError::InvalidWorkspace
         | SessionRuntimeError::EmptyPrompt
         | SessionRuntimeError::PromptTooLarge
+        | SessionRuntimeError::InvalidRunLimits
+        | SessionRuntimeError::NoCompactionToRollBack
         | SessionRuntimeError::WorkspaceNotFound
         | SessionRuntimeError::SessionNotFound
         | SessionRuntimeError::SessionActive
@@ -1498,6 +1502,100 @@ fn provider_api_name(api: ProviderApi) -> &'static str {
     }
 }
 
+/// Builds the durable provider identity only from validated, non-secret
+/// deployment inputs. Custom endpoint provenance, static header values, and
+/// URL credential channels are intentionally not hashed: those configurations
+/// remain explicitly unknown for cross-run occupancy reuse.
+fn provider_request_shape_identity(
+    provider_id: &str,
+    provider: &ProviderConfig,
+    access: &ProviderAccess,
+    api: ProviderApi,
+) -> Option<ProviderRequestShapeIdentity> {
+    if provider.uses_custom_endpoint() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    update_digest(&mut digest, b"qq-provider-request-shape-v1");
+    update_digest(&mut digest, provider_id.as_bytes());
+    update_digest(&mut digest, provider_api_name(api).as_bytes());
+    match access {
+        ProviderAccess::Http(access) => {
+            // The provider compiler rejects userinfo and fragments. Exact
+            // endpoints may otherwise contain a query, so apply the stricter
+            // durable-identity rule here before reading any endpoint bytes.
+            let endpoint = reqwest::Url::parse(access.endpoint()).ok()?;
+            if !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some()
+                || !access.headers().is_empty()
+            {
+                return None;
+            }
+            update_digest(&mut digest, b"http");
+            update_digest(&mut digest, endpoint.as_str().as_bytes());
+            update_digest(
+                &mut digest,
+                match access.endpoint_mode() {
+                    EndpointMode::Base => b"base",
+                    EndpointMode::Exact => b"exact",
+                },
+            );
+            match access.auth() {
+                HttpCredential::Configured(ProviderAuth::NoAuth) => {
+                    update_digest(&mut digest, b"configured-no-auth");
+                }
+                HttpCredential::Configured(ProviderAuth::ApiKey(_)) => {
+                    update_digest(&mut digest, b"configured-api-key");
+                }
+                HttpCredential::Configured(ProviderAuth::Bearer(_)) => {
+                    update_digest(&mut digest, b"configured-bearer");
+                }
+                HttpCredential::Configured(ProviderAuth::Header(name, _)) => {
+                    update_digest(&mut digest, b"configured-header");
+                    update_digest(&mut digest, name.as_bytes());
+                }
+                HttpCredential::ApiKey { audience, .. } => {
+                    update_digest(&mut digest, b"built-in-api-key");
+                    update_digest(&mut digest, audience.as_bytes());
+                }
+                HttpCredential::OpenAiCodex { .. } => {
+                    update_digest(&mut digest, b"request-time-codex");
+                }
+                HttpCredential::XAi { .. } => {
+                    update_digest(&mut digest, b"request-time-bearer");
+                }
+            }
+        }
+        ProviderAccess::AmazonBedrock { region, auth } => {
+            let region = region.as_deref()?;
+            update_digest(&mut digest, b"amazon-bedrock-sdk");
+            update_digest(&mut digest, region.as_bytes());
+            update_digest(&mut digest, bedrock_auth_shape(auth));
+        }
+        ProviderAccess::AmazonBedrockMantle { region, auth, .. } => {
+            let region = region.as_deref()?;
+            update_digest(&mut digest, b"amazon-bedrock-mantle");
+            update_digest(&mut digest, region.as_bytes());
+            update_digest(&mut digest, bedrock_auth_shape(auth));
+        }
+    }
+    Some(ProviderRequestShapeIdentity {
+        version: ProviderRequestShapeVersion::new(1)
+            .expect("provider request-shape version must be non-zero"),
+        digest: qq_protocol::ContentHash::from_bytes(digest.finalize().into()),
+    })
+}
+
+fn bedrock_auth_shape(auth: &BedrockAuth) -> &'static [u8] {
+    match auth {
+        BedrockAuth::Aws(AwsAuth::DefaultChain) => b"aws-default-chain",
+        BedrockAuth::Aws(AwsAuth::Profile(_)) => b"aws-profile",
+        BedrockAuth::ApiKey(_) => b"api-key",
+    }
+}
+
 fn http_protocol(provider: &str, api: ProviderApi) -> Result<HttpProtocol, RuntimeBuildError> {
     match api {
         ProviderApi::OpenAiResponses => Ok(HttpProtocol::OpenAiResponses),
@@ -1533,7 +1631,7 @@ fn provider_key<'a>(
 }
 
 fn update_digest(digest: &mut Sha256, value: &[u8]) {
-    digest.update(value.len().to_le_bytes());
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     digest.update(value);
 }
 
@@ -1663,7 +1761,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures_util::stream;
     use qq_auth::{CredentialPaths, KeyringBackend, KeyringError};
-    use qq_config::{ConfigPaths, RuntimeOverrides};
+    use qq_config::{ConfigPaths, ProviderKind, RuntimeOverrides, UsageType};
     use qq_protocol::{
         CommandId, CommandOutcome, ModelSelection, RunId, RunPromptIdentity, RunStatus,
         SessionCommand, SessionId, WorkspaceId,
@@ -1788,6 +1886,7 @@ mod tests {
                     runtime,
                     resolved_model: Arc::new(ResolvedModel {
                         version: ResolvedModelVersion::new(1).unwrap(),
+                        request_shape: None,
                         route: "test/model".to_owned(),
                         provider_model: "test/model".to_owned(),
                         organization: None,
@@ -1921,6 +2020,7 @@ mod tests {
                 SessionCommand::SubmitPrompt {
                     session_id: sessions[0],
                     prompt: "/review focus on cancellation".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await
@@ -1950,6 +2050,7 @@ mod tests {
             command: SessionCommand::SubmitPrompt {
                 session_id: sessions[1],
                 prompt: "/review focus on cancellation".to_owned(),
+                limits: qq_protocol::RunLimits::default(),
             },
         };
         let response = reqwest::Client::builder()
@@ -2113,7 +2214,8 @@ mod tests {
 
         let resolved = factory.resolved_model_for_snapshot(&snapshot).unwrap();
 
-        assert_eq!(resolved.version.get(), 1);
+        assert_eq!(resolved.version.get(), 2);
+        assert_eq!(resolved.request_shape, None);
         assert_eq!(resolved.route, "custom/test-model");
         assert_eq!(resolved.provider_model, "test-model");
         assert_eq!(resolved.organization.as_deref(), Some("org-a"));
@@ -2141,6 +2243,232 @@ mod tests {
         let encoded = serde_json::to_string(&resolved).unwrap();
         assert!(!encoded.contains("sk-super-secret"), "{encoded}");
         assert!(!encoded.contains("api_key"), "{encoded}");
+    }
+
+    #[test]
+    fn request_shape_identity_stays_unknown_for_secret_bearing_deployment_channels() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let resolve = |connection: &str| {
+            let request = LoadRequest::new(fixture.path("work")).with_explicit_content(format!(
+                r#"(
+                    version: 1,
+                    model: "custom/test-model",
+                    providers: {{
+                        "custom": Custom(
+                            connection: ({connection}),
+                            models: {{"test-model": (name: "Test model")}},
+                        ),
+                    }},
+                )"#
+            ));
+            let snapshot = factory.load(&request).unwrap();
+            factory.resolved_model_for_snapshot(&snapshot).unwrap()
+        };
+
+        for (connection, forbidden) in [
+            (
+                r#"base_url: "https://user:credential@example.test/v1", api: OpenAiResponses, auth: NoAuth"#,
+                "credential",
+            ),
+            (
+                r#"base_url: "https://example.test/v1?api_key=query-secret", api: OpenAiResponses, auth: NoAuth"#,
+                "query-secret",
+            ),
+            (
+                r#"base_url: "https://example.test/v1", api: OpenAiResponses, auth: NoAuth, headers: {"x-secret": "header-secret"}"#,
+                "header-secret",
+            ),
+            (
+                r#"base_url: "https://example.test/v1/path-secret", api: OpenAiResponses, auth: NoAuth"#,
+                "path-secret",
+            ),
+        ] {
+            let resolved = resolve(connection);
+            assert_eq!(resolved.version.get(), 2);
+            assert_eq!(resolved.request_shape, None);
+            let encoded = serde_json::to_string(&resolved).unwrap();
+            assert!(!encoded.contains(forbidden), "{encoded}");
+            let forbidden_digest = format!("{:x}", Sha256::digest(forbidden.as_bytes()));
+            assert!(!encoded.contains(&forbidden_digest), "{encoded}");
+            assert!(!encoded.contains("request_shape"), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn request_shape_identity_is_canonical_and_tracks_every_safe_wire_input() {
+        let trusted_http = ProviderConfig::new(
+            ProviderKind::OpenAi,
+            None,
+            UsageType::Metered,
+            BTreeMap::new(),
+        );
+        let trusted_bedrock = ProviderConfig::new(
+            ProviderKind::AmazonBedrock,
+            None,
+            UsageType::Metered,
+            BTreeMap::new(),
+        );
+        let http = |endpoint: &str, mode: EndpointMode, api: ProviderApi, auth: ProviderAuth| {
+            ProviderAccess::Http(HttpAccess::new(
+                endpoint,
+                mode,
+                api,
+                HttpCredential::Configured(auth),
+                BTreeMap::new(),
+            ))
+        };
+        let api_key = |value: &str| {
+            ProviderAuth::ApiKey(qq_config::SecretRef::Value(qq_config::SecretLiteral::new(
+                value,
+            )))
+        };
+        let base = http(
+            "https://example.test/v1",
+            EndpointMode::Base,
+            ProviderApi::OpenAiResponses,
+            api_key("first-secret"),
+        );
+        let identity = provider_request_shape_identity(
+            "openai",
+            &trusted_http,
+            &base,
+            ProviderApi::OpenAiResponses,
+        )
+        .unwrap();
+        let normalized = http(
+            "HTTPS://EXAMPLE.TEST:443/v1",
+            EndpointMode::Base,
+            ProviderApi::OpenAiResponses,
+            api_key("rotated-secret"),
+        );
+        assert_eq!(
+            provider_request_shape_identity(
+                "openai",
+                &trusted_http,
+                &normalized,
+                ProviderApi::OpenAiResponses,
+            ),
+            Some(identity),
+            "URL spelling and credential rotation do not change wire shape"
+        );
+
+        let variants = [
+            http(
+                "https://other.example.test/v1",
+                EndpointMode::Base,
+                ProviderApi::OpenAiResponses,
+                api_key("first-secret"),
+            ),
+            http(
+                "https://example.test/v1",
+                EndpointMode::Exact,
+                ProviderApi::OpenAiResponses,
+                api_key("first-secret"),
+            ),
+            http(
+                "https://example.test/v1",
+                EndpointMode::Base,
+                ProviderApi::OpenAiChatCompletions,
+                api_key("first-secret"),
+            ),
+            http(
+                "https://example.test/v1",
+                EndpointMode::Base,
+                ProviderApi::OpenAiResponses,
+                ProviderAuth::Bearer(qq_config::SecretRef::Value(qq_config::SecretLiteral::new(
+                    "first-secret",
+                ))),
+            ),
+        ];
+        for variant in variants {
+            let ProviderAccess::Http(access) = &variant else {
+                unreachable!()
+            };
+            assert_ne!(
+                provider_request_shape_identity("openai", &trusted_http, &variant, access.api()),
+                Some(identity)
+            );
+        }
+
+        let bedrock = ProviderAccess::AmazonBedrock {
+            region: Some("us-east-1".to_owned()),
+            auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
+        };
+        let other_region = ProviderAccess::AmazonBedrock {
+            region: Some("us-west-2".to_owned()),
+            auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
+        };
+        assert_ne!(
+            provider_request_shape_identity(
+                "bedrock",
+                &trusted_bedrock,
+                &bedrock,
+                ProviderApi::BedrockConverse,
+            ),
+            provider_request_shape_identity(
+                "bedrock",
+                &trusted_bedrock,
+                &other_region,
+                ProviderApi::BedrockConverse,
+            )
+        );
+        assert_eq!(
+            provider_request_shape_identity(
+                "bedrock",
+                &trusted_bedrock,
+                &ProviderAccess::AmazonBedrock {
+                    region: None,
+                    auth: BedrockAuth::Aws(AwsAuth::DefaultChain),
+                },
+                ProviderApi::BedrockConverse,
+            ),
+            None,
+            "a dynamic AWS region chain cannot produce a durable exact identity"
+        );
+
+        // Built-in deployments also stay unknown when the endpoint or static
+        // headers could carry a secret. Custom/LiteLLM return before these
+        // guards run, so exercise them through a trusted provider kind.
+        let guarded = [
+            http(
+                "https://user:credential@example.test/v1",
+                EndpointMode::Base,
+                ProviderApi::OpenAiResponses,
+                ProviderAuth::NoAuth,
+            ),
+            http(
+                "https://example.test/v1?api_key=query-secret",
+                EndpointMode::Exact,
+                ProviderApi::OpenAiResponses,
+                ProviderAuth::NoAuth,
+            ),
+            http(
+                "https://example.test/v1#fragment",
+                EndpointMode::Base,
+                ProviderApi::OpenAiResponses,
+                ProviderAuth::NoAuth,
+            ),
+            ProviderAccess::Http(HttpAccess::new(
+                "https://example.test/v1",
+                EndpointMode::Base,
+                ProviderApi::OpenAiResponses,
+                HttpCredential::Configured(ProviderAuth::NoAuth),
+                serde_json::from_value(serde_json::json!({"x-secret": "header-secret"})).unwrap(),
+            )),
+        ];
+        for access in guarded {
+            assert_eq!(
+                provider_request_shape_identity(
+                    "openai",
+                    &trusted_http,
+                    &access,
+                    ProviderApi::OpenAiResponses,
+                ),
+                None,
+                "{access:?}"
+            );
+        }
     }
 
     #[test]

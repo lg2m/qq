@@ -1480,7 +1480,7 @@ mod tests {
                         "type": "trial",
                         "qq_version": "0.1.0",
                         "qq_source_revision": "abc123",
-                        "protocol_version": 8,
+                        "protocol_version": 11,
                         "model": {
                             "model": "test/fixed",
                             "max_output_tokens": 4096,

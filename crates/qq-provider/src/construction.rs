@@ -50,6 +50,9 @@ enum ResolvedHttpAuth {
     GoogleGenerateContent(GoogleAuth),
 }
 
+// Only the Mantle adapter selects a retry mode at construction; the HTTP
+// families take the canary path through `without_retries` directly.
+#[cfg(feature = "provider-bedrock")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HttpRetryMode {
     Default,
@@ -65,6 +68,7 @@ pub(crate) enum CompiledHttpProvider {
 }
 
 impl CompiledHttpProvider {
+    #[cfg(feature = "provider-bedrock")]
     #[must_use]
     pub(crate) fn with_retry_mode(self, retry_mode: HttpRetryMode) -> Self {
         if retry_mode == HttpRetryMode::Default {

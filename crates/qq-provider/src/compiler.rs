@@ -4,12 +4,21 @@ use std::sync::Arc;
 
 use crate::{
     Provider, ProviderError, SharedRequestCredentialProvider,
-    aws::BedrockAuth,
-    construction::{HttpConstructionSpec, HttpRetryMode, construct_http_provider},
+    bedrock_auth::BedrockAuth,
+    construction::{HttpConstructionSpec, construct_http_provider},
     credentials::SecretLiteral,
     http::{build_client, build_direct_client, validate_endpoint},
+};
+#[cfg(feature = "provider-bedrock")]
+use crate::{
+    construction::HttpRetryMode,
     providers::{bedrock::Bedrock, mantle::Mantle},
 };
+
+/// The configuration error a build without `provider-bedrock` returns for an
+/// Amazon Bedrock recipe. Neutral request and event behavior is unchanged;
+/// only compilation of that family is refused.
+pub const BEDROCK_FAMILY_UNAVAILABLE_MESSAGE: &str = "this build of qq-provider was compiled without the provider-bedrock feature; Amazon Bedrock and Bedrock Mantle recipes cannot be compiled";
 
 /// Compiles provider recipes while sharing expensive transport state.
 #[derive(Clone)]
@@ -31,9 +40,11 @@ impl ProviderCompiler {
     pub fn compile(&self, recipe: ProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
         match recipe {
             ProviderRecipe::Http(recipe) => self.compile_http(recipe),
+            #[cfg(feature = "provider-bedrock")]
             ProviderRecipe::AmazonBedrock { region, auth } => {
                 Ok(Arc::new(Bedrock::new(auth, region)?))
             }
+            #[cfg(feature = "provider-bedrock")]
             ProviderRecipe::AmazonBedrockMantle {
                 region,
                 protocol,
@@ -45,6 +56,12 @@ impl ProviderCompiler {
                 auth,
                 HttpRetryMode::Default,
             )?)),
+            #[cfg(not(feature = "provider-bedrock"))]
+            ProviderRecipe::AmazonBedrock { .. } | ProviderRecipe::AmazonBedrockMantle { .. } => {
+                Err(ProviderError::Configuration(
+                    BEDROCK_FAMILY_UNAVAILABLE_MESSAGE.to_owned(),
+                ))
+            }
         }
     }
 
@@ -56,9 +73,11 @@ impl ProviderCompiler {
     ) -> Result<Arc<dyn Provider>, ProviderError> {
         match recipe {
             ProviderRecipe::Http(recipe) => self.compile_http_for_canary(recipe),
+            #[cfg(feature = "provider-bedrock")]
             ProviderRecipe::AmazonBedrock { region, auth } => {
                 Ok(Arc::new(Bedrock::new(auth, region)?))
             }
+            #[cfg(feature = "provider-bedrock")]
             ProviderRecipe::AmazonBedrockMantle {
                 region,
                 protocol,
@@ -70,6 +89,12 @@ impl ProviderCompiler {
                 auth,
                 HttpRetryMode::Disabled,
             )?)),
+            #[cfg(not(feature = "provider-bedrock"))]
+            ProviderRecipe::AmazonBedrock { .. } | ProviderRecipe::AmazonBedrockMantle { .. } => {
+                Err(ProviderError::Configuration(
+                    BEDROCK_FAMILY_UNAVAILABLE_MESSAGE.to_owned(),
+                ))
+            }
         }
     }
 
@@ -658,5 +683,39 @@ mod tests {
             .expect("incompatible recipe must fail");
 
         assert!(matches!(error, ProviderError::Configuration(_)));
+    }
+
+    /// Both feature profiles construct and inspect Bedrock recipes; only
+    /// compilation differs. Without `provider-bedrock` the compiler refuses
+    /// the family with a configuration error before any network or SDK work,
+    /// and the shared HTTP contract fixtures above are unaffected.
+    #[test]
+    fn bedrock_recipes_compile_only_with_the_provider_bedrock_feature() {
+        let compiler = ProviderCompiler::new().unwrap();
+        let recipes = [
+            ProviderRecipe::amazon_bedrock(
+                Some("us-east-1".to_owned()),
+                BedrockAuth::ApiKey("test-key".into()),
+            ),
+            ProviderRecipe::amazon_bedrock_mantle(
+                Some("us-east-1".to_owned()),
+                HttpProtocol::OpenAiResponses,
+                BedrockAuth::DefaultChain,
+            ),
+        ];
+        for recipe in recipes {
+            let compiled = compiler.compile(recipe);
+            if cfg!(feature = "provider-bedrock") {
+                assert!(compiled.is_ok(), "full profile compiles Bedrock recipes");
+            } else {
+                match compiled {
+                    Err(ProviderError::Configuration(message)) => {
+                        assert_eq!(message, BEDROCK_FAMILY_UNAVAILABLE_MESSAGE);
+                    }
+                    Err(other) => panic!("unexpected error kind: {other}"),
+                    Ok(_) => panic!("minimal profile must refuse Bedrock recipes"),
+                }
+            }
+        }
     }
 }

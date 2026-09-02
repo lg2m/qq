@@ -57,7 +57,7 @@ qq-client = { path = "crates/qq-client" }
 qq-config = { path = "crates/qq-config" }
 qq-core = { path = "crates/qq-core" }
 qq-mcp = { path = "crates/qq-mcp" }
-qq-provider = { path = "crates/qq-provider" }
+qq-provider = { path = "crates/qq-provider", default-features = false }
 qq-protocol = { path = "crates/qq-protocol" }
 qq-reasoning = { path = "crates/qq-reasoning" }
 qq-server = { path = "crates/qq-server" }
@@ -104,6 +104,15 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 webbrowser.workspace = true
+
+[features]
+# Feature manifests for the shipped binary. `default` is the full profile with
+# every supported provider family. The minimal embedding profile is
+# `--no-default-features`: HTTP provider families only, no AWS SDK closure.
+# Configured Bedrock providers then fail at compile time with a
+# configuration error rather than at request time.
+default = ["provider-bedrock"]
+provider-bedrock = ["qq-provider/provider-bedrock"]
 
 [dev-dependencies]
 base64.workspace = true

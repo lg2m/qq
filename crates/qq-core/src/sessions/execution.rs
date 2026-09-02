@@ -1,6 +1,8 @@
 use super::*;
 use super::{
-    approvals::SessionToolGate, runtime::SessionRuntimeInner, subagents::SessionSubagentSpawner,
+    approvals::SessionToolGate,
+    runtime::SessionRuntimeInner,
+    subagents::{SessionHistorySearcher, SessionSubagentSpawner},
 };
 
 /// Denies every tool call. Compaction runs summarize existing context; a
@@ -120,18 +122,41 @@ async fn prepare_execution(
                     .max_output_tokens
                     .min(COMPACTION_OUTPUT_RESERVE_TOKENS),
             )
-    } else if !claimed.user_initiated {
-        RunCapabilities::restricted()
     } else {
-        let spawner = if claimed.child {
-            None
+        // A hard cost cap without pricing cannot be enforced. Reject it
+        // before any provider work rather than pretend, exactly as the
+        // headless adapter did before core owned the contract.
+        if claimed.limits.max_cost_usd_nanos.is_some() && loaded.resolved_model.pricing.is_none() {
+            tool_cancellation.store(true, Ordering::Release);
+            return Err(RunOutcome::Failed {
+                failure: RunFailure {
+                    kind: RunFailureKind::Configuration,
+                    message: format!(
+                        "a cost budget cannot be enforced: model {} has no configured pricing",
+                        loaded.resolved_model.route
+                    ),
+                },
+            });
+        }
+        let base = if !claimed.user_initiated {
+            RunCapabilities::restricted()
         } else {
-            Some(Arc::new(SessionSubagentSpawner::new(
-                Arc::clone(inner),
-                claimed.clone(),
-            )) as Arc<dyn SubagentSpawner>)
+            let spawner = if claimed.child {
+                None
+            } else {
+                Some(Arc::new(SessionSubagentSpawner::new(
+                    Arc::clone(inner),
+                    claimed.clone(),
+                )) as Arc<dyn SubagentSpawner>)
+            };
+            RunCapabilities::user(spawner)
         };
-        RunCapabilities::user(spawner)
+        base.with_limits(claimed.limits, loaded.resolved_model.pricing.clone())
+            .with_history(Arc::new(SessionHistorySearcher::new(
+                Arc::clone(inner),
+                claimed.session_id,
+                claimed.run_id,
+            )))
     }
     .with_literal_slash(claimed.literal_slash);
     let mut events = loaded.runtime.run_loop_with_spawner(
@@ -160,7 +185,8 @@ async fn prepare_execution(
             Some(RuntimeEvent::Prepared {
                 turn_ordinal: 1,
                 identity: Some(prompt_identity),
-                weight,
+                static_prefix,
+                mut weight,
             }) => {
                 let mut resolved_model = loaded.resolved_model.as_ref().clone();
                 // Internal compaction deliberately reserves a smaller output
@@ -168,12 +194,26 @@ async fn prepare_execution(
                 // actually sent on every provider turn, not the model's
                 // larger configured ceiling.
                 resolved_model.max_output_tokens = weight.max_output_tokens;
+                let context_shape = context_request_shape(&resolved_model);
+                if claimed.kind == RunKind::Prompt && weight.compatible_input_tokens.is_none() {
+                    weight.compatible_input_tokens =
+                        claimed.context_occupancy.and_then(|occupancy| {
+                            compatible_context_tokens(
+                                occupancy,
+                                context_shape,
+                                static_prefix,
+                                weight.input_bytes(),
+                            )
+                        });
+                }
                 return Ok(PreparedExecution {
                     events,
                     audit: PreparedRunAudit {
-                        prompt_identity: Arc::new(prompt_identity),
+                        prompt_identity,
                         resolved_model: Arc::new(resolved_model),
+                        context_shape,
                         weight,
+                        static_prefix,
                     },
                     tool_cancellation,
                 });
@@ -280,12 +320,13 @@ pub(super) async fn execute_run(
             },
         });
         let repeats_known_overflow = matches!(plan, context::ContextPlan::Send { .. })
-            && claimed
-                .context_overflow_model
-                .as_ref()
-                .is_some_and(|model| {
-                    same_context_request_shape(model.as_ref(), loaded.resolved_model.as_ref())
-                })
+            && claimed.context_overflow_basis.is_some_and(|basis| {
+                repeats_context_basis(
+                    basis,
+                    prepared.audit.context_shape,
+                    prepared.audit.static_prefix,
+                )
+            })
             && claimed.kind == RunKind::Prompt;
         if repeats_known_overflow {
             if claimed.context_compaction_attempted {
@@ -395,7 +436,7 @@ pub(super) async fn execute_run(
                     cancellation,
                     prepared.events,
                     prepared.tool_cancellation,
-                    prepared.audit.resolved_model,
+                    &prepared.audit,
                 )
                 .await;
                 return;
@@ -496,6 +537,7 @@ async fn run_auto_compaction(
     candidate.literal_slash = false;
     candidate.messages = messages;
     candidate.context_compaction_attempted = true;
+    candidate.context_occupancy = None;
     let prepared = match prepare_execution(inner, &mut candidate, loaded, cancellation).await {
         Ok(prepared) => prepared,
         Err(outcome) => {
@@ -610,7 +652,7 @@ async fn run_auto_compaction(
             compaction_cancellation,
             prepared.events,
             prepared.tool_cancellation,
-            Arc::clone(&prepared.audit.resolved_model),
+            &prepared.audit,
         )
         .await;
     }
@@ -647,7 +689,8 @@ async fn run_auto_compaction(
                 original.messages = messages;
                 original.context_compaction_attempted = attempted;
                 if compacted {
-                    original.context_overflow_model = None;
+                    original.context_overflow_basis = None;
+                    original.context_occupancy = None;
                 }
                 return true;
             }
@@ -799,8 +842,15 @@ async fn execute_started_run(
     mut cancellation: watch::Receiver<bool>,
     mut events: crate::RuntimeStream,
     tool_cancellation: Arc<AtomicBool>,
-    resolved_model: Arc<ResolvedModel>,
+    audit: &PreparedRunAudit,
 ) {
+    let resolved_model = Arc::clone(&audit.resolved_model);
+    let context_shape = audit.context_shape;
+    let initial_occupancy_basis = context_occupancy_basis(
+        context_shape.digest,
+        audit.static_prefix,
+        audit.weight.input_bytes(),
+    );
     let mut runtime_failed = inner.failed.subscribe();
     if *runtime_failed.borrow() {
         tool_cancellation.store(true, Ordering::Release);
@@ -813,7 +863,8 @@ async fn execute_started_run(
         return;
     }
     let internal = claimed.kind == RunKind::Compaction;
-    let mut accounting = RunAccountingAccumulator::new(resolved_model.pricing.clone());
+    let mut accounting =
+        RunAccountingAccumulator::new(resolved_model.pricing.clone(), initial_occupancy_basis);
     let mut pending_text = String::new();
     let mut pending_channel = None;
     let mut reasoning_kind = None;
@@ -828,6 +879,7 @@ async fn execute_started_run(
     // streaming; text deltas always belong to it.
     let mut current_turn: u16 = 1;
     let mut current_message: Option<MessageId> = None;
+    let mut current_occupancy_basis = Some(initial_occupancy_basis);
     // Live tool output batches on the same timer as model text. Text and tool
     // output never accumulate at the same time: a turn's text is fully
     // flushed when the turn completes, before any of its calls execute.
@@ -1105,6 +1157,7 @@ async fn execute_started_run(
             RunInput::Event(Some(RuntimeEvent::Prepared {
                 turn_ordinal: _,
                 identity,
+                static_prefix,
                 weight,
             })) => {
                 if let Some(identity) = identity
@@ -1143,6 +1196,13 @@ async fn execute_started_run(
                         return;
                     }
                 }
+                let basis = context_occupancy_basis(
+                    context_shape.digest,
+                    static_prefix,
+                    weight.input_bytes(),
+                );
+                current_occupancy_basis = Some(basis);
+                accounting.request_basis = basis;
             }
             RunInput::Event(Some(RuntimeEvent::ActivityChanged { activity })) => {
                 if internal {
@@ -1301,6 +1361,7 @@ async fn execute_started_run(
                                 calls,
                                 turn_message: None,
                                 context_tokens: usage.map(turn_context_tokens),
+                                occupancy_basis: None,
                                 usage,
                                 estimated_cost_usd_nanos: turn_cost,
                                 accounting: Some(accounting.snapshot()),
@@ -1359,6 +1420,11 @@ async fn execute_started_run(
                 // occupies; the turn transaction publishes it so the meter
                 // moves while the tool loop is still running.
                 let context_tokens = usage.map(turn_context_tokens);
+                // Only an exact provider identity may seed a later request;
+                // a route-level fallback basis is never persisted for reuse.
+                let occupancy_basis = usage
+                    .and(current_occupancy_basis.take())
+                    .filter(|_| context_shape.provider_identity);
                 // The completed turn's message (if any) finalizes inside the
                 // same transaction as the turn row; the next turn's text will
                 // lazily start a fresh message.
@@ -1374,6 +1440,7 @@ async fn execute_started_run(
                             calls,
                             turn_message,
                             context_tokens,
+                            occupancy_basis,
                             usage,
                             estimated_cost_usd_nanos: turn_cost,
                             accounting: Some(turn_accounting),
@@ -1663,6 +1730,36 @@ async fn execute_started_run(
                 .await;
                 return;
             }
+            RunInput::Event(Some(RuntimeEvent::BudgetExhausted { exhaustion })) => {
+                if let Err(error) = flush_pending_text(
+                    &inner,
+                    &claimed,
+                    current_turn,
+                    &mut current_message,
+                    &mut pending_channel,
+                    &mut pending_text,
+                )
+                .await
+                {
+                    finish_run(
+                        &inner,
+                        &claimed,
+                        persistence_failure("failed to persist model output", &error),
+                    )
+                    .await;
+                    return;
+                }
+                finish_run_accounted(
+                    &inner,
+                    &claimed,
+                    RunOutcome::BudgetExhausted {
+                        exhaustion: Box::new(exhaustion),
+                    },
+                    Some(accounting.snapshot()),
+                )
+                .await;
+                return;
+            }
             RunInput::Event(Some(RuntimeEvent::Failed { kind, message })) => {
                 if let Err(error) = flush_pending_text(
                     &inner,
@@ -1908,6 +2005,9 @@ pub(super) struct RunAccounting {
     pub(super) context_tokens: Option<u64>,
     pub(super) estimated_cost_usd_nanos: Option<u64>,
     pub(super) saw_turn: bool,
+    /// Basis of the most recently prepared provider request. A provider
+    /// overflow persists it so the retry cannot repeat the same request.
+    pub(super) request_basis: ContextOccupancyBasis,
 }
 
 struct RunAccountingAccumulator {
@@ -1916,16 +2016,18 @@ struct RunAccountingAccumulator {
     estimated_cost_usd_nanos: Option<u64>,
     pricing: Option<ModelPricing>,
     saw_turn: bool,
+    request_basis: ContextOccupancyBasis,
 }
 
 impl RunAccountingAccumulator {
-    fn new(pricing: Option<ModelPricing>) -> Self {
+    fn new(pricing: Option<ModelPricing>, request_basis: ContextOccupancyBasis) -> Self {
         Self {
             usage: Some(TokenUsage::default()),
             context_tokens: None,
             estimated_cost_usd_nanos: pricing.as_ref().map(|_| 0),
             pricing,
             saw_turn: false,
+            request_basis,
         }
     }
 
@@ -1963,6 +2065,7 @@ impl RunAccountingAccumulator {
                 .then_some(self.estimated_cost_usd_nanos)
                 .flatten(),
             saw_turn: self.saw_turn,
+            request_basis: self.request_basis,
         }
     }
 }
@@ -2050,6 +2153,7 @@ pub(super) struct ModelTurnCommit {
     pub(super) calls: Vec<RuntimeToolCall>,
     pub(super) turn_message: Option<MessageId>,
     pub(super) context_tokens: Option<u64>,
+    pub(super) occupancy_basis: Option<ContextOccupancyBasis>,
     pub(super) usage: Option<TokenUsage>,
     pub(super) estimated_cost_usd_nanos: Option<u64>,
     pub(super) accounting: Option<RunAccounting>,

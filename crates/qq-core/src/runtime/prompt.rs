@@ -9,12 +9,12 @@ use crate::{
     workspace::{SelectedGuidance, WorkspaceInstructions},
 };
 
-pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(7) {
+pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(8) {
     Some(version) => version,
     None => panic!("agent prompt version must be nonzero"),
 };
 
-/// Version 7 of the base agent prompt. The text is versioned in code, not
+/// Version 8 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
 pub(crate) fn agent_system_prompt(
     workspace: &Path,
@@ -60,7 +60,7 @@ pub(crate) fn agent_system_prompt(
     let mut prompt = format!(
         "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
          \n\
-         Available tools: {tool_names}. read_file, list_dir, and search are read-only; \
+         Available tools: {tool_names}. read_file, list_dir, search, and search_history are read-only; \
          edit_file and write_file modify workspace files and may require user approval; \
          shell runs one command in the workspace with a bounded timeout and may require user approval.{mcp_note}\n\
          \n\

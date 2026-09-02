@@ -36,6 +36,22 @@ QQ_MODEL=xai/grok-4.3 cargo run -- ask "Reply with pong"
 cargo run -- auth login xai --oauth
 ```
 
+## Build Profiles
+
+The default build is the full profile: every supported provider family,
+including Amazon Bedrock and Bedrock Mantle. Embedders that only need the HTTP
+provider families (OpenAI, Anthropic, Google, and compatible endpoints) can
+build the minimal profile, which drops the AWS SDK dependency closure:
+
+```sh
+cargo build --release --no-default-features
+```
+
+A minimal build still accepts Bedrock configuration but refuses to compile a
+Bedrock provider with a configuration error naming the missing
+`provider-bedrock` feature. Library embedders select the same feature on
+`qq-provider` directly.
+
 ## Amazon Bedrock Mantle
 
 Mantle reuses the OpenAI Responses, OpenAI Chat Completions, and Anthropic

@@ -10,9 +10,10 @@ use tokio::sync::OnceCell;
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream,
     aws::{
-        AwsConfigLoadError, BedrockAuth, INVALID_REGION_MESSAGE, load_aws_config,
-        valid_region_label, validate_configuration,
+        AwsConfigLoadError, INVALID_REGION_MESSAGE, load_aws_config, valid_region_label,
+        validate_configuration,
     },
+    bedrock_auth::BedrockAuth,
     compiler::{EndpointKind, HttpAuth, HttpProtocol},
     construction::{
         CompiledHttpProvider, GOOGLE_MANTLE_UNSUPPORTED_MESSAGE, HttpConstructionSpec,

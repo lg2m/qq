@@ -6,6 +6,9 @@ use std::{future::Future, pin::Pin};
 pub(crate) struct SpawnAgentOutcome {
     pub(crate) content: String,
     pub(crate) is_error: bool,
+    /// The child run's estimated spend, charged against the parent's cost
+    /// budget. `None` means unknown, never zero.
+    pub(crate) cost_usd_nanos: Option<u64>,
 }
 
 pub(crate) type SpawnAgentFuture =

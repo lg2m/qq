@@ -1,7 +1,7 @@
 # QQ Harness Reliability, Cost, And Terminal-Bench Readiness
 
 Status: active. Re-baselined against `main` on 2026-08-04. Phase 4 completed
-and qualified on 2026-09-01; Phase 5 implementation is in progress.
+and qualified on 2026-09-01; Phase 5 completed and qualified on 2026-09-02.
 
 This plan turns QQ into a trustworthy autonomous terminal harness before
 optimizing it against Terminal-Bench. It covers the failures found in the
@@ -76,12 +76,12 @@ Passing one regression does not imply that its whole phase is complete.
 | Accepted-run supervision | implemented in `DEV-726` | Run-task panics settle as durable failures; headless sink/trace failures and owner aborts retain cancellation ownership; explicit runtime shutdown drains queued and running work; reopen interrupts abandoned running work without replaying tools | Process loss intentionally interrupts the in-flight provider request rather than attempting unsafe continuation |
 | Authoritative context projection | on `main` | `fec1e0a` makes completed, failed, cancelled, interrupted, and recovered runs share one projection; runtime notices and exact tool boundaries reach follow-up, capacity, and compaction requests without altering the transcript | No remaining Task 3 work |
 | Atomic child-run lifecycle | on `main` | `681ee07` persists the initialized read-only child, queued prompt run, and parent-run ownership atomically; recovery cancels unclaimed children of interrupted parents; the parent receives only the final model turn | No remaining Task 4 work |
-| Tool/turn budget behavior | renewable slices and live cost visibility implemented in `DEV-725`; explicit headless turn/timeout gate on `main` | `d989cf8` counts the provider-request boundary, so `--max-turns` cancels before a silent over-budget turn; `DEV-725` turns the internal 256-call ceiling into a persisted checkpoint, restores tools inside the same durable run, and commits active-run cost so `--max-cost-usd` can cancel truthfully | Core-owned configurable token/dollar/turn outcomes across every front end |
+| Tool/turn budget behavior | renewable slices and live cost visibility implemented in `DEV-725`; core-owned `RunLimits` implemented in the R5 budget slice | `d989cf8` counted the provider-request boundary client-side; `DEV-725` turns the internal 256-call ceiling into a persisted checkpoint and restores tools inside the same durable run; the R5 budget slice moves wall-clock, turn, tool-call, token, and cost enforcement into the runtime loop with a reserved final response and the typed `budget_exhausted` outcome | Surfacing limits in TUI and server clients |
 | Scoped workspace instructions | on `main` | `f8847d2` capability-loads root `AGENTS.md` with `CLAUDE.md` as an absence-only fallback, versions the completion prompt, and persists instruction provenance before provider work | Nested policy remains explicitly model-discovered through bounded tools |
 | Harbor baseline and failure taxonomy | implemented in `DEV-730` | Repository adapter converts durable per-turn traces to ATIF-v1.7 and passes Harbor 0.20.0 validation; the local smoke task resolves under Harbor; `cargo xtask eval` revision-stamps launches, hashes resolved job/trial locks, rejects mixed identity, and requires identifier-grounded primary categories before reporting | Run the credentialed fixed-model smoke and baseline; no paid public run is performed by repository tests |
 | Slash-invoked commands and skills | implemented in `DEV-731` | Shared runtime resolves explicit repository-local Markdown through the workspace capability, rejects unknown/colliding/oversized sources before provider work, and persists source/content/full-prompt/tool hashes | User-home, managed, and bundled roots stay deferred until explicit server-owned configuration preserves remote equivalence |
-| Immutable resolved-model identity | implemented in the R5 resolved-model slice | The root computes a secret-free versioned route/model/limit/context/pricing/capability descriptor; core persists it once before provider polling, exposes it in run snapshots, and audits turns with the effective route and cap | Context-window planning and core-owned token/dollar/turn outcomes remain Phase 5 work |
-| Provider-aware context admission | implemented in the R5 context-planning slice; final qualification pending | Queued runs reserve without publishing `RunStarted`; the unpublished preparation pointer uses recoverable WAL coordination and restores FULL before every authoritative transition. Asynchronous preparation measures the provider-neutral request, applies model-window plus independent 4 MiB storage policy, and atomically persists the descriptor, prompt identity, measurement, running state, and `RunStarted` before provider polling. Known overflow compacts at most once under an exact durable owner; cancellation, recovery, shutdown, and persistence races fail closed. | Cross-run provider occupancy reuse remains disabled until a secret-free codec/endpoint request-shape identity is persisted. Core-owned budgets, deeper compaction hardening, and final Phase 5 qualification remain open. |
+| Immutable resolved-model identity | implemented in the R5 resolved-model slice | The root computes a secret-free versioned route/model/limit/context/pricing/capability descriptor; core persists it once before provider polling, exposes it in run snapshots, and audits turns with the effective route and cap | Complete: context planning and core-owned budget outcomes shipped in R5 |
+| Provider-aware context admission | implemented in the R5 context-planning and occupancy-reuse slices; qualified 2026-09-02 | Queued runs reserve without publishing `RunStarted`; the unpublished preparation pointer uses recoverable WAL coordination and restores FULL before every authoritative transition. Asynchronous preparation measures the provider-neutral request, applies model-window plus independent 4 MiB storage policy, and atomically persists the descriptor, prompt identity, measurement, running state, and `RunStarted` before provider polling. A versioned secret-free request-shape and static-prefix basis now permits exact compatible occupancy reuse across restart without another store call. Known overflow compacts at most once under the same exact shape; cancellation, recovery, shutdown, and persistence races fail closed. | Complete: budgets, compaction validation/rollback/`search_history`, and the Phase 5 receipt landed in the R5 series. |
 
 The remaining P0 longevity contract is explicit: every accepted run must reach
 one durable terminal event; every imposed bound must produce a truthful outcome;
@@ -93,9 +93,9 @@ The remaining gaps are material:
 | Area | Current behavior | Consequence |
 | --- | --- | --- |
 | Evaluation export | `DEV-730` supplies the pinned Harbor adapter, ATIF validation fixtures, revision-stamped launcher, fixed-identity scorecard, and grounded failure taxonomy | A real fixed-model baseline still needs credentials, benchmark compute, and deliberate spend |
-| Context budgeting | The R5 context slice plans against the effective model window, output reserve, full request weight, and an independent 4 MiB storage backstop; no percentage trigger remains | Cross-run provider occupancy reuse awaits a persisted codec/request-shape identity, so first-turn estimates remain conservative |
+| Context budgeting | The R5 context slices plan against the effective model window, output reserve, full request weight, and an independent 4 MiB storage backstop; no percentage trigger remains. Exact request-shape/static-prefix compatibility now reuses a prior measured occupancy conservatively across restart. | Unknown/unsafe identities and any non-monotonic or mismatched request continue to use the conservative byte estimate |
 | Resolved model consumption | Runs retain the exact resolved route, provider-visible model, limits, pricing provenance, named organization/profile, and implemented controls; context admission consumes the effective output/context limits | Core-owned token/dollar/turn budgets do not yet consume the complete pricing contract |
-| Completion behavior | Internal tool slices checkpoint and continue without a terminal event, but caller-requested turn/time/cost budgets still settle through the headless adapter rather than one core-owned outcome | TUI, server, and future clients cannot yet impose and observe the same explicit overall budget contract |
+| Completion behavior | Internal tool slices checkpoint and continue without a terminal event; caller-imposed `RunLimits` settle through the core-owned `budget_exhausted` outcome on every surface | Only `qq run` exposes limit flags today; the TUI and server forward `submit_prompt.limits` unchanged but offer no UI for them |
 | Terminal control | `shell` is one-shot with null stdin and no persistent process or PTY handle | Interactive programs and background services are awkward or impossible |
 | Search and editing | Built-in search is bounded literal scanning; edits require exact replacement | Discovery or mutation can consume unnecessary model turns on large repositories |
 | Cost control | Headless time, turn, and cost limits exist, but core has no unified token/dollar/turn outcome and provider/core retries can multiply attempts | Other front ends lack the same guarantees, and one logical turn can exceed the intended request budget |
@@ -765,10 +765,9 @@ diagnostic all passed. Generated raw reports remain ignored and untracked.
 
 Priority: P0 for context correctness, P1 for cost optimization.
 
-Status: in progress. The immutable resolved-model and provider-aware context
-admission slices are implemented; enforced run budgets, cross-run occupancy
-reuse with a persisted codec/request-shape identity, compaction hardening, and
-the full Phase 5 qualification receipt remain open.
+Status: complete and qualified on 2026-09-02 (see the qualification receipt at
+the end of this phase). The live provider cache-ratio check is the one deferred
+item; it needs credentials and is tracked as a follow-up.
 
 ### Resolved Model Contract
 
@@ -820,10 +819,23 @@ Do not claim tokenizer exactness where a provider does not supply it. Prefer
 actual reported usage after each turn and a conservative safety margin before
 the next request.
 
-Provider-reported occupancy is currently reused only within the same live run.
-Cross-run reuse is deliberately disabled until the resolved request contract
-persists a secret-free codec/API and endpoint/adapter identity; semantic prompt
-and model equality alone cannot prove tokenization-compatible wire shape.
+Provider-reported occupancy is reused across runs only when the resolved model
+has a persisted secret-free codec/API/endpoint/adapter identity, the complete
+wire-affecting shape and static system/tool prefix match exactly, and the new
+measured request byte count is monotonic. The prior token count is seeded with
+the conservative byte delta. Pricing-only refreshes remain compatible. Unsafe
+endpoint/static-header configurations, historical or malformed state, missing
+usage, model changes, successful compaction, and any shape or prefix change
+disable or clear reuse. Dynamic AWS region chains and assembly-time pruning are
+also unknown because they cannot prove stable, append-only input across restart.
+The basis is loaded by the existing reservation query and committed with
+`context_tokens` in the existing model-turn transaction.
+
+Provider-overflow suppression must not weaken when reuse is unavailable. An
+unknown provider identity falls back to a route-level shape in a distinct
+digest domain, and pruned history keeps the pending overflow evidence, so a
+repeated shape and static prefix compacts once before any further provider
+request regardless of deployment channel.
 
 Automatic compaction triggers when the context plan cannot safely reserve the
 next output, not merely at 70% of 4 MiB. Keep the existing byte cap as a
@@ -847,6 +859,21 @@ A cheaper compaction model is an optimization experiment, not a default.
 Promote it only when retention tests and end-to-end task success remain
 statistically neutral.
 
+Status: implemented in the R5 compaction-hardening slice (protocol 11).
+`search_history` is a built-in read-only tool declared only for durable session
+runs; it walks the full persisted transcript (prompts, assistant turns, tool
+call arguments, tool results — including spans compaction replaced), excludes
+the calling run, and returns at most 20 excerpts of ~240 bytes each with
+citations naming the user message ordinal, turn, and call. Compaction summaries
+must be non-empty, fit the 4 MiB context limit, carry the six required section
+headings, and shrink the measured assembly (above a 16 KiB floor); any failure
+settles the internal run as a `policy` failure and the prior compaction stays in
+force. Three compactions are retained per session and `rollback_compaction`
+steps back through them to the verbatim transcript. Retention is covered by a
+five-compaction test seeding a user constraint, an exact path, a decision, an
+unresolved error, and a verification status. A cheaper summarizer has not been
+trialled.
+
 ### Enforced Budgets
 
 Support per-run:
@@ -861,14 +888,30 @@ Support per-run:
 boundary before a silent over-budget turn can hang. `DEV-725` makes the
 runtime's internal 256-call backstop renewable: it persists a tool-free
 checkpoint and continues the same run instead of emitting ordinary
-`Completed`. The remaining contract is core-owned configurable budgets, so
-every front end can impose and observe the same explicit overall outcome.
+`Completed`.
+
+Status: implemented in the R5 budget slice. `submit_prompt.limits` carries a
+versioned `RunLimits` (wall clock, model turns, tool calls, total tokens, cost)
+that is validated at admission, persisted with the run row (schema 19,
+`runs.limits_json`), and enforced by the runtime loop before every provider
+turn and around every provider stream. Every bound settles as the typed
+`RunOutcome::BudgetExhausted` with its `BudgetLimitKind`; the run status is
+`budget_exhausted` and the partial message settles as interrupted. The headless
+adapter now only relays `RunLimits` and maps the outcome (`duration` keeps
+exit-code-3 `timed_out`; every other kind is `budget_exhausted`); its
+client-side event watching and cancellation are gone. Sub-agents inherit the
+parent's wall clock and cost cap and charge their settled spend (or unknown
+spend) to the parent's meter through the `spawn_agent` result.
 
 Before each new model turn, reserve enough budget for a bounded final response.
-When the work budget is exhausted:
+The turn and tool-call caps reserve the last permitted turn as the tool-free
+final response, so the provider is never asked for more than the caller
+allowed. When the work budget is exhausted:
 
 - Request one final status response only when the reserve remains.
-- Otherwise settle with an explicit `budget_exhausted` outcome.
+- Otherwise settle with an explicit `budget_exhausted` outcome. An elapsed
+  wall clock and unmeasurable cost cannot afford the reserve; a model that
+  requests a tool on the final turn forfeits it.
 - Never label budget exhaustion as provider failure.
 
 If a hard dollar limit is requested but cost cannot be measured, reject the
@@ -901,6 +944,59 @@ For prompt caching:
 - Runs retain their original resolved model after configuration changes.
 - Supported providers reach the cache-ratio target on stable multi-turn
   fixtures without request-shape regressions.
+
+### Phase 5 Qualification Receipt — 2026-09-02
+
+Phase 5 closed at revision `42f16c6168fef9b008e7427ed581511abb3b2760` (the R5
+series `be28a9e` occupancy reuse, `8e2795e` core-owned budgets, `d369b55`
+compaction hardening, `42f16c6` shrinkage acceptance test, stacked on `main`
+`e4bdfb5`). Schema is 19 (`runs.limits_json`; 18 added the request-shape
+occupancy basis) and the protocol is 11.
+
+Acceptance evidence, all deterministic and offline:
+
+| Criterion | Evidence |
+| --- | --- |
+| Three window sizes plan differently for one transcript | `one_transcript_rejects_compacts_or_sends_for_three_windows`, `known_window_exact_fit_sends_and_one_token_over_compacts` (`sessions/context.rs`) |
+| Tool schemas and output reserve inside the budget | `tool_schema_and_output_reserve_are_both_part_of_the_window`; `unknown_windows_still_obey_the_independent_storage_backstop` |
+| No known-overflow request is sent | `known_first_turn_context_overflow_starts_no_provider_work`, `known_later_turn_context_overflow_starts_no_second_provider_request`, `failed_overflow_recovery_never_resends_the_known_overflowing_prompt`, and the occupancy-reuse suite (`unknown_provider_identity_still_compacts_a_known_overflow_before_the_retry`, `pruned_history_still_compacts_a_known_overflow_before_the_retry`) |
+| Repeated compaction preserves facts and shrinks 8x | `repeated_compactions_preserve_seeded_facts_and_bound_history` (five compactions, constraint/path/decision/error/verification seeds, history bounded to three rows); `compaction_shrinks_a_tool_heavy_assembly_at_least_eightfold` (published `before_bytes`/`after_bytes`: a 25.5 KiB tool-heavy assembly compacts to 414 bytes, 63x) |
+| Hard budgets settle deterministically and account completed turns | the `BudgetMeter` suite in `runtime/budget.rs` and the session tests `tool_call_budget_reserves_the_final_turn_before_the_cap`, `cancellation_before_a_model_turn_preserves_known_session_cost`, plus the headless mapping tests (21) |
+| Runs retain their original resolved model | `resolved_model_and_request_limits_survive_config_mutation_and_restart`, `run_snapshot_preserves_prompt_identity_across_restart` |
+| Provider cache-ratio target on live fixtures | **deferred**: requires authenticated provider credentials and live traffic, which the offline gates exclude. The request-shape basis and static-prefix identity are deterministic and regression-tested (`compatible_usage_reuses_measured_occupancy_but_incompatible_input_does_not`); the live ratio is recorded as an open Phase 5 follow-up, not as passed. |
+
+Perf: the clean detached 100-sample recorder
+(`cargo xtask perf baseline --machine-class linux-x86_64-local --samples 100
+--warmups 10`) at the exact revision above reported `source.dirty = false`, 62
+metrics, and `perf check` against `benchmarks/perf/budgets-v1.json` passed all
+55 budgeted metrics. Selected p95 results from the passing report:
+
+| Boundary | R4 receipt | Phase 5 receipt |
+| --- | ---: | ---: |
+| One MiB reasoning completion | 474.045 ms | 454.677 ms |
+| One MiB reasoning payload transactions | 129 | 129 |
+| One MiB shell completion | 113.787 ms | 112.115 ms |
+| Eight-stream batch completion | 999.780 ms | 938.582 ms |
+| Eight-stream control-call upper bound | 23.521 ms | 23.410 ms |
+| Cancellation to durable finish under load | 40.819 ms | 59.109 ms |
+| Maximum persisted same-run output service gap | 50.000 ms | 49.000 ms |
+| Eight-stream peak temporary RSS | 9.03 MiB | 9.54 MiB |
+| Restart snapshot reconstruction | 2.182 ms | 1.939 ms |
+| Restart replay reconstruction | 1.861 ms | 1.399 ms |
+| One MiB / 512 KiB durable-stream ratio | 1.925x | 1.931x |
+
+A first recorder attempt on the same revision failed one budget: the output
+service gap p95 landed at 52 ms against the 50 ms limit (one of ten samples)
+while the host carried a load average near six from unrelated processes. The
+budget was not weakened; the immediate rerun passed. Cancellation-to-finish
+moved from 40.8 ms to 59.1 ms p95 within its 100 ms budget; the budget-meter
+check now sits on that path and the shift is recorded here for the next
+comparison rather than masked.
+
+On the same clean commit `cargo test --workspace` (qq-core 318 tests),
+`cargo fmt --all -- --check`, Clippy with all targets/features and warnings
+denied, and `cargo build --workspace` passed. Raw reports remain ignored and
+untracked.
 
 ## Phase 6: Tool-Contract Tournament And Terminal Sessions
 

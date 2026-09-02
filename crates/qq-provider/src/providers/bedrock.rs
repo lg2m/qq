@@ -34,11 +34,11 @@ use http_body::Body;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-use crate::aws::BedrockAuth;
 use crate::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
     ProviderStream, ProviderUsage, Role,
     aws::{AwsConfigLoadError, load_aws_config, validate_configuration},
+    bedrock_auth::BedrockAuth,
     limits::{ByteCounter, StreamLimits},
     sanitize::sanitize_message,
 };

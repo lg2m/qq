@@ -156,6 +156,38 @@ impl ResolvedModelVersion {
     }
 }
 
+/// Version of the opaque provider request-shape identity carried by a
+/// resolved model. The identity is deliberately separate from the resolved
+/// model schema so its digest domain can evolve without reinterpreting old
+/// rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderRequestShapeVersion(NonZeroU16);
+
+impl ProviderRequestShapeVersion {
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        match NonZeroU16::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+/// Secret-free, opaque identity of the provider adapter and immutable
+/// deployment configuration that determine its wire request shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRequestShapeIdentity {
+    pub version: ProviderRequestShapeVersion,
+    pub digest: ContentHash,
+}
+
 /// Whether QQ's selected provider codec can express one generation control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,6 +219,10 @@ pub struct PromptCacheCapabilities {
 #[serde(deny_unknown_fields)]
 pub struct ResolvedModel {
     pub version: ResolvedModelVersion,
+    /// Absent for historical rows and deployments whose exact shape cannot be
+    /// represented without deriving an identity from secret-bearing config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_shape: Option<ProviderRequestShapeIdentity>,
     pub route: String,
     pub provider_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,6 +371,11 @@ pub enum SessionCommand {
     SubmitPrompt {
         session_id: SessionId,
         prompt: String,
+        /// Core-owned budgets for the run this prompt creates. Every accepted
+        /// limit settles as a typed `RunOutcome::BudgetExhausted`; an absent
+        /// or empty value imposes no limit beyond the runtime's own bounds.
+        #[serde(default, skip_serializing_if = "RunLimits::is_empty")]
+        limits: RunLimits,
     },
     CancelRun {
         run_id: RunId,
@@ -369,6 +410,13 @@ pub enum SessionCommand {
     /// summary. Valid only while the session is idle; refused while a run is
     /// active or queued. The client transcript is untouched.
     CompactSession {
+        session_id: SessionId,
+    },
+    /// Discards the newest compaction so assembly falls back to the prior
+    /// retained one (or to the verbatim transcript when none remains). Valid
+    /// only while the session is idle; refused when there is nothing to roll
+    /// back. The client transcript is untouched.
+    RollbackCompaction {
         session_id: SessionId,
     },
 }
@@ -432,6 +480,11 @@ pub enum CommandOutcome {
         session_id: SessionId,
         run_id: RunId,
     },
+    CompactionRolledBack {
+        session_id: SessionId,
+        /// Compactions still retained after the rollback.
+        remaining: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +504,72 @@ pub enum RunStatus {
     Cancelled,
     Failed,
     Interrupted,
+    BudgetExhausted,
+}
+
+/// Per-run budgets imposed by the caller and enforced by the core runtime.
+/// Each accepted limit yields exactly one typed terminal outcome, so every
+/// client observes the same bound the same way. A limit the active model
+/// cannot account for is rejected before provider work rather than ignored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunLimits {
+    /// Wall-clock budget from run start, spanning provider retries, tool
+    /// execution, and sub-agent work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
+    /// Provider turns this run may make in total. The last permitted turn is
+    /// reserved as a tool-free final status response when work remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_model_turns: Option<u16>,
+    /// Tool calls the model may request across the whole run. The meter
+    /// reserves a tool-free final response before the cap would be crossed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
+    /// Total input plus output tokens, summed over every provider turn of the
+    /// run and its sub-agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
+    /// Estimated spend cap in USD nanos. Requires configured pricing; a turn
+    /// whose usage the provider omits settles as `cost_unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd_nanos: Option<u64>,
+}
+
+impl RunLimits {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.max_duration_ms.is_none()
+            && self.max_model_turns.is_none()
+            && self.max_tool_calls.is_none()
+            && self.max_total_tokens.is_none()
+            && self.max_cost_usd_nanos.is_none()
+    }
+}
+
+/// Which budget settled a run and how far it got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetExhaustion {
+    pub limit: BudgetLimitKind,
+    /// Whether the run was granted its reserved final status response after
+    /// the work budget ran out. False when even the final turn could not be
+    /// afforded, or when the limit tripped mid-turn.
+    pub final_response: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetLimitKind {
+    Duration,
+    ModelTurns,
+    ToolCalls,
+    TotalTokens,
+    Cost,
+    /// A cost cap was imposed but a provider turn omitted usage, so spend
+    /// could no longer be measured. Never labelled a provider failure.
+    CostUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,7 +593,15 @@ pub enum RunOutcome {
     Completed,
     Cancelled,
     Interrupted,
-    Failed { failure: RunFailure },
+    Failed {
+        failure: RunFailure,
+    },
+    /// A caller-imposed `RunLimits` bound settled the run. Distinct from
+    /// `Failed`: the harness, model, and provider all behaved; the caller's
+    /// budget ran out.
+    BudgetExhausted {
+        exhaustion: Box<BudgetExhaustion>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +715,10 @@ pub struct RunSnapshot {
     pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd_nanos: Option<u64>,
+    /// Budgets the caller imposed on this run. Absent for historical runs and
+    /// runs submitted without limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<Box<RunLimits>>,
 }
 
 /// Version of the provider-neutral system prompt prepared for a run.
@@ -1010,6 +1141,13 @@ pub enum SessionEvent {
         before_bytes: u64,
         after_bytes: u64,
     },
+    /// The newest compaction was discarded. `remaining` compactions still
+    /// apply; assembly now reads the newest of them, or the full transcript
+    /// when none remain. The session meter is unknown until the next prompt.
+    SessionCompactionRolledBack {
+        session: SessionSummary,
+        remaining: u16,
+    },
     /// A measured model turn committed mid-run: the run's per-turn context
     /// audit value moved. `context_tokens` is the completed turn's input-token
     /// total (fresh input + cache reads + cache writes). This does not update
@@ -1136,6 +1274,49 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SessionEvent>(encoded).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn resolved_model_v1_decodes_with_unknown_request_shape_and_v2_round_trips_identity() {
+        let historical: ResolvedModel = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "route": "provider/model",
+            "provider_model": "model",
+            "max_output_tokens": 4096,
+            "output_token_control": "native",
+            "generation": { "reasoning_effort": "unsupported" },
+            "prompt_cache": {
+                "control": "unsupported",
+                "cache_read_usage": true,
+                "cache_write_usage": false
+            }
+        }))
+        .unwrap();
+        assert_eq!(historical.request_shape, None);
+
+        let mut current = historical;
+        current.version = ResolvedModelVersion::new(2).unwrap();
+        current.request_shape = Some(ProviderRequestShapeIdentity {
+            version: ProviderRequestShapeVersion::new(1).unwrap(),
+            digest: "a".repeat(64).parse().unwrap(),
+        });
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["version"], 2);
+        assert_eq!(encoded["request_shape"]["version"], 1);
+        assert_eq!(encoded["request_shape"]["digest"], "a".repeat(64));
+        assert_eq!(
+            serde_json::from_value::<ResolvedModel>(encoded).unwrap(),
+            current
+        );
+
+        current.request_shape = None;
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["version"], 2);
+        assert!(encoded.get("request_shape").is_none());
+        assert_eq!(
+            serde_json::from_value::<ResolvedModel>(encoded).unwrap(),
+            current
         );
     }
 
@@ -1846,6 +2027,7 @@ mod tests {
             })),
             resolved_model: Some(Box::new(ResolvedModel {
                 version: ResolvedModelVersion::new(1).unwrap(),
+                request_shape: None,
                 route: "provider/model".to_owned(),
                 provider_model: "model".to_owned(),
                 organization: Some("org".to_owned()),
@@ -1878,9 +2060,17 @@ mod tests {
             }),
             context_tokens: Some(16),
             estimated_cost_usd_nanos: Some(1),
+            limits: Some(Box::new(RunLimits {
+                max_model_turns: Some(12),
+                ..RunLimits::default()
+            })),
         };
         let encoded = serde_json::to_value(&run).unwrap();
         assert_eq!(encoded["context_tokens"], 16);
+        assert_eq!(
+            encoded["limits"],
+            serde_json::json!({"max_model_turns": 12})
+        );
         assert_eq!(encoded["prompt_identity"]["version"], 7);
         assert_eq!(encoded["resolved_model"]["version"], 1);
         assert_eq!(encoded["resolved_model"]["route"], "provider/model");
@@ -1926,12 +2116,14 @@ mod tests {
             context_tokens: None,
             prompt_identity: None,
             resolved_model: None,
+            limits: None,
             ..run.clone()
         };
         let encoded = serde_json::to_value(&bare).unwrap();
         assert!(encoded.get("context_tokens").is_none());
         assert!(encoded.get("prompt_identity").is_none());
         assert!(encoded.get("resolved_model").is_none());
+        assert!(encoded.get("limits").is_none());
         assert_eq!(
             serde_json::from_value::<RunSnapshot>(encoded).unwrap(),
             bare
@@ -1956,11 +2148,74 @@ mod tests {
         invalid["resolved_model"]["version"] = serde_json::json!(0);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
 
-        // Adding this snapshot field breaks older `deny_unknown_fields`
-        // clients, so protocol negotiation must reject version 7 peers.
-        assert_eq!(crate::PROTOCOL_VERSION, 8);
+        // Adding request-shape identity to the nested descriptor breaks older
+        // `deny_unknown_fields` clients, so negotiation rejects version 8 peers.
+        assert_eq!(crate::PROTOCOL_VERSION, 11);
         let mut invalid = serde_json::to_value(&run).unwrap();
         invalid["resolved_model"]["future_control"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
+    }
+
+    #[test]
+    fn run_limits_and_budget_exhaustion_round_trip_and_stay_additive() {
+        // Version-9 clients submit prompts without limits; the field defaults
+        // to empty and stays off the wire when unset.
+        let historical = serde_json::json!({
+            "type": "submit_prompt",
+            "session_id": SessionId::generate().unwrap(),
+            "prompt": "hello",
+        });
+        let SessionCommand::SubmitPrompt { limits, .. } =
+            serde_json::from_value::<SessionCommand>(historical).unwrap()
+        else {
+            panic!("unexpected command")
+        };
+        assert!(limits.is_empty());
+        let bare = SessionCommand::SubmitPrompt {
+            session_id: SessionId::generate().unwrap(),
+            prompt: "hello".to_owned(),
+            limits: RunLimits::default(),
+        };
+        assert!(serde_json::to_value(&bare).unwrap().get("limits").is_none());
+
+        let limits = RunLimits {
+            max_duration_ms: Some(30_000),
+            max_model_turns: Some(4),
+            max_tool_calls: Some(40),
+            max_total_tokens: Some(200_000),
+            max_cost_usd_nanos: Some(1_500_000_000),
+        };
+        let limited = SessionCommand::SubmitPrompt {
+            session_id: SessionId::generate().unwrap(),
+            prompt: "hello".to_owned(),
+            limits,
+        };
+        let encoded = serde_json::to_value(&limited).unwrap();
+        assert_eq!(encoded["limits"]["max_model_turns"], 4);
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            limited
+        );
+        let unknown = serde_json::json!({"max_model_turns": 4, "max_pizzas": 1});
+        assert!(serde_json::from_value::<RunLimits>(unknown).is_err());
+
+        let outcome = RunOutcome::BudgetExhausted {
+            exhaustion: Box::new(BudgetExhaustion {
+                limit: BudgetLimitKind::CostUnknown,
+                final_response: false,
+                message: "usage omitted".to_owned(),
+            }),
+        };
+        let encoded = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(encoded["type"], "budget_exhausted");
+        assert_eq!(encoded["exhaustion"]["limit"], "cost_unknown");
+        assert_eq!(
+            serde_json::from_value::<RunOutcome>(encoded).unwrap(),
+            outcome
+        );
+        assert_eq!(
+            serde_json::to_value(RunStatus::BudgetExhausted).unwrap(),
+            "budget_exhausted"
+        );
     }
 }

@@ -4,11 +4,9 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
-use crate::{
-    ProviderError, ProviderErrorKind,
-    aws::{AwsCredentialLease, SigV4Authorizer},
-    credentials::SecretLiteral,
-};
+#[cfg(feature = "provider-bedrock")]
+use crate::aws::{AwsCredentialLease, SigV4Authorizer};
+use crate::{ProviderError, ProviderErrorKind, credentials::SecretLiteral};
 
 pub type RequestCredentialFuture<'a> =
     Pin<Box<dyn Future<Output = Result<RequestCredential, RequestCredentialError>> + Send + 'a>>;
@@ -124,6 +122,7 @@ pub(crate) enum RequestCredentialKindExpected {
 
 #[derive(Clone, Default)]
 pub(crate) struct RequestAuthorizer {
+    #[cfg(feature = "provider-bedrock")]
     sigv4: Option<Arc<SigV4Authorizer>>,
     credentials: Option<(
         SharedRequestCredentialProvider,
@@ -132,6 +131,7 @@ pub(crate) struct RequestAuthorizer {
 }
 
 impl RequestAuthorizer {
+    #[cfg(feature = "provider-bedrock")]
     pub(crate) fn bedrock_mantle_sigv4(
         region: impl Into<Arc<str>>,
         credentials: AwsCredentialLease,
@@ -155,12 +155,13 @@ impl RequestAuthorizer {
         expected: RequestCredentialKindExpected,
     ) -> Self {
         Self {
+            #[cfg(feature = "provider-bedrock")]
             sigv4: None,
             credentials: Some((credentials, expected)),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "provider-bedrock"))]
     pub(crate) fn with_sigv4_for_test(authorizer: SigV4Authorizer) -> Self {
         Self {
             sigv4: Some(Arc::new(authorizer)),
@@ -172,6 +173,7 @@ impl RequestAuthorizer {
         &self,
         request: &mut reqwest::Request,
     ) -> Result<Vec<String>, ProviderError> {
+        #[cfg(feature = "provider-bedrock")]
         if let Some(authorizer) = &self.sigv4 {
             authorizer.sign(request).await?;
         }

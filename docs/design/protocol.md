@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 11
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -66,9 +66,17 @@ direct and inclusive session accounting totals; version 6 added persisted
 run prompt identity (`RunSnapshot.prompt_identity`); version 7 added the
 persisted `model_turn_completed` event so each provider turn records its model,
 usage, and estimated cost before it is published; version 8 added the optional
-immutable resolved-model descriptor to `RunSnapshot`. Version 8 is required
-because older snapshot decoders reject the new field under
-`deny_unknown_fields`, even though historical runs may omit it.
+immutable resolved-model descriptor to `RunSnapshot`; version 9 added its
+optional provider request-shape identity. Version 9 is required because older
+snapshot decoders reject the nested field under `deny_unknown_fields`, even
+though historical version-1 descriptors and deployments that cannot produce a
+secret-free identity omit it. Version 10 added core-owned run budgets: the
+optional `submit_prompt.limits` request field, `RunSnapshot.limits`, the
+`budget_exhausted` run status, and the typed `budget_exhausted` run outcome.
+Older clients reject both the new outcome tag and the new snapshot field.
+Version 11 added compaction rollback: the `rollback_compaction` command, the
+`compaction_rolled_back` outcome, and the `session_compaction_rolled_back`
+event. Older clients reject the new command and event tags.
 
 Clients and servers must agree on this value.
 
@@ -237,7 +245,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 8,
+  "protocol_version": 9,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -348,6 +356,34 @@ affects only sessions created afterwards.
   }
 }
 ```
+
+The optional `limits` object imposes core-owned budgets on the run:
+
+```json
+{
+  "type": "submit_prompt",
+  "session_id": "...",
+  "prompt": "Refactor the parser.",
+  "limits": {
+    "max_duration_ms": 600000,
+    "max_model_turns": 40,
+    "max_tool_calls": 200,
+    "max_total_tokens": 2000000,
+    "max_cost_usd_nanos": 2000000000
+  }
+}
+```
+
+Every field is optional and must be greater than zero when present; an
+unknown field or a zero value is rejected as an invalid request. Limits are
+persisted with the run and enforced by the runtime, not the client, so every
+surface observes the same outcome. The wall clock starts at admission and
+spans provider retries, tool execution, and sub-agent work. When the turn or
+tool-call budget is nearly spent, the runtime reserves the last permitted turn
+as a tool-free final status response. `max_cost_usd_nanos` requires the
+resolved model to carry pricing; otherwise the run fails with a
+`configuration` failure before any provider work. Sub-agents inherit the
+parent's wall clock and cost cap, and their spend is charged to the parent.
 
 Outcome on accept:
 
@@ -616,7 +652,16 @@ untouched. A crash mid-summarization commits no marker; retry the command.
 
 A later `compact_session` summarizes the current summary together with the
 span since the marker, so repeated compactions fold rather than stack. A
-small bounded history of prior compactions is retained server-side.
+small bounded history of prior compactions (three rows) is retained
+server-side for rollback.
+
+The summary is validated before it commits: it must be non-empty, fit the
+session context limit, carry every required section heading (Intent;
+Decisions and constraints; Work state; Files touched; Errors; User messages),
+and shrink the assembled context relative to the prior assembly once that
+assembly exceeds a small floor. A summary failing any check fails the run
+with a `policy` failure and leaves the prior compaction (or the verbatim
+transcript) in force.
 
 Outcome:
 
@@ -632,6 +677,41 @@ Emits `session_updated` (the session shows queued), then the internal run's
 `run_started` and `run_finished`, then `session_compacted` when the summary
 commits. A failed or cancelled summarization emits only `run_finished` with
 that outcome and leaves assembly unchanged.
+
+Runs inside a compacted session may call the built-in read-only
+`search_history` tool, which searches the complete durable transcript
+(including spans compaction replaced) and returns bounded, cited excerpts.
+
+### `POST /v1/sessions/compact/rollback`
+
+```json
+{
+  "command_id": "...",
+  "command": {
+    "type": "rollback_compaction",
+    "session_id": "..."
+  }
+}
+```
+
+Discards the session's most recent compaction so the next run assembles from
+the previous retained compaction, or from the verbatim transcript when none
+remains. Valid only while the session is idle (`400` otherwise); `400` when
+the session has no compaction to roll back. Context occupancy is cleared
+because the next assembly is not yet known.
+
+Outcome:
+
+```json
+{
+  "type": "compaction_rolled_back",
+  "session_id": "...",
+  "remaining": 1
+}
+```
+
+Emits `session_compaction_rolled_back` with the refreshed `SessionSummary`
+and the count of retained compactions still available to roll back.
 
 ### `POST /v1/workspaces/snapshot`
 
@@ -803,6 +883,7 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `cancellation_requested` | `session`, `run_id` | Cancel command accepted for a live run |
 | `run_finished` | `session`, `run_id`, `outcome`, optional `usage`, optional `context_tokens` | Terminal run state |
 | `session_compacted` | `session`, optional `summary`, `before_bytes`, `after_bytes` | Compaction summary + cutoff committed |
+| `session_compaction_rolled_back` | `session`, `remaining` | Latest compaction discarded; `remaining` prior compactions still roll back |
 
 Text channels:
 
@@ -868,7 +949,11 @@ it from cumulative run billing.
     }
   },
   "resolved_model": {
-    "version": 1,
+    "version": 2,
+    "request_shape": {
+      "version": 1,
+      "digest": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
     "route": "xai/grok-4.5",
     "provider_model": "grok-4.5",
     "organization": "example-org",
@@ -893,12 +978,16 @@ it from cumulative run billing.
   },
   "usage": null,
   "estimated_cost_usd_nanos": null,
-  "context_tokens": null
+  "context_tokens": null,
+  "limits": { "max_model_turns": 40 }
 }
 ```
 
 Run status: `queued`, `running`, `completed`, `cancelled`, `failed`,
-`interrupted`.
+`interrupted`, `budget_exhausted`.
+
+`limits` echoes the caller-imposed budgets the run was admitted under and is
+omitted for runs submitted without any.
 
 `prompt_identity.version` identifies the shared provider-neutral system prompt
 contract prepared for the run. `instruction_hash` identifies the selected root
@@ -922,6 +1011,16 @@ profile identify the selected non-secret routing/auth context. Credential
 values, API keys, access tokens, and secret hashes are never represented.
 Pricing retains its provenance, and the capability fields describe controls
 and cache-usage accounting that the selected codec actually implements.
+Version-2 descriptors may carry `request_shape`, an opaque, versioned digest of
+the exact secret-free provider adapter/API/deployment shape compiled by the
+root. It is absent for historical version-1 descriptors and whenever an exact
+identity would require reading secret-bearing endpoint userinfo/query/fragment
+or custom static headers. Custom and LiteLLM endpoint configurations always
+omit it because arbitrary URL paths can themselves carry credentials. Consumers
+must treat absence as unknown and disable cross-run compatibility reuse; the
+digest is not a credential fingerprint. AWS deployments that resolve their
+region dynamically likewise omit it because the effective region is not stable
+across restart.
 `unsupported` output control (currently Codex Responses) means QQ still bounds
 its provider-neutral request and response processing to
 `max_output_tokens`, but the codec deliberately omits a provider-side output
@@ -946,7 +1045,13 @@ for prompt turns whose model still matches the session's selected model; an
 absent `context_tokens` explicitly clears the meter when that turn was not
 measured. Clients must ignore `run_context_updated` for session occupancy,
 including during replay of pre-version-5 events. Both events carry no
-snapshots.
+snapshots. Internally, the server reuses a measured session value across runs
+only when its persisted request shape and static system/tool prefix match
+exactly and the newly measured request bytes grow monotonically. Pricing-only
+descriptor refreshes remain compatible; model, codec, endpoint, organization,
+generation/output, system-prompt, or tool-schema changes do not.
+Context assembly that replaces stale tool results with pruning stubs also
+disables reuse because total byte growth alone cannot prove append-only history.
 
 **`MessageSnapshot`**
 
@@ -1038,7 +1143,36 @@ Previews are advisory UI aids. The authoritative call remains `tool_call`.
     "message": "..."
   }
 }
+{
+  "type": "budget_exhausted",
+  "exhaustion": {
+    "limit": "model_turns",
+    "final_response": true,
+    "message": "the run exhausted its 40 model turn budget"
+  }
+}
 ```
+
+`budget_exhausted` settles a run whose caller-imposed `limits` ran out. It is
+never a `failed` outcome: the harness, model, and provider behaved. The run
+status is also `budget_exhausted`. `final_response` reports whether the
+reserved tool-free status turn was granted; it is `false` when the wall clock
+elapsed, when cost became unmeasurable, or when the model requested a tool on
+the final turn.
+
+`BudgetLimitKind` values:
+
+```text
+duration
+model_turns
+tool_calls
+total_tokens
+cost
+cost_unknown
+```
+
+`cost_unknown` means a cost cap was imposed but a provider turn (of the run or
+of a sub-agent) omitted usage, so spend could no longer be measured.
 
 `RunFailureKind` values:
 

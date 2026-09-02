@@ -15,7 +15,9 @@ cargo xtask perf baseline --machine-class linux-x86_64-dedicated
 ```
 
 The Linux-only recorder resolves and pins the Rust host target, builds `qq` with
-`cargo build --locked --release --bin qq --target <host>`, then
+`cargo build --locked --release --bin qq --target <host>`, builds the minimal
+embedding profile with `--no-default-features` into a sibling target directory
+(so feature unification cannot re-enable the heavy provider families), then
 re-executes the benchmark worker from the optimized `xtask` binary. It defaults
 to 10 requested warmups and 100 requested samples. Expensive process, tool,
 stream, replay, R4, and load cases use fixture-versioned caps; every metric
@@ -98,6 +100,7 @@ source control.
 | Area | Metrics | Boundary |
 | --- | --- | --- |
 | Artifact | release bytes, dependency closure, dynamic libraries | Default locked release build of the root `qq` package |
+| Minimal profile | `qq_minimal_*` release bytes, distinct dependency-closure crates, first and repeated `--version`, `serve` readiness, idle/peak RSS | The `--no-default-features` embedding profile built into `target/qq-perf-minimal`; a correctness receipt asserts no AWS SDK crate is linked |
 | Process startup | first and repeated `qq --version`, isolated `qq serve` readiness | Process spawn through successful exit or listening notice |
 | Memory | idle/peak server RSS, isolated load-worker peak RSS | Linux `/proc`; load sidecar starts before concurrent submission |
 | Runtime lifecycle | new-store open, existing-store reopen, idle shutdown | Public `SessionRuntime` lifecycle calls |
@@ -115,6 +118,12 @@ source control.
 | Streaming fairness | eight-stream batch, control-call upper bound, cancellation, persisted output-service gap, transactions, temporary RSS | Eight concurrent 256 KiB streams with 16 snapshots and one cancellation; the service gap uses stored event times so replay delivery cannot compress a backlog |
 | Restart reconstruction | open-to-snapshot, replay, temporary RSS | Byte-identical one MiB snapshot and exact event-envelope digest after final close and reopen |
 | Load | ack, completion, batch, spread, throughput, active runs, RSS for 1/10/100 sessions | Concurrent admitted sessions with the default eight-run cap |
+
+The deterministic runtime loader carries a known version-2 provider
+request-shape identity. Provider-handoff and completion samples therefore
+include the one-time composite-shape construction and atomic occupancy-basis
+persistence used by R5. Cross-run correctness and the no-extra-store-call
+reservation path remain covered by focused deterministic `qq-core` tests.
 
 A full 4 MiB assistant payload cannot traverse the public runtime because the
 same 4 MiB storage backstop must also hold the submitted prompt and other

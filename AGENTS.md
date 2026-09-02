@@ -42,7 +42,12 @@ cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo build --workspace
+cargo test -p qq-provider --no-default-features --features test-support
 ```
+
+The last line covers the minimal embedding profile (no Amazon Bedrock family,
+no AWS SDK closure); run it when touching `qq-provider` manifests, features,
+or anything under `aws.rs`, `providers/bedrock.rs`, or `providers/mantle.rs`.
 
 Run the narrowest useful test while iterating, then run the workspace checks
 before opening a PR. Run

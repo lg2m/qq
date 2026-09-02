@@ -27,9 +27,10 @@ use qq_core::{
 };
 use qq_protocol::{
     ApprovalMode, CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, CommandRequest,
-    EventCursor, GenerationCapabilities, ModelSelection, PromptCacheCapabilities, ResolvedModel,
-    ResolvedModelVersion, RunFailureKind, RunId, RunOutcome, SessionCommand, SessionEvent,
-    SessionId, SnapshotRequest, SubscribeRequest, ToolCallState, WorkspaceId,
+    ContentHash, EventCursor, GenerationCapabilities, ModelSelection, PromptCacheCapabilities,
+    ProviderRequestShapeIdentity, ProviderRequestShapeVersion, ResolvedModel, ResolvedModelVersion,
+    RunFailureKind, RunId, RunOutcome, SessionCommand, SessionEvent, SessionId, SnapshotRequest,
+    SubscribeRequest, ToolCallState, WorkspaceId,
 };
 use qq_provider::{
     ContentBlock, ModelRequest, Provider, ProviderError, ProviderEvent, ProviderStream,
@@ -51,7 +52,7 @@ use tokio::{
 };
 
 const REPORT_SCHEMA_VERSION: u16 = 1;
-const FIXTURE_VERSION: u16 = 2;
+const FIXTURE_VERSION: u16 = 3;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(45);
 const METADATA_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -157,6 +158,10 @@ struct PerfReport {
     build: BuildMetadata,
     machine: MachineMetadata,
     artifact: ArtifactMetadata,
+    /// The `--no-default-features` embedding profile built beside the full
+    /// binary. Absent in reports recorded before fixture version 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimal_artifact: Option<ArtifactMetadata>,
     workload: WorkloadMetadata,
     metrics: Vec<MetricResult>,
     checks: Vec<CorrectnessCheck>,
@@ -435,6 +440,29 @@ async fn launch_release_worker(args: BaselineArgs) -> Result<(), PerfError> {
     ]);
     sanitize_rust_build_environment(&mut build);
     run_status_bounded("release build", BUILD_PROCESS_TIMEOUT, &mut build).await?;
+    // The minimal embedding profile builds into its own target directory so
+    // feature unification with the full binary cannot silently re-enable the
+    // heavy provider families it exists to exclude.
+    let mut minimal_build = TokioCommand::new(cargo_program());
+    minimal_build.current_dir(&root).args([
+        "build",
+        "--locked",
+        "--release",
+        "--bin",
+        "qq",
+        "--no-default-features",
+        "--target",
+        &target,
+        "--target-dir",
+    ]);
+    minimal_build.arg(minimal_target_directory(&root));
+    sanitize_rust_build_environment(&mut minimal_build);
+    run_status_bounded(
+        "minimal-profile release build",
+        BUILD_PROCESS_TIMEOUT,
+        &mut minimal_build,
+    )
+    .await?;
     if capture_source(&root).await? != source {
         return Err(PerfError::SourceChanged);
     }
@@ -544,15 +572,63 @@ async fn record_baseline(args: BaselineArgs) -> Result<(), PerfError> {
             source,
         })?;
 
+    let mut minimal_tree = TokioCommand::new(cargo_program());
+    minimal_tree.current_dir(&root).args([
+        "tree",
+        "--locked",
+        "--package",
+        "qq",
+        "--no-default-features",
+        "--target",
+        &target,
+        "--edges",
+        "normal,features",
+    ]);
+    let minimal_dependency_tree = command_output_bounded(
+        "minimal-profile dependency tree",
+        METADATA_PROCESS_TIMEOUT,
+        &mut minimal_tree,
+    )
+    .await?;
+    prepared_output
+        .minimal_dependency_file
+        .write_all(minimal_dependency_tree.as_bytes())
+        .and_then(|()| prepared_output.minimal_dependency_file.flush())
+        .map_err(|source| PerfError::WriteFile {
+            path: prepared_output.minimal_dependency_path.clone(),
+            source,
+        })?;
+
     let binary = cargo_target_directory(&root)
         .join(&target)
         .join("release")
         .join(format!("qq{}", env::consts::EXE_SUFFIX));
     let artifact =
         artifact_metadata(&binary, &prepared_output.dependency_path, &dependency_tree).await?;
-    let (mut metrics, checks, unsupported) =
+    let minimal_binary = minimal_target_directory(&root)
+        .join(&target)
+        .join("release")
+        .join(format!("qq{}", env::consts::EXE_SUFFIX));
+    let minimal_artifact = artifact_metadata(
+        &minimal_binary,
+        &prepared_output.minimal_dependency_path,
+        &minimal_dependency_tree,
+    )
+    .await?;
+    let (mut metrics, mut checks, unsupported) =
         run_workloads(&binary, args.samples, args.warmups).await?;
     verify_artifact_unchanged(&binary, &artifact)?;
+    let (minimal_metrics, minimal_checks) = minimal_profile_workloads(
+        &minimal_binary,
+        &minimal_artifact,
+        &minimal_dependency_tree,
+        args.samples,
+        args.warmups,
+    )
+    .await?;
+    verify_artifact_unchanged(&minimal_binary, &minimal_artifact)?;
+    metrics.extend(minimal_metrics);
+    checks.extend(minimal_checks);
     metrics.insert(
         0,
         MetricResult::scalar(
@@ -576,6 +652,7 @@ async fn record_baseline(args: BaselineArgs) -> Result<(), PerfError> {
         build,
         machine: machine_metadata(&args.machine_class, &root).await,
         artifact,
+        minimal_artifact: Some(minimal_artifact),
         workload: WorkloadMetadata {
             requested_samples: args.samples,
             requested_warmups: args.warmups,
@@ -664,6 +741,8 @@ struct PreparedReportOutput {
     report_file: CapFile,
     dependency_file: CapFile,
     dependency_path: PathBuf,
+    minimal_dependency_file: CapFile,
+    minimal_dependency_path: PathBuf,
 }
 
 fn prepare_report_output(root: &Path, output: &Path) -> Result<PreparedReportOutput, PerfError> {
@@ -672,7 +751,8 @@ fn prepare_report_output(root: &Path, output: &Path) -> Result<PreparedReportOut
         return Err(PerfError::InvalidOutput);
     }
     let dependency_path = output.with_extension("dependency-tree.txt");
-    if dependency_path == output {
+    let minimal_dependency_path = output.with_extension("minimal-dependency-tree.txt");
+    if dependency_path == output || minimal_dependency_path == output {
         return Err(PerfError::InvalidOutput);
     }
     let parent = output.parent().ok_or(PerfError::InvalidOutput)?;
@@ -702,6 +782,9 @@ fn prepare_report_output(root: &Path, output: &Path) -> Result<PreparedReportOut
     let dependency_name = dependency_path
         .file_name()
         .ok_or(PerfError::InvalidOutput)?;
+    let minimal_dependency_name = minimal_dependency_path
+        .file_name()
+        .ok_or(PerfError::InvalidOutput)?;
     let mut options = CapOpenOptions::new();
     options.write(true).create_new(true);
     let report_file = directory
@@ -716,10 +799,18 @@ fn prepare_report_output(root: &Path, output: &Path) -> Result<PreparedReportOut
             path: dependency_path.clone(),
             source,
         })?;
+    let minimal_dependency_file = directory
+        .open_with(minimal_dependency_name, &options)
+        .map_err(|source| PerfError::WriteFile {
+            path: minimal_dependency_path.clone(),
+            source,
+        })?;
     Ok(PreparedReportOutput {
         report_file,
         dependency_file,
         dependency_path,
+        minimal_dependency_file,
+        minimal_dependency_path,
     })
 }
 
@@ -757,6 +848,12 @@ fn cargo_target_directory(root: &Path) -> PathBuf {
     } else {
         root.join(configured)
     }
+}
+
+/// Where the minimal embedding profile builds. A sibling of the default target
+/// directory so `CARGO_TARGET_DIR` overrides still apply.
+fn minimal_target_directory(root: &Path) -> PathBuf {
+    cargo_target_directory(root).join("qq-perf-minimal")
 }
 
 fn default_max_active_runs() -> usize {
@@ -1294,9 +1391,11 @@ async fn build_metadata(target: String, root: &Path) -> Result<BuildMetadata, Pe
             .await?,
         native_build_environment_sha256: native_build_environment_sha256(),
         cargo_configuration_sha256: cargo_configuration_sha256(root)?,
-        build_command: format!("cargo build --locked --release --bin qq --target {target}"),
+        build_command: format!(
+            "cargo build --locked --release --bin qq --target {target}; cargo build --locked --release --bin qq --no-default-features --target {target} --target-dir <target>/qq-perf-minimal"
+        ),
         dependency_command:
-            "cargo tree --locked --package qq --target <host> --edges normal,features".to_owned(),
+            "cargo tree --locked --package qq [--no-default-features] --target <host> --edges normal,features".to_owned(),
     })
 }
 
@@ -1843,7 +1942,11 @@ impl RuntimeLoader for BenchmarkLoader {
                 .map(|runtime| LoadedRuntime {
                     runtime: Arc::new(runtime),
                     resolved_model: Arc::new(ResolvedModel {
-                        version: ResolvedModelVersion::new(1).unwrap(),
+                        version: ResolvedModelVersion::new(2).unwrap(),
+                        request_shape: Some(ProviderRequestShapeIdentity {
+                            version: ProviderRequestShapeVersion::new(1).unwrap(),
+                            digest: ContentHash::from_bytes([0x51; 32]),
+                        }),
                         route: "benchmark/model".to_owned(),
                         provider_model: "benchmark/model".to_owned(),
                         organization: None,
@@ -2420,6 +2523,113 @@ async fn process_workloads(
     ))
 }
 
+/// The AWS SDK crates the minimal embedding profile must not link. Matched
+/// against `cargo tree` crate names, so the unrelated `aws-lc-rs` TLS backend
+/// that rustls pulls in either profile does not count.
+const HEAVY_PROVIDER_DEPENDENCY_PREFIXES: [&str; 7] = [
+    "aws-config ",
+    "aws-credential-types ",
+    "aws-sdk-bedrockruntime ",
+    "aws-sigv4 ",
+    "aws-smithy-http-client ",
+    "aws-smithy-runtime-api ",
+    "aws-smithy-types ",
+];
+
+/// Counts distinct crates in a `cargo tree` listing: one entry per unique
+/// `name vX.Y.Z` token, ignoring feature edges and `(*)` back-references.
+fn dependency_closure_crates(dependency_tree: &str) -> usize {
+    dependency_tree
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start_matches(['│', '├', '└', '─', ' ']);
+            let mut words = trimmed.split_whitespace();
+            let name = words.next()?;
+            let version = words.next()?;
+            version
+                .strip_prefix('v')
+                .filter(|rest| rest.starts_with(|character: char| character.is_ascii_digit()))
+                .map(|_| format!("{name} {version}"))
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// Measures the `--no-default-features` embedding profile beside the full
+/// binary: artifact size, dependency closure, fresh-process startup, server
+/// readiness, and idle RSS, with a correctness receipt that the heavy provider
+/// closure is absent. Startup and RSS reuse the full-profile fixtures exactly.
+async fn minimal_profile_workloads(
+    binary: &Path,
+    artifact: &ArtifactMetadata,
+    dependency_tree: &str,
+    samples: u16,
+    warmups: u16,
+) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
+    let (process_metrics, process_checks, _) = process_workloads(binary, samples, warmups).await?;
+    let mut metrics = vec![
+        MetricResult::scalar(
+            "qq_minimal_release_binary_bytes",
+            "bytes",
+            "target/qq-perf-minimal/release/qq file length after the locked --no-default-features release build",
+            artifact.binary_bytes,
+        )?,
+        MetricResult::scalar(
+            "qq_minimal_dependency_closure_crates",
+            "crates",
+            "distinct crates in cargo tree --no-default-features --edges normal,features for the qq package",
+            u64::try_from(dependency_closure_crates(dependency_tree)).unwrap_or(u64::MAX),
+        )?,
+    ];
+    for mut metric in process_metrics {
+        // `qq_fresh_process_version_ns` becomes `qq_minimal_fresh_process_version_ns`.
+        metric.name = format!("qq_minimal_{}", metric.name.trim_start_matches("qq_"));
+        metric.boundary = format!(
+            "{} (minimal --no-default-features profile)",
+            metric.boundary
+        );
+        metrics.push(metric);
+    }
+    let linked_heavy = dependency_tree
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start_matches(['│', '├', '└', '─', ' ']);
+            HEAVY_PROVIDER_DEPENDENCY_PREFIXES
+                .iter()
+                .find(|prefix| trimmed.starts_with(*prefix))
+                .map(|prefix| prefix.trim_end().to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut checks = process_checks
+        .into_iter()
+        .map(|mut check| {
+            check.name = format!("minimal_{}", check.name);
+            check
+        })
+        .collect::<Vec<_>>();
+    checks.push(CorrectnessCheck {
+        name: "minimal_profile_excludes_heavy_provider_dependencies".to_owned(),
+        passed: linked_heavy.is_empty(),
+        detail: if linked_heavy.is_empty() {
+            format!(
+                "the --no-default-features dependency closure ({} crates) links none of {}",
+                dependency_closure_crates(dependency_tree),
+                HEAVY_PROVIDER_DEPENDENCY_PREFIXES
+                    .iter()
+                    .map(|prefix| prefix.trim_end())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            format!(
+                "the --no-default-features dependency closure still links {}",
+                linked_heavy.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        },
+    });
+    Ok((metrics, checks))
+}
+
 async fn run_version(binary: &Path) -> Result<(), PerfError> {
     let display = format!("{} --version", binary.display());
     let mut child = tokio::process::Command::new(binary)
@@ -2654,6 +2864,7 @@ async fn direct_pipeline_workloads(
             SessionCommand::SubmitPrompt {
                 session_id,
                 prompt: "respond with deterministic text".to_owned(),
+                limits: qq_protocol::RunLimits::default(),
             },
         )
         .await?;
@@ -2760,6 +2971,7 @@ async fn replay_workload(
         SessionCommand::SubmitPrompt {
             session_id,
             prompt: "create replay fixture".to_owned(),
+            limits: qq_protocol::RunLimits::default(),
         },
     )
     .await?;
@@ -2921,6 +3133,7 @@ async fn http_pipeline_workloads(
             SessionCommand::SubmitPrompt {
                 session_id,
                 prompt: "respond over HTTP".to_owned(),
+                limits: qq_protocol::RunLimits::default(),
             },
         )
         .await?;
@@ -3017,6 +3230,7 @@ async fn http_reconnect_workload(
         SessionCommand::SubmitPrompt {
             session_id,
             prompt: "create HTTP replay fixture".to_owned(),
+            limits: qq_protocol::RunLimits::default(),
         },
     )
     .await?;
@@ -3225,6 +3439,7 @@ async fn measure_tool(
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "use the requested tool once".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await?;
@@ -3264,6 +3479,7 @@ async fn cancellation_workloads(
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: "wait until cancelled".to_owned(),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await?;
@@ -3375,6 +3591,7 @@ async fn measure_long_stream(bytes: usize, samples: u16) -> Result<(Vec<u64>, bo
                 SessionCommand::SubmitPrompt {
                     session_id,
                     prompt: format!("emit exactly {bytes} benchmark bytes"),
+                    limits: qq_protocol::RunLimits::default(),
                 },
             )
             .await?;
@@ -3581,6 +3798,7 @@ async fn r4_reasoning_sample() -> Result<R4WorkerSample, PerfError> {
             SessionCommand::SubmitPrompt {
                 session_id,
                 prompt: "emit the reasoning fixture".to_owned(),
+                limits: qq_protocol::RunLimits::default(),
             },
         )
         .await?;
@@ -3650,6 +3868,7 @@ async fn r4_shell_sample() -> Result<R4WorkerSample, PerfError> {
             SessionCommand::SubmitPrompt {
                 session_id,
                 prompt: "stream the long shell fixture".to_owned(),
+                limits: qq_protocol::RunLimits::default(),
             },
         )
         .await?;
@@ -3773,6 +3992,7 @@ async fn r4_eight_stream_sample() -> Result<R4WorkerSample, PerfError> {
                     SessionCommand::SubmitPrompt {
                         session_id,
                         prompt: "emit the paced stream fixture".to_owned(),
+                        limits: qq_protocol::RunLimits::default(),
                     },
                 )
                 .await?;
@@ -3944,6 +4164,7 @@ async fn r4_restart_sample() -> Result<R4WorkerSample, PerfError> {
         SessionCommand::SubmitPrompt {
             session_id,
             prompt: "emit the restart fixture".to_owned(),
+            limits: qq_protocol::RunLimits::default(),
         },
     )
     .await?;
@@ -4466,6 +4687,7 @@ async fn measure_load_profile(
                         SessionCommand::SubmitPrompt {
                             session_id,
                             prompt: "complete the load fixture".to_owned(),
+                            limits: qq_protocol::RunLimits::default(),
                         },
                     )
                     .await?;
@@ -4852,6 +5074,33 @@ mod tests {
     }
 
     #[test]
+    fn dependency_closure_counts_distinct_crates_and_heavy_prefixes_ignore_aws_lc() {
+        let tree = "qq v0.1.0 (/repo)\n\
+                    ├── qq-provider v0.1.0 (/repo/crates/qq-provider)\n\
+                    │   ├── reqwest v0.13.4\n\
+                    │   │   └── rustls v0.23.42\n\
+                    │   │       └── aws-lc-rs v1.17.3\n\
+                    │   └── serde v1.0.219\n\
+                    ├── serde v1.0.219 (*)\n\
+                    └── qq-provider feature \"default\"\n\
+                        └── qq-provider v0.1.0 (/repo/crates/qq-provider) (*)\n";
+        assert_eq!(dependency_closure_crates(tree), 6);
+        let heavy = tree
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start_matches(['│', '├', '└', '─', ' ']);
+                HEAVY_PROVIDER_DEPENDENCY_PREFIXES
+                    .iter()
+                    .any(|prefix| trimmed.starts_with(prefix))
+            })
+            .count();
+        assert_eq!(heavy, 0, "aws-lc-rs is the TLS backend, not the SDK");
+        assert!(
+            "aws-sdk-bedrockruntime v1.137.0".starts_with(HEAVY_PROVIDER_DEPENDENCY_PREFIXES[2])
+        );
+    }
+
+    #[test]
     fn cargo_executable_override_is_part_of_native_build_identity() {
         assert!(is_native_build_environment_key(OsStr::new("CARGO")));
     }
@@ -4935,6 +5184,7 @@ mod tests {
                 build_command: "build".to_owned(),
                 dependency_command: "tree".to_owned(),
             },
+            minimal_artifact: None,
             machine: MachineMetadata {
                 machine_class: "machine".to_owned(),
                 operating_system: "linux".to_owned(),

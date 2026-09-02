@@ -1886,6 +1886,7 @@ fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) ->
             Some(qq_protocol::RunOutcome::Completed) => (".", accent()),
             Some(qq_protocol::RunOutcome::Cancelled) => ("x", warning()),
             Some(qq_protocol::RunOutcome::Interrupted) => ("!", warning()),
+            Some(qq_protocol::RunOutcome::BudgetExhausted { .. }) => ("$", warning()),
             Some(qq_protocol::RunOutcome::Failed { .. }) => ("!", failure()),
             None => ("o", muted()),
         },

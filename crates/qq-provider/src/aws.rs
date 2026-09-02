@@ -32,7 +32,8 @@ use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
-use crate::{ProviderError, credentials::SecretLiteral};
+use crate::ProviderError;
+use crate::bedrock_auth::BedrockAuth;
 
 #[cfg(test)]
 use crate::ProviderErrorKind;
@@ -51,17 +52,6 @@ static DIRECT_AWS_HTTP_CLIENT: LazyLock<SharedHttpClient> = LazyLock::new(|| {
         ))
         .build_https()
 });
-
-/// Authentication used by Amazon Bedrock Runtime.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BedrockAuth {
-    /// Uses the standard AWS credential and region provider chains.
-    DefaultChain,
-    /// Uses one named AWS profile.
-    Profile(String),
-    /// Uses an Amazon Bedrock API key as an HTTP bearer token.
-    ApiKey(SecretLiteral),
-}
 
 pub(crate) fn validate_configuration(
     auth: &BedrockAuth,

@@ -444,21 +444,16 @@ impl Store {
         parent: &ClaimedRun,
         model: ModelSelection,
         task: String,
+        limits: RunLimits,
     ) -> Result<CreatedChildRun, SessionRuntimeError> {
         let store_id = self.store_id;
-        let workspace_id = parent.workspace_id;
-        let parent_session_id = parent.session_id;
-        let parent_run_id = parent.run_id;
+        let parent = ChildRunParent {
+            workspace_id: parent.workspace_id,
+            session_id: parent.session_id,
+            run_id: parent.run_id,
+        };
         self.call(Priority::Control, move |connection| {
-            create_child_run(
-                connection,
-                store_id,
-                workspace_id,
-                parent_session_id,
-                parent_run_id,
-                model,
-                task,
-            )
+            create_child_run(connection, store_id, parent, model, task, limits)
         })
         .await
     }
@@ -645,6 +640,24 @@ impl Store {
         .await
     }
 
+    /// Full-transcript recall for `search_history`, on the control lane so a
+    /// saturated output queue cannot starve a running tool call.
+    pub(super) async fn search_history(
+        &self,
+        session_id: SessionId,
+        calling_run: RunId,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<HistoryMatch>, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            search_session_history(&transaction, session_id, calling_run, &query, limit)
+        })
+        .await
+    }
+
     pub(super) async fn compaction_committed(
         &self,
         session_id: SessionId,
@@ -798,11 +811,11 @@ impl Store {
     pub(super) async fn record_prompt_identity(
         &self,
         claimed: &ClaimedRun,
-        identity: RunPromptIdentity,
+        identity: Arc<RunPromptIdentity>,
     ) -> Result<(), SessionRuntimeError> {
         let claimed = claimed.clone();
-        let identity =
-            serde_json::to_string(&identity).map_err(|_| SessionRuntimeError::Persistence)?;
+        let identity = serde_json::to_string(identity.as_ref())
+            .map_err(|_| SessionRuntimeError::Persistence)?;
         self.call(Priority::Control, move |connection| {
             let changed = connection
                 .execute(
@@ -1012,25 +1025,35 @@ impl Store {
 
     /// The terminal outcome of one run, if it has reached one. Polled by
     /// spawn futures awaiting their child run.
+    /// A settled run's outcome and estimated cost. The cost is `None` until
+    /// the run settles and stays `None` when spend was unmeasurable.
     pub(super) async fn run_outcome(
         &self,
         run_id: RunId,
-    ) -> Result<Option<RunOutcome>, SessionRuntimeError> {
+    ) -> Result<Option<(RunOutcome, Option<u64>)>, SessionRuntimeError> {
         self.call(Priority::Control, move |connection| {
-            let outcome = connection
+            let (outcome, cost) = connection
                 .query_row(
-                    "SELECT outcome_json FROM runs WHERE id = ?1",
+                    "SELECT outcome_json, estimated_cost_usd_nanos FROM runs WHERE id = ?1",
                     [run_id.to_string()],
-                    |row| row.get::<_, Option<String>>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<u64>>(1)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|_| SessionRuntimeError::Persistence)?
                 .ok_or(SessionRuntimeError::RunNotFound)?;
             outcome
                 .as_deref()
-                .map(serde_json::from_str)
+                .map(|encoded| {
+                    serde_json::from_str(encoded)
+                        .map(|outcome| (outcome, cost))
+                        .map_err(|_| SessionRuntimeError::Persistence)
+                })
                 .transpose()
-                .map_err(|_| SessionRuntimeError::Persistence)
         })
         .await
     }
