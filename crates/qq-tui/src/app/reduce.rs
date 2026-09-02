@@ -363,7 +363,11 @@ impl App {
         else {
             return;
         };
-        if messages.iter().any(|candidate| candidate.id == message.id) {
+        if messages
+            .iter()
+            .rev()
+            .any(|candidate| candidate.id == message.id)
+        {
             return;
         }
         // Server snapshots order messages by run first, then by ordinal
@@ -379,6 +383,9 @@ impl App {
         retain_recent_messages(messages);
     }
 
+    /// The streaming message is nearly always the newest, so scan from the
+    /// tail: a text delta then costs one comparison rather than a walk over
+    /// the retained history.
     fn message_mut(
         &mut self,
         session_id: SessionId,
@@ -389,6 +396,7 @@ impl App {
             .messages
             .as_mut()?
             .iter_mut()
+            .rev()
             .find(|message| message.id == message_id)
     }
 
@@ -415,8 +423,10 @@ impl App {
         else {
             return;
         };
+        // Updates target recent calls; scan from the tail.
         if let Some(existing) = tool_calls
             .iter_mut()
+            .rev()
             .find(|existing| existing.id == tool_call.id)
         {
             *existing = tool_call;

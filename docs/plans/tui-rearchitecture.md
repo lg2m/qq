@@ -1,7 +1,7 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phases T0 and T1 are complete (receipts below).
-Phases T2–T7 are proposed.
+Status: proposed 2026-09-02. Phases T0–T2 are complete (receipts below).
+Phases T3–T7 are proposed.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -246,6 +246,53 @@ Acceptance:
 
 - The T0 benchmarks meet the budget table.
 - Frame cost with eight background streams is `<= 1.2x` single-session cost.
+
+#### T2 Completion Receipt — 2026-09-02
+
+Commits `ee54796`, `2f135d6`, and the indexing/eviction commit that follows.
+All 149 tests pass; workspace fmt, Clippy, test, and build gates green.
+
+| Case | T0 baseline (median / p95) | After T2 (median / p95) |
+| --- | ---: | ---: |
+| First frame, 64 completed code-bearing messages | 12.1 ms | **0.80 ms** plain; fully highlighted 13.2 ms later off-tick |
+| Steady state, no changes | 18.6 µs / 21.8 µs | 22.0 µs / 24.8 µs |
+| One streaming prose message, one delta per frame | 855 µs / 1,028 µs | **34.5 µs / 36.6 µs** |
+| Run-on 32 KiB paragraph, no block boundary (new ceiling case) | 855 µs | 415 µs / 468 µs |
+| Eight background sessions, one delta each | 17.8 µs / 18.7 µs | 20.3 µs / 20.8 µs |
+| Keystroke to frame | 31.5 µs / 41.6 µs | **23.9 µs / 25.8 µs** |
+
+Every budget in the table above is met: streaming `<= 2 ms` p95, steady
+`<= 1 ms` p95, keystroke `<= 4 ms` p95, eight-background `<= 1.2x` steady
+(0.84x; still a floor until T3 reduces live status for unfocused sessions).
+The +3 µs on steady state is the cost of the highlight bookkeeping and LRU
+stamping per frame; accepted for the 15x first-frame win.
+
+What changed:
+
+- **Settled-prefix live cache.** `settled_prefix_end` finds the last blank
+  line outside a fence or indented code block; a corpus test proves
+  `markdown_lines(prefix) ++ markdown_lines(suffix) == markdown_lines(whole)`.
+  A streaming message re-lays-out only its open trailing block. `wrap_line`
+  and `wrap_line_chars` now slice span text by byte range instead of
+  allocating one `String` per character, which halved the run-on ceiling.
+- **Off-tick highlighting.** `view/highlight.rs` schedules tree-sitter on the
+  Tokio blocking pool (four in flight, bounded result channel). Completed
+  messages cache plain immediately; results are installed by
+  `HighlightKey` so stale work is dropped. Loop test proves the plain frame
+  precedes the highlighted one through the real `select!`.
+- **Loop.** Terminal size is cached from `Resize`. User input draws
+  immediately (`Redraw::Immediate`); client updates coalesce to the tick
+  (`Redraw::Scheduled`).
+- **Indexes and eviction.** `thread_order` groups children by parent in one
+  pass (was O(S²)); `children_of` replaces the view-side scan; per-delta
+  lookups scan from the tail; markdown cache eviction is LRU by frame clock.
+- **No `expect` on the frame path.** Viewport and message-body lookups
+  degrade to blank rows and recover next frame.
+
+Deferred: `Line::width()` memoization (measured immaterial after the wrap
+rewrite; revisit if a profile shows it), `TextAppended` per-frame coalescing
+(the settled-prefix cache made per-delta cost flat, so batching buys little),
+and moving reduce-focused tests out of `app.rs` (cosmetic).
 
 ### T3 — Session Store, Fast Create, Warm Bodies
 

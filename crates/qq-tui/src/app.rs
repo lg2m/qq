@@ -1648,24 +1648,46 @@ impl App {
         session.context_window
     }
 
+    /// Every session in tree order: roots newest-first, each followed by its
+    /// descendants depth-first with siblings oldest-first. One pass groups
+    /// children by parent so the walk is linear in the number of sessions
+    /// plus sorting, not quadratic.
     pub fn thread_order(&self) -> Vec<SessionId> {
-        let mut roots = self.root_sessions();
-        roots.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
-        roots.reverse();
-        let mut stack = roots.into_iter().rev().collect::<Vec<_>>();
+        let mut children: HashMap<Option<SessionId>, Vec<SessionId>> = HashMap::new();
+        for session in self.sessions.values() {
+            children
+                .entry(session.summary.parent_id)
+                .or_default()
+                .push(session.summary.id);
+        }
+        for siblings in children.values_mut() {
+            siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+        }
+        let mut stack = children.remove(&None).unwrap_or_default();
+        // Roots are newest-first; popping from the back yields the newest.
         let mut output = Vec::with_capacity(self.sessions.len());
         while let Some(session_id) = stack.pop() {
             output.push(session_id);
-            let mut children = self
-                .sessions
-                .values()
-                .filter(|session| session.summary.parent_id == Some(session_id))
-                .map(|session| session.summary.id)
-                .collect::<Vec<_>>();
-            children.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
-            stack.extend(children);
+            if let Some(mut kids) = children.remove(&Some(session_id)) {
+                // Children render oldest-first, so push newest first to be
+                // popped last.
+                kids.reverse();
+                stack.extend(kids);
+            }
         }
         output
+    }
+
+    /// Direct children of `parent`, oldest-first.
+    pub fn children_of(&self, parent: SessionId) -> Vec<SessionId> {
+        let mut children = self
+            .sessions
+            .values()
+            .filter(|session| session.summary.parent_id == Some(parent))
+            .map(|session| session.summary.id)
+            .collect::<Vec<_>>();
+        children.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+        children
     }
 
     fn root_sessions(&self) -> Vec<SessionId> {

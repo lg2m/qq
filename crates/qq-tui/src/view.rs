@@ -76,6 +76,8 @@ pub(crate) struct FrameRenderer {
     previous: Vec<Line>,
     size: Option<(u16, u16)>,
     markdown: HashMap<MessageId, CachedMarkdown>,
+    /// Monotonic counter bumped per `prepare_markdown`; stamps cache use.
+    clock: u64,
     /// Off-tick syntax highlighting for cached completed messages.
     pub(crate) highlighter: Highlighter,
     /// Settled rows of messages still streaming, keyed by message. Each entry
@@ -103,6 +105,8 @@ struct CachedMarkdown {
     /// A highlighted layout has been requested or applied; `false` means a
     /// later frame should try again once the highlighter has capacity.
     highlight_requested: bool,
+    /// Frame counter at last use, for least-recently-used eviction.
+    last_used: u64,
 }
 
 impl CachedMarkdown {
@@ -420,15 +424,22 @@ impl<'a> VirtualBody<'a> {
                         prefix_style,
                         width,
                     } => {
-                        let message = find_message(app, *message_id)
-                            .expect("virtual transcript message remains loaded");
-                        rendered.extend(index.render(
-                            MessageText::new(message),
-                            local_start..local_end,
-                            prefix,
-                            *prefix_style,
-                            *width,
-                        ));
+                        // The message can only vanish between prepare and
+                        // viewport if a snapshot replaced the session inside
+                        // one frame; blank rows are the safe degradation.
+                        match find_message(app, *message_id) {
+                            Some(message) => rendered.extend(index.render(
+                                MessageText::new(message),
+                                local_start..local_end,
+                                prefix,
+                                *prefix_style,
+                                *width,
+                            )),
+                            None => rendered.extend(std::iter::repeat_n(
+                                Line::default(),
+                                local_end - local_start,
+                            )),
+                        }
                     }
                 }
             }
@@ -597,6 +608,7 @@ impl FrameRenderer {
     }
 
     fn prepare_markdown(&mut self, app: &App, width: usize, limit: usize) {
+        self.clock += 1;
         self.prune_markdown(app);
         let Some(session) = app
             .focused
@@ -702,6 +714,7 @@ impl FrameRenderer {
             && cached.refusal_bytes == message.refusal.len()
             && cached.loaded_through == loaded_through
         {
+            cached.last_used = self.clock;
             // Layout is current; retry a highlight request that was skipped
             // because the highlighter was saturated.
             if !cached.highlight_requested {
@@ -735,7 +748,11 @@ impl FrameRenderer {
         };
         if !self.markdown.contains_key(&message.id)
             && self.markdown.len() >= MAX_VISIBLE_MESSAGES
-            && let Some(stale) = self.markdown.keys().next().copied()
+            && let Some(stale) = self
+                .markdown
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(id, _)| *id)
         {
             self.markdown.remove(&stale);
         }
@@ -746,6 +763,7 @@ impl FrameRenderer {
             loaded_through,
             body,
             highlight_requested: !needs_highlight,
+            last_used: self.clock,
         };
         let key = cached.key(message.id);
         let mut cached = cached;
@@ -807,7 +825,7 @@ impl FrameRenderer {
         ]);
         body.extend_virtual(transcript);
         if let Some(focused) = app.focused {
-            let children = child_sessions(app, focused);
+            let children = app.children_of(focused);
             if !children.is_empty() {
                 body.push_line(Line::default());
                 body.push_line(Line::styled("  +-- related sessions", muted().bold()));
@@ -888,7 +906,7 @@ impl FrameRenderer {
             );
             body.push_line(line);
         }
-        for child in child_sessions(app, session_id) {
+        for child in app.children_of(session_id) {
             body.push_line(session_line(app, child, content_width, "  > "));
         }
         body
@@ -1098,10 +1116,13 @@ impl FrameRenderer {
         body.push_line(truncate_line(header, width));
         let content_start = body.rows;
         if message_is_terminal(message) {
-            let cached = self
-                .markdown
-                .get(&message.id)
-                .expect("terminal visible message was prepared");
+            let Some(cached) = self.markdown.get(&message.id) else {
+                // `prepare_markdown` caches every visible terminal message;
+                // a miss means the cache was evicted under memory pressure
+                // this frame. Show the header and recover next frame.
+                body.push_line(message_ellipsis(prefix, prefix_style));
+                return;
+            };
             match &cached.body {
                 CachedMessageBody::Markdown(lines) => {
                     if lines.is_empty() {
@@ -1872,17 +1893,6 @@ fn shell_command_preview(tool_call: &ToolCallSnapshot) -> Option<String> {
         Some(cwd) => format!("{command}  (in {cwd})"),
         None => command.to_owned(),
     })
-}
-
-fn child_sessions(app: &App, parent: SessionId) -> Vec<SessionId> {
-    let mut children = app
-        .sessions
-        .values()
-        .filter(|session| session.summary.parent_id == Some(parent))
-        .map(|session| session.summary.id)
-        .collect::<Vec<_>>();
-    children.sort_by_key(|id| app.sessions[id].summary.updated_at_ms);
-    children
 }
 
 fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) -> Line {
