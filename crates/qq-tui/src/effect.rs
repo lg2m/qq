@@ -6,9 +6,10 @@ use qq_protocol::SessionId;
 
 use crate::ClientRequest;
 use crate::app::{Attention, NoticeLevel};
+use crate::panes::LayoutFile;
 
 /// One effect produced by an update.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Effect {
     /// Something visible changed. `Immediate` is reserved for user input so
     /// typing echoes without waiting for the frame tick; everything else
@@ -29,6 +30,17 @@ pub(crate) enum Effect {
     },
     /// Turn terminal mouse reporting on or off.
     MouseCapture(bool),
+    /// Persist the pane layout to `.qq/layouts/<name>.ron` in the workspace.
+    SaveLayout {
+        name: String,
+        file: LayoutFile,
+    },
+    /// Read `.qq/layouts/<name>.ron` and install it.
+    LoadLayout {
+        name: String,
+    },
+    /// List saved layouts as a notice.
+    ListLayouts,
     Quit,
 }
 
@@ -44,7 +56,7 @@ pub(crate) enum Redraw {
 /// The effects of one update, in application order. Most updates produce
 /// none or one, so this stays a thin wrapper that only allocates when it
 /// holds something.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct Effects(Vec<Effect>);
 
 impl Effects {

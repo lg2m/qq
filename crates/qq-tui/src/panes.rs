@@ -28,7 +28,7 @@ pub(crate) const MAX_PANES: usize = 16;
 pub(crate) struct PaneId(u32);
 
 /// Which way a split divides its rectangle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Axis {
     /// Children sit side by side; the divider is a vertical line.
     Columns,
@@ -828,5 +828,202 @@ mod tests {
         // Switching session returns to the tail.
         viewport.update((Some(session(2)), Layout::Threadline), 50, 10, false);
         assert_eq!(viewport.offset(), 0);
+    }
+}
+
+/// A saved layout: the split tree with the session or view each leaf showed.
+/// Session ids are stored as hex strings so the file survives a protocol
+/// bump; a leaf whose session no longer exists loads empty.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum LayoutNode {
+    Leaf(LeafContent),
+    Split {
+        axis: Axis,
+        ratio: f32,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum LeafContent {
+    Empty,
+    Session(String),
+    Attention,
+    Changes,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LayoutFile {
+    pub version: u32,
+    pub root: LayoutNode,
+}
+
+impl LayoutFile {
+    pub(crate) const VERSION: u32 = 1;
+}
+
+impl Panes {
+    /// Snapshot the tree and each leaf's content for `LayoutFile`.
+    pub(crate) fn to_layout(&self) -> LayoutFile {
+        fn convert(this: &Panes, node: &Node) -> LayoutNode {
+            match node {
+                Node::Leaf(id) => {
+                    LayoutNode::Leaf(match this.panes.get(id).map(|pane| pane.content) {
+                        Some(PaneContent::Transcript(Some(session))) => {
+                            LeafContent::Session(session.to_string())
+                        }
+                        Some(PaneContent::Transcript(None)) | None => LeafContent::Empty,
+                        Some(PaneContent::Attention) => LeafContent::Attention,
+                        Some(PaneContent::Changes) => LeafContent::Changes,
+                    })
+                }
+                Node::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                } => LayoutNode::Split {
+                    axis: *axis,
+                    ratio: *ratio,
+                    first: Box::new(convert(this, first)),
+                    second: Box::new(convert(this, second)),
+                },
+            }
+        }
+        LayoutFile {
+            version: LayoutFile::VERSION,
+            root: convert(self, &self.root),
+        }
+    }
+
+    /// Rebuild the tree from a saved layout. `exists` says whether a saved
+    /// session id is still known; unknown ones load as empty transcripts.
+    /// Returns `None` when the file has more leaves than `MAX_PANES`.
+    pub(crate) fn from_layout(
+        layout: &LayoutFile,
+        exists: impl Fn(SessionId) -> bool,
+    ) -> Option<Self> {
+        fn build(
+            node: &LayoutNode,
+            next_id: &mut u32,
+            panes: &mut HashMap<PaneId, Pane>,
+            exists: &dyn Fn(SessionId) -> bool,
+        ) -> Node {
+            match node {
+                LayoutNode::Leaf(content) => {
+                    let id = PaneId(*next_id);
+                    *next_id += 1;
+                    let content = match content {
+                        LeafContent::Empty => PaneContent::Transcript(None),
+                        LeafContent::Session(text) => PaneContent::Transcript(
+                            text.parse::<SessionId>().ok().filter(|id| exists(*id)),
+                        ),
+                        LeafContent::Attention => PaneContent::Attention,
+                        LeafContent::Changes => PaneContent::Changes,
+                    };
+                    panes.insert(
+                        id,
+                        Pane {
+                            content,
+                            viewport: Viewport::default(),
+                        },
+                    );
+                    Node::Leaf(id)
+                }
+                LayoutNode::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                } => Node::Split {
+                    axis: *axis,
+                    ratio: ratio.clamp(MIN_RATIO, 1.0 - MIN_RATIO),
+                    first: Box::new(build(first, next_id, panes, exists)),
+                    second: Box::new(build(second, next_id, panes, exists)),
+                },
+            }
+        }
+        let mut next_id = 0;
+        let mut panes = HashMap::new();
+        let root = build(&layout.root, &mut next_id, &mut panes, &exists);
+        if panes.len() > MAX_PANES || panes.is_empty() {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        root.leaves(&mut leaves);
+        Some(Self {
+            root,
+            panes,
+            focused: leaves[0],
+            next_id,
+            zoomed: false,
+            tiles: Vec::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn session(byte: u8) -> SessionId {
+        SessionId::from_bytes([byte; 16])
+    }
+
+    #[test]
+    fn a_layout_round_trips_through_ron_and_drops_unknown_sessions() {
+        let mut panes = Panes::default();
+        panes.focused_mut().show_session(Some(session(1)));
+        let right = panes.split(Axis::Columns).unwrap();
+        panes.focused_mut().show_session(Some(session(2)));
+        panes.split(Axis::Rows).unwrap();
+        panes.focused_mut().content = PaneContent::Changes;
+        panes.focus(right);
+
+        let file = panes.to_layout();
+        let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default()).unwrap();
+        let parsed: LayoutFile = ron::from_str(&text).unwrap();
+        assert_eq!(parsed, file);
+
+        // Session 2 no longer exists: its pane loads empty; the change board
+        // and the split shape survive.
+        let restored = Panes::from_layout(&parsed, |id| id == session(1)).unwrap();
+        let mut contents: Vec<PaneContent> = restored
+            .ids()
+            .into_iter()
+            .map(|id| restored.get(id).unwrap().content)
+            .collect();
+        contents.sort_by_key(|content| format!("{content:?}"));
+        assert_eq!(
+            contents,
+            vec![
+                PaneContent::Changes,
+                PaneContent::Transcript(None),
+                PaneContent::Transcript(Some(session(1))),
+            ]
+        );
+        assert_eq!(restored.len(), 3);
+    }
+
+    #[test]
+    fn a_layout_with_too_many_panes_is_refused() {
+        fn nest(depth: usize) -> LayoutNode {
+            if depth == 0 {
+                LayoutNode::Leaf(LeafContent::Empty)
+            } else {
+                LayoutNode::Split {
+                    axis: Axis::Columns,
+                    ratio: 0.5,
+                    first: Box::new(nest(depth - 1)),
+                    second: Box::new(LayoutNode::Leaf(LeafContent::Empty)),
+                }
+            }
+        }
+        let file = LayoutFile {
+            version: LayoutFile::VERSION,
+            root: nest(MAX_PANES + 1),
+        };
+        assert!(Panes::from_layout(&file, |_| true).is_none());
     }
 }

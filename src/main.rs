@@ -333,17 +333,6 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         .into_iter()
         .map(Into::into)
         .collect::<Vec<qq_tui::ModelOption>>();
-    let (connection, embedded, create_initial_session) =
-        match server::reserve(server::ServerOptions::for_user()?).await? {
-            server::ReserveOutcome::Existing(connection) => (connection, None, false),
-            server::ReserveOutcome::Reserved(reservation) => {
-                let handler = Arc::new(runtime::RuntimeHandler::open(factory).await?);
-                let server = reservation.start(handler.clone());
-                let connection = server.connection().clone();
-                (connection, Some(EmbeddedRuntime { server, handler }), true)
-            }
-        };
-
     let workspace = std::fs::canonicalize(std::env::current_dir()?)?;
     let configured_model = qq_protocol::ModelSelection {
         model: Some(snapshot.model().as_str().to_owned()),
@@ -354,16 +343,47 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
         .iter()
         .any(|option| option.selection.model == configured_model.model)
         .then_some(configured_model.clone());
-    let tui_client = client::TuiClient::start(
-        connection,
-        workspace,
-        configured_model,
-        model.clone(),
-        create_initial_session,
-        || async { server::discover().await.ok().flatten() },
-    )?;
+
+    // The TUI paints its first frame before the server is reserved or the
+    // embedded runtime opened; the port connects on the loop's first recv
+    // and the embedded handle comes back through the channel for shutdown.
+    let (embedded_tx, mut embedded_rx) = tokio::sync::oneshot::channel::<EmbeddedRuntime>();
+    let connect = {
+        let model = model.clone();
+        async move {
+            let options = server::ServerOptions::for_user()
+                .map_err(|error| qq_tui::ClientFailure::new(error.to_string()))?;
+            let (connection, create_initial_session) = match server::reserve(options)
+                .await
+                .map_err(|error| qq_tui::ClientFailure::new(error.to_string()))?
+            {
+                server::ReserveOutcome::Existing(connection) => (connection, false),
+                server::ReserveOutcome::Reserved(reservation) => {
+                    let handler = Arc::new(
+                        runtime::RuntimeHandler::open(factory)
+                            .await
+                            .map_err(|error| qq_tui::ClientFailure::new(error.to_string()))?,
+                    );
+                    let server = reservation.start(handler.clone());
+                    let connection = server.connection().clone();
+                    // The receiver only drops when the TUI already exited.
+                    let _ = embedded_tx.send(EmbeddedRuntime { server, handler });
+                    (connection, true)
+                }
+            };
+            client::TuiClient::start(
+                connection,
+                workspace,
+                configured_model,
+                model,
+                create_initial_session,
+                || async { server::discover().await.ok().flatten() },
+            )
+            .map_err(|error| qq_tui::ClientFailure::new(error.to_string()))
+        }
+    };
     let result = qq_tui::run(
-        tui_client,
+        qq_tui::LazyPort::new(connect),
         qq_tui::TuiOptions {
             settings: tui,
             model: model.unwrap_or_default(),
@@ -373,7 +393,7 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     )
     .await;
 
-    if let Some(embedded) = embedded {
+    if let Ok(embedded) = embedded_rx.try_recv() {
         embedded.shutdown().await?;
     }
     result.map_err(Into::into)

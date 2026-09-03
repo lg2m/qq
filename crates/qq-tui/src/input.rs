@@ -70,6 +70,18 @@ impl PickerItem for SessionRow {
     }
 }
 
+/// A row in the prompt-history search (`Ctrl-R`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryRow {
+    pub text: String,
+}
+
+impl PickerItem for HistoryRow {
+    fn search_text<'a>(&'a self, out: &mut Vec<&'a str>) {
+        out.push(&self.text);
+    }
+}
+
 /// A row in the command palette and help overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CommandRow {
@@ -105,6 +117,9 @@ pub(crate) enum Overlay {
         picker: Picker<CommandRow>,
         help: bool,
     },
+    /// Reverse search over the focused session's prompt history, newest
+    /// first. Enter puts the highlighted prompt in the composer.
+    History(Picker<HistoryRow>),
 }
 
 /// What currently owns keyboard input, from highest to lowest priority.
@@ -114,6 +129,7 @@ pub(crate) enum Mode {
     Themes,
     Sessions,
     Commands,
+    History,
     Approval,
     Compose,
 }
@@ -176,6 +192,7 @@ impl Overlay {
             Self::Themes { .. } => Mode::Themes,
             Self::Sessions { .. } => Mode::Sessions,
             Self::Commands { .. } => Mode::Commands,
+            Self::History(_) => Mode::History,
         }
     }
 
@@ -216,6 +233,7 @@ impl Overlay {
             Self::Themes { picker, .. } => dispatch(picker, key),
             Self::Sessions { picker, .. } => dispatch(picker, key),
             Self::Commands { picker, .. } => dispatch(picker, key),
+            Self::History(picker) => dispatch(picker, key),
         }
     }
 
@@ -226,6 +244,7 @@ impl Overlay {
             Self::Themes { picker, .. } => picker.push_query(text),
             Self::Sessions { picker, .. } => picker.push_query(text),
             Self::Commands { picker, .. } => picker.push_query(text),
+            Self::History(picker) => picker.push_query(text),
         }
     }
 }

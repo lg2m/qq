@@ -1,6 +1,16 @@
 # TUI Refinement
 
-Status: proposed 2026-09-02. Supersedes the structural claims in
+Status: F0–F6 landed 2026-09-03 (commits `8825c57`..`HEAD` on `main`).
+Deferred: `qq --bench-startup` (a loop test enforces the first-frame gate
+instead), the `!` shell passthrough cell, OSC 8 hyperlinks and OSC 11
+dark/light detection, `tui.ron` wiring for `status_line` (the setting exists
+in `SettingsBuilder`), and the protocol prerequisites below, which remain
+H-track work. Final bench (release, 160x48): every gate in
+[Speed Budgets](#speed-budgets) passes; `sessions_200_with_sidebar` 41 µs,
+`picker_open_close_cycle` 43 µs (from 523), `tool_calls_32_expanded` 61 µs
+p95.
+
+This plan supersedes the structural claims in
 [`tui-rearchitecture.md`](./tui-rearchitecture.md): that plan's T0–T7 phases
 shipped their features and speed budgets, but the T1 module split it promised
 (lines 78–108 there) did not land. This plan finishes the structure, removes

@@ -65,6 +65,8 @@ pub(crate) enum Command {
     InterruptRun,
     /// Edit the draft in `$VISUAL` or `$EDITOR`.
     OpenEditor,
+    /// Reverse-search the focused session's prompt history.
+    SearchHistory,
     /// Delete every empty session in the workspace after confirmation.
     PruneSessions,
     /// Split the focused pane; the new pane sits beside it.
@@ -147,7 +149,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 49] = [
+pub(crate) const COMMANDS: [CommandSpec; 50] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -334,7 +336,7 @@ pub(crate) const COMMANDS: [CommandSpec; 49] = [
         "toggle reasoning detail",
         View,
         [],
-        ["Ctrl-R"]
+        ["Alt-R"]
     ),
     spec!(
         ToggleSidebar,
@@ -436,6 +438,13 @@ pub(crate) const COMMANDS: [CommandSpec; 49] = [
         Compose,
         ["/editor"],
         ["Alt-E"]
+    ),
+    spec!(
+        SearchHistory,
+        "search prompt history",
+        Compose,
+        [],
+        ["Ctrl-R"]
     ),
     spec!(Quit, "exit QQ", System, ["/quit", "/exit"], ["Ctrl-C"]),
 ];

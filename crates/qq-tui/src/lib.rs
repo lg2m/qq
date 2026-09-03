@@ -11,6 +11,7 @@ mod effect;
 #[cfg(any(test, feature = "bench-support"))]
 pub mod fixtures;
 mod input;
+mod lazy_port;
 mod model;
 mod panes;
 mod picker;
@@ -21,6 +22,7 @@ mod theme;
 mod view;
 
 pub use app::{ModelOption, TuiError, TuiOptions, run};
+pub use lazy_port::LazyPort;
 pub use qq_client::{ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState};
 pub use settings::{
     Action, KeyChord, Layout, Settings, SettingsBuilder, SettingsError, StatusItem,

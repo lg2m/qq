@@ -151,7 +151,22 @@ Every other key lives in one command table. `?` on an empty composer, `F1`, or
 `Ctrl-K` or `/commands` opens the same list as a searchable palette that runs
 the highlighted command on Enter. Rebinding an action updates every hint that
 mentions it. Mouse capture is off so terminal selection and copy work; `/mouse`
-turns wheel scrolling and click-to-focus on.
+turns wheel scrolling and click-to-focus on. `Ctrl-R` searches the session's
+prompt history; `Ctrl-Up`/`Ctrl-Down` select a tool call and Enter expands it
+alone (or opens the child a `spawn_agent` call created); `Ctrl-O` expands
+every call and `Alt-R` the reasoning. Expanded rows show when a call started,
+finished or how long it has run, and when it last produced output.
+
+With several agents, the sidebar groups sessions by what you should do about
+them (NEEDS YOU, WORKING, IDLE, DONE) with unread counts; below 120 columns a
+one-row agent strip above the composer carries the same counts. `Ctrl-G` jumps
+to the next session that needs you; `Alt-A`/`Alt-D` approve or deny a call
+waiting in another session without leaving the current one. In an approval,
+`Shift-Y`/`Shift-N` decide and then steer the run with a note. `/attention`
+lists everything that needs you across the workspace and `/changes` shows every
+file agents edited, flagging files touched by more than one. `/layout save
+<name>`, `/layout load <name>`, and `/layout list` persist pane arrangements
+under `.qq/layouts/`.
 
 `theme` names a color theme. QQ ships `qq` (follows your terminal palette),
 `ink` and `ember` (its own), and ports of gruvbox, tokyonight, catppuccin,
@@ -180,8 +195,8 @@ offered only when the server advertises it; otherwise Enter holds the draft.
 
 The interactive composer recognizes `/help`, `/commands`, `/models`, `/theme`,
 `/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/layout`, `/mouse`,
-`/editor`, `/split`, `/stack`, `/close`, `/zoom`, `/compact`, and `/quit` (also
-`/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
+`/attention`, `/changes`, `/editor`, `/split`, `/stack`, `/close`, `/zoom`,
+`/compact`, and `/quit` (also `/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
 `/models`. `/compact`
 summarizes an idle session's history into a compact context so long
 sessions keep going; stale read-only tool results are also pruned from

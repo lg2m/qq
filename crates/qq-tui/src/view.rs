@@ -229,6 +229,7 @@ impl FrameRenderer {
             Mode::Themes => theme_picker(app, body_width, body_height),
             Mode::Sessions => session_picker(app, body_width, body_height),
             Mode::Commands => command_picker(app, body_width, body_height),
+            Mode::History => history_picker(app, body_width, body_height),
             // An approval keeps the transcript on screen and adds its block
             // under the awaiting call, so the decision is made in context.
             Mode::Approval => self.panes_body(app, Rect::new(0, 1, body_width, body_height)),

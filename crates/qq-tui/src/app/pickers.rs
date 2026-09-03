@@ -11,8 +11,8 @@ use crate::{
     commands::Command,
     effect::{Effects, Redraw},
     input::{
-        CommandRow, ModelRow, Overlay, PickerOutcome, SessionConfirm, SessionRow, ThemeRow,
-        command_rows,
+        CommandRow, HistoryRow, ModelRow, Overlay, PickerOutcome, SessionConfirm, SessionRow,
+        ThemeRow, command_rows,
     },
     picker::Picker,
     theme::Theme,
@@ -70,6 +70,14 @@ impl App {
                 };
                 self.overlay = None;
                 self.focus_session(id)
+            }
+            (PickerOutcome::Accept, Overlay::History(picker)) => {
+                let Some(text) = picker.current().map(|row| row.text.clone()) else {
+                    return Effects::none();
+                };
+                self.overlay = None;
+                self.composer.replace(text);
+                Effects::redraw(Redraw::Immediate)
             }
             (PickerOutcome::Accept, Overlay::Commands { picker, .. }) => {
                 let Some(command) = picker.current().map(|row| row.spec.command) else {
@@ -386,6 +394,36 @@ impl App {
             PendingIntent::Prune,
             qq_protocol::SessionCommand::PruneSessions { workspace_id },
         )
+    }
+
+    // --- history ---
+
+    /// `Ctrl-R`: search the focused session's prompts, newest first.
+    pub(super) fn open_history(&mut self) -> Effects {
+        let Some(session) = self.focused().and_then(|id| self.sessions.get(&id)) else {
+            self.set_info("no session history to search".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        };
+        if session.prompt_history.is_empty() {
+            self.set_info("no prompts yet in this session".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        }
+        let rows = session
+            .prompt_history
+            .iter()
+            .rev()
+            .map(|text| HistoryRow { text: text.clone() })
+            .collect();
+        self.overlay = Some(Overlay::History(Picker::with_items(rows)));
+        Effects::redraw(Redraw::Immediate)
+    }
+
+    /// Rows of the open history search, for the renderer.
+    pub(crate) fn history_picker(&self) -> Option<&Picker<HistoryRow>> {
+        match &self.overlay {
+            Some(Overlay::History(picker)) => Some(picker),
+            _ => None,
+        }
     }
 
     // --- commands ---

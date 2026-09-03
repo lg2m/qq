@@ -207,7 +207,7 @@ fn hints_for(app: &App) -> Vec<(crate::commands::Command, &'static str)> {
         Mode::Approval => {
             hints.push((Command::OpenHelp, "help"));
         }
-        Mode::Models | Mode::Themes | Mode::Sessions | Mode::Commands => {}
+        Mode::Models | Mode::Themes | Mode::Sessions | Mode::Commands | Mode::History => {}
     }
     hints
 }

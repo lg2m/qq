@@ -23,7 +23,7 @@ use tokio::{
 
 use crate::{
     ClientPort, ClientRequest, ClientUpdate,
-    app::{App, TuiError},
+    app::{App, NoticeLevel, TuiError},
     effect::{Effect, Effects, Redraw},
     view::FrameRenderer,
 };
@@ -248,6 +248,48 @@ where
                         existing.max(Redraw::Scheduled)
                     }));
                 }
+                Effect::SaveLayout { name, file } => {
+                    let workspace = app.workspace_path.clone();
+                    let outcome =
+                        tokio::task::spawn_blocking(move || save_layout(&workspace, &name, &file))
+                            .await
+                            .unwrap_or_else(|error| Err(error.to_string()));
+                    match outcome {
+                        Ok(path) => app.apply_notice(
+                            None,
+                            NoticeLevel::Info,
+                            format!("layout saved to {path}"),
+                        ),
+                        Err(message) => app.apply_notice(None, NoticeLevel::Warning, message),
+                    }
+                    redraw = Some(Redraw::Immediate);
+                }
+                Effect::LoadLayout { name } => {
+                    let workspace = app.workspace_path.clone();
+                    let loading = name.clone();
+                    let outcome =
+                        tokio::task::spawn_blocking(move || load_layout(&workspace, &loading))
+                            .await
+                            .unwrap_or_else(|error| Err(error.to_string()));
+                    match outcome {
+                        Ok(file) => queue.extend(app.apply_layout(&name, &file)),
+                        Err(message) => app.apply_notice(None, NoticeLevel::Warning, message),
+                    }
+                    redraw = Some(Redraw::Immediate);
+                }
+                Effect::ListLayouts => {
+                    let workspace = app.workspace_path.clone();
+                    let names = tokio::task::spawn_blocking(move || list_layouts(&workspace))
+                        .await
+                        .unwrap_or_default();
+                    let text = if names.is_empty() {
+                        "no saved layouts; /layout save <name> creates one".to_owned()
+                    } else {
+                        format!("layouts: {}", names.join(", "))
+                    };
+                    app.apply_notice(None, NoticeLevel::Info, text);
+                    redraw = Some(Redraw::Immediate);
+                }
                 Effect::MouseCapture(enabled) => {
                     let bytes = mouse_capture_bytes(enabled)?;
                     output.write_all(&bytes).await?;
@@ -326,6 +368,48 @@ impl Drop for TerminalGuard {
             Print("\r\n")
         );
     }
+}
+
+fn layouts_dir(workspace: &str) -> std::path::PathBuf {
+    std::path::Path::new(if workspace.is_empty() { "." } else { workspace })
+        .join(".qq")
+        .join("layouts")
+}
+
+fn save_layout(
+    workspace: &str,
+    name: &str,
+    file: &crate::panes::LayoutFile,
+) -> Result<String, String> {
+    let directory = layouts_dir(workspace);
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join(format!("{name}.ron"));
+    let text = ron::ser::to_string_pretty(file, ron::ser::PrettyConfig::default())
+        .map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| error.to_string())?;
+    Ok(path.display().to_string())
+}
+
+fn load_layout(workspace: &str, name: &str) -> Result<crate::panes::LayoutFile, String> {
+    let path = layouts_dir(workspace).join(format!("{name}.ron"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    ron::from_str(&text).map_err(|error| format!("{} is not a layout: {error}", path.display()))
+}
+
+fn list_layouts(workspace: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(layouts_dir(workspace)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_suffix(".ron").map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 /// Escape bytes that enable or disable mouse reporting.

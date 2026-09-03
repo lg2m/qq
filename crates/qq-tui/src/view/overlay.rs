@@ -349,6 +349,33 @@ pub(super) fn approval_block(app: &App, tool_call: &ToolCallSnapshot, width: usi
 /// Diff rows an inline approval shows before offering to scroll.
 const MAX_APPROVAL_DIFF_ROWS: usize = 12;
 
+/// Prompt-history search: newest first, fuzzy filtered by what the user types.
+pub(super) fn history_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let Some(picker) = app.history_picker() else {
+        return fit_height(Vec::new(), height);
+    };
+    picker_frame(
+        picker,
+        PickerChrome {
+            title: "HISTORY",
+            hint: "type to search, Enter edits the prompt, Esc closes",
+            placeholder: "recent prompts",
+            question: None,
+            empty: "  No matching prompts.",
+        },
+        width,
+        height,
+        |row: &crate::input::HistoryRow, selected, out| {
+            let mut line = cursor_prefix(selected);
+            line.push(
+                preview(&row.text, width.saturating_sub(6)),
+                if selected { normal().bold() } else { normal() },
+            );
+            out.push(finish_row(line, selected, width));
+        },
+    )
+}
+
 /// Shell approvals surface the exact command so the user can decide in place.
 pub(super) fn shell_command_preview(tool_call: &ToolCallSnapshot) -> Option<String> {
     if tool_call.name != "shell" {

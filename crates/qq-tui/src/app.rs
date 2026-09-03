@@ -938,7 +938,7 @@ impl App {
             return self.execute(Command::Quit);
         }
         match self.mode() {
-            Mode::Sessions | Mode::Models | Mode::Themes | Mode::Commands => {
+            Mode::Sessions | Mode::Models | Mode::Themes | Mode::Commands | Mode::History => {
                 self.handle_overlay_key(key)
             }
             Mode::Approval => self.handle_approval_key(key),
@@ -1228,6 +1228,7 @@ impl App {
         match command {
             Command::OpenHelp => self.open_commands(true),
             Command::OpenCommands => self.open_commands(false),
+            Command::SearchHistory => self.open_history(),
             Command::OpenModels => self.open_models(),
             Command::OpenThemes => self.open_themes(),
             Command::OpenSessions => self.open_sessions(),
@@ -1502,7 +1503,18 @@ impl App {
         // runtime can resolve an explicit command or skill consistently for
         // direct, embedded, and remote clients.
         if prompt.starts_with('/') {
-            let name = prompt.split_whitespace().next().unwrap_or(&prompt);
+            let mut words = prompt.split_whitespace();
+            let name = words.next().unwrap_or(&prompt);
+            // `/layout save|load|list [name]` carries arguments; every other
+            // client command is bare.
+            if name == "/layout"
+                && let Some(verb) = words.next()
+            {
+                let layout_name = words.next().unwrap_or("default").to_owned();
+                self.composer.clear();
+                self.slash.select(0);
+                return self.layout_command(verb, layout_name);
+            }
             if let Some(entry) = commands::slash_entries().find(|entry| entry.name == name) {
                 self.composer.clear();
                 self.slash.select(0);
@@ -2229,6 +2241,68 @@ fn is_composer_newline_key(key: KeyEvent) -> bool {
 mod tests;
 
 impl App {
+    /// `/layout save|load|list [name]`.
+    fn layout_command(&mut self, verb: &str, name: String) -> Effects {
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            self.set_warning("layout names use letters, digits, - and _".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        }
+        let mut effects = Effects::redraw(Redraw::Immediate);
+        match verb {
+            "save" => effects.push(Effect::SaveLayout {
+                name,
+                file: self.panes.to_layout(),
+            }),
+            "load" => effects.push(Effect::LoadLayout { name }),
+            "list" => effects.push(Effect::ListLayouts),
+            other => self.set_warning(format!(
+                "unknown /layout verb `{other}`; use save, load, or list"
+            )),
+        }
+        effects
+    }
+
+    /// Install a loaded layout. Leaves naming sessions the client does not
+    /// know load empty; the first pane takes focus.
+    pub(crate) fn apply_layout(&mut self, name: &str, file: &crate::panes::LayoutFile) -> Effects {
+        if file.version != crate::panes::LayoutFile::VERSION {
+            self.set_warning(format!(
+                "layout `{name}` is version {}, expected {}",
+                file.version,
+                crate::panes::LayoutFile::VERSION
+            ));
+            return Effects::redraw(Redraw::Immediate);
+        }
+        let Some(panes) = Panes::from_layout(file, |id| self.sessions.contains_key(&id)) else {
+            self.set_warning(format!("layout `{name}` has too many panes"));
+            return Effects::redraw(Redraw::Immediate);
+        };
+        self.panes = panes;
+        self.set_info(format!("layout `{name}` loaded"));
+        // Cold sessions now shown need their bodies.
+        let mut effects = Effects::redraw(Redraw::Immediate);
+        let cold: Vec<SessionId> = self
+            .panes
+            .sessions()
+            .filter(|id| self.sessions.get(id).is_some_and(|s| !s.is_warm()))
+            .collect();
+        if let Some(workspace_id) = self.workspace_id {
+            for session_id in cold {
+                effects.push(Effect::Send(ClientRequest::Snapshot(SnapshotRequest {
+                    workspace_id,
+                    focused_session_id: Some(session_id),
+                    include_sessions: Vec::new(),
+                    session_limit: SNAPSHOT_SESSION_LIMIT,
+                    message_limit: SNAPSHOT_MESSAGE_LIMIT,
+                })));
+            }
+        }
+        effects
+    }
+
     /// Move the transcript cursor to the adjacent tool call of the focused
     /// session in transcript order (the order the server persisted them).
     /// From no selection, up starts at the newest call and down at the oldest.
