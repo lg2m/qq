@@ -9,7 +9,7 @@ use qq_protocol::{
 };
 
 use super::{
-    App, Attention, MAX_RECENT_TOOL_CALLS, PendingIntent, SNAPSHOT_MESSAGE_LIMIT,
+    App, Attention, MAX_RECENT_TOOL_CALLS, NoticeLevel, PendingIntent, SNAPSHOT_MESSAGE_LIMIT,
     SNAPSHOT_SESSION_LIMIT, SessionView, format_bytes, model_context_window,
 };
 use crate::{
@@ -218,16 +218,20 @@ impl App {
             // The follow-through of an approve-for-workspace decision. A
             // failure is informational: the session grant already stands.
             SessionEvent::WorkspaceGrantPromoted { outcome, .. } => {
-                self.set_warning(match outcome {
-                    WorkspaceGrantOutcome::Written { path } => {
-                        format!("grant written to {path}")
-                    }
-                    WorkspaceGrantOutcome::AlreadyPresent { path } => {
-                        format!("grant already present in {path}")
-                    }
-                    WorkspaceGrantOutcome::Failed { message } => {
-                        format!("workspace grant not saved: {message}")
-                    }
+                effects.push(Effect::Notice {
+                    session: None,
+                    level: NoticeLevel::Warning,
+                    text: match outcome {
+                        WorkspaceGrantOutcome::Written { path } => {
+                            format!("grant written to {path}")
+                        }
+                        WorkspaceGrantOutcome::AlreadyPresent { path } => {
+                            format!("grant already present in {path}")
+                        }
+                        WorkspaceGrantOutcome::Failed { message } => {
+                            format!("workspace grant not saved: {message}")
+                        }
+                    },
                 });
             }
             SessionEvent::SessionCompacted {
@@ -237,21 +241,23 @@ impl App {
                 ..
             } => {
                 self.upsert_summary(session.clone());
-                self.set_info_for(
-                    Some(envelope.session_id),
-                    format!(
+                effects.push(Effect::Notice {
+                    session: Some(envelope.session_id),
+                    level: NoticeLevel::Info,
+                    text: format!(
                         "compacted: {} -> {}",
                         format_bytes(*before_bytes),
                         format_bytes(*after_bytes)
                     ),
-                );
+                });
             }
             SessionEvent::SessionCompactionRolledBack { session, remaining } => {
                 self.upsert_summary(session.clone());
-                self.set_info_for(
-                    Some(envelope.session_id),
-                    format!("compaction rolled back; {remaining} retained"),
-                );
+                effects.push(Effect::Notice {
+                    session: Some(envelope.session_id),
+                    level: NoticeLevel::Info,
+                    text: format!("compaction rolled back; {remaining} retained"),
+                });
             }
             // Run-level audit updates are not session state. In particular,
             // old persisted events may predate the authoritative session
@@ -326,12 +332,16 @@ impl App {
                     }
                 }
                 match outcome {
-                    RunOutcome::Failed { failure } => {
-                        self.set_error_for(Some(envelope.session_id), failure.message.clone());
-                    }
-                    RunOutcome::BudgetExhausted { exhaustion } => {
-                        self.set_error_for(Some(envelope.session_id), exhaustion.message.clone());
-                    }
+                    RunOutcome::Failed { failure } => effects.push(Effect::Notice {
+                        session: Some(envelope.session_id),
+                        level: NoticeLevel::Error,
+                        text: failure.message.clone(),
+                    }),
+                    RunOutcome::BudgetExhausted { exhaustion } => effects.push(Effect::Notice {
+                        session: Some(envelope.session_id),
+                        level: NoticeLevel::Error,
+                        text: exhaustion.message.clone(),
+                    }),
                     RunOutcome::Completed | RunOutcome::Cancelled | RunOutcome::Interrupted => {}
                 }
             }

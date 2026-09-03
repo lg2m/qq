@@ -603,7 +603,8 @@ impl App {
             .collect::<Vec<_>>();
         let mut effects = Effects::redraw(Redraw::Scheduled);
         for event in replay {
-            effects.extend(self.reduce_event(&event));
+            let reduced = self.reduce_event(&event);
+            effects.extend(self.absorb_notices(reduced));
         }
         effects
     }
@@ -729,7 +730,8 @@ impl App {
             .is_some_and(|session| event.cursor.sequence <= session.loaded_through);
         let mut effects = Effects::redraw(Redraw::Scheduled);
         if !already_loaded {
-            effects.extend(self.reduce_event(&event));
+            let reduced = self.reduce_event(&event);
+            effects.extend(self.absorb_notices(reduced));
         }
         if let Some(command_id) = event.caused_by {
             self.pending.remove(&command_id);
@@ -756,6 +758,34 @@ impl App {
 
     fn set_notice(&mut self, text: String, level: NoticeLevel) {
         self.set_notice_for(self.focused(), text, level);
+    }
+
+    /// Show a notice produced as an effect. `None` attaches it to the
+    /// focused session.
+    pub(crate) fn apply_notice(
+        &mut self,
+        session: Option<SessionId>,
+        level: NoticeLevel,
+        text: String,
+    ) {
+        self.set_notice_for(session.or_else(|| self.focused()), text, level);
+    }
+
+    /// Apply the reducer's notice effects here, where notice state lives,
+    /// and pass everything else through to the loop.
+    fn absorb_notices(&mut self, effects: Effects) -> Effects {
+        let mut rest = Effects::none();
+        for effect in effects {
+            match effect {
+                Effect::Notice {
+                    session,
+                    level,
+                    text,
+                } => self.apply_notice(session, level, text),
+                other => rest.push(other),
+            }
+        }
+        rest
     }
 
     fn set_info_for(&mut self, session_id: Option<SessionId>, text: String) {

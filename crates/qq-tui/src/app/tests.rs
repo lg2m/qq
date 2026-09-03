@@ -2903,3 +2903,51 @@ fn a_rejected_model_change_or_deletion_is_attributed_to_its_session_not_the_focu
         Some((text, NoticeLevel::Error)) if text.contains("prune refused")
     ));
 }
+
+#[test]
+fn the_reducer_returns_notices_and_attention_as_effects_instead_of_mutating_them() {
+    let (mut app, session_id, run_id, _) = running_app();
+    app.handle_terminal_event(Event::FocusLost);
+    let mut summary = app.sessions[&session_id].summary.clone();
+    summary.status = SessionStatus::Idle;
+    summary.active_run_id = None;
+    let envelope = SessionEventEnvelope {
+        run_id: Some(run_id),
+        ..fixtures::envelope(
+            2,
+            session_id,
+            SessionEvent::RunFinished {
+                session: summary,
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: qq_protocol::RunFailure {
+                        message: "provider exploded".to_owned(),
+                        kind: qq_protocol::RunFailureKind::Server,
+                    },
+                },
+                usage: None,
+                context_tokens: None,
+            },
+        )
+    };
+
+    let effects = app.reduce_event(&envelope);
+
+    // Pure: the reducer changed the model but left notice state alone.
+    assert_eq!(
+        app.sessions[&session_id].summary.status,
+        SessionStatus::Idle
+    );
+    assert_eq!(app.visible_status(), None);
+    let effects: Vec<Effect> = effects.into_iter().collect();
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Notice { session: Some(id), level: NoticeLevel::Error, text }
+            if *id == session_id && text == "provider exploded"
+    )));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Attention(Attention::RunFinished { .. })))
+    );
+}
