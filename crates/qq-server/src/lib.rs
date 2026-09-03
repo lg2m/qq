@@ -30,13 +30,13 @@ use futures_util::StreamExt;
 use qq_core::SessionEventStream;
 use qq_protocol::{
     AgentProfileSummary, ApprovalMode, BudgetLimitKind, CAPABILITIES_VERSION, CapabilitiesRequest,
-    CommandReceipt, CommandRequest, InputPartKind, LimitCapabilities, LocalConnectionError,
-    LocalServerConnection, MAX_CORRELATION_ENTRIES, MAX_EVENT_BYTES, MAX_INPUT_FILE_BYTES,
-    MAX_INPUT_FILE_PARTS, MAX_INPUT_PARTS, MAX_INPUT_TEXT_BYTES, MAX_MODEL_BYTES,
-    MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES, ModelCatalogRequest,
-    ModelDescriptor, PROTOCOL_VERSION, ServerCapabilities, ServerInfo, SessionCommand,
-    SessionCommandKind, SnapshotRequest, SteeringCapabilities, SubscribeRequest, ToolCapabilities,
-    WorkspaceId, WorkspaceSnapshot, WorkspaceToolCapabilities, validate_input,
+    CommandReceipt, CommandRequest, EventCapabilities, InputPartKind, LimitCapabilities,
+    LocalConnectionError, LocalServerConnection, MAX_CORRELATION_ENTRIES, MAX_EVENT_BYTES,
+    MAX_INPUT_FILE_BYTES, MAX_INPUT_FILE_PARTS, MAX_INPUT_PARTS, MAX_INPUT_TEXT_BYTES,
+    MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES,
+    ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION, ServerCapabilities, ServerInfo,
+    SessionCommand, SessionCommandKind, SnapshotRequest, SteeringCapabilities, SubscribeRequest,
+    ToolCapabilities, WorkspaceId, WorkspaceSnapshot, WorkspaceToolCapabilities, validate_input,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -889,6 +889,13 @@ fn server_capabilities(
             ],
         },
         workspace_tools,
+        events: EventCapabilities {
+            post_commit: true,
+            replay_page: qq_core::MAX_REPLAY_EVENTS,
+            max_subscriptions: u16::try_from(MAX_CONCURRENT_SUBSCRIPTIONS).unwrap_or(u16::MAX),
+            max_event_bytes: MAX_EVENT_BYTES as u64,
+            retention_bounded: false,
+        },
     }
 }
 

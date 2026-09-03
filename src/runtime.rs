@@ -2279,6 +2279,266 @@ mod tests {
         handler.shutdown().await.unwrap();
     }
 
+    struct CollectingSink {
+        seen: Vec<qq_protocol::SessionEventEnvelope>,
+        stop_at: Option<u64>,
+        stall_first: Option<tokio::sync::oneshot::Receiver<()>>,
+        disconnects: usize,
+    }
+
+    impl qq_client::observer::EventSink for CollectingSink {
+        fn deliver(
+            &mut self,
+            event: &qq_protocol::SessionEventEnvelope,
+        ) -> qq_client::observer::SinkFuture<'_> {
+            let event = event.clone();
+            Box::pin(async move {
+                if let Some(gate) = self.stall_first.take() {
+                    // Hold the first delivery until the test says the store
+                    // has kept committing without us.
+                    let _ = gate.await;
+                }
+                let sequence = event.cursor.sequence;
+                self.seen.push(event);
+                if self.stop_at == Some(sequence) {
+                    qq_client::observer::ObserverStep::Stop
+                } else {
+                    qq_client::observer::ObserverStep::Continue
+                }
+            })
+        }
+
+        fn disconnected(
+            &mut self,
+            _error: &qq_client::ClientError,
+            _resume_from: &qq_protocol::EventCursor,
+        ) -> qq_client::observer::ObserverStep {
+            self.disconnects += 1;
+            qq_client::observer::ObserverStep::Continue
+        }
+    }
+
+    /// An observer that falls behind by more than a replay page, stops, and
+    /// restarts from its cursor receives exactly the committed sequence a
+    /// live subscriber received; a stalled observer never delays commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observers_fall_behind_restart_and_converge_without_delaying_commits() {
+        let fixture = RuntimeFixture::new();
+        fs::create_dir_all(fixture.path("work")).unwrap();
+        let model_runtime = Arc::new(
+            Runtime::new(
+                CapturingProvider {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                "test/model",
+                256,
+            )
+            .unwrap(),
+        );
+        let durable = SessionRuntime::open(
+            SessionRuntimeOptions::new(fixture.path("sessions.sqlite3")),
+            Arc::new(FixedRuntimeLoader {
+                runtime: model_runtime,
+            }),
+        )
+        .await
+        .unwrap();
+        let handler = Arc::new(RuntimeHandler {
+            durable,
+            factory: fixture.factory(),
+        });
+        let server = match qq_server::start(
+            handler.clone(),
+            ServerOptions::new(ServerPaths::new(fixture.path("server"))),
+        )
+        .await
+        .unwrap()
+        {
+            StartOutcome::Started(server) => server,
+            StartOutcome::Existing(_) => panic!("test unexpectedly found a running server"),
+        };
+        let client = qq_client::SessionClient::new(server.connection().clone()).unwrap();
+        let (workspace_id, origin) = client
+            .resolve_workspace(&fixture.path("work"))
+            .await
+            .unwrap();
+        let created = client
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: qq_protocol::ApprovalMode::Ask,
+                    profile: qq_protocol::AgentProfileId::default(),
+                    correlation: qq_protocol::Correlation::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+
+        // A live subscriber records the authoritative sequence as it happens.
+        let live_client = client.clone();
+        let live_origin = origin;
+        let live = tokio::spawn(async move {
+            let mut stream = live_client.events(workspace_id, live_origin).await.unwrap();
+            let mut seen = Vec::new();
+            while let Some(Ok(event)) = futures_util::StreamExt::next(&mut stream).await {
+                let done = matches!(&event.event, qq_protocol::SessionEvent::RunFinished { .. })
+                    && seen.len() > 300;
+                seen.push(event);
+                if done {
+                    break;
+                }
+            }
+            seen
+        });
+
+        // A stalled observer holds its first delivery while the store keeps
+        // committing: commits must not wait for it.
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut stalled = CollectingSink {
+            seen: Vec::new(),
+            stop_at: None,
+            stall_first: Some(gate),
+            disconnects: 0,
+        };
+        let stalled_client = client.clone();
+        let stalled_origin = origin;
+        let stalled_task = tokio::spawn(async move {
+            qq_client::observer::run(&stalled_client, workspace_id, stalled_origin, &mut stalled)
+                .await
+        });
+
+        // Generate well over one replay page (128) of events. The prompt
+        // queue is bounded (16 pending), so a full queue is backpressure
+        // (503) that the producer waits out; it is never dropped work.
+        let mut acks = Vec::new();
+        for i in 0..40 {
+            loop {
+                let started = std::time::Instant::now();
+                match client
+                    .submit(
+                        session_id,
+                        vec![qq_protocol::InputPart::text(format!("prompt {i}"))],
+                        qq_protocol::RunLimits::default(),
+                        qq_protocol::Correlation::default(),
+                    )
+                    .await
+                {
+                    Ok(receipt) => {
+                        acks.push(started.elapsed());
+                        assert!(matches!(
+                            receipt.outcome,
+                            CommandOutcome::PromptQueued { .. }
+                        ));
+                        break;
+                    }
+                    Err(qq_client::ClientError::ServerMessage { status: 503, .. }) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("submit failed: {error}"),
+                }
+            }
+        }
+        let live_events = tokio::time::timeout(Duration::from_secs(30), live)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            live_events.len() > 128,
+            "{} events is not more than one page",
+            live_events.len()
+        );
+        // Acknowledgements stayed fast while an observer was stalled.
+        let mut sorted = acks.clone();
+        sorted.sort();
+        assert!(
+            sorted[sorted.len() / 2] < Duration::from_millis(250),
+            "median ack {:?} with a stalled observer",
+            sorted[sorted.len() / 2]
+        );
+        stalled_task.abort();
+        drop(release);
+
+        // A fresh observer replays from the origin, stops partway (as if it
+        // crashed), and a second observer resumes from the acknowledged
+        // cursor. Together they reproduce the live sequence exactly.
+        let midpoint = live_events[live_events.len() / 2].cursor.sequence;
+        let mut first = CollectingSink {
+            seen: Vec::new(),
+            stop_at: Some(midpoint),
+            stall_first: None,
+            disconnects: 0,
+        };
+        let (exit, resume_from) = tokio::time::timeout(
+            Duration::from_secs(30),
+            qq_client::observer::run(&client, workspace_id, origin, &mut first),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, qq_client::observer::ObserverExit::Stopped);
+        // The event being delivered when the sink stopped is not acknowledged.
+        assert_eq!(resume_from.sequence, midpoint - 1);
+        first.seen.pop();
+        let last_live = live_events.last().unwrap().cursor.sequence;
+        let mut second = CollectingSink {
+            seen: Vec::new(),
+            stop_at: Some(last_live),
+            stall_first: None,
+            disconnects: 0,
+        };
+        let (exit, _) = tokio::time::timeout(
+            Duration::from_secs(30),
+            qq_client::observer::run(&client, workspace_id, resume_from, &mut second),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, qq_client::observer::ObserverExit::Stopped);
+        let mut replayed = first.seen;
+        replayed.extend(second.seen);
+        assert_eq!(replayed.len(), live_events.len());
+        for (replayed, live) in replayed.iter().zip(&live_events) {
+            assert_eq!(
+                serde_json::to_vec(replayed).unwrap(),
+                serde_json::to_vec(live).unwrap(),
+                "replay must be byte-identical to live delivery"
+            );
+        }
+        assert_eq!(first.disconnects + second.disconnects, 0);
+
+        // A cursor from another store is rejected, not silently resumed.
+        let foreign = qq_protocol::EventCursor {
+            store_id: qq_protocol::StoreId::generate().unwrap(),
+            workspace_id,
+            sequence: 1,
+        };
+        let mut sink = CollectingSink {
+            seen: Vec::new(),
+            stop_at: None,
+            stall_first: None,
+            disconnects: 0,
+        };
+        let (exit, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            qq_client::observer::run(&client, workspace_id, foreign, &mut sink),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, qq_client::observer::ObserverExit::CursorRejected);
+        assert!(sink.seen.is_empty());
+
+        server.shutdown().await.unwrap();
+        handler.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn runtime_factory_can_be_dropped_in_async_context() {
         let fixture = RuntimeFixture::new();

@@ -13,15 +13,15 @@ use qq_protocol::{
     AgentPlanDigest, AgentProfileId, AgentProfileSummary, ApprovalDecision, ApprovalGrant,
     ApprovalMode, BudgetExhaustion, BudgetLimitKind, CAPABILITIES_VERSION, CapabilitiesRequest,
     CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, CommandRequest, ContentHash,
-    Correlation, CredentialEpoch, EventCursor, GenerationCapabilities, InputPart, InputPartKind,
-    InstructionHash, LimitCapabilities, MessageId, MessageRole, MessageSnapshot, MessageState,
-    ModelSelection, PROTOCOL_VERSION, PackSummary, PromptCacheCapabilities, PromptVersion,
-    ResolvedModel, ResolvedModelVersion, RunActivity, RunFailure, RunFailureKind, RunId, RunLimits,
-    RunOutcome, RunPlanIdentity, RunPromptIdentity, RunSnapshot, RunStatus, ServerCapabilities,
-    ServerInfo, SessionCommand, SessionCommandKind, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionStatus, SessionSummary, SkillCapabilities, SteeringCapabilities, StoreId, TokenUsage,
-    ToolCallId, ToolCapabilities, ToolExposure, ToolHostSummary, WorkspaceId,
-    WorkspaceToolCapabilities,
+    Correlation, CredentialEpoch, EventCapabilities, EventCursor, GenerationCapabilities,
+    InputPart, InputPartKind, InstructionHash, LimitCapabilities, MessageId, MessageRole,
+    MessageSnapshot, MessageState, ModelSelection, PROTOCOL_VERSION, PackSummary,
+    PromptCacheCapabilities, PromptVersion, ResolvedModel, ResolvedModelVersion, RunActivity,
+    RunFailure, RunFailureKind, RunId, RunLimits, RunOutcome, RunPlanIdentity, RunPromptIdentity,
+    RunSnapshot, RunStatus, ServerCapabilities, ServerInfo, SessionCommand, SessionCommandKind,
+    SessionEvent, SessionEventEnvelope, SessionId, SessionStatus, SessionSummary,
+    SkillCapabilities, SteeringCapabilities, StoreId, TokenUsage, ToolCallId, ToolCapabilities,
+    ToolExposure, ToolHostSummary, WorkspaceId, WorkspaceToolCapabilities,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -557,6 +557,13 @@ fn version_14_commands_receipts_events_and_capabilities_match_their_goldens() {
                     truncated: false,
                 },
             }),
+            events: EventCapabilities {
+                post_commit: true,
+                replay_page: 128,
+                max_subscriptions: 64,
+                max_event_bytes: 1_048_576,
+                retention_bounded: false,
+            },
         },
     );
     check(

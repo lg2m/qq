@@ -87,7 +87,8 @@ const COMPACTION_SHRINKAGE_FLOOR_BYTES: usize = 16 * 1024;
 /// Longest summary excerpt carried on the `SessionCompacted` event.
 const MAX_EVENT_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_PROMPT_BYTES: usize = 128 * 1024;
-const MAX_REPLAY_EVENTS: u16 = 128;
+/// Events per page a subscriber is served from its cursor.
+pub const MAX_REPLAY_EVENTS: u16 = 128;
 const MAX_SNAPSHOT_SESSIONS: u16 = 512;
 const MAX_SNAPSHOT_MESSAGES: u16 = 256;
 const MAX_SNAPSHOT_TOOL_CALLS: usize = 4_096;

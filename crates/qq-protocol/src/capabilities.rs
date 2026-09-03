@@ -51,6 +51,23 @@ pub struct ServerCapabilities {
     /// hosts and skill index of that workspace's default plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_tools: Option<WorkspaceToolCapabilities>,
+    /// How committed events are delivered to observers.
+    pub events: EventCapabilities,
+}
+
+/// Delivery contract for post-commit observers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCapabilities {
+    /// Events are published only after their durable commit.
+    pub post_commit: bool,
+    /// Events per replay page a subscriber is served from its cursor.
+    pub replay_page: u16,
+    /// Most concurrent SSE subscriptions the server accepts (503 beyond).
+    pub max_subscriptions: u16,
+    pub max_event_bytes: u64,
+    /// Whether committed events are ever pruned. `false` means a cursor
+    /// from any point in the store's history replays.
+    pub retention_bounded: bool,
 }
 
 /// Catalog and exposure bounds. Clients learn from here that a run may see
@@ -176,6 +193,10 @@ mod tests {
                 "max_catalog_schema_bytes": 1048576, "full_exposure_tools": 24,
                 "full_exposure_schema_bytes": 32768, "max_pinned_tools": 32,
                 "max_indexed_skills": 64, "external_prefixes": ["mcp__"]
+            },
+            "events": {
+                "post_commit": true, "replay_page": 128, "max_subscriptions": 64,
+                "max_event_bytes": 1048576, "retention_bounded": false
             },
             "future_section": {"anything": 1}
         }"#;

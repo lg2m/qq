@@ -19,6 +19,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
 
 mod interactive;
+pub mod observer;
 mod port;
 
 pub use interactive::TuiClient;

@@ -109,5 +109,12 @@
       "indexed": 2,
       "disclosed": 1
     }
+  },
+  "events": {
+    "post_commit": true,
+    "replay_page": 128,
+    "max_subscriptions": 64,
+    "max_event_bytes": 1048576,
+    "retention_bounded": false
   }
 }

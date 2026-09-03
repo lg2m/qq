@@ -59,11 +59,11 @@ pub use hosts::{
 pub use runtime::MAX_PENDING_STEERING;
 pub use sessions::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, MAX_CHILD_DEPTH,
-    MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_PENDING_PROMPTS, MAX_SPAWNED_CHILDREN_PER_RUN,
-    ReviewFuture, ReviewRequest, ReviewVerdict, RuntimeLoadError, RuntimeLoadFuture,
-    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
-    SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
-    WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_PENDING_PROMPTS, MAX_REPLAY_EVENTS,
+    MAX_SPAWNED_CHILDREN_PER_RUN, ReviewFuture, ReviewRequest, ReviewVerdict, RuntimeLoadError,
+    RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime,
+    SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
+    WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 pub use workspace::skills::{MAX_INDEXED_SKILLS, MAX_SKILL_DESCRIPTION_BYTES};
 pub use workspace::{SkillEntry, SkillIndex, SkillKind};
