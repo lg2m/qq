@@ -1258,7 +1258,7 @@ impl plan::CompiledAgentPlan {
                                             // at spawn time, before any
                                             // durable child state exists.
                                             let outcome = spawner
-                                                .spawn(arguments.task, arguments.model)
+                                                .spawn(call.id, arguments.task, arguments.model)
                                                 .await;
                                             child_cost = Some(outcome.cost_usd_nanos);
                                             tools::bounded_result(
@@ -4285,7 +4285,12 @@ mod tests {
     }
 
     impl SubagentSpawner for StubSpawner {
-        fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture {
+        fn spawn(
+            &self,
+            _call_id: ToolCallId,
+            task: String,
+            model: Option<String>,
+        ) -> SpawnAgentFuture {
             self.tasks.lock().unwrap().push((task, model));
             let outcome = self.outcome.clone();
             Box::pin(std::future::ready(outcome))

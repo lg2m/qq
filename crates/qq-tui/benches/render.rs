@@ -15,34 +15,91 @@ const DEFAULT_ITERATIONS: u32 = 2_000;
 const WARMUP: u32 = 200;
 const STEADY_MESSAGES: u8 = 64;
 const BACKGROUND_SESSIONS: u8 = 8;
-const DELTA: &str = "streamed text that keeps arriving in small pieces ";
+/// Prose with paragraph breaks, as models actually emit it. Every ~100 bytes a
+/// blank line settles the preceding block.
+const DELTA: &str = "streamed text that keeps arriving in small pieces and eventually forms a paragraph of prose.\n\n";
+/// Worst case: one paragraph with no block boundary, so no prefix ever settles.
+const RUN_ON_DELTA: &str = "streamed text that keeps arriving in small pieces ";
+/// Deltas appended before measuring so the live message is already long.
+const LIVE_PREFILL: usize = 340;
 
 fn main() {
     let iterations = std::env::var("QQ_BENCH_ITERATIONS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_ITERATIONS);
+    // Highlighting schedules onto the Tokio blocking pool exactly as the
+    // event loop does; the frame path itself stays synchronous.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let _guard = runtime.enter();
 
     steady_state(iterations);
+    steady_state_with_sidebar(iterations);
     streaming_focused(iterations);
+    streaming_run_on(iterations);
     streaming_background(iterations);
+    children_with_sidebar(iterations);
     keystroke_echo(iterations);
 }
 
 /// Sixty-four completed messages, no changes between frames. Measures the
-/// fixed per-frame cost of rebuilding the frame model and diffing it.
+/// fixed per-frame cost of rebuilding the frame model and diffing it. The
+/// first frame is drawn plain; highlighting lands off-tick and is settled
+/// before the steady samples so they reflect the highlighted cache.
 fn steady_state(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     let first = timed(|| harness.draw());
-    report("steady_state_first_frame", first.0, 1, first.1);
+    report("steady_state_first_frame_plain", first.0, 1, first.1);
+    let started = Instant::now();
+    let mut frames = 1;
+    loop {
+        let applied = harness.apply_finished_highlights();
+        if applied > 0 {
+            black_box(harness.draw());
+            frames += 1;
+        }
+        if !harness.highlights_pending() && applied == 0 {
+            // Idle: request any highlights that were skipped while the
+            // pool was saturated by drawing once more, then re-check.
+            black_box(harness.draw());
+            if !harness.highlights_pending() {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    println!(
+        "steady_state_fully_highlighted: {} after {frames} frames",
+        micros(started.elapsed().as_nanos())
+    );
     let samples = collect(iterations, || harness.draw().len());
     report_samples("steady_state_frame", &samples);
 }
 
-/// One streaming message in the focused session receiving one delta per frame.
+/// Steady state with the sidebar visible and eight idle sessions listed.
+fn steady_state_with_sidebar(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 9, STEADY_MESSAGES);
+    harness.show_sidebar();
+    black_box(harness.draw());
+    let samples = collect(iterations, || harness.draw().len());
+    report_samples("steady_state_with_sidebar_frame", &samples);
+}
+
+/// One long streaming message in the focused session receiving one delta per
+/// frame. Measures the settled-prefix cache: cost should track the open block,
+/// not the message.
 fn streaming_focused(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     let message = harness.start_stream(0);
+    for _ in 0..LIVE_PREFILL {
+        harness.append(0, message, DELTA);
+    }
     black_box(harness.draw());
     let samples = collect(iterations, || {
         harness.append(0, message, DELTA);
@@ -51,12 +108,30 @@ fn streaming_focused(iterations: u32) {
     report_samples("streaming_focused_delta_to_frame", &samples);
 }
 
+/// Same as above with a run-on paragraph that never settles, so every frame
+/// re-lays-out the whole 32 KiB live tail. This is the ceiling, not the norm.
+fn streaming_run_on(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
+    let message = harness.start_stream(0);
+    for _ in 0..LIVE_PREFILL * 2 {
+        harness.append(0, message, RUN_ON_DELTA);
+    }
+    black_box(harness.draw());
+    let samples = collect(iterations, || {
+        harness.append(0, message, RUN_ON_DELTA);
+        harness.draw().len()
+    });
+    report_samples("streaming_run_on_32kb_delta_to_frame", &samples);
+}
+
 /// Eight unfocused sessions each receiving one delta per frame while the
-/// focused session is idle. Today those deltas only touch summaries; the plan
-/// requires the cost to stay within 1.2x of the single-session case once they
-/// feed live status.
+/// focused session is idle. Each delta updates that session's live status
+/// (sidebar hidden here, so the frame itself does not change); the plan
+/// requires this to stay within 1.2x of the steady single-session frame.
 fn streaming_background(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, BACKGROUND_SESSIONS + 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     let messages: Vec<_> = (1..=BACKGROUND_SESSIONS)
         .map(|index| (index, harness.start_stream(index)))
         .collect();
@@ -70,10 +145,30 @@ fn streaming_background(iterations: u32) {
     report_samples("streaming_background_8_delta_to_frame", &samples);
 }
 
+/// Twenty child sessions of the focused root streaming concurrently with the
+/// sidebar visible. Every delta updates a live tail that the sidebar renders,
+/// so this is the many-agents case the plan is for.
+fn children_with_sidebar(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 21, STEADY_MESSAGES);
+    harness.show_sidebar();
+    let messages: Vec<_> = (1..=20)
+        .map(|index| (index, harness.start_stream(index)))
+        .collect();
+    black_box(harness.draw());
+    let samples = collect(iterations, || {
+        for (index, message) in &messages {
+            harness.append(*index, *message, DELTA);
+        }
+        harness.draw().len()
+    });
+    report_samples("children_20_with_sidebar_delta_to_frame", &samples);
+}
+
 /// One typed character followed by a frame. This is the latency a user feels
 /// most directly.
 fn keystroke_echo(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
     black_box(harness.draw());
     let mut alphabet = ('a'..='z').cycle();
     let samples = collect(iterations, || {

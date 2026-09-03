@@ -6,20 +6,27 @@ use std::{
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandRequest, EditPreview, MessageSnapshot, MessageState, ModelDescriptor, ModelSelection,
-    RunActivity, RunId, RunOutcome, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionStatus, SessionSummary, SnapshotRequest, ToolCallSnapshot,
-    ToolCallState, WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot,
+    CommandRequest, EditPreview, MessageSnapshot, ModelDescriptor, ModelSelection, RunActivity,
+    RunId, SessionCommand, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
+    SessionSummary, SnapshotRequest, ToolCallSnapshot, ToolCallState, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use thiserror::Error;
 
 use crate::{
     Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Layout,
-    Settings, composer::Composer, terminal,
+    Settings,
+    commands::{self, Command, SlashEntry},
+    composer::Composer,
+    input::{Mode, Overlay, SessionConfirm},
+    picker::Picker,
+    terminal,
 };
+use reduce::{retain_recent_messages, retain_recent_tool_calls};
+
+mod reduce;
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
-const MAX_PICKER_SEARCH_BYTES: usize = 256;
 const MAX_RECENT_EVENTS: usize = 1024;
 const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
@@ -33,6 +40,10 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 /// Notices are deliberately ephemeral. At the 125 ms UI tick this keeps each
 /// notice visible for five seconds without making it permanent UI.
 const NOTICE_TICKS: u16 = 40;
+/// Locally queued drafts per session.
+const MAX_QUEUED_DRAFTS: usize = 8;
+/// Animation ticks (125 ms) within which a second Esc cancels the active run.
+const ESC_CANCEL_TICKS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoticeLevel {
@@ -40,59 +51,6 @@ pub(crate) enum NoticeLevel {
     Warning,
     Error,
 }
-
-pub(crate) struct SlashCommand {
-    pub name: &'static str,
-    pub description: &'static str,
-    action: SlashAction,
-}
-
-#[derive(Clone, Copy)]
-enum SlashAction {
-    Models,
-    New,
-    Sessions,
-    Compact,
-    Quit,
-}
-
-const SLASH_COMMANDS: [SlashCommand; 7] = [
-    SlashCommand {
-        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[0],
-        description: "choose a model",
-        action: SlashAction::Models,
-    },
-    SlashCommand {
-        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[1],
-        description: "open sessions",
-        action: SlashAction::Sessions,
-    },
-    SlashCommand {
-        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[2],
-        description: "open sessions",
-        action: SlashAction::Sessions,
-    },
-    SlashCommand {
-        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[3],
-        description: "create a session",
-        action: SlashAction::New,
-    },
-    SlashCommand {
-        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[4],
-        description: "compact session context",
-        action: SlashAction::Compact,
-    },
-    SlashCommand {
-        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[5],
-        description: "exit QQ",
-        action: SlashAction::Quit,
-    },
-    SlashCommand {
-        name: qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS[6],
-        description: "exit QQ",
-        action: SlashAction::Quit,
-    },
-];
 
 #[derive(Debug, Clone, Default)]
 pub struct TuiOptions {
@@ -137,35 +95,238 @@ pub enum TuiError {
     ClientStopped,
 }
 
+/// Warm transcript bodies kept loaded at once. The focused session is always
+/// warm; the rest are the most recently focused sessions so switching back
+/// costs no round trip.
+const WARM_BODY_LIMIT: usize = 8;
+/// Bytes of assistant text retained per session for the live status tail.
+const LIVE_TAIL_BYTES: usize = 256;
+
+/// Bytes of reasoning text retained per run.
+const MAX_REASONING_BYTES: usize = 16 * 1024;
+
+/// One run's displayable reasoning: text accumulated from `ReasoningDelta`
+/// events plus whether the block is still streaming.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Reasoning {
+    pub text: String,
+    pub streaming: bool,
+    /// Animation ticks observed while streaming, for an elapsed label.
+    pub ticks: usize,
+}
+
+impl Reasoning {
+    fn append(&mut self, text: &str) {
+        self.text.push_str(text);
+        if self.text.len() > MAX_REASONING_BYTES {
+            let mut start = self.text.len() - MAX_REASONING_BYTES;
+            while !self.text.is_char_boundary(start) {
+                start += 1;
+            }
+            self.text.drain(..start);
+        }
+    }
+}
+
+/// Whether reasoning blocks render as a collapsed one-liner or in full.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReasoningDetail {
+    #[default]
+    Collapsed,
+    Expanded,
+}
+
+/// Cheap per-session liveness reduced from every event, whether or not the
+/// session's transcript body is loaded. This is what a sidebar or session
+/// list shows for the sessions the user is not looking at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveStatus {
+    /// Last bytes of the newest assistant message, whitespace-collapsed.
+    pub tail: String,
+    /// The previous append ended in whitespace that has not yet been emitted
+    /// as a separator.
+    tail_space_pending: bool,
+    /// Name of the tool call currently running or awaiting approval.
+    pub active_tool: Option<String>,
+    /// Tool calls awaiting an approval answer. A set rather than a count so
+    /// replayed or repeated events cannot drift it.
+    pub awaiting_approval: std::collections::BTreeSet<qq_protocol::ToolCallId>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionView {
     pub summary: SessionSummary,
+    /// `Some` only while the body is warm; `None` means summary-only.
     pub messages: Option<Vec<MessageSnapshot>>,
     pub tool_calls: Option<Vec<ToolCallSnapshot>>,
     pub context_window: Option<u32>,
-    /// Latest replaceable liveness state for the active run. Snapshots do not
-    /// currently carry it, so reconnects fall back to a generic running label
-    /// until the next live activity event arrives.
+    /// Latest replaceable liveness state for the active run, seeded from the
+    /// summary on load and replaced by `RunActivityChanged` events.
     pub activity: Option<(RunId, RunActivity)>,
+    pub live: LiveStatus,
+    /// Provider-exposed reasoning per run, bounded, kept only for runs whose
+    /// messages are loaded. Display-only: never fed back to the model.
+    pub reasoning: HashMap<RunId, Reasoning>,
+    /// Focus clock at the last time this session was focused; orders warm
+    /// body eviction. Zero for never-focused sessions.
+    pub(crate) last_focused: u64,
     pub(crate) loaded_through: u64,
 }
 
-pub(crate) struct ModelPicker {
-    pub query: String,
-    pub selected: usize,
+impl SessionView {
+    pub(super) fn summary_only(
+        summary: SessionSummary,
+        context_window: Option<u32>,
+        loaded_through: u64,
+    ) -> Self {
+        let activity = summary.active_run_id.zip(summary.activity);
+        Self {
+            summary,
+            messages: None,
+            tool_calls: None,
+            context_window,
+            activity,
+            live: LiveStatus::default(),
+            reasoning: HashMap::new(),
+            last_focused: 0,
+            loaded_through,
+        }
+    }
+
+    /// Refresh the summary in place. Activity follows the summary when the
+    /// summary carries it or the run changed; a live event already applied
+    /// for the same run is kept when the summary is silent.
+    pub(super) fn set_summary(&mut self, summary: SessionSummary, context_window: Option<u32>) {
+        match (summary.active_run_id, summary.activity) {
+            (Some(run_id), Some(activity)) => self.activity = Some((run_id, activity)),
+            (Some(run_id), None) => {
+                if self.activity.is_some_and(|(active, _)| active != run_id) {
+                    self.activity = None;
+                }
+            }
+            (None, _) => self.activity = None,
+        }
+        self.summary = summary;
+        self.context_window = context_window;
+    }
+
+    pub(crate) fn is_warm(&self) -> bool {
+        self.messages.is_some()
+    }
 }
 
-pub(crate) struct SessionPicker {
-    pub query: String,
-    pub selected: Option<SessionId>,
-    /// A destructive action awaiting its inline y/n answer.
-    pub confirm: Option<SessionPickerConfirm>,
+impl LiveStatus {
+    /// Derive status from a loaded body, as after a snapshot.
+    fn from_body(messages: &[MessageSnapshot], tool_calls: &[ToolCallSnapshot]) -> Self {
+        let mut live = Self::default();
+        if let Some(message) = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == qq_protocol::MessageRole::Assistant)
+        {
+            live.set_tail(&message.output);
+        }
+        for call in tool_calls {
+            live.note_tool_call(call);
+        }
+        live
+    }
+
+    /// Replace the tail with the last [`LIVE_TAIL_BYTES`] of `text`, with
+    /// whitespace collapsed to single spaces so it fits one row.
+    pub(super) fn set_tail(&mut self, text: &str) {
+        let mut start = text.len().saturating_sub(LIVE_TAIL_BYTES);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        self.tail.clear();
+        self.tail_space_pending = false;
+        self.push_collapsed(&text[start..]);
+    }
+
+    fn push_collapsed(&mut self, text: &str) {
+        for character in text.chars() {
+            if character.is_whitespace() {
+                self.tail_space_pending = !self.tail.is_empty();
+            } else if let Some(character) = terminal_safe_character(character) {
+                if self.tail_space_pending {
+                    self.tail.push(' ');
+                    self.tail_space_pending = false;
+                }
+                self.tail.push(character);
+            }
+        }
+    }
+
+    /// Append streamed text and trim the front back to the byte bound.
+    pub(super) fn append_tail(&mut self, text: &str) {
+        if text.len() >= LIVE_TAIL_BYTES {
+            self.set_tail(text);
+            return;
+        }
+        self.push_collapsed(text);
+        if self.tail.len() > LIVE_TAIL_BYTES {
+            let mut start = self.tail.len() - LIVE_TAIL_BYTES;
+            while !self.tail.is_char_boundary(start) {
+                start += 1;
+            }
+            self.tail.drain(..start);
+        }
+    }
+
+    pub(super) fn note_tool_call(&mut self, call: &ToolCallSnapshot) {
+        match call.state {
+            ToolCallState::AwaitingApproval => {
+                self.awaiting_approval.insert(call.id);
+                self.active_tool = Some(call.name.clone());
+            }
+            ToolCallState::Running | ToolCallState::Requested => {
+                self.awaiting_approval.remove(&call.id);
+                self.active_tool = Some(call.name.clone());
+            }
+            ToolCallState::Completed
+            | ToolCallState::Failed
+            | ToolCallState::Denied
+            | ToolCallState::Interrupted => {
+                self.awaiting_approval.remove(&call.id);
+                if self.active_tool.as_deref() == Some(call.name.as_str()) {
+                    self.active_tool = None;
+                }
+            }
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionPickerConfirm {
-    Delete(SessionId),
-    Prune,
+/// Whether the live session tree renders beside the transcript.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Sidebar {
+    /// Visible when the terminal is at least [`SIDEBAR_AUTO_WIDTH`] columns.
+    #[default]
+    Auto,
+    Shown,
+    Hidden,
+}
+
+/// Terminal width at which `Sidebar::Auto` shows the sidebar.
+pub(crate) const SIDEBAR_AUTO_WIDTH: usize = 120;
+
+impl Sidebar {
+    #[must_use]
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::Auto | Self::Shown => Self::Hidden,
+            Self::Hidden => Self::Shown,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn visible(self, width: usize) -> bool {
+        match self {
+            Self::Auto => width >= SIDEBAR_AUTO_WIDTH,
+            Self::Shown => true,
+            Self::Hidden => false,
+        }
+    }
 }
 
 /// How much of each tool call the transcript shows. Session-local because the
@@ -229,13 +390,29 @@ pub(crate) struct App {
     pub workspace_path: String,
     pub sessions: HashMap<SessionId, SessionView>,
     pub focused: Option<SessionId>,
-    pub session_picker: Option<SessionPicker>,
-    pub model_picker: Option<ModelPicker>,
+    /// Monotonic counter bumped on every focus change; stamps `last_focused`.
+    focus_clock: u64,
+    /// The open overlay, if any. At most one overlay owns input at a time.
+    pub overlay: Option<Overlay>,
     pub composer: Composer,
     prompt_history: HashMap<SessionId, VecDeque<String>>,
     history_position: Option<usize>,
     history_draft: Option<String>,
-    slash_selected: usize,
+    /// Cursor into the slash autocomplete list. The query is the composer
+    /// text itself, so only the cursor lives here.
+    slash: Picker,
+    /// Drafts held locally (Alt-Enter) while the focused session runs; they
+    /// submit in order when it goes idle. Bounded by [`MAX_QUEUED_DRAFTS`].
+    drafts: HashMap<SessionId, VecDeque<String>>,
+    /// Tick at which Esc was last pressed with nothing to dismiss; a second
+    /// press within [`ESC_CANCEL_TICKS`] cancels the active run.
+    esc_armed_at: Option<usize>,
+    /// Set when the user asked to edit the draft externally. The loop takes
+    /// it, suspends the terminal, runs the editor, and hands the text back.
+    editor_requested: bool,
+    /// Server capability gate for `Command::SteerRun`; false until the
+    /// capability document exists.
+    steering_available: bool,
     pub connection: ConnectionState,
     pub status: Option<String>,
     /// Session owning the current transient notice. A notice never follows
@@ -246,6 +423,10 @@ pub(crate) struct App {
     pub animation_tick: usize,
     pub quit: bool,
     pub tool_detail: ToolDetail,
+    pub reasoning_detail: ReasoningDetail,
+    /// Session sidebar visibility. `Auto` shows it when the terminal is wide
+    /// enough; the toggle command cycles through explicit on and off.
+    pub sidebar: Sidebar,
     transcript_viewport: TranscriptViewport,
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
@@ -274,13 +455,17 @@ impl App {
             workspace_path: String::new(),
             sessions: HashMap::new(),
             focused: None,
-            session_picker: None,
-            model_picker: None,
+            focus_clock: 0,
+            overlay: None,
             composer: Composer::default(),
             prompt_history: HashMap::new(),
             history_position: None,
             history_draft: None,
-            slash_selected: 0,
+            slash: Picker::new(),
+            drafts: HashMap::new(),
+            esc_armed_at: None,
+            editor_requested: false,
+            steering_available: false,
             connection: ConnectionState::Connecting,
             status: None,
             status_session_id: None,
@@ -289,6 +474,8 @@ impl App {
             animation_tick: 0,
             quit: false,
             tool_detail: ToolDetail::default(),
+            reasoning_detail: ReasoningDetail::default(),
+            sidebar: Sidebar::default(),
             transcript_viewport: TranscriptViewport::default(),
             last_sequence: 0,
             recent_events: VecDeque::new(),
@@ -302,8 +489,55 @@ impl App {
 
     /// Requests queued by [`Self::apply_client_update`]; the terminal loop
     /// drains and sends them after each update.
+    /// Who owns keyboard input right now. Overlays win over the approval
+    /// prompt, which wins over the composer.
+    pub(crate) fn mode(&self) -> Mode {
+        match &self.overlay {
+            Some(overlay) => overlay.mode(),
+            None if self.pending_approval().is_some() => Mode::Approval,
+            None => Mode::Compose,
+        }
+    }
+
     pub fn take_requests(&mut self) -> Vec<ClientRequest> {
         std::mem::take(&mut self.queued_requests)
+    }
+
+    /// Whether the user asked for an external editor since the last call.
+    /// Returns the current expanded draft to seed the editor with.
+    pub fn take_editor_request(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.editor_requested) {
+            return None;
+        }
+        Some(self.composer.expanded())
+    }
+
+    /// The external editor could not deliver text; the draft stays as it was.
+    pub fn note_editor_failure(&mut self, reason: &str) {
+        self.set_warning(reason.to_owned());
+    }
+
+    /// Install text returned by the external editor. `None` means it exited
+    /// without changing the draft.
+    pub fn apply_editor_result(&mut self, text: Option<String>) -> bool {
+        let Some(text) = text else {
+            self.set_info("external editor made no changes".to_owned());
+            return true;
+        };
+        let mut sanitized = String::with_capacity(text.len().min(MAX_INPUT_BYTES));
+        for character in text.chars() {
+            if sanitized.len() + character.len_utf8() > MAX_INPUT_BYTES {
+                break;
+            }
+            if let Some(character) = composer_character(character) {
+                sanitized.push(character);
+            }
+        }
+        let trimmed = sanitized.trim_end().to_owned();
+        self.composer.replace(trimmed);
+        self.reset_history_browse();
+        self.slash.select(0);
+        true
     }
 
     pub fn apply_client_update(&mut self, update: ClientUpdate) -> bool {
@@ -318,8 +552,7 @@ impl App {
                 self.workspace_path.clear();
                 self.sessions.clear();
                 self.focused = None;
-                self.session_picker = None;
-                self.model_picker = None;
+                self.overlay = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
                 self.edit_previews.clear();
@@ -341,7 +574,7 @@ impl App {
                                 .as_ref()
                                 .is_some_and(|intent| matches!(intent, PendingIntent::Create))
                         {
-                            self.focused = Some(session_id);
+                            self.adopt_created_session(session_id);
                         }
                         if let Some(PendingIntent::Cancel { session_id }) = intent.as_ref() {
                             self.set_info_for(
@@ -425,12 +658,18 @@ impl App {
         models: Vec<ModelDescriptor>,
         selected_model: Option<ModelSelection>,
     ) {
-        let selected = self.model_picker.as_ref().and_then(|picker| {
-            self.filtered_models()
-                .get(picker.selected)
-                .and_then(|index| self.models.get(*index))
-                .map(|model| (model.provider.clone(), model.model.clone()))
-        });
+        // Remember what the open model picker points at so the refreshed
+        // catalog keeps the cursor on the same model.
+        let selected = match &self.overlay {
+            Some(Overlay::Models(picker)) => {
+                let filtered = self.filtered_models();
+                filtered
+                    .get(picker.selected(filtered.len()))
+                    .and_then(|index| self.models.get(*index))
+                    .map(|model| (model.provider.clone(), model.model.clone()))
+            }
+            Some(Overlay::Sessions { .. }) | None => None,
+        };
         self.models = models.into_iter().map(Into::into).collect();
         self.models.sort_by(|left, right| {
             (&left.provider, &left.name, &left.model).cmp(&(
@@ -446,18 +685,17 @@ impl App {
             session.context_window =
                 model_context_window(&self.models, session.summary.model.as_deref());
         }
-        if self.model_picker.is_some() {
-            let filtered = self.filtered_models();
-            let selected = selected.and_then(|selected| {
-                filtered.iter().position(|index| {
-                    self.models.get(*index).is_some_and(|model| {
-                        (model.provider.as_str(), model.model.as_str())
-                            == (selected.0.as_str(), selected.1.as_str())
-                    })
+        if matches!(self.overlay, Some(Overlay::Models(_))) {
+            let identities: Vec<(String, String)> = self
+                .filtered_models()
+                .into_iter()
+                .map(|index| {
+                    let model = &self.models[index];
+                    (model.provider.clone(), model.model.clone())
                 })
-            });
-            if let Some(picker) = &mut self.model_picker {
-                picker.selected = selected.unwrap_or(0).min(filtered.len().saturating_sub(1));
+                .collect();
+            if let Some(Overlay::Models(picker)) = &mut self.overlay {
+                picker.preserve(selected, identities);
             }
         }
     }
@@ -497,29 +735,33 @@ impl App {
         if initial || snapshot_sequence >= self.last_sequence {
             for summary in snapshot.sessions {
                 let context_window = model_context_window(&self.models, summary.model.as_deref());
-                self.sessions
-                    .entry(summary.id)
-                    .and_modify(|session| {
-                        session.summary = summary.clone();
-                        session.context_window = context_window;
-                    })
-                    .or_insert(SessionView {
-                        summary,
-                        messages: None,
-                        tool_calls: None,
-                        context_window,
-                        activity: None,
-                        loaded_through: snapshot_sequence,
-                    });
+                match self.sessions.entry(summary.id) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().set_summary(summary, context_window);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(SessionView::summary_only(
+                            summary,
+                            context_window,
+                            snapshot_sequence,
+                        ));
+                    }
+                }
             }
+        }
+        for body in snapshot.included {
+            self.install_session_snapshot(body, snapshot_sequence);
         }
         if let Some(focused) = snapshot.focused {
             let focused_id = focused.summary.id;
             self.install_session_snapshot(focused, snapshot_sequence);
-            self.focused = Some(focused_id);
-        } else if self.focused.is_none() {
-            self.focused = self.root_sessions().first().copied();
+            self.set_focus(focused_id);
+        } else if self.focused.is_none()
+            && let Some(first) = self.root_sessions().first().copied()
+        {
+            self.set_focus(first);
         }
+        self.evict_cold_bodies();
         if initial {
             self.last_sequence = snapshot_sequence;
         }
@@ -538,14 +780,26 @@ impl App {
         true
     }
 
+    /// Load one session's transcript body. Other warm bodies are untouched;
+    /// `evict_cold_bodies` enforces the warm limit afterwards.
     fn install_session_snapshot(&mut self, snapshot: SessionSnapshot, loaded_through: u64) {
-        for session in self.sessions.values_mut() {
-            session.messages = None;
-            session.tool_calls = None;
-        }
-        // A snapshot replaces live per-call state wholesale; buffered output
-        // for calls it no longer reports as running would render forever.
-        self.live_tool_output.clear();
+        let session_id = snapshot.summary.id;
+        // Live tool output for calls this body no longer reports as running
+        // would render forever; drop this session's buffers.
+        let running: std::collections::HashSet<_> = snapshot
+            .tool_calls
+            .iter()
+            .filter(|call| call.state == ToolCallState::Running)
+            .map(|call| call.id)
+            .collect();
+        self.live_tool_output.retain(|id, _| {
+            running.contains(id)
+                || self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.tool_calls.as_ref())
+                    .is_none_or(|calls| !calls.iter().any(|call| call.id == *id))
+        });
         let mut messages = snapshot.messages;
         retain_recent_messages(&mut messages);
         let history = messages
@@ -555,7 +809,7 @@ impl App {
             .filter(|prompt| !prompt.trim().is_empty())
             .collect::<VecDeque<_>>();
         self.prompt_history.insert(
-            snapshot.summary.id,
+            session_id,
             history
                 .into_iter()
                 .rev()
@@ -566,17 +820,69 @@ impl App {
         let mut tool_calls = snapshot.tool_calls;
         retain_recent_tool_calls(&mut tool_calls);
         let context_window = model_context_window(&self.models, snapshot.summary.model.as_deref());
-        self.sessions.insert(
-            snapshot.summary.id,
-            SessionView {
-                summary: snapshot.summary,
-                messages: Some(messages),
-                tool_calls: Some(tool_calls),
-                context_window,
-                activity: None,
-                loaded_through,
-            },
-        );
+        let last_focused = self
+            .sessions
+            .get(&session_id)
+            .map_or(0, |session| session.last_focused);
+        let mut view = SessionView::summary_only(snapshot.summary, context_window, loaded_through);
+        view.live = LiveStatus::from_body(&messages, &tool_calls);
+        view.messages = Some(messages);
+        view.tool_calls = Some(tool_calls);
+        view.last_focused = last_focused;
+        self.sessions.insert(session_id, view);
+    }
+
+    /// A session this client just created has an empty transcript by
+    /// construction, so it is warm immediately: focus moves in this frame and
+    /// no snapshot round trip is needed before the user can type.
+    pub(super) fn adopt_created_session(&mut self, session_id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&session_id)
+            && !session.is_warm()
+        {
+            session.messages = Some(Vec::new());
+            session.tool_calls = Some(Vec::new());
+        }
+        self.set_focus(session_id);
+        self.reset_history_browse();
+        self.evict_cold_bodies();
+    }
+
+    /// Point focus at `session_id` and stamp it so warm-body eviction keeps
+    /// the most recently viewed sessions. Does not request anything.
+    fn set_focus(&mut self, session_id: SessionId) {
+        self.focus_clock += 1;
+        self.focused = Some(session_id);
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.last_focused = self.focus_clock;
+        }
+    }
+
+    /// Drop transcript bodies beyond the warm limit, least recently focused
+    /// first. The focused session is never evicted. Summaries and live status
+    /// stay, so the sidebar and pickers keep working for cold sessions.
+    fn evict_cold_bodies(&mut self) {
+        let mut warm: Vec<(u64, SessionId)> = self
+            .sessions
+            .values()
+            .filter(|session| session.is_warm() && Some(session.summary.id) != self.focused)
+            .map(|session| (session.last_focused, session.summary.id))
+            .collect();
+        let keep = WARM_BODY_LIMIT.saturating_sub(usize::from(self.focused.is_some()));
+        if warm.len() <= keep {
+            return;
+        }
+        warm.sort_unstable();
+        let evict = warm.len() - keep;
+        for (_, session_id) in warm.into_iter().take(evict) {
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(calls) = session.tool_calls.take() {
+                    for call in calls {
+                        self.live_tool_output.remove(&call.id);
+                    }
+                }
+                session.messages = None;
+            }
+        }
     }
 
     fn apply_live_event(&mut self, event: SessionEventEnvelope) -> bool {
@@ -612,412 +918,6 @@ impl App {
             self.recent_events.pop_front();
         }
         true
-    }
-
-    fn reduce_event(&mut self, envelope: &SessionEventEnvelope) {
-        match &envelope.event {
-            SessionEvent::SessionCreated { session } => {
-                self.upsert_summary(session.clone());
-                if envelope
-                    .caused_by
-                    .and_then(|id| self.pending.get(&id))
-                    .is_some_and(|intent| matches!(intent, PendingIntent::Create))
-                {
-                    self.focused = Some(session.id);
-                }
-            }
-            SessionEvent::SessionUpdated { session } => {
-                self.upsert_summary(session.clone());
-            }
-            SessionEvent::SessionDeleted { session_id } => {
-                self.remove_session(*session_id);
-            }
-            SessionEvent::PromptQueued {
-                session, message, ..
-            } => {
-                self.upsert_summary(session.clone());
-                self.push_message(message.clone());
-            }
-            SessionEvent::RunStarted { session, .. }
-            | SessionEvent::CancellationRequested { session, .. } => {
-                self.upsert_summary(session.clone());
-                if let SessionEvent::RunStarted { run_id, .. } = &envelope.event
-                    && let Some(messages) = self
-                        .sessions
-                        .get_mut(&envelope.session_id)
-                        .and_then(|session| session.messages.as_mut())
-                {
-                    for message in messages.iter_mut().filter(|message| {
-                        message.run_id == *run_id && message.role == qq_protocol::MessageRole::User
-                    }) {
-                        message.state = MessageState::Complete;
-                    }
-                }
-            }
-            SessionEvent::RunActivityChanged { run_id, activity } => {
-                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
-                    session.activity = Some((*run_id, *activity));
-                }
-            }
-            // Reasoning has its own display channel. Until that channel is
-            // rendered, these events still update liveness via
-            // RunActivityChanged and must not enter the assistant transcript.
-            SessionEvent::ReasoningStarted { .. }
-            | SessionEvent::ReasoningDelta { .. }
-            | SessionEvent::ReasoningCompleted { .. } => {}
-            SessionEvent::AssistantMessageStarted { message } => {
-                // A new turn's message means every earlier turn of the run
-                // has committed; the server finalized those messages inside
-                // the turn persist without a dedicated event.
-                self.complete_streamed_turns(
-                    envelope.session_id,
-                    message.run_id,
-                    message.turn_ordinal.saturating_sub(1),
-                );
-                self.push_message(message.clone());
-            }
-            SessionEvent::TextAppended {
-                message_id,
-                channel,
-                text,
-            } => {
-                if let Some(message) = self.message_mut(envelope.session_id, *message_id) {
-                    match channel {
-                        qq_protocol::TextChannel::Output => message.output.push_str(text),
-                        qq_protocol::TextChannel::Refusal => message.refusal.push_str(text),
-                    }
-                }
-            }
-            SessionEvent::ToolApprovalRequested {
-                tool_call, edit, ..
-            } => {
-                if tool_call.state != ToolCallState::AwaitingApproval {
-                    self.answered_approvals.remove(&tool_call.id);
-                }
-                if let Some(edit) = edit {
-                    self.edit_previews.insert(tool_call.id, edit.clone());
-                }
-                self.upsert_tool_call(tool_call.clone());
-            }
-            // Live tool output chunks are display-only: they feed the bounded
-            // tail under a running call's line, and the call's authoritative
-            // bounded result arrives on ToolCallFinished regardless.
-            SessionEvent::ToolCallOutputDelta {
-                tool_call_id,
-                chunk,
-            } => {
-                self.append_live_tool_output(*tool_call_id, chunk);
-            }
-            SessionEvent::ToolCallRequested { tool_call }
-            | SessionEvent::ToolApprovalResolved { tool_call, .. }
-            | SessionEvent::ToolCallStarted { tool_call }
-            | SessionEvent::ToolCallFinished { tool_call } => {
-                if matches!(envelope.event, SessionEvent::ToolCallRequested { .. }) {
-                    // Calls are persisted with their completed turn, so the
-                    // turn's message (same ordinal) is finalized by then.
-                    self.complete_streamed_turns(
-                        envelope.session_id,
-                        tool_call.run_id,
-                        tool_call.turn_ordinal,
-                    );
-                }
-                if tool_call.state != ToolCallState::AwaitingApproval {
-                    self.answered_approvals.remove(&tool_call.id);
-                    self.edit_previews.remove(&tool_call.id);
-                }
-                if tool_call_state_is_terminal(tool_call.state) {
-                    // The persisted bounded result takes over from the tail.
-                    self.live_tool_output.remove(&tool_call.id);
-                }
-                self.upsert_tool_call(tool_call.clone());
-            }
-            // The follow-through of an approve-for-workspace decision. A
-            // failure is informational: the session grant already stands.
-            SessionEvent::WorkspaceGrantPromoted { outcome, .. } => {
-                self.set_warning(match outcome {
-                    WorkspaceGrantOutcome::Written { path } => {
-                        format!("grant written to {path}")
-                    }
-                    WorkspaceGrantOutcome::AlreadyPresent { path } => {
-                        format!("grant already present in {path}")
-                    }
-                    WorkspaceGrantOutcome::Failed { message } => {
-                        format!("workspace grant not saved: {message}")
-                    }
-                });
-            }
-            SessionEvent::SessionCompacted {
-                session,
-                before_bytes,
-                after_bytes,
-                ..
-            } => {
-                self.upsert_summary(session.clone());
-                self.set_info_for(
-                    Some(envelope.session_id),
-                    format!(
-                        "compacted: {} -> {}",
-                        format_bytes(*before_bytes),
-                        format_bytes(*after_bytes)
-                    ),
-                );
-            }
-            SessionEvent::SessionCompactionRolledBack { session, remaining } => {
-                self.upsert_summary(session.clone());
-                self.set_info_for(
-                    Some(envelope.session_id),
-                    format!("compaction rolled back; {remaining} retained"),
-                );
-            }
-            // Run-level audit updates are not session state. In particular,
-            // old persisted events may predate the authoritative session
-            // field, so replaying one must not repopulate the meter.
-            SessionEvent::ModelTurnCompleted { .. } | SessionEvent::RunContextUpdated { .. } => {}
-            SessionEvent::SessionContextUpdated { context_tokens, .. } => {
-                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
-                    session.summary.context_tokens = *context_tokens;
-                }
-            }
-            SessionEvent::RunFinished {
-                session,
-                run_id,
-                outcome,
-                ..
-            } => {
-                self.upsert_summary(session.clone());
-                if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
-                    view.activity = None;
-                }
-                if let Some(messages) = self
-                    .sessions
-                    .get_mut(&envelope.session_id)
-                    .and_then(|session| session.messages.as_mut())
-                {
-                    let state = match outcome {
-                        RunOutcome::Completed => MessageState::Complete,
-                        RunOutcome::Cancelled => MessageState::Cancelled,
-                        RunOutcome::Interrupted | RunOutcome::BudgetExhausted { .. } => {
-                            MessageState::Interrupted
-                        }
-                        RunOutcome::Failed { .. } => MessageState::Failed,
-                    };
-                    for message in messages
-                        .iter_mut()
-                        .filter(|message| message.run_id == *run_id)
-                    {
-                        // Turns finalized before the run ended keep their own
-                        // state; the outcome only settles the still-streaming
-                        // current turn (and queued rows).
-                        let settled = message.role == qq_protocol::MessageRole::Assistant
-                            && !matches!(
-                                message.state,
-                                MessageState::Queued | MessageState::Streaming
-                            );
-                        if !settled
-                            && (message.role == qq_protocol::MessageRole::Assistant
-                                || message.state == MessageState::Queued)
-                        {
-                            message.state = state;
-                        }
-                    }
-                }
-                match outcome {
-                    RunOutcome::Failed { failure } => {
-                        self.set_error_for(Some(envelope.session_id), failure.message.clone());
-                    }
-                    RunOutcome::BudgetExhausted { exhaustion } => {
-                        self.set_error_for(Some(envelope.session_id), exhaustion.message.clone());
-                    }
-                    RunOutcome::Completed | RunOutcome::Cancelled | RunOutcome::Interrupted => {}
-                }
-            }
-        }
-    }
-
-    fn upsert_summary(&mut self, summary: SessionSummary) {
-        let context_window = model_context_window(&self.models, summary.model.as_deref());
-        self.sessions
-            .entry(summary.id)
-            .and_modify(|session| {
-                session.summary = summary.clone();
-                session.context_window = context_window;
-            })
-            .or_insert(SessionView {
-                summary,
-                messages: None,
-                tool_calls: None,
-                context_window,
-                activity: None,
-                loaded_through: 0,
-            });
-    }
-
-    /// Drops a deleted session from every client map, mirroring the server's
-    /// cascade: its children become roots, its per-call display state and
-    /// optimistic prompts are discarded, and a deleted focus moves to the
-    /// nearest remaining session (or clears).
-    fn remove_session(&mut self, session_id: SessionId) {
-        if !self.sessions.contains_key(&session_id) {
-            return;
-        }
-        let refocus = if self.focused == Some(session_id) {
-            let order = self.thread_order();
-            order
-                .iter()
-                .position(|candidate| *candidate == session_id)
-                .and_then(|index| {
-                    order
-                        .get(index + 1)
-                        .or_else(|| {
-                            index
-                                .checked_sub(1)
-                                .and_then(|previous| order.get(previous))
-                        })
-                        .copied()
-                })
-        } else {
-            None
-        };
-        let Some(removed) = self.sessions.remove(&session_id) else {
-            return;
-        };
-        for call in removed.tool_calls.iter().flatten() {
-            self.live_tool_output.remove(&call.id);
-            self.edit_previews.remove(&call.id);
-            self.answered_approvals.remove(&call.id);
-        }
-        self.pending.retain(|_, intent| {
-            !matches!(
-                intent,
-                PendingIntent::Prompt { session_id: target, .. } if *target == session_id
-            )
-        });
-        // The server detaches children on delete; mirror it so they stay
-        // reachable as roots until the next summary refresh.
-        for session in self.sessions.values_mut() {
-            if session.summary.parent_id == Some(session_id) {
-                session.summary.parent_id = None;
-            }
-        }
-        if self.focused == Some(session_id) {
-            self.focused = refocus;
-            if let (Some(next), Some(workspace_id)) = (refocus, self.workspace_id) {
-                self.queued_requests
-                    .push(ClientRequest::Snapshot(SnapshotRequest {
-                        workspace_id,
-                        focused_session_id: Some(next),
-                        session_limit: SNAPSHOT_SESSION_LIMIT,
-                        message_limit: SNAPSHOT_MESSAGE_LIMIT,
-                    }));
-            }
-        }
-        if let Some(picker) = &mut self.session_picker {
-            if matches!(picker.confirm, Some(SessionPickerConfirm::Delete(pending)) if pending == session_id)
-            {
-                picker.confirm = None;
-            }
-            if picker.selected == Some(session_id) {
-                picker.selected = None;
-                self.reset_session_picker_selection();
-            }
-        }
-    }
-
-    /// Marks a run's still-streaming assistant messages complete through the
-    /// given turn: the server finalizes a turn's message in the same
-    /// transaction as the turn's tool calls, without a dedicated event.
-    fn complete_streamed_turns(
-        &mut self,
-        session_id: SessionId,
-        run_id: qq_protocol::RunId,
-        through_turn: u16,
-    ) {
-        let Some(messages) = self
-            .sessions
-            .get_mut(&session_id)
-            .and_then(|session| session.messages.as_mut())
-        else {
-            return;
-        };
-        for message in messages.iter_mut().filter(|message| {
-            message.run_id == run_id
-                && message.role == qq_protocol::MessageRole::Assistant
-                && message.state == MessageState::Streaming
-                && message.turn_ordinal <= through_turn
-        }) {
-            message.state = MessageState::Complete;
-        }
-    }
-
-    fn push_message(&mut self, message: MessageSnapshot) {
-        let Some(messages) = self
-            .sessions
-            .get_mut(&message.session_id)
-            .and_then(|session| session.messages.as_mut())
-        else {
-            return;
-        };
-        if messages.iter().any(|candidate| candidate.id == message.id) {
-            return;
-        }
-        // Server snapshots order messages by run first, then by ordinal
-        // within the run, so a prompt queued mid-run sorts after that run's
-        // later per-turn messages. Mirror that live: a message whose run is
-        // already present slots in right after the run's last message, and a
-        // new run appends (runs are created in queue order).
-        let position = messages
-            .iter()
-            .rposition(|candidate| candidate.run_id == message.run_id)
-            .map_or(messages.len(), |index| index + 1);
-        messages.insert(position, message);
-        retain_recent_messages(messages);
-    }
-
-    fn message_mut(
-        &mut self,
-        session_id: SessionId,
-        message_id: qq_protocol::MessageId,
-    ) -> Option<&mut MessageSnapshot> {
-        self.sessions
-            .get_mut(&session_id)?
-            .messages
-            .as_mut()?
-            .iter_mut()
-            .find(|message| message.id == message_id)
-    }
-
-    /// Appends one live output chunk to a call's tail buffer, dropping the
-    /// oldest bytes past the bound. Trimming lands on a character boundary so
-    /// a chunk split mid-UTF-8 sequence still renders sanely.
-    fn append_live_tool_output(&mut self, tool_call_id: qq_protocol::ToolCallId, chunk: &str) {
-        let buffer = self.live_tool_output.entry(tool_call_id).or_default();
-        buffer.push_str(chunk);
-        if buffer.len() > MAX_LIVE_TOOL_OUTPUT_BYTES {
-            let mut start = buffer.len() - MAX_LIVE_TOOL_OUTPUT_BYTES;
-            while !buffer.is_char_boundary(start) {
-                start += 1;
-            }
-            buffer.drain(..start);
-        }
-    }
-
-    fn upsert_tool_call(&mut self, tool_call: ToolCallSnapshot) {
-        let Some(tool_calls) = self
-            .sessions
-            .get_mut(&tool_call.session_id)
-            .and_then(|session| session.tool_calls.as_mut())
-        else {
-            return;
-        };
-        if let Some(existing) = tool_calls
-            .iter_mut()
-            .find(|existing| existing.id == tool_call.id)
-        {
-            *existing = tool_call;
-        } else {
-            tool_calls.push(tool_call);
-            retain_recent_tool_calls(tool_calls);
-        }
     }
 
     fn set_notice_for(&mut self, session_id: Option<SessionId>, text: String, level: NoticeLevel) {
@@ -1106,19 +1006,19 @@ impl App {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
             }
-            Event::Paste(text) if self.session_picker.is_some() => {
-                let changed = self.push_session_search(&text);
-                (changed, Vec::new())
-            }
-            Event::Paste(text) if self.model_picker.is_some() => {
-                let changed = self.push_model_search(&text);
-                (changed, Vec::new())
-            }
             Event::Paste(text) => {
-                let changed = self.push_composer_text(&text);
+                let changed = match &mut self.overlay {
+                    Some(Overlay::Sessions { picker, .. }) => {
+                        let changed = picker.push_query(&text);
+                        self.reset_session_picker_selection();
+                        changed
+                    }
+                    Some(Overlay::Models(picker)) => picker.push_query(&text),
+                    None => self.push_composer_text(&text),
+                };
                 (changed, Vec::new())
             }
-            Event::Mouse(mouse) if self.model_picker.is_none() && self.session_picker.is_none() => {
+            Event::Mouse(mouse) if self.overlay.is_none() => {
                 let changed = match mouse.kind {
                     MouseEventKind::ScrollUp => self.scroll_transcript_up(MOUSE_SCROLL_ROWS),
                     MouseEventKind::ScrollDown => self.scroll_transcript_down(MOUSE_SCROLL_ROWS),
@@ -1133,37 +1033,81 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return (true, Vec::new());
+            return self.execute(Command::Quit);
         }
-        if self.session_picker.is_some() {
-            return self.handle_session_picker_key(key);
+        match self.mode() {
+            Mode::Sessions => self.handle_session_picker_key(key),
+            Mode::Models => self.handle_model_picker_key(key),
+            Mode::Approval => self.handle_approval_key(key),
+            Mode::Compose => self.handle_compose_key(key),
         }
-        if self.model_picker.is_some() {
-            return self.handle_model_picker_key(key);
-        }
-        if self.pending_approval().is_some() {
-            return self.handle_approval_key(key);
-        }
+    }
+
+    fn handle_compose_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
         // Newline chords insert into the composer. Handle them before slash
         // completion and configured bindings so they never submit.
         if is_composer_newline_key(key) {
             let changed = self.push_input('\n');
             return (changed, Vec::new());
         }
+        // Ctrl-Enter (or Ctrl-Q where the terminal cannot report it) queues
+        // the draft explicitly instead of sending it.
+        if (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (matches!(key.code, KeyCode::Char('q' | 'Q'))
+                && key.modifiers == KeyModifiers::CONTROL)
+        {
+            return self.execute(Command::QueueDraft);
+        }
+        if key.code == KeyCode::Up && key.modifiers == KeyModifiers::ALT {
+            return self.execute(Command::DequeueDraft);
+        }
+        if matches!(key.code, KeyCode::Char('e' | 'E')) && key.modifiers == KeyModifiers::ALT {
+            return self.execute(Command::OpenEditor);
+        }
+        if key.code != KeyCode::Esc {
+            self.esc_armed_at = None;
+        }
         if let Some(result) = self.handle_slash_key(key.code) {
             return result;
         }
         if let Some(action) = self.settings.action_for(key) {
-            return self.handle_action(action);
+            return self.execute(commands::command_for_action(action));
         }
         // Ctrl-O cycles tool call detail. Checked after configured bindings so
         // a user rebinding Ctrl-O keeps winning.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('o' | 'O'))
         {
-            self.tool_detail = self.tool_detail.next();
-            return (true, Vec::new());
+            return self.execute(Command::ToggleToolDetail);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('b' | 'B'))
+        {
+            return self.execute(Command::ToggleSidebar);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('r' | 'R'))
+        {
+            return self.execute(Command::ToggleReasoning);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('g' | 'G'))
+        {
+            return self.execute(Command::FocusNextApproval);
+        }
+        // Alt-arrows walk the session tree: down to the first child, left and
+        // right across siblings in spawn order. Alt-Up dequeues a draft (see
+        // above); Esc reaches the parent.
+        if key.modifiers == KeyModifiers::ALT {
+            let command = match key.code {
+                KeyCode::Down => Some(Command::FocusFirstChild),
+                KeyCode::Left => Some(Command::FocusPreviousSibling),
+                KeyCode::Right => Some(Command::FocusNextSibling),
+                _ => None,
+            };
+            if let Some(command) = command {
+                return self.execute(command);
+            }
         }
         match key.code {
             KeyCode::Esc => {
@@ -1174,6 +1118,25 @@ impl App {
                     && self.status_session_id == self.focused
                 {
                     self.status = None;
+                    return (true, Vec::new());
+                }
+                // While a run is active, Esc twice within a short window cancels
+                // it; the first press only arms and shows the hint.
+                let running = self
+                    .focused
+                    .and_then(|id| self.sessions.get(&id))
+                    .is_some_and(|session| session.summary.active_run_id.is_some());
+                if running {
+                    let now = self.animation_tick;
+                    if self
+                        .esc_armed_at
+                        .is_some_and(|armed| now.wrapping_sub(armed) <= ESC_CANCEL_TICKS)
+                    {
+                        self.esc_armed_at = None;
+                        return self.cancel_run();
+                    }
+                    self.esc_armed_at = Some(now);
+                    self.set_info("press Esc again to cancel the run".to_owned());
                     return (true, Vec::new());
                 }
                 if let Some(parent) = self
@@ -1193,11 +1156,23 @@ impl App {
                 let changed = self.scroll_transcript_down(self.transcript_viewport.height);
                 (changed, Vec::new())
             }
+            KeyCode::Backspace
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                let changed = self.composer.kill_word_back();
+                if changed {
+                    self.reset_history_browse();
+                    self.slash.select(0);
+                }
+                (changed, Vec::new())
+            }
             KeyCode::Backspace => {
                 let changed = self.composer.backspace();
                 if changed {
                     self.reset_history_browse();
-                    self.slash_selected = 0;
+                    self.slash.select(0);
                 }
                 (changed, Vec::new())
             }
@@ -1208,8 +1183,33 @@ impl App {
                 }
                 (changed, Vec::new())
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                (self.composer.move_word_left(), Vec::new())
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                (self.composer.move_word_right(), Vec::new())
+            }
             KeyCode::Left => (self.composer.move_left(), Vec::new()),
             KeyCode::Right => (self.composer.move_right(), Vec::new()),
+            KeyCode::Home => (self.composer.move_line_start(), Vec::new()),
+            KeyCode::End => (self.composer.move_line_end(), Vec::new()),
+            KeyCode::Char(character) if key.modifiers == KeyModifiers::CONTROL => {
+                let changed = match character.to_ascii_lowercase() {
+                    'a' => self.composer.move_line_start(),
+                    'e' => self.composer.move_line_end(),
+                    'w' => self.composer.kill_word_back(),
+                    'k' => self.composer.kill_to_line_end(),
+                    'u' => self.composer.kill_to_line_start(),
+                    'y' => self.composer.yank(),
+                    'z' | '_' => self.composer.undo(),
+                    _ => return (false, Vec::new()),
+                };
+                if changed {
+                    self.reset_history_browse();
+                    self.slash.select(0);
+                }
+                (changed, Vec::new())
+            }
             KeyCode::Up => {
                 let changed = self.composer.move_up() || self.browse_prompt_history(false);
                 (changed, Vec::new())
@@ -1294,24 +1294,111 @@ impl App {
         self.transcript_viewport.offset != before
     }
 
-    fn handle_action(&mut self, action: Action) -> (bool, Vec<ClientRequest>) {
-        match action {
-            Action::SelectThreadline => self.layout = Layout::Threadline,
-            Action::SelectFoldFocus => self.layout = Layout::FoldFocus,
-            Action::NextLayout => self.layout = self.layout.next(),
-            Action::PreviousLayout => self.layout = self.layout.previous(),
-            Action::ToggleNavigator => {
-                if self.session_picker.is_some() {
-                    self.session_picker = None;
+    /// Run one command from the registry. Every command surface — keybinding,
+    /// slash entry, and later the palette — ends here so behavior cannot drift
+    /// between them.
+    pub(crate) fn execute(&mut self, command: Command) -> (bool, Vec<ClientRequest>) {
+        match command {
+            Command::OpenModels => self.open_models(),
+            Command::OpenSessions => self.open_sessions(),
+            Command::OpenAgents => self.open_agents(),
+            Command::ToggleSessions => {
+                if matches!(self.overlay, Some(Overlay::Sessions { .. })) {
+                    self.overlay = None;
+                    (true, Vec::new())
                 } else {
-                    return self.open_sessions();
+                    self.open_sessions()
                 }
             }
-            Action::CreateRootSession => return self.create_session(None),
-            Action::CreateChildSession => return self.create_session(self.focused),
-            Action::CancelRun => return self.cancel_run(),
+            Command::NewRootSession => self.create_session(None),
+            Command::NewChildSession => self.create_session(self.focused),
+            Command::CompactSession => self.compact_session(),
+            Command::CancelRun => self.cancel_run(),
+            Command::SelectThreadline => {
+                self.layout = Layout::Threadline;
+                (true, Vec::new())
+            }
+            Command::SelectFoldFocus => {
+                self.layout = Layout::FoldFocus;
+                (true, Vec::new())
+            }
+            Command::NextLayout => {
+                self.layout = self.layout.next();
+                (true, Vec::new())
+            }
+            Command::PreviousLayout => {
+                self.layout = self.layout.previous();
+                (true, Vec::new())
+            }
+            Command::ToggleToolDetail => {
+                self.tool_detail = self.tool_detail.next();
+                (true, Vec::new())
+            }
+            Command::ToggleReasoning => {
+                self.reasoning_detail = match self.reasoning_detail {
+                    ReasoningDetail::Collapsed => ReasoningDetail::Expanded,
+                    ReasoningDetail::Expanded => ReasoningDetail::Collapsed,
+                };
+                (true, Vec::new())
+            }
+            Command::ToggleSidebar => {
+                self.sidebar = self.sidebar.next();
+                (true, Vec::new())
+            }
+            Command::FocusParent => match self
+                .focused
+                .and_then(|focused| self.sessions.get(&focused)?.summary.parent_id)
+            {
+                Some(parent) => self.focus_session(parent),
+                None => (false, Vec::new()),
+            },
+            Command::FocusFirstChild => match self
+                .focused
+                .and_then(|focused| self.children_of(focused).first().copied())
+            {
+                Some(child) => self.focus_session(child),
+                None => (false, Vec::new()),
+            },
+            Command::FocusNextSibling => match self.sibling(1) {
+                Some(sibling) => self.focus_session(sibling),
+                None => (false, Vec::new()),
+            },
+            Command::FocusPreviousSibling => match self.sibling(-1) {
+                Some(sibling) => self.focus_session(sibling),
+                None => (false, Vec::new()),
+            },
+            Command::OpenEditor => {
+                self.editor_requested = true;
+                (true, Vec::new())
+            }
+            Command::QueueDraft => self.queue_draft(),
+            Command::DequeueDraft => self.dequeue_draft(),
+            Command::SteerRun => {
+                if self.steering_available {
+                    // H3 supplies the steering command; until then the flag
+                    // is never set, so this arm is unreachable in practice.
+                    self.set_warning("steering is not wired to a protocol command yet".to_owned());
+                } else {
+                    self.set_warning(
+                        "this server does not support steering; the draft was queued instead"
+                            .to_owned(),
+                    );
+                    return self.queue_draft();
+                }
+                (true, Vec::new())
+            }
+            Command::FocusNextApproval => match self.next_session_awaiting_approval() {
+                Some(session_id) => self.focus_session(session_id),
+                None => {
+                    self.set_info("no session is waiting for approval".to_owned());
+                    (true, Vec::new())
+                }
+            },
+            Command::Quit => {
+                self.quit = true;
+                (true, Vec::new())
+            }
         }
-        (true, Vec::new())
     }
 
     fn open_models(&mut self) -> (bool, Vec<ClientRequest>) {
@@ -1319,30 +1406,25 @@ impl App {
             self.set_warning("no authenticated providers have selectable models".to_owned());
             return (true, Vec::new());
         }
-        self.session_picker = None;
-        self.model_picker = Some(ModelPicker {
-            query: String::new(),
-            selected: 0,
-        });
+        self.overlay = Some(Overlay::Models(Picker::new()));
         (true, Vec::new())
     }
 
+    /// Indexes into `models` matching the open model picker's query, in
+    /// catalog order. Empty when the model picker is closed.
     pub(crate) fn filtered_models(&self) -> Vec<usize> {
-        let Some(picker) = &self.model_picker else {
+        let Some(Overlay::Models(picker)) = &self.overlay else {
             return Vec::new();
         };
-        let query = picker.query.to_ascii_lowercase();
         self.models
             .iter()
             .enumerate()
             .filter(|(_, option)| {
-                query.is_empty()
-                    || option.provider.to_ascii_lowercase().contains(&query)
-                    || option.model.to_ascii_lowercase().contains(&query)
-                    || option
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.to_ascii_lowercase().contains(&query))
+                picker.matches([
+                    option.provider.as_str(),
+                    option.model.as_str(),
+                    option.name.as_deref().unwrap_or_default(),
+                ])
             })
             .map(|(index, _)| index)
             .collect()
@@ -1350,21 +1432,20 @@ impl App {
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
         let filtered = self.filtered_models();
+        let Some(Overlay::Models(picker)) = &mut self.overlay else {
+            return (false, Vec::new());
+        };
         match key.code {
             KeyCode::Esc => {
-                self.model_picker = None;
+                self.overlay = None;
                 (true, Vec::new())
             }
             KeyCode::Up => {
-                if let Some(picker) = &mut self.model_picker {
-                    picker.selected = picker.selected.saturating_sub(1);
-                }
+                picker.move_up();
                 (true, Vec::new())
             }
             KeyCode::Down => {
-                if let Some(picker) = &mut self.model_picker {
-                    picker.selected = (picker.selected + 1).min(filtered.len().saturating_sub(1));
-                }
+                picker.move_down(filtered.len());
                 (true, Vec::new())
             }
             // Enter applies the model to the focused session; without a
@@ -1382,7 +1463,7 @@ impl App {
                     None => self.create_session_with_model(None, model),
                 };
                 if !result.1.is_empty() {
-                    self.model_picker = None;
+                    self.overlay = None;
                 }
                 result
             }
@@ -1392,20 +1473,11 @@ impl App {
                 };
                 let result = self.create_session_with_model(None, model);
                 if !result.1.is_empty() {
-                    self.model_picker = None;
+                    self.overlay = None;
                 }
                 result
             }
-            KeyCode::Backspace => {
-                let changed = self
-                    .model_picker
-                    .as_mut()
-                    .is_some_and(|picker| picker.query.pop().is_some());
-                if let Some(picker) = &mut self.model_picker {
-                    picker.selected = 0;
-                }
-                (changed, Vec::new())
-            }
+            KeyCode::Backspace => (picker.pop_query(), Vec::new()),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -1413,7 +1485,7 @@ impl App {
             {
                 let mut encoded = [0; 4];
                 (
-                    self.push_model_search(character.encode_utf8(&mut encoded)),
+                    picker.push_query(character.encode_utf8(&mut encoded)),
                     Vec::new(),
                 )
             }
@@ -1422,9 +1494,11 @@ impl App {
     }
 
     fn selected_picker_model(&self, filtered: &[usize]) -> Option<ModelSelection> {
-        self.model_picker
-            .as_ref()
-            .and_then(|picker| filtered.get(picker.selected))
+        let Some(Overlay::Models(picker)) = &self.overlay else {
+            return None;
+        };
+        filtered
+            .get(picker.selected(filtered.len()))
             .and_then(|index| self.models.get(*index))
             .map(|option| option.selection.clone())
     }
@@ -1450,118 +1524,141 @@ impl App {
         )
     }
 
-    fn push_model_search(&mut self, text: &str) -> bool {
-        let Some(picker) = &mut self.model_picker else {
-            return false;
-        };
-        let before = picker.query.len();
-        for character in text.chars() {
-            if picker.query.len() + character.len_utf8() > MAX_PICKER_SEARCH_BYTES {
-                break;
-            }
-            if let Some(character) = terminal_safe_character(character) {
-                picker.query.push(character);
-            }
-        }
-        picker.selected = 0;
-        picker.query.len() != before
+    fn open_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
+        self.open_session_picker(None)
     }
 
-    fn open_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
-        self.model_picker = None;
-        self.session_picker = Some(SessionPicker {
-            query: String::new(),
-            selected: self
-                .focused
-                .filter(|session_id| self.sessions.contains_key(session_id))
-                .or_else(|| self.thread_order().first().copied()),
+    /// `/agents`: the focused session's root and every descendant, so the
+    /// user can see and jump between the agents one task fanned out into.
+    fn open_agents(&mut self) -> (bool, Vec<ClientRequest>) {
+        let Some(focused) = self.focused else {
+            self.set_warning("focus a session to view its agents".to_owned());
+            return (true, Vec::new());
+        };
+        let mut root = focused;
+        while let Some(parent) = self
+            .sessions
+            .get(&root)
+            .and_then(|session| session.summary.parent_id)
+        {
+            root = parent;
+        }
+        self.open_session_picker(Some(root))
+    }
+
+    fn open_session_picker(&mut self, scope: Option<SessionId>) -> (bool, Vec<ClientRequest>) {
+        let selected = self
+            .focused
+            .filter(|session_id| self.sessions.contains_key(session_id))
+            .or_else(|| self.thread_order().first().copied());
+        self.overlay = Some(Overlay::Sessions {
+            picker: Picker::new(),
+            scope,
+            selected,
             confirm: None,
         });
         (true, Vec::new())
     }
 
+    /// Sessions matching the open session picker's query, in tree order.
+    /// Empty when the session picker is closed.
     pub(crate) fn filtered_sessions(&self) -> Vec<SessionId> {
-        let Some(picker) = &self.session_picker else {
+        let Some(Overlay::Sessions { picker, scope, .. }) = &self.overlay else {
             return Vec::new();
         };
-        let query = picker.query.to_ascii_lowercase();
         self.thread_order()
             .into_iter()
             .filter(|session_id| {
-                query.is_empty()
-                    || self.sessions[session_id]
-                        .summary
-                        .title
-                        .to_ascii_lowercase()
-                        .contains(&query)
+                scope.is_none_or(|root| self.is_descendant_or_self(*session_id, root))
             })
+            .filter(|session_id| picker.matches([self.sessions[session_id].summary.title.as_str()]))
             .collect()
     }
 
+    fn is_descendant_or_self(&self, session_id: SessionId, root: SessionId) -> bool {
+        let mut cursor = Some(session_id);
+        while let Some(current) = cursor {
+            if current == root {
+                return true;
+            }
+            cursor = self
+                .sessions
+                .get(&current)
+                .and_then(|session| session.summary.parent_id);
+        }
+        false
+    }
+
+    /// The highlighted session in the picker, if it is still in the filtered
+    /// list.
+    pub(crate) fn session_picker_selected(&self) -> Option<SessionId> {
+        let Some(Overlay::Sessions { selected, .. }) = &self.overlay else {
+            return None;
+        };
+        (*selected).filter(|selected| self.filtered_sessions().contains(selected))
+    }
+
+    pub(crate) fn session_picker_confirm(&self) -> Option<SessionConfirm> {
+        match &self.overlay {
+            Some(Overlay::Sessions { confirm, .. }) => *confirm,
+            Some(Overlay::Models(_)) | None => None,
+        }
+    }
+
     fn handle_session_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
-        let filtered = self.filtered_sessions();
-        let selected = self
-            .session_picker
-            .as_ref()
-            .and_then(|picker| picker.selected);
-        if let Some(confirm) = self
-            .session_picker
-            .as_ref()
-            .and_then(|picker| picker.confirm)
-        {
+        if let Some(confirm) = self.session_picker_confirm() {
             return self.handle_session_picker_confirm_key(key, confirm);
         }
-        let position =
-            selected.and_then(|selected| filtered.iter().position(|session| *session == selected));
+        let filtered = self.filtered_sessions();
+        let current = self.session_picker_selected();
+        let position = current.and_then(|current| filtered.iter().position(|id| *id == current));
         match key.code {
             KeyCode::Esc => {
-                self.session_picker = None;
+                self.overlay = None;
                 (true, Vec::new())
             }
             KeyCode::Up => {
-                if let Some(picker) = &mut self.session_picker {
-                    picker.selected = filtered
-                        .get(position.unwrap_or_default().saturating_sub(1))
-                        .copied();
-                }
+                let next = filtered
+                    .get(position.unwrap_or_default().saturating_sub(1))
+                    .copied();
+                self.set_session_picker_selection(next);
                 (true, Vec::new())
             }
             KeyCode::Down => {
-                if let Some(picker) = &mut self.session_picker {
-                    picker.selected = filtered
-                        .get(
-                            position
-                                .map(|position| position + 1)
-                                .unwrap_or_default()
-                                .min(filtered.len().saturating_sub(1)),
-                        )
-                        .copied();
-                }
+                let next = filtered
+                    .get(
+                        position
+                            .map(|position| position + 1)
+                            .unwrap_or_default()
+                            .min(filtered.len().saturating_sub(1)),
+                    )
+                    .copied();
+                self.set_session_picker_selection(next);
                 (true, Vec::new())
             }
             KeyCode::Enter => {
-                let Some(selected) = selected.filter(|selected| filtered.contains(selected)) else {
+                let Some(current) = current else {
                     return (false, Vec::new());
                 };
-                self.session_picker = None;
-                self.focus_session(selected)
+                self.overlay = None;
+                self.focus_session(current)
             }
             KeyCode::Backspace => {
                 let changed = self
-                    .session_picker
+                    .overlay
                     .as_mut()
-                    .is_some_and(|picker| picker.query.pop().is_some());
+                    .is_some_and(|overlay| overlay.picker_mut().pop_query());
                 self.reset_session_picker_selection();
                 (changed, Vec::new())
             }
             // Ctrl-modified so plain letters keep feeding the search query.
-            KeyCode::Delete => self.request_delete_confirmation(selected, &filtered),
+            KeyCode::Delete => self.request_delete_confirmation(current),
             KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.request_delete_confirmation(selected, &filtered)
+                self.request_delete_confirmation(current)
             }
             KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(picker) = &mut self.session_picker {
-                    picker.confirm = Some(SessionPickerConfirm::Prune);
+                if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
+                    *confirm = Some(SessionConfirm::Prune);
                 }
                 (true, Vec::new())
             }
@@ -1571,21 +1668,29 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 let mut encoded = [0; 4];
-                (
-                    self.push_session_search(character.encode_utf8(&mut encoded)),
-                    Vec::new(),
-                )
+                let text = character.encode_utf8(&mut encoded);
+                let changed = self
+                    .overlay
+                    .as_mut()
+                    .is_some_and(|overlay| overlay.picker_mut().push_query(text));
+                self.reset_session_picker_selection();
+                (changed, Vec::new())
             }
             _ => (false, Vec::new()),
+        }
+    }
+
+    fn set_session_picker_selection(&mut self, next: Option<SessionId>) {
+        if let Some(Overlay::Sessions { selected, .. }) = &mut self.overlay {
+            *selected = next;
         }
     }
 
     fn request_delete_confirmation(
         &mut self,
         selected: Option<SessionId>,
-        filtered: &[SessionId],
     ) -> (bool, Vec<ClientRequest>) {
-        let Some(selected) = selected.filter(|selected| filtered.contains(selected)) else {
+        let Some(selected) = selected else {
             return (false, Vec::new());
         };
         if self
@@ -1596,8 +1701,8 @@ impl App {
             self.set_warning("cancel the active run before deleting".to_owned());
             return (true, Vec::new());
         }
-        if let Some(picker) = &mut self.session_picker {
-            picker.confirm = Some(SessionPickerConfirm::Delete(selected));
+        if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
+            *confirm = Some(SessionConfirm::Delete(selected));
         }
         (true, Vec::new())
     }
@@ -1605,25 +1710,27 @@ impl App {
     fn handle_session_picker_confirm_key(
         &mut self,
         key: KeyEvent,
-        confirm: SessionPickerConfirm,
+        confirm: SessionConfirm,
     ) -> (bool, Vec<ClientRequest>) {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                if let Some(picker) = &mut self.session_picker {
-                    picker.confirm = None;
-                }
+                self.clear_session_picker_confirm();
                 match confirm {
-                    SessionPickerConfirm::Delete(session_id) => self.delete_session(session_id),
-                    SessionPickerConfirm::Prune => self.prune_sessions(),
+                    SessionConfirm::Delete(session_id) => self.delete_session(session_id),
+                    SessionConfirm::Prune => self.prune_sessions(),
                 }
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                if let Some(picker) = &mut self.session_picker {
-                    picker.confirm = None;
-                }
+                self.clear_session_picker_confirm();
                 (true, Vec::new())
             }
             _ => (false, Vec::new()),
+        }
+    }
+
+    fn clear_session_picker_confirm(&mut self) {
+        if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
+            *confirm = None;
         }
     }
 
@@ -1659,34 +1766,24 @@ impl App {
         )
     }
 
-    fn push_session_search(&mut self, text: &str) -> bool {
-        let Some(picker) = &mut self.session_picker else {
-            return false;
-        };
-        let before = picker.query.len();
-        for character in text.chars() {
-            if picker.query.len() + character.len_utf8() > MAX_PICKER_SEARCH_BYTES {
-                break;
-            }
-            if let Some(character) = terminal_safe_character(character) {
-                picker.query.push(character);
-            }
-        }
-        let changed = picker.query.len() != before;
-        self.reset_session_picker_selection();
-        changed
-    }
-
     fn reset_session_picker_selection(&mut self) {
-        let selected = self.filtered_sessions().first().copied();
-        if let Some(picker) = &mut self.session_picker {
-            picker.selected = selected;
-        }
+        let first = self.filtered_sessions().first().copied();
+        self.set_session_picker_selection(first);
     }
 
+    /// Focus a session. A warm body renders immediately with no request; a
+    /// cold one shows its summary and live tail while its body is fetched.
     fn focus_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
-        self.focused = Some(session_id);
+        self.set_focus(session_id);
         self.reset_history_browse();
+        self.evict_cold_bodies();
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(SessionView::is_warm)
+        {
+            return (true, Vec::new());
+        }
         let Some(workspace_id) = self.workspace_id else {
             return (true, Vec::new());
         };
@@ -1695,6 +1792,7 @@ impl App {
             vec![ClientRequest::Snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: Some(session_id),
+                include_sessions: Vec::new(),
                 session_limit: SNAPSHOT_SESSION_LIMIT,
                 message_limit: SNAPSHOT_MESSAGE_LIMIT,
             })],
@@ -1774,7 +1872,7 @@ impl App {
     }
 
     fn submit_prompt(&mut self) -> (bool, Vec<ClientRequest>) {
-        let prompt = self.composer.text.trim().to_owned();
+        let prompt = self.composer.expanded().trim().to_owned();
         if prompt.is_empty() {
             return (false, Vec::new());
         }
@@ -1784,18 +1882,34 @@ impl App {
         // direct, embedded, and remote clients.
         if prompt.starts_with('/') {
             let name = prompt.split_whitespace().next().unwrap_or(&prompt);
-            if let Some(action) = SLASH_COMMANDS
-                .iter()
-                .find(|command| command.name == name)
-                .map(|command| command.action)
-            {
-                return self.execute_slash_action(action);
+            if let Some(entry) = commands::slash_entries().find(|entry| entry.name == name) {
+                self.composer.clear();
+                self.slash.select(0);
+                return self.execute(entry.command);
             }
         }
         let Some(session_id) = self.focused else {
             self.set_warning("create a session before sending a prompt".to_owned());
             return (true, Vec::new());
         };
+        // Enter during an active run steers when the server supports it and
+        // otherwise holds the draft locally until the run finishes. Sending
+        // it to the server queue now would lose the ability to edit it.
+        let running = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.summary.active_run_id.is_some());
+        if running {
+            if self.steering_available {
+                return self.execute(Command::SteerRun);
+            }
+            return self.queue_draft();
+        }
+        self.submit_text(session_id, prompt)
+    }
+
+    /// Send `prompt` to `session_id` as a new run.
+    fn submit_text(&mut self, session_id: SessionId, prompt: String) -> (bool, Vec<ClientRequest>) {
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
@@ -1825,6 +1939,85 @@ impl App {
                 },
             })],
         )
+    }
+
+    /// Hold the composer text for the focused session until its run ends.
+    fn queue_draft(&mut self) -> (bool, Vec<ClientRequest>) {
+        let prompt = self.composer.expanded().trim().to_owned();
+        if prompt.is_empty() {
+            return (false, Vec::new());
+        }
+        let Some(session_id) = self.focused else {
+            self.set_warning("create a session before queueing a prompt".to_owned());
+            return (true, Vec::new());
+        };
+        let drafts = self.drafts.entry(session_id).or_default();
+        if drafts.len() >= MAX_QUEUED_DRAFTS {
+            self.set_warning(format!(
+                "at most {MAX_QUEUED_DRAFTS} drafts can wait per session"
+            ));
+            return (true, Vec::new());
+        }
+        drafts.push_back(prompt);
+        self.composer.clear();
+        self.reset_history_browse();
+        self.slash.select(0);
+        (true, Vec::new())
+    }
+
+    /// Pull the newest queued draft back into the composer for editing. A
+    /// non-empty composer is queued first so nothing is lost.
+    fn dequeue_draft(&mut self) -> (bool, Vec<ClientRequest>) {
+        let Some(session_id) = self.focused else {
+            return (false, Vec::new());
+        };
+        if !self.composer.text.is_empty() {
+            let (changed, _) = self.queue_draft();
+            if !changed {
+                return (false, Vec::new());
+            }
+            // The draft just queued is newest; rotate so the previously
+            // newest one comes back.
+            if let Some(drafts) = self.drafts.get_mut(&session_id)
+                && drafts.len() > 1
+                && let Some(just_queued) = drafts.pop_back()
+            {
+                drafts.push_front(just_queued);
+            }
+        }
+        let Some(draft) = self
+            .drafts
+            .get_mut(&session_id)
+            .and_then(VecDeque::pop_back)
+        else {
+            return (false, Vec::new());
+        };
+        self.composer.replace(draft);
+        (true, Vec::new())
+    }
+
+    /// Drafts waiting for `session_id` in submission order.
+    pub(crate) fn queued_drafts(&self, session_id: SessionId) -> impl Iterator<Item = &str> {
+        self.drafts
+            .get(&session_id)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    }
+
+    /// Submit the oldest waiting draft once the session goes idle. Called by
+    /// the reducer on `RunFinished`; one draft per run so each becomes its
+    /// own run in order.
+    pub(super) fn flush_draft(&mut self, session_id: SessionId) {
+        let Some(draft) = self
+            .drafts
+            .get_mut(&session_id)
+            .and_then(VecDeque::pop_front)
+        else {
+            return;
+        };
+        let (_, requests) = self.submit_text(session_id, draft);
+        self.queued_requests.extend(requests);
     }
 
     fn record_prompt(&mut self, session_id: SessionId, prompt: &str) {
@@ -2013,85 +2206,86 @@ impl App {
         }
         self.composer.insert(character);
         self.reset_history_browse();
-        self.slash_selected = 0;
+        self.slash.select(0);
         true
     }
 
+    /// Insert pasted text. The sanitized content goes through the composer's
+    /// paste path, which collapses large pastes to a placeholder; the byte
+    /// bound applies to the expanded content so a placeholder cannot hide an
+    /// oversized prompt.
     fn push_composer_text(&mut self, text: &str) -> bool {
-        let before = self.composer.text.len();
+        let mut sanitized = String::with_capacity(text.len().min(MAX_INPUT_BYTES));
+        let budget = MAX_INPUT_BYTES.saturating_sub(self.composer.expanded().len());
         for character in text.chars() {
-            if self.composer.text.len() + character.len_utf8() > MAX_INPUT_BYTES {
+            if sanitized.len() + character.len_utf8() > budget {
                 break;
             }
             if let Some(character) = composer_character(character) {
-                self.composer.insert(character);
+                sanitized.push(character);
             }
         }
-        let changed = self.composer.text.len() != before;
+        let changed = self.composer.paste(&sanitized);
         if changed {
             self.reset_history_browse();
-            self.slash_selected = 0;
+            self.slash.select(0);
         }
         changed
     }
 
     fn handle_slash_key(&mut self, code: KeyCode) -> Option<(bool, Vec<ClientRequest>)> {
-        let commands = self.filtered_slash_commands();
-        let command_count = commands.len();
-        if command_count == 0 {
+        // Only navigation and acceptance keys consult the list; ordinary typing
+        // must not pay for building it.
+        if !matches!(
+            code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Tab
+        ) || !self.composer.text.starts_with('/')
+        {
+            return None;
+        }
+        let entries = self.filtered_slash_commands();
+        if entries.is_empty() {
             return None;
         }
         match code {
             KeyCode::Up => {
-                self.slash_selected = self.slash_selected.saturating_sub(1);
+                self.slash.move_up();
                 Some((true, Vec::new()))
             }
             KeyCode::Down => {
-                self.slash_selected = (self.slash_selected + 1).min(command_count - 1);
+                self.slash.move_down(entries.len());
                 Some((true, Vec::new()))
             }
             KeyCode::Enter | KeyCode::Tab => {
-                Some(self.execute_slash_action(
-                    commands[self.slash_selected.min(command_count - 1)].action,
-                ))
+                let command = entries[self.slash.selected(entries.len())].command;
+                self.composer.clear();
+                self.slash.select(0);
+                Some(self.execute(command))
             }
             _ => None,
         }
     }
 
-    fn execute_slash_action(&mut self, action: SlashAction) -> (bool, Vec<ClientRequest>) {
-        self.composer.clear();
-        self.slash_selected = 0;
-        match action {
-            SlashAction::Quit => {
-                self.quit = true;
-                (true, Vec::new())
-            }
-            SlashAction::Models => self.open_models(),
-            SlashAction::New => self.create_session(None),
-            SlashAction::Sessions => self.open_sessions(),
-            SlashAction::Compact => self.compact_session(),
-        }
+    /// Slash entries matching the composer text, in registry order. Empty
+    /// unless the composer holds a bare `/token`.
+    pub(crate) fn filtered_slash_commands(&self) -> Vec<SlashEntry> {
+        commands::matching_slash_entries(&self.composer.text)
     }
 
-    pub(crate) fn filtered_slash_commands(&self) -> Vec<&'static SlashCommand> {
-        if !self.composer.text.starts_with('/')
-            || self.composer.text.chars().any(char::is_whitespace)
-        {
-            return Vec::new();
-        }
-        SLASH_COMMANDS
-            .iter()
-            .filter(|command| command.name.starts_with(&self.composer.text))
-            .collect()
-    }
-
-    pub(crate) fn slash_selected(&self) -> usize {
-        self.slash_selected
+    /// Highlighted row in the slash autocomplete list, clamped to `len`.
+    pub(crate) fn slash_selected(&self, len: usize) -> usize {
+        self.slash.selected(len)
     }
 
     pub fn advance_animation(&mut self) -> bool {
         self.animation_tick = self.animation_tick.wrapping_add(1);
+        for session in self.sessions.values_mut() {
+            for reasoning in session.reasoning.values_mut() {
+                if reasoning.streaming {
+                    reasoning.ticks += 1;
+                }
+            }
+        }
         let active = self
             .sessions
             .values()
@@ -2132,24 +2326,111 @@ impl App {
         session.context_window
     }
 
+    /// Every session in tree order: roots newest-first, each followed by its
+    /// descendants depth-first with siblings oldest-first. One pass groups
+    /// children by parent so the walk is linear in the number of sessions
+    /// plus sorting, not quadratic.
     pub fn thread_order(&self) -> Vec<SessionId> {
-        let mut roots = self.root_sessions();
-        roots.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
-        roots.reverse();
-        let mut stack = roots.into_iter().rev().collect::<Vec<_>>();
+        let mut children: HashMap<Option<SessionId>, Vec<SessionId>> = HashMap::new();
+        for session in self.sessions.values() {
+            children
+                .entry(session.summary.parent_id)
+                .or_default()
+                .push(session.summary.id);
+        }
+        for siblings in children.values_mut() {
+            siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+        }
+        let mut stack = children.remove(&None).unwrap_or_default();
+        // Roots are newest-first; popping from the back yields the newest.
         let mut output = Vec::with_capacity(self.sessions.len());
         while let Some(session_id) = stack.pop() {
             output.push(session_id);
-            let mut children = self
-                .sessions
-                .values()
-                .filter(|session| session.summary.parent_id == Some(session_id))
-                .map(|session| session.summary.id)
-                .collect::<Vec<_>>();
-            children.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
-            stack.extend(children);
+            if let Some(mut kids) = children.remove(&Some(session_id)) {
+                // Children render oldest-first, so push newest first to be
+                // popped last.
+                kids.reverse();
+                stack.extend(kids);
+            }
         }
         output
+    }
+
+    /// The child session created by a `spawn_agent` call, if the server has
+    /// recorded that linkage. Linear over sessions; the map is small and this
+    /// runs only for `spawn_agent` rows on screen.
+    pub fn child_spawned_by(&self, tool_call_id: qq_protocol::ToolCallId) -> Option<SessionId> {
+        self.sessions
+            .values()
+            .find(|session| {
+                session
+                    .summary
+                    .spawned_by
+                    .is_some_and(|origin| origin.tool_call_id == Some(tool_call_id))
+            })
+            .map(|session| session.summary.id)
+    }
+
+    /// The focused session's sibling `offset` places away in spawn order
+    /// (oldest-first), wrapping at either end. Roots are siblings of roots.
+    fn sibling(&self, offset: isize) -> Option<SessionId> {
+        let focused = self.focused?;
+        let parent = self.sessions.get(&focused)?.summary.parent_id;
+        let mut siblings = match parent {
+            Some(parent) => self.children_of(parent),
+            None => self.root_sessions(),
+        };
+        siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+        if siblings.len() < 2 {
+            return None;
+        }
+        let position = siblings.iter().position(|id| *id == focused)?;
+        let next = (position as isize + offset).rem_euclid(siblings.len() as isize) as usize;
+        Some(siblings[next])
+    }
+
+    /// Sessions with a tool call awaiting approval, in tree order.
+    pub(crate) fn sessions_awaiting_approval(&self) -> Vec<SessionId> {
+        self.thread_order()
+            .into_iter()
+            .filter(|id| !self.sessions[id].live.awaiting_approval.is_empty())
+            .collect()
+    }
+
+    /// The next session (after the focused one, wrapping) that is waiting
+    /// for an approval answer, excluding the focused session itself.
+    fn next_session_awaiting_approval(&self) -> Option<SessionId> {
+        let waiting = self.sessions_awaiting_approval();
+        let others: Vec<SessionId> = waiting
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != self.focused)
+            .collect();
+        if others.is_empty() {
+            return None;
+        }
+        let order = self.thread_order();
+        let focus_position = self
+            .focused
+            .and_then(|focused| order.iter().position(|id| *id == focused))
+            .unwrap_or(0);
+        others
+            .iter()
+            .copied()
+            .find(|id| order.iter().position(|o| o == id).unwrap_or(0) > focus_position)
+            .or_else(|| others.first().copied())
+    }
+
+    /// Direct children of `parent`, oldest-first.
+    pub fn children_of(&self, parent: SessionId) -> Vec<SessionId> {
+        let mut children = self
+            .sessions
+            .values()
+            .filter(|session| session.summary.parent_id == Some(parent))
+            .map(|session| session.summary.id)
+            .collect::<Vec<_>>();
+        children.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+        children
     }
 
     fn root_sessions(&self) -> Vec<SessionId> {
@@ -2199,34 +2480,6 @@ fn approval_grant(tool_call: &ToolCallSnapshot) -> ApprovalGrant {
     }
     ApprovalGrant::Tool {
         name: tool_call.name.clone(),
-    }
-}
-
-fn retain_recent_messages(messages: &mut Vec<MessageSnapshot>) {
-    let excess = messages
-        .len()
-        .saturating_sub(usize::from(SNAPSHOT_MESSAGE_LIMIT));
-    if excess > 0 {
-        messages.drain(..excess);
-    }
-}
-
-const fn tool_call_state_is_terminal(state: ToolCallState) -> bool {
-    match state {
-        ToolCallState::Completed
-        | ToolCallState::Failed
-        | ToolCallState::Denied
-        | ToolCallState::Interrupted => true,
-        ToolCallState::Requested | ToolCallState::AwaitingApproval | ToolCallState::Running => {
-            false
-        }
-    }
-}
-
-fn retain_recent_tool_calls(tool_calls: &mut Vec<ToolCallSnapshot>) {
-    let excess = tool_calls.len().saturating_sub(MAX_RECENT_TOOL_CALLS);
-    if excess > 0 {
-        tool_calls.drain(..excess);
     }
 }
 
@@ -2308,8 +2561,9 @@ fn is_composer_newline_key(key: KeyEvent) -> bool {
 mod tests {
     use crossterm::event::MouseEvent;
     use qq_protocol::{
-        EventCursor, MessageId, MessageRole, RunId, RunSnapshot, RunStatus, SessionStatus, StoreId,
-        TokenUsage, ToolCallId, ToolCallState, WorkspaceSummary,
+        EventCursor, MessageId, MessageRole, MessageState, RunId, RunOutcome, RunSnapshot,
+        RunStatus, SessionEvent, SessionStatus, StoreId, TextChannel, TokenUsage, ToolCallId,
+        ToolCallState, WorkspaceGrantOutcome, WorkspaceSummary,
     };
 
     use super::*;
@@ -2322,6 +2576,7 @@ mod tests {
         let workspace_id = id(1, WorkspaceId::from_bytes);
         let session_id = id(2, SessionId::from_bytes);
         WorkspaceSnapshot {
+            included: Vec::new(),
             cursor: EventCursor {
                 store_id: id(3, StoreId::from_bytes),
                 workspace_id,
@@ -2332,6 +2587,8 @@ mod tests {
                 path: "/workspace".to_owned(),
             },
             sessions: vec![SessionSummary {
+                activity: None,
+                spawned_by: None,
                 id: session_id,
                 workspace_id,
                 parent_id: None,
@@ -2348,6 +2605,8 @@ mod tests {
             }],
             focused: Some(SessionSnapshot {
                 summary: SessionSummary {
+                    activity: None,
+                    spawned_by: None,
                     id: session_id,
                     workspace_id,
                     parent_id: None,
@@ -2404,10 +2663,17 @@ mod tests {
     fn paste_preserves_newlines_in_the_composer() {
         let mut app = App::new(TuiOptions::default());
         let (changed, requests) =
-            app.handle_terminal_event(Event::Paste("alpha\r\nbeta\ngamma".to_owned()));
+            app.handle_terminal_event(Event::Paste("alpha\r\nbeta".to_owned()));
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(app.composer.text, "alpha\nbeta\ngamma");
+        assert_eq!(app.composer.text, "alpha\nbeta");
+
+        // Three or more lines collapse to a placeholder; the submitted prompt
+        // carries the real content with CRLF normalized.
+        app.composer.clear();
+        app.handle_terminal_event(Event::Paste("alpha\r\nbeta\ngamma".to_owned()));
+        assert_eq!(app.composer.text, "[Pasted #1 3 lines]");
+        assert_eq!(app.composer.expanded(), "alpha\nbeta\ngamma");
     }
 
     #[test]
@@ -2677,8 +2943,8 @@ mod tests {
             app.composer.text = command.to_owned();
             let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(requests.is_empty());
-            assert!(app.session_picker.is_some());
-            app.session_picker = None;
+            assert!(matches!(app.overlay, Some(Overlay::Sessions { .. })));
+            app.overlay = None;
         }
 
         for command in ["/quit", "/exit"] {
@@ -2887,8 +3153,10 @@ mod tests {
                 "/models",
                 "/sessions",
                 "/resume",
+                "/agents",
                 "/new",
                 "/compact",
+                "/editor",
                 "/quit",
                 "/exit"
             ]
@@ -2896,19 +3164,19 @@ mod tests {
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.slash_selected, 6);
+        assert_eq!(app.slash_selected(usize::MAX), 8);
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
-        assert_eq!(app.slash_selected, 0);
+        assert_eq!(app.slash_selected(usize::MAX), 0);
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.composer.text.is_empty());
-        assert!(app.session_picker.is_some());
+        assert!(matches!(app.overlay, Some(Overlay::Sessions { .. })));
 
-        app.session_picker = None;
+        app.overlay = None;
         app.composer.text = "/qu".to_owned();
-        app.slash_selected = 0;
+        app.slash.select(0);
         assert_eq!(
             app.filtered_slash_commands()[0].name,
             "/quit",
@@ -2927,6 +3195,8 @@ mod tests {
         initial.sessions[0].title = "Deploy API".to_owned();
         initial.focused.as_mut().unwrap().summary.title = "Deploy API".to_owned();
         initial.sessions.push(SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: target,
             workspace_id,
             parent_id: None,
@@ -2951,7 +3221,7 @@ mod tests {
         assert!(changed);
         assert!(requests.is_empty());
         assert_eq!(app.filtered_sessions(), [target]);
-        assert_eq!(app.session_picker.as_ref().unwrap().selected, Some(target));
+        assert_eq!(app.session_picker_selected(), Some(target));
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
@@ -2961,7 +3231,7 @@ mod tests {
                 ..
             }) if *session_id == target
         ));
-        assert!(app.session_picker.is_none());
+        assert!(app.overlay.is_none());
     }
 
     #[test]
@@ -2975,7 +3245,7 @@ mod tests {
         let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!changed);
         assert!(requests.is_empty());
-        assert!(app.session_picker.is_some());
+        assert!(matches!(app.overlay, Some(Overlay::Sessions { .. })));
     }
 
     #[test]
@@ -2991,12 +3261,12 @@ mod tests {
         assert!(changed);
         assert!(requests.is_empty());
         assert_eq!(
-            app.session_picker.as_ref().unwrap().confirm,
-            Some(SessionPickerConfirm::Delete(session_id))
+            app.session_picker_confirm(),
+            Some(SessionConfirm::Delete(session_id))
         );
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(requests.is_empty());
-        assert_eq!(app.session_picker.as_ref().unwrap().confirm, None);
+        assert_eq!(app.session_picker_confirm(), None);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
@@ -3007,7 +3277,7 @@ mod tests {
                 ..
             }) if *target == session_id
         ));
-        assert_eq!(app.session_picker.as_ref().unwrap().confirm, None);
+        assert_eq!(app.session_picker_confirm(), None);
     }
 
     #[test]
@@ -3025,7 +3295,7 @@ mod tests {
 
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(app.session_picker.as_ref().unwrap().confirm, None);
+        assert_eq!(app.session_picker_confirm(), None);
         assert_eq!(
             app.status.as_deref(),
             Some("cancel the active run before deleting")
@@ -3043,10 +3313,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(
-            app.session_picker.as_ref().unwrap().confirm,
-            Some(SessionPickerConfirm::Prune)
-        );
+        assert_eq!(app.session_picker_confirm(), Some(SessionConfirm::Prune));
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(matches!(
@@ -3065,6 +3332,8 @@ mod tests {
         let deleted = initial.sessions[0].id;
         let neighbor = id(9, SessionId::from_bytes);
         initial.sessions.push(SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: neighbor,
             workspace_id,
             parent_id: None,
@@ -3126,10 +3395,7 @@ mod tests {
         assert!(!app.sessions.contains_key(&deleted));
         assert!(!app.live_tool_output.contains_key(&tool_call_id));
         assert_eq!(app.focused, Some(neighbor));
-        assert_eq!(
-            app.session_picker.as_ref().unwrap().selected,
-            Some(neighbor)
-        );
+        assert_eq!(app.session_picker_selected(), Some(neighbor));
         // The refocus fetches the neighbor's transcript.
         let requests = app.take_requests();
         assert!(matches!(
@@ -3658,7 +3924,7 @@ mod tests {
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(requests.is_empty());
-        assert!(app.model_picker.is_some());
+        assert!(matches!(app.overlay, Some(Overlay::Models(_))));
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.filtered_models(), vec![0]);
 
@@ -3675,7 +3941,7 @@ mod tests {
                 if model == &selection && *session_id == focused
         ));
         assert_eq!(app.model, selection);
-        assert!(app.model_picker.is_none());
+        assert!(app.overlay.is_none());
 
         // Ctrl-N creates a fresh session with the selected model instead.
         app.open_models();
@@ -3693,7 +3959,7 @@ mod tests {
             } if model == &selection
         ));
         assert_eq!(app.model, selection);
-        assert!(app.model_picker.is_none());
+        assert!(app.overlay.is_none());
     }
 
     #[test]
@@ -3735,7 +4001,7 @@ mod tests {
             } if model == &selection
         ));
         assert_eq!(app.model, selection);
-        assert!(app.model_picker.is_none());
+        assert!(app.overlay.is_none());
     }
 
     #[test]
@@ -3774,7 +4040,7 @@ mod tests {
         ));
         assert_eq!(app.model, switched);
 
-        let (_, requests) = app.handle_action(Action::CreateRootSession);
+        let (_, requests) = app.execute(Command::NewRootSession);
         assert!(matches!(
             &requests[0],
             ClientRequest::Command(CommandRequest {
@@ -3810,7 +4076,7 @@ mod tests {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(initial);
 
-        let (_, requests) = app.handle_action(Action::CreateRootSession);
+        let (_, requests) = app.execute(Command::NewRootSession);
 
         assert!(requests.is_empty());
         assert_eq!(
@@ -4067,6 +4333,8 @@ mod tests {
         let old_focus = initial.focused.as_ref().unwrap().summary.id;
         let new_focus = id(9, SessionId::from_bytes);
         initial.sessions.push(SessionSummary {
+            activity: None,
+            spawned_by: None,
             id: new_focus,
             workspace_id: initial.workspace.id,
             parent_id: None,
@@ -4217,11 +4485,7 @@ mod tests {
         assert_eq!(app.tool_detail, ToolDetail::Collapsed);
 
         // Pickers own the keyboard; the toggle must not fire underneath them.
-        app.session_picker = Some(SessionPicker {
-            query: String::new(),
-            selected: None,
-            confirm: None,
-        });
+        app.overlay = Some(Overlay::sessions("", None, None));
         app.handle_key(ctrl_o);
         assert_eq!(app.tool_detail, ToolDetail::Collapsed);
     }
@@ -4337,10 +4601,7 @@ mod tests {
     fn transcript_scroll_controls_are_ignored_by_overlays() {
         let mut app = App::new(TuiOptions::default());
         app.update_transcript_viewport(100, 10, false);
-        app.model_picker = Some(ModelPicker {
-            query: String::new(),
-            selected: 0,
-        });
+        app.overlay = Some(Overlay::models());
         let wheel = Event::Mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 0,
@@ -4353,14 +4614,453 @@ mod tests {
         assert!(!app.handle_terminal_event(page.clone()).0);
         assert_eq!(app.transcript_scroll_offset(), 0);
 
-        app.model_picker = None;
-        app.session_picker = Some(SessionPicker {
-            query: String::new(),
-            selected: app.focused,
-            confirm: None,
-        });
+        app.overlay = None;
+        app.overlay = Some(Overlay::sessions("", app.focused, None));
         assert!(!app.handle_terminal_event(wheel).0);
         assert!(!app.handle_terminal_event(page).0);
         assert_eq!(app.transcript_scroll_offset(), 0);
+    }
+
+    fn summary_named(byte: u8, workspace_id: WorkspaceId, title: &str) -> SessionSummary {
+        SessionSummary {
+            id: id(byte, SessionId::from_bytes),
+            workspace_id,
+            parent_id: None,
+            spawned_by: None,
+            title: title.to_owned(),
+            status: SessionStatus::Idle,
+            active_run_id: None,
+            activity: None,
+            queued_prompts: 0,
+            model: Some("openai/gpt-test".to_owned()),
+            context_tokens: None,
+            accounting: None,
+            estimated_cost_usd_nanos: Some(0),
+            updated_at_ms: u64::from(byte),
+            last_outcome: None,
+        }
+    }
+
+    fn body_for(summary: &SessionSummary, output: &str) -> SessionSnapshot {
+        SessionSnapshot {
+            summary: summary.clone(),
+            messages: vec![MessageSnapshot {
+                id: id(summary.id.as_bytes()[0], MessageId::from_bytes),
+                session_id: summary.id,
+                run_id: id(0xaa, RunId::from_bytes),
+                turn_ordinal: 1,
+                role: MessageRole::Assistant,
+                state: MessageState::Complete,
+                output: output.to_owned(),
+                refusal: String::new(),
+                created_at_ms: 1,
+            }],
+            runs: Vec::new(),
+            tool_calls: Vec::new(),
+            has_older_tool_calls: false,
+            has_older_messages: false,
+        }
+    }
+
+    #[test]
+    fn creating_a_session_adopts_it_without_a_snapshot_round_trip() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        let workspace_id = app.workspace_id.unwrap();
+        let (_, requests) = app.execute(Command::NewRootSession);
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one create command, got {requests:?}");
+        };
+        let created = id(0x42, SessionId::from_bytes);
+        let mut summary = summary_named(0x42, workspace_id, "New session");
+        summary.updated_at_ms = 99;
+
+        // The durable event arrives first (the SSE stream is usually ahead of
+        // the HTTP receipt); focus moves and the body is already warm.
+        let changed = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: id(3, StoreId::from_bytes),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: created,
+            run_id: None,
+            caused_by: Some(request.command_id),
+            occurred_at_ms: 1,
+            event: SessionEvent::SessionCreated {
+                session: summary.clone(),
+            },
+        }));
+        assert!(changed);
+        assert_eq!(app.focused, Some(created));
+        assert!(app.sessions[&created].is_warm());
+        assert!(app.take_requests().is_empty(), "no snapshot after create");
+
+        // The receipt confirms without changing anything or requesting more.
+        app.apply_client_update(ClientUpdate::CommandResult {
+            command_id: request.command_id,
+            result: Ok(qq_protocol::CommandReceipt {
+                command_id: request.command_id,
+                outcome: CommandOutcome::SessionCreated {
+                    session_id: created,
+                },
+                committed_through: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id,
+                    sequence: 2,
+                },
+            }),
+        });
+        assert_eq!(app.focused, Some(created));
+        assert!(app.take_requests().is_empty());
+        // The previously focused session keeps its body warm.
+        let previous = snapshot().sessions[0].id;
+        assert!(app.sessions[&previous].is_warm());
+    }
+
+    #[test]
+    fn switching_to_a_warm_session_needs_no_request_and_a_cold_one_does() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let warm = summary_named(0x51, workspace_id, "warm");
+        let cold = summary_named(0x52, workspace_id, "cold");
+        initial.sessions.push(warm.clone());
+        initial.sessions.push(cold.clone());
+        initial.included.push(body_for(&warm, "warm body"));
+        app.apply_snapshot(initial);
+        let first = snapshot().sessions[0].id;
+        assert_eq!(app.focused, Some(first));
+        assert!(app.sessions[&warm.id].is_warm());
+        assert!(!app.sessions[&cold.id].is_warm());
+
+        let (changed, requests) = app.focus_session(warm.id);
+        assert!(changed);
+        assert!(requests.is_empty(), "warm switch must not request");
+        assert_eq!(app.focused, Some(warm.id));
+        assert!(app.sessions[&first].is_warm(), "leaving does not evict");
+
+        let (_, requests) = app.focus_session(cold.id);
+        assert!(matches!(
+            requests.as_slice(),
+            [ClientRequest::Snapshot(SnapshotRequest {
+                focused_session_id: Some(id),
+                ..
+            })] if *id == cold.id
+        ));
+        assert_eq!(app.focused, Some(cold.id));
+    }
+
+    #[test]
+    fn warm_bodies_are_bounded_and_evict_least_recently_focused() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let ids: Vec<SessionId> = (0x60..0x60 + (WARM_BODY_LIMIT as u8) + 2)
+            .map(|byte| {
+                let summary = summary_named(byte, workspace_id, "s");
+                initial.sessions.push(summary.clone());
+                summary.id
+            })
+            .collect();
+        app.apply_snapshot(initial);
+        // Focus each in turn, loading a body every time.
+        for session_id in &ids {
+            app.focus_session(*session_id);
+            let summary = app.sessions[session_id].summary.clone();
+            app.apply_snapshot(WorkspaceSnapshot {
+                focused: Some(body_for(&summary, "body")),
+                ..snapshot()
+            });
+        }
+        let warm: Vec<_> = app.sessions.values().filter(|s| s.is_warm()).collect();
+        assert_eq!(warm.len(), WARM_BODY_LIMIT);
+        // The most recent WARM_BODY_LIMIT are warm; the earliest two are not.
+        assert!(!app.sessions[&ids[0]].is_warm());
+        assert!(!app.sessions[&ids[1]].is_warm());
+        assert!(app.sessions[ids.last().unwrap()].is_warm());
+        // Cold sessions keep their summary and status.
+        assert_eq!(app.sessions[&ids[0]].summary.title, "s");
+    }
+
+    #[test]
+    fn live_status_tracks_cold_sessions_and_activity_seeds_from_snapshots() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let mut child = summary_named(0x71, workspace_id, "child");
+        child.parent_id = Some(initial.sessions[0].id);
+        child.status = SessionStatus::Running;
+        child.active_run_id = Some(id(0x72, RunId::from_bytes));
+        child.activity = Some(RunActivity::Reasoning);
+        initial.sessions.push(child.clone());
+        app.apply_snapshot(initial);
+        assert!(!app.sessions[&child.id].is_warm());
+        assert_eq!(
+            app.sessions[&child.id].activity,
+            Some((id(0x72, RunId::from_bytes), RunActivity::Reasoning))
+        );
+
+        let mut sequence = 1;
+        let mut event = |event: SessionEvent| {
+            sequence += 1;
+            ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id,
+                    sequence,
+                },
+                session_id: child.id,
+                run_id: child.active_run_id,
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event,
+            })
+        };
+        let message = MessageSnapshot {
+            id: id(0x73, MessageId::from_bytes),
+            session_id: child.id,
+            run_id: child.active_run_id.unwrap(),
+            turn_ordinal: 1,
+            role: MessageRole::Assistant,
+            state: MessageState::Streaming,
+            output: String::new(),
+            refusal: String::new(),
+            created_at_ms: 1,
+        };
+        app.apply_client_update(event(SessionEvent::AssistantMessageStarted { message }));
+        app.apply_client_update(event(SessionEvent::TextAppended {
+            message_id: id(0x73, MessageId::from_bytes),
+            channel: TextChannel::Output,
+            text: "Reading   the\nrepository ".to_owned(),
+        }));
+        app.apply_client_update(event(SessionEvent::TextAppended {
+            message_id: id(0x73, MessageId::from_bytes),
+            channel: TextChannel::Output,
+            text: "layout".to_owned(),
+        }));
+        let call = ToolCallSnapshot {
+            id: id(0x74, ToolCallId::from_bytes),
+            session_id: child.id,
+            run_id: child.active_run_id.unwrap(),
+            turn_ordinal: 1,
+            call_ordinal: 0,
+            provider_call_id: "c".to_owned(),
+            name: "search".to_owned(),
+            arguments: "{}".to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+            display: None,
+        };
+        app.apply_client_update(event(SessionEvent::ToolApprovalRequested {
+            tool_call: call.clone(),
+            shell: None,
+            edit: None,
+        }));
+
+        let live = &app.sessions[&child.id].live;
+        assert_eq!(live.tail, "Reading the repository layout");
+        assert_eq!(live.active_tool.as_deref(), Some("search"));
+        assert_eq!(live.awaiting_approval.len(), 1);
+        // Still cold: deltas did not create a body.
+        assert!(!app.sessions[&child.id].is_warm());
+
+        let finished = ToolCallSnapshot {
+            state: ToolCallState::Completed,
+            ..call
+        };
+        app.apply_client_update(event(SessionEvent::ToolCallFinished {
+            tool_call: finished,
+        }));
+        let live = &app.sessions[&child.id].live;
+        assert_eq!(live.active_tool, None);
+        assert!(live.awaiting_approval.is_empty());
+
+        // A long stream keeps the tail bounded.
+        app.apply_client_update(event(SessionEvent::TextAppended {
+            message_id: id(0x73, MessageId::from_bytes),
+            channel: TextChannel::Output,
+            text: "x".repeat(LIVE_TAIL_BYTES * 3),
+        }));
+        assert!(app.sessions[&child.id].live.tail.len() <= LIVE_TAIL_BYTES);
+    }
+
+    #[test]
+    fn agents_picker_lists_only_the_focused_roots_subtree() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let root = initial.sessions[0].id;
+        let mut child = summary_named(0x81, workspace_id, "child");
+        child.parent_id = Some(root);
+        let mut grandchild = summary_named(0x82, workspace_id, "grandchild");
+        grandchild.parent_id = Some(child.id);
+        let other_root = summary_named(0x83, workspace_id, "other root");
+        initial
+            .sessions
+            .extend([child.clone(), grandchild.clone(), other_root.clone()]);
+        app.apply_snapshot(initial);
+
+        // From deep in the tree, /agents scopes to the whole root's subtree.
+        app.focus_session(grandchild.id);
+        app.execute(Command::OpenAgents);
+        let mut listed = app.filtered_sessions();
+        listed.sort();
+        let mut expected = vec![root, child.id, grandchild.id];
+        expected.sort();
+        assert_eq!(listed, expected);
+        assert!(!app.filtered_sessions().contains(&other_root.id));
+
+        // /sessions lists everything.
+        app.execute(Command::OpenSessions);
+        assert_eq!(app.filtered_sessions().len(), 4);
+    }
+
+    /// A snapshot whose one session is mid-run, plus the envelope builder for
+    /// follow-up events on it.
+    fn running_app() -> (
+        App,
+        SessionId,
+        RunId,
+        impl FnMut(SessionEvent) -> ClientUpdate,
+    ) {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let session_id = initial.sessions[0].id;
+        let run_id = id(0x90, RunId::from_bytes);
+        for summary in initial
+            .sessions
+            .iter_mut()
+            .chain(initial.focused.iter_mut().map(|body| &mut body.summary))
+        {
+            summary.status = SessionStatus::Running;
+            summary.active_run_id = Some(run_id);
+        }
+        app.apply_snapshot(initial);
+        let mut sequence = 1;
+        let event = move |event: SessionEvent| {
+            sequence += 1;
+            ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id,
+                    sequence,
+                },
+                session_id,
+                run_id: Some(run_id),
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event,
+            })
+        };
+        (app, session_id, run_id, event)
+    }
+
+    #[test]
+    fn enter_during_a_run_queues_the_draft_and_it_submits_when_the_run_ends() {
+        let (mut app, session_id, run_id, mut event) = running_app();
+        app.composer.text = "follow up".to_owned();
+        let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(changed);
+        assert!(
+            requests.is_empty(),
+            "nothing is sent while the run is active"
+        );
+        assert!(app.composer.text.is_empty());
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["follow up"]
+        );
+
+        // Ctrl-Enter queues explicitly as well; drafts keep order.
+        app.composer.text = "second".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["follow up", "second"]
+        );
+
+        // Alt-Up brings the newest back for editing.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(app.composer.text, "second");
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["follow up"]
+        );
+        app.composer.clear();
+
+        // The run finishes idle: the oldest draft becomes the next run.
+        let mut summary = app.sessions[&session_id].summary.clone();
+        summary.status = SessionStatus::Idle;
+        summary.active_run_id = None;
+        app.apply_client_update(event(SessionEvent::RunFinished {
+            session: summary,
+            run_id,
+            outcome: RunOutcome::Completed,
+            usage: None,
+            context_tokens: None,
+        }));
+        let requests = app.take_requests();
+        assert!(matches!(
+            requests.as_slice(),
+            [ClientRequest::Command(CommandRequest {
+                command: SessionCommand::SubmitPrompt { prompt, .. },
+                ..
+            })] if prompt == "follow up"
+        ));
+        assert!(app.queued_drafts(session_id).next().is_none());
+    }
+
+    #[test]
+    fn esc_twice_cancels_the_active_run_but_once_only_arms() {
+        let (mut app, session_id, run_id, _) = running_app();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let (changed, requests) = app.handle_key(esc);
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert!(app.status.as_deref().unwrap().contains("Esc again"));
+
+        // Typing disarms.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let (_, requests) = app.handle_key(esc);
+        assert!(requests.is_empty(), "disarmed by intervening input");
+
+        let (_, requests) = app.handle_key(esc);
+        assert!(matches!(
+            requests.as_slice(),
+            [ClientRequest::Command(CommandRequest {
+                command: SessionCommand::CancelRun { run_id: cancelled },
+                ..
+            })] if *cancelled == run_id
+        ));
+        assert!(app.sessions[&session_id].summary.active_run_id.is_some());
+
+        // Too slow: the arm expires.
+        let (_, _) = app.handle_key(esc);
+        for _ in 0..=ESC_CANCEL_TICKS {
+            app.advance_animation();
+        }
+        let (_, requests) = app.handle_key(esc);
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn steer_falls_back_to_queueing_until_the_server_advertises_it() {
+        let (mut app, session_id, _, _) = running_app();
+        app.composer.text = "go left".to_owned();
+        let (_, requests) = app.execute(Command::SteerRun);
+        assert!(requests.is_empty());
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["go left"]
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("does not support steering")
+        );
     }
 }

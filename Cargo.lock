@@ -2762,6 +2762,7 @@ dependencies = [
  "qq-protocol",
  "qq-tui",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tree-sitter",
