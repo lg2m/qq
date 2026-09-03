@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     commands::Category,
-    input::{CommandRow, ModelRow, Overlay, ProfileRow, SessionRow, ThemeRow},
+    input::{ApprovalModeRow, CommandRow, ModelRow, Overlay, ProfileRow, SessionRow, ThemeRow},
     picker::{Picker, PickerItem},
 };
 
@@ -240,6 +240,43 @@ pub(super) fn profile_picker(app: &App, width: usize, height: usize) -> Vec<Line
                 line.push(format!("  pack {pack}"), accent());
             }
             if row.id == *current {
+                line.push("  active", accent());
+            }
+            out.push(finish_row(line, selected, width));
+        },
+    )
+}
+
+/// Approval-mode picker: every mode the server accepts with what it holds
+/// for approval. The mode in effect is marked.
+pub(super) fn approval_mode_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let Some(Overlay::ApprovalModes(picker)) = &app.overlay else {
+        return fit_height(Vec::new(), height);
+    };
+    let current = app.effective_approval_mode();
+    picker_frame(
+        picker,
+        PickerChrome {
+            title: "APPROVAL MODE",
+            hint: if app.focused().is_some() {
+                "type to search, Enter sets the session's mode, Esc closes"
+            } else {
+                "type to search, Enter sets the mode for new sessions, Esc closes"
+            },
+            placeholder: "all modes",
+            question: None,
+            empty: "  No matching modes.",
+        },
+        width,
+        height,
+        |row: &ApprovalModeRow, selected, out| {
+            let mut line = cursor_prefix(selected);
+            line.push(
+                format!("{:<11}", row.label),
+                if selected { normal().bold() } else { normal() },
+            );
+            line.push(row.summary, muted());
+            if row.mode == current {
                 line.push("  active", accent());
             }
             out.push(finish_row(line, selected, width));

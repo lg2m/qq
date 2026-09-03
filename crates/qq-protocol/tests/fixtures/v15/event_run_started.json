@@ -2,14 +2,14 @@
   "cursor": {
     "store_id": "01010101010101010101010101010101",
     "workspace_id": "02020202020202020202020202020202",
-    "sequence": 19
+    "sequence": 14
   },
   "session_id": "03030303030303030303030303030303",
   "run_id": "04040404040404040404040404040404",
   "caused_by": "07070707070707070707070707070707",
   "occurred_at_ms": 1700000000000,
   "event": {
-    "type": "run_finished",
+    "type": "run_started",
     "session": {
       "id": "03030303030303030303030303030303",
       "workspace_id": "02020202020202020202020202020202",
@@ -20,6 +20,7 @@
       "queued_prompts": 1,
       "model": "openai/gpt-5.6",
       "profile": "review",
+      "approval_mode": "read_only",
       "correlation": {
         "thread": "t-1"
       },
@@ -28,19 +29,11 @@
       "updated_at_ms": 1700000000000
     },
     "run_id": "04040404040404040404040404040404",
-    "outcome": {
-      "type": "failed",
-      "failure": {
-        "kind": "invalid_command",
-        "message": "workspace file \"src/auth.rs\" changed: expected content hash 11…, found 22…"
-      }
-    },
-    "usage": {
-      "input_tokens": 10,
-      "cache_read_input_tokens": 0,
-      "cache_write_input_tokens": 0,
-      "output_tokens": 4
-    },
-    "context_tokens": 10
+    "plan": {
+      "profile": "review",
+      "descriptor_version": 2,
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "credential_epoch": 3
+    }
   }
 }

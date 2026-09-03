@@ -21,6 +21,9 @@ pub(crate) enum Command {
     /// Choose an agent profile for the focused session, or the default for
     /// new sessions. Lists what the server advertises.
     OpenProfiles,
+    /// Choose the approval mode for the focused session, or the default for
+    /// new sessions. Lists what the server advertises.
+    OpenApprovalModes,
     OpenThemes,
     OpenSessions,
     OpenAgents,
@@ -130,7 +133,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 35] = [
+pub(crate) const COMMANDS: [CommandSpec; 36] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -270,6 +273,13 @@ pub(crate) const COMMANDS: [CommandSpec; 35] = [
         "choose an agent profile",
         Model,
         ["/profile"],
+        []
+    ),
+    spec!(
+        OpenApprovalModes,
+        "choose an approval mode",
+        Model,
+        ["/approval"],
         []
     ),
     spec!(OpenThemes, "choose a theme", View, ["/theme"], []),

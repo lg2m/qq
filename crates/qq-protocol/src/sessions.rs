@@ -843,6 +843,13 @@ pub struct SessionSummary {
     /// rows written before profiles existed.
     #[serde(default, skip_serializing_if = "AgentProfileId::is_default")]
     pub profile: AgentProfileId,
+    /// Approval policy the session's tool calls are held against. Changed by
+    /// `SetApprovalMode`, which publishes the updated summary. Defaults on
+    /// decode because persisted events written before version 15 lack it and
+    /// still replay; `auto` was the only value those sessions could have been
+    /// created with by the shipped clients.
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
     #[serde(default, skip_serializing_if = "Correlation::is_empty")]
     pub correlation: Correlation,
     /// Input-token total of the latest measured prompt turn for this
@@ -2066,6 +2073,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
                 profile: AgentProfileId::default(),
+                approval_mode: ApprovalMode::Auto,
                 correlation: Correlation::default(),
                 context_tokens: None,
                 accounting: None,
@@ -2122,6 +2130,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model-b".to_owned()),
                 profile: AgentProfileId::default(),
+                approval_mode: ApprovalMode::Auto,
                 correlation: Correlation::default(),
                 context_tokens: Some(12_500),
                 accounting: None,
@@ -2177,6 +2186,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
                 profile: AgentProfileId::default(),
+                approval_mode: ApprovalMode::Auto,
                 correlation: Correlation::default(),
                 context_tokens: None,
                 accounting: None,
@@ -2399,6 +2409,7 @@ mod tests {
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
                 profile: AgentProfileId::default(),
+                approval_mode: ApprovalMode::Auto,
                 correlation: Correlation::default(),
                 context_tokens: Some(16),
                 accounting: None,
@@ -2584,7 +2595,8 @@ mod tests {
         // `include_sessions`/`included` on snapshots. Version 13 replaced the
         // prompt string with input parts and added profiles, plan identity,
         // steering, correlation, and capabilities.
-        assert_eq!(crate::PROTOCOL_VERSION, 14);
+        // Version 15 added `approval_mode` on summaries.
+        assert_eq!(crate::PROTOCOL_VERSION, 15);
         let mut invalid = serde_json::to_value(&run).unwrap();
         invalid["resolved_model"]["future_control"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
@@ -2806,6 +2818,7 @@ mod tests {
                 queued_prompts: 0,
                 model: None,
                 profile: AgentProfileId::default(),
+                approval_mode: ApprovalMode::Auto,
                 correlation: Correlation::default(),
                 context_tokens: None,
                 accounting: None,

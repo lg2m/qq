@@ -27,7 +27,7 @@ CHILD_SESSION = "ae" * 16
 CHILD_RUN = "af" * 16
 
 QQ_VERSION = "0.1.0"
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 15
 MODEL = {"model": "anthropic/claude-sonnet-4-5", "max_output_tokens": 32000}
 PROMPT_IDENTITY = {
     "version": 7,
@@ -125,6 +125,7 @@ def session_summary(
         "status": status,
         "queued_prompts": 0,
         "model": model,
+        "approval_mode": "auto",
         "updated_at_ms": updated_at_ms,
     }
     if parent is not None:

@@ -3202,3 +3202,113 @@ fn a_refreshed_capability_document_updates_the_open_profile_picker() {
     // The cursor follows the highlighted profile, not its position.
     assert_eq!(picker.current().unwrap().id.as_str(), "reviewer");
 }
+
+#[test]
+fn approval_picker_sets_the_focused_session_mode_and_the_summary_update_lands() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    // Nothing until the capability document arrives.
+    app.composer.text = "/approval".to_owned();
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty() && app.overlay.is_none());
+
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_profiles()));
+    let focused = app.focused().unwrap();
+    app.open_approval_modes();
+    let Some(Overlay::ApprovalModes(picker)) = &app.overlay else {
+        panic!("expected the approval-mode picker")
+    };
+    let labels: Vec<&str> = picker.items().iter().map(|row| row.label).collect();
+    assert_eq!(labels, ["read_only", "ask", "auto", "full"]);
+    // The cursor starts on the session's current mode.
+    assert_eq!(picker.current().unwrap().mode, ApprovalMode::Auto);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    let [ClientRequest::Command(request)] = requests.as_slice() else {
+        panic!("expected one set-approval-mode command")
+    };
+    assert!(matches!(
+        &request.command,
+        SessionCommand::SetApprovalMode { session_id, mode: ApprovalMode::ReadOnly }
+            if *session_id == focused
+    ));
+    assert!(app.overlay.is_none());
+    assert_eq!(app.approval_mode, ApprovalMode::ReadOnly);
+
+    app.apply_client_update(ClientUpdate::CommandResult {
+        command_id: request.command_id,
+        result: Ok(qq_protocol::CommandReceipt {
+            command_id: request.command_id,
+            outcome: CommandOutcome::ApprovalModeSet {
+                session_id: focused,
+                mode: ApprovalMode::ReadOnly,
+            },
+            committed_through: fixtures::cursor(2),
+        }),
+    });
+    assert_eq!(
+        app.status.as_deref(),
+        Some("session approval mode set to read_only")
+    );
+
+    // The published summary is what the session state reads from.
+    let mut summary = fixtures::session_summary(focused);
+    summary.approval_mode = ApprovalMode::ReadOnly;
+    app.apply_client_update(ClientUpdate::Event(fixtures::envelope(
+        2,
+        focused,
+        SessionEvent::SessionUpdated { session: summary },
+    )));
+    assert_eq!(app.effective_approval_mode(), ApprovalMode::ReadOnly);
+
+    // Picking the mode already in effect sends nothing.
+    app.open_approval_modes();
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty());
+}
+
+#[test]
+fn approval_mode_chosen_without_a_focused_session_applies_to_the_next_create() {
+    let mut app = App::new(TuiOptions {
+        settings: Settings::default(),
+        model: ModelSelection {
+            model: Some("openai/gpt-test".to_owned()),
+            max_output_tokens: Some(4_096),
+            organization: None,
+        },
+        models: Vec::new(),
+        themes: Vec::new(),
+    });
+    let mut empty = snapshot();
+    empty.sessions.clear();
+    empty.focused = None;
+    app.apply_snapshot(empty);
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_profiles()));
+    app.open_approval_modes();
+    // The cursor starts on the default (`auto`); one down is `full`.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty());
+    assert_eq!(app.approval_mode, ApprovalMode::Full);
+
+    let (_, requests) = app.execute(Command::NewRootSession).split();
+    let [ClientRequest::Command(request)] = requests.as_slice() else {
+        panic!("expected one create-session command")
+    };
+    assert!(matches!(
+        &request.command,
+        SessionCommand::CreateSession {
+            approval_mode: ApprovalMode::Full,
+            ..
+        }
+    ));
+}

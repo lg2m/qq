@@ -60,6 +60,19 @@ pub(super) fn top_row(app: &App, width: usize) -> Line {
                 let profile = focused.map_or(&app.profile, |session| &session.profile);
                 (!profile.is_default()).then(|| (format!("as {}", profile.as_str()), accent()))
             }
+            // `auto` is the default; the badge names anything stricter or
+            // looser so the user always knows what a held call means.
+            StatusItem::ApprovalMode => {
+                let mode = focused.map_or(app.approval_mode, |session| session.approval_mode);
+                (mode != ApprovalMode::Auto).then(|| {
+                    let style = if mode == ApprovalMode::Full {
+                        warning()
+                    } else {
+                        muted()
+                    };
+                    (approval_mode_label(mode).to_owned(), style)
+                })
+            }
             StatusItem::Context => match app.focused_context_usage() {
                 Some((tokens, limit)) if limit > 0 => {
                     let percent = u128::from(tokens) * 100 / u128::from(limit);
@@ -262,6 +275,7 @@ fn hints_for(app: &App) -> Vec<(crate::commands::Command, &'static str)> {
         }
         Mode::Models
         | Mode::Profiles
+        | Mode::ApprovalModes
         | Mode::Themes
         | Mode::Sessions
         | Mode::Commands
@@ -587,17 +601,6 @@ pub(super) fn align_sides(mut left: Line, right: Line, width: usize) -> Line {
         left.push(span.text, span.style);
     }
     left
-}
-
-/// The wire spelling of an approval mode, which is also what `/approval`
-/// and the profile picker show.
-pub(super) const fn approval_mode_label(mode: ApprovalMode) -> &'static str {
-    match mode {
-        ApprovalMode::ReadOnly => "read_only",
-        ApprovalMode::Ask => "ask",
-        ApprovalMode::Auto => "auto",
-        ApprovalMode::Full => "full",
-    }
 }
 
 pub(super) fn format_cost(usd_nanos: u64) -> String {

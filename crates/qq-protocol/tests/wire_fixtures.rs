@@ -1,6 +1,6 @@
-//! Golden wire encodings for protocol version 14.
+//! Golden wire encodings for protocol version 15.
 //!
-//! Each fixture under `tests/fixtures/v14/` is the exact JSON a conforming
+//! Each fixture under `tests/fixtures/v15/` is the exact JSON a conforming
 //! peer sends or receives. The test decodes every fixture into its Rust type,
 //! re-encodes it, and requires byte equality with the file, so a field rename,
 //! reorder, or default change fails here before any client notices. Set
@@ -60,6 +60,7 @@ fn summary() -> SessionSummary {
         queued_prompts: 1,
         model: Some("openai/gpt-5.6".to_owned()),
         profile: AgentProfileId::new("review").unwrap(),
+        approval_mode: ApprovalMode::ReadOnly,
         correlation: correlation(&[("thread", "t-1")]),
         context_tokens: Some(1200),
         accounting: None,
@@ -136,7 +137,7 @@ where
     T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
 {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v14")
+        .join("tests/fixtures/v15")
         .join(format!("{name}.json"));
     let encoded = serde_json::to_string_pretty(value).unwrap() + "\n";
     if std::env::var_os("QQ_UPDATE_FIXTURES").is_some() {
@@ -157,8 +158,8 @@ where
 }
 
 #[test]
-fn version_14_commands_receipts_events_and_capabilities_match_their_goldens() {
-    assert_eq!(PROTOCOL_VERSION, 14);
+fn version_15_commands_receipts_events_and_capabilities_match_their_goldens() {
+    assert_eq!(PROTOCOL_VERSION, 15);
     let session_id = SessionId::from_bytes([3; 16]);
     let run_id = RunId::from_bytes([4; 16]);
     let command = |byte: u8, command: SessionCommand| CommandRequest {
@@ -580,7 +581,7 @@ fn version_14_commands_receipts_events_and_capabilities_match_their_goldens() {
 fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     let base = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/v14/command_submit_prompt.json"),
+            .join("tests/fixtures/v15/command_submit_prompt.json"),
     )
     .unwrap();
     let mut with_extra: serde_json::Value = serde_json::from_str(&base).unwrap();
@@ -600,7 +601,7 @@ fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     assert!(serde_json::from_value::<CommandRequest>(with_extra).is_err());
 
     let capabilities = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v14/capabilities.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v15/capabilities.json"),
     )
     .unwrap();
     let mut newer: serde_json::Value = serde_json::from_str(&capabilities).unwrap();
@@ -614,7 +615,7 @@ fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     // Events and snapshots stay strict: a server never sends what a client
     // cannot name, and both bump the version together.
     let started = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v14/event_run_started.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v15/event_run_started.json"),
     )
     .unwrap();
     let mut event: serde_json::Value = serde_json::from_str(&started).unwrap();

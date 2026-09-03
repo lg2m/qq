@@ -162,6 +162,8 @@ pub enum StatusItem {
     Model,
     /// The agent profile in effect, shown only when it is not `default`.
     Profile,
+    /// The approval mode in effect, shown only when it is not `auto`.
+    ApprovalMode,
     Context,
     Cost,
     Workspace,
@@ -169,8 +171,15 @@ pub enum StatusItem {
 }
 
 impl StatusItem {
-    /// The default status line: model, profile, context occupancy, cost.
-    pub const DEFAULT: [Self; 4] = [Self::Model, Self::Profile, Self::Context, Self::Cost];
+    /// The default status line: model, profile, approval mode, context
+    /// occupancy, cost.
+    pub const DEFAULT: [Self; 5] = [
+        Self::Model,
+        Self::Profile,
+        Self::ApprovalMode,
+        Self::Context,
+        Self::Cost,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

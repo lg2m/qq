@@ -1,12 +1,13 @@
-//! Overlay pickers: models, profiles, themes, sessions, and the command palette. One
+//! Overlay pickers: models, profiles, approval modes, themes, sessions, and
+//! the command palette. One
 //! key handler in `Overlay` moves the cursor and edits the query; this module
 //! owns opening each picker with its rows and interpreting `Accept`,
 //! `Cancel`, and picker-specific chords.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use qq_protocol::{
-    AgentProfileId, ModelDescriptor, ModelSelection, ServerCapabilities, SessionCommand, SessionId,
-    SessionStatus,
+    AgentProfileId, ApprovalMode, ModelDescriptor, ModelSelection, ServerCapabilities,
+    SessionCommand, SessionId, SessionStatus,
 };
 
 use super::{App, PendingIntent};
@@ -14,8 +15,8 @@ use crate::{
     commands::Command,
     effect::{Effects, Redraw},
     input::{
-        CommandRow, HistoryRow, ModelRow, Overlay, PickerOutcome, ProfileRow, SessionConfirm,
-        SessionRow, ThemeRow, command_rows,
+        ApprovalModeRow, CommandRow, HistoryRow, ModelRow, Overlay, PickerOutcome, ProfileRow,
+        SessionConfirm, SessionRow, ThemeRow, approval_mode_label, approval_mode_row, command_rows,
     },
     picker::Picker,
     theme::Theme,
@@ -64,6 +65,12 @@ impl App {
                     return Effects::none();
                 };
                 self.accept_profile(profile)
+            }
+            (PickerOutcome::Accept, Overlay::ApprovalModes(picker)) => {
+                let Some(mode) = picker.current().map(|row| row.mode) else {
+                    return Effects::none();
+                };
+                self.accept_approval_mode(mode)
             }
             (PickerOutcome::Accept, Overlay::Themes { .. }) => {
                 let name = self.theme().name.clone();
@@ -271,6 +278,78 @@ impl App {
             return;
         };
         picker.replace_items(profile_rows(capabilities), |row| row.id.clone());
+    }
+
+    // --- approval modes ---
+
+    pub(crate) fn open_approval_modes(&mut self) -> Effects {
+        let Some(capabilities) = self.capabilities.as_deref() else {
+            self.set_warning(
+                "approval modes are not available until the server's capabilities arrive"
+                    .to_owned(),
+            );
+            return Effects::redraw(Redraw::Immediate);
+        };
+        let rows: Vec<ApprovalModeRow> = capabilities
+            .approval_modes
+            .iter()
+            .copied()
+            .map(approval_mode_row)
+            .collect();
+        if rows.is_empty() {
+            self.set_warning("the server advertised no approval modes".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        }
+        let mut picker = Picker::with_items(rows);
+        let current = self.effective_approval_mode();
+        if let Some(index) = picker.items().iter().position(|row| row.mode == current) {
+            picker.select_item(index);
+        }
+        self.overlay = Some(Overlay::ApprovalModes(picker));
+        Effects::redraw(Redraw::Immediate)
+    }
+
+    /// The approval mode in effect: the focused session's, or the default
+    /// for the next session.
+    pub(crate) fn effective_approval_mode(&self) -> ApprovalMode {
+        self.focused()
+            .and_then(|session_id| self.sessions.get(&session_id))
+            .map_or(self.approval_mode, |session| session.summary.approval_mode)
+    }
+
+    /// Apply `mode` to the focused session (the runtime reads it at the next
+    /// held call, so a running session may change too), or record it as the
+    /// default for sessions created next when nothing is focused.
+    fn accept_approval_mode(&mut self, mode: ApprovalMode) -> Effects {
+        self.overlay = None;
+        let focused = self
+            .focused()
+            .and_then(|session_id| self.sessions.get(&session_id).map(|s| (session_id, s)));
+        match focused {
+            Some((_, session)) if session.summary.approval_mode == mode => {
+                self.approval_mode = mode;
+                self.set_info(format!(
+                    "session already uses approval mode {}",
+                    approval_mode_label(mode)
+                ));
+                Effects::redraw(Redraw::Immediate)
+            }
+            Some((session_id, _)) => {
+                self.approval_mode = mode;
+                self.send(
+                    PendingIntent::SetApprovalMode { session_id },
+                    SessionCommand::SetApprovalMode { session_id, mode },
+                )
+            }
+            None => {
+                self.approval_mode = mode;
+                self.set_info(format!(
+                    "new sessions will use approval mode {}",
+                    approval_mode_label(mode)
+                ));
+                Effects::redraw(Redraw::Immediate)
+            }
+        }
     }
 
     // --- themes ---

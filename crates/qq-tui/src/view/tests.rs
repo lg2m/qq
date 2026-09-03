@@ -2938,3 +2938,39 @@ fn top_row_names_a_non_default_profile_only() {
     let badged = frame_rows(&[top_row(&app, 80)])[0].clone();
     assert!(badged.contains("as reviewer"), "{badged}");
 }
+
+#[test]
+fn approval_mode_picker_and_badge_name_the_mode_in_effect() {
+    let mut app = app_with_messages(0);
+    app.connection = crate::ConnectionState::Live;
+    // `auto` is the default and shows no badge.
+    let plain = frame_rows(&[top_row(&app, 80)])[0].clone();
+    assert!(
+        !plain.contains("auto") && !plain.contains("read_only"),
+        "{plain}"
+    );
+
+    let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
+    session.summary.approval_mode = qq_protocol::ApprovalMode::ReadOnly;
+    let badged = frame_rows(&[top_row(&app, 80)])[0].clone();
+    assert!(badged.contains("read_only"), "{badged}");
+
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        fixtures::steering_capabilities(),
+    )));
+    app.open_approval_modes();
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
+    let rows = squashed_rows(&frame);
+    let text = rows.join("\n");
+    assert!(text.contains("APPROVAL MODE"), "{text}");
+    let read_only = rows
+        .iter()
+        .find(|row| row.contains("read_only") && row.contains("deny"))
+        .unwrap();
+    assert!(read_only.contains("active"), "{read_only}");
+    let full = rows
+        .iter()
+        .find(|row| row.contains("full") && row.contains("every tool"))
+        .unwrap();
+    assert!(full.contains("without asking"), "{full}");
+}

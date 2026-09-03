@@ -1608,15 +1608,25 @@ fn execute_command(
                     params![session_id.to_string(), approval_mode_str(mode), now],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
-            let sequence = workspace_sequence(&transaction, workspace_id)?;
+            // The mode is read when each approval is evaluated, so it applies
+            // to the next held call; the summary carries it to every client.
+            let summary = load_session_summary(&transaction, session_id)?;
+            let event = append_event(
+                &transaction,
+                EventContext {
+                    store_id,
+                    workspace_id,
+                    session_id,
+                    run_id: None,
+                    caused_by: Some(command_id),
+                    occurred_at_ms: now,
+                },
+                SessionEvent::SessionUpdated { session: summary },
+            )?;
             (
                 CommandReceipt {
                     command_id,
-                    committed_through: EventCursor {
-                        store_id,
-                        workspace_id,
-                        sequence,
-                    },
+                    committed_through: event.cursor,
                     outcome: CommandOutcome::ApprovalModeSet { session_id, mode },
                 },
                 false,
@@ -5564,7 +5574,8 @@ fn load_session_summary(
                      (SELECT outcome_json FROM runs
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
                       ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1),
-                     s.owner_run_id, s.spawned_by_tool_call_id, s.profile, s.correlation_json
+                     s.owner_run_id, s.spawned_by_tool_call_id, s.profile, s.correlation_json,
+                     s.approval_mode
               FROM sessions s WHERE s.id = ?1",
             [session_id.to_string()],
             |row| {
@@ -5583,6 +5594,7 @@ fn load_session_summary(
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
+                    row.get::<_, String>(14)?,
                 ))
             },
         )
@@ -5605,6 +5617,7 @@ fn load_session_summary(
                 spawned_by_call,
                 profile,
                 correlation,
+                approval_mode,
             )| {
                 let direct_cost = accounting.direct.estimated_cost_usd_nanos;
                 let active_run_id: Option<RunId> = active.as_deref().map(parse_id).transpose()?;
@@ -5631,6 +5644,7 @@ fn load_session_summary(
                     queued_prompts: queued,
                     model,
                     profile: parse_profile(profile.as_deref())?,
+                    approval_mode: parse_approval_mode(&approval_mode)?,
                     correlation: parse_correlation(correlation.as_deref())?,
                     context_tokens,
                     accounting: Some(accounting),
@@ -23799,6 +23813,17 @@ mod tests {
                 mode: ApprovalMode::Auto,
             }
         );
+        // The change is published as a summary update carrying the new mode,
+        // so every connected client renders it, and the receipt commits
+        // through that event.
+        let updated = harness.events.next().await.unwrap().unwrap();
+        assert_eq!(updated.cursor, receipt.committed_through);
+        assert!(matches!(
+            &updated.event,
+            SessionEvent::SessionUpdated { session }
+                if session.id == harness.session_id
+                    && session.approval_mode == ApprovalMode::Auto
+        ));
 
         harness
             .runtime

@@ -20,7 +20,7 @@ use crate::{
     commands::{self, Command, SlashEntry},
     composer::Composer,
     effect::{Effect, Effects, Redraw},
-    input::{Mode, Overlay},
+    input::{Mode, Overlay, approval_mode_label},
     picker::Picker,
     terminal,
     theme::Theme,
@@ -229,6 +229,9 @@ enum PendingIntent {
     SetProfile {
         session_id: SessionId,
     },
+    SetApprovalMode {
+        session_id: SessionId,
+    },
     Delete {
         session_id: SessionId,
     },
@@ -243,6 +246,9 @@ pub(crate) struct App {
     /// Profile new sessions are created with. `/profile` with nothing focused
     /// sets it; the server validates the name when the session is created.
     pub profile: AgentProfileId,
+    /// Approval mode new sessions are created with; `/approval` with nothing
+    /// focused sets it.
+    pub approval_mode: ApprovalMode,
     pub workspace_id: Option<WorkspaceId>,
     pub workspace_path: String,
     pub sessions: SessionStore,
@@ -326,6 +332,7 @@ impl App {
             settings: options.settings,
             model: options.model,
             profile: AgentProfileId::default(),
+            approval_mode: ApprovalMode::default(),
             models: options.models,
             workspace_id: None,
             workspace_path: String::new(),
@@ -511,6 +518,15 @@ impl App {
                                     format!(
                                         "session model set to {}",
                                         model.model.as_deref().unwrap_or("default")
+                                    ),
+                                );
+                            }
+                            CommandOutcome::ApprovalModeSet { session_id, mode } => {
+                                self.set_info_for(
+                                    Some(*session_id),
+                                    format!(
+                                        "session approval mode set to {}",
+                                        approval_mode_label(*mode)
                                     ),
                                 );
                             }
@@ -912,6 +928,7 @@ impl App {
             | Some(PendingIntent::Compact { session_id })
             | Some(PendingIntent::SetModel { session_id })
             | Some(PendingIntent::SetProfile { session_id })
+            | Some(PendingIntent::SetApprovalMode { session_id })
             | Some(PendingIntent::Delete { session_id }) => Some(*session_id),
             Some(PendingIntent::Approval { tool_call_id }) => self
                 .sessions
@@ -984,6 +1001,7 @@ impl App {
             Mode::Sessions
             | Mode::Models
             | Mode::Profiles
+            | Mode::ApprovalModes
             | Mode::Themes
             | Mode::Commands
             | Mode::History => self.handle_overlay_key(key),
@@ -1251,6 +1269,7 @@ impl App {
             Command::SearchHistory => self.open_history(),
             Command::OpenModels => self.open_models(),
             Command::OpenProfiles => self.open_profiles(),
+            Command::OpenApprovalModes => self.open_approval_modes(),
             Command::OpenThemes => self.open_themes(),
             Command::OpenSessions => self.open_sessions(),
             Command::OpenAgents => self.open_agents(),
@@ -1472,7 +1491,7 @@ impl App {
                 workspace_id,
                 parent_id,
                 model,
-                approval_mode: ApprovalMode::default(),
+                approval_mode: self.approval_mode,
                 profile: self.profile.clone(),
                 correlation: qq_protocol::Correlation::default(),
             },
@@ -2032,6 +2051,7 @@ impl App {
                 | PendingIntent::Approval { .. }
                 | PendingIntent::SetModel { .. }
                 | PendingIntent::SetProfile { .. }
+                | PendingIntent::SetApprovalMode { .. }
                 | PendingIntent::Delete { .. }
                 | PendingIntent::Prune => None,
             })

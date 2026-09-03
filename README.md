@@ -109,14 +109,15 @@ approval and event flow as built-ins, namespaced `mcp__<server>__<tool>`:
 
 ```ron
 mcp: {
-    "executor": Stdio(command: "./executor.sh", args: ["--serve"],
-                      env: ["EXECUTOR_API_KEY"], eager: true,
-                      allow: ["execute", "skills"]),
+    "executor": Stdio(command: "executor", args: ["mcp"], eager: true,
+                      allow: ["execute", "skills", "resume"]),
 }
 ```
 
-Stdio and streamable-HTTP transports are supported; declarations are
-trust-gated in workspace configuration.
+This local example uses Executor's official CLI. Stdio and streamable-HTTP
+transports are supported; declarations are trust-gated in workspace
+configuration, and authenticated HTTP endpoints use `Env(...)` or `Stored(...)`
+bearer references rather than literal secrets.
 
 ## TUI Configuration
 
@@ -199,7 +200,7 @@ newest held draft back for editing. `Esc Esc` cancels the run. Steering is
 offered only when the server advertises it; otherwise Enter holds the draft.
 
 The interactive composer recognizes `/help`, `/commands`, `/models`, `/profile`,
-`/theme`, `/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/mouse`,
+`/approval`, `/theme`, `/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/mouse`,
 `/attention`, `/changes`, `/editor`, `/compact`, and `/quit` (also `/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
 `/models`. `/compact`
 summarizes an idle session's history into a compact context so long
@@ -225,3 +226,10 @@ session must finish first) or, with nothing focused, makes it the default for
 sessions created next. The top row shows `as <profile>` whenever the profile in
 effect is not `default`. `qq run --profile <name>` selects a profile for a
 headless run and fails before the run starts if the name is unknown.
+
+`/approval` lists the approval modes the server accepts (`read_only`, `ask`,
+`auto`, `full`) with what each holds for approval. Enter applies the mode to the
+focused session — it takes effect at the next held tool call, so a running
+session may change too — or, with nothing focused, sets the mode new sessions
+are created with. The top row names the mode in effect whenever it is not
+`auto`.

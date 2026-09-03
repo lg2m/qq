@@ -113,7 +113,7 @@ in the same tier do not silently shadow each other. Names are 1--64 bytes,
 start with a lowercase ASCII letter, and otherwise contain lowercase ASCII
 letters, digits, `-`, or `_`. Client control names (every entry of
 `qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS`, such as `models`, `profile`,
-`sessions`, `new`, `compact`, and `quit`) are reserved
+`approval`, `sessions`, `new`, `compact`, and `quit`) are reserved
 and cannot name runtime guidance.
 
 Authority follows command provenance rather than session ancestry. The

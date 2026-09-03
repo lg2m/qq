@@ -22,7 +22,7 @@ tell you, one at a time, in the slowest possible order.
 | Prompt text or ordering of system prompt sections | `AGENT_PROMPT_VERSION` |
 | New column, table, or index | schema version (next integer) + migration |
 
-Current values: `PROTOCOL_VERSION = 14` (`crates/qq-protocol/src/lib.rs:53`),
+Current values: `PROTOCOL_VERSION = 15` (`crates/qq-protocol/src/lib.rs:53`),
 `CAPABILITIES_VERSION = 1` (`capabilities.rs:17`), `DESCRIPTOR_VERSION = 3`
 with domain `qq-agent-plan-descriptor-v3\0` (`crates/qq-core/src/plan/descriptor.rs:13-16`),
 `AGENT_PROMPT_VERSION = 9` (`crates/qq-core/src/runtime/prompt.rs:12`), schema

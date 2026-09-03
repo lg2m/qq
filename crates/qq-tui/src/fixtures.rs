@@ -62,6 +62,7 @@ pub fn session_summary(id: SessionId) -> SessionSummary {
         queued_prompts: 0,
         model: Some("openai/gpt-test".to_owned()),
         profile: qq_protocol::AgentProfileId::default(),
+        approval_mode: ApprovalMode::Auto,
         correlation: Correlation::default(),
         context_tokens: None,
         accounting: None,

@@ -66,6 +66,21 @@ impl PickerItem for ProfileRow {
     }
 }
 
+/// A row in the approval-mode picker: one mode the server accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApprovalModeRow {
+    pub mode: ApprovalMode,
+    pub label: &'static str,
+    pub summary: &'static str,
+}
+
+impl PickerItem for ApprovalModeRow {
+    fn search_text<'a>(&'a self, out: &mut Vec<&'a str>) {
+        out.push(self.label);
+        out.push(self.summary);
+    }
+}
+
 /// A row in the theme picker: an index into `App::themes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThemeRow {
@@ -122,6 +137,7 @@ impl PickerItem for CommandRow {
 pub(crate) enum Overlay {
     Models(Picker<ModelRow>),
     Profiles(Picker<ProfileRow>),
+    ApprovalModes(Picker<ApprovalModeRow>),
     /// Theme picker. Moving the cursor previews the highlighted theme live;
     /// `restore` is the theme to put back if the user cancels.
     Themes {
@@ -151,6 +167,7 @@ pub(crate) enum Overlay {
 pub(crate) enum Mode {
     Models,
     Profiles,
+    ApprovalModes,
     Themes,
     Sessions,
     Commands,
@@ -215,6 +232,7 @@ impl Overlay {
         match self {
             Self::Models(_) => Mode::Models,
             Self::Profiles(_) => Mode::Profiles,
+            Self::ApprovalModes(_) => Mode::ApprovalModes,
             Self::Themes { .. } => Mode::Themes,
             Self::Sessions { .. } => Mode::Sessions,
             Self::Commands { .. } => Mode::Commands,
@@ -257,6 +275,7 @@ impl Overlay {
         match self {
             Self::Models(picker) => dispatch(picker, key),
             Self::Profiles(picker) => dispatch(picker, key),
+            Self::ApprovalModes(picker) => dispatch(picker, key),
             Self::Themes { picker, .. } => dispatch(picker, key),
             Self::Sessions { picker, .. } => dispatch(picker, key),
             Self::Commands { picker, .. } => dispatch(picker, key),
@@ -269,6 +288,7 @@ impl Overlay {
         match self {
             Self::Models(picker) => picker.push_query(text),
             Self::Profiles(picker) => picker.push_query(text),
+            Self::ApprovalModes(picker) => picker.push_query(text),
             Self::Themes { picker, .. } => picker.push_query(text),
             Self::Sessions { picker, .. } => picker.push_query(text),
             Self::Commands { picker, .. } => picker.push_query(text),
@@ -284,4 +304,37 @@ pub(crate) fn command_rows() -> Vec<CommandRow> {
         .filter(|spec| spec.command != Command::OpenCommands && spec.command != Command::OpenHelp)
         .map(|spec| CommandRow { spec })
         .collect()
+}
+
+/// The wire spelling of an approval mode, which is also what `/approval`,
+/// the profile picker, and the status row show.
+pub(crate) const fn approval_mode_label(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::ReadOnly => "read_only",
+        ApprovalMode::Ask => "ask",
+        ApprovalMode::Auto => "auto",
+        ApprovalMode::Full => "full",
+    }
+}
+
+/// Every approval mode with the one-line meaning the picker shows. Order is
+/// least to most permissive.
+pub(crate) const fn approval_mode_row(mode: ApprovalMode) -> ApprovalModeRow {
+    let (label, summary) = match mode {
+        ApprovalMode::ReadOnly => (
+            "read_only",
+            "deny edits, shell, and external tools without asking",
+        ),
+        ApprovalMode::Ask => ("ask", "ask before edits, shell, and external tools"),
+        ApprovalMode::Auto => (
+            "auto",
+            "edits and safe shell run; dangerous shell is held for approval",
+        ),
+        ApprovalMode::Full => ("full", "every tool call runs without asking"),
+    };
+    ApprovalModeRow {
+        mode,
+        label,
+        summary,
+    }
 }

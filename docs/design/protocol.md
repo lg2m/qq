@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -100,8 +100,13 @@ attached source with its typed outcome and content hash); `RunFailureKind`
 gained `context_source`; `RunPlanIdentity.descriptor_version` is 3 because the
 descriptor now carries the catalog, skill index, and pack sections; the
 capability document gained `tools`, `events`, and the per-workspace
-`workspace_tools` section; and `AgentProfileSummary` gained `pack`. Golden
-fixtures moved to `crates/qq-protocol/tests/fixtures/v14/`.
+`workspace_tools` section; and `AgentProfileSummary` gained `pack`. Version 15
+added `SessionSummary.approval_mode` so every client renders the policy a
+session holds tool calls against, and `set_approval_mode` now publishes
+`session_updated` with the new summary. The field defaults to `auto` on decode
+so events persisted by earlier builds still replay; a version-14 client rejects
+the field on every summary-bearing snapshot and event. Golden fixtures
+moved to `crates/qq-protocol/tests/fixtures/v15/`.
 
 Clients and servers must agree on this value.
 
@@ -274,7 +279,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 14,
+  "protocol_version": 15,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -294,12 +299,12 @@ optional-bodied:
 ```
 
 Response `ServerCapabilities` (abridged; see
-`crates/qq-protocol/tests/fixtures/v14/capabilities.json` for the full golden):
+`crates/qq-protocol/tests/fixtures/v15/capabilities.json` for the full golden):
 
 ```json
 {
   "version": 1,
-  "protocol_version": 14,
+  "protocol_version": 15,
   "server_version": "0.1.0",
   "input_parts": ["text", "workspace_file"],
   "commands": ["resolve_workspace", "create_session", "submit_prompt", "steer_run", "..."],
@@ -746,8 +751,13 @@ Modes:
 | Mode | Behavior |
 | --- | --- |
 | `read_only` | Deny mutating, shell, and MCP tools without prompting |
-| `ask` | Default. Prompt for mutating/shell/MCP unless granted |
-| `auto` | Auto-allow workspace edits/writes; still ask for shell/MCP unless granted |
+| `ask` | Prompt for mutating/shell/MCP unless granted |
+| `auto` | Default. Edits and safe shell run without prompting; only dangerous shell (deletion, privilege escalation, force-push, piped installers) is held |
+| `full` | Every tool call executes without prompting |
+
+The mode is read when each approval is evaluated, so it applies to the next
+held call even during an active run. The command commits and publishes a
+`session_updated` event whose summary carries the new `approval_mode`.
 
 Outcome:
 
@@ -1616,7 +1626,7 @@ server's version and report the skew. Events, snapshots, and every inbound
 type stay strict.
 
 Golden encodings for every command, receipt, event, and the capability
-document live under `crates/qq-protocol/tests/fixtures/v14/` and are checked
+document live under `crates/qq-protocol/tests/fixtures/v15/` and are checked
 byte-for-byte by `crates/qq-protocol/tests/wire_fixtures.rs`. A wire change
 fails that test first; regenerate the goldens with `QQ_UPDATE_FIXTURES=1`
 after bumping `PROTOCOL_VERSION`.
