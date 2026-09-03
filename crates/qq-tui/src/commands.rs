@@ -18,6 +18,9 @@ pub(crate) enum Command {
     OpenHelp,
     OpenCommands,
     OpenModels,
+    /// Choose an agent profile for the focused session, or the default for
+    /// new sessions. Lists what the server advertises.
+    OpenProfiles,
     OpenThemes,
     OpenSessions,
     OpenAgents,
@@ -127,7 +130,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 34] = [
+pub(crate) const COMMANDS: [CommandSpec; 35] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -262,6 +265,13 @@ pub(crate) const COMMANDS: [CommandSpec; 34] = [
         ["Alt-Up"]
     ),
     spec!(OpenModels, "choose a model", Model, ["/models"], []),
+    spec!(
+        OpenProfiles,
+        "choose an agent profile",
+        Model,
+        ["/profile"],
+        []
+    ),
     spec!(OpenThemes, "choose a theme", View, ["/theme"], []),
     spec!(
         ToggleToolDetail,

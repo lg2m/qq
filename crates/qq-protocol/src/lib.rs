@@ -55,10 +55,11 @@ pub const PROTOCOL_VERSION: u16 = 14;
 /// Slash commands owned by interactive clients rather than the shared
 /// runtime. Keeping this vocabulary in the transport-neutral protocol avoids
 /// a client/runtime drift where one side forwards a name the other reserves.
-pub const RESERVED_CLIENT_SLASH_COMMANDS: [&str; 16] = [
+pub const RESERVED_CLIENT_SLASH_COMMANDS: [&str; 17] = [
     "/help",
     "/commands",
     "/models",
+    "/profile",
     "/sessions",
     "/resume",
     "/agents",

@@ -111,9 +111,10 @@ are ambiguous and no match is unknown; both fail before provider work. Native
 sources intentionally shadow compatibility sources, while a command and skill
 in the same tier do not silently shadow each other. Names are 1--64 bytes,
 start with a lowercase ASCII letter, and otherwise contain lowercase ASCII
-letters, digits, `-`, or `_`. TUI control names (`models`, `sessions`,
-`resume`, `new`, `compact`, `quit`, and `exit`) are reserved and cannot name
-runtime guidance.
+letters, digits, `-`, or `_`. Client control names (every entry of
+`qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS`, such as `models`, `profile`,
+`sessions`, `new`, `compact`, and `quit`) are reserved
+and cannot name runtime guidance.
 
 Authority follows command provenance rather than session ancestry. The
 model-authored task that creates a child session cannot select guidance, while

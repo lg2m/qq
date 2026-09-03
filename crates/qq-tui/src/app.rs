@@ -5,11 +5,11 @@ use std::{
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
-    ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandRequest, EditPreview, ModelDescriptor, ModelSelection, ServerCapabilities,
-    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
-    SnapshotRequest, SteeringCapabilities, ToolCallSnapshot, ToolCallState, WorkspaceId,
-    WorkspaceSnapshot,
+    AgentProfileId, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId,
+    CommandOutcome, CommandRequest, EditPreview, ModelDescriptor, ModelSelection,
+    ServerCapabilities, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
+    SessionSnapshot, SessionStatus, SnapshotRequest, SteeringCapabilities, ToolCallSnapshot,
+    ToolCallState, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -226,6 +226,9 @@ enum PendingIntent {
     SetModel {
         session_id: SessionId,
     },
+    SetProfile {
+        session_id: SessionId,
+    },
     Delete {
         session_id: SessionId,
     },
@@ -237,6 +240,9 @@ pub(crate) struct App {
     pub settings: Settings,
     pub model: ModelSelection,
     pub models: Vec<ModelOption>,
+    /// Profile new sessions are created with. `/profile` with nothing focused
+    /// sets it; the server validates the name when the session is created.
+    pub profile: AgentProfileId,
     pub workspace_id: Option<WorkspaceId>,
     pub workspace_path: String,
     pub sessions: SessionStore,
@@ -319,6 +325,7 @@ impl App {
         Self {
             settings: options.settings,
             model: options.model,
+            profile: AgentProfileId::default(),
             models: options.models,
             workspace_id: None,
             workspace_path: String::new(),
@@ -428,7 +435,8 @@ impl App {
             }
             ClientUpdate::Capabilities(capabilities) => {
                 self.capabilities = Some(capabilities);
-                Effects::none()
+                self.refresh_profile_picker();
+                Effects::redraw(Redraw::Scheduled)
             }
             ClientUpdate::Event(event) => self.apply_live_event(event),
             ClientUpdate::CommandResult { command_id, result } => {
@@ -504,6 +512,15 @@ impl App {
                                         "session model set to {}",
                                         model.model.as_deref().unwrap_or("default")
                                     ),
+                                );
+                            }
+                            CommandOutcome::SessionProfileSet {
+                                session_id,
+                                profile,
+                            } => {
+                                self.set_info_for(
+                                    Some(*session_id),
+                                    format!("session profile set to {}", profile.as_str()),
                                 );
                             }
                             CommandOutcome::SessionDeleted { .. } => {
@@ -894,6 +911,7 @@ impl App {
             | Some(PendingIntent::Steer { session_id, .. })
             | Some(PendingIntent::Compact { session_id })
             | Some(PendingIntent::SetModel { session_id })
+            | Some(PendingIntent::SetProfile { session_id })
             | Some(PendingIntent::Delete { session_id }) => Some(*session_id),
             Some(PendingIntent::Approval { tool_call_id }) => self
                 .sessions
@@ -963,9 +981,12 @@ impl App {
             return self.execute(Command::Quit);
         }
         match self.mode() {
-            Mode::Sessions | Mode::Models | Mode::Themes | Mode::Commands | Mode::History => {
-                self.handle_overlay_key(key)
-            }
+            Mode::Sessions
+            | Mode::Models
+            | Mode::Profiles
+            | Mode::Themes
+            | Mode::Commands
+            | Mode::History => self.handle_overlay_key(key),
             Mode::Approval => self.handle_approval_key(key),
             Mode::Compose => self.handle_compose_key(key),
         }
@@ -1229,6 +1250,7 @@ impl App {
             Command::OpenCommands => self.open_commands(false),
             Command::SearchHistory => self.open_history(),
             Command::OpenModels => self.open_models(),
+            Command::OpenProfiles => self.open_profiles(),
             Command::OpenThemes => self.open_themes(),
             Command::OpenSessions => self.open_sessions(),
             Command::OpenAgents => self.open_agents(),
@@ -1451,7 +1473,7 @@ impl App {
                 parent_id,
                 model,
                 approval_mode: ApprovalMode::default(),
-                profile: qq_protocol::AgentProfileId::default(),
+                profile: self.profile.clone(),
                 correlation: qq_protocol::Correlation::default(),
             },
         )
@@ -2009,6 +2031,7 @@ impl App {
                 | PendingIntent::Compact { .. }
                 | PendingIntent::Approval { .. }
                 | PendingIntent::SetModel { .. }
+                | PendingIntent::SetProfile { .. }
                 | PendingIntent::Delete { .. }
                 | PendingIntent::Prune => None,
             })

@@ -197,6 +197,24 @@ async fn prepare_headless(
         )));
     }
 
+    // An unknown profile fails here, before a session exists, and names
+    // what would have worked.
+    let profile = match args.profile {
+        None => qq_protocol::AgentProfileId::default(),
+        Some(name) => {
+            if snapshot.profile(&name).is_none() {
+                let mut known: Vec<&str> = snapshot.profiles().keys().map(String::as_str).collect();
+                known.insert(0, "default");
+                return Err(invalid(format!(
+                    "unknown agent profile {name:?}; this workspace declares: {}",
+                    known.join(", ")
+                )));
+            }
+            qq_protocol::AgentProfileId::new(&name)
+                .map_err(|error| invalid(format!("invalid agent profile {name:?}: {error}")))?
+        }
+    };
+
     let model = qq_protocol::ModelSelection {
         model: Some(snapshot.model().as_str().to_owned()),
         max_output_tokens: Some(snapshot.max_output_tokens()),
@@ -213,6 +231,7 @@ async fn prepare_headless(
         prompt: args.prompt,
         workspace,
         model,
+        profile,
         context_window: model_metadata.and_then(qq_config::ModelMetadata::context_window),
         pricing_provenance: model_metadata
             .and_then(qq_config::ModelMetadata::pricing)

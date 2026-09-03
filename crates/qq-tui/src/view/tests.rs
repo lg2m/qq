@@ -2882,3 +2882,59 @@ fn the_composer_rule_carries_run_telemetry_notices_and_hints_in_priority_order()
     assert!(!rule.contains("F1 help"), "{rule}");
     assert!(rule.contains("────"), "{rule}");
 }
+
+#[test]
+fn profile_picker_lists_mode_pack_and_the_active_profile() {
+    let mut app = app_with_messages(0);
+    let mut capabilities = fixtures::steering_capabilities();
+    capabilities.profiles = Some(vec![
+        qq_protocol::AgentProfileSummary {
+            id: qq_protocol::AgentProfileId::default(),
+            model: Some("openai/gpt-test".to_owned()),
+            approval_mode: qq_protocol::ApprovalMode::Auto,
+            pack: None,
+        },
+        qq_protocol::AgentProfileSummary {
+            id: qq_protocol::AgentProfileId::new("reviewer").unwrap(),
+            model: None,
+            approval_mode: qq_protocol::ApprovalMode::ReadOnly,
+            pack: Some(qq_protocol::PackSummary {
+                id: "review-kit".to_owned(),
+                version: "1.0.0".to_owned(),
+            }),
+        },
+    ]);
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        capabilities,
+    )));
+    app.open_profiles();
+
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
+    let rows = squashed_rows(&frame);
+    let text = rows.join("\n");
+    assert!(text.contains("PROFILES"), "{text}");
+    assert!(text.contains("Enter sets the session profile"), "{text}");
+    let default_row = rows.iter().find(|row| row.contains("default")).unwrap();
+    assert!(
+        default_row.contains("auto") && default_row.contains("active"),
+        "{default_row}"
+    );
+    let reviewer_row = rows.iter().find(|row| row.contains("reviewer")).unwrap();
+    assert!(
+        reviewer_row.contains("read_only") && reviewer_row.contains("pack review-kit@1.0.0"),
+        "{reviewer_row}"
+    );
+}
+
+#[test]
+fn top_row_names_a_non_default_profile_only() {
+    let mut app = app_with_messages(0);
+    app.connection = crate::ConnectionState::Live;
+    let plain = frame_rows(&[top_row(&app, 80)])[0].clone();
+    assert!(!plain.contains("as "), "{plain}");
+
+    let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
+    session.summary.profile = qq_protocol::AgentProfileId::new("reviewer").unwrap();
+    let badged = frame_rows(&[top_row(&app, 80)])[0].clone();
+    assert!(badged.contains("as reviewer"), "{badged}");
+}

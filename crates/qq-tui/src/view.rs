@@ -20,8 +20,8 @@ use crossterm::{
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use qq_protocol::{
-    MessageId, MessageRole, MessageSnapshot, MessageState, RunId, SessionId, SessionStatus,
-    ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
+    ApprovalMode, MessageId, MessageRole, MessageSnapshot, MessageState, RunId, SessionId,
+    SessionStatus, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -209,6 +209,7 @@ impl FrameRenderer {
             // one costs no relayout or highlight storm. Memory stays bounded
             // by the per-pane byte budget, not by pruning here.
             Mode::Models => model_picker(app, body_width, body_height),
+            Mode::Profiles => profile_picker(app, body_width, body_height),
             Mode::Themes => theme_picker(app, body_width, body_height),
             Mode::Sessions => session_picker(app, body_width, body_height),
             Mode::Commands => command_picker(app, body_width, body_height),

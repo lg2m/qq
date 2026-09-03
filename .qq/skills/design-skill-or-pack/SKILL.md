@@ -31,8 +31,11 @@ on its own under `.qq/` or a pack.
 ## Writing a skill
 
 The file is `<name>/SKILL.md`. The name is 1–64 bytes, starts with a
-lowercase letter, then lowercase letters, digits, `-`, `_`. Reserved names:
-`models`, `sessions`, `resume`, `new`, `compact`, `quit`, `exit`.
+lowercase letter, then lowercase letters, digits, `-`, `_`. Reserved names are
+every entry of `qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS` (`help`, `commands`,
+`models`, `profile`, `sessions`, `resume`, `agents`,
+`theme`, `editor`, `new`, `compact`, `prune`, `mouse`, `attention`, `changes`,
+`quit`, `exit`).
 
 Start with YAML front matter carrying exactly one interpreted key:
 

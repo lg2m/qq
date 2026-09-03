@@ -1,18 +1,21 @@
-//! Overlay pickers: models, themes, sessions, and the command palette. One
+//! Overlay pickers: models, profiles, themes, sessions, and the command palette. One
 //! key handler in `Overlay` moves the cursor and edits the query; this module
 //! owns opening each picker with its rows and interpreting `Accept`,
 //! `Cancel`, and picker-specific chords.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use qq_protocol::{ModelDescriptor, ModelSelection, SessionId};
+use qq_protocol::{
+    AgentProfileId, ModelDescriptor, ModelSelection, ServerCapabilities, SessionCommand, SessionId,
+    SessionStatus,
+};
 
 use super::{App, PendingIntent};
 use crate::{
     commands::Command,
     effect::{Effects, Redraw},
     input::{
-        CommandRow, HistoryRow, ModelRow, Overlay, PickerOutcome, SessionConfirm, SessionRow,
-        ThemeRow, command_rows,
+        CommandRow, HistoryRow, ModelRow, Overlay, PickerOutcome, ProfileRow, SessionConfirm,
+        SessionRow, ThemeRow, command_rows,
     },
     picker::Picker,
     theme::Theme,
@@ -55,6 +58,12 @@ impl App {
                     return Effects::none();
                 };
                 self.accept_model(model, false)
+            }
+            (PickerOutcome::Accept, Overlay::Profiles(picker)) => {
+                let Some(profile) = picker.current().map(|row| row.id.clone()) else {
+                    return Effects::none();
+                };
+                self.accept_profile(profile)
             }
             (PickerOutcome::Accept, Overlay::Themes { .. }) => {
                 let name = self.theme().name.clone();
@@ -177,6 +186,91 @@ impl App {
         if let Some(Overlay::Models(picker)) = &mut self.overlay {
             picker.replace_items(rows, |row| (row.provider.clone(), row.model.clone()));
         }
+    }
+
+    // --- profiles ---
+
+    pub(crate) fn open_profiles(&mut self) -> Effects {
+        let Some(capabilities) = self.capabilities.as_deref() else {
+            self.set_warning(
+                "profiles are not available until the server's capabilities arrive".to_owned(),
+            );
+            return Effects::redraw(Redraw::Immediate);
+        };
+        // The server always lists `default`; an absent list means it answered
+        // without a workspace, which this client never asks for.
+        let rows = profile_rows(capabilities);
+        if rows.is_empty() {
+            self.set_warning("the server advertised no profiles for this workspace".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        }
+        let mut picker = Picker::with_items(rows);
+        // Start on the profile in effect: the focused session's, or the
+        // default for the next session.
+        let current = self
+            .focused()
+            .and_then(|session_id| self.sessions.get(&session_id))
+            .map_or(&self.profile, |session| &session.summary.profile);
+        if let Some(index) = picker.items().iter().position(|row| row.id == *current) {
+            picker.select_item(index);
+        }
+        self.overlay = Some(Overlay::Profiles(picker));
+        Effects::redraw(Redraw::Immediate)
+    }
+
+    /// Apply `profile` to the focused idle session, or record it as the
+    /// default for sessions created next when nothing is focused.
+    fn accept_profile(&mut self, profile: AgentProfileId) -> Effects {
+        let focused = self
+            .focused()
+            .and_then(|session_id| self.sessions.get(&session_id).map(|s| (session_id, s)));
+        match focused {
+            Some((_, session)) if session.summary.status == SessionStatus::Running => {
+                // The runtime refuses a profile change mid-run; say so here
+                // rather than round-tripping a command that will fail.
+                self.set_warning(
+                    "wait for the run to finish before changing the profile".to_owned(),
+                );
+                Effects::redraw(Redraw::Immediate)
+            }
+            Some((_, session)) if session.summary.profile == profile => {
+                self.overlay = None;
+                self.set_info(format!("session already uses profile {}", profile.as_str()));
+                self.profile = profile;
+                Effects::redraw(Redraw::Immediate)
+            }
+            Some((session_id, _)) => {
+                self.overlay = None;
+                self.profile = profile.clone();
+                self.send(
+                    PendingIntent::SetProfile { session_id },
+                    SessionCommand::SetSessionProfile {
+                        session_id,
+                        profile,
+                    },
+                )
+            }
+            None => {
+                self.overlay = None;
+                self.set_info(format!(
+                    "new sessions will use profile {}",
+                    profile.as_str()
+                ));
+                self.profile = profile;
+                Effects::redraw(Redraw::Immediate)
+            }
+        }
+    }
+
+    /// A refreshed capability document keeps an open profile picker current.
+    pub(super) fn refresh_profile_picker(&mut self) {
+        let Some(Overlay::Profiles(picker)) = &mut self.overlay else {
+            return;
+        };
+        let Some(capabilities) = self.capabilities.as_deref() else {
+            return;
+        };
+        picker.replace_items(profile_rows(capabilities), |row| row.id.clone());
     }
 
     // --- themes ---
@@ -496,4 +590,24 @@ impl App {
     pub(crate) fn open_model_picker_for_test(&mut self) {
         self.overlay = Some(Overlay::models(self.model_rows()));
     }
+}
+
+/// Rows for every advertised profile; `default` first, the rest in server
+/// order (sorted by name).
+fn profile_rows(capabilities: &ServerCapabilities) -> Vec<ProfileRow> {
+    capabilities
+        .profiles
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|profile| ProfileRow {
+            id: profile.id.clone(),
+            model: profile.model.clone(),
+            approval_mode: profile.approval_mode,
+            pack: profile
+                .pack
+                .as_ref()
+                .map(|pack| format!("{}@{}", pack.id, pack.version)),
+        })
+        .collect()
 }

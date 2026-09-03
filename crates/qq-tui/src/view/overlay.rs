@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     commands::Category,
-    input::{CommandRow, ModelRow, Overlay, SessionRow, ThemeRow},
+    input::{CommandRow, ModelRow, Overlay, ProfileRow, SessionRow, ThemeRow},
     picker::{Picker, PickerItem},
 };
 
@@ -191,6 +191,56 @@ pub(super) fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> 
             );
             if row.name.as_deref() != Some(row.model.as_str()) {
                 line.push(format!("  {}", row.model), muted());
+            }
+            out.push(finish_row(line, selected, width));
+        },
+    )
+}
+
+/// Profile picker: every profile the server advertises for this workspace
+/// with its approval mode, model override, and declaring pack. The row in
+/// effect (the focused session's, or the default for new sessions) is marked.
+pub(super) fn profile_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let Some(Overlay::Profiles(picker)) = &app.overlay else {
+        return fit_height(Vec::new(), height);
+    };
+    let focused = app
+        .focused()
+        .and_then(|session_id| app.sessions.get(&session_id));
+    let current = focused.map_or(&app.profile, |session| &session.summary.profile);
+    picker_frame(
+        picker,
+        PickerChrome {
+            title: "PROFILES",
+            hint: if focused.is_some() {
+                "type to search, Enter sets the session profile, Esc closes"
+            } else {
+                "type to search, Enter sets the profile for new sessions, Esc closes"
+            },
+            placeholder: "all profiles",
+            question: None,
+            empty: "  No matching profiles.",
+        },
+        width,
+        height,
+        |row: &ProfileRow, selected, out| {
+            let mut line = cursor_prefix(selected);
+            line.push(
+                format!("{:<16}", row.id.as_str()),
+                if selected { normal().bold() } else { normal() },
+            );
+            line.push(
+                format!("{:<10}", approval_mode_label(row.approval_mode)),
+                muted(),
+            );
+            if let Some(model) = &row.model {
+                line.push(format!("  {model}"), muted());
+            }
+            if let Some(pack) = &row.pack {
+                line.push(format!("  pack {pack}"), accent());
+            }
+            if row.id == *current {
+                line.push("  active", accent());
             }
             out.push(finish_row(line, selected, width));
         },

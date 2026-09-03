@@ -3025,3 +3025,180 @@ fn workspace_views_toggle_and_esc_returns_to_the_session_they_replaced() {
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(app.focused(), Some(other));
 }
+
+fn capabilities_with_profiles() -> std::sync::Arc<qq_protocol::ServerCapabilities> {
+    let mut capabilities = fixtures::steering_capabilities();
+    capabilities.profiles = Some(vec![
+        qq_protocol::AgentProfileSummary {
+            id: qq_protocol::AgentProfileId::default(),
+            model: Some("openai/gpt-test".to_owned()),
+            approval_mode: ApprovalMode::Auto,
+            pack: None,
+        },
+        qq_protocol::AgentProfileSummary {
+            id: qq_protocol::AgentProfileId::new("reviewer").unwrap(),
+            model: None,
+            approval_mode: ApprovalMode::ReadOnly,
+            pack: Some(qq_protocol::PackSummary {
+                id: "review-kit".to_owned(),
+                version: "1.0.0".to_owned(),
+            }),
+        },
+    ]);
+    std::sync::Arc::new(capabilities)
+}
+
+#[test]
+fn profile_picker_waits_for_capabilities_and_lists_advertised_profiles() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    app.composer.text = "/profile".to_owned();
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty());
+    assert!(app.overlay.is_none());
+    assert!(
+        app.status
+            .as_deref()
+            .unwrap()
+            .contains("capabilities arrive")
+    );
+
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_profiles()));
+    app.open_profiles();
+    let Some(Overlay::Profiles(picker)) = &app.overlay else {
+        panic!("expected the profile picker")
+    };
+    let names: Vec<&str> = picker.items().iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(names, ["default", "reviewer"]);
+    assert_eq!(picker.items()[1].pack.as_deref(), Some("review-kit@1.0.0"));
+    // The cursor starts on the profile in effect: the focused session's.
+    assert_eq!(picker.cursor(), 0);
+}
+
+#[test]
+fn profile_picker_sets_the_focused_idle_session_profile_and_refuses_running_ones() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_profiles()));
+    let focused = app.focused().unwrap();
+    app.open_profiles();
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    let [ClientRequest::Command(request)] = requests.as_slice() else {
+        panic!("expected one set-session-profile command")
+    };
+    assert!(matches!(
+        &request.command,
+        SessionCommand::SetSessionProfile { session_id, profile }
+            if *session_id == focused && profile.as_str() == "reviewer"
+    ));
+    assert!(app.overlay.is_none());
+    // The choice also becomes the default for sessions created next.
+    assert_eq!(app.profile.as_str(), "reviewer");
+
+    // The receipt names the profile; the summary update carries it.
+    app.apply_client_update(ClientUpdate::CommandResult {
+        command_id: request.command_id,
+        result: Ok(qq_protocol::CommandReceipt {
+            command_id: request.command_id,
+            outcome: CommandOutcome::SessionProfileSet {
+                session_id: focused,
+                profile: qq_protocol::AgentProfileId::new("reviewer").unwrap(),
+            },
+            committed_through: fixtures::cursor(2),
+        }),
+    });
+    assert_eq!(
+        app.status.as_deref(),
+        Some("session profile set to reviewer")
+    );
+
+    // A running session cannot change profile; nothing is sent.
+    let (mut running, _, _, _) = running_app();
+    running.apply_client_update(ClientUpdate::Capabilities(capabilities_with_profiles()));
+    running.open_profiles();
+    running.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let (_, requests) = running
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty());
+    assert!(
+        running
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("wait for the run to finish")
+    );
+}
+
+#[test]
+fn profile_chosen_without_a_focused_session_applies_to_the_next_create() {
+    let selection = ModelSelection {
+        model: Some("openai/gpt-test".to_owned()),
+        max_output_tokens: Some(4_096),
+        organization: None,
+    };
+    let mut app = App::new(TuiOptions {
+        settings: Settings::default(),
+        model: selection.clone(),
+        models: Vec::new(),
+        themes: Vec::new(),
+    });
+    let mut empty = snapshot();
+    empty.sessions.clear();
+    empty.focused = None;
+    app.apply_snapshot(empty);
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_profiles()));
+    app.open_profiles();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty());
+    assert_eq!(app.profile.as_str(), "reviewer");
+    assert_eq!(
+        app.status.as_deref(),
+        Some("new sessions will use profile reviewer")
+    );
+
+    let (_, requests) = app.execute(Command::NewRootSession).split();
+    let [ClientRequest::Command(request)] = requests.as_slice() else {
+        panic!("expected one create-session command")
+    };
+    assert!(matches!(
+        &request.command,
+        SessionCommand::CreateSession { profile, .. } if profile.as_str() == "reviewer"
+    ));
+}
+
+#[test]
+fn a_refreshed_capability_document_updates_the_open_profile_picker() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_profiles()));
+    app.open_profiles();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+    let mut refreshed = (*capabilities_with_profiles()).clone();
+    refreshed
+        .profiles
+        .as_mut()
+        .unwrap()
+        .push(qq_protocol::AgentProfileSummary {
+            id: qq_protocol::AgentProfileId::new("perf").unwrap(),
+            model: None,
+            approval_mode: ApprovalMode::Ask,
+            pack: None,
+        });
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(refreshed)));
+    let Some(Overlay::Profiles(picker)) = &app.overlay else {
+        panic!("picker stays open across a refresh")
+    };
+    assert_eq!(picker.items().len(), 3);
+    // The cursor follows the highlighted profile, not its position.
+    assert_eq!(picker.current().unwrap().id.as_str(), "reviewer");
+}

@@ -88,6 +88,11 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = RunApproval::ReadOnly)]
     pub approval: RunApproval,
 
+    /// Agent profile to run as: a name under `profiles` in the configuration
+    /// or one declared by a trusted agent pack. Defaults to `default`.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
     /// Cancel the run after N seconds and exit with the timeout status.
     #[arg(long, value_name = "N")]
     pub timeout_seconds: Option<u64>,

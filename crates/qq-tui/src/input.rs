@@ -9,7 +9,7 @@
 //! overlay-specific chords come back as a [`PickerOutcome`] for `App`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use qq_protocol::SessionId;
+use qq_protocol::{AgentProfileId, ApprovalMode, SessionId};
 
 use crate::{
     commands::{Command, CommandSpec},
@@ -39,6 +39,29 @@ impl PickerItem for ModelRow {
         out.push(&self.model);
         if let Some(name) = &self.name {
             out.push(name);
+        }
+    }
+}
+
+/// A row in the profile picker: one profile the server advertises, copied
+/// from the capability document so the picker survives a refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileRow {
+    pub id: AgentProfileId,
+    pub model: Option<String>,
+    pub approval_mode: ApprovalMode,
+    /// `id@version` of the declaring pack, when there is one.
+    pub pack: Option<String>,
+}
+
+impl PickerItem for ProfileRow {
+    fn search_text<'a>(&'a self, out: &mut Vec<&'a str>) {
+        out.push(self.id.as_str());
+        if let Some(model) = &self.model {
+            out.push(model);
+        }
+        if let Some(pack) = &self.pack {
+            out.push(pack);
         }
     }
 }
@@ -98,6 +121,7 @@ impl PickerItem for CommandRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Overlay {
     Models(Picker<ModelRow>),
+    Profiles(Picker<ProfileRow>),
     /// Theme picker. Moving the cursor previews the highlighted theme live;
     /// `restore` is the theme to put back if the user cancels.
     Themes {
@@ -126,6 +150,7 @@ pub(crate) enum Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Models,
+    Profiles,
     Themes,
     Sessions,
     Commands,
@@ -189,6 +214,7 @@ impl Overlay {
     pub(crate) fn mode(&self) -> Mode {
         match self {
             Self::Models(_) => Mode::Models,
+            Self::Profiles(_) => Mode::Profiles,
             Self::Themes { .. } => Mode::Themes,
             Self::Sessions { .. } => Mode::Sessions,
             Self::Commands { .. } => Mode::Commands,
@@ -230,6 +256,7 @@ impl Overlay {
         }
         match self {
             Self::Models(picker) => dispatch(picker, key),
+            Self::Profiles(picker) => dispatch(picker, key),
             Self::Themes { picker, .. } => dispatch(picker, key),
             Self::Sessions { picker, .. } => dispatch(picker, key),
             Self::Commands { picker, .. } => dispatch(picker, key),
@@ -241,6 +268,7 @@ impl Overlay {
     pub(crate) fn push_query(&mut self, text: &str) -> bool {
         match self {
             Self::Models(picker) => picker.push_query(text),
+            Self::Profiles(picker) => picker.push_query(text),
             Self::Themes { picker, .. } => picker.push_query(text),
             Self::Sessions { picker, .. } => picker.push_query(text),
             Self::Commands { picker, .. } => picker.push_query(text),

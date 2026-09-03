@@ -54,6 +54,12 @@ pub(super) fn top_row(app: &App, width: usize) -> Line {
                 .and_then(|session| session.model.as_deref())
                 .or(app.model.model.as_deref())
                 .map(|model| (model.to_owned(), accent())),
+            // The default profile is the unremarkable case; the badge appears
+            // only when a session (or the next one) runs as something else.
+            StatusItem::Profile => {
+                let profile = focused.map_or(&app.profile, |session| &session.profile);
+                (!profile.is_default()).then(|| (format!("as {}", profile.as_str()), accent()))
+            }
             StatusItem::Context => match app.focused_context_usage() {
                 Some((tokens, limit)) if limit > 0 => {
                     let percent = u128::from(tokens) * 100 / u128::from(limit);
@@ -254,7 +260,12 @@ fn hints_for(app: &App) -> Vec<(crate::commands::Command, &'static str)> {
         Mode::Approval => {
             hints.push((Command::OpenHelp, "help"));
         }
-        Mode::Models | Mode::Themes | Mode::Sessions | Mode::Commands | Mode::History => {}
+        Mode::Models
+        | Mode::Profiles
+        | Mode::Themes
+        | Mode::Sessions
+        | Mode::Commands
+        | Mode::History => {}
     }
     hints
 }
@@ -576,6 +587,17 @@ pub(super) fn align_sides(mut left: Line, right: Line, width: usize) -> Line {
         left.push(span.text, span.style);
     }
     left
+}
+
+/// The wire spelling of an approval mode, which is also what `/approval`
+/// and the profile picker show.
+pub(super) const fn approval_mode_label(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::ReadOnly => "read_only",
+        ApprovalMode::Ask => "ask",
+        ApprovalMode::Auto => "auto",
+        ApprovalMode::Full => "full",
+    }
 }
 
 pub(super) fn format_cost(usd_nanos: u64) -> String {

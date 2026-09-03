@@ -46,6 +46,9 @@ pub struct HeadlessOptions {
     /// Workspace directory; resolved to its canonical form by the store.
     pub workspace: PathBuf,
     pub model: ModelSelection,
+    /// Agent profile the session runs as; validated against the workspace
+    /// configuration before the run starts.
+    pub profile: qq_protocol::AgentProfileId,
     /// Resolved model context limit when configured; unknown stays absent.
     pub context_window: Option<u32>,
     /// Source of the pricing table used for durable accounting.
@@ -151,6 +154,7 @@ enum TrialRecord<'a> {
         protocol_version: u16,
         workspace_identity: &'a str,
         model: &'a ModelSelection,
+        profile: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,6 +372,7 @@ pub async fn run(
         protocol_version: qq_protocol::PROTOCOL_VERSION,
         workspace_identity: &workspace_identity,
         model: &options.model,
+        profile: options.profile.as_str(),
         context_window: options.context_window,
         pricing_provenance: options.pricing_provenance.as_deref(),
         approval: options.approval.as_str(),
@@ -472,7 +477,7 @@ async fn submit(
             parent_id: None,
             model: options.model.clone(),
             approval_mode: options.approval.approval_mode(),
-            profile: qq_protocol::AgentProfileId::default(),
+            profile: options.profile.clone(),
             correlation: qq_protocol::Correlation::default(),
         },
     )
@@ -1444,6 +1449,7 @@ mod tests {
                 max_output_tokens: Some(256),
                 organization: None,
             },
+            profile: qq_protocol::AgentProfileId::default(),
             context_window: Some(128_000),
             pricing_provenance: Some("test fixture".to_owned()),
             approval: HeadlessApproval::ReadOnly,
@@ -1566,6 +1572,46 @@ mod tests {
         }
     }
 
+    /// The selected profile reaches the runtime loader with the run (which
+    /// is what compiles the pack persona and tool policy) and is recorded
+    /// in the trial metadata so a benchmark knows which profile ran it.
+    #[tokio::test]
+    async fn the_selected_profile_reaches_the_loader_and_the_trial_record() {
+        struct RecordingLoader {
+            profiles: Arc<Mutex<Vec<String>>>,
+        }
+        impl RuntimeLoader for RecordingLoader {
+            fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                self.profiles
+                    .lock()
+                    .unwrap()
+                    .push(request.profile.as_str().to_owned());
+                Box::pin(async move {
+                    Runtime::new(TextProvider, "test-model", 256)
+                        .map(|runtime| loaded_runtime(runtime, &request.workspace, None))
+                        .map_err(|error| RuntimeLoadError {
+                            kind: qq_protocol::RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+        let profiles = Arc::new(Mutex::new(Vec::new()));
+        let fixture = fixture_with_loader(Arc::new(RecordingLoader {
+            profiles: Arc::clone(&profiles),
+        }))
+        .await;
+        let mut options = options(&fixture.workspace);
+        options.profile = qq_protocol::AgentProfileId::new("reviewer").unwrap();
+
+        let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
+
+        assert_eq!(status, HeadlessStatus::Completed);
+        assert_eq!(*profiles.lock().unwrap(), ["reviewer"]);
+        let records = parse_records(&stdout);
+        assert_eq!(records[0]["profile"], "reviewer");
+    }
+
     #[tokio::test]
     async fn auto_mode_executes_write_and_shell_calls_through_the_session_runtime() {
         let fixture = fixture(MutatingProvider::new).await;
@@ -1641,6 +1687,7 @@ mod tests {
         let records = parse_records(&stdout);
         assert_eq!(records[0]["type"], "trial", "metadata must lead the trial");
         assert_eq!(records[0]["model"]["model"], "test/model");
+        assert_eq!(records[0]["profile"], "default");
         assert_eq!(records[0]["approval"], "read-only");
         assert!(records[0].get("workspace").is_none());
         assert_eq!(records[0]["workspace_identity"].as_str().unwrap().len(), 64);

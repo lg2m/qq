@@ -198,8 +198,8 @@ until the run finishes and sends it as the next prompt; `Alt-Up` pulls the
 newest held draft back for editing. `Esc Esc` cancels the run. Steering is
 offered only when the server advertises it; otherwise Enter holds the draft.
 
-The interactive composer recognizes `/help`, `/commands`, `/models`, `/theme`,
-`/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/mouse`,
+The interactive composer recognizes `/help`, `/commands`, `/models`, `/profile`,
+`/theme`, `/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/mouse`,
 `/attention`, `/changes`, `/editor`, `/compact`, and `/quit` (also `/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
 `/models`. `/compact`
 summarizes an idle session's history into a compact context so long
@@ -216,3 +216,12 @@ before selecting one with Enter. In the session picker, Ctrl-D deletes the
 highlighted session (with confirmation; a session with an active run must be
 cancelled first). `/prune` asks before deleting every empty session in the
 workspace.
+
+`/profile` lists the agent profiles the server advertises for the workspace:
+those under `profiles` in `.qq/config.ron` and those declared by trusted agent
+packs under `.qq/packs/`, each with its approval mode, model override, and
+declaring pack. Enter applies the profile to the focused idle session (a running
+session must finish first) or, with nothing focused, makes it the default for
+sessions created next. The top row shows `as <profile>` whenever the profile in
+effect is not `default`. `qq run --profile <name>` selects a profile for a
+headless run and fails before the run starts if the name is unknown.

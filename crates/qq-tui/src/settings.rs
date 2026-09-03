@@ -160,6 +160,8 @@ fn parse_key_code(value: &str) -> Result<KeyCode, SettingsError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusItem {
     Model,
+    /// The agent profile in effect, shown only when it is not `default`.
+    Profile,
     Context,
     Cost,
     Workspace,
@@ -167,8 +169,8 @@ pub enum StatusItem {
 }
 
 impl StatusItem {
-    /// The default status line: model, context occupancy, cost.
-    pub const DEFAULT: [Self; 3] = [Self::Model, Self::Context, Self::Cost];
+    /// The default status line: model, profile, context occupancy, cost.
+    pub const DEFAULT: [Self; 4] = [Self::Model, Self::Profile, Self::Context, Self::Cost];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
