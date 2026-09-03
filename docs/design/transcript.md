@@ -109,9 +109,12 @@ Fenced code is a visually distinct panel instead of tinted prose:
 - Inline code keeps the tinted-text treatment; only fenced blocks get
   panels.
 
-Ratatui note: background tint means setting `Style::bg` on every span of
-the block's lines and padding each line to full width so the tint reads
-as a panel, not ragged highlights.
+Rendering note: the TUI paints with its own `Style`/`Span`/`Line` primitives
+and a whole-row diff (`crates/qq-tui/src/render.rs`), not Ratatui. Background
+tint means setting the surface background on every span of the block's lines
+and padding each line to full width so the tint reads as a panel, not ragged
+highlights. The surface color, like every other color in the transcript, is a
+role from the active theme (`docs/design/theme.md`).
 
 ## Diffs
 

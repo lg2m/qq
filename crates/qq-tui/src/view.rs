@@ -32,6 +32,7 @@ use crate::{
     render::{
         Line, Style, accent, brand, diff_line_style, failure, muted, normal, warning, write_line,
     },
+    theme,
 };
 use highlight::HighlightKey;
 pub(crate) use highlight::{Highlighted, Highlighter};
@@ -84,6 +85,10 @@ pub(crate) struct FrameRenderer {
     /// Off-tick syntax highlighting for cached completed messages.
     pub(crate) highlighter: Highlighter,
     panes: HashMap<PaneId, TranscriptCache>,
+    /// `App::theme_generation` the caches were built under. Cached rows
+    /// bake in colors, so a theme change discards every layout and forces
+    /// a full repaint.
+    theme_generation: u64,
 }
 
 /// Retained rendering for one pane's transcript: completed messages cached
@@ -514,6 +519,12 @@ impl FrameRenderer {
     }
 
     fn frame(&mut self, app: &mut App, width: usize, height: usize) -> Vec<Line> {
+        theme::activate(app.theme().palette);
+        if self.theme_generation != app.theme_generation {
+            self.theme_generation = app.theme_generation;
+            self.panes.clear();
+            self.invalidate();
+        }
         if width < 32 || height < 9 {
             return fit_height(
                 vec![
@@ -552,12 +563,13 @@ impl FrameRenderer {
         let body_width = width.saturating_sub(sidebar_width);
         let mode = app.mode();
         let mut body = match mode {
-            Mode::Models | Mode::Sessions | Mode::Approval => {
+            Mode::Models | Mode::Themes | Mode::Sessions | Mode::Approval => {
                 for cache in self.panes.values_mut() {
                     cache.prune_all();
                 }
                 match mode {
                     Mode::Models => model_picker(app, body_width, body_height),
+                    Mode::Themes => theme_picker(app, body_width, body_height),
                     Mode::Sessions => session_picker(app, body_width, body_height),
                     Mode::Approval | Mode::Compose => approval_prompt(app, body_width, body_height),
                 }
@@ -2135,6 +2147,64 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     fit_height(lines, height)
 }
 
+/// Theme picker. Each row shows the theme name and a swatch of its roles,
+/// painted in that theme's own colors so the list doubles as a preview
+/// strip; the whole frame is already drawn in the highlighted theme.
+fn theme_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let picker = match &app.overlay {
+        Some(overlay) => overlay.picker(),
+        None => return fit_height(Vec::new(), height),
+    };
+    let filtered = app.filtered_themes();
+    let mut lines = vec![section(
+        "THEMES",
+        "Up/Down preview live, Enter keeps, Esc restores the previous theme",
+    )];
+    lines.push(search_line(&picker.query, "all themes"));
+    lines.push(Line::default());
+    if filtered.is_empty() {
+        lines.push(Line::styled("  No matching themes.", muted().italic()));
+        return fit_height(lines, height);
+    }
+    let mut results = Vec::new();
+    let mut selected_row = 0;
+    let selected_position = picker.selected(filtered.len());
+    for (position, index) in filtered.iter().enumerate() {
+        let theme = &app.themes[*index];
+        let selected = position == selected_position;
+        if selected {
+            selected_row = results.len();
+        }
+        let mut line = Line::styled(if selected { "  > " } else { "    " }, muted());
+        line.push(
+            format!("{:<18}", theme.name),
+            if selected { normal().bold() } else { normal() },
+        );
+        let palette = theme.palette;
+        for color in [
+            palette.text,
+            palette.muted,
+            palette.accent,
+            palette.brand,
+            palette.warning,
+            palette.error,
+            palette.success,
+        ] {
+            line.push("██", Style::color(color).on(palette.surface));
+        }
+        if *index == app.theme {
+            line.push("  active", accent());
+        }
+        results.push(truncate_line(line, width));
+    }
+    lines.extend(selection_viewport(
+        results,
+        height.saturating_sub(lines.len()),
+        selected_row,
+    ));
+    fit_height(lines, height)
+}
+
 fn approval_prompt(app: &App, width: usize, height: usize) -> Vec<Line> {
     let tool_call = app.pending_approval().expect("an approval is pending");
     let mut lines = vec![section(
@@ -2768,7 +2838,8 @@ mod tests {
     use crate::{
         ClientUpdate, ModelOption, TuiOptions,
         commands::Command,
-        render::{SURFACE_COLOR, code_keyword, success, surface},
+        render::{code_keyword, success, surface, surface_color},
+        theme::Palette,
         view::markdown::{code_panel_row, tests::style_of},
     };
 
@@ -3824,7 +3895,7 @@ mod tests {
         assert!(
             row.spans
                 .iter()
-                .all(|span| span.style.background == Some(SURFACE_COLOR))
+                .all(|span| span.style.background == Some(surface_color()))
         );
         let mut rendered = Vec::new();
 
@@ -5035,5 +5106,53 @@ mod tests {
         assert!(!text.contains("row 1"));
         assert!(!text.contains('│'));
         assert_eq!(app.panes.len(), 2, "the tree is untouched");
+    }
+
+    #[test]
+    fn switching_theme_repaints_every_row_in_the_new_palette() {
+        let mut app = app_with_messages(2);
+        app.themes.push(crate::Theme::from_roles(
+            "magenta",
+            [crate::ThemeColor::Rgb(0xff, 0x00, 0xff); 8],
+        ));
+        let mut renderer = FrameRenderer::default();
+        renderer.draw(&mut app, (80, 24)).unwrap();
+        let brand_before = renderer.previous[0].spans[0].style.color;
+        assert_eq!(brand_before, Some(Palette::QQ.brand));
+        // A settled frame with nothing changed writes nothing.
+        let idle = renderer.draw(&mut app, (80, 24)).unwrap();
+        let idle_rows = String::from_utf8_lossy(&idle).matches("\x1b[2K").count();
+        assert_eq!(idle_rows, 0);
+
+        app.execute(Command::OpenThemes);
+        app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.theme().name, "magenta");
+        let repaint = renderer.draw(&mut app, (80, 24)).unwrap();
+        let repainted_rows = String::from_utf8_lossy(&repaint).matches("\x1b[2K").count();
+        assert_eq!(repainted_rows, 24, "every row is rewritten");
+        let magenta = crossterm::style::Color::Rgb {
+            r: 0xff,
+            g: 0,
+            b: 0xff,
+        };
+        assert_eq!(renderer.previous[0].spans[0].style.color, Some(magenta));
+        // Only the picker's swatches (painted in each theme's own colors)
+        // may show anything but the new palette.
+        assert!(
+            renderer
+                .previous
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.text != "██")
+                .filter_map(|span| span.style.color)
+                .all(|color| color == magenta),
+            "no row keeps a color from the previous theme"
+        );
+        // Style helpers on this thread keep the last activated palette;
+        // restore the default so later tests see the compiled look.
+        theme::activate(Palette::QQ);
     }
 }

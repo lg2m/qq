@@ -320,11 +320,13 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     let factory = runtime::RuntimeFactory::system()?;
     let request = overrides.load_request()?;
     let config_factory = factory.clone();
-    let (snapshot, tui, models) = tokio::task::spawn_blocking(move || {
+    let (snapshot, tui, themes, models) = tokio::task::spawn_blocking(move || {
         let snapshot = config_factory.load(&request)?;
-        let (_, tui) = load_tui_config(&config::ConfigLoader::system()?, request.cwd())?;
+        let loader = config::ConfigLoader::system()?;
+        let (tui_snapshot, tui) = load_tui_config(&loader, request.cwd())?;
+        let themes = load_tui_themes(&loader, request.cwd(), tui_snapshot.settings().theme())?;
         let models = config_factory.configured_model_options(&snapshot);
-        Ok::<_, runtime::RuntimeBuildError>((snapshot, tui, models))
+        Ok::<_, runtime::RuntimeBuildError>((snapshot, tui, themes, models))
     })
     .await??;
     let models = models
@@ -366,6 +368,7 @@ async fn interactive(overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
             settings: tui,
             model: model.unwrap_or_default(),
             models,
+            themes,
         },
     )
     .await;
@@ -431,19 +434,28 @@ fn config_command(
         cli::ConfigCommand::Check => {
             let request = overrides.load_request()?;
             loader.load(&request)?;
-            load_tui_config(&loader, request.cwd())?;
+            let (tui, _) = load_tui_config(&loader, request.cwd())?;
+            loader.load_theme(request.cwd(), tui.settings().theme())?;
             println!("configuration is valid");
         }
         cli::ConfigCommand::Show => {
             let request = overrides.load_request()?;
             let snapshot = loader.load(&request)?;
             print_snapshot(&snapshot);
-            let (_, settings) = load_tui_config(&loader, request.cwd())?;
-            print_tui_snapshot(&settings);
+            let (tui, settings) = load_tui_config(&loader, request.cwd())?;
+            print_tui_snapshot(&settings, tui.settings().theme());
         }
         cli::ConfigCommand::Explain { field } => {
             let request = overrides.load_request()?;
-            let source = if field == "tui.layout" {
+            let source = if field == "tui.theme" {
+                Some(
+                    load_tui_config(&loader, request.cwd())?
+                        .0
+                        .provenance()
+                        .theme()
+                        .clone(),
+                )
+            } else if field == "tui.layout" {
                 Some(
                     load_tui_config(&loader, request.cwd())?
                         .0
@@ -592,9 +604,56 @@ fn load_tui_config(
     Ok((snapshot, settings))
 }
 
-fn print_tui_snapshot(settings: &qq_tui::Settings) {
+/// The selected theme first, then every other discoverable theme so the
+/// in-TUI picker can preview them. Selecting an unknown or invalid theme
+/// is a configuration error; a broken *unselected* theme file is skipped.
+fn load_tui_themes(
+    loader: &config::ConfigLoader,
+    cwd: &Path,
+    selected: &str,
+) -> Result<Vec<qq_tui::Theme>, config::ConfigError> {
+    let active = loader.load_theme(cwd, selected)?;
+    let mut themes = vec![tui_theme(&active)];
+    for document in loader.discover_themes(cwd)? {
+        if document.name() != active.name() {
+            themes.push(tui_theme(&document));
+        }
+    }
+    Ok(themes)
+}
+
+fn tui_theme(document: &config::ThemeDocument) -> qq_tui::Theme {
+    let color = |color: config::ThemeColor| match color {
+        config::ThemeColor::Rgb(config::Rgb { r, g, b }) => qq_tui::ThemeColor::Rgb(r, g, b),
+        config::ThemeColor::Ansi(ansi) => match ansi {
+            config::AnsiColor::White => qq_tui::ThemeColor::White,
+            config::AnsiColor::DarkGrey => qq_tui::ThemeColor::DarkGrey,
+            config::AnsiColor::Cyan => qq_tui::ThemeColor::Cyan,
+            config::AnsiColor::Yellow => qq_tui::ThemeColor::Yellow,
+            config::AnsiColor::Red => qq_tui::ThemeColor::Red,
+            config::AnsiColor::Green => qq_tui::ThemeColor::Green,
+        },
+    };
+    let colors = document.colors();
+    qq_tui::Theme::from_roles(
+        document.name(),
+        [
+            color(colors.text),
+            color(colors.muted),
+            color(colors.accent),
+            color(colors.brand),
+            color(colors.warning),
+            color(colors.error),
+            color(colors.success),
+            color(colors.surface),
+        ],
+    )
+}
+
+fn print_tui_snapshot(settings: &qq_tui::Settings, theme: &str) {
     println!("tui:");
     println!("  layout: {:?}", settings.initial_layout());
+    println!("  theme: {theme}");
     println!("  bindings:");
     for (action, bindings) in settings.bindings() {
         let labels: Vec<_> = bindings.iter().map(ToString::to_string).collect();

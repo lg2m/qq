@@ -19,12 +19,17 @@ mod models;
 mod promote;
 mod providers;
 mod remote;
+mod theme;
 mod tui;
 
 pub use loader::canonical_working_directory;
 pub use qq_provider::{SecretLiteral, SecretRef, XAI_CREDENTIAL_ENDPOINT};
+pub use theme::{
+    AnsiColor, DEFAULT_THEME, Rgb, ThemeColor, ThemeColors, ThemeDocument, compiled_theme,
+};
 pub use tui::{
-    TuiAction, TuiConfigDefaults, TuiConfigSettings, TuiConfigSnapshot, TuiLayout, TuiSourceReport,
+    TuiAction, TuiConfigDefaults, TuiConfigKey, TuiConfigSettings, TuiConfigSnapshot, TuiLayout,
+    TuiSourceReport,
 };
 
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
@@ -314,6 +319,17 @@ impl ConfigLoader {
         ValidationError: fmt::Display,
     {
         tui::load(self, cwd, defaults, &validate_binding)
+    }
+
+    /// Resolve one TUI theme by name from the compiled set, the global
+    /// `themes/` directory, and project `.qq/themes/` directories.
+    pub fn load_theme(&self, cwd: &Path, name: &str) -> Result<ThemeDocument, ConfigError> {
+        theme::load(self, cwd, name)
+    }
+
+    /// Every theme selectable from `cwd`, compiled first then by name.
+    pub fn discover_themes(&self, cwd: &Path) -> Result<Vec<ThemeDocument>, ConfigError> {
+        theme::discover(self, cwd)
     }
 
     /// Resolves the durable session database owned by the configured user data directory.
@@ -1540,6 +1556,10 @@ pub enum ConfigError {
     PolicyViolation { rule: &'static str, message: String },
     #[error("TUI settings are invalid: {message}")]
     InvalidTuiSettings { message: String },
+    #[error(
+        "unknown TUI theme `{name}`; expected the compiled `qq` theme or a `themes/{name}.ron` file"
+    )]
+    UnknownTheme { name: String },
     #[error(
         "the current binary must integrate ConfigSnapshot and resolve its SecretRef externally"
     )]

@@ -11,6 +11,7 @@ use crate::settings::Action;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Command {
     OpenModels,
+    OpenThemes,
     OpenSessions,
     OpenAgents,
     ToggleSessions,
@@ -82,7 +83,7 @@ pub(crate) struct CommandSpec {
 }
 
 /// Presentation order is invocation frequency, not alphabetical.
-pub(crate) const COMMANDS: [CommandSpec; 37] = [
+pub(crate) const COMMANDS: [CommandSpec; 38] = [
     CommandSpec {
         command: Command::OpenModels,
         title: "choose a model",
@@ -102,6 +103,13 @@ pub(crate) const COMMANDS: [CommandSpec; 37] = [
         title: "open the focused session's agent tree",
         category: Category::Session,
         slash: &["/agents"],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::OpenThemes,
+        title: "choose a theme",
+        category: Category::View,
+        slash: &["/theme"],
         action: None,
     },
     CommandSpec {

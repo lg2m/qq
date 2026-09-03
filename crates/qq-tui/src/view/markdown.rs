@@ -810,7 +810,7 @@ pub(crate) fn ensure_line(lines: &mut Vec<Line>) {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::render::{SURFACE_COLOR, failure, success};
+    use crate::render::{failure, success, surface_color};
     use unicode_width::UnicodeWidthChar;
 
     fn frame_rows(frame: &[Line]) -> Vec<String> {
@@ -977,7 +977,7 @@ pub(super) mod tests {
             lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .all(|span| span.style.background == Some(SURFACE_COLOR))
+                .all(|span| span.style.background == Some(surface_color()))
         );
         assert_eq!(lines[0].spans[0].style, surface(accent().dim()));
         assert_eq!(lines[0].spans[1].style, surface(muted()));
@@ -1101,7 +1101,7 @@ pub(super) mod tests {
             lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .all(|span| span.style.background == Some(SURFACE_COLOR))
+                .all(|span| span.style.background == Some(surface_color()))
         );
         assert_eq!(
             frame_rows(&lines),

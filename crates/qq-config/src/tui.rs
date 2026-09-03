@@ -44,6 +44,7 @@ pub enum TuiLayout {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfigSettings {
     initial_layout: TuiLayout,
+    theme: String,
     bindings: Vec<(TuiAction, Vec<String>)>,
 }
 
@@ -56,6 +57,12 @@ impl TuiConfigSettings {
     #[must_use]
     pub fn bindings(&self) -> &[(TuiAction, Vec<String>)] {
         &self.bindings
+    }
+
+    /// The selected theme name; `qq` when no layer set one.
+    #[must_use]
+    pub fn theme(&self) -> &str {
+        &self.theme
     }
 }
 
@@ -78,6 +85,7 @@ impl TuiConfigDefaults {
         }
         Ok(Self(TuiConfigSettings {
             initial_layout,
+            theme: super::theme::DEFAULT_THEME.to_owned(),
             bindings: bindings.into_iter().collect(),
         }))
     }
@@ -91,6 +99,7 @@ impl TuiConfigDefaults {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TuiConfigKey {
     Layout,
+    Theme,
     Binding(TuiAction),
 }
 
@@ -115,6 +124,7 @@ impl TuiSourceReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfigProvenance {
     layout: SourceIdentity,
+    theme: SourceIdentity,
     bindings: BTreeMap<TuiAction, SourceIdentity>,
 }
 
@@ -122,6 +132,11 @@ impl TuiConfigProvenance {
     #[must_use]
     pub const fn layout(&self) -> &SourceIdentity {
         &self.layout
+    }
+
+    #[must_use]
+    pub const fn theme(&self) -> &SourceIdentity {
+        &self.theme
     }
 
     #[must_use]
@@ -216,6 +231,7 @@ impl BindingsDocument {
 struct Document {
     version: u32,
     layout: Option<ConfigLayout>,
+    theme: Option<String>,
     bindings: BindingsDocument,
 }
 
@@ -261,6 +277,9 @@ impl Document {
         if self.layout.is_some() {
             touched.push(TuiConfigKey::Layout);
         }
+        if self.theme.is_some() {
+            touched.push(TuiConfigKey::Theme);
+        }
         touched.extend(
             self.bindings
                 .entries()
@@ -284,9 +303,11 @@ where
     let cwd = canonical_working_directory(cwd)?;
     let compiled = SourceIdentity::virtual_source(SourceKind::Compiled, "compiled TUI defaults");
     let mut layout = defaults.settings().initial_layout();
+    let mut theme = defaults.settings().theme().to_owned();
     let mut bindings: BTreeMap<_, _> = defaults.settings().bindings().iter().cloned().collect();
     let mut provenance = TuiConfigProvenance {
         layout: compiled.clone(),
+        theme: compiled.clone(),
         bindings: bindings
             .keys()
             .map(|action| (*action, compiled.clone()))
@@ -294,7 +315,8 @@ where
     };
     let mut reports = vec![TuiSourceReport {
         source: compiled,
-        touched: std::iter::once(TuiConfigKey::Layout)
+        touched: [TuiConfigKey::Layout, TuiConfigKey::Theme]
+            .into_iter()
             .chain(bindings.keys().copied().map(TuiConfigKey::Binding))
             .collect(),
     }];
@@ -327,6 +349,10 @@ where
             layout = incoming.into();
             provenance.layout = source.clone();
         }
+        if let Some(incoming) = &document.theme {
+            theme.clone_from(incoming);
+            provenance.theme = source.clone();
+        }
         for (action, values) in document.bindings.entries() {
             let Some(values) = values else {
                 continue;
@@ -342,6 +368,7 @@ where
 
     let settings = TuiConfigSettings {
         initial_layout: layout,
+        theme,
         bindings: bindings.into_iter().collect(),
     };
     Ok(TuiConfigSnapshot {

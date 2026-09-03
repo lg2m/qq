@@ -128,6 +128,7 @@ from the repository root to the current directory.
 (
     version: 1,
     layout: FoldFocus,
+    theme: "qq",
     bindings: (
         select_threadline: ["F1"],
         select_fold_focus: ["F2"],
@@ -144,8 +145,22 @@ from the repository root to the current directory.
 An omitted action inherits the previous layer. An empty list disables that
 action. Invalid chords and collisions are rejected before the TUI starts.
 
-The interactive composer recognizes `/models`, `/new`, `/sessions` (also
-`/resume`), `/compact`, and `/quit` (also `/exit`). `/compact`
+`theme` names a color theme: the compiled `qq` theme, or a `<name>.ron` file
+under the global configuration directory's `themes/` or a project's
+`.qq/themes/`. `/theme` opens a picker that previews each theme live (Enter
+keeps it for the session, Esc restores); the notice it leaves shows the line to
+add to `tui.ron`. See `docs/design/theme.md` for the document shape.
+
+The transcript tiles like a window manager: `Alt-\` splits the focused pane
+side by side, `Alt--` stacks it, `Alt-W` closes it, `Alt-Z` zooms it, and
+`Alt-H/J/K/L` move focus (`Alt-Shift-H/J/K/L` move the divider). Each pane
+shows one session; the composer, approvals, and footer follow the focused pane.
+When the terminal is unfocused, an approval request or a finished run rings
+the terminal bell and posts an OSC 9 desktop notification where supported.
+
+The interactive composer recognizes `/models`, `/theme`, `/new`, `/sessions`
+(also `/resume`), `/agents`, `/editor`, `/split`, `/stack`, `/close`, `/zoom`,
+`/compact`, and `/quit` (also `/exit`). `/compact`
 summarizes an idle session's history into a compact context so long
 sessions keep going; stale read-only tool results are also pruned from
 model context automatically. `/models` applies the choice to the

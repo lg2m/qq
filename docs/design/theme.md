@@ -24,6 +24,10 @@ Until a theme is selected, the renderer uses the compiled default palette:
 | `success` | green |
 | `surface` | `#262830` (code-block background) |
 
+The compiled theme uses the terminal's own named colors for every role but
+`brand` and `surface`, so it follows the user's terminal palette. Theme files
+use `#RRGGBB` literals only, so a named theme looks the same everywhere.
+
 These roles are the only colors the view should depend on. Attributes such as
 bold, dim, and italic stay in the renderer; themes supply colors only.
 
@@ -136,10 +140,15 @@ Markdown and unified diffs reuse these roles in v1:
 
 ## Runtime Model
 
-`qq-tui` owns a resolved theme value:
+`qq-tui` owns resolved theme values:
 
 ```rust
 pub struct Theme {
+    pub name: String,
+    pub palette: Palette,
+}
+
+pub struct Palette {
     pub text: Color,
     pub muted: Color,
     pub accent: Color,
@@ -151,8 +160,10 @@ pub struct Theme {
 }
 ```
 
-`Theme::default_qq()` returns the compiled baseline and is the fallback when no
-theme name is configured.
+`Theme::qq()` returns the compiled baseline and is the fallback when no theme
+name is configured. `Theme::from_roles(name, [ThemeColor; 8])` builds a theme
+from the root's resolved role colors without exposing a terminal library type
+across the crate boundary.
 
 Configuration loading:
 
@@ -162,9 +173,13 @@ Configuration loading:
 4. Expand aliases into concrete colors.
 5. Attach the resolved `Theme` to TUI options alongside layout and bindings.
 
-The view must not hardcode palette colors. Style helpers read from the active
-`Theme` (`theme.text()`, `theme.accent()`, and so on). Frame rendering, markdown
-layout, and diff coloring all share that single resolved value for the process.
+The view must not hardcode palette colors. Style helpers (`normal()`,
+`accent()`, `surface()`, and so on in `render.rs`) read the active `Palette`
+from a thread-local the renderer refreshes at the top of every frame, so a
+theme change costs one store per frame rather than a theme parameter on every
+leaf renderer. Cached message layouts bake colors in, so the renderer compares
+`App::theme_generation` each frame and drops every pane cache and the row diff
+when it changes; the next frame repaints every row in the new palette.
 
 ## Default Theme
 
@@ -207,13 +222,28 @@ Theme failures are configuration errors reported before the TUI starts:
 Provenance should record which source supplied the theme name and, when loaded
 from disk, which path supplied the theme document.
 
+## Theme Picker
+
+`/theme` opens a picker listing every theme discoverable from the working
+directory (the root passes the selected theme first, then the rest of the
+catalog). Moving the cursor or typing a filter previews the highlighted theme
+immediately; Enter keeps it for the rest of the session and shows the
+`theme: "<name>"` line to add to `tui.ron`; Esc restores the theme that was
+active when the picker opened. Each row paints a swatch of the theme's roles
+in that theme's own colors. The picker does not write configuration: themes
+remain load-time configuration, and the picker is a preview.
+
+A theme file that fails to parse is skipped by discovery so one broken
+experiment does not hide the picker; selecting it in `tui.ron` still fails
+fast.
+
 ## Out Of Scope (v1)
 
 - Per-role light/dark dual maps
 - Syntax-highlight token palettes
 - Terminal background clear / full chrome skinning beyond `surface`
-- Hot reload while the TUI is running
-- In-TUI theme picker or `/theme` command
+- Hot reload of theme files while the TUI is running
+- Writing the picker's choice back to `tui.ron`
 - Importing foreign theme file formats
 - Inline theme bodies embedded inside `tui.ron`
 

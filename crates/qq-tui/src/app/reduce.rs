@@ -9,8 +9,9 @@ use qq_protocol::{
 };
 
 use super::{
-    App, MAX_LIVE_TOOL_OUTPUT_BYTES, MAX_RECENT_TOOL_CALLS, PendingIntent, SNAPSHOT_MESSAGE_LIMIT,
-    SNAPSHOT_SESSION_LIMIT, SessionView, format_bytes, model_context_window,
+    App, Attention, MAX_LIVE_TOOL_OUTPUT_BYTES, MAX_RECENT_TOOL_CALLS, PendingIntent,
+    SNAPSHOT_MESSAGE_LIMIT, SNAPSHOT_SESSION_LIMIT, SessionView, format_bytes,
+    model_context_window,
 };
 use crate::{
     ClientRequest,
@@ -134,6 +135,10 @@ impl App {
             } => {
                 if tool_call.state != ToolCallState::AwaitingApproval {
                     self.answered_approvals.remove(&tool_call.id);
+                } else if let Some(session) = self.sessions.get(&envelope.session_id) {
+                    self.request_attention(Attention::ApprovalRequested {
+                        session_title: session.summary.title.clone(),
+                    });
                 }
                 if let Some(edit) = edit {
                     self.edit_previews.insert(tool_call.id, edit.clone());
@@ -232,6 +237,9 @@ impl App {
                 ..
             } => {
                 self.upsert_summary(session.clone());
+                self.request_attention(Attention::RunFinished {
+                    session_title: session.title.clone(),
+                });
                 if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
                     view.activity = None;
                     view.live.active_tool = None;

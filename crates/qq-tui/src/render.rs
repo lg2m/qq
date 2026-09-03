@@ -12,7 +12,7 @@ use crossterm::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::terminal_safe_character;
+use crate::{app::terminal_safe_character, theme};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Style {
@@ -103,48 +103,45 @@ impl Line {
     }
 }
 
+/// Role styles read the thread's active palette (see `theme.rs`); the
+/// renderer refreshes it once per frame so a theme switch repaints
+/// everything without threading a theme through every leaf.
 pub(crate) fn normal() -> Style {
-    Style::color(Color::White)
+    Style::color(theme::active().text)
 }
 
 pub(crate) fn muted() -> Style {
-    Style::color(Color::DarkGrey).dim()
+    Style::color(theme::active().muted).dim()
 }
 
 pub(crate) fn accent() -> Style {
-    Style::color(Color::Cyan)
+    Style::color(theme::active().accent)
 }
 
 pub(crate) fn brand() -> Style {
-    Style::color(Color::Rgb {
-        r: 255,
-        g: 159,
-        b: 67,
-    })
+    Style::color(theme::active().brand)
 }
 
 pub(crate) fn warning() -> Style {
-    Style::color(Color::Yellow)
+    Style::color(theme::active().warning)
 }
 
 pub(crate) fn failure() -> Style {
-    Style::color(Color::Red)
+    Style::color(theme::active().error)
 }
 
 pub(crate) fn success() -> Style {
-    Style::color(Color::Green)
+    Style::color(theme::active().success)
 }
 
 /// Dark surface tint behind code-block panels, distinct from the terminal
 /// background so a padded block reads as one solid slab.
-pub(crate) const SURFACE_COLOR: Color = Color::Rgb {
-    r: 38,
-    g: 40,
-    b: 48,
-};
+pub(crate) fn surface_color() -> Color {
+    theme::active().surface
+}
 
 pub(crate) fn surface(style: Style) -> Style {
-    style.on(SURFACE_COLOR)
+    style.on(surface_color())
 }
 
 /// Syntax palette for highlighted code panels: restrained named colors that

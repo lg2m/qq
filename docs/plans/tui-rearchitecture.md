@@ -1,7 +1,6 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phases T0–T6 are complete (receipts below).
-Phase T7 is proposed.
+Status: complete 2026-09-02. Every phase T0–T7 has landed (receipts below).
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -100,7 +99,7 @@ view/chrome.rs         header, footer, notices, approval banner
 view/overlay.rs        palette, picker, and approval rendering from the ModeStack top
 view/markdown.rs, view/code.rs, view/diff.rs, view/wrap.rs   leaf renderers split out of view.rs
 render.rs              Style, Span, Line, Surface, row diff, writer
-theme.rs               theme roles per docs/design/theme.md (T7)
+theme.rs               Theme, Palette, and the per-frame active palette (docs/design/theme.md)
 settings.rs            unchanged
 ```
 
@@ -569,6 +568,55 @@ Deliverables:
 - Update the stale Ratatui note in
   [`docs/design/transcript.md`](../design/transcript.md) and the TUI paragraph
   in [`docs/design/architecture.md`](../design/architecture.md).
+
+#### T7 Completion Receipt — 2026-09-02
+
+All workspace gates green; 198 TUI tests, 52 config tests. Render bench
+unchanged from T6 (steady 20.5, keystroke 26.0, two panes 51.5 µs).
+
+- **Theme documents.** `qq-config/theme.rs` loads `<name>.ron` from the
+  compiled set, then the global `themes/`, then project `.qq/themes/`
+  nearest-last; `defs` aliases expand with cycle detection; every documented
+  failure (unknown name, version, missing role, unknown alias, bad hex,
+  cycle, unknown field) is a typed `ConfigError` before the TUI starts.
+  `tui.ron` gains an optional `theme` with provenance (`qq config explain
+  tui.theme`, `qq config show`, `qq config check` all cover it).
+  `discover_themes` enumerates the catalog for the picker, skipping broken
+  files so one experiment cannot hide the list.
+- **Runtime model.** `qq-tui/theme.rs` holds `Theme { name, palette }` and a
+  `Copy` `Palette`. The `render.rs` role helpers, called hundreds of times a
+  frame, read a thread-local the renderer sets at the top of `frame()`: one
+  store per frame, no lock, no theme parameter threaded through leaves, and
+  no measurable bench change. Cached message rows bake colors in, so a
+  `theme_generation` counter on `App` makes the renderer drop every pane
+  cache and the row diff when the theme changes; the next frame repaints
+  every row (tested). The root converts config colors to `qq_tui::ThemeColor`
+  and builds themes with `Theme::from_roles`, so no terminal library type
+  crosses the crate boundary. The compiled `qq` theme keeps the terminal's
+  named colors so it follows the user's terminal palette; files are
+  `#RRGGBB` only.
+- **Picker.** `/theme` opens `Overlay::Themes`; Up/Down and typing preview
+  the highlighted theme immediately, Enter keeps it and shows the `tui.ron`
+  line to persist it, Esc restores the theme active when the picker opened.
+  Rows carry a swatch of the theme's roles in its own colors. With only the
+  compiled theme available the command is a notice instead. The design doc's
+  "no in-TUI picker" line was superseded by this plan; `theme.md` now
+  documents the picker and keeps write-back out of scope.
+- **Attention.** The loop enables focus-change reporting; `FocusGained` /
+  `FocusLost` track `terminal_focused` on `App`. The reducer requests
+  attention on `ToolApprovalRequested` (awaiting) and `RunFinished` only
+  while unfocused; regaining focus discards anything undelivered. The loop
+  takes at most one request per iteration and writes BEL followed by an
+  OSC 9 notification (`ESC ] 9 ; text BEL`) — shown by iTerm2, WezTerm,
+  kitty, ghostty, and Windows Terminal, ignored elsewhere — with the session
+  title scrubbed of control characters and capped at 200 chars so it cannot
+  break out of the sequence. Loop test asserts the exact bytes and that a
+  focused terminal is never rung. No new dependencies.
+- **Docs.** `transcript.md` Ratatui note replaced with the hand-rolled
+  primitives and row diff; `architecture.md` `qq-tui` paragraph describes
+  retained rendering, the pane tree, off-tick highlighting, the command
+  registry, and themes; README documents `theme`, `/theme`, pane keys, and
+  the attention behaviour.
 
 `@` file mentions require a server-side file-find endpoint because the TUI must
 not discover workspace files itself. That is a protocol follow-up outside this

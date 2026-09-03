@@ -6,9 +6,9 @@ use std::{
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Attribute, Print, ResetColor, SetAttribute},
@@ -183,6 +183,10 @@ where
             renderer.invalidate();
             redraw = Redraw::Immediate;
         }
+        if let Some(attention) = app.take_attention() {
+            output.write_all(&attention_bytes(&attention)).await?;
+            output.flush().await?;
+        }
         if redraw == Redraw::Immediate {
             let bytes = renderer.draw(&mut app, terminal_size)?;
             output.write_all(&bytes).await?;
@@ -259,6 +263,21 @@ where
     Ok(app)
 }
 
+/// Terminal bytes that ask for the user's attention: BEL for the terminal's
+/// own bell or visual flash, then an OSC 9 desktop notification, which
+/// iTerm2, WezTerm, kitty, ghostty, and Windows Terminal show and every
+/// other terminal ignores. Text is scrubbed so a session title cannot
+/// terminate or extend the escape sequence.
+fn attention_bytes(attention: &crate::app::Attention) -> Vec<u8> {
+    let text: String = attention
+        .summary()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(200)
+        .collect();
+    format!("\x07\x1b]9;{text}\x07").into_bytes()
+}
+
 fn apply_send_failure(app: &mut App, request: ClientRequest, error: crate::ClientFailure) -> bool {
     let update = match request {
         ClientRequest::Command(command) => ClientUpdate::CommandResult {
@@ -317,13 +336,15 @@ fn enable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
         EnableBracketedPaste,
-        EnableMouseCapture
+        EnableMouseCapture,
+        EnableFocusChange
     )
 }
 
 fn disable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
     execute!(
         output,
+        DisableFocusChange,
         DisableMouseCapture,
         DisableBracketedPaste,
         PopKeyboardEnhancementFlags
@@ -828,5 +849,53 @@ mod tests {
         assert_eq!(app.composer.text, "x");
         let (status, _) = app.visible_status().expect("a warning is shown");
         assert!(status.contains("$EDITOR"), "{status}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_rings_the_terminal_for_an_unfocused_run_finish_only() {
+        let mut harness = Harness::new(64);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        harness.update(ClientUpdate::Snapshot(snapshot(1, Vec::new())));
+        harness.settle().await;
+        let finished = |sequence| {
+            ClientUpdate::Event(envelope(
+                sequence,
+                SessionEvent::RunFinished {
+                    session: summary(),
+                    run_id: RunId::from_bytes([9; 16]),
+                    outcome: qq_protocol::RunOutcome::Completed,
+                    usage: None,
+                    context_tokens: None,
+                },
+            ))
+        };
+        // Focused: no bell.
+        harness.update(finished(2));
+        harness.settle().await;
+        let before = harness.frames.frames().len();
+        assert!(
+            harness
+                .frames
+                .frames()
+                .iter()
+                .all(|frame| !frame.contains(&0x07)),
+            "no bell while focused"
+        );
+
+        harness
+            .events
+            .send(Ok(Event::FocusLost))
+            .expect("event channel open");
+        harness.update(finished(3));
+        harness.settle().await;
+        let frames = harness.frames.frames();
+        let bell = frames[before..]
+            .iter()
+            .find(|frame| frame.starts_with(b"\x07\x1b]9;"))
+            .expect("a bell and OSC 9 notification were written");
+        assert_eq!(frame_text(bell), "\x07\x1b]9;qq: Session finished\x07");
+
+        harness.quit();
+        task.await.expect("loop task").expect("loop exits cleanly");
     }
 }

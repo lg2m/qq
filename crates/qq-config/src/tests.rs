@@ -1676,3 +1676,156 @@ fn mcp_declarations_are_scoped_by_source_kind() {
     let inline = SourceIdentity::virtual_source(SourceKind::Inline, "inline test");
     assert!(document::Document::parse(content, &inline).is_ok());
 }
+
+const ROSE_PINE: &str = r##"(
+    version: 1,
+    defs: {
+        "text": "#e0def4",
+        "muted": "#6e6a86",
+        "rose": "#eb6f92",
+        "pine": "#31748f",
+        "gold": "#f6c177",
+        "foam": "#9ccfd8",
+        "surface": "#1f1d2e",
+    },
+    colors: (
+        text: "text",
+        muted: "muted",
+        accent: "foam",
+        brand: "rose",
+        warning: "gold",
+        error: "rose",
+        success: "pine",
+        surface: "surface",
+    ),
+)"##;
+
+#[test]
+fn tui_config_selects_a_theme_by_name_with_provenance() {
+    let tree = TempTree::new();
+    let snapshot = tree
+        .loader()
+        .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
+        .unwrap();
+    assert_eq!(snapshot.settings().theme(), DEFAULT_THEME);
+    assert_eq!(snapshot.provenance().theme().kind(), SourceKind::Compiled);
+
+    tree.write("global/tui.ron", r#"(version: 1, theme: "rose-pine")"#);
+    tree.write("work/.qq/tui.ron", r#"(version: 1, theme: "project")"#);
+    let snapshot = tree
+        .loader()
+        .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
+        .unwrap();
+    assert_eq!(snapshot.settings().theme(), "project");
+    assert_eq!(snapshot.provenance().theme().kind(), SourceKind::Project);
+    assert!(
+        snapshot
+            .source_reports()
+            .iter()
+            .any(|report| report.touched().contains(&TuiConfigKey::Theme))
+    );
+}
+
+#[test]
+fn themes_resolve_compiled_then_global_then_nearest_project() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    let compiled = loader.load_theme(&tree.path("work"), "qq").unwrap();
+    assert_eq!(compiled.name(), "qq");
+    assert_eq!(compiled.source().kind(), SourceKind::Compiled);
+
+    tree.write("global/themes/rose-pine.ron", ROSE_PINE);
+    let global = loader.load_theme(&tree.path("work"), "rose-pine").unwrap();
+    assert_eq!(global.source().kind(), SourceKind::Global);
+    assert_eq!(
+        global.colors().accent,
+        ThemeColor::Rgb(Rgb {
+            r: 0x9c,
+            g: 0xcf,
+            b: 0xd8
+        })
+    );
+    assert_eq!(
+        global.colors().brand,
+        global.colors().error,
+        "aliases share a literal"
+    );
+
+    // A project copy of the same name wins, nearest directory last.
+    tree.write(
+        "work/.qq/themes/rose-pine.ron",
+        &ROSE_PINE.replace("#9ccfd8", "#000001"),
+    );
+    tree.write(
+        "work/child/.qq/themes/rose-pine.ron",
+        &ROSE_PINE.replace("#9ccfd8", "#000002"),
+    );
+    let nearest = loader
+        .load_theme(&tree.path("work/child"), "rose-pine")
+        .unwrap();
+    assert_eq!(nearest.source().kind(), SourceKind::Project);
+    assert_eq!(
+        nearest.colors().accent,
+        ThemeColor::Rgb(Rgb { r: 0, g: 0, b: 2 })
+    );
+
+    let discovered = loader.discover_themes(&tree.path("work/child")).unwrap();
+    let names: Vec<_> = discovered.iter().map(ThemeDocument::name).collect();
+    assert_eq!(names, ["qq", "rose-pine"]);
+    assert_eq!(
+        discovered[1].colors().accent,
+        ThemeColor::Rgb(Rgb { r: 0, g: 0, b: 2 })
+    );
+}
+
+#[test]
+fn theme_documents_fail_fast_on_every_documented_error() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    let load = |content: &str| {
+        tree.write("global/themes/bad.ron", content);
+        loader.load_theme(&tree.path("work"), "bad")
+    };
+
+    assert!(matches!(
+        loader.load_theme(&tree.path("work"), "missing"),
+        Err(ConfigError::UnknownTheme { name }) if name == "missing"
+    ));
+    assert!(matches!(
+        loader.load_theme(&tree.path("work"), "../escape"),
+        Err(ConfigError::UnknownTheme { .. })
+    ));
+    assert!(matches!(
+        load(&ROSE_PINE.replace("version: 1", "version: 2")),
+        Err(ConfigError::UnsupportedVersion { version: 2, .. })
+    ));
+    let missing_role = ROSE_PINE.replace("        surface: \"surface\",\n", "");
+    assert!(matches!(
+        load(&missing_role),
+        Err(ConfigError::Parse { .. })
+    ));
+    let unknown_alias = ROSE_PINE.replace("accent: \"foam\"", "accent: \"sea\"");
+    match load(&unknown_alias) {
+        Err(ConfigError::Parse { message, .. }) => assert!(message.contains("`sea`")),
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+    let bad_hex = ROSE_PINE.replace("#9ccfd8", "#9ccfd");
+    assert!(matches!(load(&bad_hex), Err(ConfigError::Parse { .. })));
+    let cycle = ROSE_PINE.replace(
+        "\"foam\": \"#9ccfd8\"",
+        "\"foam\": \"sea\", \"sea\": \"foam\"",
+    );
+    match load(&cycle) {
+        Err(ConfigError::Parse { message, .. }) => assert!(message.contains("alias cycle")),
+        other => panic!("expected a cycle error, got {other:?}"),
+    }
+    let unknown_field = ROSE_PINE.replace("version: 1,", "version: 1, extra: 1,");
+    assert!(matches!(
+        load(&unknown_field),
+        Err(ConfigError::Parse { .. })
+    ));
+
+    // A broken file is skipped by discovery but still selectable-and-failing.
+    let discovered = loader.discover_themes(&tree.path("work")).unwrap();
+    assert_eq!(discovered.len(), 1);
+}

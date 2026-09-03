@@ -17,6 +17,12 @@ pub(crate) enum SessionConfirm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Overlay {
     Models(Picker),
+    /// Theme picker. Moving the cursor previews the highlighted theme live;
+    /// `restore` is the theme to put back if the user cancels.
+    Themes {
+        picker: Picker,
+        restore: usize,
+    },
     Sessions {
         picker: Picker,
         /// When set, only this session and its descendants are listed: the
@@ -34,6 +40,7 @@ pub(crate) enum Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Models,
+    Themes,
     Sessions,
     Approval,
     Compose,
@@ -73,6 +80,7 @@ impl Overlay {
     pub(crate) fn mode(&self) -> Mode {
         match self {
             Self::Models(_) => Mode::Models,
+            Self::Themes { .. } => Mode::Themes,
             Self::Sessions { .. } => Mode::Sessions,
         }
     }
@@ -81,13 +89,17 @@ impl Overlay {
     #[must_use]
     pub(crate) fn picker(&self) -> &Picker {
         match self {
-            Self::Models(picker) | Self::Sessions { picker, .. } => picker,
+            Self::Models(picker) | Self::Themes { picker, .. } | Self::Sessions { picker, .. } => {
+                picker
+            }
         }
     }
 
     pub(crate) fn picker_mut(&mut self) -> &mut Picker {
         match self {
-            Self::Models(picker) | Self::Sessions { picker, .. } => picker,
+            Self::Models(picker) | Self::Themes { picker, .. } | Self::Sessions { picker, .. } => {
+                picker
+            }
         }
     }
 }

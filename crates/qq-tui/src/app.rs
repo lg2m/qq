@@ -19,6 +19,7 @@ use crate::{
     panes::{Axis, Direction, PaneId, Panes, Viewport},
     picker::Picker,
     terminal,
+    theme::Theme,
 };
 use reduce::{retain_recent_messages, retain_recent_tool_calls};
 
@@ -55,6 +56,9 @@ pub struct TuiOptions {
     pub settings: Settings,
     pub model: ModelSelection,
     pub models: Vec<ModelOption>,
+    /// Every selectable theme; the first is active at startup. An empty list
+    /// means the compiled `qq` theme.
+    pub themes: Vec<Theme>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +357,27 @@ impl ToolDetail {
     }
 }
 
+/// An event worth interrupting the user for while the terminal is unfocused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Attention {
+    /// A tool call is waiting for the user to approve it.
+    ApprovalRequested { session_title: String },
+    /// A run finished in a session; the user may want to read the result.
+    RunFinished { session_title: String },
+}
+
+impl Attention {
+    /// One-line text for a desktop notification.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::ApprovalRequested { session_title } => {
+                format!("qq: {session_title} needs approval")
+            }
+            Self::RunFinished { session_title } => format!("qq: {session_title} finished"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PendingIntent {
     Create,
@@ -419,6 +444,17 @@ pub(crate) struct App {
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
     /// enough; the toggle command cycles through explicit on and off.
     pub sidebar: Sidebar,
+    /// Selectable themes and the index of the active one. Changing the
+    /// index bumps `theme_generation` so the renderer repaints everything.
+    pub(crate) themes: Vec<Theme>,
+    pub(crate) theme: usize,
+    pub(crate) theme_generation: u64,
+    /// Whether the terminal window has keyboard focus, from the terminal's
+    /// focus events. Assumed focused until told otherwise.
+    terminal_focused: bool,
+    /// Something happened that deserves the user's attention while the
+    /// terminal was unfocused; the loop takes it and rings the terminal.
+    attention: Option<Attention>,
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
     pending: HashMap<CommandId, PendingIntent>,
@@ -467,6 +503,15 @@ impl App {
             tool_detail: ToolDetail::default(),
             reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
+            themes: if options.themes.is_empty() {
+                vec![Theme::default()]
+            } else {
+                options.themes
+            },
+            theme: 0,
+            theme_generation: 0,
+            terminal_focused: true,
+            attention: None,
             last_sequence: 0,
             recent_events: VecDeque::new(),
             pending: HashMap::new(),
@@ -658,7 +703,7 @@ impl App {
                     .and_then(|index| self.models.get(*index))
                     .map(|model| (model.provider.clone(), model.model.clone()))
             }
-            Some(Overlay::Sessions { .. }) | None => None,
+            Some(Overlay::Sessions { .. } | Overlay::Themes { .. }) | None => None,
         };
         self.models = models.into_iter().map(Into::into).collect();
         self.models.sort_by(|left, right| {
@@ -1018,7 +1063,9 @@ impl App {
                         self.reset_session_picker_selection();
                         changed
                     }
-                    Some(Overlay::Models(picker)) => picker.push_query(&text),
+                    Some(Overlay::Models(picker) | Overlay::Themes { picker, .. }) => {
+                        picker.push_query(&text)
+                    }
                     None => self.push_composer_text(&text),
                 };
                 (changed, Vec::new())
@@ -1040,7 +1087,16 @@ impl App {
                 };
                 (changed, Vec::new())
             }
-            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => (true, Vec::new()),
+            Event::FocusGained => {
+                self.terminal_focused = true;
+                self.attention = None;
+                (true, Vec::new())
+            }
+            Event::FocusLost => {
+                self.terminal_focused = false;
+                (true, Vec::new())
+            }
+            Event::Resize(_, _) => (true, Vec::new()),
             Event::Key(_) | Event::Mouse(_) => (false, Vec::new()),
         }
     }
@@ -1052,6 +1108,7 @@ impl App {
         match self.mode() {
             Mode::Sessions => self.handle_session_picker_key(key),
             Mode::Models => self.handle_model_picker_key(key),
+            Mode::Themes => self.handle_theme_picker_key(key),
             Mode::Approval => self.handle_approval_key(key),
             Mode::Compose => self.handle_compose_key(key),
         }
@@ -1267,6 +1324,118 @@ impl App {
         self.panes.focused().session
     }
 
+    /// The active theme. The theme picker previews by moving `theme`, so
+    /// this is always what the next frame should paint with.
+    pub(crate) fn theme(&self) -> &Theme {
+        &self.themes[self.theme.min(self.themes.len() - 1)]
+    }
+
+    fn open_themes(&mut self) -> (bool, Vec<ClientRequest>) {
+        if self.themes.len() < 2 {
+            self.set_info(
+                "only the compiled `qq` theme is available; add themes/<name>.ron to choose"
+                    .to_owned(),
+            );
+            return (true, Vec::new());
+        }
+        let mut picker = Picker::new();
+        picker.select(self.theme);
+        self.overlay = Some(Overlay::Themes {
+            picker,
+            restore: self.theme,
+        });
+        (true, Vec::new())
+    }
+
+    /// Indexes into `themes` matching the open theme picker's query.
+    pub(crate) fn filtered_themes(&self) -> Vec<usize> {
+        let Some(Overlay::Themes { picker, .. }) = &self.overlay else {
+            return Vec::new();
+        };
+        self.themes
+            .iter()
+            .enumerate()
+            .filter(|(_, theme)| picker.matches([theme.name.as_str()]))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn set_theme(&mut self, index: usize) -> bool {
+        if index >= self.themes.len() || index == self.theme {
+            return false;
+        }
+        self.theme = index;
+        self.theme_generation += 1;
+        true
+    }
+
+    /// Theme picker keys. Up/Down and typing preview the highlighted theme
+    /// immediately; Enter keeps it, Esc restores the theme that was active
+    /// when the picker opened.
+    fn handle_theme_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+        let filtered = self.filtered_themes();
+        let Some(Overlay::Themes { picker, restore }) = &mut self.overlay else {
+            return (false, Vec::new());
+        };
+        let restore = *restore;
+        let changed = match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                self.set_theme(restore);
+                return (true, Vec::new());
+            }
+            KeyCode::Enter => {
+                let name = self.theme().name.clone();
+                self.overlay = None;
+                self.set_info(format!(
+                    "theme `{name}`; set `theme: \"{name}\"` in tui.ron to keep it"
+                ));
+                return (true, Vec::new());
+            }
+            KeyCode::Up => {
+                picker.move_up();
+                true
+            }
+            KeyCode::Down => {
+                picker.move_down(filtered.len());
+                true
+            }
+            KeyCode::Backspace => picker.pop_query(),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let mut encoded = [0; 4];
+                picker.push_query(character.encode_utf8(&mut encoded))
+            }
+            _ => false,
+        };
+        if changed {
+            let filtered = self.filtered_themes();
+            if let Some(Overlay::Themes { picker, .. }) = &self.overlay
+                && let Some(index) = filtered.get(picker.selected(filtered.len()))
+            {
+                self.set_theme(*index);
+            }
+        }
+        (changed, Vec::new())
+    }
+
+    /// Take the pending attention request, if any. The loop rings the
+    /// terminal once per request.
+    pub(crate) fn take_attention(&mut self) -> Option<Attention> {
+        self.attention.take()
+    }
+
+    /// Record something the user should notice. Only fires while the
+    /// terminal is unfocused: a focused user is already looking.
+    pub(super) fn request_attention(&mut self, attention: Attention) {
+        if !self.terminal_focused {
+            self.attention = Some(attention);
+        }
+    }
+
     /// Reconcile pane `id`'s viewport with the body laid out this frame.
     pub(crate) fn update_viewport(
         &mut self,
@@ -1373,6 +1542,7 @@ impl App {
     pub(crate) fn execute(&mut self, command: Command) -> (bool, Vec<ClientRequest>) {
         match command {
             Command::OpenModels => self.open_models(),
+            Command::OpenThemes => self.open_themes(),
             Command::OpenSessions => self.open_sessions(),
             Command::OpenAgents => self.open_agents(),
             Command::ToggleSessions => {
@@ -1686,7 +1856,7 @@ impl App {
     pub(crate) fn session_picker_confirm(&self) -> Option<SessionConfirm> {
         match &self.overlay {
             Some(Overlay::Sessions { confirm, .. }) => *confirm,
-            Some(Overlay::Models(_)) | None => None,
+            Some(Overlay::Models(_) | Overlay::Themes { .. }) | None => None,
         }
     }
 
@@ -3204,6 +3374,7 @@ mod tests {
             settings: Settings::default(),
             model: model.clone(),
             models: Vec::new(),
+            themes: Vec::new(),
         });
         app.apply_snapshot(snapshot());
         app.composer.text = "/new".to_owned();
@@ -3239,6 +3410,7 @@ mod tests {
                 "/sessions",
                 "/resume",
                 "/agents",
+                "/theme",
                 "/new",
                 "/compact",
                 "/editor",
@@ -3253,7 +3425,7 @@ mod tests {
         for _ in 0..20 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.slash_selected(usize::MAX), 12);
+        assert_eq!(app.slash_selected(usize::MAX), 13);
         for _ in 0..20 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
@@ -3571,6 +3743,7 @@ mod tests {
                 context_window: Some(128_000),
                 selection,
             }],
+            themes: Vec::new(),
         })
     }
 
@@ -3935,6 +4108,7 @@ mod tests {
                 context_window: None,
                 selection: selection.clone(),
             }],
+            themes: Vec::new(),
         });
         app.apply_snapshot(snapshot());
         app.open_models();
@@ -4007,6 +4181,7 @@ mod tests {
                 context_window: Some(200_000),
                 selection: selection.clone(),
             }],
+            themes: Vec::new(),
         });
         app.apply_snapshot(snapshot());
         app.composer.text = "/models".to_owned();
@@ -4068,6 +4243,7 @@ mod tests {
                 context_window: Some(200_000),
                 selection: selection.clone(),
             }],
+            themes: Vec::new(),
         });
         let mut empty = snapshot();
         empty.sessions.clear();
@@ -4115,6 +4291,7 @@ mod tests {
                 context_window: Some(200_000),
                 selection: switched.clone(),
             }],
+            themes: Vec::new(),
         });
         app.apply_snapshot(snapshot());
         app.open_models();
@@ -5392,5 +5569,133 @@ mod tests {
             KeyModifiers::ALT | KeyModifiers::SHIFT,
         ));
         assert!(!changed);
+    }
+
+    fn themed_app() -> App {
+        let mut app = App::new(TuiOptions {
+            settings: Settings::default(),
+            model: ModelSelection::default(),
+            models: Vec::new(),
+            themes: vec![
+                crate::Theme::qq(),
+                crate::Theme::from_roles(
+                    "rose-pine",
+                    [crate::ThemeColor::Rgb(0xe0, 0xde, 0xf4); 8],
+                ),
+                crate::Theme::from_roles("mono", [crate::ThemeColor::White; 8]),
+            ],
+        });
+        app.apply_snapshot(snapshot());
+        app
+    }
+
+    #[test]
+    fn the_theme_picker_previews_live_and_esc_restores() {
+        let mut app = themed_app();
+        assert_eq!(app.theme().name, "qq");
+        app.composer.text = "/theme".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode(), Mode::Themes);
+        let generation = app.theme_generation;
+
+        // Down previews the next theme immediately.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.theme().name, "rose-pine");
+        assert_eq!(app.theme_generation, generation + 1);
+        // Typing filters and the highlighted theme follows the filter.
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.filtered_themes().len(), 1);
+        assert_eq!(app.theme().name, "mono");
+        // Esc puts the original back.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode(), Mode::Compose);
+        assert_eq!(app.theme().name, "qq");
+
+        // Enter keeps the preview and tells the user how to persist it.
+        app.execute(Command::OpenThemes);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.theme().name, "rose-pine");
+        let (status, _) = app.visible_status().expect("info notice");
+        assert!(status.contains("theme: \"rose-pine\""), "{status}");
+    }
+
+    #[test]
+    fn a_single_theme_makes_the_picker_a_notice_instead() {
+        let mut app = App::new(TuiOptions::default());
+        app.apply_snapshot(snapshot());
+        assert_eq!(app.themes.len(), 1, "the compiled theme is always present");
+        app.execute(Command::OpenThemes);
+        assert_eq!(app.mode(), Mode::Compose);
+        assert!(
+            app.visible_status()
+                .unwrap()
+                .0
+                .contains("themes/<name>.ron")
+        );
+    }
+
+    #[test]
+    fn attention_is_requested_only_while_the_terminal_is_unfocused() {
+        let (mut app, session_id, run_id, mut event) = running_app();
+        let finish = |run_id| SessionEvent::RunFinished {
+            session: SessionSummary {
+                status: SessionStatus::Idle,
+                active_run_id: None,
+                ..summary_named(2, id(1, WorkspaceId::from_bytes), "Deploy")
+            },
+            run_id,
+            outcome: RunOutcome::Completed,
+            usage: None,
+            context_tokens: None,
+        };
+        // Focused: nothing to report.
+        app.apply_client_update(event(finish(run_id)));
+        assert_eq!(app.take_attention(), None);
+
+        // Unfocused: a finished run asks for attention with the title.
+        app.handle_terminal_event(Event::FocusLost);
+        app.apply_client_update(event(finish(run_id)));
+        assert_eq!(
+            app.take_attention(),
+            Some(Attention::RunFinished {
+                session_title: "Deploy".to_owned()
+            })
+        );
+        assert_eq!(app.take_attention(), None, "taken once");
+
+        // An approval request while unfocused also asks; regaining focus
+        // clears anything not yet delivered.
+        app.apply_client_update(event(SessionEvent::ToolApprovalRequested {
+            tool_call: ToolCallSnapshot {
+                id: id(0x51, qq_protocol::ToolCallId::from_bytes),
+                session_id,
+                run_id,
+                turn_ordinal: 1,
+                call_ordinal: 0,
+                provider_call_id: "call".to_owned(),
+                name: "shell".to_owned(),
+                arguments: "{}".to_owned(),
+                state: ToolCallState::AwaitingApproval,
+                result: None,
+                is_error: false,
+                display: None,
+            },
+            shell: None,
+            edit: None,
+        }));
+        assert!(matches!(
+            app.attention,
+            Some(Attention::ApprovalRequested { .. })
+        ));
+        app.handle_terminal_event(Event::FocusGained);
+        assert_eq!(app.take_attention(), None);
+        assert_eq!(
+            Attention::ApprovalRequested {
+                session_title: "Deploy".to_owned()
+            }
+            .summary(),
+            "qq: Deploy needs approval"
+        );
     }
 }
