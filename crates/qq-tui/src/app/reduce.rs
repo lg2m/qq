@@ -111,6 +111,13 @@ impl App {
                 }
             }
             SessionEvent::AssistantMessageStarted { message } => {
+                let shown = self
+                    .panes
+                    .sessions()
+                    .any(|shown| shown == envelope.session_id);
+                if !shown && let Some(view) = self.sessions.get_mut(&envelope.session_id) {
+                    view.unread += 1;
+                }
                 // A new turn's message means every earlier turn of the run
                 // has committed; the server finalized those messages inside
                 // the turn persist without a dedicated event.
@@ -305,6 +312,14 @@ impl App {
                 usage,
                 ..
             } => {
+                let shown = self
+                    .panes
+                    .sessions()
+                    .any(|shown| shown == envelope.session_id);
+                if !shown && let Some(view) = self.sessions.get_mut(&envelope.session_id) {
+                    view.finished_unread = true;
+                    view.unread += 1;
+                }
                 let cost_before = self
                     .sessions
                     .get(&envelope.session_id)
@@ -464,7 +479,7 @@ impl App {
         }
         for pane in &showing {
             if let Some(pane) = self.panes.get_mut(*pane) {
-                pane.session = refocus;
+                pane.show_session(refocus);
             }
         }
         if showing.contains(&self.panes.focused_id()) {

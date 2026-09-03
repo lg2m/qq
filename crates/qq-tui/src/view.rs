@@ -8,6 +8,7 @@ mod overlay;
 mod sidebar;
 mod tools;
 mod transcript;
+mod workspace;
 mod wrap;
 
 use std::{
@@ -33,7 +34,7 @@ use crate::{
     Layout, StatusItem,
     app::{App, SessionView, ToolDetail, terminal_safe_character},
     input::{Mode, SessionConfirm},
-    panes::{PaneId, Rect, Tile, Viewport},
+    panes::{Pane, PaneContent, PaneId, Rect, Tile, Viewport},
     render::{
         Line, Style, accent, border, border_active, brand, diff_line_style, failure, info, muted,
         normal, selection, success, warning, write_line,
@@ -49,6 +50,7 @@ use overlay::*;
 use sidebar::*;
 use tools::*;
 use transcript::*;
+use workspace::*;
 #[cfg(test)]
 use wrap::transcript_viewport;
 use wrap::{
@@ -199,7 +201,12 @@ impl FrameRenderer {
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(1)
             .clamp(1, MAX_COMPOSER_ROWS);
-        let draft_lines = queued_drafts(app, width);
+        let mut draft_lines = queued_drafts(app, width);
+        if !app.sidebar.visible(width)
+            && let Some(strip) = agent_strip(app, width)
+        {
+            draft_lines.insert(0, strip);
+        }
         let (composer_lines, caret) = composer(app, width, max_composer_rows);
         let body_height = height
             .saturating_sub(fixed_chrome_rows)
@@ -251,7 +258,7 @@ impl FrameRenderer {
         let composer_top = lines.len();
         lines.extend(composer_lines);
         lines.push(hint_row(app, width));
-        if mode == Mode::Compose
+        if (mode == Mode::Compose || app.approval_amendment.is_some())
             && let Some((column, row)) = caret
             && let (Ok(column), Ok(row)) = (
                 u16::try_from(column.min(width.saturating_sub(1))),

@@ -483,14 +483,41 @@ impl TranscriptCache {
         titled: bool,
     ) -> (Vec<Line>, ViewportUpdate) {
         let width = tile.rect.width;
-        let session_id = app.panes.get(tile.pane).and_then(|pane| pane.session);
+        let session_id = app.panes.get(tile.pane).and_then(Pane::session);
         let focused = app.panes.focused_id() == tile.pane;
         let mut lines = Vec::with_capacity(tile.rect.height);
         if titled {
-            lines.push(pane_title(app, session_id, focused, width));
+            let content_title = match app.panes.get(tile.pane).map(|pane| pane.content) {
+                Some(PaneContent::Attention) => Some("needs you"),
+                Some(PaneContent::Changes) => Some("changes"),
+                Some(PaneContent::Transcript(_)) | None => None,
+            };
+            lines.push(pane_title(app, session_id, content_title, focused, width));
         }
         let body_height = tile.rect.height.saturating_sub(lines.len());
         let mut viewport = app.viewport(tile.pane).cloned().unwrap_or_default();
+        // Workspace-wide panes are cheap lists; they draw without the
+        // transcript caches and scroll like any other body.
+        let content = app.panes.get(tile.pane).map(|pane| pane.content);
+        let workspace_rows = match content {
+            Some(PaneContent::Attention) => Some(attention_body(app, width)),
+            Some(PaneContent::Changes) => Some(changes_body(app, width)),
+            Some(PaneContent::Transcript(_)) | None => None,
+        };
+        if let Some(rows) = workspace_rows {
+            let mut body = VirtualBody::default();
+            body.extend_owned(rows);
+            viewport.update((None, app.layout), body.rows, body_height, false);
+            let offset = viewport.offset();
+            lines.extend(body.viewport(app, body_height, offset));
+            return (
+                fit_height(lines, tile.rect.height),
+                ViewportUpdate {
+                    pane: tile.pane,
+                    viewport,
+                },
+            );
+        }
         let body = match app.layout {
             Layout::Threadline => self.threadline(highlighter, app, session_id, &viewport, width),
             Layout::FoldFocus => self.fold_focus(highlighter, app, session_id, &viewport, width),

@@ -38,11 +38,19 @@ pub(crate) enum Command {
     ToggleReasoning,
     ToggleSidebar,
     ToggleMouse,
+    /// Show the workspace attention list or the cross-agent change board in
+    /// the focused pane.
+    ShowAttention,
+    ShowChanges,
     FocusParent,
     FocusFirstChild,
     FocusNextSibling,
     FocusPreviousSibling,
     FocusNextApproval,
+    /// Answer the first approval waiting in another session without moving
+    /// focus: approve once, or deny.
+    ApproveBackground,
+    DenyBackground,
     /// Hold the composer text locally until the active run finishes.
     QueueDraft,
     /// Pull the newest locally queued draft back into the composer.
@@ -139,7 +147,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 45] = [
+pub(crate) const COMMANDS: [CommandSpec; 49] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -230,10 +238,24 @@ pub(crate) const COMMANDS: [CommandSpec; 45] = [
     ),
     spec!(
         FocusNextApproval,
-        "jump to the next session awaiting approval",
+        "jump to the next session that needs you",
         Session,
         [],
         ["Ctrl-G"]
+    ),
+    spec!(
+        ApproveBackground,
+        "approve the waiting call in another session",
+        Session,
+        [],
+        ["Alt-A"]
+    ),
+    spec!(
+        DenyBackground,
+        "deny the waiting call in another session",
+        Session,
+        [],
+        ["Alt-D"]
     ),
     spec!(CancelRun, "cancel the active run", Run, [], [], CancelRun),
     spec!(SteerRun, "steer the active run with the draft", Run, [], []),
@@ -322,6 +344,20 @@ pub(crate) const COMMANDS: [CommandSpec; 45] = [
         ["Ctrl-\\"]
     ),
     spec!(ToggleMouse, "toggle mouse capture", View, ["/mouse"], []),
+    spec!(
+        ShowAttention,
+        "show everything that needs you",
+        View,
+        ["/attention"],
+        []
+    ),
+    spec!(
+        ShowChanges,
+        "show every file agents changed",
+        View,
+        ["/changes"],
+        []
+    ),
     spec!(
         SplitBeside,
         "split the pane side by side",
@@ -547,12 +583,18 @@ mod tests {
 
     #[test]
     fn default_chords_parse_and_do_not_collide() {
+        // Configured actions own their chords too; a default chord in the
+        // table must not shadow one of those either.
+        let settings = Settings::default();
         let mut chords: Vec<(KeyChord, Command)> = Vec::new();
         for spec in &COMMANDS {
             for chord in spec.chords {
                 let parsed = default_chord(chord);
                 if let Some((_, other)) = chords.iter().find(|(existing, _)| *existing == parsed) {
                     panic!("{chord} bound to both {other:?} and {:?}", spec.command);
+                }
+                if let Some(action) = settings.action_for(parsed.to_event()) {
+                    panic!("{chord} shadows configured action {action:?}");
                 }
                 chords.push((parsed, spec.command));
             }

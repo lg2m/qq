@@ -154,8 +154,18 @@ pub(super) fn hint_row(app: &App, width: usize) -> Line {
             },
             warning().bold(),
         );
-        if let Some(chord) = app.chord_label(crate::commands::Command::FocusNextApproval) {
-            left.push(format!(" {chord}"), muted());
+        let jump = app.chord_label(crate::commands::Command::FocusNextApproval);
+        let approve = app.chord_label(crate::commands::Command::ApproveBackground);
+        let deny = app.chord_label(crate::commands::Command::DenyBackground);
+        let mut hints = Vec::new();
+        if let Some(chord) = jump {
+            hints.push(format!("{chord} jump"));
+        }
+        if let (Some(approve), Some(deny)) = (approve, deny) {
+            hints.push(format!("{approve}/{deny} answer"));
+        }
+        if !hints.is_empty() {
+            left.push(format!("  {}", hints.join("  ")), muted());
         }
     }
 
@@ -276,6 +286,36 @@ pub(super) fn composer(
 ) -> (Vec<Line>, Option<(usize, usize)>) {
     let max_rows = max_rows.max(1);
     let mode = app.composer_mode();
+    // An armed amendment turns the composer into the steering note field.
+    if let Some(choice) = app.approval_amendment {
+        let mut line = Line::styled(" ✎ ", warning().bold());
+        line.push(
+            match choice {
+                crate::app::ApprovalChoice::Deny => "deny and steer: ",
+                _ => "approve and steer: ",
+            },
+            warning(),
+        );
+        let used = line.width();
+        if app.composer.text.is_empty() {
+            line.push(
+                "what should it do instead? Enter sends, Esc cancels",
+                muted().italic(),
+            );
+            return (vec![truncate_line(line, width)], Some((used, 0)));
+        }
+        let caret_column = used
+            + app.composer.text[..app.composer.cursor()]
+                .chars()
+                .map(|character| {
+                    unicode_width::UnicodeWidthChar::width(character).unwrap_or_default()
+                })
+                .sum::<usize>();
+        for span in composer_row(&app.composer.text).spans {
+            line.push(span.text, span.style);
+        }
+        return (vec![truncate_line(line, width)], Some((caret_column, 0)));
+    }
     let glyph_style = match mode {
         ComposerMode::Send => accent().bold(),
         ComposerMode::Steer | ComposerMode::Queue => warning().bold(),

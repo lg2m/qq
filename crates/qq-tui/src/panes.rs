@@ -166,10 +166,44 @@ impl Viewport {
     }
 }
 
+/// What a pane shows. A transcript follows one session; the other kinds are
+/// workspace-wide views that read every session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneContent {
+    /// One session's transcript, or the empty prompt when `None`.
+    Transcript(Option<SessionId>),
+    /// Every approval, failure, and unread finish across the workspace.
+    Attention,
+    /// Every file edited by any agent, grouped by path.
+    Changes,
+}
+
+impl Default for PaneContent {
+    fn default() -> Self {
+        Self::Transcript(None)
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Pane {
-    pub session: Option<SessionId>,
+    pub content: PaneContent,
     pub viewport: Viewport,
+}
+
+impl Pane {
+    /// The session this pane's transcript follows, if it shows one.
+    pub(crate) const fn session(&self) -> Option<SessionId> {
+        match self.content {
+            PaneContent::Transcript(session) => session,
+            PaneContent::Attention | PaneContent::Changes => None,
+        }
+    }
+
+    /// Point a transcript pane at `session`. Other contents switch to a
+    /// transcript: focusing a session always means reading it.
+    pub(crate) fn show_session(&mut self, session: Option<SessionId>) {
+        self.content = PaneContent::Transcript(session);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,13 +455,13 @@ impl Panes {
 
     /// Every distinct session shown by some pane. These are pinned warm.
     pub(crate) fn sessions(&self) -> impl Iterator<Item = SessionId> + '_ {
-        self.panes.values().filter_map(|pane| pane.session)
+        self.panes.values().filter_map(Pane::session)
     }
 
     pub(crate) fn panes_showing(&self, session: SessionId) -> impl Iterator<Item = PaneId> + '_ {
         self.panes
             .iter()
-            .filter(move |(_, pane)| pane.session == Some(session))
+            .filter(move |(_, pane)| pane.session() == Some(session))
             .map(|(id, _)| *id)
     }
 
@@ -439,13 +473,13 @@ impl Panes {
         }
         let fresh = PaneId(self.next_id);
         self.next_id += 1;
-        let inherited = self.focused().session;
+        let inherited = self.focused().content;
         let split = self.root.split(self.focused, axis, fresh);
         debug_assert!(split, "the focused pane is always in the tree");
         self.panes.insert(
             fresh,
             Pane {
-                session: inherited,
+                content: inherited,
                 viewport: Viewport::default(),
             },
         );
@@ -572,7 +606,7 @@ impl Panes {
     /// Reset every pane to show nothing, keeping the tree shape.
     pub(crate) fn clear_sessions(&mut self) {
         for pane in self.panes.values_mut() {
-            pane.session = None;
+            pane.show_session(None);
         }
     }
 }
@@ -614,11 +648,11 @@ mod tests {
     #[test]
     fn splitting_inherits_the_session_and_focuses_the_new_pane() {
         let mut panes = Panes::default();
-        panes.focused_mut().session = Some(session(1));
+        panes.focused_mut().show_session(Some(session(1)));
         let original = panes.focused_id();
         let fresh = panes.split(Axis::Columns).expect("room to split");
         assert_eq!(panes.focused_id(), fresh);
-        assert_eq!(panes.focused().session, Some(session(1)));
+        assert_eq!(panes.focused().session(), Some(session(1)));
         assert_eq!(panes.ids(), vec![original, fresh]);
         let tiles = tiles_of(&mut panes, Rect::new(0, 0, 101, 20));
         assert_eq!(tiles[0], (original, Rect::new(0, 0, 50, 20)));

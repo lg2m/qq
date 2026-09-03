@@ -371,10 +371,10 @@ fn notices_only_render_for_the_session_that_owns_them() {
         Some(("model request failed", NoticeLevel::Error))
     );
 
-    app.panes.focused_mut().session = Some(other);
+    app.panes.focused_mut().show_session(Some(other));
     assert_eq!(app.visible_status(), None);
 
-    app.panes.focused_mut().session = Some(owner);
+    app.panes.focused_mut().show_session(Some(owner));
     assert_eq!(
         app.visible_status(),
         Some(("model request failed", NoticeLevel::Error))
@@ -1836,14 +1836,18 @@ fn streamed_rows_do_not_move_a_scrolled_transcript() {
 #[test]
 fn session_and_layout_changes_return_the_transcript_to_the_live_tail() {
     let mut app = App::new(TuiOptions::default());
-    app.panes.focused_mut().session = Some(SessionId::from_bytes([1; 16]));
+    app.panes
+        .focused_mut()
+        .show_session(Some(SessionId::from_bytes([1; 16])));
     app.update_transcript_viewport(100, 10, false);
     app.handle_terminal_event(Event::Key(KeyEvent::new(
         KeyCode::PageUp,
         KeyModifiers::NONE,
     )));
 
-    app.panes.focused_mut().session = Some(SessionId::from_bytes([2; 16]));
+    app.panes
+        .focused_mut()
+        .show_session(Some(SessionId::from_bytes([2; 16])));
     app.update_transcript_viewport(100, 10, false);
 
     assert_eq!(app.transcript_scroll_offset(), 0);
@@ -2670,7 +2674,7 @@ fn the_mouse_scrolls_the_pane_under_the_cursor_and_clicks_focus_it() {
     for tile in [left, right] {
         let mut viewport = Viewport::default();
         viewport.update(
-            (app.panes.get(tile.pane).unwrap().session, app.layout),
+            (app.panes.get(tile.pane).unwrap().session(), app.layout),
             200,
             40,
             false,

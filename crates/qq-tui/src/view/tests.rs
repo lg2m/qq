@@ -1,12 +1,13 @@
 use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
 use qq_protocol::{
-    AccountingTotal, ModelSelection, RunId, SessionAccounting, SessionEvent, SessionEventEnvelope,
-    SessionId, SessionSnapshot, SessionStatus, SessionSummary, WorkspaceSnapshot,
+    AccountingTotal, CommandRequest, ModelSelection, RunId, SessionAccounting, SessionCommand,
+    SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
+    WorkspaceSnapshot,
 };
 
 use super::*;
 use crate::{
-    ClientUpdate, ModelOption, TuiOptions,
+    ClientRequest, ClientUpdate, ModelOption, TuiOptions,
     commands::Command,
     fixtures::{self, SESSION},
     render::{code_keyword, success, surface, surface_color},
@@ -1777,7 +1778,7 @@ fn model_picker_hint_reflects_apply_versus_create() {
     let text = frame_text(&frame);
     assert!(text.contains("Enter sets the session model, Ctrl-N creates a session"));
 
-    app.panes.focused_mut().session = None;
+    app.panes.focused_mut().show_session(None);
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
     assert!(text.contains("Enter creates session"));
@@ -1915,19 +1916,19 @@ fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
         frame_rows(&FrameRenderer::default().frame_and_commit(app, width, 24)).join("\n")
     };
     let narrow = rows_at(&mut app, 100);
-    assert!(
-        !narrow.contains("SESSIONS  1 running"),
-        "auto-hidden when narrow"
-    );
+    assert!(!narrow.contains("WORKING  1"), "auto-hidden when narrow");
 
     let wide_frame = FrameRenderer::default().frame_and_commit(&mut app, 160, 24);
     let wide = frame_rows(&wide_frame).join("\n");
-    assert!(wide.contains("SESSIONS  1 running"), "{wide}");
+    assert!(wide.contains("WORKING  1"), "{wide}");
+    // The narrow frame shows the agent strip instead so the child is not
+    // invisible at 100 columns.
+    assert!(narrow.contains("2 agents"), "{narrow}");
     assert!(wide.contains("Survey callers"));
     assert!(wide.contains("Found twelve call sites"));
     // With the sidebar glued on, every body row is exactly the terminal
     // width: the border column lines up and nothing overflows.
-    for row in &wide_frame[2..wide_frame.len() - 4] {
+    for row in &wide_frame[1..wide_frame.len() - 3] {
         assert_eq!(
             row.width(),
             160,
@@ -1939,10 +1940,10 @@ fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
     // Ctrl-\ hides it even when wide; a second press shows it again.
     let toggle = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
     app.handle_terminal_event(toggle.clone());
-    assert!(!rows_at(&mut app, 160).contains("SESSIONS  1 running"));
+    assert!(!rows_at(&mut app, 160).contains("WORKING  1"));
     app.handle_terminal_event(toggle);
     assert!(
-        rows_at(&mut app, 100).contains("SESSIONS  1 running"),
+        rows_at(&mut app, 100).contains("WORKING  1"),
         "explicitly shown wins over width"
     );
 }
@@ -2248,9 +2249,9 @@ fn two_panes_render_side_by_side_with_titles_and_a_divider() {
     assert!(titles.contains(" Session"), "{titles}");
     assert!(titles.contains("▎Other"), "{titles}");
     // Every body row has a divider at the split column and both
-    // transcripts appear on their own side of it. Body is rows 1..=20:
-    // one top row, then body, then rule, composer, hint row.
-    let body = &rows[1..1 + 24 - 4];
+    // transcripts appear on their own side of it. Body is rows 1..=19:
+    // one top row, then body, then the agent strip, rule, composer, hint.
+    let body = &rows[1..1 + 24 - 5];
     assert!(
         body.iter().all(|row| row.chars().nth(50) == Some('│')),
         "{body:?}"
@@ -2677,4 +2678,273 @@ fn paths_elide_from_the_middle_and_keep_the_file_name() {
         "…/tools.rs"
     );
     assert_eq!(elide_path("crates/qq-tui/src/view/tools.rs", 8), "…ools.rs");
+}
+
+/// A parent with a child session that is running and waiting on a `shell`
+/// approval; the child's body is warm so the call is known client-side.
+fn app_with_child_awaiting_approval() -> (App, SessionId, SessionId, RunId, ToolCallId) {
+    let mut app = app_with_messages(1);
+    app.sidebar = crate::app::Sidebar::Hidden;
+    let parent = app.focused().unwrap();
+    let child_id = SessionId::from_bytes([0x40; 16]);
+    let run_id = RunId::from_bytes([0x41; 16]);
+    let call_id = ToolCallId::from_bytes([0x42; 16]);
+    let child = SessionSummary {
+        parent_id: Some(parent),
+        title: "Deploy helper".to_owned(),
+        status: SessionStatus::Running,
+        active_run_id: Some(run_id),
+        model: None,
+        estimated_cost_usd_nanos: None,
+        updated_at_ms: 2,
+        ..fixtures::session_summary(child_id)
+    };
+    // Warm the child through an included body so its calls are known.
+    app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
+        cursor: fixtures::cursor(1),
+        sessions: vec![child.clone()],
+        focused: None,
+        included: vec![fixtures::session_snapshot(child.clone())],
+        ..fixtures::workspace_snapshot()
+    }));
+    let call = ToolCallSnapshot {
+        run_id,
+        call_ordinal: 0,
+        provider_call_id: "c".to_owned(),
+        arguments: r#"{"command":"rm -rf build"}"#.to_owned(),
+        state: ToolCallState::AwaitingApproval,
+        ..fixtures::tool_call(call_id, child_id, "shell")
+    };
+    app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+        run_id: Some(run_id),
+        occurred_at_ms: 3,
+        ..fixtures::envelope(
+            2,
+            child_id,
+            SessionEvent::ToolApprovalRequested {
+                tool_call: call,
+                shell: None,
+                edit: None,
+            },
+        )
+    }));
+    (app, parent, child_id, run_id, call_id)
+}
+
+#[test]
+fn the_agent_strip_names_a_sibling_needing_approval_at_100_columns() {
+    let (mut app, parent, _, _, _) = app_with_child_awaiting_approval();
+    assert_eq!(app.focused(), Some(parent));
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    let strip = rows
+        .iter()
+        .find(|row| row.contains("2 agents"))
+        .unwrap_or_else(|| panic!("agent strip in {rows:#?}"));
+    assert!(strip.contains("◇ 1"), "{strip}");
+    assert!(strip.contains("Ctrl-G"), "{strip}");
+    // The hint row offers the in-place answer chords.
+    let hint = rows.last().unwrap();
+    assert!(hint.contains("Alt-A/Alt-D answer"), "{hint}");
+}
+
+#[test]
+fn a_background_approval_is_answered_in_place_without_moving_focus() {
+    let (mut app, parent, child_id, run_id, call_id) = app_with_child_awaiting_approval();
+    let (changed, requests) = app
+        .handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::ALT,
+        )))
+        .split();
+    assert!(changed);
+    assert_eq!(app.focused(), Some(parent), "focus stays put");
+    assert!(matches!(
+        requests.as_slice(),
+        [ClientRequest::Command(CommandRequest {
+            command: SessionCommand::RespondToolApproval {
+                run_id: r,
+                tool_call_id: c,
+                decision: qq_protocol::ApprovalDecision::ApproveOnce,
+            },
+            ..
+        })] if *r == run_id && *c == call_id
+    ));
+    assert!(
+        !app.sessions_needing_attention().contains(&child_id) || {
+            // Answered approvals stop counting as needing attention once the
+            // server confirms; locally the row is already suppressed.
+            app.pending_approval().is_none()
+        }
+    );
+}
+
+#[test]
+fn shift_n_denies_and_steers_with_an_amendment() {
+    let (mut app, _, child_id, run_id, call_id) = app_with_child_awaiting_approval();
+    app.focus_session(child_id);
+    app.apply_client_update(ClientUpdate::Steering(qq_protocol::SteeringCapabilities {
+        boundary: true,
+        interrupt: true,
+        max_pending_per_run: 4,
+    }));
+    assert_eq!(app.mode(), Mode::Approval);
+    let key = |code, modifiers| TerminalEvent::Key(KeyEvent::new(code, modifiers));
+    app.handle_terminal_event(key(KeyCode::Char('N'), KeyModifiers::SHIFT));
+    // The composer becomes the amendment field and shows the caret.
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("deny and steer:")),
+        "{rows:#?}"
+    );
+    for character in "use cargo clean".chars() {
+        app.handle_terminal_event(key(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    let (_, requests) = app
+        .handle_terminal_event(key(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    // Decision first, then an interrupting steer with the note.
+    assert_eq!(requests.len(), 2, "{requests:#?}");
+    assert!(matches!(
+        &requests[0],
+        ClientRequest::Command(CommandRequest {
+            command: SessionCommand::RespondToolApproval {
+                tool_call_id: c,
+                decision: qq_protocol::ApprovalDecision::Deny,
+                ..
+            },
+            ..
+        }) if *c == call_id
+    ));
+    assert!(matches!(
+        &requests[1],
+        ClientRequest::Command(CommandRequest {
+            command: SessionCommand::SteerRun { run_id: r, interrupt: true, input },
+            ..
+        }) if *r == run_id && input.len() == 1
+    ));
+    assert!(app.composer.text.is_empty());
+    assert!(app.approval_amendment.is_none());
+}
+
+#[test]
+fn the_sidebar_groups_sessions_by_what_the_user_should_do() {
+    let (mut app, parent, child_id, _, _) = app_with_child_awaiting_approval();
+    app.sidebar = crate::app::Sidebar::Shown;
+    // A third session that finished while unfocused.
+    let done_id = SessionId::from_bytes([0x50; 16]);
+    let done_run = RunId::from_bytes([0x51; 16]);
+    let mut done = SessionSummary {
+        title: "Refactor".to_owned(),
+        status: SessionStatus::Running,
+        active_run_id: Some(done_run),
+        ..fixtures::session_summary(done_id)
+    };
+    let mut sequence = 2;
+    let mut event = |session_id, run_id, event| {
+        sequence += 1;
+        ClientUpdate::Event(SessionEventEnvelope {
+            run_id: Some(run_id),
+            occurred_at_ms: sequence,
+            ..fixtures::envelope(sequence, session_id, event)
+        })
+    };
+    app.apply_client_update(event(
+        done_id,
+        done_run,
+        SessionEvent::SessionCreated {
+            session: done.clone(),
+        },
+    ));
+    done.status = SessionStatus::Idle;
+    done.active_run_id = None;
+    done.last_outcome = Some(qq_protocol::RunOutcome::Completed);
+    app.apply_client_update(event(
+        done_id,
+        done_run,
+        SessionEvent::RunFinished {
+            session: done,
+            run_id: done_run,
+            outcome: qq_protocol::RunOutcome::Completed,
+            usage: None,
+            context_tokens: None,
+        },
+    ));
+
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 160, 30));
+    let sidebar: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            row.split_once('│')
+                .map(|(_, right)| right.trim_end().to_owned())
+        })
+        .collect();
+    let text = sidebar.join("\n");
+    let needs = text.find("NEEDS YOU").expect("needs-you group");
+    let idle = text
+        .find("IDLE")
+        .expect("idle group for the focused parent");
+    assert!(needs < idle, "needs-you first: {text}");
+    // The awaiting child and the unread finish both need the user.
+    assert!(text.contains("NEEDS YOU  2"), "{text}");
+    assert!(text.contains("Deploy helper"), "{text}");
+    assert!(text.contains("Refactor"), "{text}");
+    assert!(text.contains("1 new"), "unread count: {text}");
+    // Focusing the finished session clears its unread state and moves it to DONE.
+    app.focus_session(done_id);
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 160, 30));
+    let text = rows.join("\n");
+    assert!(text.contains("DONE  1"), "{text}");
+    assert!(text.contains("NEEDS YOU  1"), "{text}");
+    let _ = (parent, child_id);
+}
+
+#[test]
+fn the_attention_pane_lists_needs_most_urgent_first_and_the_changes_pane_flags_overlap() {
+    let (mut app, _, child_id, _, _) = app_with_child_awaiting_approval();
+    // A completed edit in the parent and an edit to the same file in the
+    // child so the change board has an overlap to flag.
+    let parent = app.focused().unwrap();
+    for (session_id, byte) in [(parent, 0x61_u8), (child_id, 0x62)] {
+        let mut calls = app.sessions[&session_id]
+            .tool_calls
+            .clone()
+            .unwrap_or_default();
+        calls.push(ToolCallSnapshot {
+            display: Some(qq_protocol::ToolCallDisplay::Diff {
+                path: "src/lib.rs".to_owned(),
+                diff: "@@ -1 +1,2 @@\n-a\n+b\n+c\n".to_owned(),
+            }),
+            ..fixtures::tool_call(ToolCallId::from_bytes([byte; 16]), session_id, "edit_file")
+        });
+        app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(calls);
+    }
+
+    app.execute(Command::ShowAttention);
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    let text = rows.join("\n");
+    assert!(text.contains("NEEDS YOU"), "{text}");
+    assert!(
+        text.contains("Deploy helper") && text.contains("needs approval"),
+        "{text}"
+    );
+    assert!(squash(&text).contains("Run rm -rf build"), "{text}");
+
+    app.execute(Command::ShowChanges);
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    let text = rows.join("\n");
+    assert!(text.contains("CHANGES"), "{text}");
+    let flagged = rows
+        .iter()
+        .find(|row| row.contains("src/lib.rs"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(flagged.contains("! "), "overlap flagged: {flagged}");
+    assert!(flagged.contains("+4 −2"), "{flagged}");
+    assert!(flagged.contains("2 agents"), "{flagged}");
+
+    // Focusing a session returns the pane to a transcript.
+    app.focus_session(parent);
+    assert!(matches!(
+        app.panes.focused().content,
+        PaneContent::Transcript(Some(id)) if id == parent
+    ));
 }

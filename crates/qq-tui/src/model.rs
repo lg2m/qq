@@ -288,6 +288,40 @@ pub(crate) struct SessionView {
     pub(crate) edit_previews: HashMap<ToolCallId, EditPreview>,
     /// Observed timing per tool call, bounded with the warm body.
     pub(crate) tool_timing: HashMap<ToolCallId, ToolCallTiming>,
+    /// Assistant messages and run finishes that arrived while this session
+    /// was not shown in any pane, cleared when it is focused. The sidebar
+    /// and agent strip show it so a finished sibling is not missed.
+    pub(crate) unread: u32,
+    /// The last run finished while unfocused and has not been looked at.
+    pub(crate) finished_unread: bool,
+}
+
+/// Why a session needs the user, most urgent first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Need {
+    Approval,
+    Failed,
+    FinishedUnread,
+}
+
+/// Which sidebar group a session belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Group {
+    NeedsYou,
+    Working,
+    Idle,
+    Done,
+}
+
+impl Group {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "NEEDS YOU",
+            Self::Working => "WORKING",
+            Self::Idle => "IDLE",
+            Self::Done => "DONE",
+        }
+    }
 }
 
 impl SessionView {
@@ -313,6 +347,46 @@ impl SessionView {
             live_tool_output: HashMap::new(),
             edit_previews: HashMap::new(),
             tool_timing: HashMap::new(),
+            unread: 0,
+            finished_unread: false,
+        }
+    }
+
+    /// The most urgent reason this session needs the user, if any.
+    pub(crate) fn need(&self) -> Option<Need> {
+        if !self.live.awaiting_approval.is_empty() {
+            return Some(Need::Approval);
+        }
+        if matches!(
+            self.summary.last_outcome,
+            Some(qq_protocol::RunOutcome::Failed { .. })
+        ) && self.finished_unread
+        {
+            return Some(Need::Failed);
+        }
+        if self.finished_unread {
+            return Some(Need::FinishedUnread);
+        }
+        None
+    }
+
+    /// Sidebar group: needs attention, running, idle with no history, or
+    /// finished and already seen.
+    pub(crate) fn group(&self) -> Group {
+        if self.need().is_some() {
+            return Group::NeedsYou;
+        }
+        match self.summary.status {
+            qq_protocol::SessionStatus::Running | qq_protocol::SessionStatus::Queued => {
+                Group::Working
+            }
+            qq_protocol::SessionStatus::Idle => {
+                if self.summary.last_outcome.is_some() {
+                    Group::Done
+                } else {
+                    Group::Idle
+                }
+            }
         }
     }
 

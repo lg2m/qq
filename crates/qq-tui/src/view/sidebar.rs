@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::Group;
 
 /// Columns the session sidebar occupies, including its left border.
 pub(super) const SIDEBAR_WIDTH: usize = 36;
@@ -43,6 +44,7 @@ pub(super) fn session_line(app: &App, session_id: SessionId, width: usize, prefi
 pub(super) fn pane_title(
     app: &App,
     session_id: Option<SessionId>,
+    content_title: Option<&str>,
     focused: bool,
     width: usize,
 ) -> Line {
@@ -52,6 +54,10 @@ pub(super) fn pane_title(
         (" ", muted())
     };
     let mut line = Line::styled(marker, marker_style);
+    if let Some(label) = content_title {
+        line.push(label, if focused { normal().bold() } else { muted() });
+        return truncate_line(line, width);
+    }
     match session_id.and_then(|id| app.sessions.get(&id)) {
         Some(session) => {
             line.push(
@@ -68,53 +74,116 @@ pub(super) fn pane_title(
     truncate_line(line, width)
 }
 
-/// Right-hand session tree with live status for every session, warm or cold.
-/// Each session takes one row (title) plus one row of status when it has
-/// anything to say: the active tool, an approval waiting, or the newest
-/// assistant text. Always `height` rows so it zips against the body.
+/// Right-hand session list grouped by what the user should do about each:
+/// NEEDS YOU (approvals, failures, unread finishes), WORKING, IDLE, DONE.
+/// Within a group, sessions keep tree order. Each session takes one row
+/// plus one row of live status when it has anything to say. The focused row
+/// sits on the selection background. Always `height` rows so it zips
+/// against the body.
 pub(super) fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
     let inner = width.saturating_sub(2);
-    let mut lines = Vec::with_capacity(height);
-    let mut header = Line::styled("│ ", muted());
-    header.push("SESSIONS", accent().bold());
-    let running = app
-        .sessions
-        .values()
-        .filter(|session| session.summary.status == SessionStatus::Running)
-        .count();
-    if running > 0 {
-        header.push(format!("  {running} running"), accent());
-    }
-    lines.push(truncate_line(header, width));
-    lines.push(Line::styled("│", muted()));
-    let order = app.sessions.thread_order();
     let mut rows: Vec<Line> = Vec::new();
     let mut focused_row = 0;
-    for &session_id in order {
-        let depth = app.sessions.depth(session_id);
-        let indent = "  ".repeat(depth.min(4));
-        if app.focused() == Some(session_id) {
-            focused_row = rows.len();
+    let order = app.sessions.thread_order();
+    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
+        let members: Vec<SessionId> = order
+            .iter()
+            .copied()
+            .filter(|id| app.sessions[id].group() == group)
+            .collect();
+        if members.is_empty() {
+            continue;
         }
-        rows.push(session_line(app, session_id, width, &format!("│ {indent}")));
-        if let Some(status) = live_status_line(app, session_id) {
-            let mut line = Line::styled(format!("│ {indent}   "), muted());
-            let used = line.width();
-            let (text, style) = status;
-            line.push(preview(&text, inner.saturating_sub(used)), style);
+        if !rows.is_empty() {
+            rows.push(Line::styled("│", border()));
+        }
+        let mut header = Line::styled("│ ", border());
+        header.push(
+            group.label(),
+            match group {
+                Group::NeedsYou => warning().bold(),
+                Group::Working => info().bold(),
+                Group::Idle | Group::Done => muted().bold(),
+            },
+        );
+        header.push(format!("  {}", members.len()), muted());
+        rows.push(truncate_line(header, width));
+        for session_id in members {
+            let depth = app.sessions.depth(session_id);
+            let indent = "  ".repeat(depth.min(4));
+            let focused = app.focused() == Some(session_id);
+            if focused {
+                focused_row = rows.len();
+            }
+            let mut line = session_line(app, session_id, width, &format!("│ {indent}"));
+            let unread = app.sessions[&session_id].unread;
+            if unread > 0 && !focused {
+                line.push(format!("  {unread} new"), accent());
+            }
+            if focused {
+                pad_line(&mut line, width);
+                for span in &mut line.spans[1..] {
+                    span.style = selection(span.style);
+                }
+            }
             rows.push(truncate_line(line, width));
+            if let Some((text, style)) = live_status_line(app, session_id) {
+                let mut line = Line::styled(format!("│ {indent}   "), muted());
+                let used = line.width();
+                line.push(preview(&text, inner.saturating_sub(used)), style);
+                rows.push(truncate_line(line, width));
+            }
         }
     }
     if rows.is_empty() {
         rows.push(Line::styled("│   no sessions yet", muted().italic()));
     }
-    let available = height.saturating_sub(lines.len());
-    lines.extend(selection_viewport(rows, available, focused_row));
+    let mut lines = selection_viewport(rows, height, focused_row);
     while lines.len() < height {
-        lines.push(Line::styled("│", muted()));
+        lines.push(Line::styled("│", border()));
     }
     lines.truncate(height);
     lines
+}
+
+/// One row above the composer when the sidebar is hidden and more than one
+/// session exists: how many agents there are and how many need the user,
+/// are working, or finished unseen, with the chord that jumps to them.
+pub(super) fn agent_strip(app: &App, width: usize) -> Option<Line> {
+    let total = app.sessions.values().count();
+    if total < 2 {
+        return None;
+    }
+    let mut needs = 0;
+    let mut working = 0;
+    let mut unread = 0;
+    for session in app.sessions.values() {
+        match session.group() {
+            Group::NeedsYou => needs += 1,
+            Group::Working => working += 1,
+            Group::Idle | Group::Done => {}
+        }
+        if session.unread > 0 && app.focused() != Some(session.summary.id) {
+            unread += 1;
+        }
+    }
+    let mut line = Line::styled(format!(" {total} agents"), muted());
+    if working > 0 {
+        line.push("  ", muted());
+        line.push(format!("{} {working}", spinner(app.animation_tick)), info());
+    }
+    if needs > 0 {
+        line.push("  ", muted());
+        line.push(format!("◇ {needs}"), warning().bold());
+        if let Some(chord) = app.chord_label(crate::commands::Command::FocusNextApproval) {
+            line.push(format!(" ({chord})"), muted());
+        }
+    }
+    if unread > 0 {
+        line.push("  ", muted());
+        line.push(format!("● {unread} unread"), accent());
+    }
+    Some(truncate_line(line, width))
 }
 
 /// Rows for the child session a `spawn_agent` call created: its title and
@@ -124,8 +193,40 @@ pub(super) fn child_rows(app: &App, tool_call_id: ToolCallId, width: usize) -> V
     let Some(child) = app.sessions.child_spawned_by(tool_call_id) else {
         return Vec::new();
     };
-    let mut rows = vec![session_line(app, child, width, "       ↳ ")];
-    if let Some((text, style)) = live_status_line(app, child) {
+    let view = &app.sessions[&child];
+    // `↳ title  ◐ current tool · 3 tools · 41s`: the card is the child's
+    // one-line status while it works and its outcome once it is done.
+    let mut line = session_line(app, child, width, "       ↳ ");
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tool) = &view.live.active_tool {
+        parts.push(tool.clone());
+    }
+    let calls = view
+        .runs
+        .values()
+        .map(|stats| stats.tool_calls)
+        .sum::<u32>();
+    if calls > 0 {
+        parts.push(count_noun(calls as usize, "tool", "tools"));
+    }
+    if let Some(stats) = view
+        .summary
+        .active_run_id
+        .and_then(|run| view.runs.get(&run))
+        && let Some(started) = stats.started_at_ms
+    {
+        parts.push(format_duration_ms(app.now_ms.saturating_sub(started)));
+    }
+    if view.unread > 0 && app.focused() != Some(child) {
+        parts.push(format!("{} new", view.unread));
+    }
+    if !parts.is_empty() {
+        line.push(format!("  {}", parts.join(" · ")), muted());
+    }
+    let mut rows = vec![truncate_line(line, width)];
+    if let Some((text, style)) = live_status_line(app, child)
+        && view.live.active_tool.is_none()
+    {
         let mut line = Line::styled("            ", muted());
         let used = line.width();
         line.push(preview(&text, width.saturating_sub(used)), style);

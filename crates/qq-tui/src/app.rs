@@ -18,7 +18,7 @@ use crate::{
     composer::Composer,
     effect::{Effect, Effects, Redraw},
     input::{Mode, Overlay},
-    panes::{Axis, Direction, PaneId, Panes, Viewport},
+    panes::{Axis, Direction, PaneContent, PaneId, Panes, Viewport},
     picker::Picker,
     terminal,
     theme::Theme,
@@ -226,6 +226,10 @@ pub(crate) struct App {
     /// The open overlay, if any. At most one overlay owns input at a time.
     pub overlay: Option<Overlay>,
     pub composer: Composer,
+    /// An approval decision waiting for a steering amendment: `Y` or `N`
+    /// armed it, the composer collects the text, Enter sends the decision
+    /// and then steers the run with the text.
+    pub(crate) approval_amendment: Option<ApprovalChoice>,
     history_position: Option<usize>,
     history_draft: Option<String>,
     /// Cursor into the slash autocomplete list. The query is the composer
@@ -297,6 +301,7 @@ impl App {
             focus_clock: 0,
             overlay: None,
             composer: Composer::default(),
+            approval_amendment: None,
             history_position: None,
             history_draft: None,
             slash: Picker::new(),
@@ -664,7 +669,7 @@ impl App {
     /// eviction keeps the most recently viewed sessions. Does not request
     /// anything.
     fn set_focus(&mut self, session_id: SessionId) {
-        self.panes.focused_mut().session = Some(session_id);
+        self.panes.focused_mut().show_session(Some(session_id));
         self.set_focus_clock(session_id);
     }
 
@@ -672,6 +677,8 @@ impl App {
         self.focus_clock += 1;
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.last_focused = self.focus_clock;
+            session.unread = 0;
+            session.finished_unread = false;
         }
     }
 
@@ -1008,6 +1015,11 @@ impl App {
                 let Some(call) = self.transcript_cursor else {
                     return Effects::none();
                 };
+                // A spawn call opens its child; every other call toggles detail.
+                if let Some(child) = self.sessions.child_spawned_by(call) {
+                    self.transcript_cursor = None;
+                    return self.focus_session(child);
+                }
                 if !self.expanded_tool_calls.remove(&call) {
                     self.expanded_tool_calls.insert(call);
                 }
@@ -1102,7 +1114,7 @@ impl App {
     /// The session shown in the focused pane; what every focus-dependent
     /// surface (composer, approvals, footers, tree navigation) acts on.
     pub(crate) fn focused(&self) -> Option<SessionId> {
-        self.panes.focused().session
+        self.panes.focused().session()
     }
 
     /// An effect asking for the user's attention, or nothing while the
@@ -1132,7 +1144,7 @@ impl App {
     ) {
         let layout = self.layout;
         let pane = self.panes.focused_mut();
-        let context = (pane.session, layout);
+        let context = (pane.session(), layout);
         pane.viewport
             .update(context, body_rows, height, preserve_tail_anchor);
     }
@@ -1261,6 +1273,14 @@ impl App {
                 effects
             }
             Command::PruneSessions => self.request_prune_confirmation(),
+            Command::ShowAttention => {
+                self.panes.focused_mut().content = PaneContent::Attention;
+                Effects::redraw(Redraw::Immediate)
+            }
+            Command::ShowChanges => {
+                self.panes.focused_mut().content = PaneContent::Changes;
+                Effects::redraw(Redraw::Immediate)
+            }
             Command::CursorUp => Effects::changed_now(self.move_transcript_cursor(false)),
             Command::CursorDown => Effects::changed_now(self.move_transcript_cursor(true)),
             Command::ToggleToolDetail => {
@@ -1339,10 +1359,12 @@ impl App {
                 );
                 self.queue_draft()
             }
-            Command::FocusNextApproval => match self.next_session_awaiting_approval() {
+            Command::ApproveBackground => self.respond_to_background_approval(true),
+            Command::DenyBackground => self.respond_to_background_approval(false),
+            Command::FocusNextApproval => match self.next_session_needing_attention() {
                 Some(session_id) => self.focus_session(session_id),
                 None => {
-                    self.set_info("no session is waiting for approval".to_owned());
+                    self.set_info("no session needs you right now".to_owned());
                     Effects::redraw(Redraw::Immediate)
                 }
             },
@@ -1515,6 +1537,11 @@ impl App {
         if text.is_empty() {
             return Effects::none();
         }
+        self.steer_with_text(text, interrupt)
+    }
+
+    /// Send `text` as steering for the focused session's active run.
+    fn steer_with_text(&mut self, text: String, interrupt: bool) -> Effects {
         let Some(session_id) = self.focused() else {
             self.set_warning("create a session before steering a run".to_owned());
             return Effects::redraw(Redraw::Immediate);
@@ -1762,15 +1789,105 @@ impl App {
         if matches!(self.settings.action_for(key), Some(Action::CancelRun)) {
             return self.cancel_run();
         }
+        // With an amendment armed, the composer collects the steering text;
+        // Enter sends the decision then the steer, Esc drops the amendment.
+        if let Some(choice) = self.approval_amendment {
+            return match key.code {
+                KeyCode::Enter => {
+                    self.approval_amendment = None;
+                    let text = self.composer.expanded().trim().to_owned();
+                    let mut effects = self.respond_to_approval(choice);
+                    if !text.is_empty() {
+                        self.composer.clear();
+                        effects.extend(self.steer_with_text(text, true));
+                    }
+                    effects
+                }
+                KeyCode::Esc => {
+                    self.approval_amendment = None;
+                    self.composer.clear();
+                    Effects::redraw(Redraw::Immediate)
+                }
+                KeyCode::Backspace => Effects::changed_now(self.composer.backspace()),
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Effects::changed_now(self.push_input(character))
+                }
+                _ => Effects::none(),
+            };
+        }
         match key.code {
-            KeyCode::Char('y' | 'Y') => self.respond_to_approval(ApprovalChoice::Once),
+            KeyCode::Char('y') => self.respond_to_approval(ApprovalChoice::Once),
             KeyCode::Char('a' | 'A') => self.respond_to_approval(ApprovalChoice::Session),
             KeyCode::Char('w' | 'W') => self.respond_to_approval(ApprovalChoice::Workspace),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                self.respond_to_approval(ApprovalChoice::Deny)
+            KeyCode::Char('n') | KeyCode::Esc => self.respond_to_approval(ApprovalChoice::Deny),
+            // Shift-Y / Shift-N: decide and then steer the run with a note,
+            // for "yes, but…" and "no, do this instead".
+            KeyCode::Char('Y') => {
+                self.approval_amendment = Some(ApprovalChoice::Once);
+                Effects::redraw(Redraw::Immediate)
+            }
+            KeyCode::Char('N') => {
+                self.approval_amendment = Some(ApprovalChoice::Deny);
+                Effects::redraw(Redraw::Immediate)
             }
             _ => Effects::none(),
         }
+    }
+
+    /// Answer the first approval waiting in a session other than the focused
+    /// one, without moving focus. The banner names that session; this is
+    /// its inline answer.
+    fn respond_to_background_approval(&mut self, approve: bool) -> Effects {
+        let Some(session_id) = self.sessions_needing_attention().into_iter().find(|id| {
+            Some(*id) != self.focused() && !self.sessions[id].live.awaiting_approval.is_empty()
+        }) else {
+            self.set_info("no other session is waiting for approval".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        };
+        let Some(call) = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.tool_calls.as_ref())
+            .and_then(|calls| {
+                calls.iter().find(|call| {
+                    call.state == ToolCallState::AwaitingApproval
+                        && !self.answered_approvals.contains(&call.id)
+                })
+            })
+        else {
+            // The session is waiting but its body is cold: focus it so the
+            // body loads and the inline block appears.
+            return self.focus_session(session_id);
+        };
+        let tool_call_id = call.id;
+        let run_id = call.run_id;
+        let title = self.sessions[&session_id].summary.title.clone();
+        self.answered_approvals.insert(tool_call_id);
+        self.set_info(format!(
+            "{} {title}'s {}",
+            if approve { "approved" } else { "denied" },
+            self.sessions[&session_id]
+                .live
+                .active_tool
+                .as_deref()
+                .unwrap_or("tool call")
+        ));
+        self.send(
+            PendingIntent::Approval { tool_call_id },
+            SessionCommand::RespondToolApproval {
+                run_id,
+                tool_call_id,
+                decision: if approve {
+                    ApprovalDecision::ApproveOnce
+                } else {
+                    ApprovalDecision::Deny
+                },
+            },
+        )
     }
 
     fn respond_to_approval(&mut self, choice: ApprovalChoice) -> Effects {
@@ -1964,10 +2081,25 @@ impl App {
             .collect()
     }
 
-    /// The next session (after the focused one, wrapping) that is waiting
-    /// for an approval answer, excluding the focused session itself.
-    fn next_session_awaiting_approval(&self) -> Option<SessionId> {
-        let waiting = self.sessions_awaiting_approval();
+    /// Sessions that need the user, most urgent first and then in tree
+    /// order: approvals, then unread failures, then unread finishes.
+    pub(crate) fn sessions_needing_attention(&self) -> Vec<SessionId> {
+        let mut needing: Vec<(crate::model::Need, usize, SessionId)> = self
+            .sessions
+            .thread_order()
+            .iter()
+            .enumerate()
+            .filter_map(|(position, id)| self.sessions[id].need().map(|need| (need, position, *id)))
+            .collect();
+        needing.sort();
+        needing.into_iter().map(|(_, _, id)| id).collect()
+    }
+
+    /// The next session (after the focused one, wrapping) that needs the
+    /// user, excluding the focused session itself. Approvals come first so
+    /// Ctrl-G always lands on the most urgent thing.
+    fn next_session_needing_attention(&self) -> Option<SessionId> {
+        let waiting = self.sessions_needing_attention();
         let others: Vec<SessionId> = waiting
             .iter()
             .copied()
@@ -1976,21 +2108,26 @@ impl App {
         if others.is_empty() {
             return None;
         }
-        let order = self.sessions.thread_order();
-        let focus_position = self
+        // Cycle: the item after the focused one in the priority list, or the
+        // first when the focused session is not in the list.
+        let position = self
             .focused()
-            .and_then(|focused| order.iter().position(|id| *id == focused))
-            .unwrap_or(0);
-        others
-            .iter()
-            .copied()
-            .find(|id| order.iter().position(|o| o == id).unwrap_or(0) > focus_position)
-            .or_else(|| others.first().copied())
+            .and_then(|focused| waiting.iter().position(|id| *id == focused));
+        match position {
+            Some(index) => waiting
+                .iter()
+                .cycle()
+                .skip(index + 1)
+                .take(waiting.len())
+                .copied()
+                .find(|id| Some(*id) != self.focused()),
+            None => others.first().copied(),
+        }
     }
 }
 
-#[derive(Clone, Copy)]
-enum ApprovalChoice {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalChoice {
     Once,
     Session,
     Workspace,
