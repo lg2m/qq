@@ -266,8 +266,9 @@ pub(crate) struct App {
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
     /// enough; the toggle command cycles through explicit on and off.
     pub sidebar: Sidebar,
-    /// Whether the terminal reports mouse events to us. Off by default so
-    /// native selection and copy keep working; `/mouse` turns it on.
+    /// Whether the terminal reports mouse events to us. On by default so the
+    /// wheel scrolls the transcript; `/mouse` turns it off for native
+    /// selection and copy (most terminals also select with Shift held).
     pub(crate) mouse_capture: bool,
     /// Terminal width from the last resize event, so update paths can decide
     /// whether a change to an unshown session is visible at all. Zero until
@@ -320,7 +321,7 @@ impl App {
             reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
             terminal_width: 0,
-            mouse_capture: false,
+            mouse_capture: true,
             themes: if options.themes.is_empty() {
                 vec![Theme::default()]
             } else {
@@ -1028,6 +1029,16 @@ impl App {
             KeyCode::Enter => self.submit_prompt(),
             KeyCode::PageUp => Effects::changed_now(self.scroll_focused_page(true)),
             KeyCode::PageDown => Effects::changed_now(self.scroll_focused_page(false)),
+            KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
+                let id = self.panes.focused_id();
+                let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(isize::MAX);
+                Effects::changed_now(self.scroll_pane(id, rows))
+            }
+            KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
+                let id = self.panes.focused_id();
+                let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(isize::MAX);
+                Effects::changed_now(self.scroll_pane(id, -rows))
+            }
             KeyCode::Backspace
                 if key
                     .modifiers
@@ -1264,10 +1275,9 @@ impl App {
             Command::ToggleMouse => {
                 self.mouse_capture = !self.mouse_capture;
                 self.set_info(if self.mouse_capture {
-                    "mouse capture on: wheel scrolls, click focuses; terminal selection is off"
-                        .to_owned()
+                    "mouse on: wheel scrolls, click focuses; hold Shift to select text".to_owned()
                 } else {
-                    "mouse capture off: terminal selection and copy work again".to_owned()
+                    "mouse off: terminal selection works; PageUp/PageDown scroll".to_owned()
                 });
                 let mut effects = Effects::redraw(Redraw::Immediate);
                 effects.push(Effect::MouseCapture(self.mouse_capture));

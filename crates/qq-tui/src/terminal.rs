@@ -435,6 +435,7 @@ fn enable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
         EnableBracketedPaste,
+        EnableMouseCapture,
         EnableFocusChange
     )
 }

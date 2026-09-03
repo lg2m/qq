@@ -150,8 +150,10 @@ Every other key lives in one command table. `?` on an empty composer, `F1`, or
 `/help` lists every command with its chord and slash name grouped by area;
 `Ctrl-K` or `/commands` opens the same list as a searchable palette that runs
 the highlighted command on Enter. Rebinding an action updates every hint that
-mentions it. Mouse capture is off so terminal selection and copy work; `/mouse`
-turns wheel scrolling and click-to-focus on. `Ctrl-R` searches the session's
+mentions it. The mouse wheel scrolls the pane under it and a click focuses it;
+`PageUp`/`PageDown` and `Shift-Up`/`Shift-Down` scroll from the keyboard and
+`Ctrl-Home`/`Ctrl-End` jump to the top and the live tail. Hold Shift to select
+text with the mouse, or `/mouse` to hand the mouse back to the terminal. `Ctrl-R` searches the session's
 prompt history; `Ctrl-Up`/`Ctrl-Down` select a tool call and Enter expands it
 alone (or opens the child a `spawn_agent` call created); `Ctrl-O` expands
 every call and `Alt-R` the reasoning. Expanded rows show when a call started,

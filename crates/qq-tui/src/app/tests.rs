@@ -3128,3 +3128,17 @@ fn ctrl_n_and_ctrl_p_no_longer_change_the_layout() {
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     assert_eq!(app.layout, layout);
 }
+
+#[test]
+fn shift_arrows_scroll_the_transcript_without_the_mouse() {
+    let mut app = App::new(TuiOptions::default());
+    app.update_transcript_viewport(100, 12, false);
+    let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT));
+    assert!(app.handle_terminal_event(key(KeyCode::Up)).redraws());
+    assert_eq!(app.transcript_scroll_offset(), MOUSE_SCROLL_ROWS);
+    assert!(app.handle_terminal_event(key(KeyCode::Down)).redraws());
+    assert_eq!(app.transcript_scroll_offset(), 0);
+    // Plain Up still browses history / moves the caret, not the transcript.
+    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    assert_eq!(app.transcript_scroll_offset(), 0);
+}
