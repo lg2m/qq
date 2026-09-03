@@ -494,17 +494,27 @@ fn config_command(
                     "worker_model" => snapshot.provenance().worker_model(),
                     "max_output_tokens" => snapshot.provenance().max_output_tokens(),
                     _ => field
-                        .strip_prefix("provider.")
-                        .and_then(|name| snapshot.provenance().provider(name))
+                        .strip_prefix("pack.")
+                        .and_then(|id| snapshot.provenance().pack(id))
                         .or_else(|| {
                             field
-                                .strip_prefix("grant.tool.")
-                                .and_then(|name| snapshot.provenance().grant_tool(name))
+                                .strip_prefix("profile.")
+                                .and_then(|name| snapshot.provenance().profile(name))
                         })
                         .or_else(|| {
                             field
-                                .strip_prefix("grant.shell.")
-                                .and_then(|prefix| snapshot.provenance().grant_shell_prefix(prefix))
+                                .strip_prefix("provider.")
+                                .and_then(|name| snapshot.provenance().provider(name))
+                                .or_else(|| {
+                                    field
+                                        .strip_prefix("grant.tool.")
+                                        .and_then(|name| snapshot.provenance().grant_tool(name))
+                                })
+                                .or_else(|| {
+                                    field.strip_prefix("grant.shell.").and_then(|prefix| {
+                                        snapshot.provenance().grant_shell_prefix(prefix)
+                                    })
+                                })
                         }),
                 }
                 .cloned()
@@ -571,6 +581,46 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
         "  shell prefixes: {}",
         join_or_none(grants.shell_prefixes())
     );
+    if !snapshot.packs().is_empty() {
+        println!("packs:");
+        for pack in snapshot.packs().values() {
+            let name = pack
+                .name()
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default();
+            println!(
+                "  {} {}{name}\t{}",
+                pack.id(),
+                pack.version(),
+                pack.directory().display()
+            );
+        }
+    }
+    if !snapshot.profiles().is_empty() {
+        println!("profiles:");
+        for (name, profile) in snapshot.profiles() {
+            let mut parts = Vec::new();
+            if let Some(model) = profile.model() {
+                parts.push(format!("model={model}"));
+            }
+            if let Some(mode) = profile.approval_mode() {
+                let mode = match mode {
+                    config::ProfileApprovalMode::ReadOnly => "read_only",
+                    config::ProfileApprovalMode::Ask => "ask",
+                    config::ProfileApprovalMode::Auto => "auto",
+                    config::ProfileApprovalMode::Full => "full",
+                };
+                parts.push(format!("approval_mode={mode}"));
+            }
+            if let Some(tokens) = profile.max_output_tokens() {
+                parts.push(format!("max_output_tokens={tokens}"));
+            }
+            if let Some(pack) = profile.pack() {
+                parts.push(format!("pack={}@{}", pack.pack(), pack.version()));
+            }
+            println!("  {name}: {}", join_or_none(&parts));
+        }
+    }
 }
 
 fn join_or_none(values: &[String]) -> String {
