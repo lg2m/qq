@@ -87,8 +87,15 @@ That normalized text commits in the same transaction as `PromptQueued`; the
 original command journal retains the escape marker so preparation does not
 reinterpret it. Restart, event replay, snapshots, and follow-up context
 therefore see the same prompt the first provider request saw.
-Only an exact leading invocation is special; ordinary prompts never discover
-or inject skill bodies.
+Only an exact leading invocation is special; ordinary prompts never inject
+skill bodies. Native `.qq/` roots and agent-pack roots are additionally
+*disclosed*: the plan's compiled `SkillIndex` lists their names and YAML
+front-matter descriptions in the system prompt, and the model may read one
+body on demand with the `load_skill` tool. Compatibility roots (`.agents/`,
+`.claude/`) are indexed for explicit invocation only and never disclosed. The
+index holds at most 64 entries; a loaded body obeys the same bounds and
+authority rules as an explicit invocation and is recorded in the run's
+prompt identity.
 
 The initial resolver searches repository-local sources in two precedence
 tiers:
@@ -114,8 +121,9 @@ an explicit user follow-up in that child may do so; child sessions remain
 depth-capped and never gain `spawn_agent` from that selection.
 
 Commands and skills use the same UTF-8 Markdown body contract. Their paths
-supply name and kind; no front-matter schema is interpreted initially, so
-foreign metadata remains ordinary guidance text. A body is capped at 64 KiB,
+supply name and kind; the only front matter interpreted is a `description`
+line used for disclosure, so other foreign metadata remains ordinary guidance
+text. A body is capped at 64 KiB,
 resolved through the workspace capability, and rejected if it is not a regular
 file, is invalid UTF-8, or escapes through a symlink. Supporting files remain
 references only: loading a skill grants neither filesystem authority nor
@@ -130,6 +138,13 @@ provider-neutral tool declarations so evaluation artifacts remain explainable.
 Clients may offer completion for discoverable names, but discovery, resolution,
 loading, and rejection remain runtime behavior shared by direct, server, TUI,
 and benchmark paths.
+
+Agent packs add a third source: a pack selected by the session's profile
+contributes its declared skill and command roots as `pack:<id>/...` between
+the native and compatibility tiers, and prepends its persona to the system
+prompt. Packs are directories with a `pack.ron` manifest discovered from the
+global configuration directory and, for trusted projects, `.qq/packs/`; see
+`docs/design/architecture.md`.
 
 User-home, administrator-managed, and bundled roots are reserved follow-up
 tiers. Reading the server process's home directory implicitly would make a
@@ -353,20 +368,51 @@ control, not that the model needs new verbs.
 The harness's own undo layer, run snapshots, is independent of the
 user's VCS and planned in `docs/plans/run-snapshots.md`.
 
+## External Tool Hosts
+
+Anything that is not a built-in reaches the model through an
+`ExternalToolHost`: a generation-stamped catalog, a bounded call with a
+deadline and cancellation, typed failures (`timeout`, `cancelled`,
+`unavailable`, `overloaded`, `invalid_result`, `refused`, `unknown_tool`,
+`shut_down`), explicit readiness, and terminal shutdown. Two hosts exist: the
+MCP registry below and an in-process `EmbeddedToolHost` (`ext__<host>__<tool>`)
+that an embedding application registers closures on, with a frozen registry,
+a concurrency permit, a per-call deadline, and argument (64 KiB) and result
+(1 MiB) bounds. Both pass the same conformance suite. Hosts never retry
+implicitly, and a host's effect hints are advisory: approval policy classifies
+every external call by name, exactly as before.
+
+Host tools are compiled into the plan's `ToolCatalog` at plan compile time,
+not fetched per run. A tool is excluded, with a typed reason recorded in the
+descriptor and the capability document, when its name is malformed or
+duplicates another, its schema exceeds 16 KiB, its description exceeds 4 KiB,
+the catalog already holds 512 tools, or external schemas already total 1 MiB.
+A catalog with at most 24 external tools and 32 KiB of external schema is sent
+whole on every request. A larger catalog is exposed progressively: requests
+carry the built-ins plus `select_tools`, the system prompt carries a compact
+index of external names and descriptions, and the model pins up to 32 tools
+per run by keyword; pinned schemas join every later request in that run and a
+recovered run re-pins from its transcript. Calling an unpinned external tool
+is a tool error that points at `select_tools`.
+
 ## MCP
 
-MCP is the extension mechanism. QQ does not grow a plugin API; anything
-beyond the built-in tools arrives as an MCP server.
+MCP is the primary external host. QQ does not grow a dynamic plugin API;
+anything beyond the built-in tools arrives as an MCP server or through the
+embedded host above.
 
 - Servers are declared in configuration (global and per-workspace), with
   stdio and streamable-HTTP transports. Use the official Rust SDK (`rmcp`)
   with minimal features rather than hand-rolling the protocol.
 - The QQ server owns one client connection per configured MCP server, shared
   by every session. Connections start lazily on first use (or eagerly at
-  boot when configured), and tool schemas are fetched once and cached,
-  refreshed on `list_changed` notifications. Per-session connections would
-  multiply startup cost and defeat connection reuse; a shared client keeps
-  MCP calls as cheap as built-ins after the first use.
+  boot when configured), and tool schemas are fetched once into a numbered
+  catalog generation that a `list_changed` notification, a reconnect, or a
+  shutdown advances; a stale generation makes the plan stale, so the next
+  load recompiles while active runs keep the catalog they were admitted with.
+  Per-session connections would multiply startup cost and defeat connection
+  reuse; a shared client keeps MCP calls as cheap as built-ins after the
+  first use.
 - MCP tools are namespaced `mcp__<server>__<tool>` and merged into the same
   declaration list, persistence, events, and approval flow as built-in
   tools. Clients render them identically.

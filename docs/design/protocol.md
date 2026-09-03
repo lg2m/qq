@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 14
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -93,7 +93,15 @@ events; `RunLimits` gained input/output token, tool-output-byte, and child
 bounds with their `BudgetLimitKind`s; sessions and runs carry opaque
 `correlation`; `POST /v1/capabilities` describes the server; and `ServerInfo`
 plus the capability document tolerate unknown fields so version skew is
-reported rather than failing to decode.
+reported rather than failing to decode. Version 14 froze the tool catalog into
+the plan: `RunPromptIdentity` gained `catalog_digest`, `exposure`
+(`full`/`progressive`), and `context_sources` (one `ContextSourceRecord` per
+attached source with its typed outcome and content hash); `RunFailureKind`
+gained `context_source`; `RunPlanIdentity.descriptor_version` is 3 because the
+descriptor now carries the catalog, skill index, and pack sections; the
+capability document gained `tools`, `events`, and the per-workspace
+`workspace_tools` section; and `AgentProfileSummary` gained `pack`. Golden
+fixtures moved to `crates/qq-protocol/tests/fixtures/v14/`.
 
 Clients and servers must agree on this value.
 
@@ -266,7 +274,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 13,
+  "protocol_version": 14,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -286,12 +294,12 @@ optional-bodied:
 ```
 
 Response `ServerCapabilities` (abridged; see
-`crates/qq-protocol/tests/fixtures/v13/capabilities.json` for the full golden):
+`crates/qq-protocol/tests/fixtures/v14/capabilities.json` for the full golden):
 
 ```json
 {
   "version": 1,
-  "protocol_version": 13,
+  "protocol_version": 14,
   "server_version": "0.1.0",
   "input_parts": ["text", "workspace_file"],
   "commands": ["resolve_workspace", "create_session", "submit_prompt", "steer_run", "..."],
@@ -315,8 +323,25 @@ Response `ServerCapabilities` (abridged; see
   "approval_modes": ["read_only", "ask", "auto", "full"],
   "profiles": [
     { "id": "default", "model": "openai/gpt-5.6", "approval_mode": "auto" },
-    { "id": "review", "model": "anthropic/claude-x", "approval_mode": "read_only" }
-  ]
+    { "id": "review", "model": "anthropic/claude-x", "approval_mode": "read_only",
+      "pack": { "id": "review-kit", "version": "1.2.0" } }
+  ],
+  "tools": {
+    "max_catalog_tools": 512, "max_tool_schema_bytes": 16384,
+    "max_catalog_schema_bytes": 1048576, "full_exposure_tools": 24,
+    "full_exposure_schema_bytes": 32768, "max_pinned_tools": 32,
+    "max_indexed_skills": 64, "external_prefixes": ["mcp__", "ext__"]
+  },
+  "workspace_tools": {
+    "catalog_digest": "cccc…", "exposure": "progressive",
+    "hosts": [{ "name": "mcp", "generation": 3, "tool_count": 40, "ready": true }],
+    "excluded_tools": 1,
+    "skills": { "digest": "dddd…", "indexed": 2, "disclosed": 1 }
+  },
+  "events": {
+    "post_commit": true, "replay_page": 128, "max_subscriptions": 64,
+    "max_event_bytes": 1048576, "retention_bounded": false
+  }
 }
 ```
 
@@ -327,6 +352,18 @@ that workspace's layered configuration; `default` is always first and reflects
 the top-level configuration. Provider and model capabilities stay on
 `POST /v1/models`. Every bound is the constant the transport or runtime
 enforces.
+
+`tools` states the catalog bounds every plan is compiled under and the
+external name prefixes. `workspace_tools`, like `profiles`, is present only for
+a named workspace: it summarizes that workspace's default plan — the catalog
+digest, whether requests carry every schema (`full`) or an index plus
+`select_tools` pins (`progressive`), each external host's generation, admitted
+tool count, and readiness, how many declared tools were excluded, and the skill
+index. `events` is the observer contract: events are published only after their
+durable commit, a subscriber is served `replay_page` events per page from its
+cursor, at most `max_subscriptions` SSE subscriptions are accepted (503 beyond),
+and `retention_bounded: false` means a cursor from any point in the store's
+history replays.
 
 ### Command envelope
 
@@ -1233,7 +1270,13 @@ source, optional declared version, and content hash. Nested instructions found
 later remain durable tool evidence but do not retroactively change this
 pre-provider identity. `prompt_identity` is absent for historical runs and
 runs that failed before prompt preparation; version-6 rows may omit the fields
-added in version 7.
+added in version 7. `catalog_digest` and `exposure` identify the compiled tool
+catalog the run was admitted with and how it was exposed; `context_sources`
+lists every attached `ContextSource` with its outcome (`fetched`,
+`fetched_truncated`, `cached`, `cached_truncated`, `timed_out`, `unavailable`,
+`refused`, `invalid`), item and byte counts, and the content hash of the block
+appended to the system prompt. All three are absent or empty on rows written
+before version 14.
 
 `resolved_model` is the versioned, secret-free execution descriptor committed
 once after runtime resolution and before the provider stream is polled. Its
@@ -1420,7 +1463,7 @@ bound held when the provider stopped reporting usage.
 ```json
 {
   "profile": "review",
-  "descriptor_version": 2,
+  "descriptor_version": 3,
   "digest": "aaaa…",
   "credential_epoch": 3
 }
@@ -1429,7 +1472,8 @@ bound held when the provider stopped reporting usage.
 `RunPlanIdentity` is fixed when a run starts and carried on `run_started` and
 `RunSnapshot.plan`. `digest` is the SHA-256 of the secret-free
 `AgentPlanDescriptor` the run was compiled from (provider shape, model,
-workspace, prompt version, instructions, tool catalog, MCP declarations, retry
+workspace, prompt version, instructions, tool catalog with its host
+generations and exclusions, skill index, agent pack, MCP declarations, retry
 policy, configuration sources, profile); two runs with equal digests were
 admitted with behaviorally identical plans. `credential_epoch` is the opaque
 credential-store generation that authorized the plan; it moves on rotation
@@ -1456,7 +1500,12 @@ provider_transport
 provider_api
 provider_response
 provider_protocol
+context_source
 ```
+
+`context_source` settles a run whose fail-closed `ContextSource` did not
+deliver before any provider work; the record on `prompt_identity` names the
+source and outcome.
 
 ### Token usage
 
@@ -1567,7 +1616,7 @@ server's version and report the skew. Events, snapshots, and every inbound
 type stay strict.
 
 Golden encodings for every command, receipt, event, and the capability
-document live under `crates/qq-protocol/tests/fixtures/v13/` and are checked
+document live under `crates/qq-protocol/tests/fixtures/v14/` and are checked
 byte-for-byte by `crates/qq-protocol/tests/wire_fixtures.rs`. A wire change
 fails that test first; regenerate the goldens with `QQ_UPDATE_FIXTURES=1`
 after bumping `PROTOCOL_VERSION`.

@@ -290,15 +290,19 @@ because it lacks the static-prefix identity and measured request byte count.
 Everything about an agent's behavior that does not depend on the prompt is
 compiled once into an immutable, runtime-only `CompiledAgentPlan` owned by
 `qq-core::plan`: the compiled provider handle, the `ResolvedModel`, the opened
-capability-scoped workspace with its instruction file already read, the static
-tool catalog (built-ins plus the `spawn_agent` and `search_history`
-declarations and their schema hash), the sub-agent routes, the MCP registry,
-and the retry policy. Durable session runs execute directly from the plan and
-perform no canonicalization, directory open, or instruction read before the
-first provider request; only an explicitly invoked command or skill document is
-still read per run. MCP tool declarations still join each run from the
-registry's cache, so a `list_changed` notification takes effect without a new
-plan.
+capability-scoped workspace with its instruction file already read, the
+compiled `ToolCatalog` (built-ins, the `spawn_agent`, `search_history`,
+`select_tools`, and `load_skill` declarations, and every admitted external tool
+with its serialized schema and digest), the compiled `SkillIndex`, the
+sub-agent routes, the external tool hosts, the selected agent pack, the
+context sources, and the retry policy. Durable session runs execute directly
+from the plan and perform no canonicalization, directory open, instruction
+read, or host catalog request before the first provider request; only an
+explicitly invoked command or skill document is still read per run. External
+tool declarations are frozen into the plan at compile time as a catalog
+generation: a run keeps the catalog it was admitted with, and a host that
+changes its catalog (an MCP `list_changed`, a reconnect, a shutdown) makes the
+plan stale so the next load recompiles.
 
 The root builds a typed `AgentProfile` from configuration and compiles it; core
 never sees configuration documents, secret values, or the credential store. The
@@ -306,9 +310,11 @@ plan's `AgentPlanDescriptor` is its secret-free canonical account: adapter
 build identity, provider `id`/API/sanitized endpoint/auth scheme/credential
 *reference* (environment name, stored name, profile, inline, ambient chain)
 and static header *names*, the resolved model, workspace root, prompt version,
-instruction hash and source, static tool names and schema hash, spawn routes,
-configuration grants, MCP server declarations, retry policy, and configuration
-source labels. `AgentPlanDigest` is the SHA-256 of a domain-tagged compact JSON
+instruction hash and source, the tool catalog (digest, exposure, admitted
+names, host generations, typed exclusions), the skill index, the selected pack
+(identifier, version, manifest digest, persona hash, tool policy), spawn
+routes, configuration grants, MCP server declarations, retry policy, and
+configuration source labels. `AgentPlanDigest` is the SHA-256 of a domain-tagged compact JSON
 encoding in declaration order (`DESCRIPTOR_VERSION` pins the encoding). Secret
 values, secret hashes, live handles, and the credential epoch never enter the
 descriptor or its digest.
@@ -324,9 +330,11 @@ secret bytes.
 The root's `PlanCache` holds one generation per (canonical workspace, model
 selection, explicit configuration) key and revalidates it on every load with a
 fixed list of `stat` calls: every path the configuration loader probed
-(`ConfigSnapshot::probed_paths`), the credential index file, and the workspace's
-`AGENTS.md`/`CLAUDE.md`. A warm lookup performs no configuration parsing,
-credential I/O, or directory listing. Any observable change recompiles; an
+(`ConfigSnapshot::probed_paths`), the credential index file, the workspace's
+`AGENTS.md`/`CLAUDE.md`, the skill roots the index was compiled from, and the
+selected pack's manifest and persona, plus one in-memory generation compare
+per external tool host. A warm lookup performs no configuration parsing,
+credential I/O, directory listing, or host round trip. Any observable change recompiles; an
 identical digest and epoch keeps the live generation, otherwise the new
 generation is published atomically for later runs while active runs keep the
 `Arc` they were admitted with. A failed recompile returns the configuration
@@ -357,6 +365,107 @@ profile is part of the descriptor and therefore the digest. A profile the
 configuration no longer declares fails the run that needs it with a
 `configuration` failure; `POST /v1/capabilities` lists what a workspace
 declares. `qq-config` does not depend on `qq-protocol`; the root translates.
+
+### Tool Catalog And External Hosts
+
+The catalog is compiled once per plan by `qq-core::catalog` from the static
+built-ins and every `ExternalToolHost` the root attached. Static tools are
+trusted and never excluded. External tools are validated by name shape
+(`mcp__<server>__<tool>`, `ext__<host>__<tool>`), deduplicated against the
+static names and each other, bounded per tool (16 KiB schema, 4 KiB
+description) and per catalog (512 tools, 1 MiB of external schema), and every
+refusal is recorded as a typed `ExcludedTool` in the descriptor and the
+capability document so the rest of the host stays usable. Entries are sorted
+by name for binary-search lookup; the catalog digest covers names,
+descriptions, serialized schemas, effect classes, and the exposure mode.
+
+Exposure is a compile-time decision. A catalog with at most 24 external tools
+and 32 KiB of external schema is sent whole on every request (`Full`). A larger
+catalog is `Progressive`: requests carry the static tools plus one
+`select_tools` meta-tool, and the system prompt carries a compact index of
+external names, descriptions, and host readiness. The model pins tools by
+keyword (`select_tools` ranks by deterministic token overlap, at most 8 matches
+per call, 32 pins per run); pinned schemas join every later request in that
+run, and a recovered run re-pins from the `select_tools` results already in its
+transcript, so the request the provider sees after a restart matches the one
+before it. Calling an unpinned external tool is a typed tool error that names
+`select_tools`, never a silent lookup miss.
+
+`ExternalToolHost` is the single seam for anything that is not a built-in:
+`catalog_blocking` returns a generation-stamped `HostCatalog` with readiness;
+`catalog_is_current` is the cheap plan-cache check; `call` runs under the
+runtime's deadline and cancellation and settles with a `HostCallError`
+(`Timeout`, `Cancelled`, `Unavailable`, `Overloaded`, `InvalidResult`,
+`Refused`, `UnknownTool`, `ShutDown`) that the loop turns into a bounded tool
+error; `shutdown` is explicit and terminal. Two hosts implement it: the root's
+wired MCP registry (`qq-mcp` owns generations, typed failures, hints, and
+shutdown) and `EmbeddedToolHost`, an in-process host with a frozen tool
+registry, a concurrency permit, a per-call deadline, and argument (64 KiB) and
+result (1 MiB) bounds. Both pass the shared conformance suite in
+`qq-core::hosts::conformance`; the MCP adapter runs the availability subset
+over a real stdio transport. Hosts perform no implicit retry, and host hints
+never grant authority: approval policy still classifies calls by name.
+
+Skills are compiled into a `SkillIndex` beside the catalog. Native `.qq/`
+roots and pack roots are *disclosed*: their names and front-matter
+descriptions appear in the system prompt and `load_skill` reads the body on
+demand. `.agents/` and `.claude/` roots are indexed for explicit `/name`
+invocation only. The index is bounded (64 entries) and its roots are
+fingerprinted into the plan so a new skill file recompiles on the next load,
+not on the next run.
+
+### Agent Packs
+
+An agent pack is a directory with a `pack.ron` manifest (`PACK_SCHEMA_VERSION
+= 1`) declaring an identifier, version, optional persona file, skill and
+command roots, a tool allow/deny policy, per-profile MCP subsets, and the
+minimum protocol version it requires. `qq-config` discovers packs from
+`<global>/packs/<id>/` and, when the project is trusted, `.qq/packs/<id>/`
+root-to-leaf, plus explicit `packs:` entries; at most 32 are admitted, later
+layers win by identifier, and every manifest error is a typed configuration
+failure that names the pack. Pack profiles merge beneath the configuration's
+own `profiles` in the same flat namespace and a name declared by both is a
+conflict, not a silent override.
+
+The root translates a selected pack into a `PackSelection` and the plan
+compiles it: the persona (bounded to `MAX_PERSONA_BYTES`) prepends the system
+prompt, pack skill roots join the disclosed index as `pack:<id>/...`, the tool
+policy filters the catalog before exposure is decided, and the MCP subset
+restricts which servers the wired host contributes. The descriptor's `pack`
+section and `AgentProfileSummary.pack` name the identifier and version; a pack
+that requires a newer protocol fails plan compilation with a configuration
+error rather than degrading.
+
+### Context Sources
+
+A `ContextSource` supplies pre-turn context the runtime does not own (memory,
+retrieval, project state). Sources are attached to the profile, bounded to
+eight per plan, and fetched after guidance and before the first provider
+request under a clamped `ContextBudget` (at most 64 KiB, 64 items, 10 s) with
+a bounded LRU `ContextCache` keyed by source and query. Each fetch settles with
+a `ContextSourceOutcome` (`Fetched`, `FetchedTruncated`, `Cached`,
+`CachedTruncated`, `TimedOut`, `Unavailable`, `Refused`, `Invalid`) recorded on
+`RunPromptIdentity.context_sources` with the content hash, so the descriptor
+and the run row agree on exactly what the model saw. Blocks are appended to
+the system prompt only: a source can never insert or alter transcript
+messages. A failure follows the source's declared `FailPolicy`: `Open` drops
+the block and records the outcome; `Closed` fails the run with
+`RunFailureKind::ContextSource` before any provider work.
+
+### Observers
+
+Every event a client can observe is published after its durable commit, and
+the server pages committed rows from SQLite per subscriber, so an observer
+that falls behind slows only itself. `qq_client::observer::run` is the
+ingestion contract for products that consume events (memory, analytics,
+notifications): it owns its cursor, delivers each committed event in sequence
+order to one `EventSink`, reconnects with bounded backoff (50 ms to 5 s) from
+the last acknowledged cursor after transport loss, and exits with a typed
+`ObserverExit` (`Stopped`, `CursorRejected` for a cursor from another store,
+`EventTooLarge`) that requires a fresh snapshot rather than a silent resume.
+The capability document's `events` section states the contract: post-commit
+delivery, the replay page, the subscription cap, the event bound, and that
+retention is unbounded.
 
 ### Structured Input And Steering
 
