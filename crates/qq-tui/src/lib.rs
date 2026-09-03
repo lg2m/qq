@@ -8,6 +8,7 @@ pub mod bench_support;
 mod commands;
 mod composer;
 mod input;
+mod panes;
 mod picker;
 mod render;
 mod settings;

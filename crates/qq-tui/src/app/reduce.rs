@@ -15,6 +15,7 @@ use super::{
 use crate::{
     ClientRequest,
     input::{Overlay, SessionConfirm},
+    panes::PaneId,
 };
 
 impl App {
@@ -318,7 +319,12 @@ impl App {
             return;
         }
         self.drafts.remove(&session_id);
-        let refocus = if self.focused == Some(session_id) {
+        // Every pane showing the deleted session moves to its neighbour in
+        // thread order; the focused pane's replacement is fetched if cold.
+        let showing: Vec<PaneId> = self.panes.panes_showing(session_id).collect();
+        let refocus = if showing.is_empty() {
+            None
+        } else {
             let order = self.thread_order();
             order
                 .iter()
@@ -333,8 +339,6 @@ impl App {
                         })
                         .copied()
                 })
-        } else {
-            None
         };
         let Some(removed) = self.sessions.remove(&session_id) else {
             return;
@@ -357,9 +361,16 @@ impl App {
                 session.summary.parent_id = None;
             }
         }
-        if self.focused == Some(session_id) {
-            self.focused = refocus;
-            if let (Some(next), Some(workspace_id)) = (refocus, self.workspace_id) {
+        for pane in &showing {
+            if let Some(pane) = self.panes.get_mut(*pane) {
+                pane.session = refocus;
+            }
+        }
+        if showing.contains(&self.panes.focused_id()) {
+            let warm = refocus
+                .and_then(|next| self.sessions.get(&next))
+                .is_some_and(SessionView::is_warm);
+            if let (Some(next), Some(workspace_id), false) = (refocus, self.workspace_id, warm) {
                 self.queued_requests
                     .push(ClientRequest::Snapshot(SnapshotRequest {
                         workspace_id,

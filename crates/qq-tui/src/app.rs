@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    ops::Range,
-};
+use std::collections::{HashMap, VecDeque};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
@@ -19,6 +16,7 @@ use crate::{
     commands::{self, Command, SlashEntry},
     composer::Composer,
     input::{Mode, Overlay, SessionConfirm},
+    panes::{Axis, Direction, PaneId, Panes, Viewport},
     picker::Picker,
     terminal,
 };
@@ -355,14 +353,6 @@ impl ToolDetail {
     }
 }
 
-#[derive(Debug, Default)]
-struct TranscriptViewport {
-    context: Option<(Option<SessionId>, Layout)>,
-    body_rows: usize,
-    height: usize,
-    offset: usize,
-}
-
 #[derive(Debug, Clone)]
 enum PendingIntent {
     Create,
@@ -389,7 +379,9 @@ pub(crate) struct App {
     pub workspace_id: Option<WorkspaceId>,
     pub workspace_path: String,
     pub sessions: HashMap<SessionId, SessionView>,
-    pub focused: Option<SessionId>,
+    /// Tiled panes; the focused pane decides which session the composer,
+    /// approvals, footers, and tree navigation act on.
+    pub(crate) panes: Panes,
     /// Monotonic counter bumped on every focus change; stamps `last_focused`.
     focus_clock: u64,
     /// The open overlay, if any. At most one overlay owns input at a time.
@@ -427,7 +419,6 @@ pub(crate) struct App {
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
     /// enough; the toggle command cycles through explicit on and off.
     pub sidebar: Sidebar,
-    transcript_viewport: TranscriptViewport,
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
     pending: HashMap<CommandId, PendingIntent>,
@@ -454,7 +445,7 @@ impl App {
             workspace_id: None,
             workspace_path: String::new(),
             sessions: HashMap::new(),
-            focused: None,
+            panes: Panes::default(),
             focus_clock: 0,
             overlay: None,
             composer: Composer::default(),
@@ -476,7 +467,6 @@ impl App {
             tool_detail: ToolDetail::default(),
             reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
-            transcript_viewport: TranscriptViewport::default(),
             last_sequence: 0,
             recent_events: VecDeque::new(),
             pending: HashMap::new(),
@@ -551,7 +541,7 @@ impl App {
                 self.workspace_id = None;
                 self.workspace_path.clear();
                 self.sessions.clear();
-                self.focused = None;
+                self.panes.clear_sessions();
                 self.overlay = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
@@ -710,10 +700,11 @@ impl App {
             return true;
         }
         let snapshot_focus = snapshot.focused.as_ref().map(|focused| focused.summary.id);
+        // A late snapshot for a session no pane shows any more is stale
+        // navigation output; installing it would yank focus back.
         if !initial
-            && self.focused.is_some()
-            && snapshot_focus.is_some()
-            && snapshot_focus != self.focused
+            && self.focused().is_some()
+            && snapshot_focus.is_some_and(|id| !self.panes.sessions().any(|shown| shown == id))
         {
             return false;
         }
@@ -755,8 +746,15 @@ impl App {
         if let Some(focused) = snapshot.focused {
             let focused_id = focused.summary.id;
             self.install_session_snapshot(focused, snapshot_sequence);
-            self.set_focus(focused_id);
-        } else if self.focused.is_none()
+            // The body may have been fetched for a non-focused pane (the
+            // user moved on before it arrived); only the initial snapshot
+            // and a still-focused pane move focus.
+            if initial || self.focused().is_none() || self.focused() == Some(focused_id) {
+                self.set_focus(focused_id);
+            } else {
+                self.set_focus_clock(focused_id);
+            }
+        } else if self.focused().is_none()
             && let Some(first) = self.root_sessions().first().copied()
         {
             self.set_focus(first);
@@ -847,27 +845,34 @@ impl App {
         self.evict_cold_bodies();
     }
 
-    /// Point focus at `session_id` and stamp it so warm-body eviction keeps
-    /// the most recently viewed sessions. Does not request anything.
+    /// Show `session_id` in the focused pane and stamp it so warm-body
+    /// eviction keeps the most recently viewed sessions. Does not request
+    /// anything.
     fn set_focus(&mut self, session_id: SessionId) {
+        self.panes.focused_mut().session = Some(session_id);
+        self.set_focus_clock(session_id);
+    }
+
+    fn set_focus_clock(&mut self, session_id: SessionId) {
         self.focus_clock += 1;
-        self.focused = Some(session_id);
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.last_focused = self.focus_clock;
         }
     }
 
     /// Drop transcript bodies beyond the warm limit, least recently focused
-    /// first. The focused session is never evicted. Summaries and live status
-    /// stay, so the sidebar and pickers keep working for cold sessions.
+    /// first. Sessions shown in any pane are pinned and never evicted.
+    /// Summaries and live status stay, so the sidebar and pickers keep
+    /// working for cold sessions.
     fn evict_cold_bodies(&mut self) {
+        let pinned: std::collections::HashSet<SessionId> = self.panes.sessions().collect();
         let mut warm: Vec<(u64, SessionId)> = self
             .sessions
             .values()
-            .filter(|session| session.is_warm() && Some(session.summary.id) != self.focused)
+            .filter(|session| session.is_warm() && !pinned.contains(&session.summary.id))
             .map(|session| (session.last_focused, session.summary.id))
             .collect();
-        let keep = WARM_BODY_LIMIT.saturating_sub(usize::from(self.focused.is_some()));
+        let keep = WARM_BODY_LIMIT.saturating_sub(pinned.len());
         if warm.len() <= keep {
             return;
         }
@@ -934,7 +939,7 @@ impl App {
     }
 
     fn set_notice(&mut self, text: String, level: NoticeLevel) {
-        self.set_notice_for(self.focused, text, level);
+        self.set_notice_for(self.focused(), text, level);
     }
 
     fn set_info_for(&mut self, session_id: Option<SessionId>, text: String) {
@@ -954,7 +959,7 @@ impl App {
     }
 
     pub(crate) fn visible_status(&self) -> Option<(&str, NoticeLevel)> {
-        if self.status_session_id != self.focused {
+        if self.status_session_id != self.focused() {
             return None;
         }
         self.status.as_deref().map(|text| (text, self.status_level))
@@ -984,11 +989,11 @@ impl App {
                 .flat_map(|session| session.tool_calls.iter().flatten())
                 .find(|tool_call| tool_call.id == *tool_call_id)
                 .map(|tool_call| tool_call.session_id),
-            Some(PendingIntent::Create) | None => self.focused,
+            Some(PendingIntent::Create) | None => self.focused(),
         };
         match intent {
             Some(PendingIntent::Prompt { session_id, text })
-                if self.focused == Some(session_id) && self.composer.text.is_empty() =>
+                if self.focused() == Some(session_id) && self.composer.text.is_empty() =>
             {
                 self.composer.replace(text);
             }
@@ -1019,9 +1024,18 @@ impl App {
                 (changed, Vec::new())
             }
             Event::Mouse(mouse) if self.overlay.is_none() => {
+                // The wheel scrolls the pane under the cursor; a click focuses
+                // it. Coordinates outside every pane fall back to the focused
+                // pane so a wheel over the chrome still does something useful.
+                let under = self
+                    .panes
+                    .hit(usize::from(mouse.column), usize::from(mouse.row))
+                    .unwrap_or(self.panes.focused_id());
+                let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(isize::MAX);
                 let changed = match mouse.kind {
-                    MouseEventKind::ScrollUp => self.scroll_transcript_up(MOUSE_SCROLL_ROWS),
-                    MouseEventKind::ScrollDown => self.scroll_transcript_down(MOUSE_SCROLL_ROWS),
+                    MouseEventKind::ScrollUp => self.scroll_pane(under, rows),
+                    MouseEventKind::ScrollDown => self.scroll_pane(under, -rows),
+                    MouseEventKind::Down(_) => self.focus_pane(under),
                     _ => false,
                 };
                 (changed, Vec::new())
@@ -1103,6 +1117,29 @@ impl App {
                 KeyCode::Down => Some(Command::FocusFirstChild),
                 KeyCode::Left => Some(Command::FocusPreviousSibling),
                 KeyCode::Right => Some(Command::FocusNextSibling),
+                // Panes: Alt-\ and Alt-- draw the divider they create;
+                // Alt-H/J/K/L move focus like a tiling window manager.
+                KeyCode::Char('\\') => Some(Command::SplitBeside),
+                KeyCode::Char('-') => Some(Command::SplitBelow),
+                KeyCode::Char('w' | 'W') => Some(Command::ClosePane),
+                KeyCode::Char('z' | 'Z') => Some(Command::ZoomPane),
+                KeyCode::Char('h') => Some(Command::FocusPaneLeft),
+                KeyCode::Char('j') => Some(Command::FocusPaneDown),
+                KeyCode::Char('k') => Some(Command::FocusPaneUp),
+                KeyCode::Char('l') => Some(Command::FocusPaneRight),
+                _ => None,
+            };
+            if let Some(command) = command {
+                return self.execute(command);
+            }
+        }
+        // Alt-Shift-H/J/K/L move the divider enclosing the focused pane.
+        if key.modifiers == KeyModifiers::ALT | KeyModifiers::SHIFT {
+            let command = match key.code {
+                KeyCode::Char('H') => Some(Command::ResizePaneLeft),
+                KeyCode::Char('J') => Some(Command::ResizePaneDown),
+                KeyCode::Char('K') => Some(Command::ResizePaneUp),
+                KeyCode::Char('L') => Some(Command::ResizePaneRight),
                 _ => None,
             };
             if let Some(command) = command {
@@ -1115,7 +1152,7 @@ impl App {
                 // failure is the most immediate intent Esc can carry.
                 if self.status.is_some()
                     && self.status_level == NoticeLevel::Error
-                    && self.status_session_id == self.focused
+                    && self.status_session_id == self.focused()
                 {
                     self.status = None;
                     return (true, Vec::new());
@@ -1123,7 +1160,7 @@ impl App {
                 // While a run is active, Esc twice within a short window cancels
                 // it; the first press only arms and shows the hint.
                 let running = self
-                    .focused
+                    .focused()
                     .and_then(|id| self.sessions.get(&id))
                     .is_some_and(|session| session.summary.active_run_id.is_some());
                 if running {
@@ -1140,7 +1177,7 @@ impl App {
                     return (true, Vec::new());
                 }
                 if let Some(parent) = self
-                    .focused
+                    .focused()
                     .and_then(|focused| self.sessions.get(&focused)?.summary.parent_id)
                 {
                     return self.focus_session(parent);
@@ -1148,14 +1185,8 @@ impl App {
                 (false, Vec::new())
             }
             KeyCode::Enter => self.submit_prompt(),
-            KeyCode::PageUp => {
-                let changed = self.scroll_transcript_up(self.transcript_viewport.height);
-                (changed, Vec::new())
-            }
-            KeyCode::PageDown => {
-                let changed = self.scroll_transcript_down(self.transcript_viewport.height);
-                (changed, Vec::new())
-            }
+            KeyCode::PageUp => (self.scroll_focused_page(true), Vec::new()),
+            KeyCode::PageDown => (self.scroll_focused_page(false), Vec::new()),
             KeyCode::Backspace
                 if key
                     .modifiers
@@ -1230,68 +1261,110 @@ impl App {
         }
     }
 
+    /// The session shown in the focused pane; what every focus-dependent
+    /// surface (composer, approvals, footers, tree navigation) acts on.
+    pub(crate) fn focused(&self) -> Option<SessionId> {
+        self.panes.focused().session
+    }
+
+    /// Reconcile pane `id`'s viewport with the body laid out this frame.
+    pub(crate) fn update_viewport(
+        &mut self,
+        id: PaneId,
+        body_rows: usize,
+        height: usize,
+        preserve_tail_anchor: bool,
+    ) {
+        let layout = self.layout;
+        if let Some(pane) = self.panes.get_mut(id) {
+            let context = (pane.session, layout);
+            pane.viewport
+                .update(context, body_rows, height, preserve_tail_anchor);
+        }
+    }
+
+    /// Test view of the focused pane's viewport through the pre-pane API.
+    #[cfg(test)]
     pub(crate) fn update_transcript_viewport(
         &mut self,
         body_rows: usize,
         height: usize,
         preserve_tail_anchor: bool,
     ) {
-        let context = (self.focused, self.layout);
-        if self.transcript_viewport.context != Some(context) {
-            self.transcript_viewport = TranscriptViewport {
-                context: Some(context),
-                body_rows,
-                height,
-                offset: 0,
-            };
-            return;
+        let id = self.panes.focused_id();
+        self.update_viewport(id, body_rows, height, preserve_tail_anchor);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_scroll_offset(&self) -> usize {
+        self.panes.focused().viewport.offset()
+    }
+
+    pub(crate) fn viewport(&self, id: PaneId) -> Option<&Viewport> {
+        self.panes.get(id).map(|pane| &pane.viewport)
+    }
+
+    fn scroll_pane(&mut self, id: PaneId, rows: isize) -> bool {
+        let Some(pane) = self.panes.get_mut(id) else {
+            return false;
+        };
+        match rows.cmp(&0) {
+            std::cmp::Ordering::Greater => pane.viewport.scroll_up(rows.unsigned_abs()),
+            std::cmp::Ordering::Less => pane.viewport.scroll_down(rows.unsigned_abs()),
+            std::cmp::Ordering::Equal => false,
         }
-        if self.transcript_viewport.offset > 0
-            && self.transcript_viewport.height > 0
-            && !preserve_tail_anchor
-        {
-            let top = self
-                .transcript_viewport
-                .body_rows
-                .saturating_sub(self.transcript_viewport.offset)
-                .saturating_sub(self.transcript_viewport.height);
-            self.transcript_viewport.offset = body_rows.saturating_sub(top.saturating_add(height));
+    }
+
+    fn scroll_focused_page(&mut self, up: bool) -> bool {
+        let id = self.panes.focused_id();
+        let page = isize::try_from(self.panes.focused().viewport.height()).unwrap_or(isize::MAX);
+        self.scroll_pane(id, if up { page } else { -page })
+    }
+
+    /// Split the focused pane. The new pane inherits the session and takes
+    /// focus, so nothing needs fetching.
+    fn split_pane(&mut self, axis: Axis) -> (bool, Vec<ClientRequest>) {
+        match self.panes.split(axis) {
+            Some(_) => (true, Vec::new()),
+            None => {
+                self.set_warning(format!(
+                    "at most {} panes can be open",
+                    crate::panes::MAX_PANES
+                ));
+                (true, Vec::new())
+            }
         }
-        self.transcript_viewport.body_rows = body_rows;
-        self.transcript_viewport.height = height;
-        self.transcript_viewport.offset = self
-            .transcript_viewport
-            .offset
-            .min(body_rows.saturating_sub(height));
     }
 
-    pub(crate) fn transcript_viewport_intersects_or_follows(&self, rows: &Range<usize>) -> bool {
-        self.transcript_viewport.height > 0
-            && self
-                .transcript_viewport
-                .body_rows
-                .saturating_sub(self.transcript_viewport.offset)
-                > rows.start
+    fn close_pane(&mut self) -> (bool, Vec<ClientRequest>) {
+        let closed = self.panes.close();
+        if closed.is_some() {
+            self.reset_history_browse();
+            self.evict_cold_bodies();
+        } else {
+            self.set_info("the last pane stays open".to_owned());
+        }
+        (true, Vec::new())
     }
 
-    pub(crate) const fn transcript_scroll_offset(&self) -> usize {
-        self.transcript_viewport.offset
+    /// Move focus to a neighbouring pane. Focus changes the session the
+    /// composer targets, so the history browse resets like a session switch.
+    fn focus_pane(&mut self, id: PaneId) -> bool {
+        if !self.panes.focus(id) {
+            return false;
+        }
+        if let Some(session_id) = self.focused() {
+            self.set_focus_clock(session_id);
+        }
+        self.reset_history_browse();
+        true
     }
 
-    fn scroll_transcript_up(&mut self, rows: usize) -> bool {
-        let before = self.transcript_viewport.offset;
-        let maximum = self
-            .transcript_viewport
-            .body_rows
-            .saturating_sub(self.transcript_viewport.height);
-        self.transcript_viewport.offset = before.saturating_add(rows).min(maximum);
-        self.transcript_viewport.offset != before
-    }
-
-    fn scroll_transcript_down(&mut self, rows: usize) -> bool {
-        let before = self.transcript_viewport.offset;
-        self.transcript_viewport.offset = before.saturating_sub(rows);
-        self.transcript_viewport.offset != before
+    fn focus_pane_direction(&mut self, direction: Direction) -> (bool, Vec<ClientRequest>) {
+        match self.panes.neighbour(direction) {
+            Some(id) => (self.focus_pane(id), Vec::new()),
+            None => (false, Vec::new()),
+        }
     }
 
     /// Run one command from the registry. Every command surface — keybinding,
@@ -1311,7 +1384,7 @@ impl App {
                 }
             }
             Command::NewRootSession => self.create_session(None),
-            Command::NewChildSession => self.create_session(self.focused),
+            Command::NewChildSession => self.create_session(self.focused()),
             Command::CompactSession => self.compact_session(),
             Command::CancelRun => self.cancel_run(),
             Command::SelectThreadline => {
@@ -1346,14 +1419,14 @@ impl App {
                 (true, Vec::new())
             }
             Command::FocusParent => match self
-                .focused
+                .focused()
                 .and_then(|focused| self.sessions.get(&focused)?.summary.parent_id)
             {
                 Some(parent) => self.focus_session(parent),
                 None => (false, Vec::new()),
             },
             Command::FocusFirstChild => match self
-                .focused
+                .focused()
                 .and_then(|focused| self.children_of(focused).first().copied())
             {
                 Some(child) => self.focus_session(child),
@@ -1371,6 +1444,18 @@ impl App {
                 self.editor_requested = true;
                 (true, Vec::new())
             }
+            Command::SplitBeside => self.split_pane(Axis::Columns),
+            Command::SplitBelow => self.split_pane(Axis::Rows),
+            Command::ClosePane => self.close_pane(),
+            Command::ZoomPane => (self.panes.toggle_zoom(), Vec::new()),
+            Command::FocusPaneLeft => self.focus_pane_direction(Direction::Left),
+            Command::FocusPaneRight => self.focus_pane_direction(Direction::Right),
+            Command::FocusPaneUp => self.focus_pane_direction(Direction::Up),
+            Command::FocusPaneDown => self.focus_pane_direction(Direction::Down),
+            Command::ResizePaneLeft => (self.panes.resize(Direction::Left), Vec::new()),
+            Command::ResizePaneRight => (self.panes.resize(Direction::Right), Vec::new()),
+            Command::ResizePaneUp => (self.panes.resize(Direction::Up), Vec::new()),
+            Command::ResizePaneDown => (self.panes.resize(Direction::Down), Vec::new()),
             Command::QueueDraft => self.queue_draft(),
             Command::DequeueDraft => self.dequeue_draft(),
             Command::SteerRun => {
@@ -1456,7 +1541,7 @@ impl App {
                     return (false, Vec::new());
                 };
                 let focused = self
-                    .focused
+                    .focused()
                     .filter(|session_id| self.sessions.contains_key(session_id));
                 let result = match focused {
                     Some(session_id) => self.set_session_model(session_id, model),
@@ -1531,7 +1616,7 @@ impl App {
     /// `/agents`: the focused session's root and every descendant, so the
     /// user can see and jump between the agents one task fanned out into.
     fn open_agents(&mut self) -> (bool, Vec<ClientRequest>) {
-        let Some(focused) = self.focused else {
+        let Some(focused) = self.focused() else {
             self.set_warning("focus a session to view its agents".to_owned());
             return (true, Vec::new());
         };
@@ -1548,7 +1633,7 @@ impl App {
 
     fn open_session_picker(&mut self, scope: Option<SessionId>) -> (bool, Vec<ClientRequest>) {
         let selected = self
-            .focused
+            .focused()
             .filter(|session_id| self.sessions.contains_key(session_id))
             .or_else(|| self.thread_order().first().copied());
         self.overlay = Some(Overlay::Sessions {
@@ -1773,7 +1858,7 @@ impl App {
 
     /// Focus a session. A warm body renders immediately with no request; a
     /// cold one shows its summary and live tail while its body is fetched.
-    fn focus_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
+    pub(crate) fn focus_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
         self.set_focus(session_id);
         self.reset_history_browse();
         self.evict_cold_bodies();
@@ -1814,7 +1899,7 @@ impl App {
         }
 
         let Some(route) = self
-            .focused
+            .focused()
             .and_then(|session_id| self.sessions.get(&session_id))
             .and_then(|session| session.summary.model.as_deref())
             .filter(|route| valid_model_route(route))
@@ -1888,7 +1973,7 @@ impl App {
                 return self.execute(entry.command);
             }
         }
-        let Some(session_id) = self.focused else {
+        let Some(session_id) = self.focused() else {
             self.set_warning("create a session before sending a prompt".to_owned());
             return (true, Vec::new());
         };
@@ -1947,7 +2032,7 @@ impl App {
         if prompt.is_empty() {
             return (false, Vec::new());
         }
-        let Some(session_id) = self.focused else {
+        let Some(session_id) = self.focused() else {
             self.set_warning("create a session before queueing a prompt".to_owned());
             return (true, Vec::new());
         };
@@ -1968,7 +2053,7 @@ impl App {
     /// Pull the newest queued draft back into the composer for editing. A
     /// non-empty composer is queued first so nothing is lost.
     fn dequeue_draft(&mut self) -> (bool, Vec<ClientRequest>) {
-        let Some(session_id) = self.focused else {
+        let Some(session_id) = self.focused() else {
             return (false, Vec::new());
         };
         if !self.composer.text.is_empty() {
@@ -2032,7 +2117,7 @@ impl App {
     }
 
     fn browse_prompt_history(&mut self, forward: bool) -> bool {
-        let Some(session_id) = self.focused else {
+        let Some(session_id) = self.focused() else {
             return false;
         };
         let Some(history) = self.prompt_history.get(&session_id) else {
@@ -2076,7 +2161,7 @@ impl App {
     }
 
     fn compact_session(&mut self) -> (bool, Vec<ClientRequest>) {
-        let Some(session_id) = self.focused else {
+        let Some(session_id) = self.focused() else {
             self.set_warning("create a session before compacting".to_owned());
             return (true, Vec::new());
         };
@@ -2105,7 +2190,7 @@ impl App {
     }
 
     fn cancel_run(&mut self) -> (bool, Vec<ClientRequest>) {
-        let Some(session_id) = self.focused else {
+        let Some(session_id) = self.focused() else {
             self.set_warning("focused session has no active run".to_owned());
             return (true, Vec::new());
         };
@@ -2134,7 +2219,7 @@ impl App {
 
     /// The focused session's oldest unanswered tool approval, if any.
     pub(crate) fn pending_approval(&self) -> Option<&ToolCallSnapshot> {
-        let session = self.sessions.get(&self.focused?)?;
+        let session = self.sessions.get(&self.focused()?)?;
         session.tool_calls.as_ref()?.iter().find(|tool_call| {
             tool_call.state == ToolCallState::AwaitingApproval
                 && !self.answered_approvals.contains(&tool_call.id)
@@ -2317,12 +2402,12 @@ impl App {
     }
 
     pub(crate) fn focused_context_usage(&self) -> Option<(u64, u32)> {
-        let session = self.focused.and_then(|id| self.sessions.get(&id))?;
+        let session = self.focused().and_then(|id| self.sessions.get(&id))?;
         Some((session.summary.context_tokens?, session.context_window?))
     }
 
     pub(crate) fn focused_context_window(&self) -> Option<u32> {
-        let session = self.focused.and_then(|id| self.sessions.get(&id))?;
+        let session = self.focused().and_then(|id| self.sessions.get(&id))?;
         session.context_window
     }
 
@@ -2374,7 +2459,7 @@ impl App {
     /// The focused session's sibling `offset` places away in spawn order
     /// (oldest-first), wrapping at either end. Roots are siblings of roots.
     fn sibling(&self, offset: isize) -> Option<SessionId> {
-        let focused = self.focused?;
+        let focused = self.focused()?;
         let parent = self.sessions.get(&focused)?.summary.parent_id;
         let mut siblings = match parent {
             Some(parent) => self.children_of(parent),
@@ -2404,14 +2489,14 @@ impl App {
         let others: Vec<SessionId> = waiting
             .iter()
             .copied()
-            .filter(|id| Some(*id) != self.focused)
+            .filter(|id| Some(*id) != self.focused())
             .collect();
         if others.is_empty() {
             return None;
         }
         let order = self.thread_order();
         let focus_position = self
-            .focused
+            .focused()
             .and_then(|focused| order.iter().position(|id| *id == focused))
             .unwrap_or(0);
         others
@@ -2960,7 +3045,7 @@ mod tests {
     fn compact_slash_command_sends_compact_session_for_the_focused_idle_session() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         app.composer.text = "/compact".to_owned();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2984,7 +3069,7 @@ mod tests {
     fn notices_only_render_for_the_session_that_owns_them() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
-        let owner = app.focused.unwrap();
+        let owner = app.focused().unwrap();
         let other = id(9, SessionId::from_bytes);
 
         app.set_error_for(Some(owner), "model request failed".to_owned());
@@ -2993,10 +3078,10 @@ mod tests {
             Some(("model request failed", NoticeLevel::Error))
         );
 
-        app.focused = Some(other);
+        app.panes.focused_mut().session = Some(other);
         assert_eq!(app.visible_status(), None);
 
-        app.focused = Some(owner);
+        app.panes.focused_mut().session = Some(owner);
         assert_eq!(
             app.visible_status(),
             Some(("model request failed", NoticeLevel::Error))
@@ -3157,15 +3242,19 @@ mod tests {
                 "/new",
                 "/compact",
                 "/editor",
+                "/split",
+                "/stack",
+                "/close",
+                "/zoom",
                 "/quit",
                 "/exit"
             ]
         );
-        for _ in 0..10 {
+        for _ in 0..20 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.slash_selected(usize::MAX), 8);
-        for _ in 0..10 {
+        assert_eq!(app.slash_selected(usize::MAX), 12);
+        for _ in 0..20 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
         assert_eq!(app.slash_selected(usize::MAX), 0);
@@ -3252,7 +3341,7 @@ mod tests {
     fn session_picker_deletes_the_highlighted_session_after_a_confirm() {
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(snapshot());
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         app.open_sessions();
 
         // The confirm gate: Ctrl-D asks, n keeps, y deletes.
@@ -3350,7 +3439,7 @@ mod tests {
         });
         let mut app = App::new(TuiOptions::default());
         app.apply_snapshot(initial);
-        assert_eq!(app.focused, Some(deleted));
+        assert_eq!(app.focused(), Some(deleted));
         let tool_call_id = id(7, qq_protocol::ToolCallId::from_bytes);
         app.sessions
             .get_mut(&deleted)
@@ -3394,7 +3483,7 @@ mod tests {
         assert!(changed);
         assert!(!app.sessions.contains_key(&deleted));
         assert!(!app.live_tool_output.contains_key(&tool_call_id));
-        assert_eq!(app.focused, Some(neighbor));
+        assert_eq!(app.focused(), Some(neighbor));
         assert_eq!(app.session_picker_selected(), Some(neighbor));
         // The refocus fetches the neighbor's transcript.
         let requests = app.take_requests();
@@ -3415,7 +3504,7 @@ mod tests {
         let workspace_id = initial.workspace.id;
         let deleted = initial.sessions[0].id;
         app.apply_snapshot(initial);
-        assert_eq!(app.focused, Some(deleted));
+        assert_eq!(app.focused(), Some(deleted));
 
         app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
             cursor: EventCursor {
@@ -3433,7 +3522,7 @@ mod tests {
         }));
 
         assert!(app.sessions.is_empty());
-        assert_eq!(app.focused, None);
+        assert_eq!(app.focused(), None);
         assert!(app.take_requests().is_empty());
     }
 
@@ -3824,7 +3913,7 @@ mod tests {
             selected: None,
         });
 
-        let focused = app.focused.unwrap();
+        let focused = app.focused().unwrap();
         assert_eq!(app.models.len(), 1);
         assert_eq!(app.sessions[&focused].context_window, Some(128_000));
     }
@@ -3878,7 +3967,7 @@ mod tests {
         assert_eq!(app.model, selection);
         // A session is focused, so Enter applies the preserved selection to
         // it rather than creating a new session.
-        let focused = app.focused.unwrap();
+        let focused = app.focused().unwrap();
         assert!(matches!(
             &requests[0],
             ClientRequest::Command(CommandRequest {
@@ -3898,7 +3987,7 @@ mod tests {
         app.apply_snapshot(empty);
         app.apply_snapshot(snapshot());
 
-        assert!(app.focused.is_some());
+        assert!(app.focused().is_some());
     }
 
     #[test]
@@ -3930,7 +4019,7 @@ mod tests {
 
         // Enter with a focused session repoints that session's model and
         // remembers it as the client default for later /new creates.
-        let focused = app.focused.unwrap();
+        let focused = app.focused().unwrap();
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ClientRequest::Command(request) = &requests[0] else {
             panic!("expected set-session-model command")
@@ -3984,7 +4073,7 @@ mod tests {
         empty.sessions.clear();
         empty.focused = None;
         app.apply_snapshot(empty);
-        assert!(app.focused.is_none());
+        assert!(app.focused().is_none());
         app.open_models();
 
         let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -4353,8 +4442,8 @@ mod tests {
         app.focus_session(new_focus);
 
         assert!(!app.apply_snapshot(initial));
-        assert_eq!(app.focused, Some(new_focus));
-        assert_ne!(app.focused, Some(old_focus));
+        assert_eq!(app.focused(), Some(new_focus));
+        assert_ne!(app.focused(), Some(old_focus));
     }
 
     #[test]
@@ -4557,14 +4646,14 @@ mod tests {
     #[test]
     fn session_and_layout_changes_return_the_transcript_to_the_live_tail() {
         let mut app = App::new(TuiOptions::default());
-        app.focused = Some(SessionId::from_bytes([1; 16]));
+        app.panes.focused_mut().session = Some(SessionId::from_bytes([1; 16]));
         app.update_transcript_viewport(100, 10, false);
         app.handle_terminal_event(Event::Key(KeyEvent::new(
             KeyCode::PageUp,
             KeyModifiers::NONE,
         )));
 
-        app.focused = Some(SessionId::from_bytes([2; 16]));
+        app.panes.focused_mut().session = Some(SessionId::from_bytes([2; 16]));
         app.update_transcript_viewport(100, 10, false);
 
         assert_eq!(app.transcript_scroll_offset(), 0);
@@ -4615,7 +4704,7 @@ mod tests {
         assert_eq!(app.transcript_scroll_offset(), 0);
 
         app.overlay = None;
-        app.overlay = Some(Overlay::sessions("", app.focused, None));
+        app.overlay = Some(Overlay::sessions("", app.focused(), None));
         assert!(!app.handle_terminal_event(wheel).0);
         assert!(!app.handle_terminal_event(page).0);
         assert_eq!(app.transcript_scroll_offset(), 0);
@@ -4692,7 +4781,7 @@ mod tests {
             },
         }));
         assert!(changed);
-        assert_eq!(app.focused, Some(created));
+        assert_eq!(app.focused(), Some(created));
         assert!(app.sessions[&created].is_warm());
         assert!(app.take_requests().is_empty(), "no snapshot after create");
 
@@ -4711,7 +4800,7 @@ mod tests {
                 },
             }),
         });
-        assert_eq!(app.focused, Some(created));
+        assert_eq!(app.focused(), Some(created));
         assert!(app.take_requests().is_empty());
         // The previously focused session keeps its body warm.
         let previous = snapshot().sessions[0].id;
@@ -4730,14 +4819,14 @@ mod tests {
         initial.included.push(body_for(&warm, "warm body"));
         app.apply_snapshot(initial);
         let first = snapshot().sessions[0].id;
-        assert_eq!(app.focused, Some(first));
+        assert_eq!(app.focused(), Some(first));
         assert!(app.sessions[&warm.id].is_warm());
         assert!(!app.sessions[&cold.id].is_warm());
 
         let (changed, requests) = app.focus_session(warm.id);
         assert!(changed);
         assert!(requests.is_empty(), "warm switch must not request");
-        assert_eq!(app.focused, Some(warm.id));
+        assert_eq!(app.focused(), Some(warm.id));
         assert!(app.sessions[&first].is_warm(), "leaving does not evict");
 
         let (_, requests) = app.focus_session(cold.id);
@@ -4748,7 +4837,7 @@ mod tests {
                 ..
             })] if *id == cold.id
         ));
-        assert_eq!(app.focused, Some(cold.id));
+        assert_eq!(app.focused(), Some(cold.id));
     }
 
     #[test]
@@ -5062,5 +5151,246 @@ mod tests {
                 .unwrap()
                 .contains("does not support steering")
         );
+    }
+
+    fn alt(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT)
+    }
+
+    /// Two warm root sessions; the first is focused. Returns their ids.
+    fn two_session_app() -> (App, SessionId, SessionId) {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let other = summary_named(0x42, workspace_id, "other");
+        initial.sessions.push(other.clone());
+        initial.included.push(body_for(&other, "other body"));
+        let first = initial.sessions[0].id;
+        app.apply_snapshot(initial);
+        assert!(app.sessions[&other.id].is_warm());
+        (app, first, other.id)
+    }
+
+    #[test]
+    fn splitting_inherits_the_session_and_pane_commands_route_through_keys() {
+        let (mut app, first, other) = two_session_app();
+        assert_eq!(app.panes.len(), 1);
+
+        // Alt-\ splits beside; the new pane shows the same session, focused.
+        let (changed, requests) = app.handle_key(alt('\\'));
+        assert!(changed);
+        assert!(requests.is_empty(), "a split never fetches");
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.focused(), Some(first));
+
+        // Switching the session in the new pane leaves the other pane alone.
+        app.focus_session(other);
+        assert_eq!(app.focused(), Some(other));
+        let shown: Vec<_> = app.panes.sessions().collect();
+        assert!(shown.contains(&first) && shown.contains(&other));
+
+        // Alt-- stacks below the focused pane; Alt-K goes back up after a
+        // layout has produced geometry.
+        app.handle_key(alt('-'));
+        assert_eq!(app.panes.len(), 3);
+        app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
+        let before = app.panes.focused_id();
+        let (changed, _) = app.handle_key(alt('k'));
+        assert!(changed);
+        assert_ne!(app.panes.focused_id(), before);
+        assert_eq!(app.focused(), Some(other));
+
+        // Alt-W closes; Alt-Z zooms.
+        app.handle_key(alt('w'));
+        assert_eq!(app.panes.len(), 2);
+        let (changed, _) = app.handle_key(alt('z'));
+        assert!(changed && app.panes.is_zoomed());
+        app.handle_key(alt('z'));
+        assert!(!app.panes.is_zoomed());
+        app.handle_key(alt('w'));
+        assert_eq!(app.panes.len(), 1);
+        let (_, _) = app.handle_key(alt('w'));
+        assert_eq!(app.panes.len(), 1, "the last pane stays");
+        assert!(app.status.as_deref().unwrap().contains("last pane"));
+    }
+
+    #[test]
+    fn slash_pane_commands_match_their_keys() {
+        let (mut app, _, _) = two_session_app();
+        for (slash, expected) in [("/split", 2), ("/stack", 3), ("/close", 2), ("/zoom", 2)] {
+            app.composer.text = slash.to_owned();
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.panes.len(), expected, "{slash}");
+        }
+        assert!(app.panes.is_zoomed());
+    }
+
+    #[test]
+    fn sessions_shown_in_any_pane_are_pinned_warm() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let ids: Vec<SessionId> = (0x60..0x60 + (WARM_BODY_LIMIT as u8) + 2)
+            .map(|byte| {
+                let summary = summary_named(byte, workspace_id, "s");
+                initial.sessions.push(summary.clone());
+                summary.id
+            })
+            .collect();
+        app.apply_snapshot(initial);
+        // Pin the first id in a second pane, then cycle every other session
+        // through the focused pane.
+        app.focus_session(ids[0]);
+        let summary = app.sessions[&ids[0]].summary.clone();
+        app.apply_snapshot(WorkspaceSnapshot {
+            focused: Some(body_for(&summary, "pinned")),
+            ..snapshot()
+        });
+        app.execute(Command::SplitBeside);
+        for session_id in &ids[1..] {
+            app.focus_session(*session_id);
+            let summary = app.sessions[session_id].summary.clone();
+            app.apply_snapshot(WorkspaceSnapshot {
+                focused: Some(body_for(&summary, "body")),
+                ..snapshot()
+            });
+        }
+        assert!(app.sessions[&ids[0]].is_warm(), "shown in a pane: pinned");
+        assert!(!app.sessions[&ids[1]].is_warm(), "oldest unpinned evicts");
+        let warm = app.sessions.values().filter(|s| s.is_warm()).count();
+        assert_eq!(warm, WARM_BODY_LIMIT);
+    }
+
+    #[test]
+    fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus() {
+        let (mut app, first, _) = two_session_app();
+        let workspace_id = app.workspace_id.unwrap();
+        let cold = summary_named(0x77, workspace_id, "cold");
+        app.apply_snapshot(WorkspaceSnapshot {
+            sessions: vec![cold.clone()],
+            focused: None,
+            ..snapshot()
+        });
+        app.execute(Command::SplitBeside);
+        let (_, requests) = app.focus_session(cold.id);
+        assert_eq!(requests.len(), 1, "cold body is requested");
+        // The user moves back to the first pane before the body arrives.
+        app.execute(Command::FocusPaneLeft);
+        app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
+        let (moved, _) = app.execute(Command::FocusPaneLeft);
+        assert!(moved);
+        assert_eq!(app.focused(), Some(first));
+
+        let installed = app.apply_snapshot(WorkspaceSnapshot {
+            focused: Some(body_for(&cold, "arrived")),
+            ..snapshot()
+        });
+        assert!(installed);
+        assert!(app.sessions[&cold.id].is_warm());
+        assert_eq!(
+            app.focused(),
+            Some(first),
+            "focus stays where the user put it"
+        );
+
+        // A body for a session no pane shows any more is dropped.
+        let gone = summary_named(0x78, workspace_id, "gone");
+        app.apply_snapshot(WorkspaceSnapshot {
+            sessions: vec![gone.clone()],
+            focused: None,
+            ..snapshot()
+        });
+        assert!(!app.apply_snapshot(WorkspaceSnapshot {
+            focused: Some(body_for(&gone, "late")),
+            ..snapshot()
+        }));
+    }
+
+    #[test]
+    fn deleting_a_session_repoints_every_pane_showing_it() {
+        let (mut app, first, other) = two_session_app();
+        let workspace_id = app.workspace_id.unwrap();
+        app.execute(Command::SplitBeside);
+        app.execute(Command::SplitBelow);
+        // Panes: [first] [first / first]; point the focused one at `other`.
+        app.focus_session(other);
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: id(3, StoreId::from_bytes),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: first,
+            run_id: None,
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::SessionDeleted { session_id: first },
+        }));
+        assert!(!app.sessions.contains_key(&first));
+        let shown: Vec<_> = app.panes.sessions().collect();
+        assert_eq!(shown.len(), 3);
+        assert!(shown.iter().all(|id| *id == other));
+        // The replacement is warm, so nothing is fetched.
+        assert!(app.take_requests().is_empty());
+    }
+
+    #[test]
+    fn the_mouse_scrolls_the_pane_under_the_cursor_and_clicks_focus_it() {
+        use crossterm::event::{MouseButton, MouseEvent};
+        let (mut app, _, other) = two_session_app();
+        app.execute(Command::SplitBeside);
+        app.focus_session(other);
+        let (tiles, _) = app.panes.layout(crate::panes::Rect::new(0, 2, 161, 40));
+        let left = tiles[0];
+        let right = tiles[1];
+        assert_eq!(app.panes.focused_id(), right.pane);
+        // Give both panes a scrollable body.
+        for tile in [left, right] {
+            app.update_viewport(tile.pane, 200, 40, false);
+        }
+        let mouse = |kind, column: usize, row: usize| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: u16::try_from(column).unwrap(),
+                row: u16::try_from(row).unwrap(),
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.handle_terminal_event(mouse(MouseEventKind::ScrollUp, left.rect.x + 2, 5));
+        assert_eq!(app.viewport(left.pane).unwrap().offset(), MOUSE_SCROLL_ROWS);
+        assert_eq!(app.viewport(right.pane).unwrap().offset(), 0);
+        assert_eq!(
+            app.panes.focused_id(),
+            right.pane,
+            "scrolling does not focus"
+        );
+        let (changed, _) = app.handle_terminal_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            left.rect.x + 2,
+            5,
+        ));
+        assert!(changed);
+        assert_eq!(app.panes.focused_id(), left.pane);
+    }
+
+    #[test]
+    fn resize_keys_move_the_divider_of_the_enclosing_split() {
+        let (mut app, _, _) = two_session_app();
+        app.execute(Command::SplitBeside);
+        let area = crate::panes::Rect::new(0, 2, 201, 40);
+        let (before, _) = app.panes.layout(area);
+        let (changed, _) = app.handle_key(KeyEvent::new(
+            KeyCode::Char('H'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert!(changed);
+        let (after, _) = app.panes.layout(area);
+        assert!(after[0].rect.width < before[0].rect.width);
+        // No row split encloses the focused pane, so Alt-Shift-K does nothing.
+        let (changed, _) = app.handle_key(KeyEvent::new(
+            KeyCode::Char('K'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert!(!changed);
     }
 }

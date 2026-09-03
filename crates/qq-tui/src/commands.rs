@@ -40,6 +40,22 @@ pub(crate) enum Command {
     SteerRun,
     /// Edit the draft in `$VISUAL` or `$EDITOR`.
     OpenEditor,
+    /// Split the focused pane; the new pane sits beside it.
+    SplitBeside,
+    /// Split the focused pane; the new pane sits below it.
+    SplitBelow,
+    ClosePane,
+    /// Show only the focused pane until toggled again.
+    ZoomPane,
+    FocusPaneLeft,
+    FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
+    /// Move the divider enclosing the focused pane one step.
+    ResizePaneLeft,
+    ResizePaneRight,
+    ResizePaneUp,
+    ResizePaneDown,
     Quit,
 }
 
@@ -66,7 +82,7 @@ pub(crate) struct CommandSpec {
 }
 
 /// Presentation order is invocation frequency, not alphabetical.
-pub(crate) const COMMANDS: [CommandSpec; 25] = [
+pub(crate) const COMMANDS: [CommandSpec; 37] = [
     CommandSpec {
         command: Command::OpenModels,
         title: "choose a model",
@@ -233,6 +249,90 @@ pub(crate) const COMMANDS: [CommandSpec; 25] = [
         title: "edit the draft in $EDITOR",
         category: Category::System,
         slash: &["/editor"],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::SplitBeside,
+        title: "split the pane side by side",
+        category: Category::View,
+        slash: &["/split"],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::SplitBelow,
+        title: "split the pane top and bottom",
+        category: Category::View,
+        slash: &["/stack"],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::ClosePane,
+        title: "close the focused pane",
+        category: Category::View,
+        slash: &["/close"],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::ZoomPane,
+        title: "toggle showing only the focused pane",
+        category: Category::View,
+        slash: &["/zoom"],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusPaneLeft,
+        title: "focus the pane to the left",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusPaneRight,
+        title: "focus the pane to the right",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusPaneUp,
+        title: "focus the pane above",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusPaneDown,
+        title: "focus the pane below",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::ResizePaneLeft,
+        title: "move the pane divider left",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::ResizePaneRight,
+        title: "move the pane divider right",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::ResizePaneUp,
+        title: "move the pane divider up",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::ResizePaneDown,
+        title: "move the pane divider down",
+        category: Category::View,
+        slash: &[],
         action: None,
     },
     CommandSpec {

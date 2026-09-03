@@ -28,6 +28,7 @@ use crate::{
     Layout,
     app::{App, ToolDetail, terminal_safe_character},
     input::{Mode, SessionConfirm},
+    panes::{PaneId, Rect, Tile, Viewport},
     render::{
         Line, Style, accent, brand, diff_line_style, failure, muted, normal, warning, write_line,
     },
@@ -73,15 +74,26 @@ const SIDEBAR_WIDTH: usize = 36;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
 
+/// Frame assembly and the row diff against the previous frame. Per-pane
+/// transcript state lives in a [`TranscriptCache`] per pane; the highlighter
+/// is shared because its results are keyed by message and width, not pane.
 #[derive(Default)]
 pub(crate) struct FrameRenderer {
     previous: Vec<Line>,
     size: Option<(u16, u16)>,
+    /// Off-tick syntax highlighting for cached completed messages.
+    pub(crate) highlighter: Highlighter,
+    panes: HashMap<PaneId, TranscriptCache>,
+}
+
+/// Retained rendering for one pane's transcript: completed messages cached
+/// by width, the settled prefix of streaming messages, and the row ranges
+/// the live messages occupied on the last frame.
+#[derive(Default)]
+pub(crate) struct TranscriptCache {
     markdown: HashMap<MessageId, CachedMarkdown>,
     /// Monotonic counter bumped per `prepare_markdown`; stamps cache use.
     clock: u64,
-    /// Off-tick syntax highlighting for cached completed messages.
-    pub(crate) highlighter: Highlighter,
     /// Settled rows of messages still streaming, keyed by message. Each entry
     /// holds the layout of the message's block-boundary-settled prefix so a
     /// frame only lays out the trailing open block.
@@ -502,7 +514,6 @@ impl FrameRenderer {
     }
 
     fn frame(&mut self, app: &mut App, width: usize, height: usize) -> Vec<Line> {
-        self.preserve_tail_anchor = false;
         if width < 32 || height < 9 {
             return fit_height(
                 vec![
@@ -542,7 +553,9 @@ impl FrameRenderer {
         let mode = app.mode();
         let mut body = match mode {
             Mode::Models | Mode::Sessions | Mode::Approval => {
-                self.prune_markdown(app);
+                for cache in self.panes.values_mut() {
+                    cache.prune_all();
+                }
                 match mode {
                     Mode::Models => model_picker(app, body_width, body_height),
                     Mode::Sessions => session_picker(app, body_width, body_height),
@@ -550,21 +563,14 @@ impl FrameRenderer {
                 }
             }
             Mode::Compose => {
-                let body = match app.layout {
-                    Layout::Threadline => self.threadline(app, body_width),
-                    Layout::FoldFocus => self.fold_focus(app, body_width),
-                };
-                app.update_transcript_viewport(body.rows, body_height, body.preserve_tail_anchor);
-                let live_message_ranges = body.live_message_ranges.clone();
-                let viewport = body.viewport(app, body_height, app.transcript_scroll_offset());
-                drop(body);
-                self.live_message_ranges = live_message_ranges.into_iter().collect();
-                viewport
+                let mut body = self.panes_body(app, Rect::new(0, 2, body_width, body_height));
+                overlay_slash_autocomplete(
+                    &mut body,
+                    slash_autocomplete(app, body_width, body_height),
+                );
+                body
             }
         };
-        if mode == Mode::Compose {
-            overlay_slash_autocomplete(&mut body, slash_autocomplete(app, body_width, body_height));
-        }
         if sidebar_width > 0 {
             let sidebar = sidebar(app, sidebar_width, body_height);
             body = fit_height(body, body_height);
@@ -585,41 +591,222 @@ impl FrameRenderer {
         fit_height(lines, height)
     }
 
-    fn prune_markdown(&mut self, app: &App) {
-        let visible = if app.mode() == Mode::Compose {
-            app.focused
-                .and_then(|session_id| app.sessions.get(&session_id))
-                .and_then(|session| {
-                    session
-                        .messages
-                        .as_ref()
-                        .map(|messages| (session, messages))
-                })
-                .map(|(session, messages)| {
-                    let limit = match app.layout {
-                        Layout::Threadline => MAX_VISIBLE_MESSAGES,
-                        Layout::FoldFocus => 2,
-                    };
-                    let mut visible = messages
+    /// Render every visible pane into `area` and compose them row by row,
+    /// with dividers between siblings. Each pane renders through its own
+    /// cache at its own width, so resizing one split re-lays only the panes
+    /// whose width changed.
+    fn panes_body(&mut self, app: &mut App, area: Rect) -> Vec<Line> {
+        let (tiles, dividers) = app.panes.layout(area);
+        let visible: HashSet<PaneId> = tiles.iter().map(|tile| tile.pane).collect();
+        // Caches for closed or hidden panes are dropped; a hidden pane pays a
+        // one-time relayout when it comes back, which is cheaper than holding
+        // every message twice for a pane that may never return.
+        self.panes.retain(|id, _| visible.contains(id));
+        // One pane filling the area is the common case and the one the speed
+        // budgets are written against: its rows are the body, untouched.
+        if let [tile] = tiles.as_slice()
+            && tile.rect == area
+        {
+            let tile = *tile;
+            let cache = self.panes.entry(tile.pane).or_default();
+            return cache.pane(&mut self.highlighter, app, tile, false);
+        }
+        let multiple = tiles.len() > 1;
+        // Every visible piece — pane rows or a divider — in x order. Each row
+        // of the canvas is then the pieces covering that row, left to right,
+        // so composition is one pass with no scratch tables, and pane rows are
+        // moved into place rather than copied.
+        let mut pieces: Vec<(Rect, Piece)> = Vec::with_capacity(tiles.len() + dividers.len());
+        for tile in tiles {
+            let cache = self.panes.entry(tile.pane).or_default();
+            let lines = cache.pane(&mut self.highlighter, app, tile, multiple);
+            pieces.push((tile.rect, Piece::Pane(lines)));
+        }
+        for divider in dividers {
+            let vertical = divider.width == 1 && divider.height > 1;
+            pieces.push((divider, Piece::Divider(vertical)));
+        }
+        pieces.sort_by_key(|(rect, _)| rect.x);
+        let mut canvas: Vec<Line> = Vec::with_capacity(area.height);
+        for y in area.y..area.bottom() {
+            let mut line = Line::default();
+            // Track the column by geometry so a row's width is measured at
+            // most once; measuring is the only per-cell work in composition.
+            let mut column = area.x;
+            for (rect, piece) in &mut pieces {
+                if y < rect.y || y >= rect.bottom() {
+                    continue;
+                }
+                if rect.x > column {
+                    line.push(" ".repeat(rect.x - column), normal());
+                }
+                match piece {
+                    Piece::Pane(lines) => {
+                        let Some(source) = lines.get_mut(y - rect.y) else {
+                            column = rect.right();
+                            continue;
+                        };
+                        // A section or status row laid out at full width
+                        // must not spill across the divider.
+                        let mut used = source.width();
+                        if used > rect.width {
+                            *source = truncate_line(std::mem::take(source), rect.width);
+                            used = rect.width;
+                        }
+                        line.spans.append(&mut source.spans);
+                        column = rect.x + used;
+                    }
+                    Piece::Divider(vertical) => {
+                        let glyph = if *vertical { "│" } else { "─" };
+                        line.push(glyph.repeat(rect.width), muted());
+                        column = rect.right();
+                    }
+                }
+            }
+            canvas.push(line);
+        }
+        canvas
+    }
+
+    /// Install a finished highlight layout in every pane cache holding that
+    /// message at that width. Returns whether any frame content changed;
+    /// stale results for a message that was re-laid-out or evicted are
+    /// dropped.
+    pub(crate) fn apply_highlight(&mut self, result: Highlighted) -> bool {
+        let mut changed = false;
+        for cache in self.panes.values_mut() {
+            changed |= cache.apply_highlight(&result);
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    fn cache(&mut self, pane: PaneId) -> &mut TranscriptCache {
+        self.panes.entry(pane).or_default()
+    }
+
+    #[cfg(test)]
+    fn markdown(&mut self) -> &HashMap<MessageId, CachedMarkdown> {
+        &self.cache(PaneId::default()).markdown
+    }
+
+    #[cfg(test)]
+    fn render_message(&mut self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
+        let Self {
+            highlighter, panes, ..
+        } = self;
+        panes
+            .entry(PaneId::default())
+            .or_default()
+            .render_message(highlighter, message, width)
+    }
+
+    #[cfg(test)]
+    fn transcript<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
+        let Self {
+            highlighter, panes, ..
+        } = self;
+        let pane = app.panes.focused_id();
+        let viewport = app.panes.focused().viewport.clone();
+        panes
+            .entry(pane)
+            .or_default()
+            .transcript(highlighter, app, app.focused(), &viewport, width)
+    }
+
+    #[cfg(test)]
+    fn fold_focus<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
+        let Self {
+            highlighter, panes, ..
+        } = self;
+        let pane = app.panes.focused_id();
+        let viewport = app.panes.focused().viewport.clone();
+        panes
+            .entry(pane)
+            .or_default()
+            .fold_focus(highlighter, app, app.focused(), &viewport, width)
+    }
+}
+
+enum Piece {
+    Pane(Vec<Line>),
+    Divider(bool),
+}
+
+impl TranscriptCache {
+    /// Render one pane: an optional title row when several panes share the
+    /// screen, then the session transcript scrolled to the pane's viewport.
+    /// Every row is exactly `tile.rect.width` cells wide.
+    fn pane(
+        &mut self,
+        highlighter: &mut Highlighter,
+        app: &mut App,
+        tile: Tile,
+        titled: bool,
+    ) -> Vec<Line> {
+        let width = tile.rect.width;
+        let session_id = app.panes.get(tile.pane).and_then(|pane| pane.session);
+        let focused = app.panes.focused_id() == tile.pane;
+        let mut lines = Vec::with_capacity(tile.rect.height);
+        if titled {
+            lines.push(pane_title(app, session_id, focused, width));
+        }
+        let body_height = tile.rect.height.saturating_sub(lines.len());
+        let viewport = app.viewport(tile.pane).cloned().unwrap_or_default();
+        let body = match app.layout {
+            Layout::Threadline => self.threadline(highlighter, app, session_id, &viewport, width),
+            Layout::FoldFocus => self.fold_focus(highlighter, app, session_id, &viewport, width),
+        };
+        app.update_viewport(tile.pane, body.rows, body_height, body.preserve_tail_anchor);
+        let offset = app.viewport(tile.pane).map_or(0, Viewport::offset);
+        let live_message_ranges = body.live_message_ranges.clone();
+        let rows = body.viewport(app, body_height, offset);
+        drop(body);
+        self.live_message_ranges = live_message_ranges.into_iter().collect();
+        lines.extend(rows);
+        fit_height(lines, tile.rect.height)
+    }
+
+    /// Drop every cached layout, keeping live-row anchors: an overlay hides
+    /// the transcript but a completion behind it must still preserve the
+    /// user's viewport when the transcript returns.
+    fn prune_all(&mut self) {
+        self.markdown.clear();
+        self.live.clear();
+    }
+
+    /// Keep only the layouts for messages the pane can show this frame.
+    fn prune_markdown(&mut self, app: &App, session_id: Option<SessionId>) {
+        let visible = session_id
+            .and_then(|session_id| app.sessions.get(&session_id))
+            .and_then(|session| {
+                session
+                    .messages
+                    .as_ref()
+                    .map(|messages| (session, messages))
+            })
+            .map(|(session, messages)| {
+                let limit = match app.layout {
+                    Layout::Threadline => MAX_VISIBLE_MESSAGES,
+                    Layout::FoldFocus => 2,
+                };
+                let mut visible = messages
+                    .iter()
+                    .rev()
+                    .take(limit)
+                    .map(|message| message.id)
+                    .collect::<HashSet<_>>();
+                if app.layout == Layout::FoldFocus
+                    && let Some(active_run_id) = session.summary.active_run_id
+                    && let Some(message) = messages
                         .iter()
                         .rev()
-                        .take(limit)
-                        .map(|message| message.id)
-                        .collect::<HashSet<_>>();
-                    if app.layout == Layout::FoldFocus
-                        && let Some(active_run_id) = session.summary.active_run_id
-                        && let Some(message) = messages
-                            .iter()
-                            .rev()
-                            .find(|message| message.run_id == active_run_id)
-                    {
-                        visible.insert(message.id);
-                    }
-                    visible
-                })
-        } else {
-            None
-        };
+                        .find(|message| message.run_id == active_run_id)
+                {
+                    visible.insert(message.id);
+                }
+                visible
+            });
         match visible {
             Some(visible) => {
                 self.markdown.retain(|id, _| visible.contains(id));
@@ -627,24 +814,22 @@ impl FrameRenderer {
                 self.live_message_ranges
                     .retain(|id, _| visible.contains(id));
             }
-            None => {
-                self.markdown.clear();
-                self.live.clear();
-                // An overlay temporarily hides the transcript but must not
-                // erase its live-row anchors. A completion received behind the
-                // overlay still needs to preserve the user's prior viewport
-                // when the transcript becomes visible again.
-            }
+            None => self.prune_all(),
         }
     }
 
-    fn prepare_markdown(&mut self, app: &App, width: usize, limit: usize) {
+    fn prepare_markdown(
+        &mut self,
+        highlighter: &mut Highlighter,
+        app: &App,
+        session_id: Option<SessionId>,
+        viewport: &Viewport,
+        width: usize,
+        limit: usize,
+    ) {
         self.clock += 1;
-        self.prune_markdown(app);
-        let Some(session) = app
-            .focused
-            .and_then(|session_id| app.sessions.get(&session_id))
-        else {
+        self.prune_markdown(app, session_id);
+        let Some(session) = session_id.and_then(|session_id| app.sessions.get(&session_id)) else {
             return;
         };
         let Some(messages) = session.messages.as_ref() else {
@@ -656,11 +841,11 @@ impl FrameRenderer {
                 if self
                     .live_message_ranges
                     .remove(&message.id)
-                    .is_some_and(|range| app.transcript_viewport_intersects_or_follows(&range))
+                    .is_some_and(|range| viewport.intersects_or_follows(&range))
                 {
                     self.preserve_tail_anchor = true;
                 }
-                self.cache_message(message, width, session.loaded_through);
+                self.cache_message(highlighter, message, width, session.loaded_through);
             } else {
                 self.markdown.remove(&message.id);
                 self.refresh_live(message, width);
@@ -683,11 +868,11 @@ impl FrameRenderer {
                 if self
                     .live_message_ranges
                     .remove(&message.id)
-                    .is_some_and(|range| app.transcript_viewport_intersects_or_follows(&range))
+                    .is_some_and(|range| viewport.intersects_or_follows(&range))
                 {
                     self.preserve_tail_anchor = true;
                 }
-                self.cache_message(message, width, session.loaded_through);
+                self.cache_message(highlighter, message, width, session.loaded_through);
             } else {
                 self.markdown.remove(&message.id);
                 self.refresh_live(message, width);
@@ -738,7 +923,13 @@ impl FrameRenderer {
         }
     }
 
-    fn cache_message(&mut self, message: &MessageSnapshot, width: usize, loaded_through: u64) {
+    fn cache_message(
+        &mut self,
+        highlighter: &mut Highlighter,
+        message: &MessageSnapshot,
+        width: usize,
+        loaded_through: u64,
+    ) {
         if let Some(cached) = self.markdown.get_mut(&message.id)
             && cached.width == width
             && cached.output_bytes == message.output.len()
@@ -751,7 +942,7 @@ impl FrameRenderer {
             if !cached.highlight_requested {
                 let key = cached.key(message.id);
                 cached.highlight_requested = Self::request_highlight(
-                    &mut self.highlighter,
+                    highlighter,
                     key,
                     MessageText::new(message),
                     message.role,
@@ -800,7 +991,7 @@ impl FrameRenderer {
         let mut cached = cached;
         if needs_highlight {
             cached.highlight_requested =
-                Self::request_highlight(&mut self.highlighter, key, source, message.role);
+                Self::request_highlight(highlighter, key, source, message.role);
         }
         self.markdown.insert(message.id, cached);
     }
@@ -825,10 +1016,7 @@ impl FrameRenderer {
         })
     }
 
-    /// Install a finished highlight layout. Returns whether the frame changed;
-    /// stale results for a message that was re-laid-out or evicted are
-    /// dropped.
-    pub(crate) fn apply_highlight(&mut self, result: Highlighted) -> bool {
+    fn apply_highlight(&mut self, result: &Highlighted) -> bool {
         let Some(cached) = self.markdown.get_mut(&result.key.message_id) else {
             return false;
         };
@@ -837,15 +1025,22 @@ impl FrameRenderer {
         }
         match &mut cached.body {
             CachedMessageBody::Markdown(lines) => {
-                *lines = result.lines;
+                lines.clone_from(&result.lines);
                 true
             }
             CachedMessageBody::Plain(_) => false,
         }
     }
 
-    fn threadline<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
-        let transcript = self.transcript(app, width);
+    fn threadline<'a>(
+        &'a mut self,
+        highlighter: &mut Highlighter,
+        app: &App,
+        session_id: Option<SessionId>,
+        viewport: &Viewport,
+        width: usize,
+    ) -> VirtualBody<'a> {
+        let transcript = self.transcript(highlighter, app, session_id, viewport, width);
         let mut body = VirtualBody::default();
         body.extend_owned(vec![
             section(
@@ -855,7 +1050,7 @@ impl FrameRenderer {
             Line::default(),
         ]);
         body.extend_virtual(transcript);
-        if let Some(focused) = app.focused {
+        if let Some(focused) = session_id {
             // Children already shown under their spawn call are not repeated.
             let children: Vec<SessionId> = app
                 .children_of(focused)
@@ -879,9 +1074,16 @@ impl FrameRenderer {
         body
     }
 
-    fn fold_focus<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
+    fn fold_focus<'a>(
+        &'a mut self,
+        highlighter: &mut Highlighter,
+        app: &App,
+        session_id: Option<SessionId>,
+        viewport: &Viewport,
+        width: usize,
+    ) -> VirtualBody<'a> {
         let content_width = width.min(96);
-        self.prepare_markdown(app, content_width, 2);
+        self.prepare_markdown(highlighter, app, session_id, viewport, content_width, 2);
         let mut body = VirtualBody {
             preserve_tail_anchor: std::mem::take(&mut self.preserve_tail_anchor),
             ..VirtualBody::default()
@@ -893,7 +1095,7 @@ impl FrameRenderer {
             ),
             Line::default(),
         ]);
-        let Some(session_id) = app.focused else {
+        let Some(session_id) = session_id else {
             body.push_line(Line::styled("  Alt-N creates the first session.", muted()));
             return body;
         };
@@ -954,13 +1156,27 @@ impl FrameRenderer {
         body
     }
 
-    fn transcript<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
-        self.prepare_markdown(app, width, MAX_VISIBLE_MESSAGES);
+    fn transcript<'a>(
+        &'a mut self,
+        highlighter: &mut Highlighter,
+        app: &App,
+        session_id: Option<SessionId>,
+        viewport: &Viewport,
+        width: usize,
+    ) -> VirtualBody<'a> {
+        self.prepare_markdown(
+            highlighter,
+            app,
+            session_id,
+            viewport,
+            width,
+            MAX_VISIBLE_MESSAGES,
+        );
         let mut body = VirtualBody {
             preserve_tail_anchor: std::mem::take(&mut self.preserve_tail_anchor),
             ..VirtualBody::default()
         };
-        let Some(session_id) = app.focused else {
+        let Some(session_id) = session_id else {
             body.push_line(Line::styled("  Alt-N creates the first session.", muted()));
             return body;
         };
@@ -1255,10 +1471,16 @@ impl FrameRenderer {
     }
 
     #[cfg(test)]
-    fn render_message(&mut self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
+    #[cfg(test)]
+    fn render_message(
+        &mut self,
+        highlighter: &mut Highlighter,
+        message: &MessageSnapshot,
+        width: usize,
+    ) -> Vec<Line> {
         if message_is_terminal(message) {
             self.live.remove(&message.id);
-            self.cache_message(message, width, 0);
+            self.cache_message(highlighter, message, width, 0);
         } else {
             self.refresh_live(message, width);
         }
@@ -1688,7 +1910,7 @@ fn header(app: &App, width: usize) -> Line {
 
 fn context(app: &App, width: usize) -> Line {
     let mut line = Line::styled("  ", muted());
-    if let Some(focused) = app.focused {
+    if let Some(focused) = app.focused() {
         let mut ancestors = Vec::new();
         let mut cursor = Some(focused);
         while let Some(id) = cursor {
@@ -1726,7 +1948,7 @@ fn status_notice(app: &App, width: usize) -> Vec<Line> {
             width.max(1),
         ));
     }
-    if let Some(session) = app.focused.and_then(|id| app.sessions.get(&id))
+    if let Some(session) = app.focused().and_then(|id| app.sessions.get(&id))
         && session.summary.status == SessionStatus::Running
     {
         let label = match session.activity.map(|(_, activity)| activity) {
@@ -1747,7 +1969,7 @@ fn status_notice(app: &App, width: usize) -> Vec<Line> {
     let waiting: Vec<&str> = app
         .sessions_awaiting_approval()
         .into_iter()
-        .filter(|id| Some(*id) != app.focused)
+        .filter(|id| Some(*id) != app.focused())
         .filter_map(|id| app.sessions.get(&id))
         .map(|session| session.summary.title.as_str())
         .collect();
@@ -1864,7 +2086,7 @@ fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     let filtered = app.filtered_models();
     let mut lines = vec![section(
         "MODELS",
-        if app.focused.is_some() {
+        if app.focused().is_some() {
             "type to search, Enter sets the session model, Ctrl-N creates a session, Esc closes"
         } else {
             "type to search, Up/Down select, Enter creates session, Esc closes"
@@ -2004,7 +2226,7 @@ fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) ->
     line.push(format!("{marker}  "), style);
     line.push(
         &session.title,
-        if app.focused == Some(session_id) {
+        if app.focused() == Some(session_id) {
             normal().bold()
         } else {
             normal()
@@ -2012,6 +2234,32 @@ fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) ->
     );
     if session.queued_prompts > 0 {
         line.push(format!("  {} queued", session.queued_prompts), warning());
+    }
+    truncate_line(line, width)
+}
+
+/// Title row for a pane when several share the screen: the session title,
+/// its live status, and an accent on the focused pane so the eye finds where
+/// the composer will send.
+fn pane_title(app: &App, session_id: Option<SessionId>, focused: bool, width: usize) -> Line {
+    let (marker, marker_style) = if focused {
+        ("▎", accent())
+    } else {
+        (" ", muted())
+    };
+    let mut line = Line::styled(marker, marker_style);
+    match session_id.and_then(|id| app.sessions.get(&id)) {
+        Some(session) => {
+            line.push(
+                &session.summary.title,
+                if focused { normal().bold() } else { muted() },
+            );
+            if let Some((status, style)) = live_status_line(app, session.summary.id) {
+                line.push("  ", muted());
+                line.push(status, style);
+            }
+        }
+        None => line.push("no session", muted().italic()),
     }
     truncate_line(line, width)
 }
@@ -2041,7 +2289,7 @@ fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
     for session_id in order {
         let depth = app.depth(session_id);
         let indent = "  ".repeat(depth.min(4));
-        if app.focused == Some(session_id) {
+        if app.focused() == Some(session_id) {
             focused_row = rows.len();
         }
         rows.push(session_line(app, session_id, width, &format!("│ {indent}")));
@@ -2111,7 +2359,7 @@ fn live_status_line(app: &App, session_id: SessionId) -> Option<(String, Style)>
             warning(),
         ));
     }
-    if app.focused != Some(session_id) && !live.tail.is_empty() {
+    if app.focused() != Some(session_id) && !live.tail.is_empty() {
         return Some((live.tail.clone(), muted()));
     }
     None
@@ -2190,7 +2438,7 @@ fn reasoning_rows(app: &App, session_id: SessionId, run_id: RunId, width: usize)
 /// Drafts held locally while the focused session runs, oldest first. Each
 /// takes one row; the newest is the one Alt-Up brings back.
 fn queued_drafts(app: &App, width: usize) -> Vec<Line> {
-    let Some(session_id) = app.focused else {
+    let Some(session_id) = app.focused() else {
         return Vec::new();
     };
     let drafts: Vec<&str> = app.queued_drafts(session_id).collect();
@@ -2324,7 +2572,7 @@ fn footer_context(app: &App, width: usize) -> Line {
         ),
     };
     let focused = app
-        .focused
+        .focused()
         .and_then(|id| app.sessions.get(&id))
         .map(|session| &session.summary);
     let selected_model = focused
@@ -2352,7 +2600,7 @@ fn footer_workspace(app: &App, width: usize) -> Line {
     // at this final formatting boundary. Legacy payloads without structured
     // accounting fall back to the compatibility direct-cost alias.
     let cost = app
-        .focused
+        .focused()
         .and_then(|id| app.sessions.get(&id))
         .and_then(|session| {
             session
@@ -2519,6 +2767,7 @@ mod tests {
     use super::*;
     use crate::{
         ClientUpdate, ModelOption, TuiOptions,
+        commands::Command,
         render::{SURFACE_COLOR, code_keyword, success, surface},
         view::markdown::{code_panel_row, tests::style_of},
     };
@@ -2623,7 +2872,7 @@ mod tests {
 
         // Re-rendered every frame while streaming: plain panel, no cache.
         assert_eq!(style_of(&streaming, "let"), Some(surface(normal())));
-        assert!(renderer.markdown.is_empty());
+        assert!(renderer.markdown().is_empty());
         assert_eq!(renderer.highlighter.in_flight(), 0);
 
         // Completion caches a plain layout immediately and schedules
@@ -2631,7 +2880,7 @@ mod tests {
         message.state = MessageState::Complete;
         let complete = renderer.render_message(&message, 40);
         assert_eq!(style_of(&complete, "let"), Some(surface(normal())));
-        assert!(renderer.markdown.contains_key(&message.id));
+        assert!(renderer.markdown().contains_key(&message.id));
         assert_eq!(renderer.highlighter.in_flight(), 1);
 
         let highlighted = renderer.highlighter.next().await;
@@ -2719,7 +2968,7 @@ mod tests {
     #[test]
     fn transcript_renders_replayed_tool_activity_collapsed() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(vec![tool_call_snapshot(
             7,
             "read_file",
@@ -2742,7 +2991,7 @@ mod tests {
     #[test]
     fn call_only_run_renders_before_its_first_assistant_message() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         session.messages.as_mut().unwrap()[0].role = MessageRole::User;
         session.tool_calls = Some(vec![tool_call_snapshot(
@@ -2766,7 +3015,7 @@ mod tests {
     fn fold_focus_renders_the_current_runs_tool_activity() {
         let mut app = app_with_messages(1);
         app.layout = Layout::FoldFocus;
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         session.summary.status = SessionStatus::Running;
         session.summary.active_run_id = Some(RunId::from_bytes([2; 16]));
@@ -2791,7 +3040,7 @@ mod tests {
     fn fold_focus_keeps_active_work_visible_ahead_of_queued_prompts() {
         let mut app = app_with_messages(4);
         app.layout = Layout::FoldFocus;
-        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
         session.summary.status = SessionStatus::Running;
         let active_run_id = RunId::from_bytes([2; 16]);
         session.summary.active_run_id = Some(active_run_id);
@@ -2834,7 +3083,7 @@ mod tests {
     fn fold_focus_keeps_tool_calls_between_their_model_turns() {
         let mut app = app_with_messages(3);
         app.layout = Layout::FoldFocus;
-        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
         let messages = session.messages.as_mut().unwrap();
         messages[0].role = MessageRole::User;
         messages[1].turn_ordinal = 1;
@@ -2870,7 +3119,7 @@ mod tests {
     #[test]
     fn transcript_spacing_separates_blocks_and_doubles_before_prompts() {
         let mut app = app_with_messages(3);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         let messages = session.messages.as_mut().unwrap();
         messages[0].role = MessageRole::User;
@@ -2907,7 +3156,7 @@ mod tests {
     #[test]
     fn head_orphan_call_turns_render_before_the_runs_first_message() {
         let mut app = app_with_messages(2);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         let messages = session.messages.as_mut().unwrap();
         messages[0].role = MessageRole::User;
@@ -2955,7 +3204,7 @@ mod tests {
     #[test]
     fn consecutive_call_only_turns_merge_into_one_folded_group() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         session.messages.as_mut().unwrap()[0].turn_ordinal = 1;
         let calls = [(2, 1), (3, 1), (4, 2), (5, 3)]
@@ -3171,7 +3420,7 @@ mod tests {
     #[test]
     fn approval_prompts_render_edit_previews_as_colored_diffs() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let tool_call = tool_call_snapshot(
             9,
             "edit_file",
@@ -3477,7 +3726,7 @@ mod tests {
     #[test]
     fn detail_cycling_reveals_arguments_and_result_tails() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(vec![tool_call_snapshot(
             7,
             "read_file",
@@ -3596,19 +3845,19 @@ mod tests {
         let message = completed_message(1, "hello".to_owned());
         renderer.render_message(&message, 40);
         renderer.render_message(&message, 80);
-        assert_eq!(renderer.markdown.len(), 1);
-        assert_eq!(renderer.markdown[&message.id].width, 80);
+        assert_eq!(renderer.markdown().len(), 1);
+        assert_eq!(renderer.markdown()[&message.id].width, 80);
 
         for byte in 2..=u8::try_from(MAX_VISIBLE_MESSAGES + 8).unwrap() {
             renderer.render_message(&completed_message(byte, byte.to_string()), 80);
         }
-        assert!(renderer.markdown.len() <= MAX_VISIBLE_MESSAGES);
+        assert!(renderer.markdown().len() <= MAX_VISIBLE_MESSAGES);
     }
 
     #[test]
     fn authoritative_snapshot_generation_invalidates_same_length_cached_output() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         app.sessions
             .get_mut(&session_id)
             .unwrap()
@@ -3671,7 +3920,7 @@ mod tests {
         let mut app = app_with_messages(1);
         let message = &mut app
             .sessions
-            .get_mut(&app.focused.unwrap())
+            .get_mut(&app.focused().unwrap())
             .unwrap()
             .messages
             .as_mut()
@@ -3717,7 +3966,7 @@ mod tests {
         let mut app = app_with_messages(1);
         let message = &mut app
             .sessions
-            .get_mut(&app.focused.unwrap())
+            .get_mut(&app.focused().unwrap())
             .unwrap()
             .messages
             .as_mut()
@@ -3737,7 +3986,7 @@ mod tests {
     #[test]
     fn completing_a_long_live_message_preserves_a_scrolled_tail_anchor() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         let message = &mut session.messages.as_mut().unwrap()[0];
         message.state = MessageState::Streaming;
@@ -3768,7 +4017,7 @@ mod tests {
     #[test]
     fn completion_behind_an_overlay_preserves_the_scrolled_live_tail() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         let message = &mut session.messages.as_mut().unwrap()[0];
         message.state = MessageState::Streaming;
@@ -3802,7 +4051,7 @@ mod tests {
     #[test]
     fn completing_a_live_message_does_not_move_an_older_history_viewport() {
         let mut app = app_with_messages(2);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let session = app.sessions.get_mut(&session_id).unwrap();
         let messages = session.messages.as_mut().unwrap();
         messages[0].output = (0..200)
@@ -3880,7 +4129,7 @@ mod tests {
                 organization: None,
             },
         });
-        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
         session.summary.context_tokens = Some(64_000);
         session.context_window = Some(128_000);
         let frame = FrameRenderer::default().frame(&mut app, 80, 12);
@@ -3900,7 +4149,7 @@ mod tests {
     #[test]
     fn footer_renders_unknown_context_and_cost_without_inventing_zero_usage() {
         let mut app = app_with_messages(0);
-        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
         session.summary.estimated_cost_usd_nanos = Some(100_000_000);
         session.summary.accounting = Some(SessionAccounting {
             direct: AccountingTotal {
@@ -3924,7 +4173,7 @@ mod tests {
     #[test]
     fn footer_uses_legacy_direct_cost_when_structured_accounting_is_absent() {
         let mut app = app_with_messages(0);
-        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
         session.summary.accounting = None;
         session.summary.estimated_cost_usd_nanos = Some(100_000_000);
 
@@ -3936,7 +4185,7 @@ mod tests {
     #[test]
     fn footer_displays_inclusive_accounting_cost() {
         let mut app = app_with_messages(0);
-        let session = app.sessions.get_mut(&app.focused.unwrap()).unwrap();
+        let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
         session.summary.estimated_cost_usd_nanos = Some(100_000_000);
         session.summary.accounting = Some(SessionAccounting {
             direct: AccountingTotal {
@@ -3997,7 +4246,7 @@ mod tests {
     fn slash_autocomplete_is_filtered_above_the_composer() {
         let mut app = app_with_messages(1);
         app.composer.text = "/".to_owned();
-        let frame = FrameRenderer::default().frame(&mut app, 80, 16);
+        let frame = FrameRenderer::default().frame(&mut app, 80, 20);
         let text = frame_text(&frame);
         for command in ["/models", "/sessions", "/resume", "/new", "/quit", "/exit"] {
             assert!(text.contains(command));
@@ -4125,7 +4374,7 @@ mod tests {
         let text = frame_text(&frame);
         assert!(text.contains("Enter sets the session model, Ctrl-N creates a session"));
 
-        app.focused = None;
+        app.panes.focused_mut().session = None;
         let frame = FrameRenderer::default().frame(&mut app, 100, 12);
         let text = frame_text(&frame);
         assert!(text.contains("Enter creates session"));
@@ -4174,7 +4423,7 @@ mod tests {
     #[test]
     fn page_up_reaches_the_beginning_of_a_long_completed_message() {
         let mut app = app_with_messages(1);
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         app.sessions
             .get_mut(&session_id)
             .unwrap()
@@ -4209,7 +4458,7 @@ mod tests {
         let mut app = app_with_messages(1);
         app.connection = crate::ConnectionState::Live;
         let workspace_id = app.workspace_id.unwrap();
-        let parent = app.focused.unwrap();
+        let parent = app.focused().unwrap();
         let child_id = SessionId::from_bytes([7; 16]);
         let run_id = RunId::from_bytes([8; 16]);
         app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
@@ -4321,7 +4570,7 @@ mod tests {
     fn spawned_children_render_under_their_spawn_call_and_never_fold() {
         let mut app = app_with_messages(1);
         let workspace_id = app.workspace_id.unwrap();
-        let parent = app.focused.unwrap();
+        let parent = app.focused().unwrap();
         let run_id = RunId::from_bytes([2; 16]);
         let spawn_call = tool_call_snapshot(
             0x21,
@@ -4415,7 +4664,7 @@ mod tests {
         let mut app = app_with_messages(1);
         app.sidebar = crate::app::Sidebar::Hidden;
         let workspace_id = app.workspace_id.unwrap();
-        let parent = app.focused.unwrap();
+        let parent = app.focused().unwrap();
         let child_id = SessionId::from_bytes([0x40; 16]);
         let run_id = RunId::from_bytes([0x41; 16]);
         let mut sequence = 1;
@@ -4490,7 +4739,7 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(changed);
-        assert_eq!(app.focused, Some(child_id));
+        assert_eq!(app.focused(), Some(child_id));
         // The child is cold, so the jump fetches its body...
         assert_eq!(requests.len(), 1);
         // ...and the banner no longer names the session we are now in.
@@ -4503,7 +4752,7 @@ mod tests {
         let mut app = app_with_messages(0);
         app.sidebar = crate::app::Sidebar::Hidden;
         let workspace_id = app.workspace_id.unwrap();
-        let root = app.focused.unwrap();
+        let root = app.focused().unwrap();
         let mut sequence = 1;
         let mut created = |app: &mut App, byte: u8, parent: Option<SessionId>, at: u64| {
             sequence += 1;
@@ -4546,25 +4795,25 @@ mod tests {
         let key = |code| TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::ALT));
 
         app.handle_terminal_event(key(KeyCode::Down));
-        assert_eq!(app.focused, Some(a), "first child is the oldest");
+        assert_eq!(app.focused(), Some(a), "first child is the oldest");
         app.handle_terminal_event(key(KeyCode::Right));
-        assert_eq!(app.focused, Some(b));
+        assert_eq!(app.focused(), Some(b));
         app.handle_terminal_event(key(KeyCode::Right));
-        assert_eq!(app.focused, Some(c));
+        assert_eq!(app.focused(), Some(c));
         app.handle_terminal_event(key(KeyCode::Right));
-        assert_eq!(app.focused, Some(a), "siblings wrap");
+        assert_eq!(app.focused(), Some(a), "siblings wrap");
         app.handle_terminal_event(key(KeyCode::Left));
-        assert_eq!(app.focused, Some(c));
+        assert_eq!(app.focused(), Some(c));
         // Esc walks up to the parent (Alt-Up belongs to the draft queue).
         app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.focused, Some(root));
+        assert_eq!(app.focused(), Some(root));
         // A lone root has no siblings; the key is a no-op.
         let (changed, _) = app.handle_terminal_event(key(KeyCode::Right));
         assert!(!changed);
-        assert_eq!(app.focused, Some(root));
+        assert_eq!(app.focused(), Some(root));
     }
 
     #[test]
@@ -4572,7 +4821,7 @@ mod tests {
         let mut app = app_with_messages(0);
         app.sidebar = crate::app::Sidebar::Hidden;
         let workspace_id = app.workspace_id.unwrap();
-        let session_id = app.focused.unwrap();
+        let session_id = app.focused().unwrap();
         let run_id = RunId::from_bytes([0x66; 16]);
         let mut sequence = 1;
         let mut event = |event: SessionEvent| {
@@ -4632,5 +4881,159 @@ mod tests {
         let rows = frame_rows(&transcript_lines(&app, 80));
         assert!(rows.iter().any(|row| row.contains("Then the tests.")));
         assert!(rows.iter().any(|row| row.contains("┆")));
+    }
+
+    /// `app_with_messages` plus a second warm session titled "Other" whose
+    /// messages read `other N`.
+    fn app_with_two_sessions(count: u8) -> (App, SessionId, SessionId) {
+        let mut app = app_with_messages(count);
+        let first = app.focused().unwrap();
+        let workspace_id = app.workspace_id.unwrap();
+        let other = SessionId::from_bytes([9; 16]);
+        let mut summary = app.sessions[&first].summary.clone();
+        summary.id = other;
+        summary.title = "Other".to_owned();
+        let messages = (0..count)
+            .map(|row| {
+                let mut message = completed_message(0x80 + row, format!("other {row}"));
+                message.session_id = other;
+                message
+            })
+            .collect();
+        app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
+            included: vec![SessionSnapshot {
+                summary: summary.clone(),
+                messages,
+                runs: Vec::new(),
+                tool_calls: Vec::new(),
+                has_older_tool_calls: false,
+                has_older_messages: false,
+            }],
+            cursor: EventCursor {
+                store_id: StoreId::from_bytes([4; 16]),
+                workspace_id,
+                sequence: 2,
+            },
+            workspace: WorkspaceSummary {
+                id: workspace_id,
+                path: "/workspace".to_owned(),
+            },
+            sessions: vec![summary],
+            focused: None,
+            has_older_sessions: false,
+        }));
+        (app, first, other)
+    }
+
+    #[test]
+    fn two_panes_render_side_by_side_with_titles_and_a_divider() {
+        let (mut app, _, other) = app_with_two_sessions(3);
+        app.sidebar = crate::app::Sidebar::Hidden;
+        app.execute(Command::SplitBeside);
+        app.focus_session(other);
+        let frame = FrameRenderer::default().frame(&mut app, 101, 24);
+        let rows = frame_rows(&frame);
+        // Row 2 is the pane title row: the left pane is unfocused, the right
+        // pane carries the focus marker and its title.
+        let titles = &rows[2];
+        assert!(titles.contains(" Session"), "{titles}");
+        assert!(titles.contains("▎Other"), "{titles}");
+        // Every body row has a divider at the split column and both
+        // transcripts appear on their own side of it.
+        let body = &rows[2..2 + 24 - 6];
+        assert!(
+            body.iter().all(|row| row.chars().nth(50) == Some('│')),
+            "{body:?}"
+        );
+        let (left, right): (Vec<&str>, Vec<&str>) =
+            body.iter().map(|row| row.split_once('│').unwrap()).unzip();
+        assert!(left.iter().any(|row| row.contains("row 2")));
+        assert!(!left.iter().any(|row| row.contains("other")));
+        assert!(right.iter().any(|row| row.contains("other 2")));
+        assert!(!right.iter().any(|row| row.contains("row 2")));
+        // The composer footer describes the focused pane's session.
+        assert!(frame_text(&frame).contains("Other"));
+        // Rows never exceed the frame width; a wide message cannot bleed
+        // across the divider into its neighbour.
+        assert!(frame.iter().all(|line| line.width() <= 101));
+    }
+
+    #[test]
+    fn stacked_panes_share_the_width_and_scroll_independently() {
+        let (mut app, _, _) = app_with_two_sessions(40);
+        app.sidebar = crate::app::Sidebar::Hidden;
+        app.execute(Command::SplitBelow);
+        let mut renderer = FrameRenderer::default();
+        renderer.frame(&mut app, 80, 40);
+        let (tiles, dividers) = app.panes.layout(crate::panes::Rect::new(0, 2, 80, 34));
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(dividers[0].height, 1);
+        assert_eq!(dividers[0].width, 80);
+        let top = tiles[0].pane;
+        let bottom = tiles[1].pane;
+        assert_eq!(app.panes.focused_id(), bottom);
+
+        // PageUp scrolls only the focused (bottom) pane.
+        app.handle_terminal_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        let frame = renderer.frame(&mut app, 80, 40);
+        assert!(app.viewport(bottom).unwrap().offset() > 0);
+        assert_eq!(app.viewport(top).unwrap().offset(), 0);
+        let rows = frame_rows(&frame);
+        let divider_row = rows
+            .iter()
+            .position(|row| row.starts_with("──"))
+            .expect("horizontal divider");
+        assert!(rows[..divider_row].iter().any(|row| row.contains("row 39")));
+        assert!(!rows[divider_row..].iter().any(|row| row.contains("row 39")));
+    }
+
+    #[test]
+    fn a_height_only_resize_keeps_every_pane_cache() {
+        let (mut app, _, other) = app_with_two_sessions(4);
+        app.sidebar = crate::app::Sidebar::Hidden;
+        app.execute(Command::SplitBeside);
+        app.focus_session(other);
+        let mut renderer = FrameRenderer::default();
+        renderer.frame(&mut app, 101, 24);
+        let ids = app.panes.ids();
+        let cached_before: Vec<usize> = ids
+            .iter()
+            .map(|id| renderer.cache(*id).markdown.len())
+            .collect();
+        assert_eq!(cached_before, vec![4, 4]);
+        let widths: Vec<usize> = ids
+            .iter()
+            .map(|id| renderer.cache(*id).markdown.values().next().unwrap().width)
+            .collect();
+
+        renderer.frame(&mut app, 101, 30);
+        for (id, width) in ids.iter().zip(widths) {
+            let cache = renderer.cache(*id);
+            assert_eq!(cache.markdown.len(), 4);
+            assert!(cache.markdown.values().all(|cached| cached.width == width));
+        }
+        // Closing a pane drops its cache on the next frame.
+        app.execute(Command::ClosePane);
+        renderer.frame(&mut app, 101, 30);
+        assert_eq!(renderer.panes.len(), 1);
+    }
+
+    #[test]
+    fn a_narrow_frame_shows_only_the_focused_pane_and_no_divider() {
+        let (mut app, _, other) = app_with_two_sessions(2);
+        app.sidebar = crate::app::Sidebar::Hidden;
+        app.execute(Command::SplitBeside);
+        app.focus_session(other);
+        let frame = FrameRenderer::default().frame(&mut app, 40, 16);
+        let text = frame_text(&frame);
+        assert!(text.contains("other 1"));
+        assert!(!text.contains("row 1"));
+        assert!(!text.contains('│'));
+        assert_eq!(app.panes.len(), 2, "the tree is untouched");
     }
 }

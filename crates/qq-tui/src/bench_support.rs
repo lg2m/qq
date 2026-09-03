@@ -155,6 +155,71 @@ impl BenchHarness {
         self.app.sidebar = crate::app::Sidebar::Hidden;
     }
 
+    /// Load `messages` completed assistant messages into session `index`
+    /// through an included body, as the client's pre-warm does.
+    pub fn warm_session(&mut self, index: u8, messages: u8) {
+        let workspace_id = WorkspaceId::from_bytes([1; 16]);
+        let body = SessionSnapshot {
+            summary: summary(workspace_id, session_id(index), SessionStatus::Idle),
+            messages: (0..messages)
+                .map(|row| {
+                    let mut message = assistant_message(session_id(index), row, PARAGRAPH);
+                    message.state = MessageState::Complete;
+                    message
+                })
+                .collect(),
+            runs: Vec::new(),
+            tool_calls: Vec::new(),
+            has_older_tool_calls: false,
+            has_older_messages: false,
+        };
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.app
+            .apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
+                cursor: EventCursor {
+                    store_id: StoreId::from_bytes([3; 16]),
+                    workspace_id,
+                    sequence,
+                },
+                workspace: WorkspaceSummary {
+                    id: workspace_id,
+                    path: "/workspace".to_owned(),
+                },
+                sessions: Vec::new(),
+                focused: None,
+                included: vec![body],
+                has_older_sessions: false,
+            }));
+    }
+
+    /// Split the focused pane side by side and show session `index` in the
+    /// new pane. The session must already be warm.
+    pub fn split_beside_showing(&mut self, index: u8) {
+        self.app.execute(crate::commands::Command::SplitBeside);
+        let (_, requests) = self.app.focus_session(session_id(index));
+        assert!(requests.is_empty(), "bench sessions must be warm");
+    }
+
+    /// Draw until every scheduled highlight has landed, as the event loop
+    /// does between frames. Steady-state samples should reflect the
+    /// highlighted cache, not a stream of upgrade frames.
+    pub fn settle_highlights(&mut self) {
+        loop {
+            let applied = self.apply_finished_highlights();
+            if applied > 0 {
+                self.draw();
+            }
+            if !self.highlights_pending() && applied == 0 {
+                self.draw();
+                if !self.highlights_pending() {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
     /// Whether highlight jobs are still running.
     pub fn highlights_pending(&self) -> bool {
         self.renderer.highlighter.in_flight() > 0

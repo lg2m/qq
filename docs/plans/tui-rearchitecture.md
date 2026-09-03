@@ -1,7 +1,7 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phases T0–T5 are complete (receipts below).
-Phases T6–T7 are proposed.
+Status: proposed 2026-09-02. Phases T0–T6 are complete (receipts below).
+Phase T7 is proposed.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -93,7 +93,7 @@ input.rs               ModeStack (Compose | Palette | Approval | Confirm | Searc
 picker.rs              Picker<T>: query, filtered indices, selection, viewport, categories
 composer.rs            editor; composer/kill_ring.rs, composer/paste.rs, composer/history.rs
 view.rs                frame assembly from panes and chrome
-view/panes.rs          Pane layout (single | vertical split); per-pane viewport and TranscriptCache
+panes.rs               Tiling pane tree: splits, focus, zoom, resize, geometry; per-pane viewport
 view/transcript.rs     retained message rendering, streaming tail, tool-call grouping
 view/sidebar.rs        session tree with live status
 view/chrome.rs         header, footer, notices, approval banner
@@ -496,16 +496,67 @@ All workspace gates green; 168 TUI tests. Render bench unchanged.
 
 ### T6 — Split Panes
 
-Deliverables:
+Deliverables (revised at implementation from a fixed left/right pair to a
+tiling tree, at the user's request):
 
-- `Layout::Split { left, right }` with per-pane `TranscriptCache` and viewport;
-  pane focus cycling; pinned panes stay warm; approvals and footers derive from
-  the focused pane; per-pane scroll state replaces the single viewport.
+- A binary pane tree (`panes.rs`): any pane can be split side by side or
+  stacked to any depth (bounded at 16), closed back onto its sibling, zoomed,
+  and resized; focus moves geometrically. Each pane has its own viewport and
+  `TranscriptCache`; sessions shown in any pane stay warm; approvals,
+  footers, composer, and tree navigation derive from the focused pane.
 
 Acceptance:
 
 - Two panes streaming concurrently stay within `1.5x` single-pane frame cost.
 - Resize re-lays panes without full cache invalidation.
+
+#### T6 Completion Receipt — 2026-09-02
+
+All workspace gates green; 191 TUI tests (12 tree/geometry, 7 app, 4 view).
+
+- **Model.** `Panes` owns a `Node` tree of `Split { axis, ratio }` and
+  `Leaf(PaneId)` plus a `PaneId -> Pane { session, viewport }` map. Ids are
+  stable across every mutation so per-pane render state survives splits and
+  closes. The tree stores no geometry: `layout(rect)` computes tiles and
+  dividers each frame, so a resize never touches the tree. A split that
+  cannot fit two readable panes (24x4) shows only the side on the focus path
+  and reappears when room returns; zoom shows only the focused pane. Tiles
+  are remembered for mouse hit-testing.
+- **Focus.** `App.focused: Option<SessionId>` became `App::focused()` reading
+  the focused pane's session, so every focus-dependent surface (composer,
+  approvals, footers, breadcrumb, drafts, Alt-arrows tree navigation,
+  pickers) targets the focused pane without a second code path. A new pane
+  inherits the focused session (tmux/vim behaviour) and takes focus, so a
+  split never requests anything.
+- **Warmth.** `evict_cold_bodies` pins every session shown in any pane;
+  `apply_snapshot` installs a body for any shown session and only moves focus
+  when the user is still on that pane (or nothing is focused); a late body
+  for a session no pane shows is dropped as before. Session deletion
+  repoints every pane showing it and fetches only if the replacement is
+  cold. `ResetSnapshot` clears pane sessions and keeps the tree shape.
+- **Rendering.** `FrameRenderer` keeps the row diff and the shared
+  `Highlighter`; the markdown/live/anchor state moved into a
+  `TranscriptCache` per pane. Highlight results fan out to every cache with
+  a matching key. Panes are composed row by row in one pass, moving each
+  pane's spans into place and truncating any row that would cross a divider;
+  a single pane filling the body takes the pre-T6 path untouched. Multiple
+  panes get a one-row title (focus marker, session title, live status).
+  Caches for panes that are closed or hidden this frame are dropped.
+- **Commands.** `SplitBeside` (Alt-\, `/split`), `SplitBelow` (Alt--,
+  `/stack`), `ClosePane` (Alt-W, `/close`), `ZoomPane` (Alt-Z, `/zoom`),
+  `FocusPane{Left,Down,Up,Right}` (Alt-H/J/K/L), `ResizePane*`
+  (Alt-Shift-H/J/K/L, 5% steps clamped to 15–85%). Mouse wheel scrolls the
+  pane under the cursor; a click focuses it. Four slash names were added to
+  `RESERVED_CLIENT_SLASH_COMMANDS` (additive; protocol version unchanged).
+- **Bench.** `streaming_two_panes_delta_to_frame` median 51.0 µs against
+  `streaming_focused_delta_to_frame` 36.2 µs: **1.41x**, inside the 1.5x
+  budget. Single-pane cases are unchanged from the T5 baseline (steady 20.4,
+  keystroke 25.3, sidebar 37.3, background-8 24.3 µs). The two-pane cost is
+  dominated by walking two 64-message bodies, not composition; a
+  `steady_two_panes_frame` case (51.1 µs) records that floor.
+- **Deferred.** Per-pane layout mode (Threadline/FoldFocus is still global);
+  moving a pane within the tree; swapping two panes; saving the pane tree
+  across restarts.
 
 ### T7 — Polish
 
