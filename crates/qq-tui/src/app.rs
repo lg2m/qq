@@ -6,14 +6,16 @@ use std::{
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
     AgentProfileId, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId,
-    CommandOutcome, CommandRequest, EditPreview, ModelDescriptor, ModelSelection,
-    ServerCapabilities, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionSnapshot, SessionStatus, SnapshotRequest, SteeringCapabilities, ToolCallSnapshot,
-    ToolCallState, WorkspaceId, WorkspaceSnapshot,
+    CommandOutcome, CommandRequest, ModelDescriptor, ModelSelection, ServerCapabilities,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
+    SnapshotRequest, SteeringCapabilities, ToolCallSnapshot, ToolCallState, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use thiserror::Error;
 
-pub(crate) use crate::model::{LiveStatus, ReasoningDetail, SessionStore, SessionView};
+pub(crate) use crate::model::{
+    ApprovalPreview, LiveStatus, ReasoningDetail, SessionStore, SessionView,
+};
 use crate::model::{MAX_PROMPT_HISTORY, MAX_QUEUED_DRAFTS, WARM_BODY_LIMIT};
 use crate::{
     Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Settings,
@@ -704,7 +706,7 @@ impl App {
                     .iter()
                     .any(|call| call.id == *id && call.state == ToolCallState::Running)
             });
-            view.edit_previews = previous.edit_previews;
+            view.approval_previews = previous.approval_previews;
         }
         view.messages = Some(messages);
         view.tool_calls = Some(tool_calls);
@@ -1788,11 +1790,12 @@ impl App {
     }
 
     /// The diff preview carried by the pending approval's request, if any.
-    pub(crate) fn pending_approval_edit(&self) -> Option<&EditPreview> {
+    /// The server-computed preview of what the pending approval would do.
+    pub(crate) fn pending_approval_preview(&self) -> Option<&ApprovalPreview> {
         let tool_call = self.pending_approval()?;
         self.sessions
             .get(&tool_call.session_id)?
-            .edit_previews
+            .approval_previews
             .get(&tool_call.id)
     }
 

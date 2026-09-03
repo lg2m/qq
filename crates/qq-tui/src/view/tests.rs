@@ -3029,3 +3029,44 @@ fn skills_picker_groups_commands_before_skills_with_sources() {
     let audit_row = rows.iter().find(|row| row.contains("/audit")).unwrap();
     assert!(audit_row.contains("explicit only"), "{audit_row}");
 }
+
+#[test]
+fn shell_approvals_show_the_server_preview_not_the_arguments() {
+    let mut app = app_with_messages(1);
+    let session_id = app.focused().unwrap();
+    // The arguments say one thing; the server's preview (what will really
+    // run, after its own normalization) says another. The preview wins.
+    let tool_call = tool_call_snapshot(
+        9,
+        "shell",
+        r#"{"command":"rm -rf build","cwd":"ignored"}"#,
+        ToolCallState::AwaitingApproval,
+        None,
+        false,
+    );
+    app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+        run_id: Some(tool_call.run_id),
+        occurred_at_ms: 2,
+        ..fixtures::envelope(
+            2,
+            session_id,
+            SessionEvent::ToolApprovalRequested {
+                tool_call,
+                shell: Some(qq_protocol::ShellCommandPreview {
+                    command: "rm -rf ./build".to_owned(),
+                    cwd: Some("crates/qq-tui".to_owned()),
+                }),
+                edit: None,
+            },
+        )
+    }));
+
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 24);
+    let rows = squashed_rows(&frame);
+    let command_row = rows.iter().find(|row| row.contains("$ ")).unwrap();
+    assert!(
+        command_row.contains("rm -rf ./build") && command_row.contains("(in crates/qq-tui)"),
+        "{command_row}"
+    );
+    assert!(!command_row.contains("ignored"), "{command_row}");
+}

@@ -1391,7 +1391,7 @@ pub(super) fn format_count(count: u64) -> String {
 /// `call_id` is that call; otherwise nothing.
 fn approval_rows(app: &App, call_id: ToolCallId, width: usize) -> Vec<Line> {
     match app.pending_approval() {
-        Some(call) if call.id == call_id => approval_block(app, call, width),
+        Some(call) if call.id == call_id => approval_block(app, width),
         _ => Vec::new(),
     }
 }

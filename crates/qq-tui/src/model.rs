@@ -8,8 +8,8 @@ use std::{
 };
 
 use qq_protocol::{
-    EditPreview, MessageSnapshot, RunActivity, RunId, SessionId, SessionSummary, ToolCallId,
-    ToolCallSnapshot, ToolCallState,
+    EditPreview, MessageSnapshot, RunActivity, RunId, SessionId, SessionSummary,
+    ShellCommandPreview, ToolCallId, ToolCallSnapshot, ToolCallState,
 };
 
 use crate::app::terminal_safe_character;
@@ -267,6 +267,13 @@ pub(crate) struct LiveStatus {
     pub awaiting_approval: std::collections::BTreeSet<qq_protocol::ToolCallId>,
 }
 
+/// What one `ToolApprovalRequested` event said the call would do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ApprovalPreview {
+    pub shell: Option<ShellCommandPreview>,
+    pub edit: Option<EditPreview>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionView {
     pub summary: SessionSummary,
@@ -296,9 +303,10 @@ pub(crate) struct SessionView {
     /// Bounded tails of live streamed output per running tool call, dropped
     /// when the call reaches a terminal state or the body reloads.
     pub(crate) live_tool_output: HashMap<ToolCallId, String>,
-    /// Diff previews carried by approval requests, kept only while the call
-    /// awaits an answer so the modal can show what an edit would change.
-    pub(crate) edit_previews: HashMap<ToolCallId, EditPreview>,
+    /// Shell and edit previews carried by approval requests, kept only while
+    /// the call awaits an answer so the modal can show what it would do. The
+    /// server computes these; the client never re-derives them from arguments.
+    pub(crate) approval_previews: HashMap<ToolCallId, ApprovalPreview>,
     /// Observed timing per tool call, bounded with the warm body.
     pub(crate) tool_timing: HashMap<ToolCallId, ToolCallTiming>,
     /// Assistant messages and run finishes that arrived while this session
@@ -358,7 +366,7 @@ impl SessionView {
             prompt_history: VecDeque::new(),
             drafts: VecDeque::new(),
             live_tool_output: HashMap::new(),
-            edit_previews: HashMap::new(),
+            approval_previews: HashMap::new(),
             tool_timing: HashMap::new(),
             unread: 0,
             finished_unread: false,
@@ -457,7 +465,7 @@ impl SessionView {
         self.messages = None;
         self.tool_calls = None;
         self.live_tool_output.clear();
-        self.edit_previews.clear();
+        self.approval_previews.clear();
         self.tool_timing.clear();
     }
 }

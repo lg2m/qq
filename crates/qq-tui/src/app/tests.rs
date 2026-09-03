@@ -266,7 +266,7 @@ fn approve_for_workspace_sends_the_decision_and_surfaces_the_promotion() {
 }
 
 #[test]
-fn edit_previews_are_kept_only_while_the_approval_is_pending() {
+fn approval_previews_are_kept_only_while_the_approval_is_pending() {
     let mut app = App::new(TuiOptions::default());
     let initial = snapshot();
     let session_id = initial.focused.as_ref().unwrap().summary.id;
@@ -291,21 +291,23 @@ fn edit_previews_are_kept_only_while_the_approval_is_pending() {
         SessionEvent::ToolApprovalRequested {
             tool_call: tool_call.clone(),
             shell: None,
-            edit: Some(EditPreview {
+            edit: Some(qq_protocol::EditPreview {
                 path: "note.txt".to_owned(),
                 diff: "-old\n+new".to_owned(),
             }),
         },
     ));
     assert_eq!(
-        app.pending_approval_edit().map(|edit| edit.diff.as_str()),
+        app.pending_approval_preview()
+            .and_then(|preview| preview.edit.as_ref())
+            .map(|edit| edit.diff.as_str()),
         Some("-old\n+new")
     );
 
     tool_call.state = ToolCallState::Running;
     app.apply_live_event(envelope(3, SessionEvent::ToolCallStarted { tool_call }));
-    assert!(app.pending_approval_edit().is_none());
-    assert!(app.sessions[&session_id].edit_previews.is_empty());
+    assert!(app.pending_approval_preview().is_none());
+    assert!(app.sessions[&session_id].approval_previews.is_empty());
 }
 
 #[test]

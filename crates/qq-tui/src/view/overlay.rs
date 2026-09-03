@@ -434,17 +434,24 @@ pub(super) fn command_picker(app: &App, width: usize, height: usize) -> Vec<Line
 /// The approval block drawn under a tool call awaiting an answer: the
 /// command or the diff head, then the four choices. Rendered inline in the
 /// transcript so the decision is made with the run's context on screen.
-pub(super) fn approval_block(app: &App, tool_call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
+pub(super) fn approval_block(app: &App, width: usize) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut title = Line::styled("     ◇ ", warning());
     title.push("approval needed", warning().bold());
     lines.push(truncate_line(title, width));
-    if let Some(command) = shell_command_preview(tool_call) {
+    // Both previews come from the approval event: the server states exactly
+    // what it will run or write, so the client never re-derives it from the
+    // call's arguments.
+    let preview = app.pending_approval_preview();
+    if let Some(shell) = preview.and_then(|preview| preview.shell.as_ref()) {
         let mut line = Line::styled("       $ ", muted());
-        line.push(command, normal().bold());
+        line.push(shell.command.as_str(), normal().bold());
+        if let Some(cwd) = &shell.cwd {
+            line.push(format!("  (in {cwd})"), muted());
+        }
         lines.push(truncate_line(line, width));
     }
-    if let Some(edit) = app.pending_approval_edit() {
+    if let Some(edit) = preview.and_then(|preview| preview.edit.as_ref()) {
         let mut line = Line::styled("       ", muted());
         line.push(
             elide_path(&edit.path, width.saturating_sub(9)),
@@ -511,18 +518,4 @@ pub(super) fn history_picker(app: &App, width: usize, height: usize) -> Vec<Line
             out.push(finish_row(line, selected, width));
         },
     )
-}
-
-/// Shell approvals surface the exact command so the user can decide in place.
-pub(super) fn shell_command_preview(tool_call: &ToolCallSnapshot) -> Option<String> {
-    if tool_call.name != "shell" {
-        return None;
-    }
-    let arguments = serde_json::from_str::<serde_json::Value>(&tool_call.arguments).ok()?;
-    let command = arguments.get("command")?.as_str()?;
-    let cwd = arguments.get("cwd").and_then(|value| value.as_str());
-    Some(match cwd {
-        Some(cwd) => format!("{command}  (in {cwd})"),
-        None => command.to_owned(),
-    })
 }

@@ -16,6 +16,7 @@ use crate::{
     ClientRequest,
     effect::{Effect, Effects},
     input::{Overlay, SessionConfirm},
+    model::ApprovalPreview,
     viewport::View,
 };
 
@@ -156,7 +157,9 @@ impl App {
                 }
             }
             SessionEvent::ToolApprovalRequested {
-                tool_call, edit, ..
+                tool_call,
+                shell,
+                edit,
             } => {
                 if tool_call.state != ToolCallState::AwaitingApproval {
                     self.answered_approvals.remove(&tool_call.id);
@@ -166,8 +169,14 @@ impl App {
                     }));
                 }
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
-                    if let Some(edit) = edit {
-                        session.edit_previews.insert(tool_call.id, edit.clone());
+                    if shell.is_some() || edit.is_some() {
+                        session.approval_previews.insert(
+                            tool_call.id,
+                            ApprovalPreview {
+                                shell: shell.clone(),
+                                edit: edit.clone(),
+                            },
+                        );
                     }
                     session.live.note_tool_call(tool_call);
                 }
@@ -220,7 +229,7 @@ impl App {
                 }
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
                     if tool_call.state != ToolCallState::AwaitingApproval {
-                        session.edit_previews.remove(&tool_call.id);
+                        session.approval_previews.remove(&tool_call.id);
                     }
                     if tool_call_state_is_terminal(tool_call.state) {
                         // The persisted bounded result takes over from the tail.
