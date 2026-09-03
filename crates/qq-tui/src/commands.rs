@@ -26,10 +26,6 @@ pub(crate) enum Command {
     NewChildSession,
     CompactSession,
     CancelRun,
-    SelectThreadline,
-    SelectFoldFocus,
-    NextLayout,
-    PreviousLayout,
     ToggleToolDetail,
     /// Move the transcript cursor to the previous / next tool call of the
     /// focused session; Enter then expands or collapses that call alone.
@@ -69,22 +65,6 @@ pub(crate) enum Command {
     SearchHistory,
     /// Delete every empty session in the workspace after confirmation.
     PruneSessions,
-    /// Split the focused pane; the new pane sits beside it.
-    SplitBeside,
-    /// Split the focused pane; the new pane sits below it.
-    SplitBelow,
-    ClosePane,
-    /// Show only the focused pane until toggled again.
-    ZoomPane,
-    FocusPaneLeft,
-    FocusPaneRight,
-    FocusPaneUp,
-    FocusPaneDown,
-    /// Move the divider enclosing the focused pane one step.
-    ResizePaneLeft,
-    ResizePaneRight,
-    ResizePaneUp,
-    ResizePaneDown,
     Quit,
 }
 
@@ -95,7 +75,6 @@ pub(crate) enum Category {
     Run,
     Model,
     View,
-    Panes,
     Compose,
     System,
 }
@@ -108,7 +87,6 @@ impl Category {
             Self::Run => "RUN",
             Self::Model => "MODEL",
             Self::View => "VIEW",
-            Self::Panes => "PANES",
             Self::Compose => "COMPOSER",
             Self::System => "SYSTEM",
         }
@@ -149,7 +127,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 50] = [
+pub(crate) const COMMANDS: [CommandSpec; 34] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -286,31 +264,6 @@ pub(crate) const COMMANDS: [CommandSpec; 50] = [
     spec!(OpenModels, "choose a model", Model, ["/models"], []),
     spec!(OpenThemes, "choose a theme", View, ["/theme"], []),
     spec!(
-        SelectThreadline,
-        "threadline layout",
-        View,
-        [],
-        [],
-        SelectThreadline
-    ),
-    spec!(
-        SelectFoldFocus,
-        "fold-focus layout",
-        View,
-        [],
-        [],
-        SelectFoldFocus
-    ),
-    spec!(NextLayout, "next layout", View, ["/layout"], [], NextLayout),
-    spec!(
-        PreviousLayout,
-        "previous layout",
-        View,
-        [],
-        [],
-        PreviousLayout
-    ),
-    spec!(
         ToggleToolDetail,
         "toggle tool call detail",
         View,
@@ -359,78 +312,6 @@ pub(crate) const COMMANDS: [CommandSpec; 50] = [
         View,
         ["/changes"],
         []
-    ),
-    spec!(
-        SplitBeside,
-        "split the pane side by side",
-        Panes,
-        ["/split"],
-        ["Alt-\\"]
-    ),
-    spec!(
-        SplitBelow,
-        "split the pane top and bottom",
-        Panes,
-        ["/stack"],
-        ["Alt--"]
-    ),
-    spec!(
-        ClosePane,
-        "close the focused pane",
-        Panes,
-        ["/close"],
-        ["Alt-W"]
-    ),
-    spec!(
-        ZoomPane,
-        "toggle showing only the focused pane",
-        Panes,
-        ["/zoom"],
-        ["Alt-Z"]
-    ),
-    spec!(
-        FocusPaneLeft,
-        "focus the pane to the left",
-        Panes,
-        [],
-        ["Alt-H"]
-    ),
-    spec!(
-        FocusPaneRight,
-        "focus the pane to the right",
-        Panes,
-        [],
-        ["Alt-L"]
-    ),
-    spec!(FocusPaneUp, "focus the pane above", Panes, [], ["Alt-K"]),
-    spec!(FocusPaneDown, "focus the pane below", Panes, [], ["Alt-J"]),
-    spec!(
-        ResizePaneLeft,
-        "move the pane divider left",
-        Panes,
-        [],
-        ["Alt-Shift-H"]
-    ),
-    spec!(
-        ResizePaneRight,
-        "move the pane divider right",
-        Panes,
-        [],
-        ["Alt-Shift-L"]
-    ),
-    spec!(
-        ResizePaneUp,
-        "move the pane divider up",
-        Panes,
-        [],
-        ["Alt-Shift-K"]
-    ),
-    spec!(
-        ResizePaneDown,
-        "move the pane divider down",
-        Panes,
-        [],
-        ["Alt-Shift-J"]
     ),
     spec!(
         OpenEditor,

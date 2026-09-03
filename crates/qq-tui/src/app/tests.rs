@@ -12,7 +12,7 @@ use crate::{
     fixtures,
     input::SessionConfirm,
     model::{LIVE_TAIL_BYTES, MAX_LIVE_TOOL_OUTPUT_BYTES},
-    panes::Viewport,
+    viewport::View,
 };
 
 fn id<T>(byte: u8, constructor: impl FnOnce([u8; 16]) -> T) -> T {
@@ -371,10 +371,10 @@ fn notices_only_render_for_the_session_that_owns_them() {
         Some(("model request failed", NoticeLevel::Error))
     );
 
-    app.panes.focused_mut().show_session(Some(other));
+    app.view = View::Transcript(Some(other));
     assert_eq!(app.visible_status(), None);
 
-    app.panes.focused_mut().show_session(Some(owner));
+    app.view = View::Transcript(Some(owner));
     assert_eq!(
         app.visible_status(),
         Some(("model request failed", NoticeLevel::Error))
@@ -1834,20 +1834,16 @@ fn streamed_rows_do_not_move_a_scrolled_transcript() {
 }
 
 #[test]
-fn session_and_layout_changes_return_the_transcript_to_the_live_tail() {
+fn session_and_view_changes_return_the_transcript_to_the_live_tail() {
     let mut app = App::new(TuiOptions::default());
-    app.panes
-        .focused_mut()
-        .show_session(Some(SessionId::from_bytes([1; 16])));
+    app.view = View::Transcript(Some(SessionId::from_bytes([1; 16])));
     app.update_transcript_viewport(100, 10, false);
     app.handle_terminal_event(Event::Key(KeyEvent::new(
         KeyCode::PageUp,
         KeyModifiers::NONE,
     )));
 
-    app.panes
-        .focused_mut()
-        .show_session(Some(SessionId::from_bytes([2; 16])));
+    app.view = View::Transcript(Some(SessionId::from_bytes([2; 16])));
     app.update_transcript_viewport(100, 10, false);
 
     assert_eq!(app.transcript_scroll_offset(), 0);
@@ -1856,7 +1852,7 @@ fn session_and_layout_changes_return_the_transcript_to_the_live_tail() {
         KeyCode::PageUp,
         KeyModifiers::NONE,
     )));
-    app.layout = app.layout.next();
+    app.execute(Command::ShowAttention);
     app.update_transcript_viewport(100, 10, false);
 
     assert_eq!(app.transcript_scroll_offset(), 0);
@@ -2501,62 +2497,7 @@ fn two_session_app() -> (App, SessionId, SessionId) {
 }
 
 #[test]
-fn splitting_inherits_the_session_and_pane_commands_route_through_keys() {
-    let (mut app, first, other) = two_session_app();
-    assert_eq!(app.panes.len(), 1);
-
-    // Alt-\ splits beside; the new pane shows the same session, focused.
-    let (changed, requests) = app.handle_key(alt('\\')).split();
-    assert!(changed);
-    assert!(requests.is_empty(), "a split never fetches");
-    assert_eq!(app.panes.len(), 2);
-    assert_eq!(app.focused(), Some(first));
-
-    // Switching the session in the new pane leaves the other pane alone.
-    app.focus_session(other);
-    assert_eq!(app.focused(), Some(other));
-    let shown: Vec<_> = app.panes.sessions().collect();
-    assert!(shown.contains(&first) && shown.contains(&other));
-
-    // Alt-- stacks below the focused pane; Alt-K goes back up after a
-    // layout has produced geometry.
-    app.handle_key(alt('-'));
-    assert_eq!(app.panes.len(), 3);
-    let (tiles, _) = app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
-    app.panes.remember_tiles(tiles);
-    let before = app.panes.focused_id();
-    let (changed, _) = app.handle_key(alt('k')).split();
-    assert!(changed);
-    assert_ne!(app.panes.focused_id(), before);
-    assert_eq!(app.focused(), Some(other));
-
-    // Alt-W closes; Alt-Z zooms.
-    app.handle_key(alt('w'));
-    assert_eq!(app.panes.len(), 2);
-    let (changed, _) = app.handle_key(alt('z')).split();
-    assert!(changed && app.panes.is_zoomed());
-    app.handle_key(alt('z'));
-    assert!(!app.panes.is_zoomed());
-    app.handle_key(alt('w'));
-    assert_eq!(app.panes.len(), 1);
-    let (_, _) = app.handle_key(alt('w')).split();
-    assert_eq!(app.panes.len(), 1, "the last pane stays");
-    assert!(app.status.as_deref().unwrap().contains("last pane"));
-}
-
-#[test]
-fn slash_pane_commands_match_their_keys() {
-    let (mut app, _, _) = two_session_app();
-    for (slash, expected) in [("/split", 2), ("/stack", 3), ("/close", 2), ("/zoom", 2)] {
-        app.composer.text = slash.to_owned();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.panes.len(), expected, "{slash}");
-    }
-    assert!(app.panes.is_zoomed());
-}
-
-#[test]
-fn sessions_shown_in_any_pane_are_pinned_warm() {
+fn the_shown_session_is_pinned_warm_while_others_evict() {
     let mut app = App::new(TuiOptions::default());
     let mut initial = snapshot();
     let ids: Vec<SessionId> = (0x60..0x60 + (WARM_BODY_LIMIT as u8) + 2)
@@ -2567,16 +2508,7 @@ fn sessions_shown_in_any_pane_are_pinned_warm() {
         })
         .collect();
     app.apply_snapshot(initial);
-    // Pin the first id in a second pane, then cycle every other session
-    // through the focused pane.
-    app.focus_session(ids[0]);
-    let summary = app.sessions[&ids[0]].summary.clone();
-    app.apply_snapshot(WorkspaceSnapshot {
-        focused: Some(body_for(&summary, "pinned")),
-        ..snapshot()
-    });
-    app.execute(Command::SplitBeside);
-    for session_id in &ids[1..] {
+    for session_id in &ids {
         app.focus_session(*session_id);
         let summary = app.sessions[session_id].summary.clone();
         app.apply_snapshot(WorkspaceSnapshot {
@@ -2584,14 +2516,14 @@ fn sessions_shown_in_any_pane_are_pinned_warm() {
             ..snapshot()
         });
     }
-    assert!(app.sessions[&ids[0]].is_warm(), "shown in a pane: pinned");
-    assert!(!app.sessions[&ids[1]].is_warm(), "oldest unpinned evicts");
+    assert!(app.sessions[ids.last().unwrap()].is_warm(), "shown: pinned");
+    assert!(!app.sessions[&ids[0]].is_warm(), "oldest unshown evicts");
     let warm = app.sessions.values().filter(|s| s.is_warm()).count();
     assert_eq!(warm, WARM_BODY_LIMIT);
 }
 
 #[test]
-fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus() {
+fn a_body_fetched_for_a_session_the_user_left_is_dropped_without_moving_focus() {
     let (mut app, first, _) = two_session_app();
     let cold = summary_named(0x77, "cold");
     app.apply_snapshot(WorkspaceSnapshot {
@@ -2599,15 +2531,10 @@ fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus
         focused: None,
         ..snapshot()
     });
-    app.execute(Command::SplitBeside);
     let (_, requests) = app.focus_session(cold.id).split();
     assert_eq!(requests.len(), 1, "cold body is requested");
-    // The user moves back to the first pane before the body arrives.
-    app.execute(Command::FocusPaneLeft);
-    let (tiles, _) = app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
-    app.panes.remember_tiles(tiles);
-    let (moved, _) = app.execute(Command::FocusPaneLeft).split();
-    assert!(moved);
+    // The user moves back before the body arrives.
+    app.focus_session(first);
     assert_eq!(app.focused(), Some(first));
 
     let installed = app
@@ -2616,15 +2543,14 @@ fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus
             ..snapshot()
         })
         .redraws();
-    assert!(installed);
-    assert!(app.sessions[&cold.id].is_warm());
+    assert!(!installed, "a late body for an unshown session is stale");
     assert_eq!(
         app.focused(),
         Some(first),
         "focus stays where the user put it"
     );
 
-    // A body for a session no pane shows any more is dropped.
+    // Likewise for a session that was never shown.
     let gone = summary_named(0x78, "gone");
     app.apply_snapshot(WorkspaceSnapshot {
         sessions: vec![gone.clone()],
@@ -2641,96 +2567,42 @@ fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus
 }
 
 #[test]
-fn deleting_a_session_repoints_every_pane_showing_it() {
+fn deleting_the_shown_session_moves_to_its_neighbour() {
     let (mut app, first, other) = two_session_app();
-    app.execute(Command::SplitBeside);
-    app.execute(Command::SplitBelow);
-    // Panes: [first] [first / first]; point the focused one at `other`.
-    app.focus_session(other);
+    assert_eq!(app.focused(), Some(first));
     let effects = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
         occurred_at_ms: 2,
         ..fixtures::envelope(2, first, SessionEvent::SessionDeleted { session_id: first })
     }));
     assert!(!app.sessions.contains_key(&first));
-    let shown: Vec<_> = app.panes.sessions().collect();
-    assert_eq!(shown.len(), 3);
-    assert!(shown.iter().all(|id| *id == other));
+    assert_eq!(app.focused(), Some(other));
     // The replacement is warm, so nothing is fetched.
     assert!(effects.requests().next().is_none());
 }
 
 #[test]
-fn the_mouse_scrolls_the_pane_under_the_cursor_and_clicks_focus_it() {
-    use crossterm::event::{MouseButton, MouseEvent};
-    let (mut app, _, other) = two_session_app();
-    app.execute(Command::SplitBeside);
-    app.focus_session(other);
-    let (tiles, _) = app.panes.layout(crate::panes::Rect::new(0, 2, 161, 40));
-    app.panes.remember_tiles(tiles.clone());
-    let left = tiles[0];
-    let right = tiles[1];
-    assert_eq!(app.panes.focused_id(), right.pane);
-    // Give both panes a scrollable body.
-    for tile in [left, right] {
-        let mut viewport = Viewport::default();
-        viewport.update(
-            (app.panes.get(tile.pane).unwrap().session(), app.layout),
-            200,
-            40,
-            false,
-        );
-        app.set_viewport(tile.pane, viewport);
-    }
-    let mouse = |kind, column: usize, row: usize| {
+fn the_mouse_wheel_scrolls_the_transcript_from_anywhere_on_screen() {
+    use crossterm::event::MouseEvent;
+    let (mut app, _, _) = two_session_app();
+    app.update_transcript_viewport(200, 40, false);
+    let mouse = |kind, column: u16, row: u16| {
         Event::Mouse(MouseEvent {
             kind,
-            column: u16::try_from(column).unwrap(),
-            row: u16::try_from(row).unwrap(),
+            column,
+            row,
             modifiers: KeyModifiers::NONE,
         })
     };
-    app.handle_terminal_event(mouse(MouseEventKind::ScrollUp, left.rect.x + 2, 5));
-    assert_eq!(app.viewport(left.pane).unwrap().offset(), MOUSE_SCROLL_ROWS);
-    assert_eq!(app.viewport(right.pane).unwrap().offset(), 0);
-    assert_eq!(
-        app.panes.focused_id(),
-        right.pane,
-        "scrolling does not focus"
+    assert!(
+        app.handle_terminal_event(mouse(MouseEventKind::ScrollUp, 10, 5))
+            .redraws()
     );
-    let (changed, _) = app
-        .handle_terminal_event(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            left.rect.x + 2,
-            5,
-        ))
-        .split();
-    assert!(changed);
-    assert_eq!(app.panes.focused_id(), left.pane);
-}
-
-#[test]
-fn resize_keys_move_the_divider_of_the_enclosing_split() {
-    let (mut app, _, _) = two_session_app();
-    app.execute(Command::SplitBeside);
-    let area = crate::panes::Rect::new(0, 2, 201, 40);
-    let (before, _) = app.panes.layout(area);
-    let (changed, _) = app
-        .handle_key(KeyEvent::new(
-            KeyCode::Char('H'),
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        ))
-        .split();
-    assert!(changed);
-    let (after, _) = app.panes.layout(area);
-    assert!(after[0].rect.width < before[0].rect.width);
-    // No row split encloses the focused pane, so Alt-Shift-K does nothing.
-    let (changed, _) = app
-        .handle_key(KeyEvent::new(
-            KeyCode::Char('K'),
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        ))
-        .split();
-    assert!(!changed);
+    assert_eq!(app.transcript_scroll_offset(), MOUSE_SCROLL_ROWS);
+    // Over the chrome the wheel still moves the transcript.
+    app.handle_terminal_event(mouse(MouseEventKind::ScrollUp, 10, 0));
+    assert_eq!(app.transcript_scroll_offset(), 2 * MOUSE_SCROLL_ROWS);
+    app.handle_terminal_event(mouse(MouseEventKind::ScrollDown, 150, 39));
+    assert_eq!(app.transcript_scroll_offset(), MOUSE_SCROLL_ROWS);
 }
 
 fn themed_app() -> App {
@@ -3121,15 +2993,6 @@ fn every_default_chord_reaches_its_command_through_the_table() {
 }
 
 #[test]
-fn ctrl_n_and_ctrl_p_no_longer_change_the_layout() {
-    let mut app = App::new(TuiOptions::default());
-    let layout = app.layout;
-    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    assert_eq!(app.layout, layout);
-}
-
-#[test]
 fn shift_arrows_scroll_the_transcript_without_the_mouse() {
     let mut app = App::new(TuiOptions::default());
     app.update_transcript_viewport(100, 12, false);
@@ -3141,4 +3004,26 @@ fn shift_arrows_scroll_the_transcript_without_the_mouse() {
     // Plain Up still browses history / moves the caret, not the transcript.
     app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
     assert_eq!(app.transcript_scroll_offset(), 0);
+}
+
+#[test]
+fn workspace_views_toggle_and_esc_returns_to_the_session_they_replaced() {
+    let (mut app, _, other) = two_session_app();
+    app.focus_session(other);
+    app.execute(Command::ShowAttention);
+    assert_eq!(app.view, View::Attention);
+    assert_eq!(app.focused(), None, "no session while a view is up");
+    // Esc goes back to where the user was, not to the first session.
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.focused(), Some(other));
+    // The same command twice toggles.
+    app.execute(Command::ShowChanges);
+    assert_eq!(app.view, View::Changes);
+    app.execute(Command::ShowChanges);
+    assert_eq!(app.focused(), Some(other));
+    // Switching between views keeps the original return point.
+    app.execute(Command::ShowChanges);
+    app.execute(Command::ShowAttention);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.focused(), Some(other));
 }

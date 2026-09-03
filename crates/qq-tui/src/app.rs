@@ -12,16 +12,15 @@ use thiserror::Error;
 pub(crate) use crate::model::{LiveStatus, ReasoningDetail, SessionStore, SessionView};
 use crate::model::{MAX_PROMPT_HISTORY, MAX_QUEUED_DRAFTS, WARM_BODY_LIMIT};
 use crate::{
-    Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Layout,
-    Settings,
+    Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Settings,
     commands::{self, Command, SlashEntry},
     composer::Composer,
     effect::{Effect, Effects, Redraw},
     input::{Mode, Overlay},
-    panes::{Axis, Direction, PaneContent, PaneId, Panes, Viewport},
     picker::Picker,
     terminal,
     theme::Theme,
+    viewport::{View, Viewport},
 };
 use reduce::{retain_recent_messages, retain_recent_tool_calls};
 
@@ -102,7 +101,8 @@ pub enum TuiError {
 /// Whether the live session tree renders beside the transcript.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Sidebar {
-    /// Visible when the terminal is at least [`SIDEBAR_AUTO_WIDTH`] columns.
+    /// Visible when the terminal is at least [`SIDEBAR_AUTO_WIDTH`] columns
+    /// and more than one session exists; one session has nothing to list.
     #[default]
     Auto,
     Shown,
@@ -110,7 +110,9 @@ pub(crate) enum Sidebar {
 }
 
 /// Terminal width at which `Sidebar::Auto` shows the sidebar.
-pub(crate) const SIDEBAR_AUTO_WIDTH: usize = 120;
+pub(crate) const SIDEBAR_AUTO_WIDTH: usize = 100;
+/// The sidebar takes a quarter of the terminal up to this many columns.
+pub(crate) const SIDEBAR_MAX_WIDTH: usize = 28;
 
 impl Sidebar {
     #[must_use]
@@ -122,11 +124,26 @@ impl Sidebar {
     }
 
     #[must_use]
-    pub(crate) const fn visible(self, width: usize) -> bool {
+    pub(crate) const fn visible(self, width: usize, sessions: usize) -> bool {
         match self {
-            Self::Auto => width >= SIDEBAR_AUTO_WIDTH,
+            Self::Auto => width >= SIDEBAR_AUTO_WIDTH && sessions > 1,
             Self::Shown => true,
             Self::Hidden => false,
+        }
+    }
+
+    /// Columns the sidebar takes at `width`, or zero when hidden.
+    #[must_use]
+    pub(crate) const fn width(self, width: usize, sessions: usize) -> usize {
+        if self.visible(width, sessions) {
+            let quarter = width / 4;
+            if quarter < SIDEBAR_MAX_WIDTH {
+                quarter
+            } else {
+                SIDEBAR_MAX_WIDTH
+            }
+        } else {
+            0
         }
     }
 }
@@ -212,15 +229,18 @@ enum PendingIntent {
 
 pub(crate) struct App {
     pub settings: Settings,
-    pub layout: Layout,
     pub model: ModelSelection,
     pub models: Vec<ModelOption>,
     pub workspace_id: Option<WorkspaceId>,
     pub workspace_path: String,
     pub sessions: SessionStore,
-    /// Tiled panes; the focused pane decides which session the composer,
+    /// What the main area shows. Its session is the one the composer,
     /// approvals, footers, and tree navigation act on.
-    pub(crate) panes: Panes,
+    pub(crate) view: View,
+    /// Scroll state of the main area, reconciled by the renderer each frame.
+    pub(crate) viewport: Viewport,
+    /// The session a workspace view replaced, so Esc can return to it.
+    view_return: Option<SessionId>,
     /// Monotonic counter bumped on every focus change; stamps `last_focused`.
     focus_clock: u64,
     /// The open overlay, if any. At most one overlay owns input at a time.
@@ -291,14 +311,15 @@ pub(crate) struct App {
 impl App {
     pub(crate) fn new(options: TuiOptions) -> Self {
         Self {
-            layout: options.settings.initial_layout(),
             settings: options.settings,
             model: options.model,
             models: options.models,
             workspace_id: None,
             workspace_path: String::new(),
             sessions: SessionStore::default(),
-            panes: Panes::default(),
+            view: View::default(),
+            viewport: Viewport::default(),
+            view_return: None,
             focus_clock: 0,
             overlay: None,
             composer: Composer::default(),
@@ -388,7 +409,7 @@ impl App {
                 self.workspace_id = None;
                 self.workspace_path.clear();
                 self.sessions.clear();
-                self.panes.clear_sessions();
+                self.view = View::Transcript(None);
                 self.overlay = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
@@ -515,11 +536,11 @@ impl App {
             return Effects::redraw(Redraw::Scheduled);
         }
         let snapshot_focus = snapshot.focused.as_ref().map(|focused| focused.summary.id);
-        // A late snapshot for a session no pane shows any more is stale
-        // navigation output; installing it would yank focus back.
+        // A late snapshot for a session no longer shown is stale navigation
+        // output; installing it would yank focus back.
         if !initial
             && self.focused().is_some()
-            && snapshot_focus.is_some_and(|id| !self.panes.sessions().any(|shown| shown == id))
+            && snapshot_focus.is_some_and(|id| self.focused() != Some(id))
         {
             return Effects::none();
         }
@@ -666,11 +687,11 @@ impl App {
         self.evict_cold_bodies();
     }
 
-    /// Show `session_id` in the focused pane and stamp it so warm-body
-    /// eviction keeps the most recently viewed sessions. Does not request
-    /// anything.
+    /// Show `session_id` and stamp it so warm-body eviction keeps the most
+    /// recently viewed sessions. Does not request anything. Focusing a
+    /// session always means reading it, so a workspace view gives way.
     fn set_focus(&mut self, session_id: SessionId) {
-        self.panes.focused_mut().show_session(Some(session_id));
+        self.view = View::Transcript(Some(session_id));
         self.set_focus_clock(session_id);
     }
 
@@ -684,11 +705,11 @@ impl App {
     }
 
     /// Drop transcript bodies beyond the warm limit, least recently focused
-    /// first. Sessions shown in any pane are pinned and never evicted.
+    /// first. The shown session is pinned and never evicted.
     /// Summaries and live status stay, so the sidebar and pickers keep
     /// working for cold sessions.
     fn evict_cold_bodies(&mut self) {
-        let pinned: std::collections::HashSet<SessionId> = self.panes.sessions().collect();
+        let pinned: std::collections::HashSet<SessionId> = self.focused().into_iter().collect();
         let mut warm: Vec<(u64, SessionId)> = self
             .sessions
             .values()
@@ -761,7 +782,7 @@ impl App {
         if !background_only {
             return true;
         }
-        if self.panes.sessions().any(|shown| shown == event.session_id) {
+        if self.focused() == Some(event.session_id) {
             return true;
         }
         // A child's live status renders under its spawn call in the parent.
@@ -769,11 +790,14 @@ impl App {
             .sessions
             .get(&event.session_id)
             .and_then(|session| session.summary.parent_id)
-            .is_some_and(|parent| self.panes.sessions().any(|shown| shown == parent))
+            .is_some_and(|parent| self.focused() == Some(parent))
         {
             return true;
         }
-        self.terminal_width == 0 || self.sidebar.visible(self.terminal_width)
+        self.terminal_width == 0
+            || self
+                .sidebar
+                .visible(self.terminal_width, self.sessions.len())
     }
 
     fn set_notice_for(&mut self, session_id: Option<SessionId>, text: String, level: NoticeLevel) {
@@ -902,18 +926,12 @@ impl App {
                 Effects::changed_now(changed)
             }
             Event::Mouse(mouse) if self.overlay.is_none() => {
-                // The wheel scrolls the pane under the cursor; a click focuses
-                // it. Coordinates outside every pane fall back to the focused
-                // pane so a wheel over the chrome still does something useful.
-                let under = self
-                    .panes
-                    .hit(usize::from(mouse.column), usize::from(mouse.row))
-                    .unwrap_or(self.panes.focused_id());
+                // The wheel scrolls the transcript wherever the pointer is, so
+                // a wheel over the chrome still does something useful.
                 let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(isize::MAX);
                 let changed = match mouse.kind {
-                    MouseEventKind::ScrollUp => self.scroll_pane(under, rows),
-                    MouseEventKind::ScrollDown => self.scroll_pane(under, -rows),
-                    MouseEventKind::Down(_) => self.focus_pane(under),
+                    MouseEventKind::ScrollUp => self.viewport.scroll(rows),
+                    MouseEventKind::ScrollDown => self.viewport.scroll(-rows),
                     _ => false,
                 };
                 Effects::changed_now(changed)
@@ -974,6 +992,10 @@ impl App {
                 if self.transcript_cursor.take().is_some() {
                     return Effects::redraw(Redraw::Immediate);
                 }
+                // A workspace view returns to the session it replaced.
+                if matches!(self.view, View::Attention | View::Changes) {
+                    return self.leave_workspace_view();
+                }
                 // A sticky error notice dismisses first: acknowledging the
                 // failure is the most immediate intent Esc can carry.
                 if self.status.is_some()
@@ -1030,14 +1052,12 @@ impl App {
             KeyCode::PageUp => Effects::changed_now(self.scroll_focused_page(true)),
             KeyCode::PageDown => Effects::changed_now(self.scroll_focused_page(false)),
             KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
-                let id = self.panes.focused_id();
                 let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(isize::MAX);
-                Effects::changed_now(self.scroll_pane(id, rows))
+                Effects::changed_now(self.viewport.scroll(rows))
             }
             KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
-                let id = self.panes.focused_id();
                 let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(isize::MAX);
-                Effects::changed_now(self.scroll_pane(id, -rows))
+                Effects::changed_now(self.viewport.scroll(-rows))
             }
             KeyCode::Backspace
                 if key
@@ -1076,12 +1096,10 @@ impl App {
             KeyCode::Right => Effects::changed_now(self.composer.move_right()),
             // Ctrl-Home/End jump the transcript; plain Home/End edit the line.
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let id = self.panes.focused_id();
-                Effects::changed_now(self.scroll_pane(id, isize::MAX))
+                Effects::changed_now(self.viewport.scroll(isize::MAX))
             }
             KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let id = self.panes.focused_id();
-                Effects::changed_now(self.scroll_pane(id, isize::MIN))
+                Effects::changed_now(self.viewport.scroll(isize::MIN))
             }
             KeyCode::Home => Effects::changed_now(self.composer.move_line_start()),
             KeyCode::End => Effects::changed_now(self.composer.move_line_end()),
@@ -1122,10 +1140,40 @@ impl App {
         }
     }
 
-    /// The session shown in the focused pane; what every focus-dependent
-    /// surface (composer, approvals, footers, tree navigation) acts on.
+    /// The session shown; what every focus-dependent surface (composer,
+    /// approvals, footers, tree navigation) acts on.
     pub(crate) fn focused(&self) -> Option<SessionId> {
-        self.panes.focused().session()
+        self.view.session()
+    }
+
+    /// Show a workspace-wide view. Invoking the one already shown returns to
+    /// the transcript, so `/attention` toggles.
+    fn show_workspace_view(&mut self, view: View) -> Effects {
+        if self.view == view {
+            return self.leave_workspace_view();
+        }
+        if let Some(session) = self.view.session() {
+            self.view_return = Some(session);
+        }
+        self.view = view;
+        Effects::redraw(Redraw::Immediate)
+    }
+
+    /// Return from a workspace view to the session it replaced, or to the
+    /// first session when that one is gone.
+    fn leave_workspace_view(&mut self) -> Effects {
+        let target = self
+            .view_return
+            .take()
+            .filter(|id| self.sessions.contains_key(id))
+            .or_else(|| self.sessions.thread_order().first().copied());
+        match target {
+            Some(session) => self.focus_session(session),
+            None => {
+                self.view = View::Transcript(None);
+                Effects::redraw(Redraw::Immediate)
+            }
+        }
     }
 
     /// An effect asking for the user's attention, or nothing while the
@@ -1138,14 +1186,7 @@ impl App {
         effects
     }
 
-    /// Install the viewport the renderer reconciled for pane `id` this frame.
-    pub(crate) fn set_viewport(&mut self, id: PaneId, viewport: Viewport) {
-        if let Some(pane) = self.panes.get_mut(id) {
-            pane.viewport = viewport;
-        }
-    }
-
-    /// Test view of the focused pane's viewport through the pre-pane API.
+    /// Test view of the viewport through the renderer's reconcile step.
     #[cfg(test)]
     pub(crate) fn update_transcript_viewport(
         &mut self,
@@ -1153,83 +1194,18 @@ impl App {
         height: usize,
         preserve_tail_anchor: bool,
     ) {
-        let layout = self.layout;
-        let pane = self.panes.focused_mut();
-        let context = (pane.session(), layout);
-        pane.viewport
-            .update(context, body_rows, height, preserve_tail_anchor);
+        self.viewport
+            .update(self.view, body_rows, height, preserve_tail_anchor);
     }
 
     #[cfg(test)]
     pub(crate) fn transcript_scroll_offset(&self) -> usize {
-        self.panes.focused().viewport.offset()
-    }
-
-    pub(crate) fn viewport(&self, id: PaneId) -> Option<&Viewport> {
-        self.panes.get(id).map(|pane| &pane.viewport)
-    }
-
-    fn scroll_pane(&mut self, id: PaneId, rows: isize) -> bool {
-        let Some(pane) = self.panes.get_mut(id) else {
-            return false;
-        };
-        match rows.cmp(&0) {
-            std::cmp::Ordering::Greater => pane.viewport.scroll_up(rows.unsigned_abs()),
-            std::cmp::Ordering::Less => pane.viewport.scroll_down(rows.unsigned_abs()),
-            std::cmp::Ordering::Equal => false,
-        }
+        self.viewport.offset()
     }
 
     fn scroll_focused_page(&mut self, up: bool) -> bool {
-        let id = self.panes.focused_id();
-        let page = isize::try_from(self.panes.focused().viewport.height()).unwrap_or(isize::MAX);
-        self.scroll_pane(id, if up { page } else { -page })
-    }
-
-    /// Split the focused pane. The new pane inherits the session and takes
-    /// focus, so nothing needs fetching.
-    fn split_pane(&mut self, axis: Axis) -> Effects {
-        match self.panes.split(axis) {
-            Some(_) => Effects::redraw(Redraw::Immediate),
-            None => {
-                self.set_warning(format!(
-                    "at most {} panes can be open",
-                    crate::panes::MAX_PANES
-                ));
-                Effects::redraw(Redraw::Immediate)
-            }
-        }
-    }
-
-    fn close_pane(&mut self) -> Effects {
-        let closed = self.panes.close();
-        if closed.is_some() {
-            self.reset_history_browse();
-            self.evict_cold_bodies();
-        } else {
-            self.set_info("the last pane stays open".to_owned());
-        }
-        Effects::redraw(Redraw::Immediate)
-    }
-
-    /// Move focus to a neighbouring pane. Focus changes the session the
-    /// composer targets, so the history browse resets like a session switch.
-    fn focus_pane(&mut self, id: PaneId) -> bool {
-        if !self.panes.focus(id) {
-            return false;
-        }
-        if let Some(session_id) = self.focused() {
-            self.set_focus_clock(session_id);
-        }
-        self.reset_history_browse();
-        true
-    }
-
-    fn focus_pane_direction(&mut self, direction: Direction) -> Effects {
-        match self.panes.neighbour(direction) {
-            Some(id) => Effects::changed_now(self.focus_pane(id)),
-            None => Effects::none(),
-        }
+        let page = isize::try_from(self.viewport.height()).unwrap_or(isize::MAX);
+        self.viewport.scroll(if up { page } else { -page })
     }
 
     /// Run one command from the registry. Every command surface — keybinding,
@@ -1256,22 +1232,6 @@ impl App {
             Command::NewChildSession => self.create_session(self.focused()),
             Command::CompactSession => self.compact_session(),
             Command::CancelRun => self.cancel_run(),
-            Command::SelectThreadline => {
-                self.layout = Layout::Threadline;
-                Effects::redraw(Redraw::Immediate)
-            }
-            Command::SelectFoldFocus => {
-                self.layout = Layout::FoldFocus;
-                Effects::redraw(Redraw::Immediate)
-            }
-            Command::NextLayout => {
-                self.layout = self.layout.next();
-                Effects::redraw(Redraw::Immediate)
-            }
-            Command::PreviousLayout => {
-                self.layout = self.layout.next();
-                Effects::redraw(Redraw::Immediate)
-            }
             Command::ToggleMouse => {
                 self.mouse_capture = !self.mouse_capture;
                 self.set_info(if self.mouse_capture {
@@ -1284,14 +1244,8 @@ impl App {
                 effects
             }
             Command::PruneSessions => self.request_prune_confirmation(),
-            Command::ShowAttention => {
-                self.panes.focused_mut().content = PaneContent::Attention;
-                Effects::redraw(Redraw::Immediate)
-            }
-            Command::ShowChanges => {
-                self.panes.focused_mut().content = PaneContent::Changes;
-                Effects::redraw(Redraw::Immediate)
-            }
+            Command::ShowAttention => self.show_workspace_view(View::Attention),
+            Command::ShowChanges => self.show_workspace_view(View::Changes),
             Command::CursorUp => Effects::changed_now(self.move_transcript_cursor(false)),
             Command::CursorDown => Effects::changed_now(self.move_transcript_cursor(true)),
             Command::ToggleToolDetail => {
@@ -1336,18 +1290,6 @@ impl App {
                 effects.push(Effect::Editor(self.composer.expanded()));
                 effects
             }
-            Command::SplitBeside => self.split_pane(Axis::Columns),
-            Command::SplitBelow => self.split_pane(Axis::Rows),
-            Command::ClosePane => self.close_pane(),
-            Command::ZoomPane => Effects::changed_now(self.panes.toggle_zoom()),
-            Command::FocusPaneLeft => self.focus_pane_direction(Direction::Left),
-            Command::FocusPaneRight => self.focus_pane_direction(Direction::Right),
-            Command::FocusPaneUp => self.focus_pane_direction(Direction::Up),
-            Command::FocusPaneDown => self.focus_pane_direction(Direction::Down),
-            Command::ResizePaneLeft => Effects::changed_now(self.panes.resize(Direction::Left)),
-            Command::ResizePaneRight => Effects::changed_now(self.panes.resize(Direction::Right)),
-            Command::ResizePaneUp => Effects::changed_now(self.panes.resize(Direction::Up)),
-            Command::ResizePaneDown => Effects::changed_now(self.panes.resize(Direction::Down)),
             Command::QueueDraft => self.queue_draft(),
             Command::DequeueDraft => self.dequeue_draft(),
             Command::SteerRun => {
@@ -1513,18 +1455,7 @@ impl App {
         // runtime can resolve an explicit command or skill consistently for
         // direct, embedded, and remote clients.
         if prompt.starts_with('/') {
-            let mut words = prompt.split_whitespace();
-            let name = words.next().unwrap_or(&prompt);
-            // `/layout save|load|list [name]` carries arguments; every other
-            // client command is bare.
-            if name == "/layout"
-                && let Some(verb) = words.next()
-            {
-                let layout_name = words.next().unwrap_or("default").to_owned();
-                self.composer.clear();
-                self.slash.select(0);
-                return self.layout_command(verb, layout_name);
-            }
+            let name = prompt.split_whitespace().next().unwrap_or(&prompt);
             if let Some(entry) = commands::slash_entries().find(|entry| entry.name == name) {
                 self.composer.clear();
                 self.slash.select(0);
@@ -2251,68 +2182,6 @@ fn is_composer_newline_key(key: KeyEvent) -> bool {
 mod tests;
 
 impl App {
-    /// `/layout save|load|list [name]`.
-    fn layout_command(&mut self, verb: &str, name: String) -> Effects {
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            self.set_warning("layout names use letters, digits, - and _".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        }
-        let mut effects = Effects::redraw(Redraw::Immediate);
-        match verb {
-            "save" => effects.push(Effect::SaveLayout {
-                name,
-                file: self.panes.to_layout(),
-            }),
-            "load" => effects.push(Effect::LoadLayout { name }),
-            "list" => effects.push(Effect::ListLayouts),
-            other => self.set_warning(format!(
-                "unknown /layout verb `{other}`; use save, load, or list"
-            )),
-        }
-        effects
-    }
-
-    /// Install a loaded layout. Leaves naming sessions the client does not
-    /// know load empty; the first pane takes focus.
-    pub(crate) fn apply_layout(&mut self, name: &str, file: &crate::panes::LayoutFile) -> Effects {
-        if file.version != crate::panes::LayoutFile::VERSION {
-            self.set_warning(format!(
-                "layout `{name}` is version {}, expected {}",
-                file.version,
-                crate::panes::LayoutFile::VERSION
-            ));
-            return Effects::redraw(Redraw::Immediate);
-        }
-        let Some(panes) = Panes::from_layout(file, |id| self.sessions.contains_key(&id)) else {
-            self.set_warning(format!("layout `{name}` has too many panes"));
-            return Effects::redraw(Redraw::Immediate);
-        };
-        self.panes = panes;
-        self.set_info(format!("layout `{name}` loaded"));
-        // Cold sessions now shown need their bodies.
-        let mut effects = Effects::redraw(Redraw::Immediate);
-        let cold: Vec<SessionId> = self
-            .panes
-            .sessions()
-            .filter(|id| self.sessions.get(id).is_some_and(|s| !s.is_warm()))
-            .collect();
-        if let Some(workspace_id) = self.workspace_id {
-            for session_id in cold {
-                effects.push(Effect::Send(ClientRequest::Snapshot(SnapshotRequest {
-                    workspace_id,
-                    focused_session_id: Some(session_id),
-                    include_sessions: Vec::new(),
-                    session_limit: SNAPSHOT_SESSION_LIMIT,
-                    message_limit: SNAPSHOT_MESSAGE_LIMIT,
-                })));
-            }
-        }
-        effects
-    }
-
     /// Move the transcript cursor to the adjacent tool call of the focused
     /// session in transcript order (the order the server persisted them).
     /// From no selection, up starts at the newest call and down at the oldest.

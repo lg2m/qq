@@ -3,28 +3,8 @@ use std::{fmt, str::FromStr};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
-    Threadline,
-    FoldFocus,
-}
-
-impl Layout {
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Threadline => Self::FoldFocus,
-            Self::FoldFocus => Self::Threadline,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
-    SelectThreadline,
-    SelectFoldFocus,
-    NextLayout,
-    PreviousLayout,
     ToggleNavigator,
     CreateRootSession,
     CreateChildSession,
@@ -33,11 +13,7 @@ pub enum Action {
 }
 
 impl Action {
-    const ALL: [Self; 9] = [
-        Self::SelectThreadline,
-        Self::SelectFoldFocus,
-        Self::NextLayout,
-        Self::PreviousLayout,
+    const ALL: [Self; 5] = [
         Self::ToggleNavigator,
         Self::CreateRootSession,
         Self::CreateChildSession,
@@ -187,7 +163,6 @@ pub enum StatusItem {
     Context,
     Cost,
     Workspace,
-    Layout,
     Tools,
 }
 
@@ -198,17 +173,11 @@ impl StatusItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    initial_layout: Layout,
     bindings: Vec<(Action, Vec<KeyChord>)>,
     status_line: Vec<StatusItem>,
 }
 
 impl Settings {
-    #[must_use]
-    pub const fn initial_layout(&self) -> Layout {
-        self.initial_layout
-    }
-
     #[must_use]
     pub fn action_for(&self, key: KeyEvent) -> Option<Action> {
         self.bindings.iter().find_map(|(action, chords)| {
@@ -250,7 +219,6 @@ impl Default for Settings {
 
 #[derive(Debug, Clone)]
 pub struct SettingsBuilder {
-    initial_layout: Layout,
     bindings: Vec<(Action, Vec<KeyChord>)>,
     status_line: Vec<StatusItem>,
 }
@@ -267,13 +235,8 @@ impl Default for SettingsBuilder {
             )
         };
         Self {
-            initial_layout: Layout::Threadline,
             status_line: StatusItem::DEFAULT.to_vec(),
             bindings: vec![
-                binding(Action::SelectThreadline, &["F3"]),
-                binding(Action::SelectFoldFocus, &["F4"]),
-                binding(Action::NextLayout, &[]),
-                binding(Action::PreviousLayout, &[]),
                 binding(Action::ToggleNavigator, &["Ctrl-T"]),
                 binding(Action::CreateRootSession, &["Alt-N"]),
                 binding(Action::CreateChildSession, &["Alt-C"]),
@@ -285,12 +248,6 @@ impl Default for SettingsBuilder {
 }
 
 impl SettingsBuilder {
-    #[must_use]
-    pub const fn initial_layout(mut self, layout: Layout) -> Self {
-        self.initial_layout = layout;
-        self
-    }
-
     /// Replace the top-row status items.
     #[must_use]
     pub fn status_line(mut self, items: Vec<StatusItem>) -> Self {
@@ -347,7 +304,6 @@ impl SettingsBuilder {
             }
         }
         Ok(Settings {
-            initial_layout: self.initial_layout,
             bindings: self.bindings,
             status_line: self.status_line,
         })
@@ -387,7 +343,7 @@ mod tests {
     #[test]
     fn rejects_colliding_bindings() {
         let error = SettingsBuilder::default()
-            .bindings(Action::SelectFoldFocus, vec!["F3".parse().unwrap()])
+            .bindings(Action::CreateChildSession, vec!["Ctrl-T".parse().unwrap()])
             .build()
             .unwrap_err();
 

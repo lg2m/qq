@@ -41,8 +41,6 @@ fn main() {
     steady_state_with_sidebar(iterations);
     streaming_focused(iterations);
     streaming_run_on(iterations);
-    steady_two_panes(iterations);
-    streaming_two_panes(iterations);
     streaming_background(iterations);
     children_with_sidebar(iterations);
     keystroke_echo(iterations);
@@ -129,42 +127,6 @@ fn streaming_run_on(iterations: u32) {
         harness.draw().len()
     });
     report_samples("streaming_run_on_32kb_delta_to_frame", &samples);
-}
-
-/// Two panes side by side, each streaming one delta per frame. The plan
-/// requires this to stay within 1.5x of `streaming_focused_delta_to_frame`:
-/// each pane pays its own open-block layout at half the width, and the row
-/// composition must not add more than the diff already costs.
-fn streaming_two_panes(iterations: u32) {
-    let mut harness = BenchHarness::new(SIZE, 2, STEADY_MESSAGES);
-    harness.hide_sidebar();
-    harness.warm_session(1, STEADY_MESSAGES);
-    harness.split_beside_showing(1);
-    harness.settle_highlights();
-    let left = harness.start_stream(0);
-    let right = harness.start_stream(1);
-    for _ in 0..LIVE_PREFILL {
-        harness.append(0, left, DELTA);
-        harness.append(1, right, DELTA);
-    }
-    black_box(harness.draw());
-    let samples = collect(iterations, || {
-        harness.append(0, left, DELTA);
-        harness.append(1, right, DELTA);
-        harness.draw().len()
-    });
-    report_samples("streaming_two_panes_delta_to_frame", &samples);
-}
-
-/// Two idle panes: isolates the row-composition cost from live layout.
-fn steady_two_panes(iterations: u32) {
-    let mut harness = BenchHarness::new(SIZE, 2, STEADY_MESSAGES);
-    harness.hide_sidebar();
-    harness.warm_session(1, STEADY_MESSAGES);
-    harness.split_beside_showing(1);
-    harness.settle_highlights();
-    let samples = collect(iterations, || harness.draw().len());
-    report_samples("steady_two_panes_frame", &samples);
 }
 
 /// Eight unfocused sessions each receiving one delta per frame while the

@@ -29,7 +29,7 @@ pub use theme::{
     compiled_theme,
 };
 pub use tui::{
-    TuiAction, TuiConfigDefaults, TuiConfigKey, TuiConfigSettings, TuiConfigSnapshot, TuiLayout,
+    TuiAction, TuiConfigDefaults, TuiConfigKey, TuiConfigSettings, TuiConfigSnapshot,
     TuiSourceReport,
 };
 

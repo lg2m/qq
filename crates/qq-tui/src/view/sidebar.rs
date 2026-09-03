@@ -1,8 +1,6 @@
 use super::*;
 use crate::model::Group;
 
-/// Columns the session sidebar occupies, including its left border.
-pub(super) const SIDEBAR_WIDTH: usize = 36;
 pub(super) fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) -> Line {
     let session = &app.sessions[&session_id].summary;
     // The same state vocabulary tool rows use: ● done, ✕ failed, ◌ stopped
@@ -34,42 +32,6 @@ pub(super) fn session_line(app: &App, session_id: SessionId, width: usize, prefi
     );
     if session.queued_prompts > 0 {
         line.push(format!("  {} queued", session.queued_prompts), warning());
-    }
-    truncate_line(line, width)
-}
-
-/// Title row for a pane when several share the screen: the session title,
-/// its live status, and an accent on the focused pane so the eye finds where
-/// the composer will send.
-pub(super) fn pane_title(
-    app: &App,
-    session_id: Option<SessionId>,
-    content_title: Option<&str>,
-    focused: bool,
-    width: usize,
-) -> Line {
-    let (marker, marker_style) = if focused {
-        ("▎", border_active())
-    } else {
-        (" ", muted())
-    };
-    let mut line = Line::styled(marker, marker_style);
-    if let Some(label) = content_title {
-        line.push(label, if focused { normal().bold() } else { muted() });
-        return truncate_line(line, width);
-    }
-    match session_id.and_then(|id| app.sessions.get(&id)) {
-        Some(session) => {
-            line.push(
-                &session.summary.title,
-                if focused { normal().bold() } else { muted() },
-            );
-            if let Some((status, style)) = live_status_line(app, session.summary.id) {
-                line.push("  ", muted());
-                line.push(status, style);
-            }
-        }
-        None => line.push("no session", muted().italic()),
     }
     truncate_line(line, width)
 }

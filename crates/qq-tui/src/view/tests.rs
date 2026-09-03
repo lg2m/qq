@@ -84,12 +84,6 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line> {
     body.viewport(app, body.rows, 0)
 }
 
-fn fold_focus_lines(app: &App, width: usize) -> Vec<Line> {
-    let mut renderer = FrameRenderer::default();
-    let body = renderer.fold_focus(app, width);
-    body.viewport(app, body.rows, 0)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn completed_messages_render_plain_then_upgrade_to_highlighted() {
     let mut renderer = FrameRenderer::default();
@@ -233,31 +227,6 @@ fn call_only_run_renders_before_its_first_assistant_message() {
 }
 
 #[test]
-fn fold_focus_renders_the_current_runs_tool_activity() {
-    let mut app = app_with_messages(1);
-    app.layout = Layout::FoldFocus;
-    let session_id = app.focused().unwrap();
-    let session = app.sessions.get_mut(&session_id).unwrap();
-    session.summary.status = SessionStatus::Running;
-    session.summary.active_run_id = Some(RunId::from_bytes([2; 16]));
-    session.tool_calls = Some(vec![tool_call_snapshot(
-        7,
-        "read_file",
-        r#"{"path":"note.txt"}"#,
-        ToolCallState::Running,
-        None,
-        false,
-    )]);
-
-    let rows = frame_rows(&fold_focus_lines(&app, 100));
-
-    assert!(
-        rows.iter()
-            .any(|row| squash(row).contains("Read note.txt") && row.contains("running"))
-    );
-}
-
-#[test]
 fn steering_rows_say_what_they_are_at_every_state() {
     let mut app = app_with_messages(4);
     let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
@@ -304,86 +273,6 @@ fn steering_rows_say_what_they_are_at_every_state() {
     // A steering row never shows the plain "queued" of a queued prompt,
     // which would read as a new run waiting its turn.
     assert!(!rows.iter().any(|row| row.contains("YOU  queued")));
-}
-
-#[test]
-fn fold_focus_keeps_active_work_visible_ahead_of_queued_prompts() {
-    let mut app = app_with_messages(4);
-    app.layout = Layout::FoldFocus;
-    let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
-    session.summary.status = SessionStatus::Running;
-    let active_run_id = RunId::from_bytes([2; 16]);
-    session.summary.active_run_id = Some(active_run_id);
-    let messages = session.messages.as_mut().unwrap();
-    messages[0].run_id = RunId::from_bytes([9; 16]);
-    messages[0].output = "folded history".to_owned();
-    messages[1].run_id = active_run_id;
-    messages[1].output = "active model turn".to_owned();
-    messages[2].run_id = RunId::from_bytes([3; 16]);
-    messages[2].role = MessageRole::User;
-    messages[2].state = MessageState::Queued;
-    messages[2].output = "queued prompt one".to_owned();
-    messages[3].run_id = RunId::from_bytes([4; 16]);
-    messages[3].role = MessageRole::User;
-    messages[3].state = MessageState::Queued;
-    messages[3].output = "queued prompt two".to_owned();
-    session.tool_calls = Some(vec![tool_call_snapshot(
-        7,
-        "read_file",
-        r#"{"path":"active.rs"}"#,
-        ToolCallState::Running,
-        None,
-        false,
-    )]);
-
-    let rows = frame_rows(&fold_focus_lines(&app, 100));
-    let text = rows.join("\n");
-
-    assert!(text.contains("active model turn"));
-    assert!(
-        rows.iter()
-            .any(|row| squash(row).contains("Read active.rs") && row.contains("running"))
-    );
-    assert!(text.contains("queued prompt one"));
-    assert!(text.contains("queued prompt two"));
-    assert!(!text.contains("folded history"));
-}
-
-#[test]
-fn fold_focus_keeps_tool_calls_between_their_model_turns() {
-    let mut app = app_with_messages(3);
-    app.layout = Layout::FoldFocus;
-    let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
-    let messages = session.messages.as_mut().unwrap();
-    messages[0].role = MessageRole::User;
-    messages[1].turn_ordinal = 1;
-    messages[2].turn_ordinal = 2;
-    let mut first = tool_call_snapshot(
-        7,
-        "read_file",
-        r#"{"path":"first.rs"}"#,
-        ToolCallState::Completed,
-        Some("first\n"),
-        false,
-    );
-    first.turn_ordinal = 1;
-    let mut second = tool_call_snapshot(
-        8,
-        "read_file",
-        r#"{"path":"second.rs"}"#,
-        ToolCallState::Completed,
-        Some("second\n"),
-        false,
-    );
-    second.turn_ordinal = 2;
-    session.tool_calls = Some(vec![second, first]);
-
-    let rows = frame_rows(&fold_focus_lines(&app, 100));
-    let position = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
-
-    assert!(position("row 1") < position("first.rs"));
-    assert!(position("first.rs") < position("row 2"));
-    assert!(position("row 2") < position("second.rs"));
 }
 
 #[test]
@@ -1778,7 +1667,7 @@ fn model_picker_hint_reflects_apply_versus_create() {
     let text = frame_text(&frame);
     assert!(text.contains("Enter sets the session model, Ctrl-N creates a session"));
 
-    app.panes.focused_mut().show_session(None);
+    app.view = View::Transcript(None);
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
     assert!(text.contains("Enter creates session"));
@@ -1915,17 +1804,17 @@ fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
     let rows_at = |app: &mut App, width| {
         frame_rows(&FrameRenderer::default().frame_and_commit(app, width, 24)).join("\n")
     };
-    let narrow = rows_at(&mut app, 100);
+    let narrow = rows_at(&mut app, 90);
     assert!(!narrow.contains("WORKING  1"), "auto-hidden when narrow");
 
     let wide_frame = FrameRenderer::default().frame_and_commit(&mut app, 160, 24);
     let wide = frame_rows(&wide_frame).join("\n");
     assert!(wide.contains("WORKING  1"), "{wide}");
     // The narrow frame shows the agent strip instead so the child is not
-    // invisible at 100 columns.
+    // invisible below the auto width.
     assert!(narrow.contains("2 agents"), "{narrow}");
     assert!(wide.contains("Survey callers"));
-    assert!(wide.contains("Found twelve call sites"));
+    assert!(wide.contains("Found twelve cal"), "{wide}");
     // With the sidebar glued on, every body row is exactly the terminal
     // width: the border column lines up and nothing overflows.
     for row in &wide_frame[1..wide_frame.len() - 3] {
@@ -1943,9 +1832,26 @@ fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
     assert!(!rows_at(&mut app, 160).contains("WORKING  1"));
     app.handle_terminal_event(toggle);
     assert!(
-        rows_at(&mut app, 100).contains("WORKING  1"),
+        rows_at(&mut app, 90).contains("WORKING  1"),
         "explicitly shown wins over width"
     );
+}
+
+#[test]
+fn the_sidebar_stays_hidden_with_one_session_and_scales_with_width() {
+    let mut app = app_with_messages(1);
+    let rows_at = |app: &mut App, width| {
+        frame_rows(&FrameRenderer::default().frame_and_commit(app, width, 24)).join("\n")
+    };
+    assert!(
+        !rows_at(&mut app, 200).contains("IDLE  1"),
+        "one session: nothing to list"
+    );
+    let sidebar = crate::app::Sidebar::Auto;
+    assert_eq!(sidebar.width(100, 2), 25);
+    assert_eq!(sidebar.width(200, 2), crate::app::SIDEBAR_MAX_WIDTH);
+    assert_eq!(sidebar.width(99, 2), 0);
+    assert_eq!(crate::app::Sidebar::Shown.width(80, 1), 20);
 }
 
 #[test]
@@ -2236,116 +2142,23 @@ fn app_with_two_sessions(count: u8) -> (App, SessionId, SessionId) {
 }
 
 #[test]
-fn two_panes_render_side_by_side_with_titles_and_a_divider() {
-    let (mut app, _, other) = app_with_two_sessions(3);
-    app.sidebar = crate::app::Sidebar::Hidden;
-    app.execute(Command::SplitBeside);
-    app.focus_session(other);
-    let frame = FrameRenderer::default().frame_and_commit(&mut app, 101, 24);
-    let rows = frame_rows(&frame);
-    // Row 1 is the pane title row: the left pane is unfocused, the right
-    // pane carries the focus marker and its title.
-    let titles = &rows[1];
-    assert!(titles.contains(" Session"), "{titles}");
-    assert!(titles.contains("▎Other"), "{titles}");
-    // Every body row has a divider at the split column and both
-    // transcripts appear on their own side of it. Body is rows 1..=19:
-    // one top row, then body, then the agent strip, rule, composer, hint.
-    let body = &rows[1..1 + 24 - 5];
-    assert!(
-        body.iter().all(|row| row.chars().nth(50) == Some('│')),
-        "{body:?}"
-    );
-    let (left, right): (Vec<&str>, Vec<&str>) =
-        body.iter().map(|row| row.split_once('│').unwrap()).unzip();
-    assert!(left.iter().any(|row| row.contains("row 2")));
-    assert!(!left.iter().any(|row| row.contains("other")));
-    assert!(right.iter().any(|row| row.contains("other 2")));
-    assert!(!right.iter().any(|row| row.contains("row 2")));
-    // The composer footer describes the focused pane's session.
-    assert!(frame_text(&frame).contains("Other"));
-    // Rows never exceed the frame width; a wide message cannot bleed
-    // across the divider into its neighbour.
-    assert!(frame.iter().all(|line| line.width() <= 101));
-}
-
-#[test]
-fn stacked_panes_share_the_width_and_scroll_independently() {
-    let (mut app, _, _) = app_with_two_sessions(40);
-    app.sidebar = crate::app::Sidebar::Hidden;
-    app.execute(Command::SplitBelow);
-    let mut renderer = FrameRenderer::default();
-    renderer.frame_and_commit(&mut app, 80, 40);
-    let (tiles, dividers) = app.panes.layout(crate::panes::Rect::new(0, 2, 80, 34));
-    assert_eq!(tiles.len(), 2);
-    assert_eq!(dividers[0].height, 1);
-    assert_eq!(dividers[0].width, 80);
-    let top = tiles[0].pane;
-    let bottom = tiles[1].pane;
-    assert_eq!(app.panes.focused_id(), bottom);
-
-    // PageUp scrolls only the focused (bottom) pane.
-    app.handle_terminal_event(crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::PageUp,
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    let frame = renderer.frame_and_commit(&mut app, 80, 40);
-    assert!(app.viewport(bottom).unwrap().offset() > 0);
-    assert_eq!(app.viewport(top).unwrap().offset(), 0);
-    let rows = frame_rows(&frame);
-    let divider_row = rows
-        .iter()
-        .position(|row| row.starts_with("──"))
-        .expect("horizontal divider");
-    assert!(rows[..divider_row].iter().any(|row| row.contains("row 39")));
-    assert!(!rows[divider_row..].iter().any(|row| row.contains("row 39")));
-}
-
-#[test]
-fn a_height_only_resize_keeps_every_pane_cache() {
+fn a_height_only_resize_keeps_the_transcript_cache() {
     let (mut app, _, other) = app_with_two_sessions(4);
     app.sidebar = crate::app::Sidebar::Hidden;
-    app.execute(Command::SplitBeside);
     app.focus_session(other);
     let mut renderer = FrameRenderer::default();
     renderer.frame_and_commit(&mut app, 101, 24);
-    let ids = app.panes.ids();
-    let cached_before: Vec<usize> = ids
-        .iter()
-        .map(|id| renderer.cache(*id).markdown.len())
-        .collect();
-    assert_eq!(cached_before, vec![4, 4]);
-    let widths: Vec<usize> = ids
-        .iter()
-        .map(|id| renderer.cache(*id).markdown.values().next().unwrap().width)
-        .collect();
+    assert_eq!(renderer.markdown().len(), 4);
+    let width = renderer.markdown().values().next().unwrap().width;
 
     renderer.frame_and_commit(&mut app, 101, 30);
-    for (id, width) in ids.iter().zip(widths) {
-        let cache = renderer.cache(*id);
-        assert_eq!(cache.markdown.len(), 4);
-        assert!(cache.markdown.values().all(|cached| cached.width == width));
-    }
-    // Closing a pane drops its cache on the next frame.
-    app.execute(Command::ClosePane);
-    renderer.frame_and_commit(&mut app, 101, 30);
-    assert_eq!(renderer.panes.len(), 1);
-}
-
-#[test]
-fn a_narrow_frame_shows_only_the_focused_pane_and_no_divider() {
-    let (mut app, _, other) = app_with_two_sessions(2);
-    app.sidebar = crate::app::Sidebar::Hidden;
-    app.execute(Command::SplitBeside);
-    app.focus_session(other);
-    let frame = FrameRenderer::default().frame_and_commit(&mut app, 40, 16);
-    let text = frame_text(&frame);
-    assert!(text.contains("other 1"));
-    assert!(!text.contains("row 1"));
-    assert!(!text.contains('│'));
-    assert_eq!(app.panes.len(), 2, "the tree is untouched");
+    assert_eq!(renderer.markdown().len(), 4);
+    assert!(
+        renderer
+            .markdown()
+            .values()
+            .all(|cached| cached.width == width)
+    );
 }
 
 #[test]
@@ -2941,10 +2754,7 @@ fn the_attention_pane_lists_needs_most_urgent_first_and_the_changes_pane_flags_o
     assert!(flagged.contains("+4 −2"), "{flagged}");
     assert!(flagged.contains("2 agents"), "{flagged}");
 
-    // Focusing a session returns the pane to a transcript.
+    // Focusing a session returns to its transcript.
     app.focus_session(parent);
-    assert!(matches!(
-        app.panes.focused().content,
-        PaneContent::Transcript(Some(id)) if id == parent
-    ));
+    assert_eq!(app.view, View::Transcript(Some(parent)));
 }

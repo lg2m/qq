@@ -6,7 +6,6 @@ use qq_protocol::SessionId;
 
 use crate::ClientRequest;
 use crate::app::{Attention, NoticeLevel};
-use crate::panes::LayoutFile;
 
 /// One effect produced by an update.
 #[derive(Debug, PartialEq)]
@@ -30,17 +29,6 @@ pub(crate) enum Effect {
     },
     /// Turn terminal mouse reporting on or off.
     MouseCapture(bool),
-    /// Persist the pane layout to `.qq/layouts/<name>.ron` in the workspace.
-    SaveLayout {
-        name: String,
-        file: LayoutFile,
-    },
-    /// Read `.qq/layouts/<name>.ron` and install it.
-    LoadLayout {
-        name: String,
-    },
-    /// List saved layouts as a notice.
-    ListLayouts,
     Quit,
 }
 
@@ -123,8 +111,8 @@ impl Effects {
             .any(|effect| matches!(effect, Effect::Redraw(_)))
     }
 
-    /// Requests in this batch, for tests and callers that only send.
-    #[cfg(any(test, feature = "bench-support"))]
+    /// Requests in this batch, for tests.
+    #[cfg(test)]
     pub(crate) fn requests(&self) -> impl Iterator<Item = &ClientRequest> {
         self.0.iter().filter_map(|effect| match effect {
             Effect::Send(request) => Some(request),

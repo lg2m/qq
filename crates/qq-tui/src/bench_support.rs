@@ -175,17 +175,6 @@ impl BenchHarness {
             }));
     }
 
-    /// Split the focused pane side by side and show session `index` in the
-    /// new pane. The session must already be warm.
-    pub fn split_beside_showing(&mut self, index: u8) {
-        self.app.execute(crate::commands::Command::SplitBeside);
-        let effects = self.app.focus_session(session_id(index));
-        assert!(
-            effects.requests().next().is_none(),
-            "bench sessions must be warm"
-        );
-    }
-
     /// Draw until every scheduled highlight has landed, as the event loop
     /// does between frames. Steady-state samples should reflect the
     /// highlighted cache, not a stream of upgrade frames.

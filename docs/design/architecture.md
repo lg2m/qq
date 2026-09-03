@@ -156,8 +156,8 @@ xtask/
 - `qq-tui` contains terminal rendering, input handling, and client-side state.
   It communicates through `qq-client` and the protocol and does not depend
   directly on `qq-core` or application configuration. Rendering is retained:
-  each pane of a tiling split tree keeps a `TranscriptCache` of laid-out
-  messages keyed by width, streaming messages lay out only their open block,
+  one `TranscriptCache` holds laid-out messages keyed by width for the shown
+  session, streaming messages lay out only their open block,
   syntax highlighting runs off the render tick, and frames are diffed by row
   against the previous frame with hand-rolled style primitives rather than a
   widget framework. One command registry drives keybindings, slash commands,

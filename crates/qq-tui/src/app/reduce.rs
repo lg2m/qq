@@ -16,7 +16,7 @@ use crate::{
     ClientRequest,
     effect::{Effect, Effects},
     input::{Overlay, SessionConfirm},
-    panes::PaneId,
+    viewport::View,
 };
 
 impl App {
@@ -111,10 +111,7 @@ impl App {
                 }
             }
             SessionEvent::AssistantMessageStarted { message } => {
-                let shown = self
-                    .panes
-                    .sessions()
-                    .any(|shown| shown == envelope.session_id);
+                let shown = self.focused() == Some(envelope.session_id);
                 if !shown && let Some(view) = self.sessions.get_mut(&envelope.session_id) {
                     view.unread += 1;
                 }
@@ -320,10 +317,7 @@ impl App {
                 usage,
                 ..
             } => {
-                let shown = self
-                    .panes
-                    .sessions()
-                    .any(|shown| shown == envelope.session_id);
+                let shown = self.focused() == Some(envelope.session_id);
                 if !shown && let Some(view) = self.sessions.get_mut(&envelope.session_id) {
                     view.finished_unread = true;
                     view.unread += 1;
@@ -445,12 +439,10 @@ impl App {
         if !self.sessions.contains_key(&session_id) {
             return effects;
         }
-        // Every pane showing the deleted session moves to its neighbour in
-        // thread order; the focused pane's replacement is fetched if cold.
-        let showing: Vec<PaneId> = self.panes.panes_showing(session_id).collect();
-        let refocus = if showing.is_empty() {
-            None
-        } else {
+        // A shown deleted session gives way to its neighbour in thread order;
+        // the replacement is fetched if cold.
+        let showing = self.focused() == Some(session_id);
+        let refocus = if showing {
             let order = self.sessions.thread_order();
             order
                 .iter()
@@ -465,6 +457,8 @@ impl App {
                         })
                         .copied()
                 })
+        } else {
+            None
         };
         let Some(removed) = self.sessions.remove(&session_id) else {
             return effects;
@@ -485,12 +479,8 @@ impl App {
                 session.summary.parent_id = None;
             }
         }
-        for pane in &showing {
-            if let Some(pane) = self.panes.get_mut(*pane) {
-                pane.show_session(refocus);
-            }
-        }
-        if showing.contains(&self.panes.focused_id()) {
+        if showing {
+            self.view = View::Transcript(refocus);
             let warm = refocus
                 .and_then(|next| self.sessions.get(&next))
                 .is_some_and(SessionView::is_warm);

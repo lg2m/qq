@@ -12,10 +12,6 @@ use super::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TuiAction {
-    SelectThreadline,
-    SelectFoldFocus,
-    NextLayout,
-    PreviousLayout,
     ToggleNavigator,
     CreateRootSession,
     CreateChildSession,
@@ -24,11 +20,7 @@ pub enum TuiAction {
 }
 
 impl TuiAction {
-    const ALL: [Self; 9] = [
-        Self::SelectThreadline,
-        Self::SelectFoldFocus,
-        Self::NextLayout,
-        Self::PreviousLayout,
+    const ALL: [Self; 5] = [
         Self::ToggleNavigator,
         Self::CreateRootSession,
         Self::CreateChildSession,
@@ -37,25 +29,13 @@ impl TuiAction {
     ];
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TuiLayout {
-    Threadline,
-    FoldFocus,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfigSettings {
-    initial_layout: TuiLayout,
     theme: String,
     bindings: Vec<(TuiAction, Vec<String>)>,
 }
 
 impl TuiConfigSettings {
-    #[must_use]
-    pub const fn initial_layout(&self) -> TuiLayout {
-        self.initial_layout
-    }
-
     #[must_use]
     pub fn bindings(&self) -> &[(TuiAction, Vec<String>)] {
         &self.bindings
@@ -73,7 +53,6 @@ pub struct TuiConfigDefaults(TuiConfigSettings);
 
 impl TuiConfigDefaults {
     pub fn new(
-        initial_layout: TuiLayout,
         bindings: impl IntoIterator<Item = (TuiAction, Vec<String>)>,
     ) -> Result<Self, ConfigError> {
         let bindings = bindings.into_iter().collect::<BTreeMap<_, _>>();
@@ -86,7 +65,6 @@ impl TuiConfigDefaults {
             });
         }
         Ok(Self(TuiConfigSettings {
-            initial_layout,
             theme: super::theme::DEFAULT_THEME.to_owned(),
             bindings: bindings.into_iter().collect(),
         }))
@@ -100,7 +78,6 @@ impl TuiConfigDefaults {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TuiConfigKey {
-    Layout,
     Theme,
     Binding(TuiAction),
 }
@@ -125,17 +102,11 @@ impl TuiSourceReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiConfigProvenance {
-    layout: SourceIdentity,
     theme: SourceIdentity,
     bindings: BTreeMap<TuiAction, SourceIdentity>,
 }
 
 impl TuiConfigProvenance {
-    #[must_use]
-    pub const fn layout(&self) -> &SourceIdentity {
-        &self.layout
-    }
-
     #[must_use]
     pub const fn theme(&self) -> &SourceIdentity {
         &self.theme
@@ -173,28 +144,9 @@ impl TuiConfigSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-enum ConfigLayout {
-    Threadline,
-    FoldFocus,
-}
-
-impl From<ConfigLayout> for TuiLayout {
-    fn from(value: ConfigLayout) -> Self {
-        match value {
-            ConfigLayout::Threadline => Self::Threadline,
-            ConfigLayout::FoldFocus => Self::FoldFocus,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct BindingsDocument {
-    select_threadline: Option<Vec<String>>,
-    select_fold_focus: Option<Vec<String>>,
-    next_layout: Option<Vec<String>>,
-    previous_layout: Option<Vec<String>>,
     toggle_navigator: Option<Vec<String>>,
     create_root_session: Option<Vec<String>>,
     create_child_session: Option<Vec<String>>,
@@ -203,18 +155,8 @@ struct BindingsDocument {
 }
 
 impl BindingsDocument {
-    fn entries(&self) -> [(TuiAction, Option<&[String]>); 9] {
+    fn entries(&self) -> [(TuiAction, Option<&[String]>); 5] {
         [
-            (
-                TuiAction::SelectThreadline,
-                self.select_threadline.as_deref(),
-            ),
-            (
-                TuiAction::SelectFoldFocus,
-                self.select_fold_focus.as_deref(),
-            ),
-            (TuiAction::NextLayout, self.next_layout.as_deref()),
-            (TuiAction::PreviousLayout, self.previous_layout.as_deref()),
             (TuiAction::ToggleNavigator, self.toggle_navigator.as_deref()),
             (
                 TuiAction::CreateRootSession,
@@ -234,7 +176,6 @@ impl BindingsDocument {
 #[serde(default, deny_unknown_fields)]
 struct Document {
     version: u32,
-    layout: Option<ConfigLayout>,
     theme: Option<String>,
     bindings: BindingsDocument,
 }
@@ -278,9 +219,6 @@ impl Document {
 
     fn touched(&self) -> Vec<TuiConfigKey> {
         let mut touched = Vec::new();
-        if self.layout.is_some() {
-            touched.push(TuiConfigKey::Layout);
-        }
         if self.theme.is_some() {
             touched.push(TuiConfigKey::Theme);
         }
@@ -306,11 +244,9 @@ where
 {
     let cwd = canonical_working_directory(cwd)?;
     let compiled = SourceIdentity::virtual_source(SourceKind::Compiled, "compiled TUI defaults");
-    let mut layout = defaults.settings().initial_layout();
     let mut theme = defaults.settings().theme().to_owned();
     let mut bindings: BTreeMap<_, _> = defaults.settings().bindings().iter().cloned().collect();
     let mut provenance = TuiConfigProvenance {
-        layout: compiled.clone(),
         theme: compiled.clone(),
         bindings: bindings
             .keys()
@@ -319,7 +255,7 @@ where
     };
     let mut reports = vec![TuiSourceReport {
         source: compiled,
-        touched: [TuiConfigKey::Layout, TuiConfigKey::Theme]
+        touched: [TuiConfigKey::Theme]
             .into_iter()
             .chain(bindings.keys().copied().map(TuiConfigKey::Binding))
             .collect(),
@@ -349,10 +285,6 @@ where
     for candidate in candidates {
         let (source, content) = read_candidate(&candidate)?;
         let document = Document::parse(&content, &source, validate_binding)?;
-        if let Some(incoming) = document.layout {
-            layout = incoming.into();
-            provenance.layout = source.clone();
-        }
         if let Some(incoming) = &document.theme {
             theme.clone_from(incoming);
             provenance.theme = source.clone();
@@ -371,7 +303,6 @@ where
     }
 
     let settings = TuiConfigSettings {
-        initial_layout: layout,
         theme,
         bindings: bindings.into_iter().collect(),
     };

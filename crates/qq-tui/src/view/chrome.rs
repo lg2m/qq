@@ -72,13 +72,6 @@ pub(super) fn top_row(app: &App, width: usize) -> Line {
             StatusItem::Workspace => {
                 (!app.workspace_path.is_empty()).then(|| (app.workspace_path.clone(), muted()))
             }
-            StatusItem::Layout => Some((
-                match app.layout {
-                    Layout::Threadline => "threadline".to_owned(),
-                    Layout::FoldFocus => "fold".to_owned(),
-                },
-                muted(),
-            )),
             StatusItem::Tools => Some((format!("tools {}", app.tool_detail.label()), muted())),
         };
         if let Some((text, style)) = part {

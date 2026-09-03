@@ -36,10 +36,8 @@ pub struct Palette {
     pub surface_alt: Color,
     /// Background of the selected row in pickers and the sidebar.
     pub selection_bg: Color,
-    /// Pane dividers and rules at rest.
+    /// Rules and dividers.
     pub border: Color,
-    /// The focused pane's divider and title mark.
-    pub border_active: Color,
     /// Background tint behind added and removed diff lines.
     pub diff_add_bg: Color,
     pub diff_del_bg: Color,
@@ -77,7 +75,6 @@ impl Palette {
             b: 61,
         },
         border: Color::DarkGrey,
-        border_active: Color::Cyan,
         diff_add_bg: Color::Rgb {
             r: 28,
             g: 52,
@@ -133,7 +130,6 @@ impl Palette {
             surface_alt: lift(surface, 10),
             selection_bg: lift(surface, 10),
             border: muted,
-            border_active: accent,
             diff_add_bg: tint(success, surface),
             diff_del_bg: tint(error, surface),
             info: accent,

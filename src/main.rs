@@ -475,14 +475,6 @@ fn config_command(
                         .theme()
                         .clone(),
                 )
-            } else if field == "tui.layout" {
-                Some(
-                    load_tui_config(&loader, request.cwd())?
-                        .0
-                        .provenance()
-                        .layout()
-                        .clone(),
-                )
             } else if let Some(action) = field
                 .strip_prefix("tui.bindings.")
                 .and_then(parse_tui_action)
@@ -594,20 +586,17 @@ fn load_tui_config(
     cwd: &Path,
 ) -> Result<(config::TuiConfigSnapshot, qq_tui::Settings), config::ConfigError> {
     let defaults = qq_tui::Settings::default();
-    let defaults = config::TuiConfigDefaults::new(
-        config_layout(defaults.initial_layout()),
-        defaults.bindings().iter().map(|(action, bindings)| {
+    let defaults =
+        config::TuiConfigDefaults::new(defaults.bindings().iter().map(|(action, bindings)| {
             (
                 config_action(*action),
                 bindings.iter().map(ToString::to_string).collect(),
             )
-        }),
-    )?;
+        }))?;
     let snapshot = loader.load_tui(cwd, &defaults, |binding| {
         binding.parse::<qq_tui::KeyChord>().map(|_| ())
     })?;
-    let mut builder = qq_tui::SettingsBuilder::default()
-        .initial_layout(tui_layout(snapshot.settings().initial_layout()));
+    let mut builder = qq_tui::SettingsBuilder::default();
     for (action, bindings) in snapshot.settings().bindings() {
         let bindings = bindings
             .iter()
@@ -678,7 +667,6 @@ fn tui_theme(document: &config::ThemeDocument) -> qq_tui::Theme {
 
 fn print_tui_snapshot(settings: &qq_tui::Settings, theme: &str) {
     println!("tui:");
-    println!("  layout: {:?}", settings.initial_layout());
     println!("  theme: {theme}");
     println!("  bindings:");
     for (action, bindings) in settings.bindings() {
@@ -689,10 +677,6 @@ fn print_tui_snapshot(settings: &qq_tui::Settings, theme: &str) {
 
 fn parse_tui_action(value: &str) -> Option<config::TuiAction> {
     match value {
-        "select_threadline" => Some(config::TuiAction::SelectThreadline),
-        "select_fold_focus" => Some(config::TuiAction::SelectFoldFocus),
-        "next_layout" => Some(config::TuiAction::NextLayout),
-        "previous_layout" => Some(config::TuiAction::PreviousLayout),
         "toggle_navigator" => Some(config::TuiAction::ToggleNavigator),
         "create_root_session" => Some(config::TuiAction::CreateRootSession),
         "create_child_session" => Some(config::TuiAction::CreateChildSession),
@@ -702,26 +686,8 @@ fn parse_tui_action(value: &str) -> Option<config::TuiAction> {
     }
 }
 
-fn config_layout(layout: qq_tui::Layout) -> config::TuiLayout {
-    match layout {
-        qq_tui::Layout::Threadline => config::TuiLayout::Threadline,
-        qq_tui::Layout::FoldFocus => config::TuiLayout::FoldFocus,
-    }
-}
-
-fn tui_layout(layout: config::TuiLayout) -> qq_tui::Layout {
-    match layout {
-        config::TuiLayout::Threadline => qq_tui::Layout::Threadline,
-        config::TuiLayout::FoldFocus => qq_tui::Layout::FoldFocus,
-    }
-}
-
 fn config_action(action: qq_tui::Action) -> config::TuiAction {
     match action {
-        qq_tui::Action::SelectThreadline => config::TuiAction::SelectThreadline,
-        qq_tui::Action::SelectFoldFocus => config::TuiAction::SelectFoldFocus,
-        qq_tui::Action::NextLayout => config::TuiAction::NextLayout,
-        qq_tui::Action::PreviousLayout => config::TuiAction::PreviousLayout,
         qq_tui::Action::ToggleNavigator => config::TuiAction::ToggleNavigator,
         qq_tui::Action::CreateRootSession => config::TuiAction::CreateRootSession,
         qq_tui::Action::CreateChildSession => config::TuiAction::CreateChildSession,
@@ -732,10 +698,6 @@ fn config_action(action: qq_tui::Action) -> config::TuiAction {
 
 fn tui_action(action: config::TuiAction) -> qq_tui::Action {
     match action {
-        config::TuiAction::SelectThreadline => qq_tui::Action::SelectThreadline,
-        config::TuiAction::SelectFoldFocus => qq_tui::Action::SelectFoldFocus,
-        config::TuiAction::NextLayout => qq_tui::Action::NextLayout,
-        config::TuiAction::PreviousLayout => qq_tui::Action::PreviousLayout,
         config::TuiAction::ToggleNavigator => qq_tui::Action::ToggleNavigator,
         config::TuiAction::CreateRootSession => qq_tui::Action::CreateRootSession,
         config::TuiAction::CreateChildSession => qq_tui::Action::CreateChildSession,
@@ -746,10 +708,6 @@ fn tui_action(action: config::TuiAction) -> qq_tui::Action {
 
 fn tui_action_name(action: qq_tui::Action) -> &'static str {
     match action {
-        qq_tui::Action::SelectThreadline => "select_threadline",
-        qq_tui::Action::SelectFoldFocus => "select_fold_focus",
-        qq_tui::Action::NextLayout => "next_layout",
-        qq_tui::Action::PreviousLayout => "previous_layout",
         qq_tui::Action::ToggleNavigator => "toggle_navigator",
         qq_tui::Action::CreateRootSession => "create_root_session",
         qq_tui::Action::CreateChildSession => "create_child_session",
@@ -971,7 +929,11 @@ mod tests {
         let loader = config::ConfigLoader::new(config::ConfigPaths::new(global, data, managed));
         let path = workspace.join(".qq/tui.ron");
 
-        std::fs::write(&path, r#"(version: 1, bindings: (next_layout: ["n"]))"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"(version: 1, bindings: (toggle_navigator: ["n"]))"#,
+        )
+        .unwrap();
         assert!(matches!(
             load_tui_config(&loader, &workspace),
             Err(config::ConfigError::Parse { .. })
@@ -979,7 +941,7 @@ mod tests {
 
         std::fs::write(
             path,
-            r#"(version: 1, bindings: (select_fold_focus: ["F3"]))"#,
+            r#"(version: 1, bindings: (create_child_session: ["Ctrl-T"]))"#,
         )
         .unwrap();
         assert!(matches!(
@@ -999,12 +961,12 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".qq")).unwrap();
         std::fs::write(
             global.join("tui.ron"),
-            r#"(version: 1, bindings: (next_layout: ["n"]))"#,
+            r#"(version: 1, bindings: (toggle_navigator: ["n"]))"#,
         )
         .unwrap();
         std::fs::write(
             workspace.join(".qq/tui.ron"),
-            r#"(version: 1, bindings: (next_layout: ["Ctrl-N"]))"#,
+            r#"(version: 1, bindings: (toggle_navigator: ["Ctrl-N"]))"#,
         )
         .unwrap();
         let loader = config::ConfigLoader::new(config::ConfigPaths::new(global, data, managed));

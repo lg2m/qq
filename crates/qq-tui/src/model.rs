@@ -96,6 +96,10 @@ impl SessionStore {
         self.sessions.values()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut SessionView> {
         self.index.take();
         self.sessions.values_mut()

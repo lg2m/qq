@@ -885,22 +885,22 @@ fn tui_config_layers_defaults_global_and_root_to_current_projects() {
         "global/tui.ron",
         r#"(
             version: 1,
-            bindings: (next_layout: ["Ctrl-L"]),
+            bindings: (toggle_navigator: ["Ctrl-L"]),
         )"#,
     );
     tree.write(
         "work/.qq/tui.ron",
         r#"(
             version: 1,
-            layout: FoldFocus,
-            bindings: (select_threadline: ["F3"]),
+            theme: "solarized",
+            bindings: (create_root_session: ["F3"]),
         )"#,
     );
     tree.write(
         "work/child/.qq/tui.ron",
         r#"(
             version: 1,
-            bindings: (next_layout: ["Ctrl-K"]),
+            bindings: (toggle_navigator: ["Ctrl-K"]),
         )"#,
     );
 
@@ -913,27 +913,21 @@ fn tui_config_layers_defaults_global_and_root_to_current_projects() {
         )
         .unwrap();
 
-    assert_eq!(snapshot.settings().initial_layout(), TuiLayout::FoldFocus);
+    assert_eq!(snapshot.settings().theme(), "solarized");
     assert_eq!(
-        binding_labels(snapshot.settings(), TuiAction::SelectThreadline),
+        binding_labels(snapshot.settings(), TuiAction::CreateRootSession),
         ["F3"]
     );
     assert_eq!(
-        binding_labels(snapshot.settings(), TuiAction::NextLayout),
+        binding_labels(snapshot.settings(), TuiAction::ToggleNavigator),
         ["Ctrl-K"]
     );
-    assert_eq!(snapshot.provenance().layout().kind(), SourceKind::Project);
+    assert_eq!(snapshot.provenance().theme().kind(), SourceKind::Project);
+    assert!(snapshot.provenance().binding(TuiAction::CancelRun).kind() == SourceKind::Compiled);
     assert!(
         snapshot
             .provenance()
-            .binding(TuiAction::PreviousLayout)
-            .kind()
-            == SourceKind::Compiled
-    );
-    assert!(
-        snapshot
-            .provenance()
-            .binding(TuiAction::NextLayout)
+            .binding(TuiAction::ToggleNavigator)
             .path()
             .unwrap()
             .ends_with("work/child/.qq/tui.ron")
@@ -945,28 +939,61 @@ fn tui_config_preserves_surface_bindings_for_root_validation() {
     let tree = TempTree::new();
     tree.write(
         "work/.qq/tui.ron",
-        r#"(version: 1, bindings: (next_layout: ["n"]))"#,
+        r#"(version: 1, bindings: (toggle_navigator: ["n"]))"#,
     );
     let snapshot = tree
         .loader()
         .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
         .unwrap();
     assert_eq!(
-        binding_labels(snapshot.settings(), TuiAction::NextLayout),
+        binding_labels(snapshot.settings(), TuiAction::ToggleNavigator),
         ["n"]
     );
 
     tree.write(
         "work/.qq/tui.ron",
-        r#"(version: 1, bindings: (select_fold_focus: ["F1"]))"#,
+        r#"(version: 1, bindings: (create_child_session: ["F1"]))"#,
     );
     let snapshot = tree
         .loader()
         .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
         .unwrap();
     assert_eq!(
-        binding_labels(snapshot.settings(), TuiAction::SelectFoldFocus),
+        binding_labels(snapshot.settings(), TuiAction::CreateChildSession),
         ["F1"]
+    );
+}
+
+#[test]
+fn tui_config_rejects_removed_layout_and_pane_keys_with_a_clear_error() {
+    let tree = TempTree::new();
+    tree.write("work/.qq/tui.ron", r#"(version: 1, layout: FoldFocus)"#);
+    let error = tree
+        .loader()
+        .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
+        .unwrap_err();
+    let ConfigError::Parse { message, .. } = &error else {
+        panic!("expected a parse error, got {error:?}");
+    };
+    assert!(
+        message.contains("layout"),
+        "message names the key: {message}"
+    );
+
+    tree.write(
+        "work/.qq/tui.ron",
+        r#"(version: 1, bindings: (select_fold_focus: ["F4"]))"#,
+    );
+    let error = tree
+        .loader()
+        .load_tui(&tree.path("work"), &tui_defaults(), accept_tui_binding)
+        .unwrap_err();
+    let ConfigError::Parse { message, .. } = &error else {
+        panic!("expected a parse error, got {error:?}");
+    };
+    assert!(
+        message.contains("select_fold_focus"),
+        "message names the key: {message}"
     );
 }
 
@@ -1004,20 +1031,13 @@ fn accept_tui_binding(_binding: &str) -> Result<(), std::convert::Infallible> {
 }
 
 fn tui_defaults() -> TuiConfigDefaults {
-    TuiConfigDefaults::new(
-        TuiLayout::Threadline,
-        [
-            (TuiAction::SelectThreadline, vec!["F3".to_owned()]),
-            (TuiAction::SelectFoldFocus, vec!["F4".to_owned()]),
-            (TuiAction::NextLayout, Vec::new()),
-            (TuiAction::PreviousLayout, Vec::new()),
-            (TuiAction::ToggleNavigator, vec!["Ctrl-T".to_owned()]),
-            (TuiAction::CreateRootSession, vec!["Alt-N".to_owned()]),
-            (TuiAction::CreateChildSession, vec!["Alt-C".to_owned()]),
-            (TuiAction::CancelRun, vec!["Ctrl-X".to_owned()]),
-            (TuiAction::InterruptRun, vec!["Alt-S".to_owned()]),
-        ],
-    )
+    TuiConfigDefaults::new([
+        (TuiAction::ToggleNavigator, vec!["Ctrl-T".to_owned()]),
+        (TuiAction::CreateRootSession, vec!["Alt-N".to_owned()]),
+        (TuiAction::CreateChildSession, vec!["Alt-C".to_owned()]),
+        (TuiAction::CancelRun, vec!["Ctrl-X".to_owned()]),
+        (TuiAction::InterruptRun, vec!["Alt-S".to_owned()]),
+    ])
     .unwrap()
 }
 

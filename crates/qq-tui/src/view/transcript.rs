@@ -1,7 +1,7 @@
 use super::*;
 use crate::render::Span;
 
-/// Retained rendering for one pane's transcript: completed messages cached
+/// Retained rendering for the transcript: completed messages cached
 /// by width, the settled prefix of streaming messages, and the row ranges
 /// the live messages occupied on the last frame.
 #[derive(Default)]
@@ -45,7 +45,7 @@ pub(super) struct CachedMarkdown {
     bytes: usize,
 }
 
-/// Heap bytes one pane may hold in completed-message layouts. Larger than
+/// Heap bytes the cache may hold in completed-message layouts. Larger than
 /// any single message the cache admits so the newest message always fits.
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -472,68 +472,42 @@ impl<'a> TurnIndex<'a> {
 }
 
 impl TranscriptCache {
-    /// Render one pane: an optional title row when several panes share the
-    /// screen, then the session transcript scrolled to the pane's viewport.
-    /// Every row is exactly `tile.rect.width` cells wide.
-    pub(super) fn pane(
+    /// Render the main area: the session transcript or a workspace view,
+    /// scrolled to the app's viewport. Every row is exactly `width` cells
+    /// wide. Returns the rows and the reconciled viewport, which the caller
+    /// hands back to the app after composition so rendering never writes
+    /// into the model mid-frame.
+    pub(super) fn body(
         &mut self,
         highlighter: &mut Highlighter,
         app: &App,
-        tile: Tile,
-        titled: bool,
-    ) -> (Vec<Line>, ViewportUpdate) {
-        let width = tile.rect.width;
-        let session_id = app.panes.get(tile.pane).and_then(Pane::session);
-        let focused = app.panes.focused_id() == tile.pane;
-        let mut lines = Vec::with_capacity(tile.rect.height);
-        if titled {
-            let content_title = match app.panes.get(tile.pane).map(|pane| pane.content) {
-                Some(PaneContent::Attention) => Some("needs you"),
-                Some(PaneContent::Changes) => Some("changes"),
-                Some(PaneContent::Transcript(_)) | None => None,
-            };
-            lines.push(pane_title(app, session_id, content_title, focused, width));
-        }
-        let body_height = tile.rect.height.saturating_sub(lines.len());
-        let mut viewport = app.viewport(tile.pane).cloned().unwrap_or_default();
-        // Workspace-wide panes are cheap lists; they draw without the
+        width: usize,
+        height: usize,
+    ) -> (Vec<Line>, Viewport) {
+        let session_id = app.view.session();
+        let mut viewport = app.viewport.clone();
+        // Workspace-wide views are cheap lists; they draw without the
         // transcript caches and scroll like any other body.
-        let content = app.panes.get(tile.pane).map(|pane| pane.content);
-        let workspace_rows = match content {
-            Some(PaneContent::Attention) => Some(attention_body(app, width)),
-            Some(PaneContent::Changes) => Some(changes_body(app, width)),
-            Some(PaneContent::Transcript(_)) | None => None,
+        let workspace_rows = match app.view {
+            View::Attention => Some(attention_body(app, width)),
+            View::Changes => Some(changes_body(app, width)),
+            View::Transcript(_) => None,
         };
         if let Some(rows) = workspace_rows {
             let mut body = VirtualBody::default();
             body.extend_owned(rows);
-            viewport.update((None, app.layout), body.rows, body_height, false);
+            viewport.update(app.view, body.rows, height, false);
             let offset = viewport.offset();
-            lines.extend(body.viewport(app, body_height, offset));
             return (
-                fit_height(lines, tile.rect.height),
-                ViewportUpdate {
-                    pane: tile.pane,
-                    viewport,
-                },
+                fit_height(body.viewport(app, height, offset), height),
+                viewport,
             );
         }
-        let body = match app.layout {
-            Layout::Threadline => self.threadline(highlighter, app, session_id, &viewport, width),
-            Layout::FoldFocus => self.fold_focus(highlighter, app, session_id, &viewport, width),
-        };
-        // The viewport is reconciled against this frame's body here, on a
-        // copy; the caller hands it back to the app after composition so
-        // rendering never writes into the model mid-frame.
-        viewport.update(
-            (session_id, app.layout),
-            body.rows,
-            body_height,
-            body.preserve_tail_anchor,
-        );
+        let body = self.threadline(highlighter, app, session_id, &viewport, width);
+        viewport.update(app.view, body.rows, height, body.preserve_tail_anchor);
         let offset = viewport.offset();
         let live_message_ranges = body.live_message_ranges.clone();
-        let mut rows = body.viewport(app, body_height, offset);
+        let mut rows = body.viewport(app, height, offset);
         drop(body);
         self.live_message_ranges = live_message_ranges.into_iter().collect();
         // Scrolled up while the session runs: a pill on the last row says
@@ -554,14 +528,7 @@ impl TranscriptCache {
             clipped.push(pill, accent().bold());
             *last = clipped;
         }
-        lines.extend(rows);
-        (
-            fit_height(lines, tile.rect.height),
-            ViewportUpdate {
-                pane: tile.pane,
-                viewport,
-            },
-        )
+        (fit_height(rows, height), viewport)
     }
 
     /// Drop every cached layout, keeping live-row anchors: an overlay hides
@@ -584,27 +551,13 @@ impl TranscriptCache {
                     .as_ref()
                     .map(|messages| (session, messages))
             })
-            .map(|(session, messages)| {
-                let limit = match app.layout {
-                    Layout::Threadline => MAX_VISIBLE_MESSAGES,
-                    Layout::FoldFocus => 2,
-                };
-                let mut visible = messages
+            .map(|(_, messages)| {
+                messages
                     .iter()
                     .rev()
-                    .take(limit)
+                    .take(MAX_VISIBLE_MESSAGES)
                     .map(|message| message.id)
-                    .collect::<HashSet<_>>();
-                if app.layout == Layout::FoldFocus
-                    && let Some(active_run_id) = session.summary.active_run_id
-                    && let Some(message) = messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.run_id == active_run_id)
-                {
-                    visible.insert(message.id);
-                }
-                visible
+                    .collect::<std::collections::HashSet<_>>()
             });
         match visible {
             Some(visible) => {
@@ -630,7 +583,6 @@ impl TranscriptCache {
         session_id: Option<SessionId>,
         viewport: &Viewport,
         width: usize,
-        limit: usize,
     ) {
         self.clock += 1;
         self.prune_markdown(app, session_id);
@@ -656,34 +608,7 @@ impl TranscriptCache {
         } else {
             self.tool_rows.clear();
         }
-        for message in messages.iter().rev().take(limit) {
-            if message_is_terminal(message) {
-                self.live.remove(&message.id);
-                if self
-                    .live_message_ranges
-                    .remove(&message.id)
-                    .is_some_and(|range| viewport.intersects_or_follows(&range))
-                {
-                    self.preserve_tail_anchor = true;
-                }
-                self.cache_message(highlighter, message, width, session.loaded_through);
-            } else {
-                self.markdown.remove(&message.id);
-                self.refresh_live(message, width);
-            }
-        }
-        if app.layout == Layout::FoldFocus
-            && let Some(active_run_id) = session.summary.active_run_id
-            && let Some(message) = messages
-                .iter()
-                .rev()
-                .find(|message| message.run_id == active_run_id)
-            && !messages
-                .iter()
-                .rev()
-                .take(limit)
-                .any(|visible| visible.id == message.id)
-        {
+        for message in messages.iter().rev().take(MAX_VISIBLE_MESSAGES) {
             if message_is_terminal(message) {
                 self.live.remove(&message.id);
                 if self
@@ -904,88 +829,6 @@ impl TranscriptCache {
         body
     }
 
-    pub(super) fn fold_focus<'a>(
-        &'a mut self,
-        highlighter: &mut Highlighter,
-        app: &App,
-        session_id: Option<SessionId>,
-        viewport: &Viewport,
-        width: usize,
-    ) -> VirtualBody<'a> {
-        let content_width = width.min(96);
-        self.prepare_markdown(highlighter, app, session_id, viewport, content_width, 2);
-        let mut body = VirtualBody {
-            preserve_tail_anchor: std::mem::take(&mut self.preserve_tail_anchor),
-            ..VirtualBody::default()
-        };
-        let Some(session_id) = session_id else {
-            body.push_line(Line::styled(
-                format!(
-                    "  {} creates the first session.",
-                    app.chord_label(crate::commands::Command::NewRootSession)
-                        .unwrap_or_else(|| "/new".to_owned())
-                ),
-                muted(),
-            ));
-            return body;
-        };
-        let Some(session) = app.sessions.get(&session_id) else {
-            body.push_line(Line::styled(
-                "  Loading session history...",
-                muted().italic(),
-            ));
-            return body;
-        };
-        let Some(messages) = session.messages.as_ref() else {
-            body.push_line(Line::styled(
-                "  Loading session history...",
-                muted().italic(),
-            ));
-            return body;
-        };
-        let start = messages.len().saturating_sub(2);
-        let mut selected = (start..messages.len()).collect::<Vec<_>>();
-        if let Some(active_run_id) = session.summary.active_run_id
-            && let Some(active_index) = messages
-                .iter()
-                .rposition(|message| message.run_id == active_run_id)
-            && selected.binary_search(&active_index).is_err()
-        {
-            selected.push(active_index);
-            selected.sort_unstable();
-        }
-        let folded = messages.len().saturating_sub(selected.len());
-        if folded > 0 {
-            body.push_line(Line::styled(
-                format!("  > {folded} messages folded"),
-                accent(),
-            ));
-            body.push_line(Line::default());
-        }
-        let mut focused = VirtualBody::default();
-        self.append_message_indices(
-            &mut focused,
-            app,
-            session,
-            messages,
-            selected,
-            content_width,
-        );
-        body.extend_virtual(focused);
-        for prompt in app.pending_prompts(session_id) {
-            let mut line = Line::styled("  YOU / PENDING  ", warning().bold());
-            line.push(
-                preview(prompt, content_width.saturating_sub(18)),
-                muted().italic(),
-            );
-            body.push_line(line);
-        }
-        for &child in app.sessions.children_of(session_id) {
-            body.push_line(session_line(app, child, content_width, "  > "));
-        }
-        body
-    }
-
     pub(super) fn transcript<'a>(
         &'a mut self,
         highlighter: &mut Highlighter,
@@ -994,14 +837,7 @@ impl TranscriptCache {
         viewport: &Viewport,
         width: usize,
     ) -> VirtualBody<'a> {
-        self.prepare_markdown(
-            highlighter,
-            app,
-            session_id,
-            viewport,
-            width,
-            MAX_VISIBLE_MESSAGES,
-        );
+        self.prepare_markdown(highlighter, app, session_id, viewport, width);
         let mut body = VirtualBody {
             preserve_tail_anchor: std::mem::take(&mut self.preserve_tail_anchor),
             ..VirtualBody::default()

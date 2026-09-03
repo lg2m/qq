@@ -11,12 +11,7 @@ mod transcript;
 mod workspace;
 mod wrap;
 
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    io,
-    ops::Range,
-};
+use std::{borrow::Cow, collections::HashMap, io, ops::Range};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -31,15 +26,15 @@ use qq_protocol::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    Layout, StatusItem,
+    StatusItem,
     app::{App, SessionView, ToolDetail, terminal_safe_character},
     input::{Mode, SessionConfirm},
-    panes::{Pane, PaneContent, PaneId, Rect, Tile, Viewport},
     render::{
-        Line, Style, accent, border, border_active, brand, diff_line_style, failure, info, muted,
-        normal, selection, success, warning, write_line,
+        Line, Style, accent, border, brand, diff_line_style, failure, info, muted, normal,
+        selection, success, warning, write_line,
     },
     theme,
+    viewport::{View, Viewport},
 };
 use chrome::*;
 pub(crate) use chrome::{ComposerMode, CursorPosition};
@@ -74,45 +69,35 @@ const PLAIN_TEXT_CHECKPOINT_ROWS: usize = 1024;
 const MAX_PLAIN_TEXT_CHECKPOINTS: usize = 4 * 1024;
 const MAX_PLAIN_TEXT_ROW_BYTES: usize = 4 * 1024;
 
-/// Frame assembly and the row diff against the previous frame. Per-pane
-/// transcript state lives in a [`TranscriptCache`] per pane; the highlighter
-/// is shared because its results are keyed by message and width, not pane.
+/// Frame assembly and the row diff against the previous frame. Retained
+/// transcript state lives in one [`TranscriptCache`]; the highlighter is
+/// separate because its results are keyed by message and width.
 #[derive(Default)]
 pub(crate) struct FrameRenderer {
     previous: Vec<Line>,
     size: Option<(u16, u16)>,
     /// Off-tick syntax highlighting for cached completed messages.
     pub(crate) highlighter: Highlighter,
-    panes: HashMap<PaneId, TranscriptCache>,
+    cache: TranscriptCache,
     /// `App::theme_generation` the caches were built under. Cached rows
     /// bake in colors, so a theme change discards every layout and forces
     /// a full repaint.
     theme_generation: u64,
-    /// Viewports reconciled while building the last frame. `draw` hands them
+    /// The viewport reconciled while building the last frame. `draw` hands it
     /// back to the app after the frame is composed; `frame` itself never
     /// mutates the model.
-    viewport_updates: Vec<ViewportUpdate>,
-    /// Tiles laid out for the last frame, for the same hand-back.
-    tiles: Vec<Tile>,
+    viewport_update: Option<Viewport>,
     /// Where the terminal cursor belongs after the last frame, or hidden.
     cursor: Option<CursorPosition>,
 }
 
-/// A pane's viewport after reconciling it with the body drawn this frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ViewportUpdate {
-    pub(crate) pane: PaneId,
-    pub(crate) viewport: Viewport,
-}
-
 impl FrameRenderer {
-    /// Hand the geometry decided while building the last frame back to the
-    /// model: reconciled viewports and the tiles on screen.
+    /// Hand the viewport reconciled while building the last frame back to
+    /// the model.
     pub(crate) fn commit(&mut self, app: &mut App) {
-        for update in self.viewport_updates.drain(..) {
-            app.set_viewport(update.pane, update.viewport);
+        if let Some(viewport) = self.viewport_update.take() {
+            app.viewport = viewport;
         }
-        app.panes.remember_tiles(std::mem::take(&mut self.tiles));
     }
 
     /// Forget the previous frame so the next draw repaints every row, after
@@ -167,15 +152,14 @@ impl FrameRenderer {
         Ok(output)
     }
 
-    /// Build one frame from the model without changing it. Viewport clamps
-    /// computed along the way are queued in `viewport_updates` for `draw`.
+    /// Build one frame from the model without changing it. The viewport clamp
+    /// computed along the way is kept in `viewport_update` for `draw`.
     fn frame(&mut self, app: &App, width: usize, height: usize) -> Vec<Line> {
         theme::activate(app.theme().palette);
-        self.viewport_updates.clear();
-        self.tiles.clear();
+        self.viewport_update = None;
         if self.theme_generation != app.theme_generation {
             self.theme_generation = app.theme_generation;
-            self.panes.clear();
+            self.cache = TranscriptCache::default();
             self.invalidate();
         }
         if width < 32 || height < 9 {
@@ -202,7 +186,8 @@ impl FrameRenderer {
             .saturating_sub(1)
             .clamp(1, MAX_COMPOSER_ROWS);
         let mut draft_lines = queued_drafts(app, width);
-        if !app.sidebar.visible(width)
+        let sidebar_width = app.sidebar.width(width, app.sessions.len());
+        if sidebar_width == 0
             && let Some(strip) = agent_strip(app, width)
         {
             draft_lines.insert(0, strip);
@@ -212,13 +197,8 @@ impl FrameRenderer {
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(draft_lines.len())
             .saturating_sub(composer_lines.len());
-        // The sidebar takes a fixed column on the right; the body renders in
-        // what remains so its cache keys see one stable width per layout.
-        let sidebar_width = if app.sidebar.visible(width) {
-            SIDEBAR_WIDTH
-        } else {
-            0
-        };
+        // The sidebar takes a column on the right; the body renders in what
+        // remains so its cache keys see one stable width per terminal size.
         let body_width = width.saturating_sub(sidebar_width);
         let mode = app.mode();
         let mut body = match mode {
@@ -232,9 +212,9 @@ impl FrameRenderer {
             Mode::History => history_picker(app, body_width, body_height),
             // An approval keeps the transcript on screen and adds its block
             // under the awaiting call, so the decision is made in context.
-            Mode::Approval => self.panes_body(app, Rect::new(0, 1, body_width, body_height)),
+            Mode::Approval => self.body(app, body_width, body_height),
             Mode::Compose => {
-                let mut body = self.panes_body(app, Rect::new(0, 1, body_width, body_height));
+                let mut body = self.body(app, body_width, body_height);
                 overlay_slash_autocomplete(
                     &mut body,
                     slash_autocomplete(app, body_width, body_height),
@@ -271,150 +251,43 @@ impl FrameRenderer {
         fit_height(lines, height)
     }
 
-    /// Render every visible pane into `area` and compose them row by row,
-    /// with dividers between siblings. Each pane renders through its own
-    /// cache at its own width, so resizing one split re-lays only the panes
-    /// whose width changed.
-    fn panes_body(&mut self, app: &App, area: Rect) -> Vec<Line> {
-        let (tiles, dividers) = app.panes.layout(area);
-        self.tiles.clone_from(&tiles);
-        let visible: HashSet<PaneId> = tiles.iter().map(|tile| tile.pane).collect();
-        // Caches for closed or hidden panes are dropped; a hidden pane pays a
-        // one-time relayout when it comes back, which is cheaper than holding
-        // every message twice for a pane that may never return.
-        self.panes.retain(|id, _| visible.contains(id));
-        // One pane filling the area is the common case and the one the speed
-        // budgets are written against: its rows are the body, untouched.
-        if let [tile] = tiles.as_slice()
-            && tile.rect == area
-        {
-            let tile = *tile;
-            let cache = self.panes.entry(tile.pane).or_default();
-            let (lines, update) = cache.pane(&mut self.highlighter, app, tile, false);
-            self.viewport_updates.push(update);
-            return lines;
-        }
-        let multiple = tiles.len() > 1;
-        // Every visible piece — pane rows or a divider — in x order. Each row
-        // of the canvas is then the pieces covering that row, left to right,
-        // so composition is one pass with no scratch tables, and pane rows are
-        // moved into place rather than copied.
-        let mut pieces: Vec<(Rect, Piece)> = Vec::with_capacity(tiles.len() + dividers.len());
-        for tile in tiles {
-            let cache = self.panes.entry(tile.pane).or_default();
-            let (lines, update) = cache.pane(&mut self.highlighter, app, tile, multiple);
-            self.viewport_updates.push(update);
-            pieces.push((tile.rect, Piece::Pane(lines)));
-        }
-        for divider in dividers {
-            let vertical = divider.width == 1 && divider.height > 1;
-            pieces.push((divider, Piece::Divider(vertical)));
-        }
-        pieces.sort_by_key(|(rect, _)| rect.x);
-        let mut canvas: Vec<Line> = Vec::with_capacity(area.height);
-        for y in area.y..area.bottom() {
-            let mut line = Line::default();
-            // Track the column by geometry so a row's width is measured at
-            // most once; measuring is the only per-cell work in composition.
-            let mut column = area.x;
-            for (rect, piece) in &mut pieces {
-                if y < rect.y || y >= rect.bottom() {
-                    continue;
-                }
-                if rect.x > column {
-                    line.push(" ".repeat(rect.x - column), normal());
-                }
-                match piece {
-                    Piece::Pane(lines) => {
-                        let Some(source) = lines.get_mut(y - rect.y) else {
-                            column = rect.right();
-                            continue;
-                        };
-                        // A section or status row laid out at full width
-                        // must not spill across the divider.
-                        let mut used = source.width();
-                        if used > rect.width {
-                            *source = truncate_line(std::mem::take(source), rect.width);
-                            used = rect.width;
-                        }
-                        line.spans.append(&mut source.spans);
-                        column = rect.x + used;
-                    }
-                    Piece::Divider(vertical) => {
-                        let glyph = if *vertical { "│" } else { "─" };
-                        line.push(glyph.repeat(rect.width), muted());
-                        column = rect.right();
-                    }
-                }
-            }
-            canvas.push(line);
-        }
-        canvas
+    /// Render the main area through the transcript cache and remember the
+    /// reconciled viewport for `commit`.
+    fn body(&mut self, app: &App, width: usize, height: usize) -> Vec<Line> {
+        let (lines, viewport) = self.cache.body(&mut self.highlighter, app, width, height);
+        self.viewport_update = Some(viewport);
+        lines
     }
 
-    /// Install a finished highlight layout in every pane cache holding that
+    /// Install a finished highlight layout if the cache still holds that
     /// message at that width. Returns whether any frame content changed;
     /// stale results for a message that was re-laid-out or evicted are
     /// dropped.
     pub(crate) fn apply_highlight(&mut self, result: Highlighted) -> bool {
-        let mut changed = false;
-        for cache in self.panes.values_mut() {
-            changed |= cache.apply_highlight(&result);
-        }
-        changed
+        self.cache.apply_highlight(&result)
     }
 
     #[cfg(test)]
-    fn cache(&mut self, pane: PaneId) -> &mut TranscriptCache {
-        self.panes.entry(pane).or_default()
-    }
-
-    #[cfg(test)]
-    fn markdown(&mut self) -> &HashMap<MessageId, CachedMarkdown> {
-        &self.cache(PaneId::default()).markdown
+    fn markdown(&self) -> &HashMap<MessageId, CachedMarkdown> {
+        &self.cache.markdown
     }
 
     #[cfg(test)]
     fn render_message(&mut self, message: &MessageSnapshot, width: usize) -> Vec<Line> {
-        let Self {
-            highlighter, panes, ..
-        } = self;
-        panes
-            .entry(PaneId::default())
-            .or_default()
-            .render_message(highlighter, message, width)
+        self.cache
+            .render_message(&mut self.highlighter, message, width)
     }
 
     #[cfg(test)]
     fn transcript<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
-        let Self {
-            highlighter, panes, ..
-        } = self;
-        let pane = app.panes.focused_id();
-        let viewport = app.panes.focused().viewport.clone();
-        panes
-            .entry(pane)
-            .or_default()
-            .transcript(highlighter, app, app.focused(), &viewport, width)
+        self.cache.transcript(
+            &mut self.highlighter,
+            app,
+            app.focused(),
+            &app.viewport,
+            width,
+        )
     }
-
-    #[cfg(test)]
-    fn fold_focus<'a>(&'a mut self, app: &App, width: usize) -> VirtualBody<'a> {
-        let Self {
-            highlighter, panes, ..
-        } = self;
-        let pane = app.panes.focused_id();
-        let viewport = app.panes.focused().viewport.clone();
-        panes
-            .entry(pane)
-            .or_default()
-            .fold_focus(highlighter, app, app.focused(), &viewport, width)
-    }
-}
-
-enum Piece {
-    Pane(Vec<Line>),
-    Divider(bool),
 }
 
 #[cfg(test)]

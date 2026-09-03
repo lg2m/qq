@@ -144,11 +144,6 @@ pub(crate) fn border() -> Style {
     Style::color(theme::active().border)
 }
 
-/// The focused pane's divider and title mark.
-pub(crate) fn border_active() -> Style {
-    Style::color(theme::active().border_active)
-}
-
 /// Background for the selected row in pickers and lists.
 pub(crate) fn selection(style: Style) -> Style {
     style.on(theme::active().selection_bg)
