@@ -383,10 +383,15 @@ fn consecutive_call_only_turns_merge_into_one_folded_group() {
         .collect::<Vec<_>>();
     session.tool_calls = Some(calls);
 
+    // By default every call is a row, in one contiguous block.
     let rows = squashed_rows(&transcript_lines(&app, 80));
+    assert_eq!(rows.len(), 7, "{rows:?}");
+    assert!(rows[3..].iter().all(|row| row.contains("Read a.rs")));
 
-    // The call-only turns 2 and 3 merge into turn 1's contiguous call
-    // group, and the four quiet calls fold as one, not per turn.
+    // Folded: the call-only turns 2 and 3 merge into turn 1's contiguous
+    // call group, and the four quiet calls fold as one, not per turn.
+    app.tool_detail = ToolDetail::Folded;
+    let rows = squashed_rows(&transcript_lines(&app, 80));
     assert_eq!(rows, [" QQ", " row 0", "", " ▸ Read ×4 a.rs",]);
 }
 
@@ -403,7 +408,7 @@ fn completed_edit_results_color_diff_shaped_content_at_expanded_detail() {
     let lines = render_tool_calls_simple(
         &[&diff_call],
         &HashMap::new(),
-        ToolDetail::Expanded,
+        SimpleDetail::Expanded,
         0,
         80,
         &|_, _| Vec::new(),
@@ -432,7 +437,7 @@ fn completed_edit_results_color_diff_shaped_content_at_expanded_detail() {
     let lines = render_tool_calls_simple(
         &[&summary_call],
         &HashMap::new(),
-        ToolDetail::Expanded,
+        SimpleDetail::Expanded,
         0,
         80,
         &|_, _| Vec::new(),
@@ -458,7 +463,7 @@ fn display_payload_diffs_replace_the_result_summary_at_expanded_detail() {
     let lines = render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
-        ToolDetail::Expanded,
+        SimpleDetail::Expanded,
         0,
         80,
         &|_, _| Vec::new(),
@@ -479,7 +484,7 @@ fn display_payload_diffs_replace_the_result_summary_at_expanded_detail() {
     let lines = render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         80,
         &|_, _| Vec::new(),
@@ -503,7 +508,7 @@ fn running_calls_show_a_live_output_tail_of_complete_lines() {
         "one\ntwo\nthree\nfour\nfive\nsix\nseven b\u{7}ell\npartial".to_owned(),
     );
 
-    for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
+    for detail in [SimpleDetail::Rows, SimpleDetail::Expanded] {
         let rows = frame_rows(&render_tool_calls_simple(
             &[&call],
             &live,
@@ -537,7 +542,7 @@ fn running_calls_show_a_live_output_tail_of_complete_lines() {
     let rows = frame_rows(&render_tool_calls_simple(
         &[&call],
         &live,
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         20,
         &|_, _| Vec::new(),
@@ -554,7 +559,7 @@ fn running_calls_show_a_live_output_tail_of_complete_lines() {
     let rows = frame_rows(&render_tool_calls_simple(
         &[&finished],
         &live,
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         80,
         &|_, _| Vec::new(),
@@ -710,7 +715,7 @@ fn collapsed_summaries_curate_known_tools() {
         let rows = squashed_rows(&render_tool_calls_simple(
             &[&call],
             &HashMap::new(),
-            ToolDetail::Collapsed,
+            SimpleDetail::Rows,
             0,
             120,
             &|_, _| Vec::new(),
@@ -734,7 +739,7 @@ fn unknown_tools_fall_back_to_the_first_string_argument_and_byte_size() {
     let rows = squashed_rows(&render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         160,
         &|_, _| Vec::new(),
@@ -754,7 +759,7 @@ fn unknown_tools_fall_back_to_the_first_string_argument_and_byte_size() {
     let rows = squashed_rows(&render_tool_calls_simple(
         &[&edit],
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         160,
         &|_, _| Vec::new(),
@@ -776,7 +781,7 @@ fn malformed_arguments_fall_back_to_a_raw_preview() {
     let rows = frame_rows(&render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         120,
         &|_, _| Vec::new(),
@@ -799,7 +804,7 @@ fn error_results_expand_under_the_summary_by_default() {
     let rows = frame_rows(&render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         120,
         &|_, _| Vec::new(),
@@ -822,7 +827,7 @@ fn pending_states_show_their_glyph_and_label() {
     let rows = squashed_rows(&render_tool_calls_simple(
         &[&awaiting],
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         0,
         120,
         &|_, _| Vec::new(),
@@ -840,7 +845,7 @@ fn pending_states_show_their_glyph_and_label() {
     let rows = frame_rows(&render_tool_calls_simple(
         &[&running],
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
         1,
         120,
         &|_, _| Vec::new(),
@@ -881,10 +886,21 @@ fn quiet_runs_fold_into_a_single_counted_line() {
     }
     let references = calls.iter().collect::<Vec<_>>();
 
+    // The default shows one row per call; folding is opt-in.
     let rows = frame_rows(&render_tool_calls_simple(
         &references,
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Rows,
+        0,
+        120,
+        &|_, _| Vec::new(),
+    ));
+    assert_eq!(rows.len(), 6);
+
+    let rows = frame_rows(&render_tool_calls_simple(
+        &references,
+        &HashMap::new(),
+        SimpleDetail::Folded,
         0,
         120,
         &|_, _| Vec::new(),
@@ -899,13 +915,13 @@ fn quiet_runs_fold_into_a_single_counted_line() {
         [" ▸ Read ×4 Search ×2 a.rs"]
     );
 
-    // An active or failed call keeps every line visible.
+    // An active or failed call keeps every line visible even when folded.
     calls[5].state = ToolCallState::Running;
     let references = calls.iter().collect::<Vec<_>>();
     let rows = frame_rows(&render_tool_calls_simple(
         &references,
         &HashMap::new(),
-        ToolDetail::Collapsed,
+        SimpleDetail::Folded,
         0,
         120,
         &|_, _| Vec::new(),
@@ -918,7 +934,7 @@ fn quiet_runs_fold_into_a_single_counted_line() {
     let rows = frame_rows(&render_tool_calls_simple(
         &references,
         &HashMap::new(),
-        ToolDetail::Expanded,
+        SimpleDetail::Expanded,
         0,
         120,
         &|_, _| Vec::new(),
@@ -927,35 +943,62 @@ fn quiet_runs_fold_into_a_single_counted_line() {
 }
 
 #[test]
-fn detail_cycling_reveals_arguments_and_result_tails() {
+fn expanding_a_read_shows_the_head_of_the_file_and_never_its_json() {
     let mut app = app_with_messages(1);
     let session_id = app.focused().unwrap();
+    let body = (1..=20)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     app.sessions.get_mut(&session_id).unwrap().tool_calls = Some(vec![tool_call_snapshot(
         7,
         "read_file",
         r#"{"path":"note.txt"}"#,
         ToolCallState::Completed,
-        Some("alpha\nbeta"),
+        Some(&body),
         false,
     )]);
     let mut renderer = FrameRenderer::default();
-    let ctrl_o = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
 
-    let collapsed = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
-    assert!(!collapsed.iter().any(|row| row.contains("beta")));
-
-    app.handle_terminal_event(ctrl_o.clone());
-    let expanded = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
+    let rows = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
     assert!(
-        expanded
-            .iter()
-            .any(|row| row.contains("\"path\": \"note.txt\""))
+        rows.iter()
+            .any(|row| squash(row).contains("Read note.txt 20 lines"))
     );
-    assert!(expanded.iter().any(|row| row.contains("beta")));
+    assert!(
+        !rows.iter().any(|row| row.contains("line 1")),
+        "no body by default"
+    );
 
-    app.handle_terminal_event(ctrl_o);
-    let collapsed = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
-    assert!(!collapsed.iter().any(|row| row.contains("beta")));
+    // Ctrl-Up selects the call, Enter expands it alone.
+    app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::CONTROL,
+    )));
+    app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let rows = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
+    let text = rows.join("\n");
+    assert!(text.contains("line 1\n"), "head first: {text}");
+    assert!(
+        text.contains(&format!("line {MAX_TOOL_RESULT_ROWS}")),
+        "{text}"
+    );
+    assert!(!text.contains("line 20"), "bounded: {text}");
+    assert!(text.contains("… 8 lines more"), "{text}");
+    assert!(
+        !text.contains("\"path\""),
+        "known tools show no JSON: {text}"
+    );
+
+    // Ctrl-O folds the block rather than expanding anything.
+    app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(app.tool_detail, ToolDetail::Folded);
 }
 
 #[test]
@@ -980,7 +1023,7 @@ fn tool_rows_respect_narrow_widths() {
     ];
     let references = calls.iter().collect::<Vec<_>>();
     for width in 0..24 {
-        for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
+        for detail in [SimpleDetail::Rows, SimpleDetail::Expanded] {
             let lines = render_tool_calls_simple(
                 &references,
                 &HashMap::new(),
@@ -2380,8 +2423,8 @@ fn an_expanded_running_shell_shows_started_live_elapsed_and_last_output_times() 
         "no wall-clock when collapsed: {row}"
     );
 
-    // Expanded with Ctrl-O: started, running, and last output timestamps.
-    app.execute(Command::ToggleToolDetail);
+    // Expanded: started, running, and last output timestamps.
+    app.expanded_tool_calls.insert(call_id);
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 24);
     let text = frame_rows(&frame).join("\n");
     assert!(text.contains("started 14:32:07"), "{text}");

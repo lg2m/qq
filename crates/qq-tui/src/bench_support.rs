@@ -305,9 +305,21 @@ impl BenchHarness {
         self.draw_full()
     }
 
-    /// Set `expanded` tool detail so expanded rows are rendered.
-    pub fn expand_tools(&mut self) {
-        self.app.tool_detail = crate::app::ToolDetail::Expanded;
+    /// Fold quiet finished tool blocks to one row.
+    pub fn fold_tools(&mut self) {
+        self.app.tool_detail = crate::app::ToolDetail::Folded;
+    }
+
+    /// Expand every tool call's body, as a user reviewing a whole turn would.
+    pub fn expand_every_tool(&mut self) {
+        let ids: Vec<_> = self
+            .app
+            .sessions
+            .get(&session_id(0))
+            .and_then(|session| session.tool_calls.as_ref())
+            .map(|calls| calls.iter().map(|call| call.id).collect())
+            .unwrap_or_default();
+        self.app.expanded_tool_calls.extend(ids);
     }
 }
 

@@ -33,10 +33,21 @@ pub(crate) struct ToolRow {
     pub metric: Option<String>,
     /// The result was cut short by the runtime.
     pub truncated: bool,
-    /// Pretty-printed arguments for the expanded view.
-    pub arguments_pretty: String,
+    /// Arguments as `key: value` rows, for tools without a curated view.
+    pub arguments: Vec<(String, String)>,
+    /// Which end of the result the expanded view shows.
+    pub body: ResultBody,
     /// Diff text for the expanded view and approvals, when the call has one.
     pub diff: Option<String>,
+}
+
+/// Which end of a result reads best: the head for content the model asked
+/// to see (files, listings, matches), the tail for command output whose
+/// verdict comes last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultBody {
+    Head,
+    Tail,
 }
 
 /// Identity of a cached [`ToolRow`]: the call plus everything that changes
@@ -71,10 +82,23 @@ impl ToolRow {
         } else {
             None
         };
-        let arguments_pretty = arguments
-            .as_ref()
-            .and_then(|value| serde_json::to_string_pretty(value).ok())
-            .unwrap_or_else(|| bounded_tail(&call.arguments, MAX_TOOL_DETAIL_BYTES).to_owned());
+        let argument_rows: Vec<(String, String)> =
+            match arguments.as_ref().and_then(|v| v.as_object()) {
+                Some(object) => object
+                    .iter()
+                    .map(|(key, value)| {
+                        let text = match value {
+                            serde_json::Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        };
+                        (key.clone(), text)
+                    })
+                    .collect(),
+                None => vec![(
+                    "arguments".to_owned(),
+                    bounded_tail(&call.arguments, MAX_TOOL_DETAIL_BYTES).to_owned(),
+                )],
+            };
         let string_argument = |key: &str| {
             arguments
                 .as_ref()
@@ -205,6 +229,10 @@ impl ToolRow {
                 )
             }
         };
+        let body = match call.name.as_str() {
+            "shell" => ResultBody::Tail,
+            _ => ResultBody::Head,
+        };
         Self {
             verb,
             raw_name,
@@ -212,7 +240,8 @@ impl ToolRow {
             subject_is_path,
             metric,
             truncated,
-            arguments_pretty,
+            arguments: argument_rows,
+            body,
             diff,
         }
     }
@@ -353,8 +382,10 @@ impl RowClock {
 pub(crate) struct ToolRowContext<'a> {
     pub row: &'a ToolRow,
     pub clock: RowClock,
-    /// Expanded by the global toggle or by this call's own toggle.
+    /// This call's body is shown.
     pub expanded: bool,
+    /// The transcript folds quiet finished blocks to one row.
+    pub fold: bool,
     /// The transcript cursor rests on this call.
     pub selected: bool,
 }
@@ -369,10 +400,11 @@ pub(super) type ApprovalRows<'a> = &'a dyn Fn(ToolCallId, usize) -> Vec<Line>;
 /// Resolves a call to its cached row and display state.
 pub(super) type RowLookup<'a> = &'a dyn Fn(&ToolCallSnapshot) -> ToolRowContext<'a>;
 
-/// Renders one run's tool calls: a folded row for quiet runs, otherwise one
-/// gutter line per call, with errors, expansion, and live output adding
-/// bounded body rows. A running call's live output shows at every detail
-/// level: it is the thing the user is waiting for.
+/// Renders one run's tool calls: one gutter line per call, with errors,
+/// expansion, and live output adding bounded body rows. In folded detail a
+/// block of quiet finished calls is one summary row instead. A running
+/// call's live output shows at every detail level: it is the thing the user
+/// is waiting for.
 pub(super) fn render_tool_calls(
     calls: &[&ToolCallSnapshot],
     live_output: &HashMap<ToolCallId, String>,
@@ -389,7 +421,8 @@ pub(super) fn render_tool_calls(
             && !lookup(call).selected
             && children(call.id, width).is_empty()
     };
-    if calls.len() > TOOL_FOLD_THRESHOLD && calls.iter().all(|call| quiet(call)) {
+    let fold = calls.first().is_some_and(|call| lookup(call).fold);
+    if fold && calls.len() > TOOL_FOLD_THRESHOLD && calls.iter().all(|call| quiet(call)) {
         return vec![tool_fold_line(calls, lookup, width)];
     }
     let mut lines = Vec::with_capacity(calls.len());
@@ -590,9 +623,11 @@ pub(crate) fn format_clock(ms: u64) -> String {
     )
 }
 
-/// Expanded detail: the timing line, bounded pretty-printed arguments, then
-/// the result. Diffs render head-first with line numbers so a review starts
-/// at the top of the change; other results show a bounded tail.
+/// Expanded detail: the timing line, then what the call produced. Known
+/// tools never show their JSON: reads and searches show the head of the
+/// result, edits show the diff head-first with line numbers, and commands
+/// show the tail of their output. Unknown and MCP tools list arguments as
+/// `key: value` rows before the result tail.
 pub(super) fn tool_expanded_lines(
     call: &ToolCallSnapshot,
     context: ToolRowContext<'_>,
@@ -626,34 +661,62 @@ pub(super) fn tool_expanded_lines(
         when.push(fields.join(" · "), muted());
         lines.push(truncate_line(when, width));
     }
-    for (shown, line) in row.arguments_pretty.lines().enumerate() {
-        if shown == MAX_TOOL_ARGUMENT_ROWS {
-            lines.push(Line::styled("     …", muted()));
-            break;
+    if row.raw_name {
+        for (shown, (key, value)) in row.arguments.iter().enumerate() {
+            if shown == MAX_TOOL_ARGUMENT_ROWS {
+                lines.push(Line::styled("     …", muted()));
+                break;
+            }
+            let mut line = Line::styled(format!("     {key}: "), muted());
+            line.push(preview(value, width.saturating_sub(line.width())), normal());
+            lines.push(truncate_line(line, width));
         }
-        lines.push(truncate_line(
-            Line::styled(format!("     {line}"), muted()),
-            width,
-        ));
     }
     if let Some(diff) = &row.diff {
         lines.extend(diff_lines(diff, MAX_TOOL_RESULT_ROWS, width));
-    } else if let Some(result) = call.result.as_deref()
-        && !call.is_error
-    {
-        let text = bounded_tail(result, MAX_TOOL_DETAIL_BYTES);
-        let total = text.lines().count();
-        if total > MAX_TOOL_RESULT_ROWS || text.len() < result.len() {
-            lines.push(Line::styled("     …", muted()));
+        return lines;
+    }
+    let Some(result) = call.result.as_deref().filter(|_| !call.is_error) else {
+        return lines;
+    };
+    match row.body {
+        ResultBody::Head => {
+            let total = result.lines().count();
+            for line in result
+                .lines()
+                .filter(|line| *line != TOOL_TRUNCATION_MARKER)
+                .take(MAX_TOOL_RESULT_ROWS)
+            {
+                lines.push(truncate_line(
+                    Line::styled(format!("     {}", preview(line, width)), muted()),
+                    width,
+                ));
+            }
+            if total > MAX_TOOL_RESULT_ROWS {
+                lines.push(Line::styled(
+                    format!(
+                        "     … {} more",
+                        count_noun(total - MAX_TOOL_RESULT_ROWS, "line", "lines")
+                    ),
+                    muted(),
+                ));
+            }
         }
-        for line in text
-            .lines()
-            .skip(total.saturating_sub(MAX_TOOL_RESULT_ROWS))
-        {
-            lines.push(truncate_line(
-                Line::styled(format!("     {line}"), muted()),
-                width,
-            ));
+        ResultBody::Tail => {
+            let text = bounded_tail(result, MAX_TOOL_DETAIL_BYTES);
+            let total = text.lines().count();
+            if total > MAX_TOOL_RESULT_ROWS || text.len() < result.len() {
+                lines.push(Line::styled("     …", muted()));
+            }
+            for line in text
+                .lines()
+                .skip(total.saturating_sub(MAX_TOOL_RESULT_ROWS))
+            {
+                lines.push(truncate_line(
+                    Line::styled(format!("     {}", preview(line, width)), muted()),
+                    width,
+                ));
+            }
         }
     }
     lines
@@ -781,13 +844,22 @@ pub(super) const fn tool_state_label(state: ToolCallState) -> &'static str {
     }
 }
 
-/// Test entry: derive rows on the fly and render with a global detail level,
-/// no selection, no timing, and no approval block.
+/// How the test entry shows calls: rows, folded, or every body expanded.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SimpleDetail {
+    Rows,
+    Folded,
+    Expanded,
+}
+
+/// Test entry: derive rows on the fly and render with one detail level for
+/// every call, no selection, no timing, and no approval block.
 #[cfg(test)]
 pub(super) fn render_tool_calls_simple(
     calls: &[&ToolCallSnapshot],
     live_output: &HashMap<ToolCallId, String>,
-    detail: ToolDetail,
+    detail: SimpleDetail,
     tick: usize,
     width: usize,
     children: ChildRows<'_>,
@@ -802,7 +874,8 @@ pub(super) fn render_tool_calls_simple(
             timing: ToolCallTiming::default(),
             now_ms: 0,
         },
-        expanded: detail == ToolDetail::Expanded,
+        expanded: detail == SimpleDetail::Expanded,
+        fold: detail == SimpleDetail::Folded,
         selected: false,
     };
     render_tool_calls(

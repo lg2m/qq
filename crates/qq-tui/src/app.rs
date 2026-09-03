@@ -148,28 +148,30 @@ impl Sidebar {
     }
 }
 
-/// How much of each tool call the transcript shows. Session-local because the
-/// persisted settings surface only carries keybindings and layout today.
+/// How the transcript shows a run's tool calls. One row per call is the
+/// default: while an agent works, what it is doing is the content. Folding
+/// collapses finished quiet blocks to one summary row for reading back a
+/// long transcript. A call's body is shown per call, never globally.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ToolDetail {
     #[default]
-    Collapsed,
-    Expanded,
+    Rows,
+    Folded,
 }
 
 impl ToolDetail {
     #[must_use]
     pub(crate) const fn next(self) -> Self {
         match self {
-            Self::Collapsed => Self::Expanded,
-            Self::Expanded => Self::Collapsed,
+            Self::Rows => Self::Folded,
+            Self::Folded => Self::Rows,
         }
     }
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::Collapsed => "collapsed",
-            Self::Expanded => "expanded",
+            Self::Rows => "rows",
+            Self::Folded => "folded",
         }
     }
 }

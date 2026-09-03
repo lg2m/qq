@@ -940,8 +940,8 @@ impl TranscriptCache {
                         .unwrap_or_default(),
                     now_ms: app.now_ms,
                 },
-                expanded: app.tool_detail == ToolDetail::Expanded
-                    || app.expanded_tool_calls.contains(&call.id),
+                expanded: app.expanded_tool_calls.contains(&call.id),
+                fold: app.tool_detail == ToolDetail::Folded,
                 selected: app.transcript_cursor == Some(call.id),
             }
         };

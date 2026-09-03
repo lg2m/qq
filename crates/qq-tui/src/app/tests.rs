@@ -1744,21 +1744,21 @@ fn mid_run_queued_prompts_stay_after_the_streaming_runs_turn_messages() {
 fn ctrl_o_cycles_tool_detail_and_yields_to_overlays() {
     let mut app = App::new(TuiOptions::default());
     app.apply_snapshot(snapshot());
-    assert_eq!(app.tool_detail, ToolDetail::Collapsed);
+    assert_eq!(app.tool_detail, ToolDetail::Rows);
     let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
 
     let (changed, requests) = app.handle_key(ctrl_o).split();
     assert!(changed);
     assert!(requests.is_empty());
-    assert_eq!(app.tool_detail, ToolDetail::Expanded);
+    assert_eq!(app.tool_detail, ToolDetail::Folded);
 
     app.handle_key(ctrl_o);
-    assert_eq!(app.tool_detail, ToolDetail::Collapsed);
+    assert_eq!(app.tool_detail, ToolDetail::Rows);
 
     // Pickers own the keyboard; the toggle must not fire underneath them.
     app.open_session_picker_with("", None, None);
     app.handle_key(ctrl_o);
-    assert_eq!(app.tool_detail, ToolDetail::Collapsed);
+    assert_eq!(app.tool_detail, ToolDetail::Rows);
 }
 
 #[test]

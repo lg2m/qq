@@ -183,17 +183,21 @@ fn keystroke_echo(iterations: u32) {
     report_samples("keystroke_to_frame", &samples);
 }
 
-/// Thirty-two completed tool calls in the visible run, collapsed and then
-/// expanded. Tool rows are rebuilt every frame today; the refinement plan
-/// budgets this at 60 µs p95.
+/// Thirty-two completed tool calls in the visible run: one row each (the
+/// default), folded to a summary row, and with every body expanded. The
+/// refinement plan budgets the expanded case at 60 µs p95.
 fn tool_calls_32(iterations: u32) {
     let mut harness = BenchHarness::new(SIZE, 1, 4);
     harness.hide_sidebar();
     harness.add_tool_calls(32);
     black_box(harness.draw());
     let samples = collect(iterations, || harness.draw().len());
-    report_samples("tool_calls_32_frame", &samples);
-    harness.expand_tools();
+    report_samples("tool_calls_32_rows_frame", &samples);
+    harness.fold_tools();
+    black_box(harness.draw());
+    let samples = collect(iterations, || harness.draw().len());
+    report_samples("tool_calls_32_folded_frame", &samples);
+    harness.expand_every_tool();
     black_box(harness.draw());
     let samples = collect(iterations, || harness.draw().len());
     report_samples("tool_calls_32_expanded_frame", &samples);
