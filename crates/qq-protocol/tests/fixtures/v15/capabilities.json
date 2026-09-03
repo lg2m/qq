@@ -107,7 +107,22 @@
     "skills": {
       "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "indexed": 2,
-      "disclosed": 1
+      "disclosed": 1,
+      "entries": [
+        {
+          "name": "deploy",
+          "kind": "command",
+          "source": ".qq/commands/deploy.md",
+          "description": "Ship the current branch.",
+          "disclosed": true
+        },
+        {
+          "name": "audit",
+          "kind": "skill",
+          "source": "pack:review-kit/skills/audit/SKILL.md",
+          "disclosed": false
+        }
+      ]
     }
   },
   "events": {

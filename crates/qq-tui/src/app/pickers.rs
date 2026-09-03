@@ -1,22 +1,23 @@
-//! Overlay pickers: models, profiles, approval modes, themes, sessions, and
-//! the command palette. One
+//! Overlay pickers: models, profiles, approval modes, skills, themes,
+//! sessions, and the command palette. One
 //! key handler in `Overlay` moves the cursor and edits the query; this module
 //! owns opening each picker with its rows and interpreting `Accept`,
 //! `Cancel`, and picker-specific chords.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use qq_protocol::{
-    AgentProfileId, ApprovalMode, ModelDescriptor, ModelSelection, ServerCapabilities,
-    SessionCommand, SessionId, SessionStatus,
+    AgentProfileId, ApprovalMode, GuidanceKind, ModelDescriptor, ModelSelection,
+    ServerCapabilities, SessionCommand, SessionId, SessionStatus,
 };
 
 use super::{App, PendingIntent};
 use crate::{
-    commands::Command,
+    commands::{Command, SlashAction},
     effect::{Effects, Redraw},
     input::{
         ApprovalModeRow, CommandRow, HistoryRow, ModelRow, Overlay, PickerOutcome, ProfileRow,
-        SessionConfirm, SessionRow, ThemeRow, approval_mode_label, approval_mode_row, command_rows,
+        SessionConfirm, SessionRow, SkillRow, ThemeRow, approval_mode_label, approval_mode_row,
+        command_rows,
     },
     picker::Picker,
     theme::Theme,
@@ -71,6 +72,20 @@ impl App {
                     return Effects::none();
                 };
                 self.accept_approval_mode(mode)
+            }
+            (PickerOutcome::Accept, Overlay::Skills(picker)) => {
+                let Some((name, kind)) = picker
+                    .current()
+                    .map(|row| (format!("/{}", row.name), row.kind))
+                else {
+                    return Effects::none();
+                };
+                self.overlay = None;
+                let action = match kind {
+                    GuidanceKind::Command => SlashAction::WorkspaceCommand,
+                    GuidanceKind::Skill => SlashAction::Skill,
+                };
+                self.accept_slash(action, &name)
             }
             (PickerOutcome::Accept, Overlay::Themes { .. }) => {
                 let name = self.theme().name.clone();
@@ -350,6 +365,45 @@ impl App {
                 Effects::redraw(Redraw::Immediate)
             }
         }
+    }
+
+    // --- skills ---
+
+    pub(crate) fn open_skills(&mut self) -> Effects {
+        let Some(capabilities) = self.capabilities.as_deref() else {
+            self.set_warning(
+                "skills are not available until the server's capabilities arrive".to_owned(),
+            );
+            return Effects::redraw(Redraw::Immediate);
+        };
+        let Some(tools) = capabilities.workspace_tools.as_ref() else {
+            self.set_warning(
+                "the server could not compile this workspace's plan; see `qq config check`"
+                    .to_owned(),
+            );
+            return Effects::redraw(Redraw::Immediate);
+        };
+        let rows: Vec<SkillRow> = tools
+            .skills
+            .entries
+            .iter()
+            .map(|entry| SkillRow {
+                name: entry.name.clone(),
+                kind: entry.kind,
+                source: entry.source.clone(),
+                description: entry.description.clone(),
+                disclosed: entry.disclosed,
+            })
+            .collect();
+        if rows.is_empty() {
+            self.set_info(
+                "no commands or skills are indexed; add .qq/commands/<name>.md or .qq/skills/<name>/SKILL.md"
+                    .to_owned(),
+            );
+            return Effects::redraw(Redraw::Immediate);
+        }
+        self.overlay = Some(Overlay::Skills(Picker::with_items(rows)));
+        Effects::redraw(Redraw::Immediate)
     }
 
     // --- themes ---

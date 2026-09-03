@@ -530,27 +530,17 @@ fn slash_autocomplete_filters_selects_and_executes_commands() {
     app.apply_snapshot(snapshot());
     app.composer.text = "/".to_owned();
 
-    assert_eq!(
-        app.filtered_slash_commands()
+    {
+        let mut reserved = qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.to_vec();
+        reserved.sort_unstable();
+        let mut here: Vec<String> = app
+            .filtered_slash_commands()
             .iter()
-            .map(|command| command.name)
-            .collect::<Vec<_>>(),
-        {
-            let mut reserved = qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.to_vec();
-            reserved.sort_unstable();
-            let mut here: Vec<_> = app
-                .filtered_slash_commands()
-                .iter()
-                .map(|command| command.name)
-                .collect();
-            here.sort_unstable();
-            assert_eq!(here, reserved);
-            app.filtered_slash_commands()
-                .iter()
-                .map(|command| command.name)
-                .collect::<Vec<_>>()
-        }
-    );
+            .map(|command| command.name.to_string())
+            .collect();
+        here.sort_unstable();
+        assert_eq!(here, reserved);
+    }
     let last = qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.len() - 1;
     for _ in 0..20 {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -3311,4 +3301,118 @@ fn approval_mode_chosen_without_a_focused_session_applies_to_the_next_create() {
             ..
         }
     ));
+}
+
+fn capabilities_with_skills() -> std::sync::Arc<qq_protocol::ServerCapabilities> {
+    let mut capabilities = fixtures::steering_capabilities();
+    capabilities.workspace_tools = Some(qq_protocol::WorkspaceToolCapabilities {
+        catalog_digest: qq_protocol::ContentHash::from_bytes([5; 32]),
+        exposure: qq_protocol::ToolExposure::Full,
+        hosts: Vec::new(),
+        excluded_tools: 0,
+        skills: qq_protocol::SkillCapabilities {
+            digest: qq_protocol::ContentHash::from_bytes([6; 32]),
+            indexed: 2,
+            disclosed: 2,
+            truncated: false,
+            entries: vec![
+                qq_protocol::SkillSummary {
+                    name: "ship".to_owned(),
+                    kind: qq_protocol::GuidanceKind::Command,
+                    source: ".qq/commands/ship.md".to_owned(),
+                    description: "Ship the current branch.".to_owned(),
+                    disclosed: true,
+                },
+                qq_protocol::SkillSummary {
+                    name: "qq-verify".to_owned(),
+                    kind: qq_protocol::GuidanceKind::Skill,
+                    source: ".qq/skills/qq-verify/SKILL.md".to_owned(),
+                    description: "Run the gates.".to_owned(),
+                    disclosed: true,
+                },
+            ],
+        },
+    });
+    std::sync::Arc::new(capabilities)
+}
+
+#[test]
+fn slash_completion_offers_workspace_commands_and_skills_after_client_commands() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    let session_id = app.focused().unwrap();
+    // Before the document arrives only client commands complete.
+    app.composer.text = "/".to_owned();
+    assert_eq!(
+        app.filtered_slash_commands().len(),
+        qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.len()
+    );
+
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_skills()));
+    let names: Vec<String> = app
+        .filtered_slash_commands()
+        .iter()
+        .map(|entry| entry.name.to_string())
+        .collect();
+    assert_eq!(
+        names.len(),
+        qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.len() + 2
+    );
+    assert_eq!(&names[names.len() - 2..], ["/ship", "/qq-verify"]);
+
+    // Accepting a workspace command leaves it in the composer for arguments.
+    app.composer.text = "/shi".to_owned();
+    app.slash.select(0);
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty());
+    assert_eq!(app.composer.text, "/ship ");
+
+    // Accepting a skill submits it as the prompt the runtime resolves.
+    app.composer.replace("/qq-v".to_owned());
+    app.slash.select(0);
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    let [ClientRequest::Command(request)] = requests.as_slice() else {
+        panic!("expected one submit-prompt command")
+    };
+    assert!(matches!(
+        &request.command,
+        SessionCommand::SubmitPrompt { session_id: id, input, .. }
+            if *id == session_id && input[0] == qq_protocol::InputPart::text("/qq-verify")
+    ));
+    assert!(app.composer.text.is_empty());
+}
+
+#[test]
+fn skills_picker_lists_indexed_guidance_and_accepts_like_completion() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    app.composer.text = "/skills".to_owned();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.overlay.is_none());
+    assert!(
+        app.status
+            .as_deref()
+            .unwrap()
+            .contains("capabilities arrive")
+    );
+
+    app.apply_client_update(ClientUpdate::Capabilities(capabilities_with_skills()));
+    app.open_skills();
+    let Some(Overlay::Skills(picker)) = &app.overlay else {
+        panic!("expected the skills picker")
+    };
+    assert_eq!(picker.items().len(), 2);
+    // Search text covers the source and description too.
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    assert!(requests.is_empty());
+    assert!(app.overlay.is_none());
+    assert_eq!(app.composer.text, "/ship ");
 }

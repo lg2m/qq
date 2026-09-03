@@ -2974,3 +2974,58 @@ fn approval_mode_picker_and_badge_name_the_mode_in_effect() {
         .unwrap();
     assert!(full.contains("without asking"), "{full}");
 }
+
+#[test]
+fn skills_picker_groups_commands_before_skills_with_sources() {
+    let mut app = app_with_messages(0);
+    let mut capabilities = fixtures::steering_capabilities();
+    capabilities.workspace_tools = Some(qq_protocol::WorkspaceToolCapabilities {
+        catalog_digest: qq_protocol::ContentHash::from_bytes([5; 32]),
+        exposure: qq_protocol::ToolExposure::Full,
+        hosts: Vec::new(),
+        excluded_tools: 0,
+        skills: qq_protocol::SkillCapabilities {
+            digest: qq_protocol::ContentHash::from_bytes([6; 32]),
+            indexed: 2,
+            disclosed: 1,
+            truncated: false,
+            entries: vec![
+                qq_protocol::SkillSummary {
+                    name: "ship".to_owned(),
+                    kind: qq_protocol::GuidanceKind::Command,
+                    source: ".qq/commands/ship.md".to_owned(),
+                    description: "Ship the current branch.".to_owned(),
+                    disclosed: true,
+                },
+                qq_protocol::SkillSummary {
+                    name: "audit".to_owned(),
+                    kind: qq_protocol::GuidanceKind::Skill,
+                    source: "pack:review-kit/skills/audit/SKILL.md".to_owned(),
+                    description: String::new(),
+                    disclosed: false,
+                },
+            ],
+        },
+    });
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        capabilities,
+    )));
+    app.open_skills();
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 16);
+    let rows = squashed_rows(&frame);
+    let text = rows.join("\n");
+    let commands = text.find("COMMANDS").unwrap();
+    let ship = text.find("/ship").unwrap();
+    let skills = text
+        .find("SKILLS\n")
+        .unwrap_or_else(|| text.rfind("SKILLS").unwrap());
+    let audit = text.find("/audit").unwrap();
+    assert!(commands < ship && ship < skills && skills < audit, "{text}");
+    assert!(text.contains("Ship the current branch."), "{text}");
+    assert!(
+        text.contains("pack:review-kit/skills/audit/SKILL.md"),
+        "{text}"
+    );
+    let audit_row = rows.iter().find(|row| row.contains("/audit")).unwrap();
+    assert!(audit_row.contains("explicit only"), "{audit_row}");
+}

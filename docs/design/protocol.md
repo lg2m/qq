@@ -341,7 +341,15 @@ Response `ServerCapabilities` (abridged; see
     "catalog_digest": "cccc…", "exposure": "progressive",
     "hosts": [{ "name": "mcp", "generation": 3, "tool_count": 40, "ready": true }],
     "excluded_tools": 1,
-    "skills": { "digest": "dddd…", "indexed": 2, "disclosed": 1 }
+    "skills": {
+      "digest": "dddd…", "indexed": 2, "disclosed": 1,
+      "entries": [
+        { "name": "deploy", "kind": "command", "source": ".qq/commands/deploy.md",
+          "description": "Ship the current branch.", "disclosed": true },
+        { "name": "audit", "kind": "skill",
+          "source": "pack:review-kit/skills/audit/SKILL.md", "disclosed": false }
+      ]
+    }
   },
   "events": {
     "post_commit": true, "replay_page": 128, "max_subscriptions": 64,
@@ -364,7 +372,13 @@ a named workspace: it summarizes that workspace's default plan — the catalog
 digest, whether requests carry every schema (`full`) or an index plus
 `select_tools` pins (`progressive`), each external host's generation, admitted
 tool count, and readiness, how many declared tools were excluded, and the skill
-index. `events` is the observer contract: events are published only after their
+index. `skills.entries` (additive; absent from older servers) lists every
+indexed document with its slash `name`, `kind` (`command` or `skill`),
+workspace-relative or `pack:<id>/…` `source`, front-matter `description`, and
+whether the model may load it itself (`disclosed`); it is bounded by
+`tools.max_indexed_skills` entries with descriptions of at most 512 bytes, so a
+client can offer slash completion and a listing without reading the workspace.
+`events` is the observer contract: events are published only after their
 durable commit, a subscriber is served `replay_page` events per page from its
 cursor, at most `max_subscriptions` SSE subscriptions are accepted (503 beyond),
 and `retention_bounded: false` means a cursor from any point in the store's

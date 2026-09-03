@@ -17,7 +17,7 @@ pub(crate) use crate::model::{LiveStatus, ReasoningDetail, SessionStore, Session
 use crate::model::{MAX_PROMPT_HISTORY, MAX_QUEUED_DRAFTS, WARM_BODY_LIMIT};
 use crate::{
     Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Settings,
-    commands::{self, Command, SlashEntry},
+    commands::{self, Command, SlashAction, SlashEntry},
     composer::Composer,
     effect::{Effect, Effects, Redraw},
     input::{Mode, Overlay, approval_mode_label},
@@ -1002,6 +1002,7 @@ impl App {
             | Mode::Models
             | Mode::Profiles
             | Mode::ApprovalModes
+            | Mode::Skills
             | Mode::Themes
             | Mode::Commands
             | Mode::History => self.handle_overlay_key(key),
@@ -1270,6 +1271,7 @@ impl App {
             Command::OpenModels => self.open_models(),
             Command::OpenProfiles => self.open_profiles(),
             Command::OpenApprovalModes => self.open_approval_modes(),
+            Command::OpenSkills => self.open_skills(),
             Command::OpenThemes => self.open_themes(),
             Command::OpenSessions => self.open_sessions(),
             Command::OpenAgents => self.open_agents(),
@@ -1509,10 +1511,13 @@ impl App {
         // direct, embedded, and remote clients.
         if prompt.starts_with('/') {
             let name = prompt.split_whitespace().next().unwrap_or(&prompt);
-            if let Some(entry) = commands::slash_entries().find(|entry| entry.name == name) {
+            if let Some(SlashAction::Client(command)) = commands::slash_entries()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.action)
+            {
                 self.composer.clear();
                 self.slash.select(0);
-                return self.execute(entry.command);
+                return self.execute(command);
             }
         }
         let Some(session_id) = self.focused() else {
@@ -1983,19 +1988,58 @@ impl App {
                 Some(Effects::redraw(Redraw::Immediate))
             }
             KeyCode::Enter | KeyCode::Tab => {
-                let command = entries[self.slash.selected(entries.len())].command;
-                self.composer.clear();
-                self.slash.select(0);
-                Some(self.execute(command))
+                let entry = &entries[self.slash.selected(entries.len())];
+                let name = entry.name.to_string();
+                Some(self.accept_slash(entry.action, &name))
             }
             _ => None,
         }
     }
 
-    /// Slash entries matching the composer text, in registry order. Empty
+    /// Run a client command, submit a skill, or leave a workspace command in
+    /// the composer for its arguments.
+    pub(super) fn accept_slash(&mut self, action: SlashAction, name: &str) -> Effects {
+        self.slash.select(0);
+        match action {
+            SlashAction::Client(command) => {
+                self.composer.clear();
+                self.execute(command)
+            }
+            SlashAction::WorkspaceCommand => {
+                self.composer.replace(format!("{name} "));
+                Effects::redraw(Redraw::Immediate)
+            }
+            SlashAction::Skill => {
+                self.composer.replace(name.to_owned());
+                self.submit_prompt()
+            }
+        }
+    }
+
+    /// Slash entries matching the composer text: client commands first, then
+    /// the workspace's commands and skills as the server indexed them. Empty
     /// unless the composer holds a bare `/token`.
     pub(crate) fn filtered_slash_commands(&self) -> Vec<SlashEntry> {
-        commands::matching_slash_entries(&self.composer.text)
+        commands::matching_slash_entries(&self.composer.text, self.guidance_slash_entries())
+    }
+
+    /// The workspace's indexed commands and skills as slash entries. Nothing
+    /// until the capability document arrives.
+    fn guidance_slash_entries(&self) -> impl Iterator<Item = SlashEntry> + '_ {
+        self.capabilities
+            .as_deref()
+            .and_then(|capabilities| capabilities.workspace_tools.as_ref())
+            .map(|tools| tools.skills.entries.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| SlashEntry {
+                name: std::borrow::Cow::Owned(format!("/{}", entry.name)),
+                title: std::borrow::Cow::Owned(entry.description.clone()),
+                action: match entry.kind {
+                    qq_protocol::GuidanceKind::Command => SlashAction::WorkspaceCommand,
+                    qq_protocol::GuidanceKind::Skill => SlashAction::Skill,
+                },
+            })
     }
 
     /// Highlighted row in the slash autocomplete list, clamped to `len`.

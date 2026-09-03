@@ -9,6 +9,8 @@
 //! Chords listed here are defaults. A command with an [`Action`] can be
 //! rebound through `tui.ron`; `Settings` overrides the table for those.
 
+use std::borrow::Cow;
+
 use crossterm::event::KeyEvent;
 
 use crate::settings::{Action, KeyChord, Settings};
@@ -24,6 +26,8 @@ pub(crate) enum Command {
     /// Choose the approval mode for the focused session, or the default for
     /// new sessions. Lists what the server advertises.
     OpenApprovalModes,
+    /// List the workspace's commands and skills as the server indexes them.
+    OpenSkills,
     OpenThemes,
     OpenSessions,
     OpenAgents,
@@ -133,7 +137,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 36] = [
+pub(crate) const COMMANDS: [CommandSpec; 37] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -282,6 +286,13 @@ pub(crate) const COMMANDS: [CommandSpec; 36] = [
         ["/approval"],
         []
     ),
+    spec!(
+        OpenSkills,
+        "list workspace commands and skills",
+        Model,
+        ["/skills"],
+        []
+    ),
     spec!(OpenThemes, "choose a theme", View, ["/theme"], []),
     spec!(
         ToggleToolDetail,
@@ -350,21 +361,35 @@ pub(crate) const COMMANDS: [CommandSpec; 36] = [
     spec!(Quit, "exit QQ", System, ["/quit", "/exit"], ["Ctrl-C"]),
 ];
 
-/// One slash spelling of a command, as shown in the autocomplete list.
+/// What accepting a slash entry does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SlashEntry {
-    pub name: &'static str,
-    pub title: &'static str,
-    pub command: Command,
+pub(crate) enum SlashAction {
+    /// A client command: runs immediately.
+    Client(Command),
+    /// A workspace command the runtime resolves; it may take arguments, so
+    /// accepting leaves `/name ` in the composer for the user to finish.
+    WorkspaceCommand,
+    /// A workspace skill the runtime resolves; accepting submits `/name`.
+    Skill,
 }
 
-/// Every slash spelling in presentation order.
+/// One slash spelling, as shown in the autocomplete list: a client command
+/// from the registry or a workspace command/skill from the capability
+/// document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlashEntry {
+    pub name: Cow<'static, str>,
+    pub title: Cow<'static, str>,
+    pub action: SlashAction,
+}
+
+/// Every client slash spelling in presentation order.
 pub(crate) fn slash_entries() -> impl Iterator<Item = SlashEntry> {
     COMMANDS.iter().flat_map(|spec| {
         spec.slash.iter().map(move |name| SlashEntry {
-            name,
-            title: spec.title,
-            command: spec.command,
+            name: Cow::Borrowed(name),
+            title: Cow::Borrowed(spec.title),
+            action: SlashAction::Client(spec.command),
         })
     })
 }
@@ -373,15 +398,20 @@ pub(crate) fn slash_entries() -> impl Iterator<Item = SlashEntry> {
 /// must start with `/` and contain no whitespace, otherwise nothing matches:
 /// a slash token followed by arguments is a prompt for the runtime, not a
 /// client command. Prefix matches sort first so `/s` still lists `/sessions`
-/// ahead of `/models`.
-pub(crate) fn matching_slash_entries(token: &str) -> Vec<SlashEntry> {
+/// ahead of `/models`; within each group client commands precede `extra`
+/// (the workspace's commands and skills), matching how the runtime resolves
+/// a collision.
+pub(crate) fn matching_slash_entries(
+    token: &str,
+    extra: impl Iterator<Item = SlashEntry>,
+) -> Vec<SlashEntry> {
     if !token.starts_with('/') || token.chars().any(char::is_whitespace) {
         return Vec::new();
     }
     let query = &token[1..];
     let mut prefix = Vec::new();
     let mut fuzzy = Vec::new();
-    for entry in slash_entries() {
+    for entry in slash_entries().chain(extra) {
         let name = &entry.name[1..];
         if name.starts_with(query) {
             prefix.push(entry);
@@ -454,10 +484,12 @@ mod tests {
 
     #[test]
     fn slash_names_match_the_protocol_reservation_exactly() {
-        let here: BTreeSet<&str> = slash_entries().map(|entry| entry.name).collect();
-        let reserved: BTreeSet<&str> = qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS
+        let here: BTreeSet<String> = slash_entries()
+            .map(|entry| entry.name.into_owned())
+            .collect();
+        let reserved: BTreeSet<String> = qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS
             .iter()
-            .copied()
+            .map(|name| (*name).to_owned())
             .collect();
         assert_eq!(here, reserved);
     }
@@ -511,40 +543,70 @@ mod tests {
         }
     }
 
+    fn matching(token: &str) -> Vec<SlashEntry> {
+        matching_slash_entries(token, std::iter::empty())
+    }
+
+    fn entry_names(entries: Vec<SlashEntry>) -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|entry| entry.name.into_owned())
+            .collect()
+    }
+
     #[test]
     fn slash_matching_requires_a_bare_slash_token() {
-        assert!(matching_slash_entries("").is_empty());
-        assert!(matching_slash_entries("hello").is_empty());
-        assert!(matching_slash_entries("/new ").is_empty());
-        assert!(matching_slash_entries("/new arg").is_empty());
-        let names: Vec<_> = matching_slash_entries("/")
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
+        assert!(matching("").is_empty());
+        assert!(matching("hello").is_empty());
+        assert!(matching("/new ").is_empty());
+        assert!(matching("/new arg").is_empty());
+        let names = entry_names(matching("/"));
         assert_eq!(
             names.len(),
             qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.len()
         );
         assert_eq!(names[0], "/help");
-        let quit: Vec<_> = matching_slash_entries("/qu")
+        let quit: Vec<_> = matching("/qu")
             .into_iter()
-            .map(|entry| entry.command)
+            .map(|entry| entry.action)
             .collect();
-        assert_eq!(quit, vec![Command::Quit]);
+        assert_eq!(quit, vec![SlashAction::Client(Command::Quit)]);
     }
 
     #[test]
     fn slash_matching_prefers_prefixes_then_falls_back_to_subsequences() {
-        let names: Vec<_> = matching_slash_entries("/s")
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
+        let names = entry_names(matching("/s"));
         assert_eq!(names[0], "/sessions", "prefix matches lead");
-        assert!(names.contains(&"/models"), "subsequence matches follow");
-        let names: Vec<_> = matching_slash_entries("/mdl")
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(names, vec!["/models"]);
+        assert!(
+            names.iter().any(|name| name == "/models"),
+            "subsequence matches follow"
+        );
+        assert_eq!(entry_names(matching("/mdl")), vec!["/models"]);
+    }
+
+    #[test]
+    fn workspace_guidance_joins_the_list_after_client_commands() {
+        let extra = [
+            SlashEntry {
+                name: Cow::Owned("/ship".to_owned()),
+                title: Cow::Owned("Ship the branch".to_owned()),
+                action: SlashAction::WorkspaceCommand,
+            },
+            SlashEntry {
+                name: Cow::Owned("/sessions-audit".to_owned()),
+                title: Cow::Borrowed(""),
+                action: SlashAction::Skill,
+            },
+        ];
+        let names = entry_names(matching_slash_entries("/s", extra.iter().cloned()));
+        // Prefix matches: client rows first, then the workspace rows.
+        let sessions = names.iter().position(|n| n == "/sessions").unwrap();
+        let ship = names.iter().position(|n| n == "/ship").unwrap();
+        let audit = names.iter().position(|n| n == "/sessions-audit").unwrap();
+        assert!(sessions < ship && ship < audit, "{names:?}");
+        assert_eq!(
+            entry_names(matching_slash_entries("/shp", extra.iter().cloned())),
+            ["/ship"]
+        );
     }
 }

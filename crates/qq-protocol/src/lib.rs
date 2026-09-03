@@ -14,8 +14,8 @@ mod sessions;
 
 pub use capabilities::{
     AgentProfileSummary, CAPABILITIES_VERSION, CapabilitiesRequest, EventCapabilities,
-    LimitCapabilities, PackSummary, ServerCapabilities, SkillCapabilities, SteeringCapabilities,
-    ToolCapabilities, ToolHostSummary, WorkspaceToolCapabilities,
+    LimitCapabilities, PackSummary, ServerCapabilities, SkillCapabilities, SkillSummary,
+    SteeringCapabilities, ToolCapabilities, ToolHostSummary, WorkspaceToolCapabilities,
 };
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
 pub use input::{
@@ -55,12 +55,13 @@ pub const PROTOCOL_VERSION: u16 = 15;
 /// Slash commands owned by interactive clients rather than the shared
 /// runtime. Keeping this vocabulary in the transport-neutral protocol avoids
 /// a client/runtime drift where one side forwards a name the other reserves.
-pub const RESERVED_CLIENT_SLASH_COMMANDS: [&str; 18] = [
+pub const RESERVED_CLIENT_SLASH_COMMANDS: [&str; 19] = [
     "/help",
     "/commands",
     "/models",
     "/profile",
     "/approval",
+    "/skills",
     "/sessions",
     "/resume",
     "/agents",

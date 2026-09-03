@@ -9,7 +9,7 @@
 //! overlay-specific chords come back as a [`PickerOutcome`] for `App`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use qq_protocol::{AgentProfileId, ApprovalMode, SessionId};
+use qq_protocol::{AgentProfileId, ApprovalMode, GuidanceKind, SessionId};
 
 use crate::{
     commands::{Command, CommandSpec},
@@ -81,6 +81,24 @@ impl PickerItem for ApprovalModeRow {
     }
 }
 
+/// A row in the skills picker: one indexed command or skill document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillRow {
+    pub name: String,
+    pub kind: GuidanceKind,
+    pub source: String,
+    pub description: String,
+    pub disclosed: bool,
+}
+
+impl PickerItem for SkillRow {
+    fn search_text<'a>(&'a self, out: &mut Vec<&'a str>) {
+        out.push(&self.name);
+        out.push(&self.source);
+        out.push(&self.description);
+    }
+}
+
 /// A row in the theme picker: an index into `App::themes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThemeRow {
@@ -138,6 +156,9 @@ pub(crate) enum Overlay {
     Models(Picker<ModelRow>),
     Profiles(Picker<ProfileRow>),
     ApprovalModes(Picker<ApprovalModeRow>),
+    /// The workspace's indexed commands and skills. Enter puts a command in
+    /// the composer for its arguments or submits a skill.
+    Skills(Picker<SkillRow>),
     /// Theme picker. Moving the cursor previews the highlighted theme live;
     /// `restore` is the theme to put back if the user cancels.
     Themes {
@@ -168,6 +189,7 @@ pub(crate) enum Mode {
     Models,
     Profiles,
     ApprovalModes,
+    Skills,
     Themes,
     Sessions,
     Commands,
@@ -233,6 +255,7 @@ impl Overlay {
             Self::Models(_) => Mode::Models,
             Self::Profiles(_) => Mode::Profiles,
             Self::ApprovalModes(_) => Mode::ApprovalModes,
+            Self::Skills(_) => Mode::Skills,
             Self::Themes { .. } => Mode::Themes,
             Self::Sessions { .. } => Mode::Sessions,
             Self::Commands { .. } => Mode::Commands,
@@ -276,6 +299,7 @@ impl Overlay {
             Self::Models(picker) => dispatch(picker, key),
             Self::Profiles(picker) => dispatch(picker, key),
             Self::ApprovalModes(picker) => dispatch(picker, key),
+            Self::Skills(picker) => dispatch(picker, key),
             Self::Themes { picker, .. } => dispatch(picker, key),
             Self::Sessions { picker, .. } => dispatch(picker, key),
             Self::Commands { picker, .. } => dispatch(picker, key),
@@ -289,6 +313,7 @@ impl Overlay {
             Self::Models(picker) => picker.push_query(text),
             Self::Profiles(picker) => picker.push_query(text),
             Self::ApprovalModes(picker) => picker.push_query(text),
+            Self::Skills(picker) => picker.push_query(text),
             Self::Themes { picker, .. } => picker.push_query(text),
             Self::Sessions { picker, .. } => picker.push_query(text),
             Self::Commands { picker, .. } => picker.push_query(text),

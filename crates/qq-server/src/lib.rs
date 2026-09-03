@@ -1927,6 +1927,7 @@ mod tests {
                             indexed: 2,
                             disclosed: 1,
                             truncated: false,
+                            entries: Vec::new(),
                         },
                     })
                 } else {

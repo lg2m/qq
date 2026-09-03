@@ -1,7 +1,9 @@
 use super::*;
 use crate::{
     commands::Category,
-    input::{ApprovalModeRow, CommandRow, ModelRow, Overlay, ProfileRow, SessionRow, ThemeRow},
+    input::{
+        ApprovalModeRow, CommandRow, ModelRow, Overlay, ProfileRow, SessionRow, SkillRow, ThemeRow,
+    },
     picker::{Picker, PickerItem},
 };
 
@@ -280,6 +282,54 @@ pub(super) fn approval_mode_picker(app: &App, width: usize, height: usize) -> Ve
                 line.push("  active", accent());
             }
             out.push(finish_row(line, selected, width));
+        },
+    )
+}
+
+/// Skills picker: the workspace's indexed commands and skills with their
+/// source and description. Commands are grouped before skills.
+pub(super) fn skill_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
+    let Some(Overlay::Skills(picker)) = &app.overlay else {
+        return fit_height(Vec::new(), height);
+    };
+    let mut kind: Option<qq_protocol::GuidanceKind> = None;
+    picker_frame(
+        picker,
+        PickerChrome {
+            title: "SKILLS",
+            hint: "type to search, Enter inserts a command or runs a skill, Esc closes",
+            placeholder: "all commands and skills",
+            question: None,
+            empty: "  No matching commands or skills.",
+        },
+        width,
+        height,
+        |row: &SkillRow, selected, out| {
+            if kind != Some(row.kind) {
+                kind = Some(row.kind);
+                out.push(Line::styled(
+                    match row.kind {
+                        qq_protocol::GuidanceKind::Command => "  COMMANDS",
+                        qq_protocol::GuidanceKind::Skill => "  SKILLS",
+                    },
+                    accent().bold(),
+                ));
+            }
+            let mut line = cursor_prefix(selected);
+            line.push(
+                format!("/{:<22}", row.name),
+                if selected { normal().bold() } else { normal() },
+            );
+            if !row.description.is_empty() {
+                line.push(row.description.as_str(), muted());
+            }
+            if !row.disclosed {
+                line.push("  explicit only", warning());
+            }
+            out.push(finish_row(line, selected, width));
+            let mut source = Line::styled("      ", muted());
+            source.push(row.source.as_str(), muted().italic());
+            out.push(finish_row(source, false, width));
         },
     )
 }

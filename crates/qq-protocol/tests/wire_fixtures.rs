@@ -556,6 +556,22 @@ fn version_15_commands_receipts_events_and_capabilities_match_their_goldens() {
                     indexed: 2,
                     disclosed: 1,
                     truncated: false,
+                    entries: vec![
+                        qq_protocol::SkillSummary {
+                            name: "deploy".to_owned(),
+                            kind: qq_protocol::GuidanceKind::Command,
+                            source: ".qq/commands/deploy.md".to_owned(),
+                            description: "Ship the current branch.".to_owned(),
+                            disclosed: true,
+                        },
+                        qq_protocol::SkillSummary {
+                            name: "audit".to_owned(),
+                            kind: qq_protocol::GuidanceKind::Skill,
+                            source: "pack:review-kit/skills/audit/SKILL.md".to_owned(),
+                            description: String::new(),
+                            disclosed: false,
+                        },
+                    ],
                 },
             }),
             events: EventCapabilities {

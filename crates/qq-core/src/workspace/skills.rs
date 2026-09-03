@@ -70,6 +70,15 @@ impl From<SkillKind> for GuidanceKind {
     }
 }
 
+impl From<SkillKind> for qq_protocol::GuidanceKind {
+    fn from(kind: SkillKind) -> Self {
+        match kind {
+            SkillKind::Command => Self::Command,
+            SkillKind::Skill => Self::Skill,
+        }
+    }
+}
+
 /// A root the index scans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillRoot {

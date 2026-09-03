@@ -211,6 +211,7 @@ impl FrameRenderer {
             Mode::Models => model_picker(app, body_width, body_height),
             Mode::Profiles => profile_picker(app, body_width, body_height),
             Mode::ApprovalModes => approval_mode_picker(app, body_width, body_height),
+            Mode::Skills => skill_picker(app, body_width, body_height),
             Mode::Themes => theme_picker(app, body_width, body_height),
             Mode::Sessions => session_picker(app, body_width, body_height),
             Mode::Commands => command_picker(app, body_width, body_height),

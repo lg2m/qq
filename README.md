@@ -200,7 +200,7 @@ newest held draft back for editing. `Esc Esc` cancels the run. Steering is
 offered only when the server advertises it; otherwise Enter holds the draft.
 
 The interactive composer recognizes `/help`, `/commands`, `/models`, `/profile`,
-`/approval`, `/theme`, `/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/mouse`,
+`/approval`, `/skills`, `/theme`, `/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/mouse`,
 `/attention`, `/changes`, `/editor`, `/compact`, and `/quit` (also `/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
 `/models`. `/compact`
 summarizes an idle session's history into a compact context so long
@@ -233,3 +233,11 @@ focused session — it takes effect at the next held tool call, so a running
 session may change too — or, with nothing focused, sets the mode new sessions
 are created with. The top row names the mode in effect whenever it is not
 `auto`.
+
+Slash completion also lists the workspace's own commands (`.qq/commands/*.md`)
+and skills (`.qq/skills/<name>/SKILL.md`, plus those from trusted packs) after
+the client commands, with their descriptions. Accepting a command leaves
+`/name ` in the composer for its arguments; accepting a skill submits `/name`
+so the runtime loads it into the run. `/skills` opens the same index as a
+picker grouped by kind with each document's source, marking documents the
+model may not load on its own as `explicit only`.

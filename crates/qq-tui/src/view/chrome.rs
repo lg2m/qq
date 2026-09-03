@@ -276,6 +276,7 @@ fn hints_for(app: &App) -> Vec<(crate::commands::Command, &'static str)> {
         Mode::Models
         | Mode::Profiles
         | Mode::ApprovalModes
+        | Mode::Skills
         | Mode::Themes
         | Mode::Sessions
         | Mode::Commands
@@ -576,7 +577,7 @@ pub(super) fn slash_autocomplete(app: &App, width: usize, height: usize) -> Vec<
                 normal()
             },
         );
-        line.push(command.title, muted());
+        line.push(command.title.as_ref(), muted());
         pad_line(&mut line, width);
         lines.push(truncate_line(line, width));
     }

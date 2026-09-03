@@ -1531,6 +1531,17 @@ fn workspace_tool_capabilities(plan: &CompiledAgentPlan) -> qq_protocol::Workspa
             indexed: u32::try_from(skills.len()).unwrap_or(u32::MAX),
             disclosed: u32::try_from(skills.disclosed_count()).unwrap_or(u32::MAX),
             truncated: skills.truncated(),
+            entries: skills
+                .entries()
+                .iter()
+                .map(|entry| qq_protocol::SkillSummary {
+                    name: entry.name.clone(),
+                    kind: entry.kind.into(),
+                    source: entry.source.clone(),
+                    description: entry.description.clone(),
+                    disclosed: entry.disclosed,
+                })
+                .collect(),
         },
     }
 }
@@ -2552,7 +2563,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
         }
-        fs::create_dir_all(fixture.path("work/.qq")).unwrap();
+        fs::create_dir_all(fixture.path("work/.qq/skills/qq-verify")).unwrap();
+        fs::write(
+            fixture.path("work/.qq/skills/qq-verify/SKILL.md"),
+            "---\ndescription: Run the gates.\n---\n# Verify\n",
+        )
+        .unwrap();
         fs::write(
             fixture.path("work/.qq/config.ron"),
             r#"(version: 1, model: "custom/test-model", providers: { "custom": Custom(connection: (base_url: "http://127.0.0.1:1/v1", api: OpenAiResponses, auth: NoAuth), models: { "test-model": (name: "Test model") }) })"#,
@@ -2635,7 +2651,16 @@ mod tests {
             .expect("workspace-scoped document");
         assert_eq!(profiles.len(), 1);
         assert!(profiles[0].id.is_default());
-        assert!(initial.workspace_tools.is_some());
+        // The skill index is listed entry by entry so a client can complete
+        // and describe the workspace's guidance.
+        let skills = &initial.workspace_tools.as_ref().unwrap().skills;
+        assert_eq!(skills.indexed, 1);
+        assert_eq!(skills.entries.len(), 1);
+        assert_eq!(skills.entries[0].name, "qq-verify");
+        assert_eq!(skills.entries[0].kind, qq_protocol::GuidanceKind::Skill);
+        assert_eq!(skills.entries[0].source, ".qq/skills/qq-verify/SKILL.md");
+        assert_eq!(skills.entries[0].description, "Run the gates.");
+        assert!(skills.entries[0].disclosed);
         assert!(initial.steering.boundary);
 
         // A pack dropped into the trusted workspace appears on refresh.

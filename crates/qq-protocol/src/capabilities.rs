@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentProfileId, ApprovalMode, BudgetLimitKind, ContentHash, InputPartKind, ToolExposure,
-    WorkspaceId, sessions::SessionCommandKind,
+    AgentProfileId, ApprovalMode, BudgetLimitKind, ContentHash, GuidanceKind, InputPartKind,
+    ToolExposure, WorkspaceId, sessions::SessionCommandKind,
 };
 
 /// Schema version of [`ServerCapabilities`]. Bumped when the meaning of an
@@ -115,6 +115,27 @@ pub struct SkillCapabilities {
     pub disclosed: u32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Every indexed document, so a client can list and complete them.
+    /// Bounded by the runtime's skill index (`ToolCapabilities::max_indexed_skills`
+    /// entries, descriptions at most 512 bytes each). Absent from servers
+    /// older than this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<SkillSummary>,
+}
+
+/// One indexed guidance document of the workspace's default plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSummary {
+    /// The slash name: `/name` invokes a command; a skill is loaded by the
+    /// model through `load_skill` or forwarded by a client as `/name`.
+    pub name: String,
+    pub kind: GuidanceKind,
+    /// Workspace-relative path, or `pack:<id>/<relative>` for a pack document.
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Whether the model may load this document itself.
+    pub disclosed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
