@@ -30,7 +30,12 @@ pub(super) fn promote_workspace_grant(
 
     let directory = workspace_dir.join(".qq");
     let path = directory.join("config.ron");
-    let existing = loader::discover_file(path.clone(), SourceKind::Project, false)?;
+    let existing = loader::discover_file(
+        path.clone(),
+        SourceKind::Project,
+        false,
+        &mut loader::Probes::default(),
+    )?;
     let (content, prior_sensitive_digest, path) = match existing {
         None => (render_new_document(grant), None, path),
         Some(candidate) => {
@@ -151,7 +156,8 @@ fn record_trust(
         error,
     })?;
     let _lock = loader::TrustStateLock::acquire(config_loader.paths())?;
-    let mut trust = loader::TrustState::load(config_loader.paths())?;
+    let mut trust =
+        loader::TrustState::load(config_loader.paths(), &mut loader::Probes::default())?;
     let prior_trusted = match prior_sensitive_digest {
         None => true,
         Some(prior) => trust.contains(&canonical, &prior),
@@ -189,6 +195,7 @@ fn refuse_if_managed_denies(
         "managed.ron",
         "managed.d",
         SourceKind::Managed,
+        &mut loader::Probes::default(),
     )? {
         if paths.enforce_managed_ownership {
             loader::validate_managed_file(&candidate.path)?;

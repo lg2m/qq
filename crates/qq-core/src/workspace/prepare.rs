@@ -118,9 +118,7 @@ pub(crate) enum WorkspacePreparationError {
 pub(crate) async fn prepare_workspace(
     path: PathBuf,
     cancelled: Arc<AtomicBool>,
-    guidance: Option<GuidanceRequest>,
-) -> Result<(Workspace, WorkspaceInstructions, Option<SelectedGuidance>), WorkspacePreparationError>
-{
+) -> Result<(Workspace, WorkspaceInstructions), WorkspacePreparationError> {
     let permit = blocking_permits()
         .acquire_owned()
         .await
@@ -147,10 +145,30 @@ pub(crate) async fn prepare_workspace(
             return Err(WorkspacePreparationError::Cancelled);
         }
         let instructions = super::instructions::load(&workspace, &cancelled)?;
-        let guidance = guidance
-            .map(|request| super::guidance::load(&workspace, request, &cancelled))
-            .transpose()?;
-        Ok((workspace, instructions, guidance))
+        Ok((workspace, instructions))
+    })
+    .await
+    .map_err(|source| WorkspacePreparationError::Stopped { source })?
+}
+
+/// Loads one explicitly invoked command or skill document from an already
+/// opened workspace. This is the only filesystem work a plan-backed run does
+/// before its first provider request, and only when the prompt named guidance.
+pub(crate) async fn prepare_guidance(
+    workspace: Workspace,
+    cancelled: Arc<AtomicBool>,
+    request: GuidanceRequest,
+) -> Result<SelectedGuidance, WorkspacePreparationError> {
+    let permit = blocking_permits()
+        .acquire_owned()
+        .await
+        .map_err(|source| WorkspacePreparationError::Unavailable { source })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(WorkspacePreparationError::Cancelled);
+        }
+        Ok(super::guidance::load(&workspace, request, &cancelled)?)
     })
     .await
     .map_err(|source| WorkspacePreparationError::Stopped { source })?

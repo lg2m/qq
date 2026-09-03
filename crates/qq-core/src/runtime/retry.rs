@@ -45,6 +45,14 @@ impl TurnRetryPolicy {
         self.max_attempts
     }
 
+    pub(crate) const fn base_delay(&self) -> Duration {
+        self.base_delay
+    }
+
+    pub(crate) const fn max_delay(&self) -> Duration {
+        self.max_delay
+    }
+
     pub(crate) fn delay(&self, completed_attempts: u32) -> Duration {
         let exponent = completed_attempts.saturating_sub(1).min(31);
         self.base_delay

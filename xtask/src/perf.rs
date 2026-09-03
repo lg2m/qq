@@ -1931,17 +1931,28 @@ struct BenchmarkLoader {
 }
 
 impl RuntimeLoader for BenchmarkLoader {
-    fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+    /// Compiles the plan for the requested workspace on every load, the same
+    /// blocking filesystem work (canonicalize, open, read instructions) the
+    /// run loop performed per run before plans existed. The production loader
+    /// caches compiled plans; this fixture measures the uncached floor so the
+    /// admission-to-provider metric stays comparable with earlier reports.
+    fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
         let provider = BenchmarkProvider {
             mode: self.mode.clone(),
             marks: self.marks.clone(),
             activity: Arc::clone(&self.activity),
         };
         Box::pin(async move {
-            Runtime::new(provider, "benchmark/model", 16_384)
-                .map(|runtime| LoadedRuntime {
-                    runtime: Arc::new(runtime),
-                    resolved_model: Arc::new(ResolvedModel {
+            let runtime = Runtime::new(provider, "benchmark/model", 16_384).map_err(|error| {
+                RuntimeLoadError {
+                    kind: RunFailureKind::Configuration,
+                    message: error.to_string(),
+                }
+            })?;
+            let compiled = tokio::task::spawn_blocking(move || {
+                LoadedRuntime::compile_blocking(
+                    &runtime,
+                    ResolvedModel {
                         version: ResolvedModelVersion::new(2).unwrap(),
                         request_shape: Some(ProviderRequestShapeIdentity {
                             version: ProviderRequestShapeVersion::new(1).unwrap(),
@@ -1963,12 +1974,22 @@ impl RuntimeLoader for BenchmarkLoader {
                             cache_read_usage: false,
                             cache_write_usage: false,
                         },
-                    }),
-                })
-                .map_err(|error| RuntimeLoadError {
+                    },
+                    PathBuf::from(request.workspace),
+                )
+            })
+            .await;
+            match compiled {
+                Ok(Ok(loaded)) => Ok(loaded),
+                Ok(Err(error)) => Err(RuntimeLoadError {
                     kind: RunFailureKind::Configuration,
                     message: error.to_string(),
-                })
+                }),
+                Err(_) => Err(RuntimeLoadError {
+                    kind: RunFailureKind::Server,
+                    message: "benchmark plan compilation stopped unexpectedly".to_owned(),
+                }),
+            }
         })
     }
 }
@@ -2898,7 +2919,6 @@ async fn direct_pipeline_workloads(
             fixture.runtime.snapshot(SnapshotRequest {
                 workspace_id: fixture.workspace_id,
                 focused_session_id: None,
-                include_sessions: Vec::new(),
                 session_limit: 512,
                 message_limit: 256,
             }),
@@ -3610,7 +3630,6 @@ async fn measure_long_stream(bytes: usize, samples: u16) -> Result<(Vec<u64>, bo
             fixture.runtime.snapshot(SnapshotRequest {
                 workspace_id: fixture.workspace_id,
                 focused_session_id: latest_session,
-                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             }),
@@ -4050,7 +4069,6 @@ async fn r4_eight_stream_sample() -> Result<R4WorkerSample, PerfError> {
                     runtime.snapshot(SnapshotRequest {
                         workspace_id,
                         focused_session_id: Some(session_id),
-                        include_sessions: Vec::new(),
                         session_limit: STREAMS as u16,
                         message_limit: 8,
                     }),
@@ -4178,7 +4196,6 @@ async fn r4_restart_sample() -> Result<R4WorkerSample, PerfError> {
         .snapshot(SnapshotRequest {
             workspace_id: fixture.workspace_id,
             focused_session_id: Some(session_id),
-            include_sessions: Vec::new(),
             session_limit: 1,
             message_limit: 8,
         })
@@ -4214,7 +4231,6 @@ async fn r4_restart_sample() -> Result<R4WorkerSample, PerfError> {
             .snapshot(SnapshotRequest {
                 workspace_id: fixture.workspace_id,
                 focused_session_id: Some(session_id),
-                include_sessions: Vec::new(),
                 session_limit: 1,
                 message_limit: 8,
             })

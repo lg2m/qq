@@ -1,7 +1,5 @@
 use std::{future::Future, pin::Pin};
 
-use qq_protocol::ToolCallId;
-
 /// The outcome one spawned sub-agent call returns to its parent. The content
 /// flows through the same bounded-result truncation as built-in tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,9 +20,7 @@ pub(crate) type SpawnAgentFuture =
 /// nor dispatchable there. Dropping the returned future must cancel the
 /// in-flight child work.
 pub(crate) trait SubagentSpawner: Send + Sync {
-    /// `call_id` is the parent's `spawn_agent` tool call; the child records it
-    /// so clients can place the child under the call that created it.
-    fn spawn(&self, call_id: ToolCallId, task: String, model: Option<String>) -> SpawnAgentFuture;
+    fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture;
 }
 
 /// The dispatcher's defensive answer when `spawn_agent` is called by a run

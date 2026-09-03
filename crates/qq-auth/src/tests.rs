@@ -392,6 +392,45 @@ fn keyring_success_records_and_resolves_the_backend() {
 }
 
 #[test]
+fn credential_epoch_advances_on_every_durable_mutation_and_survives_reload() {
+    let (store, _keyring, directory) = test_store();
+    assert_eq!(store.epoch().unwrap(), CredentialEpoch::NONE);
+
+    store.set("openai", "first", false).unwrap();
+    let after_set = store.epoch().unwrap();
+    assert!(after_set > CredentialEpoch::NONE);
+
+    // Reading secrets does not move the epoch.
+    store
+        .resolve(&SecretRef::Stored("openai".to_owned()))
+        .unwrap();
+    assert_eq!(store.epoch().unwrap(), after_set);
+
+    store.set("openai", "rotated", false).unwrap();
+    let after_rotation = store.epoch().unwrap();
+    assert!(after_rotation > after_set);
+
+    assert!(store.remove("openai").unwrap());
+    let after_remove = store.epoch().unwrap();
+    assert!(after_remove > after_rotation);
+
+    // A second store over the same files observes the persisted revision.
+    let reopened =
+        CredentialStore::with_backend(store.paths().clone(), Arc::new(FakeKeyring::default()));
+    assert_eq!(reopened.epoch().unwrap(), after_remove);
+    drop(directory);
+}
+
+#[test]
+fn legacy_index_without_a_revision_loads_as_epoch_zero_and_then_advances() {
+    let (store, _keyring, _directory) = test_store();
+    write_private(store.paths().index_file(), "(version: 2, records: [])");
+    assert_eq!(store.epoch().unwrap(), CredentialEpoch::NONE);
+    store.set("anthropic", "key", false).unwrap();
+    assert_eq!(store.epoch().unwrap(), CredentialEpoch::new(1));
+}
+
+#[test]
 fn unavailable_keyring_never_silently_falls_back() {
     let (store, keyring, _directory) = test_store();
     keyring.set_mode(FakeMode::Unavailable);

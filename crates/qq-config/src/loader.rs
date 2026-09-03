@@ -66,9 +66,12 @@ pub(super) fn load(
     request: &LoadRequest,
 ) -> Result<ConfigSnapshot, ConfigError> {
     let cwd = canonical_working_directory(&request.cwd)?;
-    let trust = TrustState::load(&loader.paths)?;
+    let mut probes = Probes::default();
+    let probes = &mut probes;
+    probes.record(&cwd);
+    let trust = TrustState::load(&loader.paths, probes)?;
     let mdm = read_mdm_document(loader)?;
-    let organization = selected_organization(loader, request, &cwd, &trust, mdm.as_ref())?;
+    let organization = selected_organization(loader, request, &cwd, &trust, mdm.as_ref(), probes)?;
     let (mut merged, compiled_report) = MergeState::compiled();
     let mut reports = vec![compiled_report];
     let mut pending = Vec::new();
@@ -76,7 +79,7 @@ pub(super) fn load(
 
     if let Some(organization) = organization
         && let Some((document, source)) =
-            remote::load_cached_if_enrolled(&loader.paths, &organization)?
+            remote::load_cached_if_enrolled(&loader.paths, &organization, probes)?
     {
         apply_document(
             document,
@@ -93,6 +96,7 @@ pub(super) fn load(
         "config.ron",
         "config.d",
         SourceKind::Global,
+        probes,
     )? {
         apply_candidate(
             candidate,
@@ -105,9 +109,9 @@ pub(super) fn load(
         )?;
     }
 
-    for directory in project_directories(&cwd) {
+    for directory in project_directories(&cwd, probes) {
         if let Some(candidate) =
-            discover_file(directory.join("qq.ron"), SourceKind::Project, false)?
+            discover_file(directory.join("qq.ron"), SourceKind::Project, false, probes)?
         {
             apply_candidate(
                 candidate,
@@ -124,6 +128,7 @@ pub(super) fn load(
             "config.ron",
             "config.d",
             SourceKind::Project,
+            probes,
         )? {
             apply_candidate(
                 candidate,
@@ -143,7 +148,7 @@ pub(super) fn load(
         } else {
             cwd.join(path)
         };
-        let candidate = discover_file(path.clone(), SourceKind::Explicit, true)?
+        let candidate = discover_file(path.clone(), SourceKind::Explicit, true, probes)?
             .ok_or(ConfigError::ExplicitConfigMissing { path })?;
         apply_candidate(
             candidate,
@@ -188,6 +193,7 @@ pub(super) fn load(
         "managed.ron",
         "managed.d",
         SourceKind::Managed,
+        probes,
     )? {
         apply_candidate(
             candidate,
@@ -214,7 +220,7 @@ pub(super) fn load(
     if !pending.is_empty() {
         return Err(ConfigError::TrustRequired { pending, reports });
     }
-    merged.finish(reports)
+    merged.finish(reports, std::mem::take(probes).into_paths())
 }
 
 fn selected_organization(
@@ -223,8 +229,9 @@ fn selected_organization(
     cwd: &Path,
     trust: &TrustState,
     mdm: Option<&MdmDocument>,
+    probes: &mut Probes,
 ) -> Result<Option<String>, ConfigError> {
-    let mut organization = remote::selected(&loader.paths)?;
+    let mut organization = remote::selected(&loader.paths, probes)?;
     let mut seen = BTreeSet::new();
 
     for candidate in discover_layer_directory(
@@ -232,13 +239,14 @@ fn selected_organization(
         "config.ron",
         "config.d",
         SourceKind::Global,
+        probes,
     )? {
         apply_organization_candidate(candidate, false, &mut seen, trust, &mut organization)?;
     }
 
-    for directory in project_directories(cwd) {
+    for directory in project_directories(cwd, probes) {
         if let Some(candidate) =
-            discover_file(directory.join("qq.ron"), SourceKind::Project, false)?
+            discover_file(directory.join("qq.ron"), SourceKind::Project, false, probes)?
         {
             apply_organization_candidate(candidate, false, &mut seen, trust, &mut organization)?;
         }
@@ -247,6 +255,7 @@ fn selected_organization(
             "config.ron",
             "config.d",
             SourceKind::Project,
+            probes,
         )? {
             apply_organization_candidate(candidate, false, &mut seen, trust, &mut organization)?;
         }
@@ -258,7 +267,7 @@ fn selected_organization(
         } else {
             cwd.join(path)
         };
-        let candidate = discover_file(path.clone(), SourceKind::Explicit, true)?
+        let candidate = discover_file(path.clone(), SourceKind::Explicit, true, probes)?
             .ok_or(ConfigError::ExplicitConfigMissing { path })?;
         apply_organization_candidate(candidate, false, &mut seen, trust, &mut organization)?;
     }
@@ -285,6 +294,7 @@ fn selected_organization(
         "managed.ron",
         "managed.d",
         SourceKind::Managed,
+        probes,
     )? {
         apply_organization_candidate(
             candidate,
@@ -362,13 +372,15 @@ pub(super) fn grant_pending_trust(
 ) -> Result<Vec<PendingTrust>, ConfigError> {
     let cwd = canonical_working_directory(&request.cwd)?;
     let _state_lock = TrustStateLock::acquire(&loader.paths)?;
-    let mut trust = TrustState::load(&loader.paths)?;
+    let mut probes = Probes::default();
+    let probes = &mut probes;
+    let mut trust = TrustState::load(&loader.paths, probes)?;
     let mut pending = Vec::new();
 
-    for directory in project_directories(&cwd) {
+    for directory in project_directories(&cwd, probes) {
         let mut candidates = Vec::new();
         if let Some(candidate) =
-            discover_file(directory.join("qq.ron"), SourceKind::Project, false)?
+            discover_file(directory.join("qq.ron"), SourceKind::Project, false, probes)?
         {
             candidates.push(candidate);
         }
@@ -377,6 +389,7 @@ pub(super) fn grant_pending_trust(
             "config.ron",
             "config.d",
             SourceKind::Project,
+            probes,
         )?);
 
         for candidate in candidates {
@@ -407,6 +420,28 @@ pub(super) fn grant_pending_trust(
         trust.save(&loader.paths)?;
     }
     Ok(pending)
+}
+
+/// The filesystem locations one load inspected to decide which sources exist.
+/// Recording them lets a caller revalidate a cached result by re-checking
+/// exactly these paths instead of rediscovering: every directory whose
+/// presence or listing mattered, every candidate file whether or not it
+/// existed, and every VCS root marker probed while bounding the project walk.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Probes {
+    paths: Vec<PathBuf>,
+}
+
+impl Probes {
+    fn record(&mut self, path: &Path) {
+        if !self.paths.iter().any(|recorded| recorded == path) {
+            self.paths.push(path.to_owned());
+        }
+    }
+
+    pub(super) fn into_paths(self) -> Vec<PathBuf> {
+        self.paths
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -471,7 +506,9 @@ fn apply_document(
     Ok(())
 }
 
-pub(super) fn canonical_working_directory(path: &Path) -> Result<PathBuf, ConfigError> {
+/// Canonicalizes a working directory the way every configuration load does,
+/// rejecting paths that do not name an existing directory.
+pub fn canonical_working_directory(path: &Path) -> Result<PathBuf, ConfigError> {
     let canonical = fs::canonicalize(path).map_err(|_| ConfigError::InvalidWorkingDirectory {
         path: path.to_owned(),
     })?;
@@ -485,10 +522,10 @@ pub(super) fn canonical_working_directory(path: &Path) -> Result<PathBuf, Config
     Ok(canonical)
 }
 
-pub(super) fn project_directories(cwd: &Path) -> Vec<PathBuf> {
+pub(super) fn project_directories(cwd: &Path, probes: &mut Probes) -> Vec<PathBuf> {
     let root = cwd
         .ancestors()
-        .find(|directory| is_vcs_root(directory))
+        .find(|directory| is_vcs_root(directory, probes))
         .unwrap_or(cwd);
     let mut directories = Vec::new();
     let mut current = Some(cwd);
@@ -503,10 +540,15 @@ pub(super) fn project_directories(cwd: &Path) -> Vec<PathBuf> {
     directories
 }
 
-fn is_vcs_root(directory: &Path) -> bool {
-    [".git", ".hg", ".svn"]
-        .iter()
-        .any(|marker| directory.join(marker).exists())
+fn is_vcs_root(directory: &Path, probes: &mut Probes) -> bool {
+    for marker in [".git", ".hg", ".svn"] {
+        let candidate = directory.join(marker);
+        probes.record(&candidate);
+        if candidate.exists() {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn discover_layer_directory(
@@ -514,24 +556,30 @@ pub(super) fn discover_layer_directory(
     primary_name: &str,
     fragment_name: &str,
     kind: SourceKind,
+    probes: &mut Probes,
 ) -> Result<Vec<FileCandidate>, ConfigError> {
-    if !check_optional_directory(directory)? {
+    if !check_optional_directory(directory, probes)? {
         return Ok(Vec::new());
     }
 
     let mut candidates = Vec::new();
-    if let Some(primary) = discover_file(directory.join(primary_name), kind, false)? {
+    if let Some(primary) = discover_file(directory.join(primary_name), kind, false, probes)? {
         candidates.push(primary);
     }
-    candidates.extend(discover_fragments(&directory.join(fragment_name), kind)?);
+    candidates.extend(discover_fragments(
+        &directory.join(fragment_name),
+        kind,
+        probes,
+    )?);
     Ok(candidates)
 }
 
 fn discover_fragments(
     directory: &Path,
     kind: SourceKind,
+    probes: &mut Probes,
 ) -> Result<Vec<FileCandidate>, ConfigError> {
-    if !check_optional_directory(directory)? {
+    if !check_optional_directory(directory, probes)? {
         return Ok(Vec::new());
     }
     let entries = fs::read_dir(directory).map_err(|error| ConfigError::Io {
@@ -557,7 +605,7 @@ fn discover_fragments(
     paths.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let mut candidates = Vec::new();
     for (_, path) in paths {
-        if let Some(candidate) = discover_file(path, kind, false)? {
+        if let Some(candidate) = discover_file(path, kind, false, probes)? {
             candidates.push(candidate);
         }
     }
@@ -581,7 +629,8 @@ fn is_fragment_name(name: &str) -> bool {
         })
 }
 
-fn check_optional_directory(path: &Path) -> Result<bool, ConfigError> {
+fn check_optional_directory(path: &Path, probes: &mut Probes) -> Result<bool, ConfigError> {
+    probes.record(path);
     reject_symlink_components(path)?;
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -610,7 +659,9 @@ pub(super) fn discover_file(
     path: PathBuf,
     kind: SourceKind,
     required: bool,
+    probes: &mut Probes,
 ) -> Result<Option<FileCandidate>, ConfigError> {
+    probes.record(&path);
     reject_symlink_components(&path)?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -736,8 +787,9 @@ impl Default for TrustState {
 }
 
 impl TrustState {
-    pub(super) fn load(paths: &ConfigPaths) -> Result<Self, ConfigError> {
-        let Some(candidate) = discover_file(paths.trust_file(), SourceKind::TrustState, false)?
+    pub(super) fn load(paths: &ConfigPaths, probes: &mut Probes) -> Result<Self, ConfigError> {
+        let Some(candidate) =
+            discover_file(paths.trust_file(), SourceKind::TrustState, false, probes)?
         else {
             return Ok(Self::default());
         };

@@ -3,6 +3,7 @@
 //! `ask` mode, and an exact-name session grant auto-approves the next call.
 
 use std::{
+    path::PathBuf,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
@@ -95,21 +96,26 @@ struct McpLoader {
 }
 
 impl RuntimeLoader for McpLoader {
-    fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+    fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
         let registry = Arc::new(PingRegistry {
             calls: Arc::clone(&self.calls),
         });
         Box::pin(async move {
-            Runtime::new(
+            let runtime = Runtime::new(
                 McpTurnProvider {
                     turn: Mutex::new(0),
                 },
                 "test-model",
                 256,
             )
-            .map(|runtime| LoadedRuntime {
-                runtime: Arc::new(runtime.with_mcp_registry(registry)),
-                resolved_model: Arc::new(ResolvedModel {
+            .map(|runtime| runtime.with_mcp_registry(registry))
+            .map_err(|error| RuntimeLoadError {
+                kind: RunFailureKind::Configuration,
+                message: error.to_string(),
+            })?;
+            LoadedRuntime::compile_blocking(
+                &runtime,
+                ResolvedModel {
                     version: ResolvedModelVersion::new(1).unwrap(),
                     request_shape: None,
                     route: "test/model".to_owned(),
@@ -128,8 +134,9 @@ impl RuntimeLoader for McpLoader {
                         cache_read_usage: false,
                         cache_write_usage: false,
                     },
-                }),
-            })
+                },
+                PathBuf::from(request.workspace),
+            )
             .map_err(|error| RuntimeLoadError {
                 kind: RunFailureKind::Configuration,
                 message: error.to_string(),

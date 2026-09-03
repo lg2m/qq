@@ -388,6 +388,49 @@ fn applies_every_layer_in_documented_order() {
 }
 
 #[test]
+fn probed_paths_cover_every_present_and_absent_source_location() {
+    let tree = TempTree::new();
+    fs::create_dir_all(tree.path("work/child")).unwrap();
+    fs::create_dir_all(tree.path("work/.git")).unwrap();
+    tree.write("global/config.ron", r#"(version: 1, max_output_tokens: 1)"#);
+    tree.write(
+        "global/config.d/10-first.ron",
+        r#"(version: 1, max_output_tokens: 2)"#,
+    );
+    tree.write("work/child/qq.ron", r#"(version: 1, max_output_tokens: 5)"#);
+    let explicit = tree.write("explicit.ron", r#"(version: 1, max_output_tokens: 7)"#);
+
+    let request = LoadRequest::new(tree.path("work/child"))
+        .with_explicit_path(explicit.clone())
+        .with_overrides(RuntimeOverrides::new().with_model("openai/runtime"));
+    let snapshot = tree.loader().load(&request).unwrap();
+    let probed = snapshot.probed_paths();
+    let canonical = |relative: &str| fs::canonicalize(tree.path(relative)).unwrap();
+    let contains = |path: PathBuf| probed.contains(&path);
+
+    // Present sources.
+    assert!(contains(canonical("global").join("config.ron")));
+    assert!(contains(canonical("global").join("config.d/10-first.ron")));
+    assert!(contains(canonical("work/child").join("qq.ron")));
+    assert!(contains(canonical("explicit.ron")));
+    // Absent locations whose appearance would change the result.
+    assert!(contains(canonical("work").join("qq.ron")));
+    assert!(contains(canonical("work").join(".qq")));
+    assert!(contains(canonical("work/child").join(".qq")));
+    assert!(contains(tree.path("managed")));
+    assert!(contains(tree.path("data").join("trust.ron")));
+    assert!(contains(tree.path("data").join("organizations.ron")));
+    // The VCS marker that bounded the ancestor walk.
+    assert!(contains(canonical("work").join(".git")));
+    // Nothing above the VCS root was inspected, and no duplicates were kept.
+    assert!(!contains(tree.path("qq.ron")));
+    let mut unique = probed.to_vec();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), probed.len());
+}
+
+#[test]
 fn mdm_is_read_once_and_applied_after_managed_files() {
     let tree = TempTree::new();
     tree.write(

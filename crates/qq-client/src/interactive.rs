@@ -21,10 +21,6 @@ use crate::{
 const TUI_REQUEST_CAPACITY: usize = 64;
 const TUI_UPDATE_CAPACITY: usize = 256;
 const TUI_CONCURRENT_REQUESTS: usize = 8;
-/// Other sessions whose bodies the bootstrap snapshot pre-warms alongside the
-/// focused one. Kept below the TUI's warm-body limit so nothing is evicted
-/// on arrival.
-const PREWARM_SESSIONS: usize = 4;
 
 type ReconnectFuture = Pin<Box<dyn Future<Output = Option<Connection>> + Send + 'static>>;
 type ConnectionResolver = Arc<dyn Fn() -> ReconnectFuture + Send + Sync + 'static>;
@@ -401,7 +397,6 @@ async fn load_tui_models(
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: None,
-            include_sessions: Vec::new(),
             session_limit: 1,
             message_limit: 1,
         })
@@ -436,7 +431,6 @@ async fn load_tui_models(
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: Some(session_id),
-            include_sessions: Vec::new(),
             session_limit: 512,
             message_limit: 256,
         })
@@ -457,7 +451,6 @@ async fn bootstrap_tui(
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: None,
-            include_sessions: Vec::new(),
             session_limit: 512,
             message_limit: 256,
         })
@@ -483,20 +476,10 @@ async fn bootstrap_tui(
     } else {
         return Ok((workspace_id, snapshot));
     };
-    // Pre-warm the most recent other sessions so the first few switches in
-    // the TUI cost no round trip. Sessions arrive newest-first.
-    let include_sessions = snapshot
-        .sessions
-        .iter()
-        .map(|session| session.id)
-        .filter(|id| *id != focused)
-        .take(PREWARM_SESSIONS)
-        .collect();
     let snapshot = client
         .snapshot(SnapshotRequest {
             workspace_id,
             focused_session_id: Some(focused),
-            include_sessions,
             session_limit: 512,
             message_limit: 256,
         })
@@ -553,25 +536,58 @@ fn dispatch_tui_request(
         return;
     };
     tokio::spawn(async move {
-        // A newly created session has an empty transcript by construction, so
-        // the TUI adopts it from the receipt alone; no follow-up snapshot.
-        let update = match request {
-            ClientRequest::Command(command) => ClientUpdate::CommandResult {
-                command_id: command.command_id,
-                result: client
+        let (update, created) = match request {
+            ClientRequest::Command(command) => {
+                let result = client
                     .command(command.command_id, command.command)
                     .await
-                    .map_err(|error| TuiClientFailure::new(error.to_string())),
-            },
+                    .map_err(|error| TuiClientFailure::new(error.to_string()));
+                let created = result.as_ref().ok().and_then(|receipt| {
+                    if let qq_protocol::CommandOutcome::SessionCreated { session_id } =
+                        &receipt.outcome
+                    {
+                        Some((receipt.committed_through.workspace_id, *session_id))
+                    } else {
+                        None
+                    }
+                });
+                (
+                    ClientUpdate::CommandResult {
+                        command_id: command.command_id,
+                        result,
+                    },
+                    created,
+                )
+            }
             ClientRequest::Snapshot(request) => match client.snapshot(request).await {
+                Ok(snapshot) => (ClientUpdate::Snapshot(snapshot), None),
+                Err(error) => (
+                    ClientUpdate::SnapshotFailed(TuiClientFailure::new(error.to_string())),
+                    None,
+                ),
+            },
+        };
+        let _permit = permit;
+        if updates.send(update).await.is_err() {
+            return;
+        }
+        if let Some((workspace_id, session_id)) = created {
+            let update = match client
+                .snapshot(SnapshotRequest {
+                    workspace_id,
+                    focused_session_id: Some(session_id),
+                    session_limit: 512,
+                    message_limit: 256,
+                })
+                .await
+            {
                 Ok(snapshot) => ClientUpdate::Snapshot(snapshot),
                 Err(error) => {
                     ClientUpdate::SnapshotFailed(TuiClientFailure::new(error.to_string()))
                 }
-            },
-        };
-        let _permit = permit;
-        let _ = updates.send(update).await;
+            };
+            let _ = updates.send(update).await;
+        }
     });
 }
 

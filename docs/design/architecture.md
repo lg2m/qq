@@ -279,6 +279,59 @@ Schema version 18 stores that overflow basis in its own additive column; the
 version-17 resolved-model overflow column remains legacy state and is ignored
 because it lacks the static-prefix identity and measured request byte count.
 
+### Compiled Agent Plans
+
+Everything about an agent's behavior that does not depend on the prompt is
+compiled once into an immutable, runtime-only `CompiledAgentPlan` owned by
+`qq-core::plan`: the compiled provider handle, the `ResolvedModel`, the opened
+capability-scoped workspace with its instruction file already read, the static
+tool catalog (built-ins plus the `spawn_agent` and `search_history`
+declarations and their schema hash), the sub-agent routes, the MCP registry,
+and the retry policy. Durable session runs execute directly from the plan and
+perform no canonicalization, directory open, or instruction read before the
+first provider request; only an explicitly invoked command or skill document is
+still read per run. MCP tool declarations still join each run from the
+registry's cache, so a `list_changed` notification takes effect without a new
+plan.
+
+The root builds a typed `AgentProfile` from configuration and compiles it; core
+never sees configuration documents, secret values, or the credential store. The
+plan's `AgentPlanDescriptor` is its secret-free canonical account: adapter
+build identity, provider `id`/API/sanitized endpoint/auth scheme/credential
+*reference* (environment name, stored name, profile, inline, ambient chain)
+and static header *names*, the resolved model, workspace root, prompt version,
+instruction hash and source, static tool names and schema hash, spawn routes,
+configuration grants, MCP server declarations, retry policy, and configuration
+source labels. `AgentPlanDigest` is the SHA-256 of a domain-tagged compact JSON
+encoding in declaration order (`DESCRIPTOR_VERSION` pins the encoding). Secret
+values, secret hashes, live handles, and the credential epoch never enter the
+descriptor or its digest.
+
+Credential rotation is tracked separately by an opaque `CredentialEpoch` owned
+by `qq-auth`: every durable credential write advances the store's index
+revision, including in-place rotation of an existing entry. The root records
+the epoch beside a compiled plan and rekeys its MCP registry cache by
+declaration digest plus epoch, so a rotated secret rebuilds live authorization
+without changing behavioral identity. No cache key in the process hashes raw
+secret bytes.
+
+The root's `PlanCache` holds one generation per (canonical workspace, model
+selection, explicit configuration) key and revalidates it on every load with a
+fixed list of `stat` calls: every path the configuration loader probed
+(`ConfigSnapshot::probed_paths`), the credential index file, and the workspace's
+`AGENTS.md`/`CLAUDE.md`. A warm lookup performs no configuration parsing,
+credential I/O, or directory listing. Any observable change recompiles; an
+identical digest and epoch keeps the live generation, otherwise the new
+generation is published atomically for later runs while active runs keep the
+`Arc` they were admitted with. A failed recompile returns the configuration
+error to the triggering run and leaves the previous generation cached. The
+cache has hard entry and estimated-byte bounds, evicts least-recently-used
+inactive generations, never evicts a generation an active run holds, fails
+admission explicitly when pinned generations exhaust the bound, compiles one
+generation per key at a time under refresh storms, and refuses loads after
+shutdown. The digest and epoch are not yet persisted or exposed on the wire;
+that is protocol work owned by the harness plan's Phase 3.
+
 Protocol codecs, request-time authorization, framing, retry policy, and
 transport are internal implementation details. Shared protocol behavior is
 composed from private functions and small structs; do not introduce a

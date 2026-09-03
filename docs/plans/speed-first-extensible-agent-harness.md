@@ -1,8 +1,9 @@
 # Speed-First Extensible Agent Harness Backend
 
-Status: Phase 0 complete 2026-09-01. Phase 1 complete 2026-09-02: R4 qualified
-2026-09-01, R5 qualified 2026-09-02, H1 feature profiles landed and measured.
-Implementation Phases 2–7 and tasks H2–H12 remain proposed.
+Status: Phase 0 complete 2026-09-01. Phase 1 complete 2026-09-02 (R4, R5, H1).
+Phase 2 complete 2026-09-02: H2 compiled agent plans, secret-free descriptors,
+credential epochs, and the bounded revalidating plan cache landed and measured.
+Implementation Phases 3–7 and tasks H3–H12 remain proposed.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -246,11 +247,10 @@ The critical gaps already recorded in the active readiness plan are:
 | Retry ownership | Provider and core retries can amplify | Duplicate spend and unclear delivery certainty |
 | Evaluation | No complete useful-result latency gate | Speed claims are not yet end-to-end |
 
-One additional footprint issue matters for embedders: `qq-provider` currently
-depends unconditionally on the AWS SDK family, and `qq-core` depends on
-`qq-provider`. A consumer that needs only a lightweight HTTP provider therefore
-inherits the heavy adapter graph. The fix is feature-gated adapter families
-inside the existing provider crate, not a provider-per-crate redesign.
+One footprint issue mattered for embedders at the time of the audit:
+`qq-provider` depended unconditionally on the AWS SDK family. H1 resolved it by
+feature-gating that family inside the existing provider crate rather than
+splitting providers into crates.
 
 ## Cross-Project Feature Inventory
 
@@ -942,8 +942,8 @@ authentication, and stronger durability.
 | Retry | Core/provider ownership can amplify | Delivery-certainty-aware attempt contract |
 | Search/edit | Literal/exact-only contracts | Evaluation-driven ignore-aware search and patch edit |
 | Terminal | One-shot only | Durable process handles, cursors, leases, monitors, optional PTY |
-| Provider footprint | AWS SDK always linked through provider crate | Feature-gate heavy adapter families internally |
-| Embedding | No profile/plan plane | `AgentProfile` plus cached `CompiledAgentPlan` |
+| Provider footprint | AWS SDK always linked through provider crate (resolved by H1) | Feature-gate heavy adapter families internally |
+| Embedding | No profile/plan plane (resolved by H2) | `AgentProfile` plus cached `CompiledAgentPlan` |
 | Protocol | Text-only and weak active control | Input parts, profile, plan digest, limits, steering, capabilities |
 | Observability | Incomplete end-to-end evidence | Admission, compile, send, TTFT, persist, deliver, tool, replay spans |
 
@@ -991,7 +991,7 @@ redefine their schemas, migrations, tool contracts, or tests.
 | --- | --- | --- | --- |
 | H0 | Complete: current-runtime speed, size, RSS, replay, and concurrency baseline | None | `xtask`, existing benches |
 | H1 | Cargo feature/dependency profiles, full/minimal baselines, and budget gates | H0 | Root, `qq-provider` |
-| H2 | Immutable live `CompiledAgentPlan`, secret-free descriptor, and bounded cache | H1, R5 | Root, config, core, provider |
+| H2 | Complete: immutable live `CompiledAgentPlan`, secret-free descriptor, and bounded cache | H1, R5 | Root, config, core, provider |
 | H3 | Input parts, profiles, plan identity, limits, steering, capabilities, and correlation | H2 | `qq-protocol`, server, client |
 | H4 | Client conformance fixtures and first external SDK | H3 | `qq-client`, external adapter |
 | H5 | Declarative addon/agent-pack manifest | H2, real consumer | Root, config |
@@ -1237,6 +1237,115 @@ Acceptance:
 ### Phase 2 — Compile The Execution Plan
 
 Implement H2 before protocol-visible plan identity or general addon packaging.
+
+Status: complete 2026-09-02. Receipt follows.
+
+#### H2 Completion Receipt — 2026-09-02
+
+Before H2, every `SubmitPrompt` reloaded and re-parsed layered configuration,
+re-resolved every secret under the credential store's file lock, re-enumerated
+and re-authenticated every provider/model for spawn routes, hashed raw secret
+bytes into the runtime cache key, cloned the cached runtime to attach spawn
+routes, then canonicalized and reopened the workspace and re-read `AGENTS.md`
+inside the run loop. Only the prompt, guidance, and limits were per-run.
+
+Landed (squashed as one commit on `main`):
+
+- `qq-protocol`: `AgentPlanDigest` and opaque `CredentialEpoch` newtypes. No
+  wire type carries them yet; `PROTOCOL_VERSION` stays 11.
+- `qq-auth`: the credential index carries a `revision` advanced by every
+  durable write, including in-place rotation of an existing keyring entry,
+  which previously skipped the index write. `CredentialStore::epoch()` reads it
+  without touching secrets; pre-revision indexes load as epoch zero.
+- `qq-provider`: `BUILD_IDENTITY` names the crate version and compiled adapter
+  families for descriptors.
+- `qq-config`: the loader records every filesystem location it probed (files
+  present or absent, layer directories, VCS-root markers, trust and
+  organization state, the working directory) and exposes
+  `ConfigSnapshot::probed_paths()`.
+- `qq-core::plan`: typed `AgentProfile`; `AgentPlanDescriptor` with a
+  domain-tagged canonical compact-JSON encoding (`DESCRIPTOR_VERSION = 1`) and
+  golden digest fixture; runtime-only `CompiledAgentPlan` holding the runtime,
+  opened workspace, preloaded instructions, static tool catalog and schema
+  hash, resolved model, descriptor, digest, epoch, instruction-source
+  fingerprints, and a byte estimate; `SourceFingerprint` (`len`, `mtime`,
+  inode, presence) for stat revalidation. The run loop executes from the plan:
+  no canonicalize, `Workspace::open`, instruction read, or `spawn_agent`
+  schema rebuild per run. `Runtime::run_in_workspace` compiles an embedded plan
+  and delegates, so direct callers are unchanged. `LoadedRuntime` carries the
+  plan; the former runtime/resolved-model mismatch check moved to compile time.
+- Root: `PlanCache` keyed by canonical workspace, model selection, and
+  explicit configuration; `Hit`/`Revalidated`/`Compiled` outcomes; LRU eviction
+  of inactive generations; pinned active generations count toward the
+  16-entry/64 MiB bound and produce an explicit capacity error; single-flight
+  compile per key; shutdown wired to `RuntimeHandler::shutdown`. `RuntimeKey`
+  and all raw-secret hashing were deleted; the provider preparers return
+  `ProviderDescriptor`s; the MCP registry cache is keyed by declaration digest
+  plus epoch and yields `McpServerDescriptor`s. `qq ask` runs from the plan.
+
+Acceptance:
+
+- the same canonical descriptor produces the same digest (golden
+  `b04a4fbe…e069`; round trip through JSON preserves it);
+- 27 behavior-affecting descriptor fields each change the digest, and a
+  compiled plan's digest changes when `AGENTS.md` changes;
+- secrets and secret hashes never enter descriptors, digests, or diagnostics:
+  sentinel secrets (inline bearer, custom header value, stored key before and
+  after rotation) are asserted absent from canonical bytes and `Debug`, and
+  endpoints are reduced to scheme/host/port/path;
+- rotation of a stored credential changes the epoch and recompiles the
+  provider handle while the digest is unchanged
+  (`credential_rotation_changes_the_epoch_but_not_the_plan_digest`);
+- a warm lookup performs no filesystem discovery: it is the recorded `stat`
+  list only, asserted by counting compiles across repeated loads;
+- a config or instruction edit recompiles on the next prompt, an edit that
+  produces an identical digest keeps the live generation, a broken edit fails
+  the triggering run and leaves the valid generation cached, and reverting
+  hits again;
+- active runs retain their admitted generation across a refresh (pinned
+  entries survive LRU eviction and are never evicted);
+- refresh storms compile once per key (16 concurrent misses) and pinned entries
+  cannot grow the cache past its entry or byte bound; and
+- the default path stays within the regression gate (below).
+
+Measurements at exact revision `2375928` (clean detached recorder,
+100 samples, 69 metrics, all 61 budgets green):
+
+| Metric | Phase 1 (`8ccba84`) | Phase 2 (`2375928`) |
+| --- | ---: | ---: |
+| Submit start to provider entry p95 | 16.4 ms | 16.5 ms |
+| Durable direct command acknowledgement p95 | 5.8 ms | 5.8 ms |
+| Eight-stream output service gap p95 | 50.0 ms | 47.0 ms |
+| 1 MiB / 512 KiB scaling ratio | 1.951x | 1.919x |
+| Release binary | 63.99 MB | 64.02 MB |
+| Idle server RSS p95 | 17.96 MB | 17.89 MB |
+
+The fixture's `BenchmarkLoader` compiles a fresh plan on every load rather than
+caching, so `submit_start_to_provider_entry_ns` measures the uncached floor
+and stays comparable with earlier reports; it did not move. The saving H2
+targets is outside that fixture and is measured directly:
+
+| Benchmark | Result |
+| --- | ---: |
+| `plan_compile` (embedded profile, 1.5 KiB `AGENTS.md`) | 20.9 µs |
+| `plan_descriptor_digest` | 1.78 µs |
+| Compiled plan estimated heap | 7.0 KiB |
+| `RuntimeFactory::plan_for` cold compile (config + stored credential + provider) median / p95 | 180 µs / 205 µs |
+| `RuntimeFactory::plan_for` warm hit median / p95 | 6.1 µs / 6.2 µs |
+
+The warm path is ~30x cheaper than the per-prompt work every run paid before,
+and it no longer holds the credential store's file lock or parses RON. Cold
+compile is dominated by configuration discovery and credential resolution, not
+by plan construction.
+
+Not in scope, per the phase split: persisting the digest or epoch on runs,
+exposing them on the wire, an `AgentProfileId` or configuration-level profile
+key, freezing the MCP catalog into a generation (H6), or agent-pack manifests
+(H5). Deferred: the perf fixture could grow a cached-loader variant to record
+the warm admission path end to end.
+
+Phase 2 is complete.
+
 
 Deliverables:
 

@@ -27,6 +27,7 @@ use thiserror::Error;
 
 mod approval;
 mod mcp;
+pub mod plan;
 mod runtime;
 mod sessions;
 mod tools;
@@ -39,7 +40,7 @@ use runtime::{
     RuntimeToolCall, SEARCH_HISTORY_TOOL, SPAWN_UNAVAILABLE_RESULT, SearchHistoryArgs,
     SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, TurnBlock,
     agent_system_prompt, attempts_message, is_transient_provider_failure, render_history_matches,
-    search_history_spec, tool_schema_measurement,
+    tool_schema_measurement,
 };
 
 pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult};
@@ -250,8 +251,32 @@ impl Runtime {
         self
     }
 
-    pub(crate) const fn context_window(&self) -> Option<u32> {
-        self.context_window
+    /// The resolved-model account of a runtime constructed without
+    /// configuration: identity comes from the runtime itself, and every
+    /// capability the embedder did not declare is recorded as unsupported or
+    /// unknown rather than guessed.
+    pub(crate) fn embedded_resolved_model(&self) -> qq_protocol::ResolvedModel {
+        qq_protocol::ResolvedModel {
+            version: qq_protocol::ResolvedModelVersion::new(1)
+                .expect("resolved-model version one is non-zero"),
+            request_shape: None,
+            route: format!("embedded/{}", self.model),
+            provider_model: self.model.to_string(),
+            organization: None,
+            credential_profile: None,
+            max_output_tokens: self.max_output_tokens,
+            context_window: self.context_window,
+            pricing: None,
+            output_token_control: qq_protocol::CapabilitySupport::Unsupported,
+            generation: qq_protocol::GenerationCapabilities {
+                reasoning_effort: qq_protocol::CapabilitySupport::Unsupported,
+            },
+            prompt_cache: qq_protocol::PromptCacheCapabilities {
+                control: qq_protocol::CapabilitySupport::Unsupported,
+                cache_read_usage: false,
+                cache_write_usage: false,
+            },
+        }
     }
 
     /// Attaches a registry of configuration-declared MCP servers. Its cached
@@ -358,21 +383,131 @@ impl Runtime {
         )
     }
 
+    /// Runs the loop from a runtime that was not compiled into a plan: the
+    /// workspace is canonicalized and opened, and instructions are read, for
+    /// this run only. Durable sessions compile once and call
+    /// [`CompiledAgentPlan::execute`] directly.
     pub(crate) fn run_loop_with_spawner(
         &self,
-        mut messages: Vec<Message>,
+        messages: Vec<Message>,
         workspace: PathBuf,
         cancelled: Arc<AtomicBool>,
         gate: Arc<dyn ToolGate>,
         file_state: Arc<workspace::FileState>,
         capabilities: RunCapabilities,
     ) -> RuntimeStream {
-        let provider = Arc::clone(&self.provider);
-        let model = Arc::clone(&self.model);
-        let model_max_output_tokens = self.max_output_tokens;
-        let mcp = self.mcp.clone();
-        let spawn_model_routes = Arc::clone(&self.spawn_model_routes);
-        let turn_retry = self.turn_retry;
+        let runtime = self.clone();
+        Box::pin(stream! {
+            let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
+            yield RuntimeEvent::Started;
+            let (opened, _instructions) = match workspace::prepare_workspace(
+                workspace,
+                Arc::clone(&cancelled),
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(error @ (workspace::WorkspacePreparationError::Canonicalize { .. }
+                    | workspace::WorkspacePreparationError::Open { .. })) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::InvalidCommand,
+                        message: format!("could not open the workspace directory: {error}"),
+                    };
+                    return;
+                }
+                Err(error) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    };
+                    return;
+                }
+            };
+            // Compilation re-opens the workspace and re-reads instructions on
+            // a blocking thread; the direct path pays this once per run, the
+            // same filesystem work it always did.
+            let profile = plan::AgentProfile::embedded(&runtime, opened.path().to_owned());
+            let compiled = match tokio::task::spawn_blocking(move || {
+                plan::CompiledAgentPlan::compile_blocking(profile)
+            })
+            .await
+            {
+                Ok(Ok(plan)) => plan,
+                Ok(Err(error)) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    };
+                    return;
+                }
+                Err(_) => {
+                    yield RuntimeEvent::Failed {
+                        kind: RunFailureKind::Server,
+                        message: "plan compilation stopped unexpectedly".to_owned(),
+                    };
+                    return;
+                }
+            };
+            drop(opened);
+            let mut events = compiled.execute(messages, cancelled, gate, file_state, capabilities);
+            while let Some(event) = events.next().await {
+                match event {
+                    // The wrapper already announced the start.
+                    RuntimeEvent::Started => {}
+                    event => yield event,
+                }
+            }
+        })
+    }
+}
+
+impl plan::CompiledAgentPlan {
+    /// Runs one command from this plan with read-only tools scoped to the
+    /// plan's workspace, the direct (non-durable) counterpart of a session
+    /// run. Configuration allowlists are the only grants.
+    pub fn run(self: &Arc<Self>, command: RunCommand) -> RunStream {
+        let grants = approval::SessionGrants {
+            tools: self
+                .runtime
+                .mcp
+                .as_ref()
+                .map(|registry| registry.config_grants().into_iter().collect())
+                .unwrap_or_default(),
+            shell_prefixes: Vec::new(),
+        };
+        public_run_stream(
+            self.execute(
+                vec![Message::user(command.into_prompt())],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(StaticPolicyGate {
+                    mode: ApprovalMode::Ask,
+                    grants,
+                }),
+                Arc::new(workspace::FileState::default()),
+                RunCapabilities::user(None),
+            ),
+            self.runtime.context_window,
+        )
+    }
+
+    /// Executes one run from this plan. No filesystem discovery happens
+    /// before the first provider request unless the prompt invokes a command
+    /// or skill, whose document is then read from the already opened
+    /// workspace.
+    pub(crate) fn execute(
+        self: &Arc<Self>,
+        mut messages: Vec<Message>,
+        cancelled: Arc<AtomicBool>,
+        gate: Arc<dyn ToolGate>,
+        file_state: Arc<workspace::FileState>,
+        capabilities: RunCapabilities,
+    ) -> RuntimeStream {
+        let plan = Arc::clone(self);
+        let provider = Arc::clone(&plan.runtime.provider);
+        let model = Arc::clone(&plan.runtime.model);
+        let model_max_output_tokens = plan.runtime.max_output_tokens;
+        let mcp = plan.runtime.mcp.clone();
+        let turn_retry = plan.runtime.turn_retry;
         Box::pin(stream! {
             let RunCapabilities {
                 spawner,
@@ -418,51 +553,52 @@ impl Runtime {
                 }
             };
 
-            let (workspace, workspace_instructions, selected_guidance) = match workspace::prepare_workspace(
-                workspace,
-                Arc::clone(&cancelled),
-                parsed_invocation.guidance,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(error @ (workspace::WorkspacePreparationError::Canonicalize { .. }
-                    | workspace::WorkspacePreparationError::Open { .. })) => {
-                    yield RuntimeEvent::Failed {
-                        kind: RunFailureKind::InvalidCommand,
-                        message: format!("could not open the workspace directory: {error}"),
-                    };
-                    return;
-                }
-                Err(workspace::WorkspacePreparationError::Guidance(error)) => {
-                    yield RuntimeEvent::Failed {
-                        kind: RunFailureKind::InvalidCommand,
-                        message: error.to_string(),
-                    };
-                    return;
-                }
-                Err(error) => {
-                    yield RuntimeEvent::Failed {
-                        kind: RunFailureKind::Configuration,
-                        message: error.to_string(),
-                    };
-                    return;
-                }
+            let workspace = plan.workspace.clone();
+            let workspace_instructions = &plan.instructions;
+            let selected_guidance = match parsed_invocation.guidance {
+                None => None,
+                Some(request) => match workspace::prepare_guidance(
+                    workspace.clone(),
+                    Arc::clone(&cancelled),
+                    request,
+                )
+                .await
+                {
+                    Ok(guidance) => Some(guidance),
+                    Err(workspace::WorkspacePreparationError::Guidance(error)) => {
+                        yield RuntimeEvent::Failed {
+                            kind: RunFailureKind::InvalidCommand,
+                            message: error.to_string(),
+                        };
+                        return;
+                    }
+                    Err(error) => {
+                        yield RuntimeEvent::Failed {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        };
+                        return;
+                    }
+                },
             };
             // MCP declarations join the built-ins once per run: the cached
             // specs are fetched here (connecting lazily on first use) so
             // every turn of the run sees one stable tool list. The `mcp__`
             // prefix keeps collisions with built-ins impossible, and specs
             // that do not carry it are discarded to keep dispatch unambiguous.
-            let mut tool_specs = if allow_tools { tools::specs() } else { Vec::new() };
+            let mut tool_specs = if allow_tools {
+                plan.built_in_specs().to_vec()
+            } else {
+                Vec::new()
+            };
             // The sub-agent tool is declared only when this run may spawn:
             // depth is one, so child runs (spawner-less) never see it.
             if allow_tools && spawner.is_some() {
-                tool_specs.push(tools::spawn_agent_spec(&spawn_model_routes));
+                tool_specs.push(plan.spawn_agent_spec().clone());
             }
             // Full-transcript recall exists only for durable session runs.
             if allow_tools && history.is_some() {
-                tool_specs.push(search_history_spec());
+                tool_specs.push(plan.search_history_spec().clone());
             }
             if allow_tools && let Some(registry) = &mcp {
                 for spec in registry.tool_specs().await {
@@ -477,7 +613,7 @@ impl Runtime {
             let system: Arc<str> = Arc::from(agent_system_prompt(
                 workspace.path(),
                 &tool_specs,
-                &workspace_instructions,
+                workspace_instructions,
                 selected_guidance.as_ref(),
             ));
             let tool_schema = tool_schema_measurement(&tool_specs);
@@ -1122,7 +1258,7 @@ impl Runtime {
                                             // at spawn time, before any
                                             // durable child state exists.
                                             let outcome = spawner
-                                                .spawn(call.id, arguments.task, arguments.model)
+                                                .spawn(arguments.task, arguments.model)
                                                 .await;
                                             child_cost = Some(outcome.cost_usd_nanos);
                                             tools::bounded_result(
@@ -4149,12 +4285,7 @@ mod tests {
     }
 
     impl SubagentSpawner for StubSpawner {
-        fn spawn(
-            &self,
-            _call_id: ToolCallId,
-            task: String,
-            model: Option<String>,
-        ) -> SpawnAgentFuture {
+        fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture {
             self.tasks.lock().unwrap().push((task, model));
             let outcome = self.outcome.clone();
             Box::pin(std::future::ready(outcome))

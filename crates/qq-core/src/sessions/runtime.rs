@@ -1,5 +1,6 @@
 use super::scheduler::schedule_runs;
 use super::*;
+use crate::plan::{AgentProfile, CompiledAgentPlan, PlanCompileError, ProviderDescriptor};
 
 pub type RuntimeLoadFuture =
     Pin<Box<dyn Future<Output = Result<LoadedRuntime, RuntimeLoadError>> + Send + 'static>>;
@@ -8,10 +9,56 @@ pub type WorkerRuntimeLoadFuture =
 pub type SpawnModelValidationFuture =
     Pin<Box<dyn Future<Output = Result<(), RuntimeLoadError>> + Send + 'static>>;
 
+/// The compiled plan a session run executes from, as returned by the
+/// embedding application's [`RuntimeLoader`].
 #[derive(Clone)]
 pub struct LoadedRuntime {
-    pub runtime: Arc<Runtime>,
-    pub resolved_model: Arc<ResolvedModel>,
+    pub plan: Arc<CompiledAgentPlan>,
+}
+
+impl LoadedRuntime {
+    /// Compiles a plan from an already constructed runtime and its resolved
+    /// model, for loaders that build runtimes directly (embedders, tests,
+    /// benchmarks). The runtime's provider, MCP registry, spawn routes, and
+    /// retry policy are kept; its model identity must agree with
+    /// `resolved_model`, which the compiled plan then reports. Performs
+    /// blocking filesystem work.
+    pub fn compile_blocking(
+        runtime: &Runtime,
+        resolved_model: ResolvedModel,
+        workspace: PathBuf,
+    ) -> Result<Self, PlanCompileError> {
+        if runtime.model.as_ref() != resolved_model.provider_model.as_str()
+            || runtime.max_output_tokens != resolved_model.max_output_tokens
+            || runtime.context_window != resolved_model.context_window
+        {
+            return Err(PlanCompileError::ModelMismatch {
+                route: resolved_model.route,
+                runtime_model: runtime.model.to_string(),
+                runtime_max_output_tokens: runtime.max_output_tokens,
+                runtime_context_window: runtime.context_window,
+            });
+        }
+        let mut profile = AgentProfile::new(
+            Arc::clone(&runtime.provider),
+            ProviderDescriptor::embedded(),
+            resolved_model,
+            workspace,
+        )
+        .with_spawn_model_routes(runtime.spawn_model_routes.to_vec())
+        .with_turn_retry_policy(runtime.turn_retry);
+        if let Some(registry) = &runtime.mcp {
+            profile = profile.with_mcp(Arc::clone(registry), Vec::new());
+        }
+        Ok(Self {
+            plan: CompiledAgentPlan::compile_blocking(profile)?,
+        })
+    }
+
+    #[must_use]
+    pub fn resolved_model(&self) -> &Arc<ResolvedModel> {
+        self.plan.resolved_model()
+    }
 }
 
 pub trait RuntimeLoader: Send + Sync + 'static {
@@ -459,7 +506,6 @@ impl SessionRuntime {
             || request.session_limit > MAX_SNAPSHOT_SESSIONS
             || request.message_limit == 0
             || request.message_limit > MAX_SNAPSHOT_MESSAGES
-            || request.include_sessions.len() > qq_protocol::MAX_INCLUDED_SESSIONS
         {
             return Err(SessionRuntimeError::InvalidPageLimit);
         }

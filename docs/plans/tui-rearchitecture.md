@@ -1,7 +1,7 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phases T0–T5 are complete (receipts below).
-Phases T6–T7 are proposed.
+Status: proposed 2026-09-02. Phase T0 is complete (receipt below). Phases
+T1–T7 are proposed.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -189,38 +189,6 @@ Acceptance:
 - The three pickers share one implementation.
 - Adding a command touches one table row.
 
-#### T1 Completion Receipt — 2026-09-02
-
-Landed without user-visible behavior change; all 135 pre-existing tests pass
-unmodified in intent, plus seven new unit tests.
-
-- `commands.rs`: `Command` enum and `COMMANDS` table (title, category, slash
-  aliases, bound `Action`). `App::execute(Command)` is the single dispatch
-  point for keybindings, slash entries, and Ctrl-C/Ctrl-O. A parity test
-  asserts the table's slash names equal
-  `qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS` as sets, replacing the old
-  index coupling.
-- `input.rs`: `Overlay { Models, Sessions }` and `Mode { Models, Sessions,
-  Approval, Compose }`. `App::mode()` replaces the if-chains in
-  `handle_key`, `frame`, and `prune_markdown`; the approval prompt stays
-  derived from session data.
-- `picker.rs`: one `Picker` (query, clamped cursor, bounded query bytes,
-  case-insensitive match, `preserve` across refresh) shared by the model
-  picker, session picker, and slash autocomplete.
-- Module split, no `mod.rs`: `render.rs` (Style/Span/Line, writer),
-  `view/markdown.rs` (markdown, tables, code panels, tree-sitter),
-  `view/wrap.rs` (wrapping, truncation, viewport slicing), `app/reduce.rs`
-  (`reduce_event` and transcript mutation). Markdown and wrap tests moved
-  with their code. `view.rs` went from 5,258 to 3,645 lines and `app.rs`
-  from 4,343 to 3,830.
-- Render bench after T1 matched the T0 baseline within noise once slash
-  autocomplete stopped rebuilding its list on ordinary typing
-  (keystroke-to-frame p95 41.4 µs vs 41.6 µs baseline).
-
-Deferred from T1 to T2: removing the remaining `expect`s in the approval
-renderer and the transcript viewport path, and moving reduce-focused tests
-out of `app.rs`.
-
 ### T2 — Hot Path
 
 Deliverables:
@@ -246,53 +214,6 @@ Acceptance:
 
 - The T0 benchmarks meet the budget table.
 - Frame cost with eight background streams is `<= 1.2x` single-session cost.
-
-#### T2 Completion Receipt — 2026-09-02
-
-Commits `ee54796`, `2f135d6`, and the indexing/eviction commit that follows.
-All 149 tests pass; workspace fmt, Clippy, test, and build gates green.
-
-| Case | T0 baseline (median / p95) | After T2 (median / p95) |
-| --- | ---: | ---: |
-| First frame, 64 completed code-bearing messages | 12.1 ms | **0.80 ms** plain; fully highlighted 13.2 ms later off-tick |
-| Steady state, no changes | 18.6 µs / 21.8 µs | 22.0 µs / 24.8 µs |
-| One streaming prose message, one delta per frame | 855 µs / 1,028 µs | **34.5 µs / 36.6 µs** |
-| Run-on 32 KiB paragraph, no block boundary (new ceiling case) | 855 µs | 415 µs / 468 µs |
-| Eight background sessions, one delta each | 17.8 µs / 18.7 µs | 20.3 µs / 20.8 µs |
-| Keystroke to frame | 31.5 µs / 41.6 µs | **23.9 µs / 25.8 µs** |
-
-Every budget in the table above is met: streaming `<= 2 ms` p95, steady
-`<= 1 ms` p95, keystroke `<= 4 ms` p95, eight-background `<= 1.2x` steady
-(0.84x; still a floor until T3 reduces live status for unfocused sessions).
-The +3 µs on steady state is the cost of the highlight bookkeeping and LRU
-stamping per frame; accepted for the 15x first-frame win.
-
-What changed:
-
-- **Settled-prefix live cache.** `settled_prefix_end` finds the last blank
-  line outside a fence or indented code block; a corpus test proves
-  `markdown_lines(prefix) ++ markdown_lines(suffix) == markdown_lines(whole)`.
-  A streaming message re-lays-out only its open trailing block. `wrap_line`
-  and `wrap_line_chars` now slice span text by byte range instead of
-  allocating one `String` per character, which halved the run-on ceiling.
-- **Off-tick highlighting.** `view/highlight.rs` schedules tree-sitter on the
-  Tokio blocking pool (four in flight, bounded result channel). Completed
-  messages cache plain immediately; results are installed by
-  `HighlightKey` so stale work is dropped. Loop test proves the plain frame
-  precedes the highlighted one through the real `select!`.
-- **Loop.** Terminal size is cached from `Resize`. User input draws
-  immediately (`Redraw::Immediate`); client updates coalesce to the tick
-  (`Redraw::Scheduled`).
-- **Indexes and eviction.** `thread_order` groups children by parent in one
-  pass (was O(S²)); `children_of` replaces the view-side scan; per-delta
-  lookups scan from the tail; markdown cache eviction is LRU by frame clock.
-- **No `expect` on the frame path.** Viewport and message-body lookups
-  degrade to blank rows and recover next frame.
-
-Deferred: `Line::width()` memoization (measured immaterial after the wrap
-rewrite; revisit if a profile shows it), `TextAppended` per-frame coalescing
-(the settled-prefix cache made per-delta cost flat, so batching buys little),
-and moving reduce-focused tests out of `app.rs` (cosmetic).
 
 ### T3 — Session Store, Fast Create, Warm Bodies
 
@@ -330,59 +251,6 @@ Acceptance:
 - Twenty concurrent children render live status.
 - Memory is bounded by the warm LRU and live-status caps.
 
-#### T3 Completion Receipt — 2026-09-02
-
-Commits `181597e` (protocol and core) and the TUI/client commit that follows.
-All workspace gates green; 154 TUI tests, 23 protocol tests, 324 core tests.
-
-Protocol version 12 (additive, every field defaults when absent):
-
-- `SessionSummary.spawned_by: Option<SpawnOrigin { run_id, tool_call_id }>`.
-  Core threads the spawning `ToolCallId` through `SubagentSpawner::spawn` and
-  persists it in `sessions.spawned_by_tool_call_id` (schema version 20).
-  Historical children report the owner run with no call.
-- `SessionSummary.activity: Option<RunActivity>`, read from the newest
-  `run_activity_changed` for the active run at snapshot time.
-- `SnapshotRequest.include_sessions` (at most 16) and
-  `WorkspaceSnapshot.included`. Foreign or unknown ids are skipped; over-limit
-  requests fail with `InvalidPageLimit`.
-
-TUI session store:
-
-- `SessionView` bodies are warm (`Some`) or cold (`None`). Loading a body no
-  longer evicts every other body; `evict_cold_bodies` keeps the eight most
-  recently focused (`WARM_BODY_LIMIT`), never the focused one.
-- `LiveStatus` (256-byte collapsed assistant tail, active tool, awaiting
-  approval set) reduces from every event for every session, warm or cold.
-  Activity seeds from the summary and is replaced by live events.
-- Fast create: a `SessionCreated` for this client's `PendingIntent::Create`
-  adopts the session as warm-and-empty and moves focus in the same frame,
-  whether the SSE event or the HTTP receipt arrives first. The client's
-  auto-snapshot after create is removed. Zero requests are asserted.
-- Fast switch: warm sessions focus with zero requests; cold sessions show
-  their summary and live tail while one focused snapshot fills the body.
-  Bootstrap pre-warms the four most recent other sessions via
-  `include_sessions`.
-- Sidebar (`Ctrl-B`; auto at 120 columns): the session tree with a status
-  row per session showing approval waits, the active tool, the live tail, or
-  the run activity label. Body width is `width - 36` when visible so caches
-  key on one stable width per layout.
-
-| Case | median / p95 |
-| --- | ---: |
-| Steady state (sidebar hidden, unchanged from T2) | 22.3 µs / 32.5 µs |
-| Steady state with sidebar, nine sessions | 34.3 µs / 50.4 µs |
-| Eight background sessions streaming (now reducing live status) | 21.5 µs / 22.4 µs |
-| Twenty children streaming with the sidebar visible | 51.9 µs / 54.8 µs |
-| Keystroke to frame | 24.0 µs / 28.4 µs |
-
-The eight-background case stays at 0.97x the steady frame, within the 1.2x
-gate, now that the deltas do real work. The sidebar costs about 12 µs per
-frame for nine rows; twenty streaming children cost 30 µs over steady.
-
-Deferred to T4: rendering `spawned_by` inline under the `spawn_agent` call,
-parent/child navigation commands, and workspace-wide approval routing.
-
 ### T4 — Children And Approvals Across The Workspace
 
 Deliverables:
@@ -401,38 +269,6 @@ Acceptance:
   frame of `SessionCreated`.
 - Approvals in background sessions are surfaced and answerable without losing
   focus context.
-
-#### T4 Completion Receipt — 2026-09-02
-
-All workspace gates green; 158 TUI tests. No render-bench change.
-
-- **Inline children.** `render_tool_calls` takes a child-rows callback; a
-  `spawn_agent` call whose `ToolCallId` matches a session's `spawned_by`
-  renders that child directly beneath it (`↳ title`, then the same live
-  status line the sidebar uses). A run with an inline child never folds into
-  the "N tool calls" summary, and the child is not repeated in the "related
-  sessions" list. Children without a recorded call (pre-version-12 stores)
-  keep appearing in that list.
-- **Navigation.** `FocusParent` / `FocusFirstChild` / `FocusNextSibling` /
-  `FocusPreviousSibling` on Alt-Up/Down/Left/Right; siblings are ordered by
-  `updated_at_ms` (spawn order) and wrap. `/agents` (reserved in the
-  protocol list alongside `/sessions`) opens the session picker scoped to the
-  focused session's root and its descendants; the header reads `AGENTS`.
-- **Workspace-wide approvals.** `sessions_awaiting_approval` derives from
-  `LiveStatus`, so it covers cold sessions. A status-area banner names the
-  first waiting non-focused session and how many more; `Ctrl-G`
-  (`FocusNextApproval`) jumps to the next one in tree order, after which the
-  existing approval mode answers it. Approvals are therefore answerable from
-  any session with one keystroke of context switch.
-
-Not done, deliberately: answering a background approval *without* switching
-focus. The modal reads the focused session's pending call; making it
-session-addressable is a small change but the jump-then-answer flow keeps the
-user looking at the diff or command they are approving, which is the safer
-default. Revisit with T6 split panes, where the second pane can host it.
-Cost on the inline child row is also deferred: `SessionAccounting` is on the
-summary but the row is already dense; the sidebar row is the better home once
-it gains a cost column.
 
 ### T5 — Composer And Busy Input
 
@@ -454,45 +290,6 @@ Acceptance:
 - Editor behaviors are tested.
 - The queued-prompt list is bounded.
 - Steering availability is capability-driven with a fixture.
-
-#### T5 Completion Receipt — 2026-09-02
-
-All workspace gates green; 168 TUI tests. Render bench unchanged.
-
-- **Composer.** Ctrl-Left/Right word motion, Home/End and Ctrl-A/E, Ctrl-W
-  and Alt-Backspace kill word, Ctrl-K/U kill to line end/start, Ctrl-Y yank
-  from a one-slot kill ring, Ctrl-Z/Ctrl-_ undo (64 snapshots, coalesced on
-  word boundaries). Pastes of three or more lines or 512+ bytes collapse to
-  `[Pasted #n N lines]`; the placeholder is one token for cursor motion and
-  deletion, and `Composer::expanded()` substitutes the content on submit.
-  The 64 KiB input bound applies to the expanded text.
-- **Busy input.** Enter during an active run holds the draft locally instead
-  of sending it; Ctrl-Enter (or Ctrl-Q) queues explicitly; Alt-Up pulls the
-  newest draft back for editing (queueing any current text first). Drafts
-  render above the composer, are capped at eight per session, and flush one
-  per `RunFinished` in order so each becomes its own run. Local drafts were
-  chosen over the server queue because the server queue is not editable and
-  the user was typing to *this* run's outcome.
-- **Esc.** With a run active, Esc arms and shows "press Esc again to cancel";
-  a second Esc within 16 animation ticks (2 s) cancels. Any other key disarms.
-  Without a run, Esc still dismisses errors then walks to the parent. Alt-Up
-  therefore moved off tree navigation; parent is Esc, the rest stay on
-  Alt-Down/Left/Right.
-- **Steering.** `Command::SteerRun` exists in the table; `steering_available`
-  is `false` until the capability document (H3) sets it, so the command warns
-  and falls back to queueing. Tested as a fixture of that fallback.
-- **Reasoning.** `ReasoningDelta` accumulates per run (16 KiB bound, warm
-  sessions only, dropped when the run's messages are trimmed). A collapsed
-  `∴ thought for Ns  <first paragraph>` row precedes the run's first
-  assistant message; Ctrl-R expands to the full text under a `┆` rail. It
-  never enters `MessageSnapshot.output`.
-- **External editor.** Alt-E or `/editor` (reserved in the protocol list)
-  hands the expanded draft to `$VISUAL`/`$EDITOR` via a temp file. The loop
-  runs the editor inline (nothing else can use the TTY meanwhile), leaves raw
-  mode and input modes for its lifetime, then repaints every row. Missing
-  editor, non-zero exit, and I/O failures each surface as a typed
-  `EditorError` warning with the draft intact. The loop test injects a
-  scripted editor.
 
 ### T6 — Split Panes
 

@@ -19,6 +19,7 @@ mod cli;
 mod headless;
 mod mcp;
 mod output;
+mod plan;
 mod runtime;
 
 #[tokio::main]
@@ -95,9 +96,8 @@ impl CliOverrides {
 async fn ask(prompt: String, overrides: &CliOverrides) -> Result<(), Box<dyn Error>> {
     let factory = runtime::RuntimeFactory::system()?;
     let load = overrides.load_request()?;
-    let workspace = std::env::current_dir()?;
-    let runtime = tokio::task::spawn_blocking(move || factory.runtime_for(&load)).await??;
-    render_events(runtime.run_in_workspace(RunCommand::new(prompt), workspace)).await
+    let plan = tokio::task::spawn_blocking(move || factory.plan_for(&load)).await??;
+    render_events(plan.run(RunCommand::new(prompt))).await
 }
 
 /// Runs one autonomous headless task through the durable session runtime and

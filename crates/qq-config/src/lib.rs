@@ -21,6 +21,7 @@ mod providers;
 mod remote;
 mod tui;
 
+pub use loader::canonical_working_directory;
 pub use qq_provider::{SecretLiteral, SecretRef, XAI_CREDENTIAL_ENDPOINT};
 pub use tui::{
     TuiAction, TuiConfigDefaults, TuiConfigSettings, TuiConfigSnapshot, TuiLayout, TuiSourceReport,
@@ -102,6 +103,12 @@ impl LoadRequest {
     #[must_use]
     pub fn has_explicit_content(&self) -> bool {
         self.explicit_content.is_some()
+    }
+
+    /// The inline configuration document, when one was supplied.
+    #[must_use]
+    pub fn explicit_content(&self) -> Option<&str> {
+        self.explicit_content.as_deref()
     }
 
     #[must_use]
@@ -1337,6 +1344,7 @@ pub struct ConfigSnapshot {
     grants: PolicyGrants,
     reports: Vec<SourceReport>,
     provenance: ConfigProvenance,
+    probed_paths: Vec<PathBuf>,
 }
 
 impl ConfigSnapshot {
@@ -1398,6 +1406,18 @@ impl ConfigSnapshot {
     #[must_use]
     pub const fn provenance(&self) -> &ConfigProvenance {
         &self.provenance
+    }
+
+    /// Every filesystem location this load inspected to decide which sources
+    /// exist: candidate files whether present or absent, layer directories,
+    /// VCS-root markers, trust and organization state, and the working
+    /// directory itself. A caller holding this snapshot can detect that a
+    /// reload might differ by re-checking exactly these paths, without
+    /// repeating discovery, parsing, or trust evaluation. The list is in
+    /// probe order and free of duplicates; it says nothing about content.
+    #[must_use]
+    pub fn probed_paths(&self) -> &[PathBuf] {
+        &self.probed_paths
     }
 }
 

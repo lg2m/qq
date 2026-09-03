@@ -54,7 +54,6 @@ impl BenchHarness {
         };
         let mut app = App::new(TuiOptions::default());
         app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
-            included: Vec::new(),
             cursor: EventCursor {
                 store_id: StoreId::from_bytes([3; 16]),
                 workspace_id,
@@ -133,33 +132,6 @@ impl BenchHarness {
             .expect("in-memory frame rendering cannot fail")
     }
 
-    /// Install any finished off-tick highlight results, as the event loop
-    /// would between frames. Returns how many were applied.
-    pub fn apply_finished_highlights(&mut self) -> usize {
-        let mut applied = 0;
-        while let Some(result) = self.renderer.highlighter.try_next() {
-            if self.renderer.apply_highlight(result) {
-                applied += 1;
-            }
-        }
-        applied
-    }
-
-    /// Force the session sidebar on regardless of width.
-    pub fn show_sidebar(&mut self) {
-        self.app.sidebar = crate::app::Sidebar::Shown;
-    }
-
-    /// Force the session sidebar off regardless of width.
-    pub fn hide_sidebar(&mut self) {
-        self.app.sidebar = crate::app::Sidebar::Hidden;
-    }
-
-    /// Whether highlight jobs are still running.
-    pub fn highlights_pending(&self) -> bool {
-        self.renderer.highlighter.in_flight() > 0
-    }
-
     fn apply(&mut self, index: u8, event: SessionEvent) -> bool {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
@@ -193,8 +165,6 @@ fn run_id(index: u8) -> RunId {
 
 fn summary(workspace_id: WorkspaceId, id: SessionId, status: SessionStatus) -> SessionSummary {
     SessionSummary {
-        activity: None,
-        spawned_by: None,
         id,
         workspace_id,
         parent_id: None,

@@ -4,12 +4,16 @@ mod guidance;
 mod instructions;
 mod prepare;
 
-pub(crate) use access::{Workspace, WorkspacePathError, blocking_permits};
+pub use access::WorkspacePathError;
+pub(crate) use access::{Workspace, blocking_permits};
 pub(crate) use file_state::{FileState, FileStateUpdate, content_hash, stale_file_error};
 pub(crate) use guidance::{
     GuidanceError, GuidanceRequest, ParsedInvocation, SelectedGuidance, parse_invocation,
 };
-pub(crate) use instructions::{WorkspaceInstructionError, WorkspaceInstructions};
+pub use instructions::WorkspaceInstructionError;
+pub(crate) use instructions::{
+    WorkspaceInstructions, load_with_sources as load_instructions_with_sources,
+};
 #[cfg(test)]
 pub(crate) use prepare::test_pause_after_workspace_open;
-pub(crate) use prepare::{WorkspacePreparationError, prepare_workspace};
+pub(crate) use prepare::{WorkspacePreparationError, prepare_guidance, prepare_workspace};

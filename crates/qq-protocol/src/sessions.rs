@@ -67,7 +67,7 @@ impl fmt::Display for CursorError {
 
 impl std::error::Error for CursorError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -655,18 +655,6 @@ pub struct WorkspaceSummary {
     pub path: String,
 }
 
-/// The parent run and tool call that spawned a child session. Lets a client
-/// render the child inline under the `spawn_agent` call that created it and
-/// attribute its work to the parent run without inferring from timestamps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpawnOrigin {
-    pub run_id: RunId,
-    /// Absent for children created before the spawning call was recorded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<ToolCallId>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSummary {
@@ -674,19 +662,10 @@ pub struct SessionSummary {
     pub workspace_id: WorkspaceId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<SessionId>,
-    /// Set on child sessions created by a parent run; `None` for roots and
-    /// for summaries produced by older servers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spawned_by: Option<SpawnOrigin>,
     pub title: String,
     pub status: SessionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_run_id: Option<RunId>,
-    /// Latest liveness state of the active run, so a client that loads or
-    /// reconnects mid-run shows the right label without waiting for the next
-    /// `RunActivityChanged`. `None` when idle or unknown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activity: Option<RunActivity>,
     pub queued_prompts: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1007,50 +986,17 @@ pub struct WorkspaceSnapshot {
     pub sessions: Vec<SessionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused: Option<SessionSnapshot>,
-    /// Bodies for every session named in `SnapshotRequest::include_sessions`,
-    /// in request order, so a client can keep several transcripts warm from
-    /// one round trip. Sessions outside the workspace are omitted.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub included: Vec<SessionSnapshot>,
     pub has_older_sessions: bool,
 }
 
-/// Upper bound on `SnapshotRequest::include_sessions`; requests above it are
-/// rejected rather than truncated.
-pub const MAX_INCLUDED_SESSIONS: usize = 16;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotRequest {
     pub workspace_id: WorkspaceId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_session_id: Option<SessionId>,
-    /// Additional sessions whose bodies should be returned in
-    /// `WorkspaceSnapshot::included`, each bounded by `message_limit`. At
-    /// most [`MAX_INCLUDED_SESSIONS`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include_sessions: Vec<SessionId>,
     pub session_limit: u16,
     pub message_limit: u16,
-}
-
-impl SnapshotRequest {
-    /// A workspace snapshot with an optional focused body and no extras.
-    #[must_use]
-    pub fn new(
-        workspace_id: WorkspaceId,
-        focused_session_id: Option<SessionId>,
-        session_limit: u16,
-        message_limit: u16,
-    ) -> Self {
-        Self {
-            workspace_id,
-            focused_session_id,
-            include_sessions: Vec::new(),
-            session_limit,
-            message_limit,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1807,8 +1753,6 @@ mod tests {
 
         let event = SessionEvent::SessionCompacted {
             session: SessionSummary {
-                activity: None,
-                spawned_by: None,
                 id: session_id,
                 workspace_id: id(2),
                 parent_id: None,
@@ -1861,8 +1805,6 @@ mod tests {
         let session_id = id::<SessionId>(3);
         let updated = SessionEvent::SessionUpdated {
             session: SessionSummary {
-                activity: None,
-                spawned_by: None,
                 id: session_id,
                 workspace_id: id(2),
                 parent_id: None,
@@ -1914,8 +1856,6 @@ mod tests {
         let session_id = id::<SessionId>(3);
         let event = SessionEvent::RunFinished {
             session: SessionSummary {
-                activity: None,
-                spawned_by: None,
                 id: session_id,
                 workspace_id,
                 parent_id: None,
@@ -1997,105 +1937,6 @@ mod tests {
     }
 
     #[test]
-    fn spawn_origin_and_activity_are_additive_on_session_summaries() {
-        let legacy = serde_json::json!({
-            "id": id::<SessionId>(3),
-            "workspace_id": id::<WorkspaceId>(2),
-            "parent_id": id::<SessionId>(1),
-            "title": "child",
-            "status": "running",
-            "active_run_id": id::<RunId>(9),
-            "queued_prompts": 0,
-            "updated_at_ms": 11
-        });
-        let decoded: SessionSummary = serde_json::from_value(legacy).unwrap();
-        assert_eq!(decoded.spawned_by, None);
-        assert_eq!(decoded.activity, None);
-        assert!(
-            !serde_json::to_value(&decoded)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .contains_key("spawned_by")
-        );
-
-        let current = SessionSummary {
-            spawned_by: Some(SpawnOrigin {
-                run_id: id(8),
-                tool_call_id: Some(id(7)),
-            }),
-            activity: Some(RunActivity::GeneratingResponse),
-            ..decoded
-        };
-        let encoded = serde_json::to_value(&current).unwrap();
-        assert_eq!(
-            encoded["spawned_by"]["run_id"],
-            serde_json::json!(id::<RunId>(8))
-        );
-        assert_eq!(encoded["activity"], "generating_response");
-        assert_eq!(
-            serde_json::from_value::<SessionSummary>(encoded).unwrap(),
-            current
-        );
-        // A spawn origin without a recorded tool call is still valid.
-        let bare = serde_json::json!({ "run_id": id::<RunId>(8) });
-        assert_eq!(
-            serde_json::from_value::<SpawnOrigin>(bare).unwrap(),
-            SpawnOrigin {
-                run_id: id(8),
-                tool_call_id: None
-            }
-        );
-    }
-
-    #[test]
-    fn snapshot_requests_and_responses_stay_additive_for_included_sessions() {
-        let legacy_request = serde_json::json!({
-            "workspace_id": id::<WorkspaceId>(2),
-            "focused_session_id": id::<SessionId>(3),
-            "session_limit": 8,
-            "message_limit": 16
-        });
-        let request: SnapshotRequest = serde_json::from_value(legacy_request).unwrap();
-        assert!(request.include_sessions.is_empty());
-        assert_eq!(request, SnapshotRequest::new(id(2), Some(id(3)), 8, 16));
-        let encoded = serde_json::to_value(&request).unwrap();
-        assert!(
-            !encoded
-                .as_object()
-                .unwrap()
-                .contains_key("include_sessions")
-        );
-
-        let with_extras = SnapshotRequest {
-            include_sessions: vec![id(4), id(5)],
-            ..request
-        };
-        let encoded = serde_json::to_value(&with_extras).unwrap();
-        assert_eq!(encoded["include_sessions"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            serde_json::from_value::<SnapshotRequest>(encoded).unwrap(),
-            with_extras
-        );
-
-        let legacy_response = serde_json::json!({
-            "cursor": { "store_id": id::<StoreId>(1), "workspace_id": id::<WorkspaceId>(2), "sequence": 5 },
-            "workspace": { "id": id::<WorkspaceId>(2), "path": "/w" },
-            "sessions": [],
-            "has_older_sessions": false
-        });
-        let snapshot: WorkspaceSnapshot = serde_json::from_value(legacy_response).unwrap();
-        assert!(snapshot.included.is_empty());
-        assert!(
-            !serde_json::to_value(&snapshot)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .contains_key("included")
-        );
-    }
-
-    #[test]
     fn context_events_and_fields_round_trip_and_legacy_payloads_decode_to_none() {
         let updated = SessionEvent::RunContextUpdated {
             run_id: id(4),
@@ -2134,8 +1975,6 @@ mod tests {
 
         let finished = SessionEvent::RunFinished {
             session: SessionSummary {
-                activity: None,
-                spawned_by: None,
                 id: id(3),
                 workspace_id: id(2),
                 parent_id: None,
@@ -2311,9 +2150,7 @@ mod tests {
 
         // Adding request-shape identity to the nested descriptor breaks older
         // `deny_unknown_fields` clients, so negotiation rejects version 8 peers.
-        // Version 12 added optional `spawned_by`/`activity` on summaries and
-        // `include_sessions`/`included` on snapshots.
-        assert_eq!(crate::PROTOCOL_VERSION, 12);
+        assert_eq!(crate::PROTOCOL_VERSION, 11);
         let mut invalid = serde_json::to_value(&run).unwrap();
         invalid["resolved_model"]["future_control"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());

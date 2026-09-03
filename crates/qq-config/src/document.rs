@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     marker::PhantomData,
+    path::PathBuf,
 };
 
 use ron::{Options, extensions::Extensions};
@@ -1442,7 +1443,11 @@ impl MergeState {
         }
     }
 
-    pub(super) fn finish(self, reports: Vec<SourceReport>) -> Result<ConfigSnapshot, ConfigError> {
+    pub(super) fn finish(
+        self,
+        reports: Vec<SourceReport>,
+        probed_paths: Vec<PathBuf>,
+    ) -> Result<ConfigSnapshot, ConfigError> {
         let model = ModelRoute::parse(self.model.ok_or(ConfigError::ModelRequired)?)?;
         let worker_model = self.worker_model.map(ModelRoute::parse).transpose()?;
         let reviewer_model = self.reviewer_model.map(ModelRoute::parse).transpose()?;
@@ -1468,6 +1473,7 @@ impl MergeState {
             grants,
             reports,
             provenance: self.provenance,
+            probed_paths,
         })
     }
 }

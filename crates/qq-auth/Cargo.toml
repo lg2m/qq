@@ -11,6 +11,7 @@ base64.workspace = true
 directories.workspace = true
 getrandom.workspace = true
 keyring.workspace = true
+qq-protocol.workspace = true
 qq-provider.workspace = true
 reqwest.workspace = true
 ron.workspace = true

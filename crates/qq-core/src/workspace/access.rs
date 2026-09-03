@@ -111,7 +111,7 @@ pub(crate) fn blocking_permits() -> Arc<Semaphore> {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum WorkspacePathError {
+pub enum WorkspacePathError {
     #[error("path must not be empty")]
     Empty,
     #[error("path must be relative to the workspace")]

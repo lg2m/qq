@@ -118,7 +118,7 @@ async fn prepare_execution(
             .without_tools()
             .with_max_output_tokens(
                 loaded
-                    .resolved_model
+                    .resolved_model()
                     .max_output_tokens
                     .min(COMPACTION_OUTPUT_RESERVE_TOKENS),
             )
@@ -126,14 +126,15 @@ async fn prepare_execution(
         // A hard cost cap without pricing cannot be enforced. Reject it
         // before any provider work rather than pretend, exactly as the
         // headless adapter did before core owned the contract.
-        if claimed.limits.max_cost_usd_nanos.is_some() && loaded.resolved_model.pricing.is_none() {
+        if claimed.limits.max_cost_usd_nanos.is_some() && loaded.resolved_model().pricing.is_none()
+        {
             tool_cancellation.store(true, Ordering::Release);
             return Err(RunOutcome::Failed {
                 failure: RunFailure {
                     kind: RunFailureKind::Configuration,
                     message: format!(
                         "a cost budget cannot be enforced: model {} has no configured pricing",
-                        loaded.resolved_model.route
+                        loaded.resolved_model().route
                     ),
                 },
             });
@@ -151,7 +152,7 @@ async fn prepare_execution(
             };
             RunCapabilities::user(spawner)
         };
-        base.with_limits(claimed.limits, loaded.resolved_model.pricing.clone())
+        base.with_limits(claimed.limits, loaded.resolved_model().pricing.clone())
             .with_history(Arc::new(SessionHistorySearcher::new(
                 Arc::clone(inner),
                 claimed.session_id,
@@ -159,9 +160,11 @@ async fn prepare_execution(
             )))
     }
     .with_literal_slash(claimed.literal_slash);
-    let mut events = loaded.runtime.run_loop_with_spawner(
+    // The claimed workspace is the plan's workspace: the loader compiled the
+    // plan for exactly this session's canonical root, so no per-run
+    // canonicalization or directory open happens here.
+    let mut events = loaded.plan.execute(
         messages,
-        PathBuf::from(&claimed.workspace),
         Arc::clone(&tool_cancellation),
         gate,
         file_state,
@@ -188,7 +191,7 @@ async fn prepare_execution(
                 static_prefix,
                 mut weight,
             }) => {
-                let mut resolved_model = loaded.resolved_model.as_ref().clone();
+                let mut resolved_model = loaded.resolved_model().as_ref().clone();
                 // Internal compaction deliberately reserves a smaller output
                 // budget. Its immutable descriptor records the effective cap
                 // actually sent on every provider turn, not the model's
@@ -276,18 +279,21 @@ pub(super) async fn execute_run(
         return;
     }
 
-    if loaded.runtime.model.as_ref() != loaded.resolved_model.provider_model.as_str()
-        || loaded.runtime.max_output_tokens != loaded.resolved_model.max_output_tokens
-        || loaded.runtime.context_window() != loaded.resolved_model.context_window
-    {
+    // A compiled plan is built from its resolved model, so the two cannot
+    // disagree; the loader is still accountable for compiling the plan for
+    // this run's workspace.
+    if loaded.plan.workspace_path() != Path::new(&claimed.workspace) {
         finish_reserved_run(
             &inner,
             &claimed,
             RunOutcome::Failed {
                 failure: RunFailure {
                     kind: RunFailureKind::Configuration,
-                    message: "loaded runtime does not match its resolved model descriptor"
-                        .to_owned(),
+                    message: format!(
+                        "loaded plan was compiled for workspace {} but the run belongs to {}",
+                        loaded.plan.workspace_path().display(),
+                        claimed.workspace
+                    ),
                 },
             },
         )
@@ -304,7 +310,7 @@ pub(super) async fn execute_run(
                 }
             };
         let plan = context::plan(context::ContextInput {
-            context_window: loaded.resolved_model.context_window,
+            context_window: loaded.resolved_model().context_window,
             max_output_tokens: prepared.audit.weight.max_output_tokens,
             system_bytes: prepared.audit.weight.system_bytes,
             tool_schema_bytes: prepared.audit.weight.tool_schema_bytes,
@@ -546,7 +552,7 @@ async fn run_auto_compaction(
         }
     };
     let plan = context::plan(context::ContextInput {
-        context_window: loaded.resolved_model.context_window,
+        context_window: loaded.resolved_model().context_window,
         max_output_tokens: prepared.audit.weight.max_output_tokens,
         system_bytes: prepared.audit.weight.system_bytes,
         tool_schema_bytes: prepared.audit.weight.tool_schema_bytes,

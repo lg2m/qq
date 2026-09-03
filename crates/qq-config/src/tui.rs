@@ -5,7 +5,9 @@ use serde::Deserialize;
 
 use super::{
     ConfigError, ConfigLoader, SourceIdentity, SourceKind,
-    loader::{canonical_working_directory, discover_file, project_directories, read_candidate},
+    loader::{
+        Probes, canonical_working_directory, discover_file, project_directories, read_candidate,
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -298,17 +300,22 @@ where
     }];
 
     let mut candidates = Vec::new();
+    let mut probes = Probes::default();
     if let Some(global) = discover_file(
         loader.paths.global_dir.join("tui.ron"),
         SourceKind::Global,
         false,
+        &mut probes,
     )? {
         candidates.push(global);
     }
-    for directory in project_directories(&cwd) {
-        if let Some(project) =
-            discover_file(directory.join(".qq/tui.ron"), SourceKind::Project, false)?
-        {
+    for directory in project_directories(&cwd, &mut probes) {
+        if let Some(project) = discover_file(
+            directory.join(".qq/tui.ron"),
+            SourceKind::Project,
+            false,
+            &mut probes,
+        )? {
             candidates.push(project);
         }
     }

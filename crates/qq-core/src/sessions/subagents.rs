@@ -27,14 +27,12 @@ impl SessionSubagentSpawner {
 }
 
 impl SubagentSpawner for SessionSubagentSpawner {
-    fn spawn(&self, call_id: ToolCallId, task: String, model: Option<String>) -> SpawnAgentFuture {
+    fn spawn(&self, task: String, model: Option<String>) -> SpawnAgentFuture {
         let inner = Arc::clone(&self.inner);
         let parent = self.parent.clone();
         let slots = Arc::clone(&self.slots);
         let spawned = Arc::clone(&self.spawned);
-        Box::pin(async move {
-            spawn_child_run(inner, parent, call_id, slots, spawned, task, model).await
-        })
+        Box::pin(async move { spawn_child_run(inner, parent, slots, spawned, task, model).await })
     }
 }
 
@@ -61,7 +59,6 @@ fn spawn_error_with_cost(
 pub(super) async fn spawn_child_run(
     inner: Arc<SessionRuntimeInner>,
     parent: ClaimedRun,
-    call_id: ToolCallId,
     slots: Arc<Semaphore>,
     spawned: Arc<AtomicUsize>,
     task: String,
@@ -149,7 +146,7 @@ pub(super) async fn spawn_child_run(
     };
     let created = match inner
         .store
-        .create_child_run(&parent, call_id, selection, task, child_limits)
+        .create_child_run(&parent, selection, task, child_limits)
         .await
     {
         Ok(created) => created,

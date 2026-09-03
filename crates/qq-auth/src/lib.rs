@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use qq_protocol::CredentialEpoch;
 use qq_provider::SecretRef;
 
 mod codex;
@@ -399,7 +400,13 @@ impl CredentialStore {
         {
             match record.backend {
                 CredentialBackend::Keyring => match self.keyring.set(name, secret) {
-                    Ok(()) => return Ok(CredentialBackend::Keyring),
+                    Ok(()) => {
+                        // In-place rotation leaves the record unchanged, but
+                        // the index is still rewritten so the credential
+                        // epoch advances for every durable secret change.
+                        self.save_index(&index)?;
+                        return Ok(CredentialBackend::Keyring);
+                    }
                     Err(KeyringError::TooLarge) => {}
                     Err(KeyringError::Unavailable) if allow_file_fallback => {}
                     Err(KeyringError::Unavailable) => {
@@ -424,6 +431,7 @@ impl CredentialStore {
                     }
                     fallback.upsert(name, secret);
                     self.save_fallback(&fallback)?;
+                    self.save_index(&index)?;
                     return Ok(CredentialBackend::File);
                 }
                 CredentialBackend::File => {}
@@ -431,6 +439,7 @@ impl CredentialStore {
                     self.windows_protected
                         .set(name, secret)
                         .map_err(|error| windows_protected_auth_error(error, "store", name))?;
+                    self.save_index(&index)?;
                     return Ok(CredentialBackend::WindowsProtectedFile);
                 }
             }
@@ -524,6 +533,18 @@ impl CredentialStore {
         let _lock = self.lock_state()?;
         let index = self.load_index()?;
         Ok(index.records.into_iter().map(Into::into).collect())
+    }
+
+    /// The opaque epoch of the stored-credential set. Every durable `set`,
+    /// refresh, or `remove` advances it, so a caller that cached work derived
+    /// from resolved secrets can detect rotation by comparing epochs without
+    /// hashing or retaining secret material. A store with no index yet reports
+    /// [`CredentialEpoch::NONE`]. Environment and inline secrets are outside
+    /// the store and never move the epoch.
+    pub fn epoch(&self) -> Result<CredentialEpoch, AuthError> {
+        let _lock = self.lock_state()?;
+        let index = self.load_index()?;
+        Ok(CredentialEpoch::new(index.revision))
     }
 
     pub fn status(&self, name: &str) -> Result<Option<CredentialMetadata>, AuthError> {
@@ -1037,6 +1058,7 @@ impl CredentialStore {
     fn save_index(&self, state: &IndexState) -> Result<(), AuthError> {
         let mut state = state.clone();
         state.version = INDEX_STATE_VERSION;
+        state.revision = state.revision.wrapping_add(1);
         state.sort();
         let bytes = serialize_state(&state, self.paths.index_file())?;
         atomic_write(self.paths.index_file(), &bytes)
@@ -1277,6 +1299,11 @@ struct CredentialRecord {
 #[serde(deny_unknown_fields)]
 struct IndexState {
     version: u32,
+    /// Advanced by every durable index write. Indexes written before the
+    /// field existed load as revision zero, so the first mutation after an
+    /// upgrade still produces a strictly newer epoch.
+    #[serde(default)]
+    revision: u64,
     records: Vec<CredentialRecord>,
 }
 
@@ -1284,6 +1311,7 @@ impl Default for IndexState {
     fn default() -> Self {
         Self {
             version: INDEX_STATE_VERSION,
+            revision: 0,
             records: Vec::new(),
         }
     }

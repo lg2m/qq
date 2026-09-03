@@ -1,9 +1,9 @@
 //! Application configuration to model-runtime composition.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use qq_auth::{AuthError, CredentialStore, Secret, resolve_provider_credential};
@@ -14,28 +14,34 @@ use qq_config::{
 };
 use qq_core::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, ReviewFuture,
-    ReviewRequest, ReviewVerdict, Runtime, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture,
+    ReviewRequest, ReviewVerdict, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture,
     RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
     SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
     WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    plan::{
+        AgentProfile, CompiledAgentPlan, CredentialReference, PlanCompileError, ProviderDescriptor,
+        SourceFingerprint,
+    },
 };
 use qq_protocol::{
     ApprovalGrant, CapabilitySupport, CommandRequest, GenerationCapabilities, ModelCatalogRequest,
-    ModelDescriptor, PromptCacheCapabilities, ProviderRequestShapeIdentity,
+    ModelDescriptor, ModelSelection, PromptCacheCapabilities, ProviderRequestShapeIdentity,
     ProviderRequestShapeVersion, ResolvedModel, ResolvedModelVersion, RunFailureKind,
     SnapshotRequest, SubscribeRequest, WorkspaceGrantOutcome,
 };
 use qq_provider::{
     BedrockAuth as ProviderBedrockAuth, EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe,
-    ProviderCompiler, ProviderError, ProviderRecipe,
+    ProviderCompiler, ProviderError, ProviderRecipe, SecretRef,
 };
 use qq_server::{CommandFuture, ModelsFuture, ServerHandler, ServerHandlerError, SnapshotFuture};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::catalog::{DiscoveredModel, ModelDiscovery};
+use crate::{
+    catalog::{DiscoveredModel, ModelDiscovery},
+    plan::{CompiledGeneration, PlanCache, PlanCacheError, PlanCacheLimits, PlanKey, PlanLookup},
+};
 
-const MAX_CACHED_RUNTIMES: usize = 16;
 const MAX_MODEL_OPTIONS: usize = 4_096;
 const MAX_DISCOVERY_PROVIDERS: usize = 4;
 
@@ -50,7 +56,7 @@ struct RuntimeFactoryInner {
     providers: ProviderCompiler,
     discovery: ModelDiscovery,
     mcp: crate::mcp::McpRegistryCache,
-    cache: Mutex<VecDeque<(RuntimeKey, Arc<Runtime>)>>,
+    plans: PlanCache,
 }
 
 impl RuntimeFactory {
@@ -69,7 +75,7 @@ impl RuntimeFactory {
                 providers: ProviderCompiler::new()?,
                 discovery: ModelDiscovery::new()?,
                 mcp: crate::mcp::McpRegistryCache::new(),
-                cache: Mutex::new(VecDeque::new()),
+                plans: PlanCache::new(PlanCacheLimits::default()),
             }),
         })
     }
@@ -428,87 +434,108 @@ impl RuntimeFactory {
         )
     }
 
-    pub fn runtime_for(&self, request: &LoadRequest) -> Result<Arc<Runtime>, RuntimeBuildError> {
+    /// Compiles (or returns the cached) plan for a load request. Blocking:
+    /// performs configuration, credential, provider, and workspace work on
+    /// the calling thread.
+    pub fn plan_for(
+        &self,
+        request: &LoadRequest,
+    ) -> Result<Arc<CompiledAgentPlan>, RuntimeBuildError> {
+        self.plan_with_lookup(request).map(|(plan, _)| plan)
+    }
+
+    /// [`Self::plan_for`] plus how the plan was obtained, for tests and
+    /// benchmarks that assert cache behavior.
+    pub fn plan_with_lookup(
+        &self,
+        request: &LoadRequest,
+    ) -> Result<(Arc<CompiledAgentPlan>, PlanLookup), RuntimeBuildError> {
+        let workspace = qq_config::canonical_working_directory(request.cwd())?;
+        let key = PlanKey {
+            workspace: workspace.clone(),
+            model: ModelSelection {
+                model: request.overrides().model().map(str::to_owned),
+                max_output_tokens: request.overrides().max_output_tokens(),
+                organization: request.overrides().organization().map(str::to_owned),
+            },
+            explicit_config_path: request.explicit_path().map(Path::to_owned),
+            explicit_config_content: request.explicit_content().map(str::to_owned),
+        };
+        let lookup = self
+            .inner
+            .plans
+            .load(key, || self.compile_generation(request, &workspace));
+        match lookup {
+            Ok(result) => Ok(result),
+            Err(PlanCacheError::Compile(error)) => Err(error),
+            Err(PlanCacheError::Capacity { .. }) => Err(RuntimeBuildError::PlanCacheFull),
+            Err(PlanCacheError::ShutDown) => Err(RuntimeBuildError::PlanCacheShutDown),
+            Err(PlanCacheError::Poisoned) => Err(RuntimeBuildError::CacheUnavailable),
+        }
+    }
+
+    /// Stops the plan cache. Active runs keep the plans they hold.
+    pub fn shutdown_plans(&self) {
+        self.inner.plans.shutdown();
+    }
+
+    /// One full compile: configuration load, credential epoch, resolved
+    /// model, provider recipe and descriptor, MCP registry, spawn routes, and
+    /// the workspace itself. Also returns every filesystem source whose state
+    /// decided the result so the cache can revalidate without repeating it.
+    fn compile_generation(
+        &self,
+        request: &LoadRequest,
+        workspace: &Path,
+    ) -> Result<CompiledGeneration, RuntimeBuildError> {
+        // The credential index is fingerprinted before secrets are read so a
+        // rotation racing this compile is observed on the next lookup.
+        let credential_index =
+            SourceFingerprint::capture(self.inner.credentials.paths().index_file());
+        let epoch = self.inner.credentials.epoch()?;
         let snapshot = self.load(request)?;
-        self.runtime_for_snapshot(&snapshot)
-    }
-
-    pub fn runtime_for_snapshot(
-        &self,
-        snapshot: &ConfigSnapshot,
-    ) -> Result<Arc<Runtime>, RuntimeBuildError> {
-        let resolved_model = self.resolved_model_for_snapshot(snapshot)?;
-        self.runtime_with_key_for_snapshot(snapshot, &resolved_model)
-            .map(|(runtime, _)| runtime)
-    }
-
-    fn runtime_with_key_for_snapshot(
-        &self,
-        snapshot: &ConfigSnapshot,
-        resolved_model: &ResolvedModel,
-    ) -> Result<(Arc<Runtime>, RuntimeKey), RuntimeBuildError> {
+        let resolved_model = self.resolved_model_for_snapshot(&snapshot)?;
         let provider_id = snapshot.model().provider();
         let provider_config = snapshot
             .providers()
             .get(provider_id)
             .ok_or_else(|| RuntimeBuildError::UnknownProvider(provider_id.to_owned()))?;
-        let (recipe, provider_key) =
+        let (recipe, descriptor) =
             self.prepare_provider(provider_id, snapshot.model().model(), provider_config)?;
-        // Configured MCP servers ride the runtime: the shared registry (one
-        // client per server, cached by declaration digest) attaches here, and
-        // its digest joins the cache key so declaration changes rebuild.
-        let mcp = self
-            .inner
-            .mcp
-            .registry_for_snapshot(&self.inner.credentials, snapshot)?;
-        let (mcp_registry, mcp_key) = match mcp {
-            Some((registry, key)) => (Some(registry), key),
-            None => (None, Vec::new()),
-        };
-        let key = RuntimeKey::new(
-            provider_id,
-            &resolved_model.provider_model,
-            resolved_model.max_output_tokens,
-            resolved_model.context_window,
-            &provider_key,
-            &mcp_key,
-        );
-
+        let provider = self.inner.providers.compile(recipe)?;
+        let spawn_model_routes = self
+            .configured_model_options(&snapshot)
+            .into_iter()
+            .filter_map(|model| model.selection.model)
+            .collect();
+        let provenance = snapshot
+            .source_reports()
+            .iter()
+            .map(|report| report.source().label().to_owned())
+            .collect();
+        let mut profile =
+            AgentProfile::new(provider, descriptor, resolved_model, workspace.to_owned())
+                .with_spawn_model_routes(spawn_model_routes)
+                .with_provenance(provenance)
+                .with_credential_epoch(epoch);
+        if let Some(wired) =
+            self.inner
+                .mcp
+                .registry_for_snapshot(&self.inner.credentials, epoch, &snapshot)?
         {
-            let mut cache = self
-                .inner
-                .cache
-                .lock()
-                .map_err(|_| RuntimeBuildError::CacheUnavailable)?;
-            if let Some(runtime) = promote_cached_runtime(&mut cache, &key) {
-                return Ok((runtime, key));
-            }
+            profile = profile.with_mcp(wired.registry, wired.servers);
         }
-
-        let mut runtime = Runtime::with_provider(
-            self.inner.providers.compile(recipe)?,
-            resolved_model.provider_model.clone(),
-            resolved_model.max_output_tokens,
-        )?
-        .with_context_window(resolved_model.context_window);
-        if let Some(registry) = mcp_registry {
-            runtime = runtime.with_mcp_registry(registry);
-        }
-        let runtime = Arc::new(runtime);
-
-        let mut cache = self
-            .inner
-            .cache
-            .lock()
-            .map_err(|_| RuntimeBuildError::CacheUnavailable)?;
-        if let Some(existing) = promote_cached_runtime(&mut cache, &key) {
-            return Ok((existing, key));
-        }
-        cache.push_back((key.clone(), Arc::clone(&runtime)));
-        while cache.len() > MAX_CACHED_RUNTIMES {
-            cache.pop_front();
-        }
-        Ok((runtime, key))
+        let plan = CompiledAgentPlan::compile_blocking(profile)?;
+        let mut sources = Vec::with_capacity(snapshot.probed_paths().len() + 3);
+        sources.push(credential_index);
+        sources.extend(
+            snapshot
+                .probed_paths()
+                .iter()
+                .map(SourceFingerprint::capture),
+        );
+        sources.extend(plan.instruction_sources().iter().cloned());
+        Ok(CompiledGeneration { plan, sources })
     }
 
     fn resolved_model_for_snapshot(
@@ -600,7 +627,7 @@ impl RuntimeFactory {
         provider_id: &str,
         model_id: &str,
         config: &ProviderConfig,
-    ) -> Result<(ProviderRecipe, Vec<u8>), RuntimeBuildError> {
+    ) -> Result<(ProviderRecipe, ProviderDescriptor), RuntimeBuildError> {
         let access = config
             .access()
             .ok_or_else(|| RuntimeBuildError::IncompleteProvider(provider_id.to_owned()))?;
@@ -621,53 +648,81 @@ impl RuntimeFactory {
         provider_id: &str,
         access: &HttpAccess,
         api: ProviderApi,
-    ) -> Result<(ProviderRecipe, Vec<u8>), RuntimeBuildError> {
-        let prepared_auth = match access.auth() {
+    ) -> Result<(ProviderRecipe, ProviderDescriptor), RuntimeBuildError> {
+        let (auth, auth_scheme, credential) = match access.auth() {
             HttpCredential::Configured(auth) => {
-                PreparedHttpAuth::Static(self.resolve_http_auth(auth, access.endpoint())?)
+                let (scheme, credential) = match auth {
+                    ProviderAuth::NoAuth => ("none".to_owned(), CredentialReference::None),
+                    ProviderAuth::ApiKey(reference) => {
+                        ("api_key".to_owned(), credential_reference(reference))
+                    }
+                    ProviderAuth::Bearer(reference) => {
+                        ("bearer".to_owned(), credential_reference(reference))
+                    }
+                    ProviderAuth::Header(name, reference) => {
+                        (format!("header:{name}"), credential_reference(reference))
+                    }
+                };
+                (
+                    self.resolve_http_auth(auth, access.endpoint())?
+                        .into_http()?,
+                    scheme,
+                    credential,
+                )
             }
             HttpCredential::ApiKey {
                 explicit,
                 stored_name,
                 environment_variable,
                 audience,
-            } => PreparedHttpAuth::Static(ResolvedAuth::ApiKey(resolve_provider_credential(
-                &self.inner.credentials,
-                explicit.as_ref(),
-                stored_name,
-                environment_variable,
-                Some(audience),
-            )?)),
+            } => {
+                let secret = resolve_provider_credential(
+                    &self.inner.credentials,
+                    explicit.as_ref(),
+                    stored_name,
+                    environment_variable,
+                    Some(audience),
+                )?;
+                // Built-in providers try the explicit reference, then the
+                // stored name, then the environment variable; the descriptor
+                // names the source that actually applies.
+                let credential = match explicit {
+                    Some(reference) => credential_reference(reference),
+                    None => {
+                        if self.inner.credentials.is_registered(stored_name)? {
+                            CredentialReference::Stored((*stored_name).to_owned())
+                        } else {
+                            CredentialReference::Environment(environment_variable.to_string())
+                        }
+                    }
+                };
+                (
+                    ResolvedAuth::ApiKey(secret).into_http()?,
+                    "api_key".to_owned(),
+                    credential,
+                )
+            }
             HttpCredential::OpenAiCodex { profile } => {
                 let profile = profile.as_deref().unwrap_or("default");
-                PreparedHttpAuth::RequestTime {
-                    auth: HttpAuth::RequestTimeCodex(
+                (
+                    HttpAuth::RequestTimeCodex(
                         self.inner.credentials.codex_request_credentials(profile),
                     ),
-                    key_auth: ResolvedAuth::NoAuth,
-                    identity: vec![("credential-profile".to_owned(), profile.to_owned())],
-                }
+                    "codex".to_owned(),
+                    CredentialReference::Profile(profile.to_owned()),
+                )
             }
             HttpCredential::XAi { api_key, profile } => {
                 let profile = profile.as_deref().unwrap_or("default");
-                let key_auth = match api_key.as_ref() {
-                    Some(reference) => {
-                        ResolvedAuth::Bearer(self.inner.credentials.resolve_with_endpoint(
-                            reference,
-                            Some(qq_config::XAI_CREDENTIAL_ENDPOINT),
-                        )?)
-                    }
-                    None => ResolvedAuth::NoAuth,
-                };
-                PreparedHttpAuth::RequestTime {
-                    auth: HttpAuth::RequestTimeBearer(
+                (
+                    HttpAuth::RequestTimeBearer(
                         self.inner
                             .credentials
                             .xai_request_credentials(profile, api_key.clone()),
                     ),
-                    key_auth,
-                    identity: vec![("credential-profile".to_owned(), profile.to_owned())],
-                }
+                    "bearer".to_owned(),
+                    CredentialReference::Profile(profile.to_owned()),
+                )
             }
         };
         let headers = access
@@ -679,18 +734,16 @@ impl RuntimeFactory {
             EndpointMode::Base => "base",
             EndpointMode::Exact => "exact",
         };
-        let mut key_headers = headers.clone();
-        key_headers.extend(prepared_auth.identity().iter().cloned());
-        let key = provider_key(
-            provider_id,
-            access.endpoint(),
-            endpoint_mode,
-            provider_api_name(api),
-            prepared_auth.key_auth(),
-            key_headers
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-        );
+        let descriptor = ProviderDescriptor {
+            id: provider_id.to_owned(),
+            api: provider_api_name(api).to_owned(),
+            endpoint: Some(describe_endpoint(access.endpoint())),
+            endpoint_mode: Some(endpoint_mode.to_owned()),
+            auth_scheme,
+            credential,
+            header_names: access.headers().keys().cloned().collect(),
+            region: None,
+        };
         let protocol = http_protocol(provider_id, api)?;
         let allow_http = access
             .endpoint()
@@ -701,10 +754,9 @@ impl RuntimeFactory {
             EndpointMode::Exact => EndpointSpec::exact(access.endpoint(), allow_http),
         };
         let recipe = ProviderRecipe::http(
-            HttpProviderRecipe::new(endpoint, protocol, prepared_auth.into_http()?)
-                .with_headers(headers),
+            HttpProviderRecipe::new(endpoint, protocol, auth).with_headers(headers),
         );
-        Ok((recipe, key))
+        Ok((recipe, descriptor))
     }
 
     fn prepare_bedrock_provider(
@@ -712,58 +764,24 @@ impl RuntimeFactory {
         provider_id: &str,
         region: Option<&str>,
         auth: &BedrockAuth,
-    ) -> Result<(ProviderRecipe, Vec<u8>), RuntimeBuildError> {
+    ) -> Result<(ProviderRecipe, ProviderDescriptor), RuntimeBuildError> {
         let credential_endpoint =
             region.map(|region| format!("https://bedrock-runtime.{region}.amazonaws.com"));
-        let key_endpoint = credential_endpoint
-            .as_deref()
-            .unwrap_or("aws-region-provider-chain");
-
-        let (auth, key) = match auth {
-            BedrockAuth::Aws(AwsAuth::DefaultChain) => {
-                let key = provider_key(
-                    provider_id,
-                    key_endpoint,
-                    "aws",
-                    "bedrock_converse",
-                    &ResolvedAuth::NoAuth,
-                    [("aws-auth", "default-chain")],
-                );
-                (ProviderBedrockAuth::DefaultChain, key)
-            }
-            BedrockAuth::Aws(AwsAuth::Profile(profile)) => {
-                let key = provider_key(
-                    provider_id,
-                    key_endpoint,
-                    "aws",
-                    "bedrock_converse",
-                    &ResolvedAuth::NoAuth,
-                    [("aws-auth", "profile"), ("aws-profile", profile)],
-                );
-                (ProviderBedrockAuth::Profile(profile.clone()), key)
-            }
-            BedrockAuth::ApiKey(reference) => {
-                let secret = self
-                    .inner
-                    .credentials
-                    .resolve_with_endpoint(reference, credential_endpoint.as_deref())?;
-                let api_key = secret.expose_secret_str()?.to_owned();
-                let key_auth = ResolvedAuth::ApiKey(secret);
-                let key = provider_key(
-                    provider_id,
-                    key_endpoint,
-                    "aws",
-                    "bedrock_converse",
-                    &key_auth,
-                    std::iter::empty::<(&str, &str)>(),
-                );
-                (ProviderBedrockAuth::ApiKey(api_key.into()), key)
-            }
+        let (auth, auth_scheme, credential) =
+            self.prepare_bedrock_auth(auth, credential_endpoint.as_deref())?;
+        let descriptor = ProviderDescriptor {
+            id: provider_id.to_owned(),
+            api: "bedrock_converse".to_owned(),
+            endpoint: None,
+            endpoint_mode: None,
+            auth_scheme,
+            credential,
+            header_names: Vec::new(),
+            region: region.map(str::to_owned),
         };
-
         Ok((
             ProviderRecipe::amazon_bedrock(region.map(str::to_owned), auth),
-            key,
+            descriptor,
         ))
     }
 
@@ -773,7 +791,7 @@ impl RuntimeFactory {
         region: Option<&str>,
         api: ProviderApi,
         auth: &BedrockAuth,
-    ) -> Result<(ProviderRecipe, Vec<u8>), RuntimeBuildError> {
+    ) -> Result<(ProviderRecipe, ProviderDescriptor), RuntimeBuildError> {
         let protocol = match api {
             ProviderApi::OpenAiResponses => HttpProtocol::OpenAiResponses,
             ProviderApi::OpenAiChatCompletions => HttpProtocol::OpenAiChatCompletions,
@@ -787,57 +805,52 @@ impl RuntimeFactory {
         };
         let credential_endpoint =
             region.map(|region| format!("https://bedrock-mantle.{region}.api.aws"));
-        let key_endpoint = credential_endpoint
-            .as_deref()
-            .unwrap_or("aws-region-provider-chain");
-        let api_name = provider_api_name(api);
+        let (auth, auth_scheme, credential) =
+            self.prepare_bedrock_auth(auth, credential_endpoint.as_deref())?;
+        let descriptor = ProviderDescriptor {
+            id: provider_id.to_owned(),
+            api: provider_api_name(api).to_owned(),
+            endpoint: None,
+            endpoint_mode: None,
+            auth_scheme,
+            credential,
+            header_names: Vec::new(),
+            region: region.map(str::to_owned),
+        };
+        Ok((
+            ProviderRecipe::amazon_bedrock_mantle(region.map(str::to_owned), protocol, auth),
+            descriptor,
+        ))
+    }
 
-        let (auth, key) = match auth {
-            BedrockAuth::Aws(AwsAuth::DefaultChain) => {
-                let key = provider_key(
-                    provider_id,
-                    key_endpoint,
-                    "aws",
-                    api_name,
-                    &ResolvedAuth::NoAuth,
-                    [("aws-auth", "default-chain")],
-                );
-                (ProviderBedrockAuth::DefaultChain, key)
-            }
-            BedrockAuth::Aws(AwsAuth::Profile(profile)) => {
-                let key = provider_key(
-                    provider_id,
-                    key_endpoint,
-                    "aws",
-                    api_name,
-                    &ResolvedAuth::NoAuth,
-                    [("aws-auth", "profile"), ("aws-profile", profile)],
-                );
-                (ProviderBedrockAuth::Profile(profile.clone()), key)
-            }
+    fn prepare_bedrock_auth(
+        &self,
+        auth: &BedrockAuth,
+        credential_endpoint: Option<&str>,
+    ) -> Result<(ProviderBedrockAuth, String, CredentialReference), RuntimeBuildError> {
+        Ok(match auth {
+            BedrockAuth::Aws(AwsAuth::DefaultChain) => (
+                ProviderBedrockAuth::DefaultChain,
+                "sigv4".to_owned(),
+                CredentialReference::AmbientChain,
+            ),
+            BedrockAuth::Aws(AwsAuth::Profile(profile)) => (
+                ProviderBedrockAuth::Profile(profile.clone()),
+                "sigv4".to_owned(),
+                CredentialReference::Profile(profile.clone()),
+            ),
             BedrockAuth::ApiKey(reference) => {
                 let secret = self
                     .inner
                     .credentials
-                    .resolve_with_endpoint(reference, credential_endpoint.as_deref())?;
-                let api_key = secret.expose_secret_str()?.to_owned();
-                let key_auth = ResolvedAuth::ApiKey(secret);
-                let key = provider_key(
-                    provider_id,
-                    key_endpoint,
-                    "aws",
-                    api_name,
-                    &key_auth,
-                    std::iter::empty::<(&str, &str)>(),
-                );
-                (ProviderBedrockAuth::ApiKey(api_key.into()), key)
+                    .resolve_with_endpoint(reference, credential_endpoint)?;
+                (
+                    ProviderBedrockAuth::ApiKey(secret.expose_secret_str()?.to_owned().into()),
+                    "api_key".to_owned(),
+                    credential_reference(reference),
+                )
             }
-        };
-
-        Ok((
-            ProviderRecipe::amazon_bedrock_mantle(region.map(str::to_owned), protocol, auth),
-            key,
-        ))
+        })
     }
 
     fn resolve_http_auth(
@@ -994,25 +1007,8 @@ impl RuntimeLoader for RuntimeFactory {
                     overrides = overrides.with_organization(organization);
                 }
                 load = load.with_overrides(overrides);
-                let snapshot = factory.load(&load)?;
-                let resolved_model = Arc::new(factory.resolved_model_for_snapshot(&snapshot)?);
-                let spawn_model_routes = factory
-                    .configured_model_options(&snapshot)
-                    .into_iter()
-                    .filter_map(|model| model.selection.model)
-                    .collect();
-                let runtime = Arc::new(
-                    factory
-                        .runtime_with_key_for_snapshot(&snapshot, &resolved_model)?
-                        .0
-                        .as_ref()
-                        .clone()
-                        .with_spawn_model_routes(spawn_model_routes),
-                );
-                Ok::<_, RuntimeBuildError>(LoadedRuntime {
-                    runtime,
-                    resolved_model,
-                })
+                let plan = factory.plan_for(&load)?;
+                Ok::<_, RuntimeBuildError>(LoadedRuntime { plan })
             })
             .await;
             match build {
@@ -1255,18 +1251,6 @@ fn parse_reviewer_verdict(text: &str) -> ReviewVerdict {
     }
 }
 
-fn promote_cached_runtime(
-    cache: &mut VecDeque<(RuntimeKey, Arc<Runtime>)>,
-    key: &RuntimeKey,
-) -> Option<Arc<Runtime>> {
-    let index = cache.iter().position(|(candidate, _)| candidate == key)?;
-    let (cached_key, runtime) = cache
-        .remove(index)
-        .expect("a located runtime cache entry must exist");
-    cache.push_back((cached_key, Arc::clone(&runtime)));
-    Some(runtime)
-}
-
 enum ResolvedAuth {
     NoAuth,
     ApiKey(Secret),
@@ -1274,35 +1258,36 @@ enum ResolvedAuth {
     Header(String, Secret),
 }
 
-enum PreparedHttpAuth {
-    Static(ResolvedAuth),
-    RequestTime {
-        auth: HttpAuth,
-        key_auth: ResolvedAuth,
-        identity: Vec<(String, String)>,
-    },
+/// The secret-free reference a configured secret resolves through.
+fn credential_reference(reference: &SecretRef) -> CredentialReference {
+    match reference {
+        SecretRef::Env(name) => CredentialReference::Environment(name.clone()),
+        SecretRef::Stored(name) => CredentialReference::Stored(name.clone()),
+        SecretRef::Value(_) => CredentialReference::Inline,
+    }
 }
 
-impl PreparedHttpAuth {
-    fn key_auth(&self) -> &ResolvedAuth {
-        match self {
-            Self::Static(auth) => auth,
-            Self::RequestTime { key_auth, .. } => key_auth,
+/// An endpoint reduced to scheme, host, port, and path. Userinfo, query, and
+/// fragment can carry credentials and are dropped; an unparseable endpoint is
+/// described only by its scheme so no raw bytes leak into a descriptor.
+pub(crate) fn describe_endpoint(endpoint: &str) -> String {
+    match reqwest::Url::parse(endpoint) {
+        Ok(url) => {
+            let mut described = format!("{}://", url.scheme());
+            if let Some(host) = url.host_str() {
+                described.push_str(host);
+            }
+            if let Some(port) = url.port() {
+                described.push(':');
+                described.push_str(&port.to_string());
+            }
+            described.push_str(url.path());
+            described
         }
-    }
-
-    fn identity(&self) -> &[(String, String)] {
-        match self {
-            Self::Static(_) => &[],
-            Self::RequestTime { identity, .. } => identity,
-        }
-    }
-
-    fn into_http(self) -> Result<HttpAuth, AuthError> {
-        match self {
-            Self::Static(auth) => auth.into_http(),
-            Self::RequestTime { auth, .. } => Ok(auth),
-        }
+        Err(_) => endpoint.split_once("://").map_or_else(
+            || "unparseable".to_owned(),
+            |(scheme, _)| format!("{scheme}://<unparseable>"),
+        ),
     }
 }
 
@@ -1314,25 +1299,6 @@ impl ResolvedAuth {
             Self::Bearer(secret) => Ok(HttpAuth::Bearer(secret.expose_secret_str()?.into())),
             Self::Header(name, secret) => {
                 Ok(HttpAuth::Header(name, secret.expose_secret_str()?.into()))
-            }
-        }
-    }
-
-    fn update_digest(&self, digest: &mut Sha256) {
-        match self {
-            Self::NoAuth => update_digest(digest, b"no_auth"),
-            Self::ApiKey(secret) => {
-                update_digest(digest, b"api_key");
-                update_digest(digest, secret.expose_secret_bytes());
-            }
-            Self::Bearer(secret) => {
-                update_digest(digest, b"bearer");
-                update_digest(digest, secret.expose_secret_bytes());
-            }
-            Self::Header(name, secret) => {
-                update_digest(digest, b"header");
-                update_digest(digest, name.as_bytes());
-                update_digest(digest, secret.expose_secret_bytes());
             }
         }
     }
@@ -1368,7 +1334,10 @@ impl RuntimeHandler {
     /// Gracefully stops the durable runtime after its serving adapter has
     /// stopped accepting new requests.
     pub async fn shutdown(&self) -> Result<(), RuntimeHandlerError> {
+        // Runs settle first so every active plan is released before the
+        // cache stops admitting; a plan a run still holds stays valid.
         self.durable.shutdown().await?;
+        self.factory.shutdown_plans();
         Ok(())
     }
 
@@ -1609,65 +1578,9 @@ fn http_protocol(provider: &str, api: ProviderApi) -> Result<HttpProtocol, Runti
     }
 }
 
-fn provider_key<'a>(
-    provider: &str,
-    endpoint: &str,
-    endpoint_mode: &str,
-    api: &str,
-    auth: &ResolvedAuth,
-    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Vec<u8> {
-    let mut digest = Sha256::new();
-    update_digest(&mut digest, provider.as_bytes());
-    update_digest(&mut digest, endpoint.as_bytes());
-    update_digest(&mut digest, endpoint_mode.as_bytes());
-    update_digest(&mut digest, api.as_bytes());
-    auth.update_digest(&mut digest);
-    for (name, value) in headers {
-        update_digest(&mut digest, name.as_bytes());
-        update_digest(&mut digest, value.as_bytes());
-    }
-    digest.finalize().to_vec()
-}
-
 fn update_digest(digest: &mut Sha256, value: &[u8]) {
     digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     digest.update(value);
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct RuntimeKey([u8; 32]);
-
-impl RuntimeKey {
-    fn new(
-        provider: &str,
-        model: &str,
-        max_output_tokens: u32,
-        context_window: Option<u32>,
-        provider_key: &[u8],
-        mcp_key: &[u8],
-    ) -> Self {
-        let mut digest = Sha256::new();
-        update_digest(&mut digest, provider.as_bytes());
-        update_digest(&mut digest, model.as_bytes());
-        digest.update(max_output_tokens.to_le_bytes());
-        match context_window {
-            Some(context_window) => {
-                digest.update([1]);
-                digest.update(context_window.to_le_bytes());
-            }
-            None => digest.update([0]),
-        }
-        update_digest(&mut digest, provider_key);
-        update_digest(&mut digest, mcp_key);
-        Self(digest.finalize().into())
-    }
-}
-
-impl std::fmt::Debug for RuntimeKey {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RuntimeKey([REDACTED])")
-    }
 }
 
 #[derive(Debug, Error)]
@@ -1702,6 +1615,12 @@ pub enum RuntimeBuildError {
     Mcp(#[from] qq_mcp::McpConfigError),
     #[error("runtime cache is unavailable")]
     CacheUnavailable,
+    #[error("plan cache is full: every cached plan is held by an active run")]
+    PlanCacheFull,
+    #[error("plan cache has been shut down")]
+    PlanCacheShutDown,
+    #[error(transparent)]
+    Plan(#[from] PlanCompileError),
     #[error(transparent)]
     CatalogClientUnavailable(#[from] crate::catalog::ModelDiscoveryError),
 }
@@ -1739,7 +1658,11 @@ impl RuntimeBuildError {
             | Self::IncompleteProvider(_)
             | Self::UnsupportedApi { .. }
             | Self::UnrepresentableOutputLimit { .. } => RunFailureKind::ProviderConfiguration,
-            Self::CacheUnavailable | Self::CatalogClientUnavailable(_) => RunFailureKind::Server,
+            Self::Plan(_) => RunFailureKind::Configuration,
+            Self::CacheUnavailable
+            | Self::PlanCacheFull
+            | Self::PlanCacheShutDown
+            | Self::CatalogClientUnavailable(_) => RunFailureKind::Server,
         }
     }
 }
@@ -1762,6 +1685,7 @@ mod tests {
     use futures_util::stream;
     use qq_auth::{CredentialPaths, KeyringBackend, KeyringError};
     use qq_config::{ConfigPaths, ProviderKind, RuntimeOverrides, UsageType};
+    use qq_core::Runtime;
     use qq_protocol::{
         CommandId, CommandOutcome, ModelSelection, RunId, RunPromptIdentity, RunStatus,
         SessionCommand, SessionId, WorkspaceId,
@@ -1879,12 +1803,12 @@ mod tests {
     }
 
     impl RuntimeLoader for FixedRuntimeLoader {
-        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             let runtime = Arc::clone(&self.runtime);
             Box::pin(async move {
-                Ok(LoadedRuntime {
-                    runtime,
-                    resolved_model: Arc::new(ResolvedModel {
+                LoadedRuntime::compile_blocking(
+                    &runtime,
+                    ResolvedModel {
                         version: ResolvedModelVersion::new(1).unwrap(),
                         request_shape: None,
                         route: "test/model".to_owned(),
@@ -1903,7 +1827,12 @@ mod tests {
                             cache_read_usage: false,
                             cache_write_usage: false,
                         },
-                    }),
+                    },
+                    PathBuf::from(request.workspace),
+                )
+                .map_err(|error| RuntimeLoadError {
+                    kind: RunFailureKind::Configuration,
+                    message: error.to_string(),
                 })
             })
         }
@@ -1921,7 +1850,6 @@ mod tests {
                     .snapshot(SnapshotRequest {
                         workspace_id,
                         focused_session_id: Some(session_id),
-                        include_sessions: Vec::new(),
                         session_limit: 8,
                         message_limit: 32,
                     })
@@ -3169,7 +3097,7 @@ mod tests {
                 )"#
             ));
             factory
-                .runtime_for(&request)
+                .plan_for(&request)
                 .unwrap_or_else(|error| panic!("failed to construct {api}: {error}"));
         }
 
@@ -3185,7 +3113,7 @@ mod tests {
                 },
             )"#,
         );
-        factory.runtime_for(&anthropic).unwrap();
+        factory.plan_for(&anthropic).unwrap();
 
         let google = fixture.request(
             r#"(
@@ -3199,7 +3127,7 @@ mod tests {
                 },
             )"#,
         );
-        factory.runtime_for(&google).unwrap();
+        factory.plan_for(&google).unwrap();
     }
 
     #[test]
@@ -3217,7 +3145,7 @@ mod tests {
                     }},
                 )"#
             ));
-            factory.runtime_for(&request).unwrap();
+            factory.plan_for(&request).unwrap();
         }
     }
 
@@ -3241,7 +3169,7 @@ mod tests {
             )"#,
         );
 
-        fixture.factory().runtime_for(&request).unwrap();
+        fixture.factory().plan_for(&request).unwrap();
     }
 
     #[test]
@@ -3295,8 +3223,8 @@ mod tests {
             )"#,
         );
 
-        let first = factory.runtime_for(&request).unwrap();
-        let second = factory.runtime_for(&request).unwrap();
+        let first = factory.plan_for(&request).unwrap();
+        let second = factory.plan_for(&request).unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -3329,9 +3257,9 @@ mod tests {
             ))
         };
 
-        let first = factory.runtime_for(&request(32_768)).unwrap();
-        let reused = factory.runtime_for(&request(32_768)).unwrap();
-        let changed = factory.runtime_for(&request(65_536)).unwrap();
+        let first = factory.plan_for(&request(32_768)).unwrap();
+        let reused = factory.plan_for(&request(32_768)).unwrap();
+        let changed = factory.plan_for(&request(65_536)).unwrap();
 
         assert!(Arc::ptr_eq(&first, &reused));
         assert!(!Arc::ptr_eq(&first, &changed));
@@ -3364,11 +3292,8 @@ mod tests {
                 },
             )"#,
         );
-        let runtime = factory.runtime_for(&request).unwrap();
-        let mut events = runtime.run_in_workspace(
-            qq_protocol::RunCommand::new("this cannot fit"),
-            fixture.path("work"),
-        );
+        let plan = factory.plan_for(&request).unwrap();
+        let mut events = plan.run(qq_protocol::RunCommand::new("this cannot fit"));
         let mut failure = None;
         while let Some(event) = events.next().await {
             if let qq_protocol::RunEvent::Failed { kind, message } = event {
@@ -3407,7 +3332,7 @@ mod tests {
             ));
 
             factory
-                .runtime_for(&request)
+                .plan_for(&request)
                 .unwrap_or_else(|error| panic!("failed to construct {provider}: {error}"));
         }
     }
@@ -3443,7 +3368,7 @@ mod tests {
                     )"#
                 ));
 
-                factory.runtime_for(&request).unwrap_or_else(|error| {
+                factory.plan_for(&request).unwrap_or_else(|error| {
                     panic!("failed to construct Mantle {api}/{auth_name}: {error}")
                 });
             }
@@ -3475,9 +3400,8 @@ mod tests {
             ));
 
             let error = factory
-                .runtime_for(&request)
-                .err()
-                .expect("unsupported Mantle API must fail");
+                .plan_for(&request)
+                .expect_err("unsupported Mantle API must fail");
             assert!(matches!(
                 error,
                 RuntimeBuildError::UnsupportedApi { api: actual, .. }
@@ -3508,24 +3432,24 @@ mod tests {
         };
 
         let base = document("us-east-1", "OpenAiResponses", "Aws(DefaultChain)");
-        let first = factory.runtime_for(&base).unwrap();
-        let reused = factory.runtime_for(&base).unwrap();
+        let first = factory.plan_for(&base).unwrap();
+        let reused = factory.plan_for(&base).unwrap();
         let different_region = factory
-            .runtime_for(&document(
+            .plan_for(&document(
                 "us-west-2",
                 "OpenAiResponses",
                 "Aws(DefaultChain)",
             ))
             .unwrap();
         let different_api = factory
-            .runtime_for(&document(
+            .plan_for(&document(
                 "us-east-1",
                 "AnthropicMessages",
                 "Aws(DefaultChain)",
             ))
             .unwrap();
         let different_profile = factory
-            .runtime_for(&document(
+            .plan_for(&document(
                 "us-east-1",
                 "OpenAiResponses",
                 r#"Aws(Profile("work"))"#,
@@ -3564,18 +3488,17 @@ mod tests {
         };
 
         factory
-            .runtime_for(&document("openai-model"))
+            .plan_for(&document("openai-model"))
             .expect("per-model OpenAiResponses override must construct");
         factory
-            .runtime_for(&document("anthropic-model"))
+            .plan_for(&document("anthropic-model"))
             .expect("provider default AnthropicMessages must construct");
 
         // The per-model API must reach Mantle preparation: an unsupported
         // override fails even though the provider default is supported.
         let error = factory
-            .runtime_for(&document("rejected-model"))
-            .err()
-            .expect("unsupported per-model API must fail");
+            .plan_for(&document("rejected-model"))
+            .expect_err("unsupported per-model API must fail");
         assert!(matches!(
             error,
             RuntimeBuildError::UnsupportedApi {
@@ -3610,44 +3533,304 @@ mod tests {
 
         let api_key = fixture.request(document(r#"ApiKey(Value("same-test-secret"))"#));
         let bearer = fixture.request(document(r#"Bearer(Value("same-test-secret"))"#));
-        let first = factory.runtime_for(&api_key).unwrap();
-        let reused = factory.runtime_for(&api_key).unwrap();
-        let different_auth = factory.runtime_for(&bearer).unwrap();
+        let first = factory.plan_for(&api_key).unwrap();
+        let reused = factory.plan_for(&api_key).unwrap();
+        let different_auth = factory.plan_for(&bearer).unwrap();
 
         assert!(Arc::ptr_eq(&first, &reused));
         assert!(!Arc::ptr_eq(&first, &different_auth));
     }
 
     #[test]
-    fn cache_key_includes_custom_auth_header_name() {
-        let secret = || Secret::from_secret_bytes(b"same-test-secret".to_vec());
-        let first = provider_key(
-            "custom",
-            "https://example.test/v1/responses",
-            "exact",
-            "openai_responses",
-            &ResolvedAuth::Header("x-first".to_owned(), secret()),
-            [],
+    fn plan_digest_includes_custom_auth_header_name_but_never_its_value() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let document = |header: &str, secret: &str| {
+            format!(
+                r#"(
+                    version: 1,
+                    model: "custom/test-model",
+                    providers: {{
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: OpenAiResponses,
+                                auth: Header("{header}", Value("{secret}")),
+                            ),
+                            models: {{"test-model": (name: "Test model")}},
+                        ),
+                    }},
+                )"#
+            )
+        };
+
+        let first = factory
+            .plan_for(&fixture.request(document("x-first", "same-test-secret")))
+            .unwrap();
+        let second = factory
+            .plan_for(&fixture.request(document("x-second", "same-test-secret")))
+            .unwrap();
+        let rotated = factory
+            .plan_for(&fixture.request(document("x-first", "rotated-test-secret")))
+            .unwrap();
+
+        assert_ne!(first.digest(), second.digest());
+        // The header value is a secret: rotating it must not change behavior.
+        assert_eq!(first.digest(), rotated.digest());
+        assert_eq!(first.descriptor().provider.auth_scheme, "header:x-first");
+        assert_eq!(
+            first.descriptor().provider.credential,
+            CredentialReference::Inline
         );
-        let second = provider_key(
-            "custom",
-            "https://example.test/v1/responses",
-            "exact",
-            "openai_responses",
-            &ResolvedAuth::Header("x-second".to_owned(), secret()),
-            [],
+        let canonical = String::from_utf8(first.descriptor().canonical_bytes().unwrap()).unwrap();
+        assert!(!canonical.contains("same-test-secret"));
+        assert!(!format!("{first:?}").contains("same-test-secret"));
+    }
+
+    #[test]
+    fn credential_rotation_changes_the_epoch_but_not_the_plan_digest() {
+        let fixture = RuntimeFixture::new();
+        let credentials = CredentialStore::with_backend(
+            CredentialPaths::new(fixture.path("data")),
+            Arc::new(MemoryKeyring::default()),
         );
-        let different_endpoint_mode = provider_key(
-            "custom",
-            "https://example.test/v1/responses",
-            "base",
-            "openai_responses",
-            &ResolvedAuth::Header("x-first".to_owned(), secret()),
-            [],
+        credentials
+            .set("openai/default", "sk-first-secret", false)
+            .unwrap();
+        let factory = fixture.factory_with_credentials(credentials.clone());
+        let request = fixture.request(r#"(version: 1, model: "openai/gpt-5.6")"#);
+
+        let (first, lookup) = factory.plan_with_lookup(&request).unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        let (hit, lookup) = factory.plan_with_lookup(&request).unwrap();
+        assert_eq!(lookup, PlanLookup::Hit);
+        assert!(Arc::ptr_eq(&first, &hit));
+
+        credentials
+            .set("openai/default", "sk-second-secret", false)
+            .unwrap();
+        let (rotated, lookup) = factory.plan_with_lookup(&request).unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        assert!(!Arc::ptr_eq(&first, &rotated));
+        assert_eq!(first.digest(), rotated.digest());
+        assert!(rotated.credential_epoch() > first.credential_epoch());
+        assert_eq!(
+            rotated.descriptor().provider.credential,
+            CredentialReference::Stored("openai/default".to_owned())
+        );
+        for plan in [&first, &rotated] {
+            let canonical =
+                String::from_utf8(plan.descriptor().canonical_bytes().unwrap()).unwrap();
+            assert!(!canonical.contains("sk-first-secret"));
+            assert!(!canonical.contains("sk-second-secret"));
+            let debug = format!("{plan:?}");
+            assert!(!debug.contains("sk-first-secret"));
+            assert!(!debug.contains("sk-second-secret"));
+        }
+    }
+
+    #[test]
+    fn workspace_config_edits_recompile_and_a_broken_edit_keeps_the_valid_plan() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Trust state lives under the data directory, which must be private.
+            fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let config = fixture.path("work/.qq/config.ron");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let document = |max_output_tokens: u32| {
+            format!(
+                r#"(
+                    version: 1,
+                    model: "custom/test-model",
+                    max_output_tokens: {max_output_tokens},
+                    providers: {{
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: OpenAiResponses,
+                                auth: NoAuth,
+                            ),
+                            models: {{"test-model": (name: "Test model")}},
+                        ),
+                    }},
+                )"#
+            )
+        };
+        fs::write(&config, document(64)).unwrap();
+        // No explicit content: the project file is the source under test.
+        let request = LoadRequest::new(fixture.path("work"));
+        factory.inner.config.grant_pending_trust(&request).unwrap();
+
+        let (first, lookup) = factory.plan_with_lookup(&request).unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        assert_eq!(first.resolved_model().max_output_tokens, 64);
+        assert_eq!(
+            factory.plan_with_lookup(&request).unwrap().1,
+            PlanLookup::Hit
         );
 
-        assert_ne!(first, second);
-        assert_ne!(first, different_endpoint_mode);
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&config, document(96)).unwrap();
+        factory.inner.config.grant_pending_trust(&request).unwrap();
+        let (edited, lookup) = factory.plan_with_lookup(&request).unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        assert_eq!(edited.resolved_model().max_output_tokens, 96);
+        assert_ne!(first.digest(), edited.digest());
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&config, "(version: 1, model: ").unwrap();
+        assert!(factory.plan_with_lookup(&request).is_err());
+        // The previous valid generation survives the failed refresh.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&config, document(96)).unwrap();
+        let (recovered, _) = factory.plan_with_lookup(&request).unwrap();
+        assert_eq!(recovered.digest(), edited.digest());
+    }
+
+    #[test]
+    fn plan_descriptor_covers_provider_model_workspace_and_tools_without_secrets() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        fs::write(fixture.path("work/AGENTS.md"), "Always answer in haiku.\n").unwrap();
+        let request = fixture.request(
+            r#"(
+                version: 1,
+                model: "custom/test-model",
+                providers: {
+                    "custom": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: Bearer(Value("sk-live-sentinel")),
+                            headers: {"X-Static": "static-value"},
+                        ),
+                        models: {"test-model": (name: "Test model", context_window: 4096)},
+                    ),
+                },
+            )"#,
+        );
+
+        let plan = factory.plan_for(&request).unwrap();
+        let descriptor = plan.descriptor();
+        assert_eq!(descriptor.provider.id, "custom");
+        assert_eq!(descriptor.provider.api, "openai_responses");
+        assert_eq!(
+            descriptor.provider.endpoint.as_deref(),
+            Some("http://127.0.0.1:1/v1")
+        );
+        assert_eq!(descriptor.provider.endpoint_mode.as_deref(), Some("base"));
+        assert_eq!(descriptor.provider.auth_scheme, "bearer");
+        assert_eq!(descriptor.provider.credential, CredentialReference::Inline);
+        assert_eq!(
+            descriptor.provider.header_names,
+            vec!["X-Static".to_owned()]
+        );
+        assert_eq!(descriptor.model.context_window, Some(4096));
+        assert_eq!(
+            descriptor.workspace,
+            fixture.path("work").display().to_string()
+        );
+        assert_eq!(descriptor.instruction_source.as_deref(), Some("AGENTS.md"));
+        assert!(descriptor.tools.names.contains(&"read_file".to_owned()));
+        assert!(descriptor.tools.names.contains(&"spawn_agent".to_owned()));
+        assert!(
+            descriptor
+                .tools
+                .names
+                .contains(&"search_history".to_owned())
+        );
+        assert!(!descriptor.provenance.is_empty());
+
+        let canonical = String::from_utf8(descriptor.canonical_bytes().unwrap()).unwrap();
+        for forbidden in ["static-value", "sk-live-sentinel"] {
+            assert!(
+                !canonical.contains(forbidden),
+                "descriptor leaked {forbidden}"
+            );
+        }
+        assert!(canonical.starts_with("qq-agent-plan-descriptor-v1\0{"));
+    }
+
+    #[test]
+    fn described_endpoints_drop_userinfo_query_and_fragment() {
+        assert_eq!(
+            describe_endpoint(
+                "https://user:hunter2@api.example.test:8443/v1/responses?token=abc#frag"
+            ),
+            "https://api.example.test:8443/v1/responses"
+        );
+        assert_eq!(
+            describe_endpoint("http://127.0.0.1:1/v1"),
+            "http://127.0.0.1:1/v1"
+        );
+        assert_eq!(describe_endpoint("not a url"), "unparseable");
+        assert_eq!(describe_endpoint("http://exa mple"), "http://<unparseable>");
+    }
+
+    /// Not a correctness test: prints cold-compile versus warm-lookup cost of
+    /// `plan_for` through the full configuration and credential path. Run with
+    /// `cargo test -p qq --release -- --ignored plan_cache_cold_versus_warm --nocapture`.
+    /// The root package has no library target, so this lives beside the unit
+    /// tests instead of under `benches/`.
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn plan_cache_cold_versus_warm() {
+        let fixture = RuntimeFixture::new();
+        let credentials = CredentialStore::with_backend(
+            CredentialPaths::new(fixture.path("data")),
+            Arc::new(MemoryKeyring::default()),
+        );
+        credentials
+            .set("openai/default", "sk-bench-secret", false)
+            .unwrap();
+        let factory = fixture.factory_with_credentials(credentials);
+        fs::write(fixture.path("work/AGENTS.md"), "Be brief.\n".repeat(50)).unwrap();
+        let request = fixture.request(r#"(version: 1, model: "openai/gpt-5.6")"#);
+        let iterations: u32 = std::env::var("QQ_BENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(200);
+
+        // Cold: force a miss each time by editing an instruction source. This
+        // is the per-run cost every prompt paid before plans were cached.
+        let mut cold_compile = Vec::with_capacity(iterations as usize);
+        for index in 0..iterations {
+            fs::write(
+                fixture.path("work/AGENTS.md"),
+                format!("Be brief. Iteration {index}.\n"),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let (_, lookup) = factory.plan_with_lookup(&request).unwrap();
+            cold_compile.push(started.elapsed());
+            assert_eq!(lookup, PlanLookup::Compiled);
+        }
+        let mut warm = Vec::with_capacity(iterations as usize);
+        for _ in 0..iterations {
+            let started = std::time::Instant::now();
+            let (_, lookup) = factory.plan_with_lookup(&request).unwrap();
+            warm.push(started.elapsed());
+            assert_eq!(lookup, PlanLookup::Hit);
+        }
+        let summarize = |mut samples: Vec<Duration>| {
+            samples.sort();
+            let index = |quantile: f64| {
+                let position = ((samples.len() - 1) as f64 * quantile).round() as usize;
+                samples[position]
+            };
+            (index(0.5), index(0.95))
+        };
+        let (cold_median, cold_p95) = summarize(cold_compile);
+        let (warm_median, warm_p95) = summarize(warm);
+        println!(
+            "plan_for cold compile: median {:?} p95 {:?}; warm hit: median {:?} p95 {:?} \
+             ({iterations} iterations)",
+            cold_median, cold_p95, warm_median, warm_p95
+        );
     }
 
     #[test]

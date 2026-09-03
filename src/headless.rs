@@ -739,7 +739,6 @@ async fn run_prompt_identity(
         .snapshot(SnapshotRequest {
             workspace_id: handle.workspace_id,
             focused_session_id: Some(handle.session_id),
-            include_sessions: Vec::new(),
             session_limit: 1,
             message_limit: 1,
         })
@@ -941,10 +940,14 @@ mod tests {
 
     use super::*;
 
-    fn loaded_runtime(runtime: Runtime, pricing: Option<ModelPricing>) -> LoadedRuntime {
-        LoadedRuntime {
-            runtime: Arc::new(runtime),
-            resolved_model: Arc::new(qq_protocol::ResolvedModel {
+    fn loaded_runtime(
+        runtime: Runtime,
+        workspace: &str,
+        pricing: Option<ModelPricing>,
+    ) -> LoadedRuntime {
+        LoadedRuntime::compile_blocking(
+            &runtime,
+            qq_protocol::ResolvedModel {
                 version: qq_protocol::ResolvedModelVersion::new(1).unwrap(),
                 request_shape: None,
                 route: "test/model".to_owned(),
@@ -963,8 +966,10 @@ mod tests {
                     cache_read_usage: false,
                     cache_write_usage: false,
                 },
-            }),
-        }
+            },
+            PathBuf::from(workspace),
+        )
+        .expect("test plan compiles")
     }
 
     /// Builds a fresh provider per claimed run, mirroring how the real
@@ -976,13 +981,14 @@ mod tests {
         P: Provider + 'static,
         F: Fn() -> P + Send + Sync + 'static,
     {
-        fn load(&self, _request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
             let provider = (self.0)();
             Box::pin(async move {
                 Runtime::new(provider, "test-model", 256)
                     .map(|runtime| {
                         loaded_runtime(
                             runtime,
+                            &request.workspace,
                             Some(ModelPricing {
                                 input_usd_nanos_per_token: 1_000,
                                 output_usd_nanos_per_token: 2_000,
@@ -1018,6 +1024,7 @@ mod tests {
                     .map(|runtime| {
                         loaded_runtime(
                             runtime.with_spawn_model_routes(vec!["test/child".to_owned()]),
+                            &request.workspace,
                             Some(ModelPricing {
                                 input_usd_nanos_per_token: 1_000,
                                 output_usd_nanos_per_token: 2_000,
@@ -1501,7 +1508,6 @@ mod tests {
             .snapshot(SnapshotRequest {
                 workspace_id,
                 focused_session_id: None,
-                include_sessions: Vec::new(),
                 session_limit: 16,
                 message_limit: 16,
             })
@@ -1523,7 +1529,6 @@ mod tests {
                 .snapshot(SnapshotRequest {
                     workspace_id: snapshot.workspace.id,
                     focused_session_id: Some(session.id),
-                    include_sessions: Vec::new(),
                     session_limit: 1,
                     message_limit: 1,
                 })

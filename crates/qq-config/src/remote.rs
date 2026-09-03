@@ -18,7 +18,7 @@ use super::{
     ConfigError, ConfigPaths, MAX_CONFIG_BYTES, OrganizationEnrollment, SourceIdentity, SourceKind,
     document::Document,
     loader::{
-        atomic_write, discover_file, ensure_data_directory, read_candidate,
+        Probes, atomic_write, discover_file, ensure_data_directory, read_candidate,
         reject_symlink_components,
     },
 };
@@ -55,8 +55,13 @@ impl Default for OrganizationState {
 }
 
 impl OrganizationState {
-    fn load(paths: &ConfigPaths) -> Result<Self, ConfigError> {
-        let Some(candidate) = discover_file(paths.organizations_file(), SourceKind::Remote, false)?
+    fn load(paths: &ConfigPaths, probes: &mut Probes) -> Result<Self, ConfigError> {
+        let Some(candidate) = discover_file(
+            paths.organizations_file(),
+            SourceKind::Remote,
+            false,
+            probes,
+        )?
         else {
             return Ok(Self::default());
         };
@@ -158,7 +163,7 @@ fn enroll_with(
     let cache_key = manifest_cache_key(name, url.as_str());
 
     let _lock = OrganizationStateLock::acquire(paths)?;
-    let mut state = OrganizationState::load(paths)?;
+    let mut state = OrganizationState::load(paths, &mut Probes::default())?;
     let record = OrganizationRecord {
         name: name.to_owned(),
         manifest_url: url.to_string(),
@@ -201,7 +206,7 @@ fn refresh_with(
     validate_name(name)?;
     let original = {
         let _lock = OrganizationStateLock::acquire(paths)?;
-        OrganizationState::load(paths)?
+        OrganizationState::load(paths, &mut Probes::default())?
             .find(name)
             .cloned()
             .ok_or_else(|| ConfigError::OrganizationNotEnrolled(name.to_owned()))?
@@ -211,7 +216,7 @@ fn refresh_with(
     validate_manifest(name, url.as_str(), &content)?;
 
     let _lock = OrganizationStateLock::acquire(paths)?;
-    let state = OrganizationState::load(paths)?;
+    let state = OrganizationState::load(paths, &mut Probes::default())?;
     if state.find(name) != Some(&original) {
         return Err(ConfigError::OrganizationEnrollmentChanged {
             name: name.to_owned(),
@@ -228,7 +233,7 @@ fn refresh_with(
 pub(super) fn select(paths: &ConfigPaths, name: &str) -> Result<(), ConfigError> {
     validate_name(name)?;
     let _lock = OrganizationStateLock::acquire(paths)?;
-    let mut state = OrganizationState::load(paths)?;
+    let mut state = OrganizationState::load(paths, &mut Probes::default())?;
     if state.find(name).is_none() {
         return Err(ConfigError::OrganizationNotEnrolled(name.to_owned()));
     }
@@ -239,7 +244,7 @@ pub(super) fn select(paths: &ConfigPaths, name: &str) -> Result<(), ConfigError>
 pub(super) fn remove(paths: &ConfigPaths, name: &str) -> Result<bool, ConfigError> {
     validate_name(name)?;
     let _lock = OrganizationStateLock::acquire(paths)?;
-    let mut state = OrganizationState::load(paths)?;
+    let mut state = OrganizationState::load(paths, &mut Probes::default())?;
     let Some(index) = state
         .enrollments
         .iter()
@@ -261,24 +266,28 @@ pub(super) fn remove(paths: &ConfigPaths, name: &str) -> Result<bool, ConfigErro
 
 pub(super) fn list(paths: &ConfigPaths) -> Result<Vec<OrganizationEnrollment>, ConfigError> {
     let _lock = OrganizationStateLock::acquire(paths)?;
-    Ok(OrganizationState::load(paths)?.metadata())
+    Ok(OrganizationState::load(paths, &mut Probes::default())?.metadata())
 }
 
-pub(super) fn selected(paths: &ConfigPaths) -> Result<Option<String>, ConfigError> {
-    Ok(OrganizationState::load(paths)?.selected)
+pub(super) fn selected(
+    paths: &ConfigPaths,
+    probes: &mut Probes,
+) -> Result<Option<String>, ConfigError> {
+    Ok(OrganizationState::load(paths, probes)?.selected)
 }
 
 pub(super) fn load_cached(
     paths: &ConfigPaths,
     name: &str,
+    probes: &mut Probes,
 ) -> Result<(Document, SourceIdentity), ConfigError> {
     validate_name(name)?;
-    let state = OrganizationState::load(paths)?;
+    let state = OrganizationState::load(paths, probes)?;
     let enrollment = state
         .find(name)
         .ok_or_else(|| ConfigError::OrganizationNotEnrolled(name.to_owned()))?;
     let path = cache_path(paths, &enrollment.cache_key);
-    let Some(candidate) = discover_file(path, SourceKind::Remote, false)? else {
+    let Some(candidate) = discover_file(path, SourceKind::Remote, false, probes)? else {
         return Err(ConfigError::OrganizationManifestMissing {
             name: name.to_owned(),
         });
@@ -298,11 +307,12 @@ pub(super) fn load_cached(
 pub(super) fn load_cached_if_enrolled(
     paths: &ConfigPaths,
     name: &str,
+    probes: &mut Probes,
 ) -> Result<Option<(Document, SourceIdentity)>, ConfigError> {
-    if OrganizationState::load(paths)?.find(name).is_none() {
+    if OrganizationState::load(paths, probes)?.find(name).is_none() {
         return Ok(None);
     }
-    load_cached(paths, name).map(Some)
+    load_cached(paths, name, probes).map(Some)
 }
 
 fn validate_manifest(name: &str, url: &str, content: &str) -> Result<(), ConfigError> {
@@ -651,12 +661,27 @@ mod tests {
         .unwrap();
 
         assert!(first.selected());
-        assert_eq!(selected(&state.paths).unwrap().as_deref(), Some("acme"));
-        assert!(load_cached(&state.paths, "acme").is_ok());
+        assert_eq!(
+            selected(&state.paths, &mut Probes::default())
+                .unwrap()
+                .as_deref(),
+            Some("acme")
+        );
+        assert!(load_cached(&state.paths, "acme", &mut Probes::default()).is_ok());
         select(&state.paths, "other").unwrap();
-        assert_eq!(selected(&state.paths).unwrap().as_deref(), Some("other"));
+        assert_eq!(
+            selected(&state.paths, &mut Probes::default())
+                .unwrap()
+                .as_deref(),
+            Some("other")
+        );
         assert!(remove(&state.paths, "other").unwrap());
-        assert_eq!(selected(&state.paths).unwrap().as_deref(), Some("acme"));
+        assert_eq!(
+            selected(&state.paths, &mut Probes::default())
+                .unwrap()
+                .as_deref(),
+            Some("acme")
+        );
         assert!(!remove(&state.paths, "missing").unwrap());
     }
 
@@ -820,7 +845,7 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ConfigError::OrganizationFetch { .. }));
-        assert!(load_cached(&state.paths, "acme").is_ok());
+        assert!(load_cached(&state.paths, "acme", &mut Probes::default()).is_ok());
     }
 
     #[test]

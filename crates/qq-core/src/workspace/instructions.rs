@@ -4,6 +4,8 @@ use std::{
 };
 
 use qq_protocol::InstructionHash;
+
+use crate::plan::SourceFingerprint;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -14,7 +16,7 @@ const CLAUDE_FILE: &str = "CLAUDE.md";
 const MAX_INSTRUCTION_FILE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
-pub(crate) enum WorkspaceInstructionError {
+pub enum WorkspaceInstructionError {
     #[error("workspace instruction loading was cancelled")]
     Cancelled,
     #[error("could not inspect workspace instruction {path}: {source}")]
@@ -65,6 +67,17 @@ impl WorkspaceInstructions {
 
     pub(crate) fn hash(&self) -> InstructionHash {
         self.hash
+    }
+
+    /// The instruction file that was selected, relative to the workspace root.
+    pub(crate) fn source_path(&self) -> Option<&'static str> {
+        self.selected.as_ref().map(|selected| selected.path)
+    }
+
+    pub(crate) fn content_len(&self) -> usize {
+        self.selected
+            .as_ref()
+            .map_or(0, |selected| selected.content.len())
     }
 
     pub(crate) fn append_to_prompt(&self, prompt: &mut String) {
@@ -165,4 +178,21 @@ fn hash_instruction(selected: Option<&SelectedInstruction>) -> InstructionHash {
         digest.update(content);
     }
     InstructionHash::from_bytes(digest.finalize().into())
+}
+
+/// Loads instructions exactly like [`load`] and also returns the fingerprint
+/// of every candidate path it consulted, present or absent, so a cached
+/// result can be revalidated without re-reading. The fingerprints are taken
+/// before the read: a file that changes between the two observations is
+/// reported stale on the next check rather than silently trusted.
+pub(crate) fn load_with_sources(
+    workspace: &Workspace,
+    cancelled: &AtomicBool,
+) -> Result<(WorkspaceInstructions, Vec<SourceFingerprint>), WorkspaceInstructionError> {
+    let sources = [AGENTS_FILE, CLAUDE_FILE]
+        .into_iter()
+        .map(|path| SourceFingerprint::capture(workspace.path().join(path)))
+        .collect();
+    let instructions = load(workspace, cancelled)?;
+    Ok((instructions, sources))
 }
