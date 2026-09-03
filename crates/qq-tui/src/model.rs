@@ -232,6 +232,12 @@ pub(crate) struct RunStats {
     /// Highest model turn committed so far, from `ModelTurnCompleted`; zero
     /// for historical runs loaded from a snapshot.
     pub turns: u16,
+    /// The profile the run was claimed under and the first eight hex digits
+    /// of its plan digest, from `RunStarted.plan` or the loaded run.
+    pub plan: Option<(qq_protocol::AgentProfileId, String)>,
+    /// The `provider/model` route actually executed, when the run recorded
+    /// it. Shown only when it differs from the session's selected model.
+    pub resolved_route: Option<String>,
     /// Cost accumulated from committed turns while the run is active. Shown
     /// until `RunFinished` settles `cost_usd_nanos` from the session totals.
     pub live_cost_usd_nanos: Option<u64>,

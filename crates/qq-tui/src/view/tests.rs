@@ -3102,3 +3102,86 @@ fn shell_approvals_show_the_server_preview_not_the_arguments() {
     );
     assert!(!command_row.contains("ignored"), "{command_row}");
 }
+
+#[test]
+fn the_completion_line_names_the_plan_and_an_overridden_route() {
+    let mut app = app_with_messages(1);
+    let session_id = app.focused().unwrap();
+    let run_id = RunId::from_bytes([0x91; 16]);
+    let mut summary = app.sessions[&session_id].summary.clone();
+    summary.status = SessionStatus::Running;
+    summary.active_run_id = Some(run_id);
+    let mut sequence = 1;
+    let mut event = |event: SessionEvent| {
+        sequence += 1;
+        ClientUpdate::Event(SessionEventEnvelope {
+            run_id: Some(run_id),
+            occurred_at_ms: 10_000 + sequence * 1_000,
+            ..fixtures::envelope(sequence, session_id, event)
+        })
+    };
+    app.apply_client_update(event(SessionEvent::RunStarted {
+        session: summary.clone(),
+        run_id,
+        plan: Some(Box::new(qq_protocol::RunPlanIdentity {
+            profile: qq_protocol::AgentProfileId::new("reviewer").unwrap(),
+            descriptor_version: 3,
+            digest: qq_protocol::AgentPlanDigest::from_hash(qq_protocol::ContentHash::from_bytes(
+                [0xab; 32],
+            )),
+            credential_epoch: qq_protocol::CredentialEpoch::new(1),
+        })),
+    }));
+    app.apply_client_update(event(SessionEvent::AssistantMessageStarted {
+        message: MessageSnapshot {
+            run_id,
+            ..fixtures::message(MessageId::from_bytes([0x73; 16]), session_id, "done")
+        },
+    }));
+    // The reviewer profile pins a different model than the session selected.
+    app.apply_client_update(event(SessionEvent::ModelTurnCompleted {
+        run_id,
+        turn_ordinal: 1,
+        model: ModelSelection {
+            model: Some("anthropic/claude-opus".to_owned()),
+            max_output_tokens: None,
+            organization: None,
+        },
+        usage: None,
+        estimated_cost_usd_nanos: None,
+    }));
+    summary.status = SessionStatus::Idle;
+    summary.active_run_id = None;
+    app.apply_client_update(event(SessionEvent::RunFinished {
+        session: summary,
+        run_id,
+        outcome: qq_protocol::RunOutcome::Completed,
+        usage: None,
+        context_tokens: None,
+    }));
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 20);
+    let rows = frame_rows(&frame);
+    let line = rows.iter().find(|row| row.contains(" ✓ ")).unwrap();
+    assert!(line.contains("on anthropic/claude-opus"), "{line}");
+    assert!(line.contains("as reviewer · plan abababab"), "{line}");
+
+    // A run on the session's own model with the default profile shows only
+    // the digest: nothing to call out.
+    let session = app.sessions.get_mut(&session_id).unwrap();
+    let stats = session.runs.get_mut(&run_id).unwrap();
+    stats.resolved_route = session.summary.model.clone();
+    stats.plan = Some((
+        qq_protocol::AgentProfileId::default(),
+        "abababab".to_owned(),
+    ));
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 20);
+    let line = frame_rows(&frame)
+        .into_iter()
+        .find(|row| row.contains(" ✓ "))
+        .unwrap();
+    assert!(!line.contains("on "), "{line}");
+    assert!(
+        line.contains("plan abababab") && !line.contains("as "),
+        "{line}"
+    );
+}

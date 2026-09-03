@@ -1342,6 +1342,21 @@ pub(super) fn run_completion_line(
             parts.push(format!("{per_second} tok/s"));
         }
     }
+    // Provenance: which profile and plan ran, and the model route when it is
+    // not the one the session selected (a profile override, or a change made
+    // since). Both come from the run's own records, never inferred.
+    if let Some(route) = &stats.resolved_route
+        && session.summary.model.as_deref() != Some(route.as_str())
+    {
+        parts.push(format!("on {route}"));
+    }
+    if let Some((profile, digest)) = &stats.plan {
+        parts.push(if profile.is_default() {
+            format!("plan {digest}")
+        } else {
+            format!("as {} · plan {digest}", profile.as_str())
+        });
+    }
     if parts.is_empty() && matches!(outcome, qq_protocol::RunOutcome::Completed) {
         return None;
     }

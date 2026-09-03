@@ -52,7 +52,7 @@ impl App {
             SessionEvent::RunStarted { session, .. }
             | SessionEvent::CancellationRequested { session, .. } => {
                 self.upsert_summary(session.clone());
-                if let SessionEvent::RunStarted { run_id, .. } = &envelope.event
+                if let SessionEvent::RunStarted { run_id, plan, .. } = &envelope.event
                     && let Some(view) = self.sessions.get_mut(&envelope.session_id)
                 {
                     let cost_before = view
@@ -63,6 +63,7 @@ impl App {
                     let stats = view.runs.entry(*run_id).or_default();
                     stats.started_at_ms = Some(envelope.occurred_at_ms);
                     stats.cost_usd_nanos = cost_before;
+                    stats.plan = plan.as_deref().map(super::plan_label);
                 }
                 if let SessionEvent::RunStarted { run_id, .. } = &envelope.event
                     && let Some(messages) = self
@@ -327,11 +328,17 @@ impl App {
             SessionEvent::ModelTurnCompleted {
                 run_id,
                 turn_ordinal,
+                model,
                 estimated_cost_usd_nanos,
                 ..
             } => {
                 if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
                     let stats = view.runs.entry(*run_id).or_default();
+                    // The turn names the route it ran on, which a profile may
+                    // have overridden away from the session's selection.
+                    if let Some(route) = &model.model {
+                        stats.resolved_route = Some(route.clone());
+                    }
                     stats.turns = stats.turns.max(*turn_ordinal);
                     if let Some(cost) = estimated_cost_usd_nanos {
                         stats.live_cost_usd_nanos =

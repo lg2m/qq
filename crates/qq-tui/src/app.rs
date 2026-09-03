@@ -701,6 +701,11 @@ impl App {
             stats.outcome = run.outcome.clone();
             stats.usage = run.usage;
             stats.cost_usd_nanos = run.estimated_cost_usd_nanos;
+            stats.plan = run.plan.as_deref().map(plan_label);
+            stats.resolved_route = run
+                .resolved_model
+                .as_deref()
+                .map(|model| model.route.clone());
         }
         for call in &tool_calls {
             if matches!(
@@ -2376,4 +2381,14 @@ impl App {
             ComposerMode::Queue
         }
     }
+}
+
+/// The profile and the first eight hex digits of the plan digest: enough to
+/// tell two plans apart in a transcript without filling the line.
+pub(crate) fn plan_label(plan: &qq_protocol::RunPlanIdentity) -> (AgentProfileId, String) {
+    let digest = plan.digest.to_string();
+    (
+        plan.profile.clone(),
+        digest[..digest.len().min(8)].to_owned(),
+    )
 }
