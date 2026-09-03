@@ -46,10 +46,11 @@ use sidebar::*;
 use tools::*;
 use transcript::*;
 use workspace::*;
+pub(crate) use wrap::preview;
 #[cfg(test)]
 use wrap::transcript_viewport;
 use wrap::{
-    bounded_tail, fit_height, indent_lines, preview, selection_viewport, truncate_line, wrap_line,
+    bounded_tail, fit_height, indent_lines, selection_viewport, truncate_line, wrap_line,
     wrap_line_chars,
 };
 

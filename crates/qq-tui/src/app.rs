@@ -222,6 +222,9 @@ enum PendingIntent {
     Compact {
         session_id: SessionId,
     },
+    Rollback {
+        session_id: SessionId,
+    },
     Approval {
         tool_call_id: qq_protocol::ToolCallId,
     },
@@ -521,6 +524,24 @@ impl App {
                                         "session model set to {}",
                                         model.model.as_deref().unwrap_or("default")
                                     ),
+                                );
+                            }
+                            CommandOutcome::CompactionRolledBack {
+                                session_id,
+                                remaining: 0,
+                            } => {
+                                self.set_info_for(
+                                    Some(*session_id),
+                                    "compaction rolled back; full history restored".to_owned(),
+                                );
+                            }
+                            CommandOutcome::CompactionRolledBack {
+                                session_id,
+                                remaining,
+                            } => {
+                                self.set_info_for(
+                                    Some(*session_id),
+                                    format!("compaction rolled back; {remaining} earlier retained"),
                                 );
                             }
                             CommandOutcome::ApprovalModeSet { session_id, mode } => {
@@ -928,6 +949,7 @@ impl App {
             | Some(PendingIntent::Cancel { session_id })
             | Some(PendingIntent::Steer { session_id, .. })
             | Some(PendingIntent::Compact { session_id })
+            | Some(PendingIntent::Rollback { session_id })
             | Some(PendingIntent::SetModel { session_id })
             | Some(PendingIntent::SetProfile { session_id })
             | Some(PendingIntent::SetApprovalMode { session_id })
@@ -1288,6 +1310,7 @@ impl App {
             Command::NewRootSession => self.create_session(None),
             Command::NewChildSession => self.create_session(self.focused()),
             Command::CompactSession => self.compact_session(),
+            Command::RollbackCompaction => self.rollback_compaction(),
             Command::CancelRun => self.cancel_run(),
             Command::ToggleMouse => {
                 self.mouse_capture = !self.mouse_capture;
@@ -1761,6 +1784,25 @@ impl App {
         )
     }
 
+    fn rollback_compaction(&mut self) -> Effects {
+        let Some(session_id) = self.focused() else {
+            self.set_warning("focus a session before rolling back a compaction".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        };
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.summary.status != SessionStatus::Idle)
+        {
+            self.set_warning("rollback needs an idle session; wait or cancel first".to_owned());
+            return Effects::redraw(Redraw::Immediate);
+        }
+        self.send(
+            PendingIntent::Rollback { session_id },
+            SessionCommand::RollbackCompaction { session_id },
+        )
+    }
+
     fn cancel_run(&mut self) -> Effects {
         let Some(session_id) = self.focused() else {
             self.set_warning("focused session has no active run".to_owned());
@@ -2095,6 +2137,7 @@ impl App {
                 | PendingIntent::Steer { .. }
                 | PendingIntent::Cancel { .. }
                 | PendingIntent::Compact { .. }
+                | PendingIntent::Rollback { .. }
                 | PendingIntent::Approval { .. }
                 | PendingIntent::SetModel { .. }
                 | PendingIntent::SetProfile { .. }

@@ -20,6 +20,9 @@ use crate::{
     viewport::View,
 };
 
+/// Characters of the compaction summary shown in its notice.
+const MAX_COMPACTION_EXCERPT_CHARS: usize = 96;
+
 impl App {
     pub(super) fn reduce_event(&mut self, envelope: &SessionEventEnvelope) -> Effects {
         let mut effects = Effects::none();
@@ -287,19 +290,27 @@ impl App {
             }
             SessionEvent::SessionCompacted {
                 session,
+                summary,
                 before_bytes,
                 after_bytes,
-                ..
             } => {
                 self.upsert_summary(session.clone());
+                // The excerpt is the model's own statement of what it kept;
+                // one bounded line of it tells the user what the compaction
+                // preserved without opening anything.
+                let mut text = format!(
+                    "compacted: {} -> {}",
+                    format_bytes(*before_bytes),
+                    format_bytes(*after_bytes)
+                );
+                if let Some(summary) = summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    text.push_str("; ");
+                    text.push_str(&crate::view::preview(summary, MAX_COMPACTION_EXCERPT_CHARS));
+                }
                 effects.push(Effect::Notice {
                     session: Some(envelope.session_id),
                     level: NoticeLevel::Info,
-                    text: format!(
-                        "compacted: {} -> {}",
-                        format_bytes(*before_bytes),
-                        format_bytes(*after_bytes)
-                    ),
+                    text,
                 });
             }
             SessionEvent::SessionCompactionRolledBack { session, remaining } => {

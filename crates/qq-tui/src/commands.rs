@@ -35,6 +35,8 @@ pub(crate) enum Command {
     NewRootSession,
     NewChildSession,
     CompactSession,
+    /// Discard the focused session's newest compaction.
+    RollbackCompaction,
     CancelRun,
     ToggleToolDetail,
     /// Move the transcript cursor to the previous / next tool call of the
@@ -137,7 +139,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 37] = [
+pub(crate) const COMMANDS: [CommandSpec; 38] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -195,6 +197,13 @@ pub(crate) const COMMANDS: [CommandSpec; 37] = [
         "compact session context",
         Session,
         ["/compact"],
+        []
+    ),
+    spec!(
+        RollbackCompaction,
+        "undo the newest compaction",
+        Session,
+        ["/rollback"],
         []
     ),
     spec!(

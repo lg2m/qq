@@ -201,11 +201,13 @@ offered only when the server advertises it; otherwise Enter holds the draft.
 
 The interactive composer recognizes `/help`, `/commands`, `/models`, `/profile`,
 `/approval`, `/skills`, `/theme`, `/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/mouse`,
-`/attention`, `/changes`, `/editor`, `/compact`, and `/quit` (also `/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
+`/attention`, `/changes`, `/editor`, `/compact`, `/rollback`, and `/quit` (also `/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
 `/models`. `/compact`
 summarizes an idle session's history into a compact context so long
-sessions keep going; stale read-only tool results are also pruned from
-model context automatically. `/models` applies the choice to the
+sessions keep going, and the notice quotes the start of the summary the model
+wrote; `/rollback` discards the newest compaction of an idle session and
+restores the history beneath it. Stale read-only tool results are also pruned
+from model context automatically. `/models` applies the choice to the
 focused session (or creates one when none is focused); Ctrl-N always creates a
 new session with the selected model. The pick also becomes the client default
 for later `/new` creates until you choose another model. The picker only lists

@@ -489,8 +489,96 @@ fn session_compacted_events_surface_the_shrink_in_the_status_line() {
 
     assert_eq!(
         app.status.as_deref(),
-        Some("compacted: 3.1 MiB -> 240.0 KiB")
+        Some("compacted: 3.1 MiB -> 240.0 KiB; intent: keep going")
     );
+
+    // A long excerpt is bounded to one line; an absent one adds nothing.
+    let session = app.sessions[&app.focused().unwrap()].summary.clone();
+    app.apply_live_event(SessionEventEnvelope {
+        occurred_at_ms: 3,
+        ..fixtures::envelope(
+            3,
+            session.id,
+            SessionEvent::SessionCompacted {
+                session: session.clone(),
+                summary: Some("word ".repeat(80)),
+                before_bytes: 2048,
+                after_bytes: 1024,
+            },
+        )
+    });
+    let status = app.status.clone().unwrap();
+    assert!(status.starts_with("compacted: 2.0 KiB -> 1.0 KiB; word word"));
+    assert!(status.chars().count() < 140, "{status}");
+    app.apply_live_event(SessionEventEnvelope {
+        occurred_at_ms: 4,
+        ..fixtures::envelope(
+            4,
+            session.id,
+            SessionEvent::SessionCompacted {
+                session,
+                summary: None,
+                before_bytes: 2048,
+                after_bytes: 1024,
+            },
+        )
+    });
+    assert_eq!(app.status.as_deref(), Some("compacted: 2.0 KiB -> 1.0 KiB"));
+}
+
+#[test]
+fn rollback_sends_for_an_idle_session_and_reports_the_receipt() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    let focused = app.focused().unwrap();
+    app.composer.text = "/rollback".to_owned();
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
+    let [ClientRequest::Command(request)] = requests.as_slice() else {
+        panic!("expected one rollback command")
+    };
+    assert!(matches!(
+        &request.command,
+        SessionCommand::RollbackCompaction { session_id } if *session_id == focused
+    ));
+    app.apply_client_update(ClientUpdate::CommandResult {
+        command_id: request.command_id,
+        result: Ok(qq_protocol::CommandReceipt {
+            command_id: request.command_id,
+            outcome: CommandOutcome::CompactionRolledBack {
+                session_id: focused,
+                remaining: 0,
+            },
+            committed_through: fixtures::cursor(2),
+        }),
+    });
+    assert_eq!(
+        app.status.as_deref(),
+        Some("compaction rolled back; full history restored")
+    );
+
+    // A server refusal (nothing to roll back) surfaces as the failure notice.
+    let (_, requests) = app.execute(Command::RollbackCompaction).split();
+    let [ClientRequest::Command(request)] = requests.as_slice() else {
+        panic!("expected one rollback command")
+    };
+    app.apply_client_update(ClientUpdate::CommandResult {
+        command_id: request.command_id,
+        result: Err(crate::ClientFailure::new("no compaction to roll back")),
+    });
+    assert!(
+        app.status
+            .as_deref()
+            .unwrap()
+            .contains("no compaction to roll back")
+    );
+
+    // A running session is refused locally.
+    let (mut running, _, _, _) = running_app();
+    let (_, requests) = running.execute(Command::RollbackCompaction).split();
+    assert!(requests.is_empty());
+    assert!(running.status.as_deref().unwrap().contains("idle session"));
 }
 
 #[test]
