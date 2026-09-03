@@ -1,0 +1,39 @@
+// Ember: a warm, low-glare dark theme for QQ.
+//
+// Design notes
+// - Text is parchment, not white: less glare on long transcripts.
+// - Muted is a cool grey so rails, chrome, and folded rows recede from
+//   the warm content instead of competing with it.
+// - Accent (your prompts, headings, list markers, focused pane marker)
+//   is a muted teal: the one cool note on a warm canvas, so it can never
+//   be confused with the ember brand mark beside it.
+// - Warning, error, and success sit at three clearly different hues
+//   (gold, coral, sage) and all stay legible on both the terminal
+//   background and the code-panel surface.
+// - Surface is a few steps above a near-black background so a fenced
+//   code block reads as one solid slab without glowing.
+//
+// Select it with `theme: "ember"` in tui.ron, or preview it with /theme.
+(
+    version: 1,
+    defs: {
+        "parchment": "#e8dfd0",
+        "ash":       "#8a8577",
+        "teal":      "#7fb5a6",
+        "ember":     "#ff7f50",
+        "gold":      "#f2c14e",
+        "coral":     "#e5636b",
+        "sage":      "#8fbf88",
+        "slab":      "#2a2622",
+    },
+    colors: (
+        text:    "parchment",
+        muted:   "ash",
+        accent:  "teal",
+        brand:   "ember",
+        warning: "gold",
+        error:   "coral",
+        success: "sage",
+        surface: "slab",
+    ),
+)

@@ -1,0 +1,27 @@
+// One Dark. Palette: github.com/navarasu/onedark.nvim (dark style).
+//
+// Blue is the accent, as in Atom's function color; the orange (joshdick's
+// dark_yellow) carries the brand. bg1 is the elevated surface.
+(
+    version: 1,
+    defs: {
+        "fg":     "#abb2bf",
+        "grey":   "#5c6370",
+        "blue":   "#61afef",
+        "orange": "#d19a66",
+        "yellow": "#e5c07b",
+        "red":    "#e86671",
+        "green":  "#98c379",
+        "bg1":    "#31353f",
+    },
+    colors: (
+        text:    "fg",
+        muted:   "grey",
+        accent:  "blue",
+        brand:   "orange",
+        warning: "yellow",
+        error:   "red",
+        success: "green",
+        surface: "bg1",
+    ),
+)

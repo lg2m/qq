@@ -1,0 +1,28 @@
+// Gruvbox (dark, medium contrast). Palette: github.com/morhetz/gruvbox.
+//
+// The bright orange is the signature, so it carries the brand; aqua is the
+// accent because it is gruvbox's most legible cool color against the warm
+// parchment text. Surface is bg1, one step above the editor background.
+(
+    version: 1,
+    defs: {
+        "fg1":           "#ebdbb2",
+        "gray":          "#928374",
+        "bright_aqua":   "#8ec07c",
+        "bright_orange": "#fe8019",
+        "bright_yellow": "#fabd2f",
+        "bright_red":    "#fb4934",
+        "bright_green":  "#b8bb26",
+        "bg1":           "#3c3836",
+    },
+    colors: (
+        text:    "fg1",
+        muted:   "gray",
+        accent:  "bright_aqua",
+        brand:   "bright_orange",
+        warning: "bright_yellow",
+        error:   "bright_red",
+        success: "bright_green",
+        surface: "bg1",
+    ),
+)

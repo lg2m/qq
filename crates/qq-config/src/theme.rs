@@ -24,6 +24,25 @@ use super::{
 /// The compiled default theme name, always resolvable.
 pub const DEFAULT_THEME: &str = "qq";
 
+/// Themes shipped inside the binary as ordinary theme documents, so they go
+/// through the same parser and errors as user files and double as
+/// copy-and-tweak examples. Sorted by name; `qq` itself is built in code.
+pub const COMPILED_THEMES: &[(&str, &str)] = &[
+    ("catppuccin", include_str!("../themes/catppuccin.ron")),
+    ("dracula", include_str!("../themes/dracula.ron")),
+    ("ember", include_str!("../themes/ember.ron")),
+    ("everforest", include_str!("../themes/everforest.ron")),
+    ("gruvbox", include_str!("../themes/gruvbox.ron")),
+    ("ink", include_str!("../themes/ink.ron")),
+    ("kanagawa", include_str!("../themes/kanagawa.ron")),
+    ("monokai", include_str!("../themes/monokai.ron")),
+    ("nord", include_str!("../themes/nord.ron")),
+    ("onedark", include_str!("../themes/onedark.ron")),
+    ("rose-pine", include_str!("../themes/rose-pine.ron")),
+    ("solarized", include_str!("../themes/solarized.ron")),
+    ("tokyonight", include_str!("../themes/tokyonight.ron")),
+];
+
 /// Upper bound on theme files enumerated for the picker.
 const MAX_DISCOVERED_THEMES: usize = 64;
 
@@ -130,6 +149,19 @@ pub fn compiled_theme() -> ThemeDocument {
     }
 }
 
+/// Parse one of `COMPILED_THEMES`. A shipped document that fails to parse
+/// is a build defect, surfaced as the same `ConfigError` a user file gets.
+fn compiled_document(name: &str, content: &str) -> Result<ThemeDocument, ConfigError> {
+    let source =
+        SourceIdentity::virtual_source(SourceKind::Compiled, format!("compiled theme {name}"));
+    let colors = Document::parse(content, &source)?;
+    Ok(ThemeDocument {
+        name: name.to_owned(),
+        colors,
+        source,
+    })
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RolesDocument {
@@ -225,8 +257,9 @@ fn theme_paths(
     directories
 }
 
-/// Resolve theme `name`: compiled first, then the global `themes/` directory,
-/// then project `.qq/themes/` directories nearest-last so the nearest wins.
+/// Resolve theme `name`: the global `themes/` directory, then project
+/// `.qq/themes/` directories nearest-last so the nearest wins, falling back
+/// to the compiled set so a user file may shadow a shipped theme.
 pub(super) fn load(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -250,9 +283,15 @@ pub(super) fn load(
         }
     }
     let Some(candidate) = found else {
-        return Err(ConfigError::UnknownTheme {
-            name: name.to_owned(),
-        });
+        return match COMPILED_THEMES
+            .iter()
+            .find(|(compiled, _)| *compiled == name)
+        {
+            Some((compiled, content)) => compiled_document(compiled, content),
+            None => Err(ConfigError::UnknownTheme {
+                name: name.to_owned(),
+            }),
+        };
     };
     let (source, content) = read_candidate(&candidate)?;
     let colors = Document::parse(&content, &source)?;
@@ -275,6 +314,10 @@ pub(super) fn discover(
     let mut probes = Probes::default();
     let mut themes: BTreeMap<String, ThemeDocument> = BTreeMap::new();
     themes.insert(DEFAULT_THEME.to_owned(), compiled_theme());
+    for (name, content) in COMPILED_THEMES {
+        let document = compiled_document(name, content)?;
+        themes.insert((*name).to_owned(), document);
+    }
     for (directory, kind) in theme_paths(loader, &cwd, &mut probes) {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;

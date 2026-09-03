@@ -1,0 +1,47 @@
+// Ink: the QQ house theme.
+//
+// A cool, quiet dark theme built for reading a lot of text for a long
+// time. Everything that is not content recedes; the few things that need
+// your attention are the only things that are saturated.
+//
+// - Text is a soft cool white (`paper`), not pure white, so long
+//   transcripts do not glare.
+// - Muted is a blue-grey (`slate`) with enough contrast on both the
+//   terminal background and the surface panel to stay readable, but far
+//   enough from `paper` that chrome, rails, and folded rows visibly step
+//   back from the words.
+// - Accent is a calm sky blue for your prompts, headings, list markers,
+//   the focused pane marker, and links. It is the one "structural" color.
+// - Brand is a warm copper: the single warm note on a cool canvas, so the
+//   `qq` mark and the live spinner read instantly and never get confused
+//   with a heading.
+// - Warning, error, and success sit at gold, rose, and mint: three hues
+//   that stay distinct for common color-vision deficiencies and all pass
+//   contrast on the surface slab.
+// - Surface is a graphite slab a few steps above a near-black background
+//   so a fenced code block reads as one solid panel without glowing.
+//
+// Select it with `theme: "ink"` in tui.ron, or preview it with /theme.
+(
+    version: 1,
+    defs: {
+        "paper":    "#d8dee9",
+        "slate":    "#7b8497",
+        "sky":      "#8fb8e8",
+        "copper":   "#e0a071",
+        "gold":     "#e6c07b",
+        "rose":     "#ec7b8d",
+        "mint":     "#8fd3a6",
+        "graphite": "#20242c",
+    },
+    colors: (
+        text:    "paper",
+        muted:   "slate",
+        accent:  "sky",
+        brand:   "copper",
+        warning: "gold",
+        error:   "rose",
+        success: "mint",
+        surface: "graphite",
+    ),
+)

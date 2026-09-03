@@ -1,0 +1,28 @@
+// Kanagawa (wave). Palette: github.com/rebelot/kanagawa.nvim.
+//
+// crystalBlue is the accent, surimiOrange the brand, carpYellow the
+// warning, peachRed the error, springGreen the success. fujiGray is the
+// palette's comment tone; sumiInk4 is the elevated surface.
+(
+    version: 1,
+    defs: {
+        "fujiWhite":    "#dcd7ba",
+        "fujiGray":     "#727169",
+        "crystalBlue":  "#7e9cd8",
+        "surimiOrange": "#ffa066",
+        "carpYellow":   "#e6c384",
+        "peachRed":     "#ff5d62",
+        "springGreen":  "#98bb6c",
+        "sumiInk4":     "#2a2a37",
+    },
+    colors: (
+        text:    "fujiWhite",
+        muted:   "fujiGray",
+        accent:  "crystalBlue",
+        brand:   "surimiOrange",
+        warning: "carpYellow",
+        error:   "peachRed",
+        success: "springGreen",
+        surface: "sumiInk4",
+    ),
+)

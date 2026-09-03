@@ -1,0 +1,28 @@
+// Tokyo Night (night variant). Palette: github.com/folke/tokyonight.nvim.
+//
+// Blue is the accent, as in the editor theme's functions and headings;
+// the brand takes the orange so the mark stays warm against the indigo
+// text. Surface is bg_highlight.
+(
+    version: 1,
+    defs: {
+        "fg":           "#c0caf5",
+        "comment":      "#565f89",
+        "blue":         "#7aa2f7",
+        "orange":       "#ff9e64",
+        "yellow":       "#e0af68",
+        "red":          "#f7768e",
+        "green":        "#9ece6a",
+        "bg_highlight": "#292e42",
+    },
+    colors: (
+        text:    "fg",
+        muted:   "comment",
+        accent:  "blue",
+        brand:   "orange",
+        warning: "yellow",
+        error:   "red",
+        success: "green",
+        surface: "bg_highlight",
+    ),
+)

@@ -1,0 +1,28 @@
+// Catppuccin Mocha. Palette: github.com/catppuccin/palette.
+//
+// Mauve is Catppuccin's signature accent; peach carries the brand so the
+// two never blur. Overlay0 is the muted tone the palette itself uses for
+// comments. Surface0 is the palette's own first elevated surface.
+(
+    version: 1,
+    defs: {
+        "text":     "#cdd6f4",
+        "overlay0": "#6c7086",
+        "mauve":    "#cba6f7",
+        "peach":    "#fab387",
+        "yellow":   "#f9e2af",
+        "red":      "#f38ba8",
+        "green":    "#a6e3a1",
+        "surface0": "#313244",
+    },
+    colors: (
+        text:    "text",
+        muted:   "overlay0",
+        accent:  "mauve",
+        brand:   "peach",
+        warning: "yellow",
+        error:   "red",
+        success: "green",
+        surface: "surface0",
+    ),
+)

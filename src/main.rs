@@ -500,6 +500,12 @@ fn config_command(
             let source =
                 source.ok_or_else(|| format!("unknown or unset config field {field:?}"))?;
             println!("{field}: {source}");
+            if field == "tui.theme" {
+                println!("available themes:");
+                for theme in loader.discover_themes(request.cwd())? {
+                    println!("  {}\t{}", theme.name(), theme.source());
+                }
+            }
         }
     }
     Ok(())

@@ -1,0 +1,28 @@
+// Monokai Pro (default filter). Palette: monokai.pro.
+//
+// Blue is the accent, orange the brand; the yellow, red, and green are
+// Monokai Pro's own. dimmed3 is its comment tone; dimmed5 is the
+// elevated surface.
+(
+    version: 1,
+    defs: {
+        "foreground": "#fcfcfa",
+        "dimmed3":    "#727072",
+        "blue":       "#78dce8",
+        "orange":     "#fc9867",
+        "yellow":     "#ffd866",
+        "red":        "#ff6188",
+        "green":      "#a9dc76",
+        "dimmed5":    "#403e41",
+    },
+    colors: (
+        text:    "foreground",
+        muted:   "dimmed3",
+        accent:  "blue",
+        brand:   "orange",
+        warning: "yellow",
+        error:   "red",
+        success: "green",
+        surface: "dimmed5",
+    ),
+)

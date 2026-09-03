@@ -33,6 +33,12 @@ impl BenchHarness {
     /// `messages` completed assistant messages loaded; the rest are summaries.
     #[must_use]
     pub fn new(size: (u16, u16), sessions: u8, messages: u8) -> Self {
+        Self::with_options(size, sessions, messages, TuiOptions::default())
+    }
+
+    /// `new`, with the TUI options (themes, settings) supplied by the caller.
+    #[must_use]
+    pub fn with_options(size: (u16, u16), sessions: u8, messages: u8, options: TuiOptions) -> Self {
         assert!(sessions >= 1, "at least one session is required");
         let workspace_id = WorkspaceId::from_bytes([1; 16]);
         let summaries: Vec<SessionSummary> = (0..sessions)
@@ -52,7 +58,7 @@ impl BenchHarness {
             has_older_tool_calls: false,
             has_older_messages: false,
         };
-        let mut app = App::new(TuiOptions::default());
+        let mut app = App::new(options);
         app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
             included: Vec::new(),
             cursor: EventCursor {
@@ -132,6 +138,12 @@ impl BenchHarness {
         self.renderer
             .draw(&mut self.app, self.size)
             .expect("in-memory frame rendering cannot fail")
+    }
+
+    /// Draw every row regardless of the previous frame, as after a resize.
+    pub fn draw_full(&mut self) -> Vec<u8> {
+        self.renderer.invalidate();
+        self.draw()
     }
 
     /// Install any finished off-tick highlight results, as the event loop

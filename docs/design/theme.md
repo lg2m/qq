@@ -68,11 +68,13 @@ Custom themes are RON documents named `<name>.ron`.
 
 Given a selected name `N`, resolve the first match in this order:
 
-1. Compiled-in themes (`qq` is always present).
-2. Global `themes/N.ron` under the QQ configuration directory.
-3. Project `.qq/themes/N.ron`, walking from the repository root to the current
+1. Global `themes/N.ron` under the QQ configuration directory.
+2. Project `.qq/themes/N.ron`, walking from the repository root to the current
    directory. The nearest file wins when several project layers define the same
    name.
+3. Shipped themes compiled into the binary (below). A user file with the same
+   name shadows the shipped copy, so any shipped theme can be copied out and
+   tweaked.
 
 Unknown names are a configuration error.
 
@@ -181,11 +183,40 @@ leaf renderer. Cached message layouts bake colors in, so the renderer compares
 `App::theme_generation` each frame and drops every pane cache and the row diff
 when it changes; the next frame repaints every row in the new palette.
 
-## Default Theme
+## Shipped Themes
 
 The compiled theme id is `"qq"`. Its colors match the baseline table above so
 existing installs keep the current look when `theme` is omitted or set to
 `"qq"`.
+
+The binary also ships these themes as ordinary theme documents
+(`crates/qq-config/themes/*.ron`, embedded with `include_str!` and parsed by
+the same code path as user files, so a broken shipped document is a build
+defect that surfaces as a `ConfigError`):
+
+| Name | Source |
+|------|--------|
+| `ink` | QQ house theme: cool paper text, sky accent, copper brand |
+| `ember` | QQ warm theme: parchment text, teal accent, ember brand |
+| `catppuccin` | Catppuccin Mocha |
+| `dracula` | Dracula |
+| `everforest` | Everforest dark medium |
+| `gruvbox` | Gruvbox dark medium |
+| `kanagawa` | Kanagawa wave |
+| `monokai` | Monokai Pro |
+| `nord` | Nord |
+| `onedark` | One Dark |
+| `rose-pine` | Rosé Pine main |
+| `solarized` | Solarized dark |
+| `tokyonight` | Tokyo Night night |
+
+Ports use the upstream palette's canonical hex values and map roles the way
+the upstream theme uses those colors (its primary accent, its comment tone,
+its elevated surface). Where a canonical tone fails contrast as text on the
+theme's own background or surface, the port substitutes the palette's
+nearest legible tone and says so in the file. Every shipped theme keeps all
+eight roles distinct. `qq config explain tui.theme` lists the available names
+and where each comes from.
 
 Users create custom themes by adding files under the global or project `themes`
 directory and selecting the file stem from `tui.ron`:

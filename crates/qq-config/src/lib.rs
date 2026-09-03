@@ -25,7 +25,8 @@ mod tui;
 pub use loader::canonical_working_directory;
 pub use qq_provider::{SecretLiteral, SecretRef, XAI_CREDENTIAL_ENDPOINT};
 pub use theme::{
-    AnsiColor, DEFAULT_THEME, Rgb, ThemeColor, ThemeColors, ThemeDocument, compiled_theme,
+    AnsiColor, COMPILED_THEMES, DEFAULT_THEME, Rgb, ThemeColor, ThemeColors, ThemeDocument,
+    compiled_theme,
 };
 pub use tui::{
     TuiAction, TuiConfigDefaults, TuiConfigKey, TuiConfigSettings, TuiConfigSnapshot, TuiLayout,
@@ -1632,7 +1633,7 @@ pub enum ConfigError {
     #[error("TUI settings are invalid: {message}")]
     InvalidTuiSettings { message: String },
     #[error(
-        "unknown TUI theme `{name}`; expected the compiled `qq` theme or a `themes/{name}.ron` file"
+        "unknown TUI theme `{name}`; expected a shipped theme (see `qq config explain tui.theme`) or a `themes/{name}.ron` file"
     )]
     UnknownTheme { name: String },
     #[error(

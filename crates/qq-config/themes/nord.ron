@@ -1,0 +1,29 @@
+// Nord. Palette: nordtheme.com/docs/colors-and-palettes.
+//
+// Frost nord8 is the primary accent per the Nord spec; Aurora nord12
+// (orange) carries the brand. Muted is Nord's brightened comment tone
+// (nord3_bright), which the spec recommends where plain nord3 falls under
+// 2:1 contrast. nord1 is the elevated UI surface.
+(
+    version: 1,
+    defs: {
+        "nord4":  "#d8dee9",
+        "nord3_bright": "#616e88",
+        "nord8":  "#88c0d0",
+        "nord12": "#d08770",
+        "nord13": "#ebcb8b",
+        "nord11": "#bf616a",
+        "nord14": "#a3be8c",
+        "nord1":  "#3b4252",
+    },
+    colors: (
+        text:    "nord4",
+        muted:   "nord3_bright",
+        accent:  "nord8",
+        brand:   "nord12",
+        warning: "nord13",
+        error:   "nord11",
+        success: "nord14",
+        surface: "nord1",
+    ),
+)

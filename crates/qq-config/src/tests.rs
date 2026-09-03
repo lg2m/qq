@@ -1734,9 +1734,14 @@ fn themes_resolve_compiled_then_global_then_nearest_project() {
     assert_eq!(compiled.name(), "qq");
     assert_eq!(compiled.source().kind(), SourceKind::Compiled);
 
+    // `rose-pine` ships in the binary; a global file of the same name
+    // shadows it.
+    let shipped = loader.load_theme(&tree.path("work"), "rose-pine").unwrap();
+    assert_eq!(shipped.source().kind(), SourceKind::Compiled);
     tree.write("global/themes/rose-pine.ron", ROSE_PINE);
     let global = loader.load_theme(&tree.path("work"), "rose-pine").unwrap();
     assert_eq!(global.source().kind(), SourceKind::Global);
+    assert_ne!(global.colors().surface, shipped.colors().surface);
     assert_eq!(
         global.colors().accent,
         ThemeColor::Rgb(Rgb {
@@ -1770,12 +1775,63 @@ fn themes_resolve_compiled_then_global_then_nearest_project() {
     );
 
     let discovered = loader.discover_themes(&tree.path("work/child")).unwrap();
-    let names: Vec<_> = discovered.iter().map(ThemeDocument::name).collect();
-    assert_eq!(names, ["qq", "rose-pine"]);
+    let rose = discovered
+        .iter()
+        .find(|theme| theme.name() == "rose-pine")
+        .unwrap();
+    assert_eq!(rose.source().kind(), SourceKind::Project);
     assert_eq!(
-        discovered[1].colors().accent,
+        rose.colors().accent,
         ThemeColor::Rgb(Rgb { r: 0, g: 0, b: 2 })
     );
+    assert_eq!(
+        discovered.len(),
+        COMPILED_THEMES.len() + 1,
+        "one entry per shipped name plus qq; the user file replaced, not added"
+    );
+}
+
+#[test]
+fn every_shipped_theme_parses_and_is_discoverable_without_any_files() {
+    let tree = TempTree::new();
+    let loader = tree.loader();
+    let mut names: Vec<&str> = COMPILED_THEMES.iter().map(|(name, _)| *name).collect();
+    assert!(
+        names.windows(2).all(|pair| pair[0] < pair[1]),
+        "table is sorted"
+    );
+    assert!(names.contains(&"ink") && names.contains(&"gruvbox"));
+    for name in &names {
+        let theme = loader.load_theme(&tree.path("work"), name).unwrap();
+        assert_eq!(theme.name(), *name);
+        assert_eq!(theme.source().kind(), SourceKind::Compiled);
+        let colors = theme.colors();
+        // Every role is a distinct literal: a theme that maps two roles to
+        // one color loses a distinction the renderer relies on.
+        let roles = [
+            colors.text,
+            colors.muted,
+            colors.accent,
+            colors.brand,
+            colors.warning,
+            colors.error,
+            colors.success,
+            colors.surface,
+        ];
+        let distinct: std::collections::BTreeSet<_> =
+            roles.iter().map(|color| format!("{color:?}")).collect();
+        assert_eq!(
+            distinct.len(),
+            roles.len(),
+            "{name} maps two roles to one color"
+        );
+    }
+    let discovered = loader.discover_themes(&tree.path("work")).unwrap();
+    let mut listed: Vec<&str> = discovered.iter().map(ThemeDocument::name).collect();
+    names.push(DEFAULT_THEME);
+    names.sort_unstable();
+    listed.sort_unstable();
+    assert_eq!(listed, names);
 }
 
 #[test]
@@ -1827,7 +1883,8 @@ fn theme_documents_fail_fast_on_every_documented_error() {
 
     // A broken file is skipped by discovery but still selectable-and-failing.
     let discovered = loader.discover_themes(&tree.path("work")).unwrap();
-    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered.len(), COMPILED_THEMES.len() + 1);
+    assert!(discovered.iter().all(|theme| theme.name() != "bad"));
 }
 
 #[test]

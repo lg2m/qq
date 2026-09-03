@@ -1,0 +1,27 @@
+// Everforest (dark, medium). Palette: github.com/sainnhe/everforest.
+//
+// Aqua is the accent, orange the brand. grey1 is the palette's comment
+// tone and bg2 the elevated surface.
+(
+    version: 1,
+    defs: {
+        "fg":     "#d3c6aa",
+        "grey1":  "#859289",
+        "aqua":   "#83c092",
+        "orange": "#e69875",
+        "yellow": "#dbbc7f",
+        "red":    "#e67e80",
+        "green":  "#a7c080",
+        "bg2":    "#3d484d",
+    },
+    colors: (
+        text:    "fg",
+        muted:   "grey1",
+        accent:  "aqua",
+        brand:   "orange",
+        warning: "yellow",
+        error:   "red",
+        success: "green",
+        surface: "bg2",
+    ),
+)

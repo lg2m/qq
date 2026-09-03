@@ -1,0 +1,28 @@
+// Solarized Dark. Palette: github.com/altercation/solarized.
+//
+// Solarized's contrast is deliberately low: base0 text on base03, base01
+// for secondary content, blue as the primary accent, orange for the
+// brand, and base02 as the highlighted background surface.
+(
+    version: 1,
+    defs: {
+        "base0":  "#839496",
+        "base01": "#586e75",
+        "blue":   "#268bd2",
+        "orange": "#cb4b16",
+        "yellow": "#b58900",
+        "red":    "#dc322f",
+        "green":  "#859900",
+        "base02": "#073642",
+    },
+    colors: (
+        text:    "base0",
+        muted:   "base01",
+        accent:  "blue",
+        brand:   "orange",
+        warning: "yellow",
+        error:   "red",
+        success: "green",
+        surface: "base02",
+    ),
+)

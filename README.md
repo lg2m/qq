@@ -145,9 +145,12 @@ from the repository root to the current directory.
 An omitted action inherits the previous layer. An empty list disables that
 action. Invalid chords and collisions are rejected before the TUI starts.
 
-`theme` names a color theme: the compiled `qq` theme, or a `<name>.ron` file
-under the global configuration directory's `themes/` or a project's
-`.qq/themes/`. `/theme` opens a picker that previews each theme live (Enter
+`theme` names a color theme. QQ ships `qq` (follows your terminal palette),
+`ink` and `ember` (its own), and ports of gruvbox, tokyonight, catppuccin,
+dracula, nord, solarized, onedark, rose-pine, kanagawa, everforest, and
+monokai; `qq config explain tui.theme` lists them. A `<name>.ron` file under
+the global configuration directory's `themes/` or a project's `.qq/themes/`
+adds a theme or shadows a shipped one. `/theme` opens a picker that previews each theme live (Enter
 keeps it for the session, Esc restores); the notice it leaves shows the line to
 add to `tui.ron`. See `docs/design/theme.md` for the document shape.
 
