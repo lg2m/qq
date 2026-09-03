@@ -84,61 +84,99 @@ pub(super) fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
     let inner = width.saturating_sub(2);
     let mut rows: Vec<Line> = Vec::new();
     let mut focused_row = 0;
-    let order = app.sessions.thread_order();
-    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
-        let members: Vec<SessionId> = order
-            .iter()
-            .copied()
-            .filter(|id| app.sessions[id].group() == group)
-            .collect();
+    // One pass buckets sessions by group in tree order; the sidebar is
+    // drawn for every frame with 200 sessions listed.
+    let mut buckets: [Vec<SessionId>; 4] = Default::default();
+    for &id in app.sessions.thread_order() {
+        let bucket = match app.sessions[&id].group() {
+            Group::NeedsYou => 0,
+            Group::Working => 1,
+            Group::Idle => 2,
+            Group::Done => 3,
+        };
+        buckets[bucket].push(id);
+    }
+    // Row plan first: each entry is a header, a session, its status, or a
+    // gap. Only the entries inside the scrolled window are drawn, so the
+    // cost is per visible row, not per session.
+    enum Entry {
+        Gap,
+        Header(Group, usize),
+        Session(SessionId),
+        Status(SessionId, String, Style),
+    }
+    let mut plan: Vec<Entry> = Vec::new();
+    for (group, members) in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done]
+        .into_iter()
+        .zip(buckets)
+    {
         if members.is_empty() {
             continue;
         }
-        if !rows.is_empty() {
-            rows.push(Line::styled("│", border()));
+        if !plan.is_empty() {
+            plan.push(Entry::Gap);
         }
-        let mut header = Line::styled("│ ", border());
-        header.push(
-            group.label(),
-            match group {
-                Group::NeedsYou => warning().bold(),
-                Group::Working => info().bold(),
-                Group::Idle | Group::Done => muted().bold(),
-            },
-        );
-        header.push(format!("  {}", members.len()), muted());
-        rows.push(truncate_line(header, width));
+        plan.push(Entry::Header(group, members.len()));
         for session_id in members {
-            let depth = app.sessions.depth(session_id);
-            let indent = "  ".repeat(depth.min(4));
-            let focused = app.focused() == Some(session_id);
-            if focused {
-                focused_row = rows.len();
+            if app.focused() == Some(session_id) {
+                focused_row = plan.len();
             }
-            let mut line = session_line(app, session_id, width, &format!("│ {indent}"));
-            let unread = app.sessions[&session_id].unread;
-            if unread > 0 && !focused {
-                line.push(format!("  {unread} new"), accent());
-            }
-            if focused {
-                pad_line(&mut line, width);
-                for span in &mut line.spans[1..] {
-                    span.style = selection(span.style);
-                }
-            }
-            rows.push(truncate_line(line, width));
+            plan.push(Entry::Session(session_id));
             if let Some((text, style)) = live_status_line(app, session_id) {
+                plan.push(Entry::Status(session_id, text, style));
+            }
+        }
+    }
+    if plan.is_empty() {
+        rows.push(Line::styled("│   no sessions yet", muted().italic()));
+    }
+    let start = focused_row
+        .saturating_sub(height / 2)
+        .min(plan.len().saturating_sub(height));
+    for entry in plan.into_iter().skip(start).take(height) {
+        rows.push(match entry {
+            Entry::Gap => Line::styled("│", border()),
+            Entry::Header(group, count) => {
+                let mut header = Line::styled("│ ", border());
+                header.push(
+                    group.label(),
+                    match group {
+                        Group::NeedsYou => warning().bold(),
+                        Group::Working => info().bold(),
+                        Group::Idle | Group::Done => muted().bold(),
+                    },
+                );
+                header.push(format!("  {count}"), muted());
+                truncate_line(header, width)
+            }
+            Entry::Session(session_id) => {
+                let depth = app.sessions.depth(session_id);
+                let indent = "  ".repeat(depth.min(4));
+                let focused = app.focused() == Some(session_id);
+                let mut line = session_line(app, session_id, width, &format!("│ {indent}"));
+                let unread = app.sessions[&session_id].unread;
+                if unread > 0 && !focused {
+                    line.push(format!("  {unread} new"), accent());
+                }
+                if focused {
+                    pad_line(&mut line, width);
+                    for span in &mut line.spans[1..] {
+                        span.style = selection(span.style);
+                    }
+                }
+                truncate_line(line, width)
+            }
+            Entry::Status(session_id, text, style) => {
+                let depth = app.sessions.depth(session_id);
+                let indent = "  ".repeat(depth.min(4));
                 let mut line = Line::styled(format!("│ {indent}   "), muted());
                 let used = line.width();
                 line.push(preview(&text, inner.saturating_sub(used)), style);
-                rows.push(truncate_line(line, width));
+                truncate_line(line, width)
             }
-        }
+        });
     }
-    if rows.is_empty() {
-        rows.push(Line::styled("│   no sessions yet", muted().italic()));
-    }
-    let mut lines = selection_viewport(rows, height, focused_row);
+    let mut lines = rows;
     while lines.len() < height {
         lines.push(Line::styled("│", border()));
     }
