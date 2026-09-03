@@ -320,3 +320,50 @@ fn resolve_server(
         .expect("the validated concurrency bound fits usize");
     Ok(settings)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use qq_core::hosts::conformance::{ConformanceFixture, check};
+    use qq_mcp::{McpManager, McpServerSettings, McpTransportSettings};
+
+    use super::WiredMcpRegistry;
+
+    /// The adapter runs the shared host suite against a real manager whose
+    /// stdio server cannot start: the snapshot reports the backend as
+    /// unavailable rather than Ready, every call is a typed `Unavailable`
+    /// (never a success or a panic), shutdown is bounded, and a shut-down
+    /// manager invalidates the catalog generation a plan was compiled from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wired_mcp_adapter_passes_the_availability_subset_over_the_real_transport() {
+        let mut settings = McpServerSettings::new(
+            "srv",
+            McpTransportSettings::Stdio {
+                command: "qq-mcp-test-no-such-binary".to_owned(),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
+        );
+        settings.call_timeout = std::time::Duration::from_secs(5);
+        settings.allow = vec!["echo".to_owned()];
+        let host: Arc<dyn qq_core::ExternalToolHost> = Arc::new(WiredMcpRegistry {
+            manager: Arc::new(McpManager::new(vec![settings]).unwrap()),
+        });
+        assert_eq!(host.config_grants(), ["mcp__srv__echo"]);
+        check(
+            host,
+            ConformanceFixture {
+                succeeds: Some(("mcp__srv__echo".to_owned(), String::new())),
+                tool_error: None,
+                hangs: None,
+                oversized: None,
+                unknown: "mcp__other__nope".to_owned(),
+                concurrency: None,
+                backend_unavailable: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+}

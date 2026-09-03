@@ -276,6 +276,12 @@ impl ServerHandle {
     }
 
     async fn client_locked(&self, state: &mut ServerState) -> Result<Arc<Client>, String> {
+        if self.shut_down.load(Ordering::Acquire) {
+            return Err(format!(
+                "MCP server {:?} has been shut down",
+                self.settings.name
+            ));
+        }
         if let Some(client) = &state.client {
             return Ok(Arc::clone(client));
         }
@@ -718,9 +724,10 @@ impl McpManager {
             handle.shut_down.store(true, Ordering::Release);
             let mut state = handle.state.lock().await;
             state.client = None;
-            if state.tools.take().is_some() {
-                handle.bump_generation();
-            }
+            state.tools = None;
+            // Always advance: a plan compiled against this manager must not
+            // consider its snapshot current once the backends are gone.
+            handle.bump_generation();
         }
     }
 

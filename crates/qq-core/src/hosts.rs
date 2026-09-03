@@ -162,3 +162,13 @@ pub trait ExternalToolHost: Send + Sync {
 pub(crate) fn host_error_result(error: &HostCallError) -> crate::tools::ToolExecutionResult {
     crate::tools::bounded_result(error.to_string(), true)
 }
+
+pub mod embedded;
+pub use embedded::{
+    DEFAULT_EMBEDDED_CALL_TIMEOUT, DEFAULT_EMBEDDED_MAX_CONCURRENT_CALLS, EmbeddedHostError,
+    EmbeddedToolFuture, EmbeddedToolHandler, EmbeddedToolHost, EmbeddedToolHostBuilder,
+    MAX_EMBEDDED_ARGUMENT_BYTES, MAX_EMBEDDED_RESULT_BYTES,
+};
+
+#[doc(hidden)]
+pub mod conformance;

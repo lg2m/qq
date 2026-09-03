@@ -46,8 +46,10 @@ use runtime::{
 };
 
 pub use hosts::{
-    EMBEDDED_TOOL_PREFIX, ExternalToolHost, HostCallError, HostCallFuture, HostCatalog,
-    HostReadiness, HostShutdownFuture, HostTool, HostToolResult, MCP_TOOL_PREFIX, ToolHints,
+    EMBEDDED_TOOL_PREFIX, EmbeddedHostError, EmbeddedToolFuture, EmbeddedToolHandler,
+    EmbeddedToolHost, EmbeddedToolHostBuilder, ExternalToolHost, HostCallError, HostCallFuture,
+    HostCatalog, HostReadiness, HostShutdownFuture, HostTool, HostToolResult, MCP_TOOL_PREFIX,
+    ToolHints,
 };
 pub use runtime::MAX_PENDING_STEERING;
 pub use sessions::{
