@@ -992,8 +992,8 @@ fn tui_config_rejects_removed_layout_and_pane_keys_with_a_clear_error() {
         panic!("expected a parse error, got {error:?}");
     };
     assert!(
-        message.contains("select_fold_focus"),
-        "message names the key: {message}"
+        message.contains("delete the `select_fold_focus` binding"),
+        "message says what to do: {message}"
     );
 }
 

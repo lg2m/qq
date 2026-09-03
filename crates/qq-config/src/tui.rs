@@ -195,7 +195,7 @@ impl Document {
             .from_str(content)
             .map_err(|error| ConfigError::Parse {
                 origin: source.clone(),
-                message: error.to_string(),
+                message: explain_removed_key(&error.to_string()),
             })?;
         if document.version != 1 {
             return Err(ConfigError::UnsupportedVersion {
@@ -230,6 +230,41 @@ impl Document {
         );
         touched
     }
+}
+
+/// Keys the TUI used to accept and now rejects. The parser's "unexpected
+/// field" error names the key; this adds what to do about it, so a config
+/// written for an older `qq` fails with instructions rather than a schema.
+const REMOVED_KEYS: [(&str, &str); 5] = [
+    (
+        "layout",
+        "the TUI has one transcript layout now; delete the `layout` key",
+    ),
+    (
+        "select_threadline",
+        "layouts were removed; delete the `select_threadline` binding",
+    ),
+    (
+        "select_fold_focus",
+        "layouts were removed; delete the `select_fold_focus` binding",
+    ),
+    (
+        "next_layout",
+        "layouts were removed; delete the `next_layout` binding",
+    ),
+    (
+        "previous_layout",
+        "layouts were removed; delete the `previous_layout` binding",
+    ),
+];
+
+fn explain_removed_key(message: &str) -> String {
+    for (key, advice) in REMOVED_KEYS {
+        if message.contains(&format!("`{key}`")) {
+            return format!("{message}; {advice}");
+        }
+    }
+    message.to_owned()
 }
 
 pub(super) fn load<Validate, ValidationError>(
