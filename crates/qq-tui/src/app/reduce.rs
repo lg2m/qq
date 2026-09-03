@@ -136,6 +136,14 @@ impl App {
                 channel,
                 text,
             } => {
+                if let Some(run_id) = envelope.run_id
+                    && let Some(view) = self.sessions.get_mut(&envelope.session_id)
+                {
+                    let stats = view.runs.entry(run_id).or_default();
+                    if stats.first_token_at_ms.is_none() {
+                        stats.first_token_at_ms = Some(envelope.occurred_at_ms);
+                    }
+                }
                 // Live status reduces for every session, warm or cold, so the
                 // sidebar tracks children the user is not looking at.
                 if *channel == qq_protocol::TextChannel::Output

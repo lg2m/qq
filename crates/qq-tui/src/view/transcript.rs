@@ -1481,6 +1481,24 @@ pub(super) fn run_completion_line(
     {
         parts.push(format_cost(cost));
     }
+    // Speed telemetry: time to first token, and output tokens per second of
+    // generation (first token to finish).
+    if let (Some(started), Some(first)) = (stats.started_at_ms, stats.first_token_at_ms) {
+        parts.push(format!(
+            "ttft {}",
+            format_duration_ms(first.saturating_sub(started))
+        ));
+    }
+    if let (Some(first), Some(finished), Some(usage)) =
+        (stats.first_token_at_ms, stats.finished_at_ms, stats.usage)
+        && finished > first
+        && usage.output_tokens > 0
+    {
+        let per_second = usage.output_tokens * 1000 / (finished - first);
+        if per_second > 0 {
+            parts.push(format!("{per_second} tok/s"));
+        }
+    }
     if parts.is_empty() && matches!(outcome, qq_protocol::RunOutcome::Completed) {
         return None;
     }

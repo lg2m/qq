@@ -208,6 +208,8 @@ impl Reasoning {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RunStats {
     pub started_at_ms: Option<u64>,
+    /// When the first assistant text of the run arrived: time to first token.
+    pub first_token_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub outcome: Option<qq_protocol::RunOutcome>,
     pub usage: Option<qq_protocol::TokenUsage>,

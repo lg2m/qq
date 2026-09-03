@@ -6,9 +6,7 @@ use std::io::{self, Write};
 
 use crossterm::{
     queue,
-    style::{
-        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    },
+    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -215,30 +213,114 @@ pub(crate) fn diff_line_style(line: &str) -> Style {
     }
 }
 
+/// Write one row. The caller has reset attributes and colors at the start of
+/// the row; from there only the differences between consecutive spans are
+/// emitted, so a row of one style costs one color sequence instead of a
+/// reset-and-set per span. Attributes that turn off (bold to plain) need a
+/// reset, which then re-applies the surviving colors.
 pub(crate) fn write_line(output: &mut impl Write, line: &Line) -> io::Result<()> {
+    let mut current = Style::default();
     for span in &line.spans {
-        queue!(output, SetAttribute(Attribute::Reset), ResetColor)?;
-        if let Some(color) = span.style.color {
-            queue!(output, SetForegroundColor(color))?;
+        if span.text.is_empty() {
+            continue;
         }
-        if let Some(background) = span.style.background {
-            queue!(output, SetBackgroundColor(background))?;
+        let next = span.style;
+        if next != current {
+            let attribute_dropped = (current.bold && !next.bold)
+                || (current.dim && !next.dim)
+                || (current.italic && !next.italic);
+            if attribute_dropped {
+                // SGR 0 clears colors too; no separate color reset needed.
+                queue!(output, SetAttribute(Attribute::Reset))?;
+                current = Style::default();
+            }
+            match (current.color, next.color) {
+                (same, Some(color)) if same != Some(color) => {
+                    queue!(output, SetForegroundColor(color))?;
+                }
+                (Some(_), None) => queue!(output, SetForegroundColor(Color::Reset))?,
+                _ => {}
+            }
+            match (current.background, next.background) {
+                (same, Some(background)) if same != Some(background) => {
+                    queue!(output, SetBackgroundColor(background))?;
+                }
+                (Some(_), None) => queue!(output, SetBackgroundColor(Color::Reset))?,
+                _ => {}
+            }
+            if next.bold && !current.bold {
+                queue!(output, SetAttribute(Attribute::Bold))?;
+            }
+            if next.dim && !current.dim {
+                queue!(output, SetAttribute(Attribute::Dim))?;
+            }
+            if next.italic && !current.italic {
+                queue!(output, SetAttribute(Attribute::Italic))?;
+            }
+            current = next;
         }
-        if span.style.bold {
-            queue!(output, SetAttribute(Attribute::Bold))?;
-        }
-        if span.style.dim {
-            queue!(output, SetAttribute(Attribute::Dim))?;
-        }
-        if span.style.italic {
-            queue!(output, SetAttribute(Attribute::Italic))?;
-        }
-        let safe = span
+        // Most spans are already terminal-safe; scan once and only allocate
+        // when something must be dropped.
+        if span
             .text
             .chars()
-            .filter_map(terminal_safe_character)
-            .collect::<String>();
-        queue!(output, Print(safe))?;
+            .all(|c| terminal_safe_character(c) == Some(c))
+        {
+            queue!(output, Print(&span.text))?;
+        } else {
+            let safe = span
+                .text
+                .chars()
+                .filter_map(terminal_safe_character)
+                .collect::<String>();
+            queue!(output, Print(safe))?;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(line: &Line) -> String {
+        let mut out = Vec::new();
+        write_line(&mut out, line).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_single_style_row_sets_its_color_once() {
+        let mut line = Line::styled("alpha ", Style::color(Color::Red));
+        line.push("beta", Style::color(Color::Red));
+        let out = bytes(&line);
+        // `push` merges same-style spans, so one span, one color, no reset.
+        assert_eq!(out.matches("\x1b[38;5;9m").count(), 1, "{out:?}");
+        assert!(!out.contains("\x1b[0m"), "{out:?}");
+    }
+
+    #[test]
+    fn only_differences_between_spans_are_emitted() {
+        let mut line = Line::styled("a", Style::color(Color::Red));
+        line.push("b", Style::color(Color::Red).bold());
+        line.push("c", Style::color(Color::Green).bold());
+        let out = bytes(&line);
+        // red, then bold added (no new color), then green replaces red.
+        assert_eq!(out, "\x1b[38;5;9ma\x1b[1mb\x1b[38;5;10mc", "{out:?}");
+    }
+
+    #[test]
+    fn dropping_an_attribute_resets_then_reapplies_the_color() {
+        let mut line = Line::styled("a", Style::color(Color::Red).bold());
+        line.push("b", Style::color(Color::Red));
+        let out = bytes(&line);
+        assert_eq!(out, "\x1b[38;5;9m\x1b[1ma\x1b[0m\x1b[38;5;9mb", "{out:?}");
+    }
+
+    #[test]
+    fn unsafe_characters_are_dropped_without_touching_safe_spans() {
+        let mut line = Line::styled("ok", Style::default());
+        line.push("b\u{7}ell", Style::default());
+        assert_eq!(bytes(&line), "okbell");
+    }
 }
