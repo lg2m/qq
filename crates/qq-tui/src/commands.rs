@@ -31,6 +31,10 @@ pub(crate) enum Command {
     NextLayout,
     PreviousLayout,
     ToggleToolDetail,
+    /// Move the transcript cursor to the previous / next tool call of the
+    /// focused session; Enter then expands or collapses that call alone.
+    CursorUp,
+    CursorDown,
     ToggleReasoning,
     ToggleSidebar,
     ToggleMouse,
@@ -135,7 +139,7 @@ macro_rules! spec {
 
 /// Presentation order is invocation frequency within a category, and the
 /// palette shows categories in this order too.
-pub(crate) const COMMANDS: [CommandSpec; 43] = [
+pub(crate) const COMMANDS: [CommandSpec; 45] = [
     spec!(
         OpenHelp,
         "show every command and key",
@@ -288,6 +292,20 @@ pub(crate) const COMMANDS: [CommandSpec; 43] = [
         View,
         [],
         ["Ctrl-O"]
+    ),
+    spec!(
+        CursorUp,
+        "select the previous tool call",
+        View,
+        [],
+        ["Ctrl-Up"]
+    ),
+    spec!(
+        CursorDown,
+        "select the next tool call",
+        View,
+        [],
+        ["Ctrl-Down"]
     ),
     spec!(
         ToggleReasoning,

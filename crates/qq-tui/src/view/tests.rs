@@ -37,6 +37,30 @@ fn app_with_messages(count: u8) -> App {
     app
 }
 
+/// Row text with runs of spaces collapsed so tool rows (a fixed subject
+/// column followed by a right-aligned metric) compare without counting
+/// padding.
+fn squash(row: &str) -> String {
+    let mut out = String::with_capacity(row.len());
+    let mut spaces = 0;
+    for character in row.chars() {
+        if character == ' ' {
+            spaces += 1;
+            if spaces <= 1 {
+                out.push(character);
+            }
+        } else {
+            spaces = 0;
+            out.push(character);
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+fn squashed_rows(frame: &[Line]) -> Vec<String> {
+    frame_rows(frame).iter().map(|row| squash(row)).collect()
+}
+
 fn frame_text(frame: &[Line]) -> String {
     frame
         .iter()
@@ -179,7 +203,7 @@ fn transcript_renders_replayed_tool_activity_collapsed() {
 
     assert!(
         rows.iter()
-            .any(|row| row.contains("● read_file note.txt (1 line)"))
+            .any(|row| squash(row).contains("● Read note.txt 1 line"))
     );
     assert!(!frame_text(&frame).contains("contents"));
 }
@@ -203,7 +227,7 @@ fn call_only_run_renders_before_its_first_assistant_message() {
 
     assert!(
         rows.iter()
-            .any(|row| row.contains("read_file note.txt") && row.contains("running"))
+            .any(|row| squash(row).contains("Read note.txt") && row.contains("running"))
     );
 }
 
@@ -228,7 +252,7 @@ fn fold_focus_renders_the_current_runs_tool_activity() {
 
     assert!(
         rows.iter()
-            .any(|row| row.contains("read_file note.txt") && row.contains("running"))
+            .any(|row| squash(row).contains("Read note.txt") && row.contains("running"))
     );
 }
 
@@ -317,7 +341,7 @@ fn fold_focus_keeps_active_work_visible_ahead_of_queued_prompts() {
     assert!(text.contains("active model turn"));
     assert!(
         rows.iter()
-            .any(|row| row.contains("read_file active.rs") && row.contains("running"))
+            .any(|row| squash(row).contains("Read active.rs") && row.contains("running"))
     );
     assert!(text.contains("queued prompt one"));
     assert!(text.contains("queued prompt two"));
@@ -378,7 +402,7 @@ fn transcript_spacing_separates_blocks_and_doubles_before_prompts() {
         false,
     )]);
 
-    let rows = frame_rows(&transcript_lines(&app, 80));
+    let rows = squashed_rows(&transcript_lines(&app, 80));
 
     assert_eq!(
         rows,
@@ -386,10 +410,10 @@ fn transcript_spacing_separates_blocks_and_doubles_before_prompts() {
             " ▌ YOU",
             " ▌ row 0",
             "",
-            "   QQ",
-            "   row 1",
+            " QQ",
+            " row 1",
             "",
-            "   ● read_file note.txt (1 line)",
+            " ● Read note.txt 1 line",
             "",
             "",
             " ▌ YOU",
@@ -425,7 +449,7 @@ fn head_orphan_call_turns_render_before_the_runs_first_message() {
         call(3, 1, "read_file", r#"{"path":"a.rs"}"#, "a\n"),
     ]);
 
-    let rows = frame_rows(&transcript_lines(&app, 80));
+    let rows = squashed_rows(&transcript_lines(&app, 80));
 
     // The call-only turn 1 renders before the run's first message (turn
     // 2), so the transcript reads in execution order.
@@ -435,13 +459,13 @@ fn head_orphan_call_turns_render_before_the_runs_first_message() {
             " ▌ YOU",
             " ▌ row 0",
             "",
-            "   ● read_file a.rs (1 line)",
-            "   ● read_file b.rs (1 line)",
+            " ● Read a.rs 1 line",
+            " ● Read b.rs 1 line",
             "",
-            "   QQ",
-            "   row 1",
+            " QQ",
+            " row 1",
             "",
-            "   ● search \"x\" (no matches)",
+            " ● Search \"x\" no matches",
         ]
     );
 }
@@ -469,14 +493,11 @@ fn consecutive_call_only_turns_merge_into_one_folded_group() {
         .collect::<Vec<_>>();
     session.tool_calls = Some(calls);
 
-    let rows = frame_rows(&transcript_lines(&app, 80));
+    let rows = squashed_rows(&transcript_lines(&app, 80));
 
     // The call-only turns 2 and 3 merge into turn 1's contiguous call
     // group, and the four quiet calls fold as one, not per turn.
-    assert_eq!(
-        rows,
-        ["   QQ", "   row 0", "", "   ▸ 4 tool calls (read_file ×4)",]
-    );
+    assert_eq!(rows, [" QQ", " row 0", "", " ▸ Read ×4 a.rs",]);
 }
 
 #[test]
@@ -489,7 +510,7 @@ fn completed_edit_results_color_diff_shaped_content_at_expanded_detail() {
         Some("@@ -1 +1 @@\n-old\n+new\n context"),
         false,
     );
-    let lines = render_tool_calls(
+    let lines = render_tool_calls_simple(
         &[&diff_call],
         &HashMap::new(),
         ToolDetail::Expanded,
@@ -518,7 +539,7 @@ fn completed_edit_results_color_diff_shaped_content_at_expanded_detail() {
         Some("Edited src/lib.rs: replaced 1 occurrence(s)."),
         false,
     );
-    let lines = render_tool_calls(
+    let lines = render_tool_calls_simple(
         &[&summary_call],
         &HashMap::new(),
         ToolDetail::Expanded,
@@ -544,7 +565,7 @@ fn display_payload_diffs_replace_the_result_summary_at_expanded_detail() {
         diff: "- old line\n+ new line\n".to_owned(),
     });
 
-    let lines = render_tool_calls(
+    let lines = render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
         ToolDetail::Expanded,
@@ -565,7 +586,7 @@ fn display_payload_diffs_replace_the_result_summary_at_expanded_detail() {
     assert!(style_of("replaced 1 occurrence").is_none());
 
     // Collapsed detail keeps the one-liner; the payload adds no rows.
-    let lines = render_tool_calls(
+    let lines = render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -593,7 +614,7 @@ fn running_calls_show_a_live_output_tail_of_complete_lines() {
     );
 
     for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
-        let rows = frame_rows(&render_tool_calls(
+        let rows = frame_rows(&render_tool_calls_simple(
             &[&call],
             &live,
             detail,
@@ -601,7 +622,7 @@ fn running_calls_show_a_live_output_tail_of_complete_lines() {
             80,
             &|_, _| Vec::new(),
         ));
-        assert!(rows[0].contains("shell"), "the spinner one-liner stays");
+        assert!(rows[0].contains("Run"), "the spinner one-liner stays");
         let tail_start = rows.len() - MAX_LIVE_TAIL_ROWS;
         assert_eq!(
             &rows[tail_start..],
@@ -623,7 +644,7 @@ fn running_calls_show_a_live_output_tail_of_complete_lines() {
     // stays bounded in rows.
     let mut live = HashMap::new();
     live.insert(call.id, format!("{}\n", "x".repeat(40)));
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &[&call],
         &live,
         ToolDetail::Collapsed,
@@ -640,7 +661,7 @@ fn running_calls_show_a_live_output_tail_of_complete_lines() {
     let mut finished = call.clone();
     finished.state = ToolCallState::Completed;
     finished.result = Some("ok\n".to_owned());
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &[&finished],
         &live,
         ToolDetail::Collapsed,
@@ -694,7 +715,25 @@ fn approval_prompts_render_edit_previews_as_colored_diffs() {
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 24);
     let rows = frame_rows(&frame);
 
-    assert!(rows.iter().any(|row| row.contains("file: src/lib.rs")));
+    // The approval is inline under the tool row: the transcript stays
+    // visible, the file and diff head follow, then the four choices.
+    assert!(
+        rows.iter().any(|row| row.contains("row 0")),
+        "transcript stays: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| squash(row).contains("◇ Edit src/lib.rs")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("approval needed")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("src/lib.rs")),
+        "{rows:?}"
+    );
     assert!(!frame_text(&frame).contains("arguments:"));
     let style_of = |needle: &str| {
         frame
@@ -706,13 +745,16 @@ fn approval_prompts_render_edit_previews_as_colored_diffs() {
     assert_eq!(style_of("@@ -1 +1 @@"), Some(muted()));
     assert_eq!(style_of("-old"), Some(diff_line_style("-")));
     assert_eq!(style_of("+new"), Some(diff_line_style("+")));
-    // The modal offers all four decisions, including workspace lifetime.
+    // The block offers all four decisions, including workspace lifetime.
     assert!(rows.iter().any(|row| {
-        row.contains("[y] approve once")
-            && row.contains("[a] for session")
-            && row.contains("[w] for workspace")
-            && row.contains("[n]/[Esc] deny")
+        let row = squash(row);
+        row.contains("y once")
+            && row.contains("a session")
+            && row.contains("w workspace")
+            && row.contains("n deny")
     }));
+    // The composer is disabled while the approval owns input.
+    assert!(rows.iter().any(|row| row.starts_with(" ✎ ")), "{rows:?}");
 }
 
 #[test]
@@ -727,7 +769,7 @@ fn collapsed_summaries_curate_known_tools() {
                 Some("a\nb\nc\n"),
                 false,
             ),
-            "   ● read_file src/config/loader.rs (3 lines)",
+            " ● Read src/config/loader.rs 3 lines",
         ),
         (
             tool_call_snapshot(
@@ -738,7 +780,7 @@ fn collapsed_summaries_curate_known_tools() {
                 Some("a\n...[truncated by qq]\n"),
                 false,
             ),
-            "   ● read_file big.log (1 line, truncated)",
+            " ● Read big.log 1 line · truncated",
         ),
         (
             tool_call_snapshot(
@@ -749,7 +791,7 @@ fn collapsed_summaries_curate_known_tools() {
                 Some("src/a.rs:1:x pattern\nsrc/a.rs:9:pattern y\nsrc/b.rs: filename match\n"),
                 false,
             ),
-            "   ● search \"pattern\" (3 matches, 2 files)",
+            " ● Search \"pattern\" 3 hits · 2 files",
         ),
         (
             tool_call_snapshot(
@@ -760,7 +802,7 @@ fn collapsed_summaries_curate_known_tools() {
                 Some("No matches found.\n"),
                 false,
             ),
-            "   ● search \"absent\" (no matches)",
+            " ● Search \"absent\" no matches",
         ),
         (
             tool_call_snapshot(
@@ -771,11 +813,11 @@ fn collapsed_summaries_curate_known_tools() {
                 Some("lib.rs\nsessions.rs\ntools.rs\n"),
                 false,
             ),
-            "   ● list_dir crates/qq-core/src (3 entries)",
+            " ● List crates/qq-core/src 3 entries",
         ),
     ];
     for (call, expected) in cases {
-        let rows = frame_rows(&render_tool_calls(
+        let rows = squashed_rows(&render_tool_calls_simple(
             &[&call],
             &HashMap::new(),
             ToolDetail::Collapsed,
@@ -788,18 +830,18 @@ fn collapsed_summaries_curate_known_tools() {
 }
 
 #[test]
-fn unknown_tools_fall_back_to_compact_arguments_and_byte_size() {
+fn unknown_tools_fall_back_to_the_first_string_argument_and_byte_size() {
     let result = "x".repeat(2048);
     let call = tool_call_snapshot(
         1,
-        "edit_file",
-        r#"{"path":"src/main.rs","content":"fn main() {}"}"#,
+        "mcp__executor__run_query",
+        r#"{"sql":"select 1","limit":10}"#,
         ToolCallState::Completed,
         Some(&result),
         false,
     );
 
-    let rows = frame_rows(&render_tool_calls(
+    let rows = squashed_rows(&render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -808,10 +850,26 @@ fn unknown_tools_fall_back_to_compact_arguments_and_byte_size() {
         &|_, _| Vec::new(),
     ));
 
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].contains("● edit_file"));
-    assert!(rows[0].contains(r#"{"path":"src/main.rs","#));
-    assert!(rows[0].contains("(2.0 KB)"));
+    assert_eq!(rows, [" ● executor · run_query select 1 2.0 KB"]);
+
+    // A known tool without a diff payload keeps a size metric.
+    let edit = tool_call_snapshot(
+        2,
+        "edit_file",
+        r#"{"path":"src/main.rs","content":"fn main() {}"}"#,
+        ToolCallState::Completed,
+        Some("Edited src/main.rs: replaced 1 occurrence(s)."),
+        false,
+    );
+    let rows = squashed_rows(&render_tool_calls_simple(
+        &[&edit],
+        &HashMap::new(),
+        ToolDetail::Collapsed,
+        0,
+        160,
+        &|_, _| Vec::new(),
+    ));
+    assert_eq!(rows, [" ● Edit src/main.rs 45 B"]);
 }
 
 #[test]
@@ -825,7 +883,7 @@ fn malformed_arguments_fall_back_to_a_raw_preview() {
         false,
     );
 
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -834,7 +892,7 @@ fn malformed_arguments_fall_back_to_a_raw_preview() {
         &|_, _| Vec::new(),
     ));
 
-    assert!(rows[0].contains("read_file {not json (1 line)"));
+    assert_eq!(squash(&rows[0]), " ● Read {not json 1 line");
 }
 
 #[test]
@@ -848,7 +906,7 @@ fn error_results_expand_under_the_summary_by_default() {
         true,
     );
 
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &[&call],
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -857,7 +915,7 @@ fn error_results_expand_under_the_summary_by_default() {
         &|_, _| Vec::new(),
     ));
 
-    assert_eq!(rows[0], "   ✕ read_file gone.txt");
+    assert_eq!(squash(&rows[0]), " ✕ Read gone.txt");
     assert_eq!(rows[1], "     path is not a file");
 }
 
@@ -871,7 +929,7 @@ fn pending_states_show_their_glyph_and_label() {
         None,
         false,
     );
-    let rows = frame_rows(&render_tool_calls(
+    let rows = squashed_rows(&render_tool_calls_simple(
         &[&awaiting],
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -879,10 +937,7 @@ fn pending_states_show_their_glyph_and_label() {
         120,
         &|_, _| Vec::new(),
     ));
-    assert_eq!(
-        rows,
-        ["   ◇ shell {\"command\":\"cargo test\"} awaiting approval"]
-    );
+    assert_eq!(rows, [" ◇ Run cargo test awaiting approval"]);
 
     let running = tool_call_snapshot(
         2,
@@ -892,7 +947,7 @@ fn pending_states_show_their_glyph_and_label() {
         None,
         false,
     );
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &[&running],
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -900,7 +955,15 @@ fn pending_states_show_their_glyph_and_label() {
         120,
         &|_, _| Vec::new(),
     ));
-    assert_eq!(rows, ["   ◓ search \"x\" running"]);
+    assert_eq!(
+        squashed_rows(
+            &rows
+                .iter()
+                .map(|row| Line::styled(row.clone(), normal()))
+                .collect::<Vec<_>>()
+        ),
+        [" ◓ Search \"x\" running"]
+    );
 }
 
 #[test]
@@ -928,7 +991,7 @@ fn quiet_runs_fold_into_a_single_counted_line() {
     }
     let references = calls.iter().collect::<Vec<_>>();
 
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &references,
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -936,12 +999,20 @@ fn quiet_runs_fold_into_a_single_counted_line() {
         120,
         &|_, _| Vec::new(),
     ));
-    assert_eq!(rows, ["   ▸ 6 tool calls (read_file ×4, search ×2)"]);
+    assert_eq!(
+        squashed_rows(
+            &rows
+                .iter()
+                .map(|row| Line::styled(row.clone(), normal()))
+                .collect::<Vec<_>>()
+        ),
+        [" ▸ Read ×4 Search ×2 a.rs"]
+    );
 
     // An active or failed call keeps every line visible.
     calls[5].state = ToolCallState::Running;
     let references = calls.iter().collect::<Vec<_>>();
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &references,
         &HashMap::new(),
         ToolDetail::Collapsed,
@@ -954,7 +1025,7 @@ fn quiet_runs_fold_into_a_single_counted_line() {
     // Expanded detail never folds.
     calls[5].state = ToolCallState::Completed;
     let references = calls.iter().collect::<Vec<_>>();
-    let rows = frame_rows(&render_tool_calls(
+    let rows = frame_rows(&render_tool_calls_simple(
         &references,
         &HashMap::new(),
         ToolDetail::Expanded,
@@ -1020,10 +1091,14 @@ fn tool_rows_respect_narrow_widths() {
     let references = calls.iter().collect::<Vec<_>>();
     for width in 0..24 {
         for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
-            let lines =
-                render_tool_calls(&references, &HashMap::new(), detail, 0, width, &|_, _| {
-                    Vec::new()
-                });
+            let lines = render_tool_calls_simple(
+                &references,
+                &HashMap::new(),
+                detail,
+                0,
+                width,
+                &|_, _| Vec::new(),
+            );
             assert!(lines.iter().all(|line| line.width() <= width));
         }
     }
@@ -1930,7 +2005,7 @@ fn spawned_children_render_under_their_spawn_call_and_never_fold() {
     let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 40));
     let spawn_row = rows
         .iter()
-        .position(|row| row.contains("spawn_agent"))
+        .position(|row| row.contains("Spawn"))
         .expect("spawn call is rendered, not folded");
     assert!(rows[spawn_row + 1].contains("↳"));
     assert!(rows[spawn_row + 1].contains("survey callers"));
@@ -1948,10 +2023,7 @@ fn spawned_children_render_under_their_spawn_call_and_never_fold() {
     // but still appears in related sessions.
     app.sessions.get_mut(&child_id).unwrap().summary.spawned_by = None;
     let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 40));
-    let spawn_row = rows
-        .iter()
-        .position(|row| row.contains("spawn_agent"))
-        .unwrap();
+    let spawn_row = rows.iter().position(|row| row.contains("Spawn")).unwrap();
     assert!(!rows[spawn_row + 1].contains("↳"));
     assert!(rows.iter().any(|row| row.contains("related sessions")));
 }
@@ -2426,4 +2498,183 @@ fn no_role_style_relies_on_dim_and_muted_is_a_color_step_only() {
         assert!(!style.dim, "{style:?}");
     }
     assert_ne!(muted().color, normal().color);
+}
+
+#[test]
+fn an_expanded_running_shell_shows_started_live_elapsed_and_last_output_times() {
+    let (mut app, session_id, run_id, _) = running_view_app();
+    let call_id = ToolCallId::from_bytes([0x81; 16]);
+    let mut sequence = 2;
+    let mut event = |at_ms: u64, event: SessionEvent| {
+        sequence += 1;
+        ClientUpdate::Event(SessionEventEnvelope {
+            run_id: Some(run_id),
+            occurred_at_ms: at_ms,
+            ..fixtures::envelope(sequence, session_id, event)
+        })
+    };
+    // 14:32:07 UTC on some day.
+    let started = (14 * 3600 + 32 * 60 + 7) * 1000;
+    app.apply_client_update(event(
+        started - 1,
+        SessionEvent::AssistantMessageStarted {
+            message: MessageSnapshot {
+                run_id,
+                state: MessageState::Streaming,
+                ..fixtures::message(
+                    MessageId::from_bytes([0x80; 16]),
+                    session_id,
+                    "Running tests.",
+                )
+            },
+        },
+    ));
+    app.apply_client_update(event(
+        started,
+        SessionEvent::ToolCallStarted {
+            tool_call: ToolCallSnapshot {
+                run_id,
+                arguments: r#"{"command":"cargo test -p qq-auth"}"#.to_owned(),
+                state: ToolCallState::Running,
+                ..fixtures::tool_call(call_id, session_id, "shell")
+            },
+        },
+    ));
+    app.apply_client_update(event(
+        started + 4 * 60 * 1000,
+        SessionEvent::ToolCallOutputDelta {
+            tool_call_id: call_id,
+            chunk: "Compiling qq-core\n".to_owned(),
+        },
+    ));
+    // Time passes: the animation tick advances the clock 125 ms at a time.
+    for _ in 0..(12 * 8) {
+        app.advance_animation();
+    }
+
+    // Collapsed: relative duration only, no wall-clock time.
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 24);
+    let rows = frame_rows(&frame);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("Run "))
+        .unwrap_or_else(|| panic!("tool row in {rows:#?}"));
+    assert!(squash(row).contains("cargo test -p qq-auth"), "{row}");
+    assert!(row.contains("4m12s"), "live elapsed: {row}");
+    assert!(
+        !row.contains("14:32:07"),
+        "no wall-clock when collapsed: {row}"
+    );
+
+    // Expanded with Ctrl-O: started, running, and last output timestamps.
+    app.execute(Command::ToggleToolDetail);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 24);
+    let text = frame_rows(&frame).join("\n");
+    assert!(text.contains("started 14:32:07"), "{text}");
+    assert!(text.contains("running 4m12s"), "{text}");
+    assert!(text.contains("last output 14:36:07"), "{text}");
+
+    // Another tick moves the elapsed clock.
+    for _ in 0..8 {
+        app.advance_animation();
+    }
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 24);
+    assert!(frame_rows(&frame).join("\n").contains("running 4m13s"));
+}
+
+#[test]
+fn the_transcript_cursor_selects_a_call_and_enter_expands_only_that_one() {
+    let mut app = app_with_messages(1);
+    let session_id = app.focused().unwrap();
+    let session = app.sessions.get_mut(&session_id).unwrap();
+    session.tool_calls = Some(vec![
+        tool_call_snapshot(
+            1,
+            "read_file",
+            r#"{"path":"a.rs"}"#,
+            ToolCallState::Completed,
+            Some("alpha\n"),
+            false,
+        ),
+        tool_call_snapshot(
+            2,
+            "read_file",
+            r#"{"path":"b.rs"}"#,
+            ToolCallState::Completed,
+            Some("beta\n"),
+            false,
+        ),
+    ]);
+    let key = |code| TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL));
+    // Ctrl-Up from nothing selects the newest call.
+    app.handle_terminal_event(key(KeyCode::Up));
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    let selected = rows
+        .iter()
+        .find(|row| row.contains("▶"))
+        .expect("cursor row");
+    assert!(squash(selected).contains("Read b.rs"), "{selected}");
+    // Enter expands that call alone.
+    app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let text = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24)).join("\n");
+    assert!(text.contains("beta"), "{text}");
+    assert!(!text.contains("alpha"), "{text}");
+    // Ctrl-Up again moves to the older call; Esc clears the cursor.
+    app.handle_terminal_event(key(KeyCode::Up));
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    let selected = rows
+        .iter()
+        .find(|row| row.contains("▶"))
+        .expect("cursor row");
+    assert!(squash(selected).contains("Read a.rs"), "{selected}");
+    app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    )));
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    assert!(rows.iter().all(|row| !row.contains("▶")));
+}
+
+#[test]
+fn diffs_render_head_first_with_new_file_line_numbers() {
+    let diff =
+        "--- a/x.rs\n+++ b/x.rs\n@@ -10,3 +10,4 @@\n context\n-old\n+new one\n+new two\n tail\n";
+    let rows = frame_rows(&diff_lines(diff, 20, 60));
+    assert_eq!(
+        rows.iter().map(|row| squash(row)).collect::<Vec<_>>(),
+        [
+            " @@ -10,3 +10,4 @@",
+            " 10 context",
+            " -old",
+            " 11 +new one",
+            " 12 +new two",
+            " 13 tail",
+        ]
+    );
+    // A long diff shows its head and says how much follows.
+    let long: String = (0..30).map(|index| format!("+line {index}\n")).collect();
+    let rows = frame_rows(&diff_lines(&format!("@@ -0,0 +1,30 @@\n{long}"), 5, 60));
+    assert_eq!(rows.len(), 6);
+    assert!(rows[1].contains("+line 0"));
+    assert!(rows[5].contains("… 26 lines more"), "{:?}", rows[5]);
+}
+
+#[test]
+fn paths_elide_from_the_middle_and_keep_the_file_name() {
+    assert_eq!(
+        elide_path("crates/qq-tui/src/view/tools.rs", 40),
+        "crates/qq-tui/src/view/tools.rs"
+    );
+    assert_eq!(
+        elide_path("crates/qq-tui/src/view/tools.rs", 24),
+        "crates/qq-tui/…/tools.rs"
+    );
+    assert_eq!(
+        elide_path("crates/qq-tui/src/view/tools.rs", 12),
+        "…/tools.rs"
+    );
+    assert_eq!(elide_path("crates/qq-tui/src/view/tools.rs", 8), "…ools.rs");
 }

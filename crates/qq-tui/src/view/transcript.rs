@@ -7,6 +7,9 @@ use crate::render::Span;
 #[derive(Default)]
 pub(crate) struct TranscriptCache {
     pub(super) markdown: HashMap<MessageId, CachedMarkdown>,
+    /// Derived tool rows keyed by call, refreshed when a call's state or
+    /// result changes so JSON parsing stays off the per-frame path.
+    tool_rows: HashMap<ToolCallId, (ToolRowKey, ToolRow)>,
     /// Sum of `CachedMarkdown::bytes` over `markdown`.
     cached_bytes: usize,
     /// Monotonic counter bumped per `prepare_markdown`; stamps cache use.
@@ -541,6 +544,7 @@ impl TranscriptCache {
         self.markdown.clear();
         self.cached_bytes = 0;
         self.live.clear();
+        self.tool_rows.clear();
     }
 
     /// Keep only the layouts for messages the pane can show this frame.
@@ -609,6 +613,22 @@ impl TranscriptCache {
         let Some(messages) = session.messages.as_ref() else {
             return;
         };
+        if let Some(calls) = session.tool_calls.as_ref() {
+            self.tool_rows
+                .retain(|id, _| calls.iter().any(|call| call.id == *id));
+            for call in calls {
+                let key = ToolRowKey::of(call);
+                let stale = self
+                    .tool_rows
+                    .get(&call.id)
+                    .is_none_or(|(cached, _)| *cached != key);
+                if stale {
+                    self.tool_rows.insert(call.id, (key, ToolRow::derive(call)));
+                }
+            }
+        } else {
+            self.tool_rows.clear();
+        }
         for message in messages.iter().rev().take(limit) {
             if message_is_terminal(message) {
                 self.live.remove(&message.id);
@@ -1035,6 +1055,33 @@ impl TranscriptCache {
         width: usize,
     ) {
         let tool_calls = session.tool_calls.as_deref().unwrap_or_default();
+        let fallback_rows: HashMap<ToolCallId, ToolRow> = tool_calls
+            .iter()
+            .filter(|call| !self.tool_rows.contains_key(&call.id))
+            .map(|call| (call.id, ToolRow::derive(call)))
+            .collect();
+        let lookup = |call: &ToolCallSnapshot| -> ToolRowContext<'_> {
+            let row = self
+                .tool_rows
+                .get(&call.id)
+                .map(|(_, row)| row)
+                .or_else(|| fallback_rows.get(&call.id))
+                .expect("every call has a derived row");
+            ToolRowContext {
+                row,
+                clock: RowClock {
+                    timing: session
+                        .tool_timing
+                        .get(&call.id)
+                        .copied()
+                        .unwrap_or_default(),
+                    now_ms: app.now_ms,
+                },
+                expanded: app.tool_detail == ToolDetail::Expanded
+                    || app.expanded_tool_calls.contains(&call.id),
+                selected: app.transcript_cursor == Some(call.id),
+            }
+        };
         // One pass over messages and calls answers every per-message question
         // below (first assistant message of a run, next assistant turn, calls
         // by run) so the loop is linear in messages plus calls.
@@ -1081,10 +1128,11 @@ impl TranscriptCache {
                     body.extend_owned(render_tool_calls(
                         &run_calls[..head],
                         &session.live_tool_output,
-                        app.tool_detail,
+                        &lookup,
                         app.animation_tick,
                         width,
                         &|call_id, width| child_rows(app, call_id, width),
+                        &|call_id, width| approval_rows(app, call_id, width),
                     ));
                     body.push_line(Line::default());
                 }
@@ -1101,10 +1149,11 @@ impl TranscriptCache {
                     body.extend_owned(render_tool_calls(
                         &run_calls[head..],
                         &session.live_tool_output,
-                        app.tool_detail,
+                        &lookup,
                         app.animation_tick,
                         width,
                         &|call_id, width| child_rows(app, call_id, width),
+                        &|call_id, width| approval_rows(app, call_id, width),
                     ));
                 }
                 // The run's last assistant message carries its completion line.
@@ -1122,10 +1171,11 @@ impl TranscriptCache {
                         body.extend_owned(render_tool_calls(
                             orphan_calls,
                             &session.live_tool_output,
-                            app.tool_detail,
+                            &lookup,
                             app.animation_tick,
                             width,
                             &|call_id, width| child_rows(app, call_id, width),
+                            &|call_id, width| approval_rows(app, call_id, width),
                         ));
                     }
                 }
@@ -1449,6 +1499,15 @@ pub(super) fn format_count(count: u64) -> String {
         format!("{}.{}k", count / 1_000, (count % 1_000) / 100)
     } else {
         format!("{}.{}M", count / 1_000_000, (count % 1_000_000) / 100_000)
+    }
+}
+
+/// The inline approval block under the call the user must answer, when
+/// `call_id` is that call; otherwise nothing.
+fn approval_rows(app: &App, call_id: ToolCallId, width: usize) -> Vec<Line> {
+    match app.pending_approval() {
+        Some(call) if call.id == call_id => approval_block(app, call, width),
+        _ => Vec::new(),
     }
 }
 

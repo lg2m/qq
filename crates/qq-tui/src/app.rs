@@ -29,6 +29,9 @@ mod pickers;
 mod reduce;
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
+/// Milliseconds the loop's animation tick advances `now_ms` by; matches
+/// `terminal::ANIMATION_INTERVAL`.
+pub(crate) const ANIMATION_INTERVAL_MS: u64 = 125;
 const MAX_RECENT_EVENTS: usize = 1024;
 const SNAPSHOT_SESSION_LIMIT: u16 = 512;
 const SNAPSHOT_MESSAGE_LIMIT: u16 = 256;
@@ -243,7 +246,18 @@ pub(crate) struct App {
     pub(crate) status_level: NoticeLevel,
     status_ticks_left: u16,
     pub animation_tick: usize,
+    /// Wall-clock estimate in server milliseconds: the newest event's
+    /// `occurred_at_ms`, advanced by the animation interval between events
+    /// so running rows show a live elapsed time without a system clock in
+    /// the frame path. Zero until the first event.
+    pub(crate) now_ms: u64,
     pub tool_detail: ToolDetail,
+    /// Tool calls expanded individually (Enter on a selected row), on top of
+    /// the global `tool_detail` toggle.
+    pub(crate) expanded_tool_calls: std::collections::HashSet<qq_protocol::ToolCallId>,
+    /// The tool call the transcript cursor rests on, if any. Ctrl-Up/Down
+    /// move it through the focused session's calls; Enter toggles expansion.
+    pub(crate) transcript_cursor: Option<qq_protocol::ToolCallId>,
     pub reasoning_detail: ReasoningDetail,
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
     /// enough; the toggle command cycles through explicit on and off.
@@ -294,7 +308,10 @@ impl App {
             status_level: NoticeLevel::Info,
             status_ticks_left: 0,
             animation_tick: 0,
+            now_ms: 0,
             tool_detail: ToolDetail::default(),
+            expanded_tool_calls: std::collections::HashSet::new(),
+            transcript_cursor: None,
             reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
             terminal_width: 0,
@@ -701,6 +718,7 @@ impl App {
         }
         self.workspace_id.get_or_insert(event.cursor.workspace_id);
         self.last_sequence = event.cursor.sequence;
+        self.now_ms = self.now_ms.max(event.occurred_at_ms);
         let already_loaded = self
             .sessions
             .get(&event.session_id)
@@ -945,6 +963,9 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => {
+                if self.transcript_cursor.take().is_some() {
+                    return Effects::redraw(Redraw::Immediate);
+                }
                 // A sticky error notice dismisses first: acknowledging the
                 // failure is the most immediate intent Esc can carry.
                 if self.status.is_some()
@@ -980,6 +1001,17 @@ impl App {
                     return self.focus_session(parent);
                 }
                 Effects::none()
+            }
+            // With a tool row selected and nothing typed, Enter toggles that
+            // call's detail; otherwise it submits.
+            KeyCode::Enter if self.transcript_cursor.is_some() && self.composer.text.is_empty() => {
+                let Some(call) = self.transcript_cursor else {
+                    return Effects::none();
+                };
+                if !self.expanded_tool_calls.remove(&call) {
+                    self.expanded_tool_calls.insert(call);
+                }
+                Effects::redraw(Redraw::Immediate)
             }
             KeyCode::Enter => self.submit_prompt(),
             KeyCode::PageUp => Effects::changed_now(self.scroll_focused_page(true)),
@@ -1229,6 +1261,8 @@ impl App {
                 effects
             }
             Command::PruneSessions => self.request_prune_confirmation(),
+            Command::CursorUp => Effects::changed_now(self.move_transcript_cursor(false)),
+            Command::CursorDown => Effects::changed_now(self.move_transcript_cursor(true)),
             Command::ToggleToolDetail => {
                 self.tool_detail = self.tool_detail.next();
                 Effects::redraw(Redraw::Immediate)
@@ -1848,6 +1882,9 @@ impl App {
 
     pub fn advance_animation(&mut self) -> bool {
         self.animation_tick = self.animation_tick.wrapping_add(1);
+        if self.now_ms > 0 {
+            self.now_ms += ANIMATION_INTERVAL_MS;
+        }
         for session in self.sessions.values_mut() {
             for reasoning in session.reasoning.values_mut() {
                 if reasoning.streaming {
@@ -2055,6 +2092,36 @@ fn is_composer_newline_key(key: KeyEvent) -> bool {
 mod tests;
 
 impl App {
+    /// Move the transcript cursor to the adjacent tool call of the focused
+    /// session in transcript order (the order the server persisted them).
+    /// From no selection, up starts at the newest call and down at the oldest.
+    fn move_transcript_cursor(&mut self, down: bool) -> bool {
+        let Some(session) = self.focused().and_then(|id| self.sessions.get(&id)) else {
+            return false;
+        };
+        let Some(calls) = session.tool_calls.as_ref() else {
+            return false;
+        };
+        if calls.is_empty() {
+            return false;
+        }
+        let position = self
+            .transcript_cursor
+            .and_then(|id| calls.iter().position(|call| call.id == id));
+        let next = match (position, down) {
+            (None, true) => 0,
+            (None, false) => calls.len() - 1,
+            (Some(index), true) => (index + 1).min(calls.len() - 1),
+            (Some(index), false) => index.saturating_sub(1),
+        };
+        let target = calls[next].id;
+        if self.transcript_cursor == Some(target) {
+            return false;
+        }
+        self.transcript_cursor = Some(target);
+        true
+    }
+
     /// What Enter does in the composer right now, for the prompt glyph.
     pub(crate) fn composer_mode(&self) -> crate::view::ComposerMode {
         use crate::view::ComposerMode;

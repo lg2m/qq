@@ -294,64 +294,60 @@ pub(super) fn command_picker(app: &App, width: usize, height: usize) -> Vec<Line
     )
 }
 
-pub(super) fn approval_prompt(app: &App, width: usize, height: usize) -> Vec<Line> {
-    let tool_call = app.pending_approval().expect("an approval is pending");
-    let mut lines = vec![section(
-        "TOOL APPROVAL",
-        "y approves once, a approves for this session, w always allows in this workspace, \
-         n or Esc denies",
-    )];
-    lines.push(Line::default());
-    let mut name = Line::styled("  ◇ ", warning());
-    name.push("tool: ", muted());
-    name.push(tool_call.name.clone(), warning().bold());
-    lines.push(truncate_line(name, width));
+/// The approval block drawn under a tool call awaiting an answer: the
+/// command or the diff head, then the four choices. Rendered inline in the
+/// transcript so the decision is made with the run's context on screen.
+pub(super) fn approval_block(app: &App, tool_call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut title = Line::styled("     ◇ ", warning());
+    title.push("approval needed", warning().bold());
+    lines.push(truncate_line(title, width));
     if let Some(command) = shell_command_preview(tool_call) {
-        let mut line = Line::styled("  command: ", muted());
+        let mut line = Line::styled("       $ ", muted());
         line.push(command, normal().bold());
         lines.push(truncate_line(line, width));
     }
     if let Some(edit) = app.pending_approval_edit() {
-        // An edit approval shows what would change instead of the raw
-        // arguments; diff lines truncate rather than reflow.
-        let mut line = Line::styled("  file: ", muted());
-        line.push(edit.path.clone(), normal().bold());
+        let mut line = Line::styled("       ", muted());
+        line.push(
+            elide_path(&edit.path, width.saturating_sub(9)),
+            normal().bold(),
+        );
         lines.push(truncate_line(line, width));
-        let available = height.saturating_sub(lines.len() + 2).max(1);
-        for (shown, text) in edit.diff.lines().enumerate() {
-            if shown == available {
-                lines.push(Line::styled("    ...", muted().italic()));
-                break;
-            }
-            lines.push(truncate_line(
-                Line::styled(format!("    {text}"), diff_line_style(text)),
-                width,
-            ));
-        }
-    } else {
-        lines.push(Line::styled("  arguments:", muted()));
-        let arguments = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
-            .and_then(|value| serde_json::to_string_pretty(&value))
-            .unwrap_or_else(|_| tool_call.arguments.clone());
-        let available = height.saturating_sub(lines.len() + 2).max(1);
-        for (shown, text) in arguments.lines().enumerate() {
-            if shown == available {
-                lines.push(Line::styled("    ...", muted().italic()));
-                break;
-            }
-            lines.push(truncate_line(
-                Line::styled(format!("    {text}"), normal()),
-                width,
-            ));
-        }
+        lines.extend(
+            diff_lines(&edit.diff, MAX_APPROVAL_DIFF_ROWS, width.saturating_sub(2))
+                .into_iter()
+                .map(|line| {
+                    let mut indented = Line::styled("  ", muted());
+                    for span in line.spans {
+                        indented.push(span.text, span.style);
+                    }
+                    indented
+                }),
+        );
     }
-    lines.push(Line::default());
-    lines.push(Line::styled(
-        "  [y] approve once   [a] for session   [w] for workspace   [n]/[Esc] deny",
-        accent().bold(),
-    ));
-    fit_height(lines, height)
+    let mut choices = Line::styled("       ", muted());
+    for (index, (key, label)) in [
+        ("y", "once"),
+        ("a", "session"),
+        ("w", "workspace"),
+        ("n", "deny"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            choices.push("   ", muted());
+        }
+        choices.push(key, accent().bold());
+        choices.push(format!(" {label}"), muted());
+    }
+    lines.push(truncate_line(choices, width));
+    lines
 }
+
+/// Diff rows an inline approval shows before offering to scroll.
+const MAX_APPROVAL_DIFF_ROWS: usize = 12;
 
 /// Shell approvals surface the exact command so the user can decide in place.
 pub(super) fn shell_command_preview(tool_call: &ToolCallSnapshot) -> Option<String> {

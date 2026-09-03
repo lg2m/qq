@@ -170,16 +170,29 @@ impl App {
             } => {
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
                     session.append_live_tool_output(*tool_call_id, chunk);
+                    session
+                        .tool_timing
+                        .entry(*tool_call_id)
+                        .or_default()
+                        .last_output_at_ms = Some(envelope.occurred_at_ms);
                 }
             }
             SessionEvent::ToolCallRequested { tool_call }
             | SessionEvent::ToolApprovalResolved { tool_call, .. }
             | SessionEvent::ToolCallStarted { tool_call }
             | SessionEvent::ToolCallFinished { tool_call } => {
-                if matches!(envelope.event, SessionEvent::ToolCallFinished { .. })
-                    && let Some(view) = self.sessions.get_mut(&envelope.session_id)
-                {
-                    view.runs.entry(tool_call.run_id).or_default().tool_calls += 1;
+                if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
+                    let timing = view.tool_timing.entry(tool_call.id).or_default();
+                    match &envelope.event {
+                        SessionEvent::ToolCallStarted { .. } => {
+                            timing.started_at_ms = Some(envelope.occurred_at_ms);
+                        }
+                        SessionEvent::ToolCallFinished { .. } => {
+                            timing.finished_at_ms = Some(envelope.occurred_at_ms);
+                            view.runs.entry(tool_call.run_id).or_default().tool_calls += 1;
+                        }
+                        _ => {}
+                    }
                 }
                 if matches!(envelope.event, SessionEvent::ToolCallRequested { .. }) {
                     // Calls are persisted with their completed turn, so the

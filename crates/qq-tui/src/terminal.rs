@@ -30,7 +30,7 @@ use crate::{
 
 /// Interval between frame ticks. Frames are only drawn when state changed.
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(8);
-const ANIMATION_INTERVAL: Duration = Duration::from_millis(125);
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(crate::app::ANIMATION_INTERVAL_MS);
 
 pub async fn run<P>(client: P, app: App) -> Result<(), TuiError>
 where

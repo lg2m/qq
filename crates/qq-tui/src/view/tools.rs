@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::ToolCallTiming;
 
 /// Runs with more than this many quiet tool calls fold into one summary row.
 pub(super) const TOOL_FOLD_THRESHOLD: usize = 3;
@@ -13,43 +14,396 @@ pub(super) const MAX_TOOL_RESULT_ROWS: usize = 12;
 /// Rows of live streamed output shown under a running call's one-liner.
 pub(super) const MAX_LIVE_TAIL_ROWS: usize = 6;
 pub(super) const TOOL_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+/// Files named in a folded read-only group before `+N`.
+const FOLD_NAMED_FILES: usize = 3;
 
-/// Renders one run's tool calls: a folded count for quiet runs, otherwise one
-/// gutter line per call, with errors and the expanded detail level adding
-/// bounded body rows. Running calls with buffered live output show a bounded
-/// tail of it at every detail level — a running command's output is the thing
-/// the user is waiting for.
+/// What the transcript needs to know about a tool call to draw its row,
+/// derived once from the JSON arguments and result and cached by the
+/// renderer under [`ToolRowKey`]. Nothing here depends on width or time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolRow {
+    /// `Read`, `Edit`, `Run`, `Search`, `Spawn`, or the raw tool name.
+    pub verb: &'static str,
+    pub raw_name: bool,
+    /// Path, command, query, or task: what the call acted on.
+    pub subject: Option<String>,
+    /// The subject is a path and may be middle-elided and hyperlinked.
+    pub subject_is_path: bool,
+    /// `212 lines`, `+12 −3`, `exit 0`, `14 hits · 3 files`.
+    pub metric: Option<String>,
+    /// The result was cut short by the runtime.
+    pub truncated: bool,
+    /// Pretty-printed arguments for the expanded view.
+    pub arguments_pretty: String,
+    /// Diff text for the expanded view and approvals, when the call has one.
+    pub diff: Option<String>,
+}
+
+/// Identity of a cached [`ToolRow`]: the call plus everything that changes
+/// its derivation. Width and time are applied at draw time, not cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolRowKey {
+    pub id: ToolCallId,
+    pub state: ToolCallState,
+    pub result_len: usize,
+    pub is_error: bool,
+    pub has_display: bool,
+}
+
+impl ToolRowKey {
+    pub(crate) fn of(call: &ToolCallSnapshot) -> Self {
+        Self {
+            id: call.id,
+            state: call.state,
+            result_len: call.result.as_ref().map_or(0, String::len),
+            is_error: call.is_error,
+            has_display: call.display.is_some(),
+        }
+    }
+}
+
+impl ToolRow {
+    /// Derive the row from a call. The one place `serde_json` touches tool
+    /// arguments on the render side.
+    pub(crate) fn derive(call: &ToolCallSnapshot) -> Self {
+        let arguments = if call.arguments.len() <= MAX_TOOL_DETAIL_BYTES {
+            serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
+        } else {
+            None
+        };
+        let arguments_pretty = arguments
+            .as_ref()
+            .and_then(|value| serde_json::to_string_pretty(value).ok())
+            .unwrap_or_else(|| bounded_tail(&call.arguments, MAX_TOOL_DETAIL_BYTES).to_owned());
+        let string_argument = |key: &str| {
+            arguments
+                .as_ref()
+                .and_then(|value| value.get(key))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        };
+        let result = call.result.as_deref().unwrap_or_default();
+        let truncated = result.lines().any(|line| line == TOOL_TRUNCATION_MARKER);
+        let content_lines = || {
+            result
+                .lines()
+                .filter(|line| *line != TOOL_TRUNCATION_MARKER)
+                .count()
+        };
+        let has_result = call.result.is_some() && !call.is_error;
+        let diff = match &call.display {
+            Some(ToolCallDisplay::Diff { diff, .. }) => Some(diff.clone()),
+            None => (matches!(call.name.as_str(), "edit_file" | "write_file")
+                && has_result
+                && looks_like_diff(result))
+            .then(|| result.to_owned()),
+        };
+
+        let compact = || {
+            let text = preview(&call.arguments, TOOL_SUBJECT_WIDTH);
+            (!text.is_empty()).then_some(text)
+        };
+        let (verb, raw_name, subject, subject_is_path, metric) = match call.name.as_str() {
+            "read_file" => (
+                "Read",
+                false,
+                string_argument("path").or_else(compact),
+                arguments.is_some(),
+                has_result.then(|| count_noun(content_lines(), "line", "lines")),
+            ),
+            "list_dir" => (
+                "List",
+                false,
+                string_argument("path").or_else(compact),
+                arguments.is_some(),
+                has_result.then(|| count_noun(content_lines(), "entry", "entries")),
+            ),
+            "search" => (
+                "Search",
+                false,
+                string_argument("query")
+                    .map(|query| format!("\"{query}\""))
+                    .or_else(compact),
+                false,
+                has_result.then(|| search_metric(result)),
+            ),
+            "edit_file" => (
+                "Edit",
+                false,
+                string_argument("path").or_else(compact),
+                arguments.is_some(),
+                diff.as_deref()
+                    .map(diff_metric)
+                    .or_else(|| has_result.then(|| format_result_size(result.len()))),
+            ),
+            "write_file" => (
+                "Write",
+                false,
+                string_argument("path").or_else(compact),
+                arguments.is_some(),
+                diff.as_deref().map(diff_metric).or_else(|| {
+                    string_argument("content")
+                        .map(|content| count_noun(content.lines().count(), "line", "lines"))
+                }),
+            ),
+            "shell" => {
+                let cwd = string_argument("cwd");
+                let command = string_argument("command").map(|command| match cwd {
+                    Some(cwd) => format!("{command}  (in {cwd})"),
+                    None => command,
+                });
+                let exit = call
+                    .result
+                    .as_deref()
+                    .and_then(|result| result.lines().last())
+                    .and_then(|last| last.strip_prefix("exit code: "))
+                    .map(|code| format!("exit {code}"));
+                ("Run", false, command, false, exit)
+            }
+            "spawn_agent" => (
+                "Spawn",
+                false,
+                string_argument("task").map(|task| first_sentence(&task)),
+                false,
+                None,
+            ),
+            "web_fetch" => (
+                "Fetch",
+                false,
+                string_argument("url"),
+                false,
+                has_result.then(|| format_result_size(result.len())),
+            ),
+            name => {
+                // MCP tools arrive as `mcp__server__tool`; show `server · tool`
+                // and the first string argument as the subject.
+                let (verb, raw) = match name.strip_prefix("mcp__") {
+                    Some(rest) => {
+                        let _ = rest;
+                        ("MCP", true)
+                    }
+                    None => ("", true),
+                };
+                let subject = arguments
+                    .as_ref()
+                    .and_then(|value| value.as_object())
+                    .and_then(|object| {
+                        object
+                            .values()
+                            .find_map(|value| value.as_str().map(str::to_owned))
+                    })
+                    .or_else(|| {
+                        let text = preview(&call.arguments, TOOL_SUBJECT_WIDTH);
+                        (!text.is_empty()).then_some(text)
+                    });
+                (
+                    verb,
+                    raw,
+                    subject,
+                    false,
+                    has_result.then(|| format_result_size(result.len())),
+                )
+            }
+        };
+        Self {
+            verb,
+            raw_name,
+            subject,
+            subject_is_path,
+            metric,
+            truncated,
+            arguments_pretty,
+            diff,
+        }
+    }
+
+    /// The name shown in the row: the verb, or `server · tool` for MCP, or
+    /// the raw tool name.
+    fn label(&self, call: &ToolCallSnapshot) -> String {
+        if !self.raw_name {
+            return self.verb.to_owned();
+        }
+        match call.name.strip_prefix("mcp__") {
+            Some(rest) => match rest.split_once("__") {
+                Some((server, tool)) => format!("{server} · {tool}"),
+                None => rest.to_owned(),
+            },
+            None => call.name.clone(),
+        }
+    }
+}
+
+fn search_metric(result: &str) -> String {
+    if result.starts_with("No matches found.") {
+        return "no matches".to_owned();
+    }
+    // Match rows are `path:line:content` or `path: filename match`, grouped
+    // per file, so counting consecutive distinct path prefixes counts files.
+    let mut matches = 0_usize;
+    let mut files = 0_usize;
+    let mut previous: Option<&str> = None;
+    for line in result.lines() {
+        if line.is_empty() || line == TOOL_TRUNCATION_MARKER {
+            continue;
+        }
+        matches += 1;
+        let path = line.split(':').next().unwrap_or(line);
+        if previous != Some(path) {
+            files += 1;
+            previous = Some(path);
+        }
+    }
+    format!(
+        "{} · {}",
+        count_noun(matches, "hit", "hits"),
+        count_noun(files, "file", "files")
+    )
+}
+
+/// `+12 −3` from a unified diff.
+fn diff_metric(diff: &str) -> String {
+    let mut added = 0_usize;
+    let mut removed = 0_usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    format!("+{added} −{removed}")
+}
+
+fn first_sentence(text: &str) -> String {
+    let trimmed = text.trim();
+    let end = trimmed
+        .find(['.', '\n'])
+        .map_or(trimmed.len(), |index| index);
+    trimmed[..end].trim_end().to_owned()
+}
+
+/// Shorten a path from the middle so the file name always survives:
+/// `crates/qq-tui/src/view/tools.rs` at 24 columns becomes
+/// `crates/…/view/tools.rs`.
+pub(crate) fn elide_path(path: &str, width: usize) -> String {
+    let count = path.chars().count();
+    if count <= width {
+        return path.to_owned();
+    }
+    if width < 6 {
+        return preview(path, width);
+    }
+    let Some((head, tail)) = path.rsplit_once('/') else {
+        return preview(path, width);
+    };
+    // Keep the file name whole when it fits with an ellipsis and one head
+    // segment; otherwise fall back to a plain truncation of the name.
+    let tail_count = tail.chars().count();
+    if tail_count + 2 >= width {
+        return format!(
+            "…{}",
+            tail.chars()
+                .skip(tail_count + 1 - width)
+                .collect::<String>()
+        );
+    }
+    let budget = width - tail_count - 2;
+    let mut kept = String::new();
+    for segment in head.split('/') {
+        let candidate_len = kept.chars().count() + segment.chars().count() + 1;
+        if candidate_len > budget {
+            break;
+        }
+        kept.push_str(segment);
+        kept.push('/');
+    }
+    if kept.is_empty() {
+        format!("…/{tail}")
+    } else {
+        format!("{kept}…/{tail}")
+    }
+}
+
+/// Live timing for the row: how long a running call has run and when it
+/// last produced output, or its wall-clock start and end when finished.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowClock {
+    pub timing: ToolCallTiming,
+    pub now_ms: u64,
+}
+
+impl RowClock {
+    /// Elapsed since start, live for running calls, fixed for finished ones.
+    fn duration(&self, running: bool) -> Option<u64> {
+        let started = self.timing.started_at_ms?;
+        let end = if running {
+            self.now_ms
+        } else {
+            self.timing.finished_at_ms?
+        };
+        Some(end.saturating_sub(started))
+    }
+}
+
+/// Per-call display state the caller resolves before rendering.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolRowContext<'a> {
+    pub row: &'a ToolRow,
+    pub clock: RowClock,
+    /// Expanded by the global toggle or by this call's own toggle.
+    pub expanded: bool,
+    /// The transcript cursor rests on this call.
+    pub selected: bool,
+}
+
 /// Rows rendered beneath a tool call that spawned a child session.
 pub(super) type ChildRows<'a> = &'a dyn Fn(ToolCallId, usize) -> Vec<Line>;
 
+/// Rows of the approval block for the call awaiting an answer; empty for
+/// every other call.
+pub(super) type ApprovalRows<'a> = &'a dyn Fn(ToolCallId, usize) -> Vec<Line>;
+
+/// Resolves a call to its cached row and display state.
+pub(super) type RowLookup<'a> = &'a dyn Fn(&ToolCallSnapshot) -> ToolRowContext<'a>;
+
+/// Renders one run's tool calls: a folded row for quiet runs, otherwise one
+/// gutter line per call, with errors, expansion, and live output adding
+/// bounded body rows. A running call's live output shows at every detail
+/// level: it is the thing the user is waiting for.
 pub(super) fn render_tool_calls(
     calls: &[&ToolCallSnapshot],
     live_output: &HashMap<ToolCallId, String>,
-    detail: ToolDetail,
+    lookup: RowLookup<'_>,
     tick: usize,
     width: usize,
     children: ChildRows<'_>,
+    approval: ApprovalRows<'_>,
 ) -> Vec<Line> {
     let quiet = |call: &ToolCallSnapshot| {
         call.state == ToolCallState::Completed
             && !call.is_error
+            && !lookup(call).expanded
+            && !lookup(call).selected
             && children(call.id, width).is_empty()
     };
-    if detail == ToolDetail::Collapsed
-        && calls.len() > TOOL_FOLD_THRESHOLD
-        && calls.iter().all(|call| quiet(call))
-    {
-        return vec![tool_fold_line(calls, width)];
+    if calls.len() > TOOL_FOLD_THRESHOLD && calls.iter().all(|call| quiet(call)) {
+        return vec![tool_fold_line(calls, lookup, width)];
     }
     let mut lines = Vec::with_capacity(calls.len());
     for call in calls {
-        lines.push(tool_summary_line(call, tick, width));
-        if call.is_error {
-            if let Some(result) = call.result.as_deref() {
-                lines.extend(tool_error_lines(result, width));
-            }
-        } else if detail == ToolDetail::Expanded {
-            lines.extend(tool_expanded_lines(call, width));
+        let context = lookup(call);
+        lines.push(tool_summary_line(call, context, tick, width));
+        lines.extend(approval(call.id, width));
+        if call.is_error
+            && let Some(result) = call.result.as_deref()
+        {
+            lines.extend(tool_error_lines(result, width));
+        }
+        if context.expanded {
+            lines.extend(tool_expanded_lines(call, context, width));
         }
         if call.state == ToolCallState::Running
             && let Some(output) = live_output.get(&call.id)
@@ -63,53 +417,128 @@ pub(super) fn render_tool_calls(
     lines
 }
 
-pub(super) fn tool_fold_line(calls: &[&ToolCallSnapshot], width: usize) -> Line {
-    let mut counts: Vec<(&str, usize)> = Vec::new();
+/// `▸ Read ×4  cache.rs, refresh.rs, lib.rs, +1` for a group of quiet calls;
+/// mixed verbs list each with its count.
+pub(super) fn tool_fold_line(
+    calls: &[&ToolCallSnapshot],
+    lookup: RowLookup<'_>,
+    width: usize,
+) -> Line {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
     for call in calls {
-        match counts.iter_mut().find(|(name, _)| *name == call.name) {
+        let row = lookup(call).row;
+        let label = row.label(call);
+        match counts.iter_mut().find(|(name, _)| *name == label) {
             Some((_, count)) => *count += 1,
-            None => counts.push((call.name.as_str(), 1)),
+            None => counts.push((label, 1)),
+        }
+        if row.subject_is_path
+            && let Some(subject) = &row.subject
+        {
+            let name = subject.rsplit('/').next().unwrap_or(subject).to_owned();
+            if !files.contains(&name) {
+                files.push(name);
+            }
         }
     }
     let mut line = Line::styled("   ", muted());
     line.push("▸ ", accent());
-    line.push(format!("{} tool calls (", calls.len()), muted());
     for (index, (name, count)) in counts.iter().enumerate() {
         if index > 0 {
-            line.push(", ", muted());
+            line.push("  ", muted());
         }
-        line.push(format!("{name} ×{count}"), muted());
+        line.push(name, normal());
+        line.push(format!(" ×{count}"), muted());
     }
-    line.push(")", muted());
+    if !files.is_empty() {
+        line.push("  ", muted());
+        let shown = files
+            .iter()
+            .take(FOLD_NAMED_FILES)
+            .cloned()
+            .collect::<Vec<_>>();
+        line.push(shown.join(", "), muted());
+        if files.len() > FOLD_NAMED_FILES {
+            line.push(format!(", +{}", files.len() - FOLD_NAMED_FILES), muted());
+        }
+    }
     truncate_line(line, width)
 }
 
-/// One collapsed gutter line: state glyph, tool name, curated subject from the
-/// arguments, and a metric derived from the result.
-pub(super) fn tool_summary_line(call: &ToolCallSnapshot, tick: usize, width: usize) -> Line {
+/// One gutter line: state glyph, verb, subject, metric, and duration. The
+/// subject column is fixed so metrics align down a run; paths elide from
+/// the middle so the file name always shows.
+pub(super) fn tool_summary_line(
+    call: &ToolCallSnapshot,
+    context: ToolRowContext<'_>,
+    tick: usize,
+    width: usize,
+) -> Line {
+    let row = context.row;
     let (glyph, glyph_style) = tool_state_glyph(call, tick);
-    let mut line = Line::styled("   ", muted());
+    let mut line = Line::styled(if context.selected { " ▶ " } else { "   " }, accent());
     line.push(glyph, glyph_style);
     line.push(" ", muted());
-    line.push(call.name.as_str(), muted());
-    if let Some(subject) = tool_subject(call) {
-        line.push(format!(" {subject}"), muted());
-    }
-    if let Some(metric) = tool_result_metric(call) {
-        line.push(format!(" ({metric})"), muted());
+    let label = row.label(call);
+    let label_width = label.chars().count().max(6);
+    line.push(
+        format!("{label:<label_width$} "),
+        if row.raw_name { muted() } else { normal() },
+    );
+    let running = call.state == ToolCallState::Running;
+    let mut right = Line::default();
+    if let Some(metric) = &row.metric {
+        right.push(metric.clone(), muted());
+        if row.truncated {
+            right.push(" · truncated", muted());
+        }
     }
     if call.state != ToolCallState::Completed {
-        line.push(
-            format!(" {}", tool_state_label(call.state)),
+        if !right.is_empty() {
+            right.push(" · ", muted());
+        }
+        right.push(
+            tool_state_label(call.state),
             match call.state {
                 ToolCallState::Failed | ToolCallState::Denied => failure(),
                 ToolCallState::AwaitingApproval => warning(),
-                ToolCallState::Running => accent(),
+                ToolCallState::Running => info(),
                 ToolCallState::Requested
                 | ToolCallState::Interrupted
                 | ToolCallState::Completed => muted(),
             },
         );
+    }
+    if let Some(duration) = context.clock.duration(running) {
+        right.push(
+            format!("  {}", format_duration_ms(duration)),
+            if running { info() } else { muted() },
+        );
+    }
+    // The subject occupies a fixed column so metrics line up down a run;
+    // narrow panes shrink the column, and paths give up their middle first.
+    let right_width = right.width();
+    let available = width
+        .saturating_sub(line.width())
+        .saturating_sub(if right_width > 0 { right_width + 2 } else { 0 });
+    let column = available.clamp(6, TOOL_SUBJECT_WIDTH);
+    if let Some(subject) = &row.subject {
+        let text = if row.subject_is_path {
+            elide_path(subject, column)
+        } else {
+            preview(subject, column)
+        };
+        let shown = text.chars().count();
+        line.push(text, normal());
+        if !right.is_empty() {
+            line.push(" ".repeat(column.saturating_sub(shown) + 2), muted());
+        }
+    } else if !right.is_empty() {
+        line.push(" ".repeat(column + 2), muted());
+    }
+    for span in right.spans {
+        line.push(span.text, span.style);
     }
     truncate_line(line, width)
 }
@@ -131,86 +560,6 @@ pub(super) fn tool_state_glyph(call: &ToolCallSnapshot, tick: usize) -> (&'stati
     }
 }
 
-/// The most informative argument for known tools; a compact truncated argument
-/// preview otherwise, so new tool names degrade gracefully. Malformed JSON
-/// falls back to the raw truncated string.
-pub(super) fn tool_subject(call: &ToolCallSnapshot) -> Option<String> {
-    let compact = || {
-        let text = preview(&call.arguments, TOOL_SUBJECT_WIDTH);
-        (!text.is_empty()).then_some(text)
-    };
-    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
-        return compact();
-    };
-    match call.name.as_str() {
-        "read_file" | "list_dir" => arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .map(|path| preview(path, TOOL_SUBJECT_WIDTH))
-            .or_else(compact),
-        "search" => arguments
-            .get("query")
-            .and_then(|value| value.as_str())
-            .map(|query| format!("\"{}\"", preview(query, TOOL_SUBJECT_WIDTH)))
-            .or_else(compact),
-        _ => compact(),
-    }
-}
-
-/// A one-glance size for the result: line/entry/match counts for known tools,
-/// byte size for everything else. Errors expand instead of summarizing.
-pub(super) fn tool_result_metric(call: &ToolCallSnapshot) -> Option<String> {
-    if call.is_error {
-        return None;
-    }
-    let result = call.result.as_deref()?;
-    let truncated = result.lines().any(|line| line == TOOL_TRUNCATION_MARKER);
-    let content_lines = || {
-        result
-            .lines()
-            .filter(|line| *line != TOOL_TRUNCATION_MARKER)
-            .count()
-    };
-    let metric = match call.name.as_str() {
-        "read_file" => count_noun(content_lines(), "line", "lines"),
-        "list_dir" => count_noun(content_lines(), "entry", "entries"),
-        "search" => {
-            if result.starts_with("No matches found.") {
-                "no matches".to_owned()
-            } else {
-                // Match rows are `path:line:content` or `path: filename
-                // match`, grouped per file, so counting consecutive distinct
-                // path prefixes counts files without allocating.
-                let mut matches = 0_usize;
-                let mut files = 0_usize;
-                let mut previous: Option<&str> = None;
-                for line in result.lines() {
-                    if line.is_empty() || line == TOOL_TRUNCATION_MARKER {
-                        continue;
-                    }
-                    matches += 1;
-                    let path = line.split(':').next().unwrap_or(line);
-                    if previous != Some(path) {
-                        files += 1;
-                        previous = Some(path);
-                    }
-                }
-                format!(
-                    "{}, {}",
-                    count_noun(matches, "match", "matches"),
-                    count_noun(files, "file", "files")
-                )
-            }
-        }
-        _ => format_result_size(result.len()),
-    };
-    if truncated {
-        Some(format!("{metric}, truncated"))
-    } else {
-        Some(metric)
-    }
-}
-
 /// Errors are the one case where content matters by default: show a bounded
 /// tail of the error text under the gutter line.
 pub(super) fn tool_error_lines(result: &str, width: usize) -> Vec<Line> {
@@ -218,7 +567,7 @@ pub(super) fn tool_error_lines(result: &str, width: usize) -> Vec<Line> {
     let total = text.lines().count();
     let mut lines = Vec::new();
     if total > MAX_TOOL_ERROR_ROWS || text.len() < result.len() {
-        lines.push(Line::styled("     ...", muted().italic()));
+        lines.push(Line::styled("     …", muted()));
     }
     for line in text.lines().skip(total.saturating_sub(MAX_TOOL_ERROR_ROWS)) {
         lines.push(truncate_line(
@@ -229,23 +578,57 @@ pub(super) fn tool_error_lines(result: &str, width: usize) -> Vec<Line> {
     lines
 }
 
-/// Expanded detail: bounded pretty-printed arguments plus a bounded tail of
-/// the result. Oversized or malformed arguments render as a raw bounded tail.
-pub(super) fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<Line> {
+/// `HH:MM:SS` in UTC from server milliseconds. Local-time rendering waits on
+/// a timezone source that does not read the environment inside the frame.
+pub(crate) fn format_clock(ms: u64) -> String {
+    let seconds = ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}",
+        (seconds / 3600) % 24,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
+/// Expanded detail: the timing line, bounded pretty-printed arguments, then
+/// the result. Diffs render head-first with line numbers so a review starts
+/// at the top of the change; other results show a bounded tail.
+pub(super) fn tool_expanded_lines(
+    call: &ToolCallSnapshot,
+    context: ToolRowContext<'_>,
+    width: usize,
+) -> Vec<Line> {
     let mut lines = Vec::new();
-    let pretty = if call.arguments.len() <= MAX_TOOL_DETAIL_BYTES {
-        serde_json::from_str::<serde_json::Value>(&call.arguments)
-            .and_then(|value| serde_json::to_string_pretty(&value))
-            .ok()
-    } else {
-        None
-    };
-    let arguments = pretty
-        .as_deref()
-        .unwrap_or_else(|| bounded_tail(&call.arguments, MAX_TOOL_DETAIL_BYTES));
-    for (shown, line) in arguments.lines().enumerate() {
+    let row = context.row;
+    let timing = context.clock.timing;
+    let running = call.state == ToolCallState::Running;
+    // The timing line answers "is this new, or am I still waiting on the
+    // same thing?": wall-clock start, then finish or a live elapsed clock,
+    // then when output last arrived.
+    let mut when = Line::styled("     ", muted());
+    let mut fields = Vec::new();
+    if let Some(started) = timing.started_at_ms {
+        fields.push(format!("started {}", format_clock(started)));
+    }
+    match (running, timing.finished_at_ms) {
+        (true, _) => {
+            if let Some(duration) = context.clock.duration(true) {
+                fields.push(format!("running {}", format_duration_ms(duration)));
+            }
+            if let Some(last) = timing.last_output_at_ms {
+                fields.push(format!("last output {}", format_clock(last)));
+            }
+        }
+        (false, Some(finished)) => fields.push(format!("→ {}", format_clock(finished))),
+        (false, None) => {}
+    }
+    if !fields.is_empty() {
+        when.push(fields.join(" · "), muted());
+        lines.push(truncate_line(when, width));
+    }
+    for (shown, line) in row.arguments_pretty.lines().enumerate() {
         if shown == MAX_TOOL_ARGUMENT_ROWS {
-            lines.push(Line::styled("     ...", muted().italic()));
+            lines.push(Line::styled("     …", muted()));
             break;
         }
         lines.push(truncate_line(
@@ -253,35 +636,77 @@ pub(super) fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<
             width,
         ));
     }
-    // Calls carrying a diff display payload render it in place of the raw
-    // result string; diff-shaped results without a payload (shell output,
-    // older stores) keep the looks_like_diff heuristic as a fallback.
-    let (body, diff) = match &call.display {
-        Some(ToolCallDisplay::Diff { diff, .. }) => (Some(diff.as_str()), true),
-        None => {
-            let result = call.result.as_deref();
-            let diff = matches!(call.name.as_str(), "edit_file" | "write_file")
-                && !call.is_error
-                && result.is_some_and(looks_like_diff);
-            (result, diff)
-        }
-    };
-    if let Some(result) = body {
+    if let Some(diff) = &row.diff {
+        lines.extend(diff_lines(diff, MAX_TOOL_RESULT_ROWS, width));
+    } else if let Some(result) = call.result.as_deref()
+        && !call.is_error
+    {
         let text = bounded_tail(result, MAX_TOOL_DETAIL_BYTES);
         let total = text.lines().count();
         if total > MAX_TOOL_RESULT_ROWS || text.len() < result.len() {
-            lines.push(Line::styled("     ...", muted().italic()));
+            lines.push(Line::styled("     …", muted()));
         }
         for line in text
             .lines()
             .skip(total.saturating_sub(MAX_TOOL_RESULT_ROWS))
         {
-            let style = if diff { diff_line_style(line) } else { muted() };
             lines.push(truncate_line(
-                Line::styled(format!("     {line}"), style),
+                Line::styled(format!("     {line}"), muted()),
                 width,
             ));
         }
+    }
+    lines
+}
+
+/// A unified diff, head-first, with new-file line numbers in the gutter and
+/// the role tints behind added and removed lines. Shows at most `max_rows`
+/// and says how many more there are.
+pub(crate) fn diff_lines(diff: &str, max_rows: usize, width: usize) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut new_line: Option<usize> = None;
+    let total = diff.lines().count();
+    for (shown, text) in diff.lines().enumerate() {
+        if shown == max_rows {
+            lines.push(Line::styled(
+                format!("     … {} more", count_noun(total - shown, "line", "lines")),
+                muted(),
+            ));
+            break;
+        }
+        if text.starts_with("@@") {
+            // `@@ -a,b +c,d @@`: the new-file start is `c`.
+            new_line = text
+                .split_whitespace()
+                .nth(2)
+                .and_then(|range| range.strip_prefix('+'))
+                .and_then(|range| range.split(',').next())
+                .and_then(|start| start.parse().ok());
+            lines.push(truncate_line(
+                Line::styled(format!("     {text}"), muted()),
+                width,
+            ));
+            continue;
+        }
+        if text.starts_with("+++") || text.starts_with("---") {
+            continue;
+        }
+        let style = diff_line_style(text);
+        let (number, advance) = match text.chars().next() {
+            Some('-') => (None, false),
+            _ => (new_line, true),
+        };
+        let gutter = match number {
+            Some(number) => format!(" {number:>4} "),
+            None => "      ".to_owned(),
+        };
+        if advance && let Some(number) = new_line.as_mut() {
+            *number += 1;
+        }
+        let mut line = Line::styled(gutter, muted());
+        line.push(text, style);
+        pad_line(&mut line, width);
+        lines.push(truncate_line(line, width));
     }
     lines
 }
@@ -354,4 +779,39 @@ pub(super) const fn tool_state_label(state: ToolCallState) -> &'static str {
         ToolCallState::Denied => "denied",
         ToolCallState::Interrupted => "interrupted",
     }
+}
+
+/// Test entry: derive rows on the fly and render with a global detail level,
+/// no selection, no timing, and no approval block.
+#[cfg(test)]
+pub(super) fn render_tool_calls_simple(
+    calls: &[&ToolCallSnapshot],
+    live_output: &HashMap<ToolCallId, String>,
+    detail: ToolDetail,
+    tick: usize,
+    width: usize,
+    children: ChildRows<'_>,
+) -> Vec<Line> {
+    let rows: HashMap<ToolCallId, ToolRow> = calls
+        .iter()
+        .map(|call| (call.id, ToolRow::derive(call)))
+        .collect();
+    let lookup = |call: &ToolCallSnapshot| ToolRowContext {
+        row: &rows[&call.id],
+        clock: RowClock {
+            timing: ToolCallTiming::default(),
+            now_ms: 0,
+        },
+        expanded: detail == ToolDetail::Expanded,
+        selected: false,
+    };
+    render_tool_calls(
+        calls,
+        live_output,
+        &lookup,
+        tick,
+        width,
+        children,
+        &|_, _| Vec::new(),
+    )
 }

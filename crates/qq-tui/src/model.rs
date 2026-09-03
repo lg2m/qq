@@ -218,6 +218,17 @@ pub(crate) struct RunStats {
     pub cost_usd_nanos: Option<u64>,
 }
 
+/// When a tool call started, last produced output, and finished, from the
+/// `occurred_at_ms` of the events that carried those transitions. Historical
+/// calls loaded from a snapshot have none of this until the protocol records
+/// call timing; the rows then show no wall-clock time rather than a guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolCallTiming {
+    pub started_at_ms: Option<u64>,
+    pub last_output_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+}
+
 /// Whether reasoning blocks render as a collapsed one-liner or in full.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ReasoningDetail {
@@ -275,6 +286,8 @@ pub(crate) struct SessionView {
     /// Diff previews carried by approval requests, kept only while the call
     /// awaits an answer so the modal can show what an edit would change.
     pub(crate) edit_previews: HashMap<ToolCallId, EditPreview>,
+    /// Observed timing per tool call, bounded with the warm body.
+    pub(crate) tool_timing: HashMap<ToolCallId, ToolCallTiming>,
 }
 
 impl SessionView {
@@ -299,6 +312,7 @@ impl SessionView {
             drafts: VecDeque::new(),
             live_tool_output: HashMap::new(),
             edit_previews: HashMap::new(),
+            tool_timing: HashMap::new(),
         }
     }
 
@@ -357,6 +371,7 @@ impl SessionView {
         self.tool_calls = None;
         self.live_tool_output.clear();
         self.edit_previews.clear();
+        self.tool_timing.clear();
     }
 }
 
