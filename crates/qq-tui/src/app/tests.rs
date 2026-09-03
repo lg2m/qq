@@ -2837,3 +2837,69 @@ fn attention_is_requested_only_while_the_terminal_is_unfocused() {
         "qq: Deploy needs approval"
     );
 }
+
+#[test]
+fn a_rejected_model_change_or_deletion_is_attributed_to_its_session_not_the_focused_one() {
+    let (mut app, first, other) = two_session_app();
+    assert_eq!(app.focused(), Some(first));
+
+    // Change `other`'s model while `first` stays focused.
+    let request = |effects: Effects| {
+        let requests = effects.into_requests();
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one command")
+        };
+        request.clone()
+    };
+    let set = request(app.set_session_model(
+        other,
+        ModelSelection {
+            model: Some("openai/gpt-x".to_owned()),
+            ..ModelSelection::default()
+        },
+    ));
+    app.apply_client_update(ClientUpdate::CommandResult {
+        command_id: set.command_id,
+        result: Err(ClientFailure::new("model rejected")),
+    });
+    // The failure belongs to `other`, so the focused session shows nothing.
+    assert_eq!(
+        app.visible_status(),
+        None,
+        "notice must not leak onto `first`"
+    );
+    app.focus_session(other);
+    assert!(matches!(
+        app.visible_status(),
+        Some((text, NoticeLevel::Error)) if text.contains("model rejected")
+    ));
+
+    // Same for a deletion refused by the server.
+    app.focus_session(first);
+    let delete = request(app.delete_session(other));
+    app.apply_client_update(ClientUpdate::CommandResult {
+        command_id: delete.command_id,
+        result: Err(ClientFailure::new("delete refused")),
+    });
+    assert!(
+        app.visible_status()
+            .is_none_or(|(text, _)| !text.contains("delete refused")),
+        "deletion failure must not appear on the focused session"
+    );
+    app.focus_session(other);
+    assert!(matches!(
+        app.visible_status(),
+        Some((text, NoticeLevel::Error)) if text.contains("delete refused")
+    ));
+
+    // Prune is workspace-wide, so its failure lands on the focused session.
+    let prune = request(app.prune_sessions());
+    app.apply_client_update(ClientUpdate::CommandResult {
+        command_id: prune.command_id,
+        result: Err(ClientFailure::new("prune refused")),
+    });
+    assert!(matches!(
+        app.visible_status(),
+        Some((text, NoticeLevel::Error)) if text.contains("prune refused")
+    ));
+}

@@ -196,6 +196,14 @@ enum PendingIntent {
     Approval {
         tool_call_id: qq_protocol::ToolCallId,
     },
+    SetModel {
+        session_id: SessionId,
+    },
+    Delete {
+        session_id: SessionId,
+    },
+    /// Workspace-wide; failures attach to the focused session.
+    Prune,
 }
 
 pub(crate) struct App {
@@ -791,14 +799,16 @@ impl App {
             Some(PendingIntent::Prompt { session_id, .. })
             | Some(PendingIntent::Cancel { session_id })
             | Some(PendingIntent::Steer { session_id, .. })
-            | Some(PendingIntent::Compact { session_id }) => Some(*session_id),
+            | Some(PendingIntent::Compact { session_id })
+            | Some(PendingIntent::SetModel { session_id })
+            | Some(PendingIntent::Delete { session_id }) => Some(*session_id),
             Some(PendingIntent::Approval { tool_call_id }) => self
                 .sessions
                 .values()
                 .flat_map(|session| session.tool_calls.iter().flatten())
                 .find(|tool_call| tool_call.id == *tool_call_id)
                 .map(|tool_call| tool_call.session_id),
-            Some(PendingIntent::Create) | None => self.focused(),
+            Some(PendingIntent::Create | PendingIntent::Prune) | None => self.focused(),
         };
         match intent {
             Some(PendingIntent::Prompt { session_id, text })
@@ -1529,18 +1539,29 @@ impl App {
             .map(|option| option.selection.clone())
     }
 
-    fn set_session_model(&mut self, session_id: SessionId, model: ModelSelection) -> Effects {
+    /// Send one session command, remembering `intent` so the receipt or
+    /// failure is attributed to the right session and can undo optimistic
+    /// state. Every request that carries a `CommandId` goes through here.
+    fn send(&mut self, intent: PendingIntent, command: SessionCommand) -> Effects {
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
             return Effects::redraw(Redraw::Immediate);
         };
+        self.pending.insert(command_id, intent);
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command,
+        }))
+    }
+
+    fn set_session_model(&mut self, session_id: SessionId, model: ModelSelection) -> Effects {
         // Remember the pick as the client default so /new and later creates
         // keep using it until the user chooses another model.
         self.model = model.clone();
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::SetSessionModel { session_id, model },
-        }))
+        self.send(
+            PendingIntent::SetModel { session_id },
+            SessionCommand::SetSessionModel { session_id, model },
+        )
     }
 
     fn open_sessions(&mut self) -> Effects {
@@ -1751,14 +1772,10 @@ impl App {
     }
 
     fn delete_session(&mut self, session_id: SessionId) -> Effects {
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::DeleteSession { session_id },
-        }))
+        self.send(
+            PendingIntent::Delete { session_id },
+            SessionCommand::DeleteSession { session_id },
+        )
     }
 
     fn prune_sessions(&mut self) -> Effects {
@@ -1766,14 +1783,10 @@ impl App {
             self.set_warning("workspace is still connecting".to_owned());
             return Effects::redraw(Redraw::Immediate);
         };
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::PruneSessions { workspace_id },
-        }))
+        self.send(
+            PendingIntent::Prune,
+            SessionCommand::PruneSessions { workspace_id },
+        )
     }
 
     fn reset_session_picker_selection(&mut self) {
@@ -1856,17 +1869,12 @@ impl App {
             self.set_warning("workspace is still connecting".to_owned());
             return Effects::redraw(Redraw::Immediate);
         };
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
         // Keep the chosen model as the client default for the rest of this TUI
         // process until /models picks something else.
         self.model = model.clone();
-        self.pending.insert(command_id, PendingIntent::Create);
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::CreateSession {
+        self.send(
+            PendingIntent::Create,
+            SessionCommand::CreateSession {
                 workspace_id,
                 parent_id,
                 model,
@@ -1874,7 +1882,7 @@ impl App {
                 profile: qq_protocol::AgentProfileId::default(),
                 correlation: qq_protocol::Correlation::default(),
             },
-        }))
+        )
     }
 
     fn submit_prompt(&mut self) -> Effects {
@@ -1934,38 +1942,26 @@ impl App {
             self.set_warning("focused session has no active run to steer".to_owned());
             return Effects::redraw(Redraw::Immediate);
         };
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
         self.record_prompt(session_id, &text);
         self.composer.clear();
         self.reset_history_browse();
         self.slash.select(0);
         self.esc_armed_at = None;
-        self.pending.insert(
-            command_id,
+        self.send(
             PendingIntent::Steer {
                 session_id,
                 text: text.clone(),
             },
-        );
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::SteerRun {
+            SessionCommand::SteerRun {
                 run_id,
                 input: vec![qq_protocol::InputPart::text(text)],
                 interrupt,
             },
-        }))
+        )
     }
 
     /// Send `prompt` to `session_id` as a new run.
     fn submit_text(&mut self, session_id: SessionId, prompt: String) -> Effects {
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
         self.record_prompt(session_id, &prompt);
         self.composer.clear();
         self.reset_history_browse();
@@ -1973,22 +1969,18 @@ impl App {
         if self.status_level == NoticeLevel::Error && self.status_session_id == Some(session_id) {
             self.status = None;
         }
-        self.pending.insert(
-            command_id,
+        self.send(
             PendingIntent::Prompt {
                 session_id,
                 text: prompt.clone(),
             },
-        );
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::SubmitPrompt {
+            SessionCommand::SubmitPrompt {
                 session_id,
                 input: vec![qq_protocol::InputPart::text(prompt)],
                 limits: qq_protocol::RunLimits::default(),
                 correlation: qq_protocol::Correlation::default(),
             },
-        }))
+        )
     }
 
     /// Hold the composer text for the focused session until its run ends.
@@ -2137,17 +2129,11 @@ impl App {
             self.set_warning("compaction needs an idle session; wait or cancel first".to_owned());
             return Effects::redraw(Redraw::Immediate);
         }
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
-        self.pending
-            .insert(command_id, PendingIntent::Compact { session_id });
         self.set_info("compacting session...".to_owned());
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::CompactSession { session_id },
-        }))
+        self.send(
+            PendingIntent::Compact { session_id },
+            SessionCommand::CompactSession { session_id },
+        )
     }
 
     fn cancel_run(&mut self) -> Effects {
@@ -2163,16 +2149,10 @@ impl App {
             self.set_warning("focused session has no active run".to_owned());
             return Effects::redraw(Redraw::Immediate);
         };
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
-        self.pending
-            .insert(command_id, PendingIntent::Cancel { session_id });
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::CancelRun { run_id },
-        }))
+        self.send(
+            PendingIntent::Cancel { session_id },
+            SessionCommand::CancelRun { run_id },
+        )
     }
 
     /// The focused session's oldest unanswered tool approval, if any.
@@ -2224,21 +2204,15 @@ impl App {
             },
             ApprovalChoice::Deny => ApprovalDecision::Deny,
         };
-        let Ok(command_id) = CommandId::generate() else {
-            self.set_warning("secure randomness is unavailable".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
         self.answered_approvals.insert(tool_call_id);
-        self.pending
-            .insert(command_id, PendingIntent::Approval { tool_call_id });
-        Effects::send_now(ClientRequest::Command(CommandRequest {
-            command_id,
-            command: SessionCommand::RespondToolApproval {
+        self.send(
+            PendingIntent::Approval { tool_call_id },
+            SessionCommand::RespondToolApproval {
                 run_id,
                 tool_call_id,
                 decision,
             },
-        }))
+        )
     }
 
     fn push_input(&mut self, character: char) -> bool {
@@ -2363,7 +2337,10 @@ impl App {
                 | PendingIntent::Steer { .. }
                 | PendingIntent::Cancel { .. }
                 | PendingIntent::Compact { .. }
-                | PendingIntent::Approval { .. } => None,
+                | PendingIntent::Approval { .. }
+                | PendingIntent::SetModel { .. }
+                | PendingIntent::Delete { .. }
+                | PendingIntent::Prune => None,
             })
     }
 

@@ -92,6 +92,7 @@ impl Effects {
         self.0.extend(other.0);
     }
 
+    #[cfg(any(test, feature = "bench-support"))]
     #[must_use]
     pub(crate) fn redraws(&self) -> bool {
         self.0
@@ -100,6 +101,7 @@ impl Effects {
     }
 
     /// Requests in this batch, for tests and callers that only send.
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn requests(&self) -> impl Iterator<Item = &ClientRequest> {
         self.0.iter().filter_map(|effect| match effect {
             Effect::Send(request) => Some(request),
