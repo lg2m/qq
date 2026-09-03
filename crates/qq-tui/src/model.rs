@@ -229,6 +229,12 @@ pub(crate) struct RunStats {
     pub tool_calls: u32,
     /// Estimated cost of the run, when the accounting delta was observable.
     pub cost_usd_nanos: Option<u64>,
+    /// Highest model turn committed so far, from `ModelTurnCompleted`; zero
+    /// for historical runs loaded from a snapshot.
+    pub turns: u16,
+    /// Cost accumulated from committed turns while the run is active. Shown
+    /// until `RunFinished` settles `cost_usd_nanos` from the session totals.
+    pub live_cost_usd_nanos: Option<u64>,
 }
 
 /// When a tool call started, last produced output, and finished, from the

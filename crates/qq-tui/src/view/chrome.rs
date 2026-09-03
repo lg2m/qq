@@ -171,6 +171,16 @@ pub(super) fn composer_rule(app: &App, width: usize) -> Line {
                     muted(),
                 );
             }
+            // Committed turns and their cost so far, so a long agentic run
+            // shows it is progressing and what it has spent.
+            if stats.turns > 0 {
+                left.push(format!("  turn {}", stats.turns), muted());
+            }
+            if let Some(cost) = stats.live_cost_usd_nanos
+                && cost > 0
+            {
+                left.push(format!("  {}", format_cost(cost)), muted());
+            }
         }
     } else if let Some(session) = app.focused().and_then(|id| app.sessions.get(&id))
         && session.summary.status == SessionStatus::Queued
@@ -238,7 +248,9 @@ fn rule_with(left: Line, mut right: Line, width: usize) -> Line {
     if left.width() + right.width() + MIN_RULE > width {
         right = Line::default();
     }
-    let mut rule = truncate_line(left, width.saturating_sub(right.width() + MIN_RULE));
+    // The separating space after a truncated left side must not eat into
+    // the minimum rule.
+    let mut rule = truncate_line(left, width.saturating_sub(right.width() + MIN_RULE + 1));
     if !rule.is_empty() {
         rule.push(" ", muted());
     }

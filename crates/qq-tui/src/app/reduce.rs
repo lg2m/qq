@@ -321,10 +321,28 @@ impl App {
                     text: format!("compaction rolled back; {remaining} retained"),
                 });
             }
-            // Run-level audit updates are not session state. In particular,
-            // old persisted events may predate the authoritative session
-            // field, so replaying one must not repopulate the meter.
-            SessionEvent::ModelTurnCompleted { .. } | SessionEvent::RunContextUpdated { .. } => {}
+            // Each committed model turn advances the run's live audit: how
+            // many turns so far and what they have cost. `RunFinished` still
+            // settles the authoritative totals.
+            SessionEvent::ModelTurnCompleted {
+                run_id,
+                turn_ordinal,
+                estimated_cost_usd_nanos,
+                ..
+            } => {
+                if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
+                    let stats = view.runs.entry(*run_id).or_default();
+                    stats.turns = stats.turns.max(*turn_ordinal);
+                    if let Some(cost) = estimated_cost_usd_nanos {
+                        stats.live_cost_usd_nanos =
+                            Some(stats.live_cost_usd_nanos.unwrap_or(0).saturating_add(*cost));
+                    }
+                }
+            }
+            // The run-level context audit is not session state: old persisted
+            // events may predate the authoritative session field, so replaying
+            // one must not repopulate the meter.
+            SessionEvent::RunContextUpdated { .. } => {}
             SessionEvent::SessionContextUpdated { context_tokens, .. } => {
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
                     session.summary.context_tokens = *context_tokens;

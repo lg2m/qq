@@ -2310,6 +2310,16 @@ fn a_finished_run_ends_with_a_completion_line_and_a_running_one_does_not() {
     let mut summary = app.sessions[&session_id].summary.clone();
     summary.status = SessionStatus::Idle;
     summary.active_run_id = None;
+    // Three committed turns show as a count on the completion line.
+    for turn in 1..=3 {
+        app.apply_client_update(event(SessionEvent::ModelTurnCompleted {
+            run_id,
+            turn_ordinal: turn,
+            model: ModelSelection::default(),
+            usage: None,
+            estimated_cost_usd_nanos: None,
+        }));
+    }
     // The run started at the fixture's occurred_at_ms (1) and finishes here;
     // duration comes from the envelopes, tokens from usage.
     app.apply_client_update(event(SessionEvent::RunFinished {
@@ -2331,6 +2341,7 @@ fn a_finished_run_ends_with_a_completion_line_and_a_running_one_does_not() {
         .iter()
         .find(|row| row.contains(" ✓ "))
         .unwrap_or_else(|| panic!("completion line in {text}"));
+    assert!(line.contains("3 turns"), "{line}");
     assert!(line.contains("1 tool"), "{line}");
     assert!(line.contains("12.3k tok"), "{line}");
     assert!(line.contains('s'), "duration: {line}");
@@ -2868,6 +2879,27 @@ fn the_composer_rule_carries_run_telemetry_notices_and_hints_in_priority_order()
     assert!(rule.contains("generating 4.2s  ttft 0.6s"), "{rule}");
     assert!(rule.contains("F1 help"), "{rule}");
     assert!(rule.contains("─"), "{rule}");
+
+    // Committed turns and their running cost join the rule as the run goes.
+    for (sequence, turn, cost) in [(7, 1, 40_000_000), (8, 2, 60_000_000)] {
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            run_id: Some(run_id),
+            occurred_at_ms: started + 5_000,
+            ..fixtures::envelope(
+                sequence,
+                session_id,
+                SessionEvent::ModelTurnCompleted {
+                    run_id,
+                    turn_ordinal: turn,
+                    model: ModelSelection::default(),
+                    usage: None,
+                    estimated_cost_usd_nanos: Some(cost),
+                },
+            )
+        }));
+    }
+    let rule = rule_at(&mut app, 140);
+    assert!(rule.contains("turn 2  $0.10"), "{rule}");
 
     // A notice takes the left side and the hints step aside.
     app.apply_notice(None, crate::app::NoticeLevel::Info, "saved".to_owned());

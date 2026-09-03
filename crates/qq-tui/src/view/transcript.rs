@@ -1304,6 +1304,9 @@ pub(super) fn run_completion_line(
     if let (Some(started), Some(finished)) = (stats.started_at_ms, stats.finished_at_ms) {
         parts.push(format_duration_ms(finished.saturating_sub(started)));
     }
+    if stats.turns > 1 {
+        parts.push(count_noun(usize::from(stats.turns), "turn", "turns"));
+    }
     if stats.tool_calls > 0 {
         parts.push(count_noun(stats.tool_calls as usize, "tool", "tools"));
     }
