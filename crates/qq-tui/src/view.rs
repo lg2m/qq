@@ -176,11 +176,11 @@ impl FrameRenderer {
 
         self.cursor = None;
         let mut lines = vec![top_row(app, width)];
-        // One top row, the composer rule, and one hint row are fixed. The
-        // composer can grow with wrapped multi-line input, so body height is
-        // computed after the composer is laid out against the remaining space.
-        // Notices overlay the hint row, so the body never moves for one.
-        let fixed_chrome_rows = 3;
+        // The top row and the composer rule are fixed; the rule doubles as
+        // the status and hint line so no row is spent on either. The composer
+        // can grow with wrapped multi-line input, so body height is computed
+        // after the composer is laid out against the remaining space.
+        let fixed_chrome_rows = 2;
         let max_composer_rows = height
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(1)
@@ -238,7 +238,6 @@ impl FrameRenderer {
         lines.push(composer_rule(app, width));
         let composer_top = lines.len();
         lines.extend(composer_lines);
-        lines.push(hint_row(app, width));
         if (mode == Mode::Compose || app.approval_amendment.is_some())
             && let Some((column, row)) = caret
             && let (Ok(column), Ok(row)) = (

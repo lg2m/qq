@@ -710,10 +710,11 @@ impl CodeBlockBuffer {
     }
 }
 
-/// Lays a buffered code block out as a full-width tinted panel: a padding row
-/// carrying the right-aligned language label, character-wrapped content rows,
-/// and a closing padding row. Every row is padded to `width` so the tint
-/// reads as one solid panel rather than ragged highlights.
+/// Lays a buffered code block out as a full-width tinted panel: a header row
+/// naming the language at the left where reading starts (blank when the
+/// fence has no tag), then character-wrapped content rows. Every row is
+/// padded to `width` so the tint reads as one solid panel rather than ragged
+/// highlights.
 ///
 /// With `highlight` set, a recognized fence tag colors the content through
 /// its tree-sitter grammar; diff fences keep their dedicated coloring, and
@@ -726,13 +727,9 @@ fn layout_code_panel(block: &CodeBlockBuffer, width: usize, highlight: bool) -> 
         let label = language
             .chars()
             .filter_map(terminal_safe_character)
+            .take(content_width)
             .collect::<String>();
-        let mut labelled = Line::styled(label, muted());
-        let label_width = labelled.width();
-        if label_width > 0 && label_width <= content_width {
-            top.push(" ".repeat(content_width - label_width), muted());
-            top.spans.append(&mut labelled.spans);
-        }
+        top.push(label, muted());
     }
     let mut output = vec![code_panel_row(top, width)];
     let highlighted = if highlight && !diff && block.text.len() <= MAX_HIGHLIGHT_BYTES {
@@ -769,7 +766,6 @@ fn layout_code_panel(block: &CodeBlockBuffer, width: usize, highlight: bool) -> 
             }
         }
     }
-    output.push(code_panel_row(Line::default(), width));
     output
 }
 

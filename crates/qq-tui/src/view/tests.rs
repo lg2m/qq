@@ -1389,14 +1389,15 @@ fn refreshed_chrome_shows_identity_status_and_session_metrics() {
     assert!(rows[0].contains("openai/gpt-test"));
     assert!(rows[0].contains("50% ctx"), "{:?}", rows[0]);
     assert_eq!(frame[0].spans[0].style, brand().bold());
-    // Rule, composer, hint row: the bottom three rows.
-    assert!(rows[9].starts_with('─'), "{:?}", rows[9]);
-    assert!(rows[9].ends_with(" idle "), "{:?}", rows[9]);
-    assert!(rows[10].starts_with(" › Ask QQ..."), "{:?}", rows[10]);
-    assert!(rows[11].contains("help"), "{:?}", rows[11]);
-    assert!(rows[11].contains("^K commands"), "{:?}", rows[11]);
-    // Rows 1..=8 are transcript: eight body rows out of twelve.
-    assert!(rows[1..9].iter().any(|row| row.contains("row 0")));
+    // Rule then composer: the bottom two rows. The rule carries the hints so
+    // no row is spent on them, and an idle session shows no state chip.
+    assert!(rows[10].starts_with('─'), "{:?}", rows[10]);
+    assert!(rows[10].contains("F1 help"), "{:?}", rows[10]);
+    assert!(rows[10].contains("^K commands"), "{:?}", rows[10]);
+    assert!(!rows[10].contains("idle"), "{:?}", rows[10]);
+    assert!(rows[11].starts_with(" › Ask QQ..."), "{:?}", rows[11]);
+    // Rows 1..=9 are transcript: nine body rows out of twelve.
+    assert!(rows[1..10].iter().any(|row| row.contains("row 0")));
 }
 
 #[test]
@@ -1509,10 +1510,10 @@ fn the_terminal_cursor_follows_the_composer_caret_and_hides_under_overlays() {
     let mut renderer = FrameRenderer::default();
     let bytes = renderer.draw(&mut app, (80, 12)).unwrap();
     let text = String::from_utf8_lossy(&bytes);
-    // Composer is row 10 (0-based) in a 12-row frame; caret after "ab" is
-    // column 3 + 2 = 5, so the terminal cursor moves to row 11, column 6 in
+    // Composer is row 11 (0-based) in a 12-row frame; caret after "ab" is
+    // column 3 + 2 = 5, so the terminal cursor moves to row 12, column 6 in
     // 1-based ANSI coordinates and is shown.
-    assert!(text.contains("\x1b[11;6H\x1b[?25h"), "{text:?}");
+    assert!(text.contains("\x1b[12;6H\x1b[?25h"), "{text:?}");
     // Moving the cursor left moves the terminal cursor with it.
     app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
         KeyCode::Left,
@@ -1520,7 +1521,7 @@ fn the_terminal_cursor_follows_the_composer_caret_and_hides_under_overlays() {
     )));
     let bytes = renderer.draw(&mut app, (80, 12)).unwrap();
     let text = String::from_utf8_lossy(&bytes);
-    assert!(text.contains("\x1b[11;5H\x1b[?25h"), "{text:?}");
+    assert!(text.contains("\x1b[12;5H\x1b[?25h"), "{text:?}");
     // An overlay owns input without a caret: the cursor hides.
     app.execute(Command::OpenCommands);
     let bytes = renderer.draw(&mut app, (80, 12)).unwrap();
@@ -2588,19 +2589,22 @@ fn app_with_child_awaiting_approval() -> (App, SessionId, SessionId, RunId, Tool
 }
 
 #[test]
-fn the_agent_strip_names_a_sibling_needing_approval_at_100_columns() {
+fn the_agent_strip_names_a_sibling_needing_approval_below_the_sidebar_width() {
     let (mut app, parent, _, _, _) = app_with_child_awaiting_approval();
     assert_eq!(app.focused(), Some(parent));
-    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24));
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 90, 24));
     let strip = rows
         .iter()
         .find(|row| row.contains("2 agents"))
         .unwrap_or_else(|| panic!("agent strip in {rows:#?}"));
     assert!(strip.contains("◇ 1"), "{strip}");
     assert!(strip.contains("Ctrl-G"), "{strip}");
-    // The hint row offers the in-place answer chords.
-    let hint = rows.last().unwrap();
-    assert!(hint.contains("Alt-A/Alt-D answer"), "{hint}");
+    // The rule offers the in-place answer chords.
+    let rule = rows
+        .iter()
+        .find(|row| row.contains("needs approval"))
+        .unwrap_or_else(|| panic!("rule in {rows:#?}"));
+    assert!(rule.contains("Alt-A/Alt-D answer"), "{rule}");
 }
 
 #[test]
@@ -2800,4 +2804,85 @@ fn the_attention_pane_lists_needs_most_urgent_first_and_the_changes_pane_flags_o
     // Focusing a session returns to its transcript.
     app.focus_session(parent);
     assert_eq!(app.view, View::Transcript(Some(parent)));
+}
+
+#[test]
+fn the_composer_rule_carries_run_telemetry_notices_and_hints_in_priority_order() {
+    let (mut app, session_id, run_id, _) = running_view_app();
+    let rule_at = |app: &mut App, width| {
+        let rows = frame_rows(&FrameRenderer::default().frame_and_commit(app, width, 12));
+        rows[rows.len() - 2].clone()
+    };
+    // Running: activity glyph, elapsed since the run started, hints right.
+    // The chrome is two rows: no separate hint row exists below the composer.
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 12));
+    assert!(
+        rows[11].starts_with(" ⇥ "),
+        "composer is the last row: {rows:#?}"
+    );
+    let started = 1_000;
+    app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+        run_id: Some(run_id),
+        occurred_at_ms: started,
+        ..fixtures::envelope(
+            3,
+            session_id,
+            SessionEvent::RunActivityChanged {
+                run_id,
+                activity: qq_protocol::RunActivity::GeneratingResponse,
+            },
+        )
+    }));
+    app.sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .runs
+        .get_mut(&run_id)
+        .unwrap()
+        .started_at_ms = Some(started);
+    let message = MessageSnapshot {
+        run_id,
+        ..fixtures::message(MessageId::from_bytes([0x72; 16]), session_id, "")
+    };
+    app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+        run_id: Some(run_id),
+        occurred_at_ms: started + 600,
+        ..fixtures::envelope(
+            4,
+            session_id,
+            SessionEvent::AssistantMessageStarted { message },
+        )
+    }));
+    for (sequence, at, text) in [(5, started + 600, "hi"), (6, started + 4_200, " there")] {
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            run_id: Some(run_id),
+            occurred_at_ms: at,
+            ..fixtures::envelope(
+                sequence,
+                session_id,
+                SessionEvent::TextAppended {
+                    message_id: MessageId::from_bytes([0x72; 16]),
+                    channel: qq_protocol::TextChannel::Output,
+                    text: text.to_owned(),
+                },
+            )
+        }));
+    }
+    let rule = rule_at(&mut app, 100);
+    assert!(rule.contains("generating 4.2s  ttft 0.6s"), "{rule}");
+    assert!(rule.contains("F1 help"), "{rule}");
+    assert!(rule.contains("─"), "{rule}");
+
+    // A notice takes the left side and the hints step aside.
+    app.apply_notice(None, crate::app::NoticeLevel::Info, "saved".to_owned());
+    let rule = rule_at(&mut app, 100);
+    assert!(rule.starts_with(" saved "), "{rule}");
+    assert!(!rule.contains("F1 help"), "{rule}");
+    app.status = None;
+
+    // Cramped: status outranks hints, and some rule always shows.
+    let rule = rule_at(&mut app, 40);
+    assert!(rule.contains("generating"), "{rule}");
+    assert!(!rule.contains("F1 help"), "{rule}");
+    assert!(rule.contains("────"), "{rule}");
 }

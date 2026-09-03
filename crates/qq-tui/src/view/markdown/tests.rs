@@ -140,7 +140,6 @@ fn code_blocks_keep_character_wrapping() {
             "│ let answer",
             "│ _value = 4",
             "│ 2;        ",
-            "│           ",
         ]
     );
 }
@@ -154,9 +153,8 @@ fn fenced_code_renders_as_a_tinted_panel_with_a_language_label() {
     assert_eq!(
         rows,
         [
-            format!("│ {}rust", " ".repeat(18)),
+            format!("│ rust{}", " ".repeat(18)),
             format!("│ let x = 1;{}", " ".repeat(12)),
-            format!("│{}", " ".repeat(23)),
         ]
     );
     // Every row is padded to the full width with the surface tint so the

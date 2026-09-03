@@ -97,23 +97,23 @@ pub(super) fn top_row(app: &App, width: usize) -> Line {
     align_sides(left, right, width)
 }
 
-/// The single bottom row. A transient notice takes the whole row while it
-/// lasts; otherwise a running-state label sits left and context-sensitive
-/// key hints from the command table sit right. Approvals waiting in other
-/// sessions are named here too so they never stall silently.
-pub(super) fn hint_row(app: &App, width: usize) -> Line {
+/// The rule between transcript and composer carries the status the user
+/// needs while typing. A transient notice takes the left side while it
+/// lasts; otherwise a running session shows its activity, elapsed time, and
+/// time to first token. Approvals waiting in other sessions are named here
+/// too so they never stall silently. Context-sensitive key hints from the
+/// command table sit right, so the composer needs no hint row of its own.
+pub(super) fn composer_rule(app: &App, width: usize) -> Line {
+    let mut left = Line::default();
     if let Some((status, level)) = app.visible_status() {
         let (prefix, style) = match level {
             crate::app::NoticeLevel::Info => ("", accent()),
             crate::app::NoticeLevel::Warning => ("warning: ", warning()),
             crate::app::NoticeLevel::Error => ("error: ", failure()),
         };
-        return truncate_line(
-            Line::styled(format!(" {prefix}{status}"), style.bold()),
-            width,
-        );
+        left.push(format!(" {prefix}{status} "), style.bold());
+        return rule_with(left, Line::default(), width);
     }
-    let mut left = Line::default();
     if let Some(session) = app.focused().and_then(|id| app.sessions.get(&id))
         && session.summary.status == SessionStatus::Running
     {
@@ -128,6 +128,35 @@ pub(super) fn hint_row(app: &App, width: usize) -> Line {
             },
             info(),
         );
+        // Elapsed and time to first token answer "is it stuck?" without a
+        // glance at the transcript.
+        if let Some(stats) = session
+            .summary
+            .active_run_id
+            .and_then(|run_id| session.runs.get(&run_id))
+            && let Some(started) = stats.started_at_ms
+        {
+            left.push(
+                format!(
+                    " {}",
+                    format_duration_ms(app.now_ms.saturating_sub(started))
+                ),
+                muted(),
+            );
+            if let Some(first) = stats.first_token_at_ms {
+                left.push(
+                    format!(
+                        "  ttft {}",
+                        format_duration_ms(first.saturating_sub(started))
+                    ),
+                    muted(),
+                );
+            }
+        }
+    } else if let Some(session) = app.focused().and_then(|id| app.sessions.get(&id))
+        && session.summary.status == SessionStatus::Queued
+    {
+        left.push(" queued", muted());
     }
     let waiting: Vec<&str> = app
         .sessions_awaiting_approval()
@@ -173,8 +202,33 @@ pub(super) fn hint_row(app: &App, width: usize) -> Line {
         right.push(compact_chord(&chord), accent());
         right.push(format!(" {label}"), muted());
     }
-    right.push(" ", muted());
-    align_sides(left, right, width)
+    rule_with(left, right, width)
+}
+
+/// A rule of `─` with `left` laid over its start and `right` over its end.
+/// Status on the left outranks hints on the right: when both do not fit
+/// with a visible run of rule, the hints go first.
+fn rule_with(left: Line, mut right: Line, width: usize) -> Line {
+    const MIN_RULE: usize = 4;
+    if !right.is_empty() {
+        let mut padded = Line::styled(" ", muted());
+        padded.spans.append(&mut right.spans);
+        padded.push(" ", muted());
+        right = padded;
+    }
+    if left.width() + right.width() + MIN_RULE > width {
+        right = Line::default();
+    }
+    let mut rule = truncate_line(left, width.saturating_sub(right.width() + MIN_RULE));
+    if !rule.is_empty() {
+        rule.push(" ", muted());
+    }
+    let filler = width.saturating_sub(rule.width() + right.width());
+    rule.push("─".repeat(filler), border());
+    for span in right.spans {
+        rule.push(span.text, span.style);
+    }
+    truncate_line(rule, width)
 }
 
 /// The three or four most useful commands for the current state, in order.
@@ -403,28 +457,6 @@ pub(super) fn composer(
         caret = None;
     }
     (wrapped, caret)
-}
-
-/// The rule above the composer, carrying the approval-mode chip on the right.
-pub(super) fn composer_rule(app: &App, width: usize) -> Line {
-    let chip = app
-        .focused()
-        .and_then(|id| app.sessions.get(&id))
-        .map(|session| match session.summary.status {
-            SessionStatus::Running => "running",
-            SessionStatus::Queued => "queued",
-            SessionStatus::Idle => "idle",
-        });
-    let mut right = Line::default();
-    if let Some(chip) = chip {
-        right.push(format!(" {chip} "), muted());
-    }
-    let right_width = right.width();
-    let mut rule = Line::styled("─".repeat(width.saturating_sub(right_width)), border());
-    for span in right.spans {
-        rule.push(span.text, span.style);
-    }
-    rule
 }
 
 /// Drafts held locally while the focused session runs, oldest first. Each

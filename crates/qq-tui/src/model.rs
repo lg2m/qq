@@ -149,8 +149,15 @@ impl SessionStore {
                     index.spawned_by_call.insert(call, session.summary.id);
                 }
             }
+            // Ties on the timestamp fall back to the title so the list is stable
+            // across frames whatever the map's iteration order.
             for siblings in index.children.values_mut() {
-                siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+                siblings.sort_by(|a, b| {
+                    let (a, b) = (&self.sessions[a].summary, &self.sessions[b].summary);
+                    a.updated_at_ms
+                        .cmp(&b.updated_at_ms)
+                        .then_with(|| b.title.cmp(&a.title))
+                });
             }
             // Roots are newest-first; popping from the back yields the newest.
             let mut stack: Vec<(SessionId, usize)> = index

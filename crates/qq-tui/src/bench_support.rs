@@ -326,3 +326,120 @@ impl BenchHarness {
 fn black_box_draw(harness: &mut BenchHarness) {
     std::hint::black_box(harness.draw());
 }
+
+impl BenchHarness {
+    /// The first minute of a real session, as events: the user's prompt is
+    /// accepted, the run starts, the model reads a file, runs the tests, and
+    /// is mid-way through an edit while streaming its explanation. Session 0
+    /// must be empty. Returns the streaming message id so callers can keep
+    /// appending.
+    pub fn golden_path(&mut self) -> MessageId {
+        let session = session_id(0);
+        let run_id = run_id(0);
+        let mut prompt =
+            assistant_message(session, 0x10, "make the sse reconnect test deterministic");
+        prompt.role = qq_protocol::MessageRole::User;
+        prompt.state = MessageState::Complete;
+        prompt.turn_ordinal = 0;
+        self.apply(
+            0,
+            SessionEvent::PromptQueued {
+                session: summary(session, SessionStatus::Queued),
+                message: prompt,
+                run: Box::new(fixtures::run(
+                    run_id,
+                    session,
+                    qq_protocol::RunStatus::Queued,
+                )),
+                queue_position: 0,
+            },
+        );
+        self.apply(
+            0,
+            SessionEvent::RunStarted {
+                session: summary(session, SessionStatus::Running),
+                run_id,
+                plan: None,
+            },
+        );
+        let call = |index: u8, name: &str, arguments: &str, turn: u16| {
+            let mut id = [0x50; 16];
+            id[15] = index;
+            ToolCallSnapshot {
+                run_id,
+                turn_ordinal: turn,
+                call_ordinal: 0,
+                arguments: arguments.to_owned(),
+                state: qq_protocol::ToolCallState::Running,
+                ..fixtures::tool_call(ToolCallId::from_bytes(id), session, name)
+            }
+        };
+        let read = call(
+            1,
+            "read_file",
+            r#"{"path":"crates/qq-client/src/sse.rs"}"#,
+            1,
+        );
+        self.apply(
+            0,
+            SessionEvent::ToolCallStarted {
+                tool_call: read.clone(),
+            },
+        );
+        self.apply(
+            0,
+            SessionEvent::ToolCallFinished {
+                tool_call: ToolCallSnapshot {
+                    state: qq_protocol::ToolCallState::Completed,
+                    result: Some("fn reconnect() {}\n".repeat(412)),
+                    ..read
+                },
+            },
+        );
+        let test = call(
+            2,
+            "shell",
+            r#"{"command":"cargo test -p qq-client reconnect"}"#,
+            2,
+        );
+        self.apply(
+            0,
+            SessionEvent::ToolCallStarted {
+                tool_call: test.clone(),
+            },
+        );
+        self.apply(
+            0,
+            SessionEvent::ToolCallFinished {
+                tool_call: ToolCallSnapshot {
+                    state: qq_protocol::ToolCallState::Completed,
+                    result: Some(
+                        "running 4 tests\ntest reconnect_replays ... FAILED\ntest result: FAILED. 3 passed; 1 failed\nexit code: 101\n"
+                            .to_owned(),
+                    ),
+                    ..test
+                },
+            },
+        );
+        let edit = call(
+            3,
+            "edit_file",
+            r#"{"path":"crates/qq-client/src/sse.rs"}"#,
+            3,
+        );
+        self.apply(0, SessionEvent::ToolCallStarted { tool_call: edit });
+        let mut message = assistant_message(session, 0x11, "");
+        message.turn_ordinal = 4;
+        let id = message.id;
+        self.apply(0, SessionEvent::AssistantMessageStarted { message });
+        self.apply(
+            0,
+            SessionEvent::TextAppended {
+                message_id: id,
+                channel: qq_protocol::TextChannel::Output,
+                text: "The test slept on wall-clock time; pausing the runtime clock removes the race. Applying the edit now.".to_owned(),
+            },
+        );
+        id
+    }
+}

@@ -240,12 +240,12 @@ pub(super) fn live_status_line(app: &App, session_id: SessionId) -> Option<(Stri
     let session = app.sessions.get(&session_id)?;
     let live = &session.live;
     if !live.awaiting_approval.is_empty() {
-        let tool = live.active_tool.as_deref().unwrap_or("tool");
-        return Some((format!("? approve {tool}"), warning().bold()));
+        let tool = live.active_tool.as_deref().map_or("tool", tool_verb);
+        return Some((format!("◇ approve {tool}"), warning().bold()));
     }
     if session.summary.status == SessionStatus::Running {
         if let Some(tool) = &live.active_tool {
-            return Some((format!("> {tool}"), accent()));
+            return Some((tool_verb(tool).to_owned(), accent()));
         }
         if !live.tail.is_empty() {
             return Some((live.tail.clone(), muted()));
@@ -268,6 +268,25 @@ pub(super) fn live_status_line(app: &App, session_id: SessionId) -> Option<(Stri
         return Some((live.tail.clone(), muted()));
     }
     None
+}
+
+/// The verb a tool call row would show for `name`, lower-cased for prose:
+/// the sidebar says `edit`, not `edit_file`. MCP tools show their tool part.
+fn tool_verb(name: &str) -> &str {
+    match name {
+        "read_file" => "read",
+        "list_dir" => "list",
+        "search" => "search",
+        "edit_file" => "edit",
+        "write_file" => "write",
+        "shell" => "run",
+        "spawn_agent" => "spawn",
+        "web_fetch" => "fetch",
+        other => other
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+            .map_or(other, |(_, tool)| tool),
+    }
 }
 
 /// Extend `line` with spaces to exactly `width` display columns.
