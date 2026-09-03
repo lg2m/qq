@@ -72,8 +72,17 @@ impl ModelRequest {
 }
 
 /// A tool the model may call, described provider-neutrally.
+///
+/// Specs are immutable once built and travel with every request, catalog,
+/// and plan, so the payload is shared: cloning is a reference count bump,
+/// never a deep copy of the schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
+    inner: Arc<ToolSpecInner>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ToolSpecInner {
     name: String,
     description: String,
     input_schema: serde_json::Value,
@@ -87,25 +96,27 @@ impl ToolSpec {
         input_schema: serde_json::Value,
     ) -> Self {
         Self {
-            name: name.into(),
-            description: description.into(),
-            input_schema,
+            inner: Arc::new(ToolSpecInner {
+                name: name.into(),
+                description: description.into(),
+                input_schema,
+            }),
         }
     }
 
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        &self.inner.name
     }
 
     #[must_use]
     pub fn description(&self) -> &str {
-        &self.description
+        &self.inner.description
     }
 
     #[must_use]
-    pub const fn input_schema(&self) -> &serde_json::Value {
-        &self.input_schema
+    pub fn input_schema(&self) -> &serde_json::Value {
+        &self.inner.input_schema
     }
 }
 

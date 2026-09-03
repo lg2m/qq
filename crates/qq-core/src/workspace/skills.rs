@@ -197,9 +197,14 @@ impl SkillIndex {
             let Some(opened) = root.resolve(workspace, packs) else {
                 continue;
             };
-            fingerprints.push(SourceFingerprint::capture(
-                opened.path().join(&root.directory),
-            ));
+            let fingerprint = SourceFingerprint::capture(opened.path().join(&root.directory));
+            let present = fingerprint.is_present();
+            fingerprints.push(fingerprint);
+            if !present {
+                // The fingerprint already observed the root's absence; do not
+                // pay a second syscall to fail the listing.
+                continue;
+            }
             let listing = match opened.root().read_dir(&root.directory) {
                 Ok(listing) => listing,
                 // An absent or unreadable root contributes nothing; the
