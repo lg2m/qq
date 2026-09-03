@@ -76,6 +76,19 @@ fn cursor_prefix(selected: bool) -> Line {
     Line::styled(if selected { "  > " } else { "    " }, muted())
 }
 
+/// Finish a picker row: pad to `width` and, when selected, paint the whole
+/// row on the selection background so it reads without the `>` alone.
+fn finish_row(mut line: Line, selected: bool, width: usize) -> Line {
+    line = truncate_line(line, width);
+    if selected {
+        pad_line(&mut line, width);
+        for span in &mut line.spans {
+            span.style = selection(span.style);
+        }
+    }
+    line
+}
+
 pub(super) fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     let Some(Overlay::Sessions {
         picker,
@@ -134,7 +147,11 @@ pub(super) fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line
                 "  ".repeat(depth),
                 if selected { ">" } else { " " }
             );
-            out.push(session_line(app, row.id, width, &prefix));
+            out.push(finish_row(
+                session_line(app, row.id, width, &prefix),
+                selected,
+                width,
+            ));
         },
     )
 }
@@ -175,7 +192,7 @@ pub(super) fn model_picker(app: &App, width: usize, height: usize) -> Vec<Line> 
             if row.name.as_deref() != Some(row.model.as_str()) {
                 line.push(format!("  {}", row.model), muted());
             }
-            out.push(truncate_line(line, width));
+            out.push(finish_row(line, selected, width));
         },
     )
 }
@@ -220,7 +237,7 @@ pub(super) fn theme_picker(app: &App, width: usize, height: usize) -> Vec<Line> 
             if row.index == app.theme {
                 line.push("  active", accent());
             }
-            out.push(truncate_line(line, width));
+            out.push(finish_row(line, selected, width));
         },
     )
 }
@@ -272,7 +289,7 @@ pub(super) fn command_picker(app: &App, width: usize, height: usize) -> Vec<Line
             if let Some(slash) = row.spec.slash.first() {
                 line.push(format!("  {slash}"), muted());
             }
-            out.push(truncate_line(line, width));
+            out.push(finish_row(line, selected, width));
         },
     )
 }

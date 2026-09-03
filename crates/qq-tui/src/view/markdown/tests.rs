@@ -1,5 +1,5 @@
 use super::*;
-use crate::render::{failure, success, surface_color};
+use crate::render::{diff_line_style, surface_color};
 use unicode_width::UnicodeWidthChar;
 
 fn frame_rows(frame: &[Line]) -> Vec<String> {
@@ -184,9 +184,9 @@ fn diff_fenced_blocks_color_lines_inside_the_panel() {
             .find(|span| span.text.contains(needle))
             .map(|span| span.style)
     };
-    assert_eq!(style_of("@@ -1,2 +1,2 @@"), Some(surface(accent().dim())));
-    assert_eq!(style_of("-old line"), Some(surface(failure())));
-    assert_eq!(style_of("+new line"), Some(surface(success())));
+    assert_eq!(style_of("@@ -1,2 +1,2 @@"), Some(surface(muted())));
+    assert_eq!(style_of("-old line"), Some(surface(diff_line_style("-"))));
+    assert_eq!(style_of("+new line"), Some(surface(diff_line_style("+"))));
     assert_eq!(style_of(" context"), Some(surface(normal())));
     assert!(lines.iter().all(|line| line.width() == 30));
 }
@@ -341,12 +341,15 @@ fn diff_fences_keep_diff_coloring_when_highlighting_is_enabled() {
     let source = "```diff\n@@ -1 +1 @@\n-old line\n+new line\n```";
     let lines = markdown_lines(source, 30, true);
 
+    assert_eq!(style_of(&lines, "@@ -1 +1 @@"), Some(surface(muted())));
     assert_eq!(
-        style_of(&lines, "@@ -1 +1 @@"),
-        Some(surface(accent().dim()))
+        style_of(&lines, "-old line"),
+        Some(surface(diff_line_style("-")))
     );
-    assert_eq!(style_of(&lines, "-old line"), Some(surface(failure())));
-    assert_eq!(style_of(&lines, "+new line"), Some(surface(success())));
+    assert_eq!(
+        style_of(&lines, "+new line"),
+        Some(surface(diff_line_style("+")))
+    );
 }
 
 #[test]

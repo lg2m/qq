@@ -361,10 +361,10 @@ async fn loop_upgrades_completed_code_to_highlighted_off_the_render_path() {
     harness.update(ClientUpdate::Connection(ConnectionState::Live));
 
     // Real time here: the highlight runs on the blocking pool. Poll until a
-    // frame carries the keyword color (crossterm encodes `Magenta` as
-    // `38;5;13`), bounded so a regression fails fast. Frames are row
-    // diffs, so the upgraded frame holds only the code row.
-    let keyword = "\x1b[38;5;13m\x1b[48;2;38;40;48mlet";
+    // frame carries the keyword color (the theme's brand role, RGB
+    // 255/159/67 in the default theme), bounded so a regression fails fast.
+    // Frames are row diffs, so the upgraded frame holds only the code row.
+    let keyword = "\x1b[38;2;255;159;67m\x1b[48;2;38;40;48mlet";
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut plain_seen = false;
     let mut highlighted_seen = false;

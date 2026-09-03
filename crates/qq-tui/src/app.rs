@@ -590,6 +590,20 @@ impl App {
         let previous = self.sessions.remove(&session_id);
         let mut view = SessionView::summary_only(snapshot.summary, context_window, loaded_through);
         view.live = LiveStatus::from_body(&messages, &tool_calls);
+        for run in &snapshot.runs {
+            let stats = view.runs.entry(run.id).or_default();
+            stats.outcome = run.outcome.clone();
+            stats.usage = run.usage;
+            stats.cost_usd_nanos = run.estimated_cost_usd_nanos;
+        }
+        for call in &tool_calls {
+            if matches!(
+                call.state,
+                ToolCallState::Completed | ToolCallState::Failed | ToolCallState::Denied
+            ) {
+                view.runs.entry(call.run_id).or_default().tool_calls += 1;
+            }
+        }
         view.prompt_history = history
             .into_iter()
             .rev()
@@ -1005,6 +1019,15 @@ impl App {
             }
             KeyCode::Left => Effects::changed_now(self.composer.move_left()),
             KeyCode::Right => Effects::changed_now(self.composer.move_right()),
+            // Ctrl-Home/End jump the transcript; plain Home/End edit the line.
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let id = self.panes.focused_id();
+                Effects::changed_now(self.scroll_pane(id, isize::MAX))
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let id = self.panes.focused_id();
+                Effects::changed_now(self.scroll_pane(id, isize::MIN))
+            }
             KeyCode::Home => Effects::changed_now(self.composer.move_line_start()),
             KeyCode::End => Effects::changed_now(self.composer.move_line_end()),
             KeyCode::Char(character) if key.modifiers == KeyModifiers::CONTROL => {
@@ -1877,11 +1900,6 @@ impl App {
         Some((session.summary.context_tokens?, session.context_window?))
     }
 
-    pub(crate) fn focused_context_window(&self) -> Option<u32> {
-        let session = self.focused().and_then(|id| self.sessions.get(&id))?;
-        session.context_window
-    }
-
     /// The focused session's sibling `offset` places away in spawn order
     /// (oldest-first), wrapping at either end. Roots are siblings of roots.
     fn sibling(&self, offset: isize) -> Option<SessionId> {
@@ -2035,3 +2053,25 @@ fn is_composer_newline_key(key: KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+impl App {
+    /// What Enter does in the composer right now, for the prompt glyph.
+    pub(crate) fn composer_mode(&self) -> crate::view::ComposerMode {
+        use crate::view::ComposerMode;
+        if self.pending_approval().is_some() {
+            return ComposerMode::Approval;
+        }
+        let running = self
+            .focused()
+            .and_then(|id| self.sessions.get(&id))
+            .is_some_and(|session| session.summary.active_run_id.is_some());
+        if !running {
+            return ComposerMode::Send;
+        }
+        if self.steering.is_some_and(|steering| steering.boundary) {
+            ComposerMode::Steer
+        } else {
+            ComposerMode::Queue
+        }
+    }
+}

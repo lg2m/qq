@@ -18,7 +18,7 @@ use std::{
 };
 
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{Hide, MoveTo, Show},
     queue,
     style::{Attribute, ResetColor, SetAttribute},
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
@@ -30,16 +30,18 @@ use qq_protocol::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    Layout,
+    Layout, StatusItem,
     app::{App, SessionView, ToolDetail, terminal_safe_character},
     input::{Mode, SessionConfirm},
     panes::{PaneId, Rect, Tile, Viewport},
     render::{
-        Line, Style, accent, brand, diff_line_style, failure, muted, normal, warning, write_line,
+        Line, Style, accent, border, border_active, brand, diff_line_style, failure, info, muted,
+        normal, selection, success, warning, write_line,
     },
     theme,
 };
 use chrome::*;
+pub(crate) use chrome::{ComposerMode, CursorPosition};
 use highlight::HighlightKey;
 pub(crate) use highlight::{Highlighted, Highlighter};
 use markdown::{has_fenced_code, markdown_lines, settled_prefix_end};
@@ -54,6 +56,8 @@ use wrap::{
     wrap_line_chars,
 };
 
+/// Rows the composer may grow to before it scrolls around the caret.
+const MAX_COMPOSER_ROWS: usize = 8;
 const MAX_RENDER_WIDTH: u16 = 320;
 const MAX_RENDER_HEIGHT: u16 = 160;
 const MAX_LIVE_MARKDOWN_BYTES: usize = 32 * 1024;
@@ -88,6 +92,8 @@ pub(crate) struct FrameRenderer {
     viewport_updates: Vec<ViewportUpdate>,
     /// Tiles laid out for the last frame, for the same hand-back.
     tiles: Vec<Tile>,
+    /// Where the terminal cursor belongs after the last frame, or hidden.
+    cursor: Option<CursorPosition>,
 }
 
 /// A pane's viewport after reconciling it with the body drawn this frame.
@@ -143,12 +149,17 @@ impl FrameRenderer {
                 write_line(&mut output, line)?;
             }
         }
-        queue!(
-            &mut output,
-            SetAttribute(Attribute::Reset),
-            ResetColor,
-            EndSynchronizedUpdate
-        )?;
+        queue!(&mut output, SetAttribute(Attribute::Reset), ResetColor)?;
+        // The real cursor marks the composer caret; overlays and approvals own
+        // input without a caret, so it hides then. Placing it after the rows
+        // keeps IME candidate windows and screen readers anchored correctly.
+        match self.cursor {
+            Some(position) => {
+                queue!(&mut output, MoveTo(position.column, position.row), Show)?;
+            }
+            None => queue!(&mut output, Hide)?,
+        }
+        queue!(&mut output, EndSynchronizedUpdate)?;
         self.previous = frame;
         self.size = Some(actual_size);
         Ok(output)
@@ -177,18 +188,19 @@ impl FrameRenderer {
             );
         }
 
-        let mut lines = vec![header(app, width), context(app, width)];
-        let status_lines = status_notice(app, width);
-        // Header, context, two footer rows, and the optional notice are fixed.
-        // The composer can grow with wrapped multi-line input, so body height is
+        self.cursor = None;
+        let mut lines = vec![top_row(app, width)];
+        // One top row, the composer rule, and one hint row are fixed. The
+        // composer can grow with wrapped multi-line input, so body height is
         // computed after the composer is laid out against the remaining space.
-        let fixed_chrome_rows = 4 + status_lines.len();
+        // Notices overlay the hint row, so the body never moves for one.
+        let fixed_chrome_rows = 3;
         let max_composer_rows = height
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(1)
-            .max(1);
+            .clamp(1, MAX_COMPOSER_ROWS);
         let draft_lines = queued_drafts(app, width);
-        let composer_lines = composer(app, width, max_composer_rows);
+        let (composer_lines, caret) = composer(app, width, max_composer_rows);
         let body_height = height
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(draft_lines.len())
@@ -212,7 +224,7 @@ impl FrameRenderer {
             Mode::Commands => command_picker(app, body_width, body_height),
             Mode::Approval => approval_prompt(app, body_width, body_height),
             Mode::Compose => {
-                let mut body = self.panes_body(app, Rect::new(0, 2, body_width, body_height));
+                let mut body = self.panes_body(app, Rect::new(0, 1, body_width, body_height));
                 overlay_slash_autocomplete(
                     &mut body,
                     slash_autocomplete(app, body_width, body_height),
@@ -232,11 +244,20 @@ impl FrameRenderer {
             }
         }
         lines.extend(body);
-        lines.extend(status_lines);
         lines.extend(draft_lines);
+        lines.push(composer_rule(app, width));
+        let composer_top = lines.len();
         lines.extend(composer_lines);
-        lines.push(footer_context(app, width));
-        lines.push(footer_workspace(app, width));
+        lines.push(hint_row(app, width));
+        if mode == Mode::Compose
+            && let Some((column, row)) = caret
+            && let (Ok(column), Ok(row)) = (
+                u16::try_from(column.min(width.saturating_sub(1))),
+                u16::try_from(composer_top + row),
+            )
+        {
+            self.cursor = Some(CursorPosition { column, row });
+        }
         fit_height(lines, height)
     }
 

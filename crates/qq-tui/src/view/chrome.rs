@@ -1,25 +1,19 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(super) const GIT_COMMIT: &str = env!("QQ_GIT_COMMIT");
-pub(super) fn header(app: &App, width: usize) -> Line {
-    let mut left = Line::styled(" qq", brand().bold());
-    left.push(format!("  {VERSION} {GIT_COMMIT}"), muted());
-    let mut right = Line::styled("local", normal());
-    let connection = match app.connection {
-        crate::ConnectionState::Connecting => Some("connecting"),
-        crate::ConnectionState::Replaying => Some("reconnecting"),
-        crate::ConnectionState::Live => None,
-        crate::ConnectionState::Offline => Some("offline"),
-    };
-    if let Some(connection) = connection {
-        right.push(format!("  {connection}"), warning());
-    }
-    align_sides(left, right, width)
+
+/// One spinner for every running thing on screen, at the animation tick.
+pub(super) fn spinner(tick: usize) -> &'static str {
+    TOOL_SPINNER[tick % TOOL_SPINNER.len()]
 }
 
-pub(super) fn context(app: &App, width: usize) -> Line {
-    let mut line = Line::styled("  ", muted());
+/// The single top row: brand mark, breadcrumb of the focused session, then
+/// right-aligned model, context occupancy, cost, and the connection state
+/// only when it is degraded. `local` and the version are not shown; they
+/// are in `/status`.
+pub(super) fn top_row(app: &App, width: usize) -> Line {
+    let mut left = Line::styled(" qq", brand().bold());
     if let Some(focused) = app.focused() {
         let mut ancestors = Vec::new();
         let mut cursor = Some(focused);
@@ -31,51 +25,117 @@ pub(super) fn context(app: &App, width: usize) -> Line {
             cursor = session.summary.parent_id;
         }
         ancestors.reverse();
-        line.push(ancestors.join(" / "), normal().bold());
-    } else {
-        line.push(
-            if app.workspace_path.is_empty() {
-                "QQ"
-            } else {
-                &app.workspace_path
-            },
-            muted(),
-        );
+        left.push("  ", muted());
+        for (index, title) in ancestors.iter().enumerate() {
+            if index > 0 {
+                left.push(" › ", muted());
+            }
+            left.push(
+                *title,
+                if index + 1 == ancestors.len() {
+                    normal().bold()
+                } else {
+                    muted()
+                },
+            );
+        }
+    } else if !app.workspace_path.is_empty() {
+        left.push(format!("  {}", app.workspace_path), muted());
     }
-    truncate_line(line, width)
+
+    let mut right = Line::default();
+    let focused = app
+        .focused()
+        .and_then(|id| app.sessions.get(&id))
+        .map(|session| &session.summary);
+    for item in app.settings.status_line() {
+        let part: Option<(String, Style)> = match item {
+            StatusItem::Model => focused
+                .and_then(|session| session.model.as_deref())
+                .or(app.model.model.as_deref())
+                .map(|model| (model.to_owned(), accent())),
+            StatusItem::Context => match app.focused_context_usage() {
+                Some((tokens, limit)) if limit > 0 => {
+                    let percent = u128::from(tokens) * 100 / u128::from(limit);
+                    Some((format!("{percent}% ctx"), muted()))
+                }
+                _ => None,
+            },
+            StatusItem::Cost => focused
+                .and_then(|session| {
+                    session
+                        .accounting
+                        .map(|accounting| accounting.inclusive.estimated_cost_usd_nanos)
+                        .unwrap_or(session.estimated_cost_usd_nanos)
+                })
+                .map(|nanos| (format_cost(nanos), muted())),
+            StatusItem::Workspace => {
+                (!app.workspace_path.is_empty()).then(|| (app.workspace_path.clone(), muted()))
+            }
+            StatusItem::Layout => Some((
+                match app.layout {
+                    Layout::Threadline => "threadline".to_owned(),
+                    Layout::FoldFocus => "fold".to_owned(),
+                },
+                muted(),
+            )),
+            StatusItem::Tools => Some((format!("tools {}", app.tool_detail.label()), muted())),
+        };
+        if let Some((text, style)) = part {
+            if !right.is_empty() {
+                right.push("  ", muted());
+            }
+            right.push(text, style);
+        }
+    }
+    let connection = match app.connection {
+        crate::ConnectionState::Connecting => Some("connecting"),
+        crate::ConnectionState::Replaying => Some("reconnecting"),
+        crate::ConnectionState::Offline => Some("offline"),
+        crate::ConnectionState::Live => None,
+    };
+    if let Some(connection) = connection {
+        if !right.is_empty() {
+            right.push("  ", muted());
+        }
+        right.push(connection, warning().bold());
+    }
+    right.push(" ", muted());
+    align_sides(left, right, width)
 }
 
-pub(super) fn status_notice(app: &App, width: usize) -> Vec<Line> {
-    let mut lines = Vec::new();
+/// The single bottom row. A transient notice takes the whole row while it
+/// lasts; otherwise a running-state label sits left and context-sensitive
+/// key hints from the command table sit right. Approvals waiting in other
+/// sessions are named here too so they never stall silently.
+pub(super) fn hint_row(app: &App, width: usize) -> Line {
     if let Some((status, level)) = app.visible_status() {
         let (prefix, style) = match level {
             crate::app::NoticeLevel::Info => ("", accent()),
             crate::app::NoticeLevel::Warning => ("warning: ", warning()),
             crate::app::NoticeLevel::Error => ("error: ", failure()),
         };
-        lines.extend(wrap_line(
-            Line::styled(format!("  {prefix}{status}"), style.bold()),
-            width.max(1),
-        ));
+        return truncate_line(
+            Line::styled(format!(" {prefix}{status}"), style.bold()),
+            width,
+        );
     }
+    let mut left = Line::default();
     if let Some(session) = app.focused().and_then(|id| app.sessions.get(&id))
         && session.summary.status == SessionStatus::Running
     {
-        let label = match session.activity.map(|(_, activity)| activity) {
-            Some(qq_protocol::RunActivity::WaitingForProvider) => "waiting for model",
-            Some(qq_protocol::RunActivity::Reasoning) => "reasoning",
-            Some(qq_protocol::RunActivity::GeneratingResponse) => "generating response",
-            Some(qq_protocol::RunActivity::PreparingToolCall) => "preparing tool call",
-            None => "working",
-        };
-        let spinner = TOOL_SPINNER[app.animation_tick % TOOL_SPINNER.len()];
-        lines.extend(wrap_line(
-            Line::styled(format!("  {spinner} {label}…"), accent().bold()),
-            width.max(1),
-        ));
+        left.push(format!(" {} ", spinner(app.animation_tick)), info());
+        left.push(
+            match session.activity.map(|(_, activity)| activity) {
+                Some(qq_protocol::RunActivity::WaitingForProvider) => "waiting for model",
+                Some(qq_protocol::RunActivity::Reasoning) => "reasoning",
+                Some(qq_protocol::RunActivity::GeneratingResponse) => "generating",
+                Some(qq_protocol::RunActivity::PreparingToolCall) => "preparing tool call",
+                None => "working",
+            },
+            info(),
+        );
     }
-    // Approvals waiting in sessions the user is not looking at would
-    // otherwise stall silently. One row names them and how to jump.
     let waiting: Vec<&str> = app
         .sessions_awaiting_approval()
         .into_iter()
@@ -84,24 +144,256 @@ pub(super) fn status_notice(app: &App, width: usize) -> Vec<Line> {
         .map(|session| session.summary.title.as_str())
         .collect();
     if !waiting.is_empty() {
-        let mut line = Line::styled("  ? ", warning().bold());
-        line.push(
+        left.push(if left.is_empty() { " " } else { "  " }, muted());
+        left.push("◇ ", warning().bold());
+        left.push(
             match waiting.as_slice() {
-                [one] => format!("approval needed in {one}"),
-                [first, rest @ ..] => {
-                    format!("approval needed in {first} and {} more", rest.len())
-                }
+                [one] => format!("{one} needs approval"),
+                [first, rest @ ..] => format!("{first} +{} need approval", rest.len()),
                 [] => String::new(),
             },
             warning().bold(),
         );
         if let Some(chord) = app.chord_label(crate::commands::Command::FocusNextApproval) {
-            line.push(format!("  {chord} jumps there"), muted());
+            left.push(format!(" {chord}"), muted());
         }
-        lines.push(truncate_line(line, width));
     }
-    lines
+
+    let mut right = Line::default();
+    for (command, label) in hints_for(app) {
+        let Some(chord) = app.chord_label(command) else {
+            continue;
+        };
+        if !right.is_empty() {
+            right.push("  ", muted());
+        }
+        right.push(compact_chord(&chord), accent());
+        right.push(format!(" {label}"), muted());
+    }
+    right.push(" ", muted());
+    align_sides(left, right, width)
 }
+
+/// The three or four most useful commands for the current state, in order.
+fn hints_for(app: &App) -> Vec<(crate::commands::Command, &'static str)> {
+    use crate::commands::Command;
+    let mut hints = Vec::with_capacity(4);
+    match app.mode() {
+        Mode::Compose => {
+            hints.push((Command::OpenHelp, "help"));
+            hints.push((Command::OpenCommands, "commands"));
+            let running = app
+                .focused()
+                .and_then(|id| app.sessions.get(&id))
+                .is_some_and(|session| session.summary.active_run_id.is_some());
+            if running {
+                hints.push((Command::QueueDraft, "queue"));
+                hints.push((Command::CancelRun, "cancel"));
+            } else {
+                hints.push((Command::ToggleToolDetail, "detail"));
+                hints.push((Command::OpenSessions, "sessions"));
+            }
+        }
+        Mode::Approval => {
+            hints.push((Command::OpenHelp, "help"));
+        }
+        Mode::Models | Mode::Themes | Mode::Sessions | Mode::Commands => {}
+    }
+    hints
+}
+
+/// `Ctrl-K` as `^K`, `Alt-N` as `M-N`, function and plain keys unchanged:
+/// the footer has room for four hints only in the short form.
+fn compact_chord(chord: &str) -> String {
+    let mut out = String::with_capacity(chord.len());
+    let mut rest = chord;
+    loop {
+        if let Some(tail) = rest.strip_prefix("Ctrl-") {
+            out.push('^');
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("Alt-") {
+            out.push_str("M-");
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("Shift-") {
+            out.push_str("S-");
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What Enter does right now, shown as the composer's prompt glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComposerMode {
+    /// Enter sends a new prompt.
+    Send,
+    /// Enter steers the active run at its next boundary.
+    Steer,
+    /// Enter holds the draft until the run finishes.
+    Queue,
+    /// An approval owns input; the composer is disabled.
+    Approval,
+}
+
+impl ComposerMode {
+    pub(crate) const fn glyph(self) -> &'static str {
+        match self {
+            Self::Send => "›",
+            Self::Steer => "↦",
+            Self::Queue => "⇥",
+            Self::Approval => "✎",
+        }
+    }
+
+    const fn placeholder(self) -> &'static str {
+        match self {
+            Self::Send => "Ask QQ...",
+            Self::Steer => "Steer the run...",
+            Self::Queue => "Queue for after this run...",
+            Self::Approval => "Answer the approval above",
+        }
+    }
+}
+
+/// Where the terminal cursor belongs after a frame, in frame coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorPosition {
+    pub column: u16,
+    pub row: u16,
+}
+
+/// The composer block: a rule carrying the approval-mode chip, then the
+/// draft rows with the mode glyph in the gutter of the first. Returns the
+/// rows and the caret's position relative to the block's first row, or
+/// `None` when the composer does not own the cursor.
+pub(super) fn composer(
+    app: &App,
+    width: usize,
+    max_rows: usize,
+) -> (Vec<Line>, Option<(usize, usize)>) {
+    let max_rows = max_rows.max(1);
+    let mode = app.composer_mode();
+    let glyph_style = match mode {
+        ComposerMode::Send => accent().bold(),
+        ComposerMode::Steer | ComposerMode::Queue => warning().bold(),
+        ComposerMode::Approval => muted(),
+    };
+    let gutter = format!(" {} ", mode.glyph());
+    if app.composer.text.is_empty() {
+        let mut line = Line::styled(gutter, glyph_style);
+        line.push(mode.placeholder(), muted().italic());
+        let caret = (mode != ComposerMode::Approval).then_some((3, 0));
+        return (vec![truncate_line(line, width)], caret);
+    }
+
+    // Lay the draft out with the same wrapping the caret is measured by so
+    // both agree on where each character lands.
+    let content_width = width.saturating_sub(3).max(1);
+    let cursor = app.composer.cursor();
+    let mut wrapped: Vec<Line> = Vec::new();
+    let mut caret: Option<(usize, usize)> = None;
+    let mut consumed = 0_usize;
+    for (line_index, part) in app.composer.text.split('\n').enumerate() {
+        let content_rows = if part.is_empty() {
+            vec![Line::default()]
+        } else {
+            wrap_line_chars(composer_row(part), content_width)
+        };
+        let cursor_in_part = cursor >= consumed && cursor <= consumed + part.len();
+        let mut row_start = consumed;
+        for (row_index, content) in content_rows.into_iter().enumerate() {
+            let row_bytes: usize = content.spans.iter().map(|span| span.text.len()).sum();
+            if cursor_in_part && caret.is_none() {
+                let last_row = row_start + row_bytes == consumed + part.len();
+                if cursor < row_start + row_bytes || (last_row && cursor <= row_start + row_bytes) {
+                    let column = content
+                        .spans
+                        .iter()
+                        .flat_map(|span| span.text.chars())
+                        .scan(row_start, |offset, character| {
+                            let start = *offset;
+                            *offset += character.len_utf8();
+                            Some((start, character))
+                        })
+                        .take_while(|(start, _)| *start < cursor)
+                        .map(|(_, character)| {
+                            unicode_width::UnicodeWidthChar::width(character).unwrap_or_default()
+                        })
+                        .sum::<usize>();
+                    caret = Some((3 + column, wrapped.len()));
+                }
+            }
+            row_start += row_bytes;
+            let mut row = if line_index == 0 && row_index == 0 {
+                Line::styled(gutter.clone(), glyph_style)
+            } else {
+                Line::styled("   ", muted())
+            };
+            for span in content.spans {
+                row.push(span.text, span.style);
+            }
+            wrapped.push(row);
+        }
+        consumed += part.len() + 1;
+    }
+
+    // When the draft outgrows the reserved composer region, keep the rows
+    // around the caret so the cursor and newest typing stay visible.
+    if wrapped.len() > max_rows {
+        let caret_row = caret.map_or(wrapped.len() - 1, |(_, row)| row);
+        let skip = caret_row
+            .saturating_sub(max_rows - 1)
+            .min(wrapped.len() - max_rows);
+        wrapped.drain(..skip);
+        wrapped.truncate(max_rows);
+        if let Some((_, row)) = caret.as_mut() {
+            *row = row.saturating_sub(skip);
+        }
+        if skip > 0
+            && let Some(first) = wrapped.first_mut()
+        {
+            let rest = std::mem::take(first);
+            let mut clipped = Line::styled(" … ", muted());
+            for span in rest.spans.into_iter().skip(1) {
+                clipped.push(span.text, span.style);
+            }
+            *first = clipped;
+        }
+    }
+    for row in &mut wrapped {
+        *row = truncate_line(std::mem::take(row), width);
+    }
+    if mode == ComposerMode::Approval {
+        caret = None;
+    }
+    (wrapped, caret)
+}
+
+/// The rule above the composer, carrying the approval-mode chip on the right.
+pub(super) fn composer_rule(app: &App, width: usize) -> Line {
+    let chip = app
+        .focused()
+        .and_then(|id| app.sessions.get(&id))
+        .map(|session| match session.summary.status {
+            SessionStatus::Running => "running",
+            SessionStatus::Queued => "queued",
+            SessionStatus::Idle => "idle",
+        });
+    let mut right = Line::default();
+    if let Some(chip) = chip {
+        right.push(format!(" {chip} "), muted());
+    }
+    let right_width = right.width();
+    let mut rule = Line::styled("─".repeat(width.saturating_sub(right_width)), border());
+    for span in right.spans {
+        rule.push(span.text, span.style);
+    }
+    rule
+}
+
 /// Drafts held locally while the focused session runs, oldest first. Each
 /// takes one row; the newest is the one Alt-Up brings back.
 pub(super) fn queued_drafts(app: &App, width: usize) -> Vec<Line> {
@@ -127,12 +419,9 @@ pub(super) fn queued_drafts(app: &App, width: usize) -> Vec<Line> {
                 } else {
                     "queued  ".to_owned()
                 },
-                warning().dim(),
+                warning(),
             );
-            line.push(
-                preview(draft, width.saturating_sub(line.width())),
-                normal().dim(),
-            );
+            line.push(preview(draft, width.saturating_sub(line.width())), muted());
             truncate_line(line, width)
         })
         .collect()
@@ -153,140 +442,6 @@ pub(super) fn composer_row(part: &str) -> Line {
     }
     line.push(rest, normal());
     line
-}
-
-pub(super) fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
-    let max_rows = max_rows.max(1);
-    let caret = if app.animation_tick.is_multiple_of(2) {
-        "|"
-    } else {
-        " "
-    };
-    if app.composer.text.is_empty() {
-        let mut line = Line::styled(" > ", accent().bold());
-        line.push("Ask QQ...", muted().italic());
-        line.push(caret, accent());
-        return vec![truncate_line(line, width)];
-    }
-
-    // Insert the visual caret into a rendering copy. Composer offsets are UTF-8
-    // byte boundaries, so this remains correct for non-ASCII input.
-    let mut display_text = app.composer.text.clone();
-    display_text.insert_str(app.composer.cursor(), caret);
-
-    // Keep hard newlines from Shift-Enter / paste, then soft-wrap each logical
-    // line inside the content column so every visual row keeps a gutter.
-    let content_width = width.saturating_sub(3).max(1);
-    let mut wrapped = Vec::new();
-    for (line_index, part) in display_text.split('\n').enumerate() {
-        let content_rows = if part.is_empty() {
-            vec![Line::default()]
-        } else {
-            wrap_line_chars(composer_row(part), content_width)
-        };
-        for (row_index, content) in content_rows.into_iter().enumerate() {
-            let mut row = if line_index == 0 && row_index == 0 {
-                Line::styled(" > ", accent().bold())
-            } else {
-                Line::styled("   ", muted())
-            };
-            for span in content.spans {
-                row.push(span.text, span.style);
-            }
-            wrapped.push(row);
-        }
-    }
-
-    // When the draft outgrows the reserved composer region, keep the tail so
-    // the caret and newest typing stay visible.
-    if wrapped.len() > max_rows {
-        let skip = wrapped.len() - max_rows;
-        wrapped.drain(..skip);
-        if let Some(first) = wrapped.first_mut() {
-            let mut clipped = Line::styled(" … ", muted());
-            let rest = std::mem::take(first);
-            let spans = match rest.spans.split_first() {
-                Some((first_span, rest_spans))
-                    if first_span.text == " > "
-                        || first_span.text == "   "
-                        || first_span.text == " … " =>
-                {
-                    rest_spans.to_vec()
-                }
-                _ => rest.spans,
-            };
-            for span in spans {
-                clipped.push(span.text, span.style);
-            }
-            *first = truncate_line(clipped, width);
-        }
-    }
-
-    if wrapped.is_empty() {
-        let mut line = Line::styled(" > ", accent().bold());
-        line.push(caret, accent());
-        wrapped.push(truncate_line(line, width));
-    }
-    wrapped
-}
-
-pub(super) fn footer_context(app: &App, width: usize) -> Line {
-    let context = match app.focused_context_usage() {
-        Some((tokens, limit)) if limit > 0 => {
-            let tenths = u128::from(tokens) * 1_000 / u128::from(limit);
-            format!(" context: {}.{}% / {limit}", tenths / 10, tenths % 10)
-        }
-        Some(_) | None => app.focused_context_window().map_or_else(
-            || " context: --".to_owned(),
-            |limit| format!(" context: -- / {limit}"),
-        ),
-    };
-    let focused = app
-        .focused()
-        .and_then(|id| app.sessions.get(&id))
-        .map(|session| &session.summary);
-    let selected_model = focused
-        .and_then(|session| session.model.as_deref())
-        .or(app.model.model.as_deref())
-        .unwrap_or("default");
-    let mut left = Line::styled(context, muted());
-    left.push(format!("  tools: {}", app.tool_detail.label()), muted());
-    align_sides(
-        left,
-        Line::styled(format!("model: {selected_model} "), accent()),
-        width,
-    )
-}
-
-pub(super) fn footer_workspace(app: &App, width: usize) -> Line {
-    let workspace = if app.workspace_path.is_empty() {
-        "cwd: connecting".to_owned()
-    } else {
-        format!("cwd: {}", app.workspace_path)
-    };
-    // Parent rows deliberately display inclusive accounting. Child rows use
-    // the same field, whose inclusive total currently equals direct because
-    // delegation depth is capped at one. Unknown cost stays visibly unknown
-    // at this final formatting boundary. Legacy payloads without structured
-    // accounting fall back to the compatibility direct-cost alias.
-    let cost = app
-        .focused()
-        .and_then(|id| app.sessions.get(&id))
-        .and_then(|session| {
-            session
-                .summary
-                .accounting
-                .map(|accounting| accounting.inclusive.estimated_cost_usd_nanos)
-                .unwrap_or(session.summary.estimated_cost_usd_nanos)
-        })
-        .map(format_cost)
-        .unwrap_or_else(|| "--".to_owned());
-    let cost = format!("cost: {cost} ");
-    align_sides(
-        Line::styled(format!(" {workspace}"), muted()),
-        Line::styled(cost, accent()),
-        width,
-    )
 }
 
 /// Rows the slash menu wants to show. The rule stays within `MAX_SLASH_ROWS`

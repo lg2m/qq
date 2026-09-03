@@ -4,20 +4,25 @@ use super::*;
 pub(super) const SIDEBAR_WIDTH: usize = 36;
 pub(super) fn session_line(app: &App, session_id: SessionId, width: usize, prefix: &str) -> Line {
     let session = &app.sessions[&session_id].summary;
+    // The same state vocabulary tool rows use: ● done, ✕ failed, ◌ stopped
+    // early, ◇ waiting, the shared spinner while running.
+    let awaiting = !app.sessions[&session_id].live.awaiting_approval.is_empty();
     let (marker, style) = match session.status {
+        _ if awaiting => ("◇", warning()),
         SessionStatus::Idle => match session.last_outcome.as_ref() {
-            Some(qq_protocol::RunOutcome::Completed) => (".", accent()),
-            Some(qq_protocol::RunOutcome::Cancelled) => ("x", warning()),
-            Some(qq_protocol::RunOutcome::Interrupted) => ("!", warning()),
-            Some(qq_protocol::RunOutcome::BudgetExhausted { .. }) => ("$", warning()),
-            Some(qq_protocol::RunOutcome::Failed { .. }) => ("!", failure()),
-            None => ("o", muted()),
+            Some(qq_protocol::RunOutcome::Completed) => ("●", success()),
+            Some(qq_protocol::RunOutcome::Cancelled | qq_protocol::RunOutcome::Interrupted) => {
+                ("◌", warning())
+            }
+            Some(qq_protocol::RunOutcome::BudgetExhausted { .. }) => ("◌", warning()),
+            Some(qq_protocol::RunOutcome::Failed { .. }) => ("✕", failure()),
+            None => ("○", muted()),
         },
-        SessionStatus::Queued => ("+", warning()),
-        SessionStatus::Running => (["/", "-", "\\", "|"][app.animation_tick % 4], accent()),
+        SessionStatus::Queued => ("○", warning()),
+        SessionStatus::Running => (spinner(app.animation_tick), info()),
     };
     let mut line = Line::styled(prefix, muted());
-    line.push(format!("{marker}  "), style);
+    line.push(format!("{marker} "), style);
     line.push(
         &session.title,
         if app.focused() == Some(session_id) {
@@ -42,7 +47,7 @@ pub(super) fn pane_title(
     width: usize,
 ) -> Line {
     let (marker, marker_style) = if focused {
-        ("▎", accent())
+        ("▎", border_active())
     } else {
         (" ", muted())
     };

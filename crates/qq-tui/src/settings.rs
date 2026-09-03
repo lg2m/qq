@@ -180,10 +180,27 @@ fn parse_key_code(value: &str) -> Result<KeyCode, SettingsError> {
     }
 }
 
+/// One item of the top row's right-hand status, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusItem {
+    Model,
+    Context,
+    Cost,
+    Workspace,
+    Layout,
+    Tools,
+}
+
+impl StatusItem {
+    /// The default status line: model, context occupancy, cost.
+    pub const DEFAULT: [Self; 3] = [Self::Model, Self::Context, Self::Cost];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     initial_layout: Layout,
     bindings: Vec<(Action, Vec<KeyChord>)>,
+    status_line: Vec<StatusItem>,
 }
 
 impl Settings {
@@ -215,6 +232,12 @@ impl Settings {
     pub fn bindings(&self) -> &[(Action, Vec<KeyChord>)] {
         &self.bindings
     }
+
+    /// Items shown at the right of the top row, in order.
+    #[must_use]
+    pub fn status_line(&self) -> &[StatusItem] {
+        &self.status_line
+    }
 }
 
 impl Default for Settings {
@@ -229,6 +252,7 @@ impl Default for Settings {
 pub struct SettingsBuilder {
     initial_layout: Layout,
     bindings: Vec<(Action, Vec<KeyChord>)>,
+    status_line: Vec<StatusItem>,
 }
 
 impl Default for SettingsBuilder {
@@ -244,6 +268,7 @@ impl Default for SettingsBuilder {
         };
         Self {
             initial_layout: Layout::Threadline,
+            status_line: StatusItem::DEFAULT.to_vec(),
             bindings: vec![
                 binding(Action::SelectThreadline, &["F3"]),
                 binding(Action::SelectFoldFocus, &["F4"]),
@@ -263,6 +288,13 @@ impl SettingsBuilder {
     #[must_use]
     pub const fn initial_layout(mut self, layout: Layout) -> Self {
         self.initial_layout = layout;
+        self
+    }
+
+    /// Replace the top-row status items.
+    #[must_use]
+    pub fn status_line(mut self, items: Vec<StatusItem>) -> Self {
+        self.status_line = items;
         self
     }
 
@@ -317,6 +349,7 @@ impl SettingsBuilder {
         Ok(Settings {
             initial_layout: self.initial_layout,
             bindings: self.bindings,
+            status_line: self.status_line,
         })
     }
 }

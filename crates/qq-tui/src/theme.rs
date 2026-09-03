@@ -11,14 +11,16 @@ use std::cell::Cell;
 
 use crossterm::style::Color;
 
-/// One resolved theme: a name for the picker and its eight role colors.
+/// One resolved theme: a name for the picker and its role colors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub name: String,
     pub palette: Palette,
 }
 
-/// The eight role colors. `Copy` so a frame can snapshot it for free.
+/// The role colors. `Copy` so a frame can snapshot it for free. The first
+/// eight are what a theme file declares; the rest are derived from them
+/// unless the theme overrides them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     pub text: Color,
@@ -29,6 +31,20 @@ pub struct Palette {
     pub error: Color,
     pub success: Color,
     pub surface: Color,
+    /// A second surface a step further from the background, for rules and
+    /// the composer frame.
+    pub surface_alt: Color,
+    /// Background of the selected row in pickers and the sidebar.
+    pub selection_bg: Color,
+    /// Pane dividers and rules at rest.
+    pub border: Color,
+    /// The focused pane's divider and title mark.
+    pub border_active: Color,
+    /// Background tint behind added and removed diff lines.
+    pub diff_add_bg: Color,
+    pub diff_del_bg: Color,
+    /// Running-state color: spinners and "working" labels.
+    pub info: Color,
 }
 
 impl Palette {
@@ -50,7 +66,79 @@ impl Palette {
             g: 40,
             b: 48,
         },
+        surface_alt: Color::Rgb {
+            r: 48,
+            g: 51,
+            b: 61,
+        },
+        selection_bg: Color::Rgb {
+            r: 48,
+            g: 51,
+            b: 61,
+        },
+        border: Color::DarkGrey,
+        border_active: Color::Cyan,
+        diff_add_bg: Color::Rgb {
+            r: 28,
+            g: 52,
+            b: 36,
+        },
+        diff_del_bg: Color::Rgb {
+            r: 60,
+            g: 30,
+            b: 34,
+        },
+        info: Color::Cyan,
     };
+
+    /// Fill the derived roles from the eight declared ones: the selection and
+    /// alternate surface lift the surface a step, borders come from muted and
+    /// accent, diff tints from success and error at low intensity, and info
+    /// follows accent.
+    #[must_use]
+    pub fn derive(roles: [Color; 8]) -> Self {
+        let [text, muted, accent, brand, warning, error, success, surface] = roles;
+        let lift = |color: Color, amount: u8| match color {
+            Color::Rgb { r, g, b } => Color::Rgb {
+                r: r.saturating_add(amount),
+                g: g.saturating_add(amount),
+                b: b.saturating_add(amount),
+            },
+            other => other,
+        };
+        let tint = |color: Color, base: Color| match (color, base) {
+            (
+                Color::Rgb { r, g, b },
+                Color::Rgb {
+                    r: br,
+                    g: bg,
+                    b: bb,
+                },
+            ) => Color::Rgb {
+                r: ((u16::from(r) + u16::from(br) * 3) / 4) as u8,
+                g: ((u16::from(g) + u16::from(bg) * 3) / 4) as u8,
+                b: ((u16::from(b) + u16::from(bb) * 3) / 4) as u8,
+            },
+            (_, base) => base,
+        };
+        Self {
+            text,
+            muted,
+            accent,
+            brand,
+            warning,
+            error,
+            success,
+            surface,
+            surface_alt: lift(surface, 10),
+            selection_bg: lift(surface, 10),
+            border: muted,
+            border_active: accent,
+            diff_add_bg: tint(success, surface),
+            diff_del_bg: tint(error, surface),
+            info: accent,
+        }
+    }
 }
 
 impl Default for Palette {
@@ -107,16 +195,16 @@ impl Theme {
         let [text, muted, accent, brand, warning, error, success, surface] = roles;
         Self {
             name: name.into(),
-            palette: Palette {
-                text: text.into(),
-                muted: muted.into(),
-                accent: accent.into(),
-                brand: brand.into(),
-                warning: warning.into(),
-                error: error.into(),
-                success: success.into(),
-                surface: surface.into(),
-            },
+            palette: Palette::derive([
+                text.into(),
+                muted.into(),
+                accent.into(),
+                brand.into(),
+                warning.into(),
+                error.into(),
+                success.into(),
+                surface.into(),
+            ]),
         }
     }
 }

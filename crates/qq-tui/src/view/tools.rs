@@ -91,7 +91,7 @@ pub(super) fn tool_summary_line(call: &ToolCallSnapshot, tick: usize, width: usi
     let mut line = Line::styled("   ", muted());
     line.push(glyph, glyph_style);
     line.push(" ", muted());
-    line.push(call.name.as_str(), normal().dim());
+    line.push(call.name.as_str(), muted());
     if let Some(subject) = tool_subject(call) {
         line.push(format!(" {subject}"), muted());
     }
@@ -116,16 +116,16 @@ pub(super) fn tool_summary_line(call: &ToolCallSnapshot, tick: usize, width: usi
 
 pub(super) fn tool_state_glyph(call: &ToolCallSnapshot, tick: usize) -> (&'static str, Style) {
     match call.state {
-        ToolCallState::Running => (TOOL_SPINNER[tick % TOOL_SPINNER.len()], accent()),
-        ToolCallState::Requested => ("◌", muted()),
+        ToolCallState::Running => (spinner(tick), info()),
+        ToolCallState::Requested => ("○", muted()),
         ToolCallState::Completed => {
             if call.is_error {
-                ("✗", failure())
+                ("✕", failure())
             } else {
                 ("●", muted())
             }
         }
-        ToolCallState::Failed | ToolCallState::Denied => ("✗", failure()),
+        ToolCallState::Failed | ToolCallState::Denied => ("✕", failure()),
         ToolCallState::AwaitingApproval => ("◇", warning()),
         ToolCallState::Interrupted => ("◌", muted()),
     }
@@ -222,7 +222,7 @@ pub(super) fn tool_error_lines(result: &str, width: usize) -> Vec<Line> {
     }
     for line in text.lines().skip(total.saturating_sub(MAX_TOOL_ERROR_ROWS)) {
         lines.push(truncate_line(
-            Line::styled(format!("     {line}"), failure().dim()),
+            Line::styled(format!("     {line}"), failure()),
             width,
         ));
     }
@@ -276,11 +276,7 @@ pub(super) fn tool_expanded_lines(call: &ToolCallSnapshot, width: usize) -> Vec<
             .lines()
             .skip(total.saturating_sub(MAX_TOOL_RESULT_ROWS))
         {
-            let style = if diff {
-                diff_line_style(line)
-            } else {
-                normal().dim()
-            };
+            let style = if diff { diff_line_style(line) } else { muted() };
             lines.push(truncate_line(
                 Line::styled(format!("     {line}"), style),
                 width,

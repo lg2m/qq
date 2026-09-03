@@ -22,5 +22,7 @@ mod view;
 
 pub use app::{ModelOption, TuiError, TuiOptions, run};
 pub use qq_client::{ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState};
-pub use settings::{Action, KeyChord, Layout, Settings, SettingsBuilder, SettingsError};
+pub use settings::{
+    Action, KeyChord, Layout, Settings, SettingsBuilder, SettingsError, StatusItem,
+};
 pub use theme::{Palette, Theme, ThemeColor, ThemeRoles};

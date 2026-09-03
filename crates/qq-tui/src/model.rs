@@ -201,6 +201,23 @@ impl Reasoning {
     }
 }
 
+/// What is known about one run's timing and outcome, for the completion
+/// line under its last message. Timestamps are the server's `occurred_at_ms`
+/// of the run events; historical runs loaded from a snapshot carry only the
+/// outcome and usage until the protocol records run timing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RunStats {
+    pub started_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+    pub outcome: Option<qq_protocol::RunOutcome>,
+    pub usage: Option<qq_protocol::TokenUsage>,
+    /// Tool calls the run made, counted as their finished events arrive or
+    /// from the loaded body.
+    pub tool_calls: u32,
+    /// Estimated cost of the run, when the accounting delta was observable.
+    pub cost_usd_nanos: Option<u64>,
+}
+
 /// Whether reasoning blocks render as a collapsed one-liner or in full.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ReasoningDetail {
@@ -240,6 +257,9 @@ pub(crate) struct SessionView {
     /// Provider-exposed reasoning per run, bounded, kept only for runs whose
     /// messages are loaded. Display-only: never fed back to the model.
     pub reasoning: HashMap<RunId, Reasoning>,
+    /// Timing and outcome per run, for completion lines. Bounded with
+    /// `reasoning`: runs whose messages were trimmed are dropped together.
+    pub runs: HashMap<RunId, RunStats>,
     /// Focus clock at the last time this session was focused; orders warm
     /// body eviction. Zero for never-focused sessions.
     pub(crate) last_focused: u64,
@@ -272,6 +292,7 @@ impl SessionView {
             activity,
             live: LiveStatus::default(),
             reasoning: HashMap::new(),
+            runs: HashMap::new(),
             last_focused: 0,
             loaded_through,
             prompt_history: VecDeque::new(),

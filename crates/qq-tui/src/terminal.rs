@@ -5,7 +5,7 @@ use std::{
 };
 
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{MoveTo, Show},
     event::{
         DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
         EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
@@ -105,7 +105,7 @@ fn external_editor(draft: String) -> EditorFuture {
         .unwrap_or(Err(EditorError::NotConfigured));
         let _ = terminal::enable_raw_mode();
         let _ = enable_input_modes(&mut output);
-        let _ = execute!(output, Hide, Clear(ClearType::All), MoveTo(0, 0));
+        let _ = execute!(output, Clear(ClearType::All), MoveTo(0, 0));
         result
     })
 }
@@ -301,7 +301,7 @@ impl TerminalGuard {
         let guard = Self;
         let mut output = stdout();
         enable_input_modes(&mut output)?;
-        execute!(output, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+        execute!(output, Clear(ClearType::All), MoveTo(0, 0))?;
         Ok(guard)
     }
 }

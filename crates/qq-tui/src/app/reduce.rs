@@ -49,6 +49,18 @@ impl App {
             | SessionEvent::CancellationRequested { session, .. } => {
                 self.upsert_summary(session.clone());
                 if let SessionEvent::RunStarted { run_id, .. } = &envelope.event
+                    && let Some(view) = self.sessions.get_mut(&envelope.session_id)
+                {
+                    let cost_before = view
+                        .summary
+                        .accounting
+                        .map(|accounting| accounting.direct.estimated_cost_usd_nanos)
+                        .unwrap_or(view.summary.estimated_cost_usd_nanos);
+                    let stats = view.runs.entry(*run_id).or_default();
+                    stats.started_at_ms = Some(envelope.occurred_at_ms);
+                    stats.cost_usd_nanos = cost_before;
+                }
+                if let SessionEvent::RunStarted { run_id, .. } = &envelope.event
                     && let Some(messages) = self
                         .sessions
                         .get_mut(&envelope.session_id)
@@ -164,6 +176,11 @@ impl App {
             | SessionEvent::ToolApprovalResolved { tool_call, .. }
             | SessionEvent::ToolCallStarted { tool_call }
             | SessionEvent::ToolCallFinished { tool_call } => {
+                if matches!(envelope.event, SessionEvent::ToolCallFinished { .. })
+                    && let Some(view) = self.sessions.get_mut(&envelope.session_id)
+                {
+                    view.runs.entry(tool_call.run_id).or_default().tool_calls += 1;
+                }
                 if matches!(envelope.event, SessionEvent::ToolCallRequested { .. }) {
                     // Calls are persisted with their completed turn, so the
                     // turn's message (same ordinal) is finalized by then.
@@ -272,9 +289,29 @@ impl App {
                 session,
                 run_id,
                 outcome,
+                usage,
                 ..
             } => {
+                let cost_before = self
+                    .sessions
+                    .get(&envelope.session_id)
+                    .and_then(|view| view.runs.get(run_id))
+                    .and_then(|stats| stats.cost_usd_nanos);
                 self.upsert_summary(session.clone());
+                if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
+                    let cost_after = session
+                        .accounting
+                        .map(|accounting| accounting.direct.estimated_cost_usd_nanos)
+                        .unwrap_or(session.estimated_cost_usd_nanos);
+                    let stats = view.runs.entry(*run_id).or_default();
+                    stats.finished_at_ms = Some(envelope.occurred_at_ms);
+                    stats.outcome = Some(outcome.clone());
+                    stats.usage = *usage;
+                    stats.cost_usd_nanos = match (cost_before, cost_after) {
+                        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+                        _ => None,
+                    };
+                }
                 effects.extend(self.attention(Attention::RunFinished {
                     session_title: session.title.clone(),
                 }));
@@ -293,6 +330,7 @@ impl App {
                         let retained: std::collections::HashSet<_> =
                             messages.iter().map(|message| message.run_id).collect();
                         view.reasoning.retain(|run, _| retained.contains(run));
+                        view.runs.retain(|run, _| retained.contains(run));
                     }
                 }
                 if session.active_run_id.is_none() && session.queued_prompts == 0 {

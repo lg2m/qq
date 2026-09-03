@@ -503,9 +503,27 @@ impl TranscriptCache {
         );
         let offset = viewport.offset();
         let live_message_ranges = body.live_message_ranges.clone();
-        let rows = body.viewport(app, body_height, offset);
+        let mut rows = body.viewport(app, body_height, offset);
         drop(body);
         self.live_message_ranges = live_message_ranges.into_iter().collect();
+        // Scrolled up while the session runs: a pill on the last row says
+        // how much has arrived below, so the user knows to jump back.
+        let running = session_id
+            .and_then(|id| app.sessions.get(&id))
+            .is_some_and(|session| session.summary.active_run_id.is_some());
+        if offset > 0
+            && running
+            && let Some(last) = rows.last_mut()
+        {
+            let pill = format!(" ↓ {} more ", count_noun(offset, "row", "rows"));
+            let pill_width = pill.chars().count();
+            let mut row = std::mem::take(last);
+            pad_line(&mut row, width);
+            let mut clipped = truncate_line(row, width.saturating_sub(pill_width + 1));
+            pad_line(&mut clipped, width.saturating_sub(pill_width));
+            clipped.push(pill, accent().bold());
+            *last = clipped;
+        }
         lines.extend(rows);
         (
             fit_height(lines, tile.rect.height),
@@ -812,13 +830,6 @@ impl TranscriptCache {
     ) -> VirtualBody<'a> {
         let transcript = self.transcript(highlighter, app, session_id, viewport, width);
         let mut body = VirtualBody::default();
-        body.extend_owned(vec![
-            section(
-                "THREADLINE",
-                "conversation with child work in one chronology",
-            ),
-            Line::default(),
-        ]);
         body.extend_virtual(transcript);
         if let Some(focused) = session_id {
             // Children already shown under their spawn call are not repeated.
@@ -837,9 +848,9 @@ impl TranscriptCache {
                 .collect();
             if !children.is_empty() {
                 body.push_line(Line::default());
-                body.push_line(Line::styled("  +-- related sessions", muted().bold()));
+                body.push_line(Line::styled("  related sessions", muted().bold()));
                 for child in children {
-                    body.push_line(session_line(app, child, width, "     "));
+                    body.push_line(session_line(app, child, width, "  ↳ "));
                 }
             }
         }
@@ -860,13 +871,6 @@ impl TranscriptCache {
             preserve_tail_anchor: std::mem::take(&mut self.preserve_tail_anchor),
             ..VirtualBody::default()
         };
-        body.extend_owned(vec![
-            section(
-                "FOLD / FOCUS",
-                "history and parallel work compressed around now",
-            ),
-            Line::default(),
-        ]);
         let Some(session_id) = session_id else {
             body.push_line(Line::styled(
                 format!(
@@ -1102,6 +1106,12 @@ impl TranscriptCache {
                         width,
                         &|call_id, width| child_rows(app, call_id, width),
                     ));
+                }
+                // The run's last assistant message carries its completion line.
+                if next_turn == u16::MAX
+                    && let Some(line) = run_completion_line(session, message.run_id, width)
+                {
+                    body.push_line(line);
                 }
             } else {
                 self.append_message(body, message, width);
@@ -1343,7 +1353,7 @@ pub(super) fn reasoning_rows(
                         .filter_map(terminal_safe_character)
                         .collect::<String>();
                     for wrapped in wrap_line(Line::styled(safe, muted().italic()), content_width) {
-                        let mut row = Line::styled(" ┆ ", muted().dim());
+                        let mut row = Line::styled(" ┆ ", muted());
                         for span in wrapped.spans {
                             row.push(span.text, span.style);
                         }
@@ -1355,6 +1365,93 @@ pub(super) fn reasoning_rows(
         }
     }
 }
+/// `✓ 42s · 8 tools · 12.3k tok · $0.04` under the last message of a finished
+/// run. Each field appears only when known; a run still executing, or one
+/// with nothing measurable, produces no row.
+pub(super) fn run_completion_line(
+    session: &SessionView,
+    run_id: RunId,
+    width: usize,
+) -> Option<Line> {
+    let stats = session.runs.get(&run_id)?;
+    let outcome = stats.outcome.as_ref()?;
+    let (glyph, style) = match outcome {
+        qq_protocol::RunOutcome::Completed => ("✓", success()),
+        qq_protocol::RunOutcome::Cancelled | qq_protocol::RunOutcome::Interrupted => {
+            ("◌", warning())
+        }
+        qq_protocol::RunOutcome::BudgetExhausted { .. } => ("◌", warning()),
+        qq_protocol::RunOutcome::Failed { .. } => ("✕", failure()),
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if let (Some(started), Some(finished)) = (stats.started_at_ms, stats.finished_at_ms) {
+        parts.push(format_duration_ms(finished.saturating_sub(started)));
+    }
+    if stats.tool_calls > 0 {
+        parts.push(count_noun(stats.tool_calls as usize, "tool", "tools"));
+    }
+    if let Some(usage) = stats.usage {
+        let tokens = usage.input_tokens
+            + usage.cache_read_input_tokens
+            + usage.cache_write_input_tokens
+            + usage.output_tokens;
+        if tokens > 0 {
+            parts.push(format!("{} tok", format_count(tokens)));
+        }
+    }
+    if let Some(cost) = stats.cost_usd_nanos
+        && cost > 0
+    {
+        parts.push(format_cost(cost));
+    }
+    if parts.is_empty() && matches!(outcome, qq_protocol::RunOutcome::Completed) {
+        return None;
+    }
+    let mut line = Line::styled(format!("   {glyph} "), style);
+    if parts.is_empty() {
+        line.push(
+            match outcome {
+                qq_protocol::RunOutcome::Cancelled => "cancelled",
+                qq_protocol::RunOutcome::Interrupted => "interrupted",
+                qq_protocol::RunOutcome::BudgetExhausted { .. } => "budget exhausted",
+                qq_protocol::RunOutcome::Failed { .. } => "failed",
+                qq_protocol::RunOutcome::Completed => "",
+            },
+            muted(),
+        );
+    } else {
+        line.push(parts.join(" · "), muted());
+    }
+    Some(truncate_line(line, width))
+}
+
+/// `0.4s`, `42s`, `4m12s`, `1h03m`.
+pub(super) fn format_duration_ms(ms: u64) -> String {
+    if ms < 10_000 {
+        return format!("{}.{}s", ms / 1000, (ms % 1000) / 100);
+    }
+    let seconds = ms / 1000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m{:02}s", seconds % 60);
+    }
+    format!("{}h{:02}m", minutes / 60, minutes % 60)
+}
+
+/// `999`, `12.3k`, `1.2M`.
+pub(super) fn format_count(count: u64) -> String {
+    if count < 1_000 {
+        count.to_string()
+    } else if count < 1_000_000 {
+        format!("{}.{}k", count / 1_000, (count % 1_000) / 100)
+    } else {
+        format!("{}.{}M", count / 1_000_000, (count % 1_000_000) / 100_000)
+    }
+}
+
 /// The `▌ YOU  streaming` style row that opens a message. Steering rows keep
 /// the user prefix but say what they are: injected mid-run, not a new prompt,
 /// with a lifecycle (waiting for a boundary, applied, superseded) in words the

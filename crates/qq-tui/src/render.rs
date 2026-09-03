@@ -110,8 +110,10 @@ pub(crate) fn normal() -> Style {
     Style::color(theme::active().text)
 }
 
+/// Secondary text. Color alone carries the step back: `Dim` on top would
+/// sink it below readability on many terminals.
 pub(crate) fn muted() -> Style {
-    Style::color(theme::active().muted).dim()
+    Style::color(theme::active().muted)
 }
 
 pub(crate) fn accent() -> Style {
@@ -134,6 +136,26 @@ pub(crate) fn success() -> Style {
     Style::color(theme::active().success)
 }
 
+/// Running-state color for spinners and activity labels.
+pub(crate) fn info() -> Style {
+    Style::color(theme::active().info)
+}
+
+/// Pane dividers and rules at rest.
+pub(crate) fn border() -> Style {
+    Style::color(theme::active().border)
+}
+
+/// The focused pane's divider and title mark.
+pub(crate) fn border_active() -> Style {
+    Style::color(theme::active().border_active)
+}
+
+/// Background for the selected row in pickers and lists.
+pub(crate) fn selection(style: Style) -> Style {
+    style.on(theme::active().selection_bg)
+}
+
 /// Dark surface tint behind code-block panels, distinct from the terminal
 /// background so a padded block reads as one solid slab.
 pub(crate) fn surface_color() -> Color {
@@ -144,46 +166,50 @@ pub(crate) fn surface(style: Style) -> Style {
     style.on(surface_color())
 }
 
-/// Syntax palette for highlighted code panels: restrained named colors that
-/// stay readable on the dark surface tint. Anything a grammar leaves
+/// Syntax palette for highlighted code panels, derived from theme roles so
+/// every theme colors code in its own voice: keywords in brand, strings in
+/// success, comments in muted, functions in accent, types in warning,
+/// constants in error, properties in text. Anything a grammar leaves
 /// uncaptured keeps the plain panel text style.
 pub(crate) fn code_keyword() -> Style {
-    Style::color(Color::Magenta)
+    Style::color(theme::active().brand)
 }
 
 pub(crate) fn code_string() -> Style {
-    Style::color(Color::Green)
+    Style::color(theme::active().success)
 }
 
 pub(crate) fn code_comment() -> Style {
-    Style::color(Color::DarkGrey).italic()
+    Style::color(theme::active().muted).italic()
 }
 
 pub(crate) fn code_function() -> Style {
-    Style::color(Color::Cyan)
+    Style::color(theme::active().accent)
 }
 
 pub(crate) fn code_type() -> Style {
-    Style::color(Color::Yellow)
+    Style::color(theme::active().warning)
 }
 
 pub(crate) fn code_constant() -> Style {
-    Style::color(Color::DarkYellow)
+    Style::color(theme::active().error)
 }
 
 pub(crate) fn code_property() -> Style {
-    Style::color(Color::Blue)
+    Style::color(theme::active().text)
 }
 
-/// Unified-diff line coloring: additions green, removals red, hunk headers in
-/// the muted accent, context lines normal. Diff lines never reflow.
+/// Unified-diff line coloring: additions in success on the add tint,
+/// removals in error on the delete tint, hunk headers muted, context lines
+/// normal. Diff lines never reflow.
 pub(crate) fn diff_line_style(line: &str) -> Style {
+    let palette = theme::active();
     if line.starts_with("@@") {
-        accent().dim()
+        muted()
     } else if line.starts_with('+') {
-        success()
+        success().on(palette.diff_add_bg)
     } else if line.starts_with('-') {
-        failure()
+        failure().on(palette.diff_del_bg)
     } else {
         normal()
     }

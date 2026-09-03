@@ -1102,7 +1102,10 @@ fn compaction_run_usage_does_not_become_session_context() {
         )
     });
     assert_eq!(app.focused_context_usage(), None);
-    assert_eq!(app.focused_context_window(), Some(272_000));
+    assert_eq!(
+        app.sessions[&app.focused().unwrap()].context_window,
+        Some(272_000)
+    );
 }
 
 #[test]

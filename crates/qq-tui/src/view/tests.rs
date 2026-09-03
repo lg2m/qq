@@ -504,9 +504,9 @@ fn completed_edit_results_color_diff_shaped_content_at_expanded_detail() {
             .find(|span| span.text.contains(needle))
             .map(|span| span.style)
     };
-    assert_eq!(style_of(&lines, "@@ -1 +1 @@"), Some(accent().dim()));
-    assert_eq!(style_of(&lines, "-old"), Some(failure()));
-    assert_eq!(style_of(&lines, "+new"), Some(success()));
+    assert_eq!(style_of(&lines, "@@ -1 +1 @@"), Some(muted()));
+    assert_eq!(style_of(&lines, "-old"), Some(diff_line_style("-")));
+    assert_eq!(style_of(&lines, "+new"), Some(diff_line_style("+")));
     assert_eq!(style_of(&lines, " context"), Some(normal()));
 
     // Today's summary results are not diff-shaped and keep the raw style.
@@ -526,7 +526,7 @@ fn completed_edit_results_color_diff_shaped_content_at_expanded_detail() {
         80,
         &|_, _| Vec::new(),
     );
-    assert_eq!(style_of(&lines, "Edited src/lib.rs"), Some(normal().dim()));
+    assert_eq!(style_of(&lines, "Edited src/lib.rs"), Some(muted()));
 }
 
 #[test]
@@ -559,8 +559,8 @@ fn display_payload_diffs_replace_the_result_summary_at_expanded_detail() {
             .find(|span| span.text.contains(needle))
             .map(|span| span.style)
     };
-    assert_eq!(style_of("- old line"), Some(failure()));
-    assert_eq!(style_of("+ new line"), Some(success()));
+    assert_eq!(style_of("- old line"), Some(diff_line_style("-")));
+    assert_eq!(style_of("+ new line"), Some(diff_line_style("+")));
     // The payload renders instead of the raw summary sentence.
     assert!(style_of("replaced 1 occurrence").is_none());
 
@@ -703,9 +703,9 @@ fn approval_prompts_render_edit_previews_as_colored_diffs() {
             .find(|span| span.text.contains(needle))
             .map(|span| span.style)
     };
-    assert_eq!(style_of("@@ -1 +1 @@"), Some(accent().dim()));
-    assert_eq!(style_of("-old"), Some(failure()));
-    assert_eq!(style_of("+new"), Some(success()));
+    assert_eq!(style_of("@@ -1 +1 @@"), Some(muted()));
+    assert_eq!(style_of("-old"), Some(diff_line_style("-")));
+    assert_eq!(style_of("+new"), Some(diff_line_style("+")));
     // The modal offers all four decisions, including workspace lifetime.
     assert!(rows.iter().any(|row| {
         row.contains("[y] approve once")
@@ -857,7 +857,7 @@ fn error_results_expand_under_the_summary_by_default() {
         &|_, _| Vec::new(),
     ));
 
-    assert_eq!(rows[0], "   ✗ read_file gone.txt");
+    assert_eq!(rows[0], "   ✕ read_file gone.txt");
     assert_eq!(rows[1], "     path is not a file");
 }
 
@@ -982,7 +982,6 @@ fn detail_cycling_reveals_arguments_and_result_tails() {
 
     let collapsed = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
     assert!(!collapsed.iter().any(|row| row.contains("beta")));
-    assert!(collapsed.iter().any(|row| row.contains("tools: collapsed")));
 
     app.handle_terminal_event(ctrl_o.clone());
     let expanded = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
@@ -992,7 +991,6 @@ fn detail_cycling_reveals_arguments_and_result_tails() {
             .any(|row| row.contains("\"path\": \"note.txt\""))
     );
     assert!(expanded.iter().any(|row| row.contains("beta")));
-    assert!(expanded.iter().any(|row| row.contains("tools: expanded")));
 
     app.handle_terminal_event(ctrl_o);
     let collapsed = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
@@ -1375,19 +1373,26 @@ fn refreshed_chrome_shows_identity_status_and_session_metrics() {
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 12);
     let rows = frame_rows(&frame);
 
-    assert!(rows[0].contains(&format!("qq  {VERSION} {GIT_COMMIT}")));
-    assert!(rows[0].ends_with("local"));
-    assert!(!rows[0].contains("Threadline"));
-    assert!(rows[9].contains("> Ask QQ..."));
-    assert!(rows[10].contains("context: 50.0% / 128000"));
-    assert!(rows[10].ends_with("model: openai/gpt-test "));
-    assert!(rows[11].contains("cwd: /workspace"));
-    assert!(rows[11].ends_with("cost: $0.00 "));
+    // One top row: brand, breadcrumb, then model and context on the right.
+    // No version, no "local", no layout name.
+    assert!(rows[0].starts_with(" qq  Session"), "{:?}", rows[0]);
+    assert!(!rows[0].contains(VERSION));
+    assert!(!rows[0].contains("local"));
+    assert!(rows[0].contains("openai/gpt-test"));
+    assert!(rows[0].contains("50% ctx"), "{:?}", rows[0]);
     assert_eq!(frame[0].spans[0].style, brand().bold());
+    // Rule, composer, hint row: the bottom three rows.
+    assert!(rows[9].starts_with('─'), "{:?}", rows[9]);
+    assert!(rows[9].ends_with(" idle "), "{:?}", rows[9]);
+    assert!(rows[10].starts_with(" › Ask QQ..."), "{:?}", rows[10]);
+    assert!(rows[11].contains("help"), "{:?}", rows[11]);
+    assert!(rows[11].contains("^K commands"), "{:?}", rows[11]);
+    // Rows 1..=8 are transcript: eight body rows out of twelve.
+    assert!(rows[1..9].iter().any(|row| row.contains("row 0")));
 }
 
 #[test]
-fn footer_renders_unknown_context_and_cost_without_inventing_zero_usage() {
+fn top_row_renders_unknown_context_and_cost_without_inventing_zero_usage() {
     let mut app = app_with_messages(0);
     let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
     session.summary.estimated_cost_usd_nanos = Some(100_000_000);
@@ -1404,26 +1409,35 @@ fn footer_renders_unknown_context_and_cost_without_inventing_zero_usage() {
     session.summary.context_tokens = None;
     session.context_window = Some(272_000);
 
-    let rows = frame_rows(&[footer_context(&app, 80), footer_workspace(&app, 80)]);
+    let rows = frame_rows(&[top_row(&app, 80)]);
 
-    assert!(rows[0].contains("context: -- / 272000"));
-    assert!(rows[1].ends_with("cost: -- "));
+    assert!(
+        !rows[0].contains("ctx"),
+        "unknown occupancy shows nothing: {:?}",
+        rows[0]
+    );
+    assert!(
+        !rows[0].contains('$'),
+        "unknown cost shows nothing: {:?}",
+        rows[0]
+    );
 }
 
 #[test]
-fn footer_uses_legacy_direct_cost_when_structured_accounting_is_absent() {
+fn top_row_uses_legacy_direct_cost_when_structured_accounting_is_absent() {
     let mut app = app_with_messages(0);
     let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
     session.summary.accounting = None;
     session.summary.estimated_cost_usd_nanos = Some(100_000_000);
 
-    let rows = frame_rows(&[footer_workspace(&app, 80)]);
+    app.connection = crate::ConnectionState::Live;
+    let rows = frame_rows(&[top_row(&app, 80)]);
 
-    assert!(rows[0].ends_with("cost: $0.10 "));
+    assert!(rows[0].ends_with("$0.10 "), "{:?}", rows[0]);
 }
 
 #[test]
-fn footer_displays_inclusive_accounting_cost() {
+fn top_row_displays_inclusive_accounting_cost() {
     let mut app = app_with_messages(0);
     let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
     session.summary.estimated_cost_usd_nanos = Some(100_000_000);
@@ -1438,21 +1452,26 @@ fn footer_displays_inclusive_accounting_cost() {
         },
     });
 
-    let rows = frame_rows(&[footer_workspace(&app, 80)]);
+    app.connection = crate::ConnectionState::Live;
+    let rows = frame_rows(&[top_row(&app, 80)]);
 
-    assert!(rows[0].ends_with("cost: $0.25 "));
+    assert!(rows[0].ends_with("$0.25 "), "{:?}", rows[0]);
 }
 
 #[test]
-fn header_only_qualifies_local_when_the_connection_has_a_problem() {
+fn top_row_names_the_connection_only_when_it_has_a_problem() {
     let mut app = app_with_messages(0);
+    app.connection = crate::ConnectionState::Live;
+    let live = frame_rows(&[top_row(&app, 80)])[0].clone();
+    assert!(!live.contains("connecting") && !live.contains("offline"));
     for (connection, expected) in [
-        (crate::ConnectionState::Connecting, "local  connecting"),
-        (crate::ConnectionState::Replaying, "local  reconnecting"),
-        (crate::ConnectionState::Offline, "local  offline"),
+        (crate::ConnectionState::Connecting, "connecting "),
+        (crate::ConnectionState::Replaying, "reconnecting "),
+        (crate::ConnectionState::Offline, "offline "),
     ] {
         app.connection = connection;
-        assert!(frame_rows(&[header(&app, 80)])[0].ends_with(expected));
+        let row = frame_rows(&[top_row(&app, 80)])[0].clone();
+        assert!(row.ends_with(expected), "{row:?}");
     }
 }
 
@@ -1465,21 +1484,91 @@ fn threadline_has_no_vertical_message_rails() {
 }
 
 #[test]
-fn composer_renders_hard_newlines_across_multiple_rows() {
+fn composer_renders_hard_newlines_across_multiple_rows_and_reports_the_caret() {
     let mut app = App::new(TuiOptions::default());
     app.composer.text = "hello\nworld".to_owned();
-    app.animation_tick = 0;
-    let rows = frame_rows(&composer(&app, 40, 8));
-    assert_eq!(rows, vec![" > hello".to_owned(), "   world|".to_owned()]);
+    let (lines, caret) = composer(&app, 40, 8);
+    let rows = frame_rows(&lines);
+    // No fake caret in the text; the real cursor sits after "world".
+    assert_eq!(rows, vec![" › hello".to_owned(), "   world".to_owned()]);
+    assert_eq!(caret, Some((3 + 5, 1)));
 }
 
 #[test]
-fn composer_keeps_the_tail_when_max_rows_clip() {
+fn the_terminal_cursor_follows_the_composer_caret_and_hides_under_overlays() {
+    let mut app = app_with_messages(1);
+    app.composer.text = "ab".to_owned();
+    let mut renderer = FrameRenderer::default();
+    let bytes = renderer.draw(&mut app, (80, 12)).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    // Composer is row 10 (0-based) in a 12-row frame; caret after "ab" is
+    // column 3 + 2 = 5, so the terminal cursor moves to row 11, column 6 in
+    // 1-based ANSI coordinates and is shown.
+    assert!(text.contains("\x1b[11;6H\x1b[?25h"), "{text:?}");
+    // Moving the cursor left moves the terminal cursor with it.
+    app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::NONE,
+    )));
+    let bytes = renderer.draw(&mut app, (80, 12)).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("\x1b[11;5H\x1b[?25h"), "{text:?}");
+    // An overlay owns input without a caret: the cursor hides.
+    app.execute(Command::OpenCommands);
+    let bytes = renderer.draw(&mut app, (80, 12)).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.ends_with("\x1b[?25l\x1b[?2026l"), "{text:?}");
+}
+
+#[test]
+fn the_composer_glyph_says_what_enter_will_do() {
+    let (mut app, _, _, _) = running_view_app();
+    let (lines, _) = composer(&app, 40, 2);
+    assert!(
+        frame_rows(&lines)[0].starts_with(" ⇥ "),
+        "queue while running without steering"
+    );
+    app.apply_client_update(ClientUpdate::Steering(qq_protocol::SteeringCapabilities {
+        boundary: true,
+        interrupt: true,
+        max_pending_per_run: 4,
+    }));
+    let (lines, _) = composer(&app, 40, 2);
+    assert!(
+        frame_rows(&lines)[0].starts_with(" ↦ "),
+        "steer when advertised"
+    );
+    let idle = app_with_messages(0);
+    let (lines, _) = composer(&idle, 40, 2);
+    assert!(frame_rows(&lines)[0].starts_with(" › "), "send when idle");
+}
+
+#[test]
+fn an_80_by_24_frame_gives_the_transcript_at_least_twenty_rows() {
+    let mut app = app_with_messages(30);
+    app.sidebar = crate::app::Sidebar::Hidden;
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 24);
+    let rows = frame_rows(&frame);
+    // Body rows are everything between the top row and the composer rule.
+    let rule = rows
+        .iter()
+        .position(|row| row.starts_with('─'))
+        .expect("composer rule");
+    let transcript_rows = rule - 1;
+    assert!(
+        transcript_rows >= 20,
+        "{transcript_rows} transcript rows: {rows:#?}"
+    );
+}
+
+#[test]
+fn composer_keeps_the_rows_around_the_caret_when_max_rows_clip() {
     let mut app = App::new(TuiOptions::default());
     app.composer.text = "one\ntwo\nthree\nfour".to_owned();
-    app.animation_tick = 1; // steady caret space, simpler assertions
-    let rows = frame_rows(&composer(&app, 40, 2));
-    assert_eq!(rows, vec![" … three".to_owned(), "   four ".to_owned()]);
+    let (lines, caret) = composer(&app, 40, 2);
+    let rows = frame_rows(&lines);
+    assert_eq!(rows, vec![" … three".to_owned(), "   four".to_owned()]);
+    assert_eq!(caret, Some((3 + 4, 1)));
 }
 
 #[test]
@@ -1918,7 +2007,7 @@ fn background_approvals_surface_a_banner_that_ctrl_g_jumps_to() {
     // Focused on the parent: no modal, but the banner names the child.
     assert_eq!(app.mode(), Mode::Compose);
     let text = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24)).join("\n");
-    assert!(text.contains("approval needed in Deploy helper"), "{text}");
+    assert!(text.contains("Deploy helper needs approval"), "{text}");
     assert!(text.contains("Ctrl-G"));
 
     let (changed, requests) = app
@@ -2081,14 +2170,15 @@ fn two_panes_render_side_by_side_with_titles_and_a_divider() {
     app.focus_session(other);
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 101, 24);
     let rows = frame_rows(&frame);
-    // Row 2 is the pane title row: the left pane is unfocused, the right
+    // Row 1 is the pane title row: the left pane is unfocused, the right
     // pane carries the focus marker and its title.
-    let titles = &rows[2];
+    let titles = &rows[1];
     assert!(titles.contains(" Session"), "{titles}");
     assert!(titles.contains("▎Other"), "{titles}");
     // Every body row has a divider at the split column and both
-    // transcripts appear on their own side of it.
-    let body = &rows[2..2 + 24 - 6];
+    // transcripts appear on their own side of it. Body is rows 1..=20:
+    // one top row, then body, then rule, composer, hint row.
+    let body = &rows[1..1 + 24 - 4];
     assert!(
         body.iter().all(|row| row.chars().nth(50) == Some('│')),
         "{body:?}"
@@ -2231,4 +2321,109 @@ fn switching_theme_repaints_every_row_in_the_new_palette() {
     // Style helpers on this thread keep the last activated palette;
     // restore the default so later tests see the compiled look.
     theme::activate(Palette::QQ);
+}
+
+/// An app whose focused session has an active run, plus the ids to drive it.
+fn running_view_app() -> (App, SessionId, RunId, u64) {
+    let mut app = app_with_messages(1);
+    let session_id = app.focused().unwrap();
+    let run_id = RunId::from_bytes([0x90; 16]);
+    let mut summary = app.sessions[&session_id].summary.clone();
+    summary.status = SessionStatus::Running;
+    summary.active_run_id = Some(run_id);
+    app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+        run_id: Some(run_id),
+        ..fixtures::envelope(
+            2,
+            session_id,
+            SessionEvent::RunStarted {
+                session: summary,
+                run_id,
+                plan: None,
+            },
+        )
+    }));
+    (app, session_id, run_id, 2)
+}
+
+#[test]
+fn a_finished_run_ends_with_a_completion_line_and_a_running_one_does_not() {
+    let (mut app, session_id, run_id, _) = running_view_app();
+    let message_id = MessageId::from_bytes([0x71; 16]);
+    let mut sequence = 2;
+    let mut event = |event: SessionEvent| {
+        sequence += 1;
+        ClientUpdate::Event(SessionEventEnvelope {
+            run_id: Some(run_id),
+            occurred_at_ms: 10_000 + sequence * 1_000,
+            ..fixtures::envelope(sequence, session_id, event)
+        })
+    };
+    app.apply_client_update(event(SessionEvent::AssistantMessageStarted {
+        message: MessageSnapshot {
+            run_id,
+            state: MessageState::Streaming,
+            ..fixtures::message(message_id, session_id, "working on it")
+        },
+    }));
+    app.apply_client_update(event(SessionEvent::ToolCallFinished {
+        tool_call: ToolCallSnapshot {
+            run_id,
+            result: Some("ok".to_owned()),
+            ..fixtures::tool_call(ToolCallId::from_bytes([0x72; 16]), session_id, "shell")
+        },
+    }));
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 20);
+    assert!(
+        !frame_text(&frame).contains(" ✓ "),
+        "no completion line while running"
+    );
+
+    let mut summary = app.sessions[&session_id].summary.clone();
+    summary.status = SessionStatus::Idle;
+    summary.active_run_id = None;
+    // The run started at the fixture's occurred_at_ms (1) and finishes here;
+    // duration comes from the envelopes, tokens from usage.
+    app.apply_client_update(event(SessionEvent::RunFinished {
+        session: summary,
+        run_id,
+        outcome: qq_protocol::RunOutcome::Completed,
+        usage: Some(qq_protocol::TokenUsage {
+            input_tokens: 12_000,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 300,
+        }),
+        context_tokens: None,
+    }));
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 20);
+    let text = frame_text(&frame);
+    let rows = frame_rows(&frame);
+    let line = rows
+        .iter()
+        .find(|row| row.contains(" ✓ "))
+        .unwrap_or_else(|| panic!("completion line in {text}"));
+    assert!(line.contains("1 tool"), "{line}");
+    assert!(line.contains("12.3k tok"), "{line}");
+    assert!(line.contains('s'), "duration: {line}");
+}
+
+#[test]
+fn no_role_style_relies_on_dim_and_muted_is_a_color_step_only() {
+    // Dim is unreliable across terminals; every role reads by color and
+    // weight alone so a theme can map roles to any palette.
+    for style in [
+        normal(),
+        muted(),
+        accent(),
+        brand(),
+        warning(),
+        failure(),
+        success(),
+        info(),
+        border(),
+    ] {
+        assert!(!style.dim, "{style:?}");
+    }
+    assert_ne!(muted().color, normal().color);
 }
