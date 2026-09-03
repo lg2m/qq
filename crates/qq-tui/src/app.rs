@@ -971,6 +971,25 @@ impl App {
         {
             return self.execute(Command::ToggleSidebar);
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('g' | 'G'))
+        {
+            return self.execute(Command::FocusNextApproval);
+        }
+        // Alt-arrows walk the session tree: up to the parent, down to the
+        // first child, left and right across siblings in spawn order.
+        if key.modifiers == KeyModifiers::ALT {
+            let command = match key.code {
+                KeyCode::Up => Some(Command::FocusParent),
+                KeyCode::Down => Some(Command::FocusFirstChild),
+                KeyCode::Left => Some(Command::FocusPreviousSibling),
+                KeyCode::Right => Some(Command::FocusNextSibling),
+                _ => None,
+            };
+            if let Some(command) = command {
+                return self.execute(command);
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 // A sticky error notice dismisses first: acknowledging the
@@ -1107,6 +1126,7 @@ impl App {
         match command {
             Command::OpenModels => self.open_models(),
             Command::OpenSessions => self.open_sessions(),
+            Command::OpenAgents => self.open_agents(),
             Command::ToggleSessions => {
                 if matches!(self.overlay, Some(Overlay::Sessions { .. })) {
                     self.overlay = None;
@@ -1143,6 +1163,35 @@ impl App {
                 self.sidebar = self.sidebar.next();
                 (true, Vec::new())
             }
+            Command::FocusParent => match self
+                .focused
+                .and_then(|focused| self.sessions.get(&focused)?.summary.parent_id)
+            {
+                Some(parent) => self.focus_session(parent),
+                None => (false, Vec::new()),
+            },
+            Command::FocusFirstChild => match self
+                .focused
+                .and_then(|focused| self.children_of(focused).first().copied())
+            {
+                Some(child) => self.focus_session(child),
+                None => (false, Vec::new()),
+            },
+            Command::FocusNextSibling => match self.sibling(1) {
+                Some(sibling) => self.focus_session(sibling),
+                None => (false, Vec::new()),
+            },
+            Command::FocusPreviousSibling => match self.sibling(-1) {
+                Some(sibling) => self.focus_session(sibling),
+                None => (false, Vec::new()),
+            },
+            Command::FocusNextApproval => match self.next_session_awaiting_approval() {
+                Some(session_id) => self.focus_session(session_id),
+                None => {
+                    self.set_info("no session is waiting for approval".to_owned());
+                    (true, Vec::new())
+                }
+            },
             Command::Quit => {
                 self.quit = true;
                 (true, Vec::new())
@@ -1274,12 +1323,35 @@ impl App {
     }
 
     fn open_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
+        self.open_session_picker(None)
+    }
+
+    /// `/agents`: the focused session's root and every descendant, so the
+    /// user can see and jump between the agents one task fanned out into.
+    fn open_agents(&mut self) -> (bool, Vec<ClientRequest>) {
+        let Some(focused) = self.focused else {
+            self.set_warning("focus a session to view its agents".to_owned());
+            return (true, Vec::new());
+        };
+        let mut root = focused;
+        while let Some(parent) = self
+            .sessions
+            .get(&root)
+            .and_then(|session| session.summary.parent_id)
+        {
+            root = parent;
+        }
+        self.open_session_picker(Some(root))
+    }
+
+    fn open_session_picker(&mut self, scope: Option<SessionId>) -> (bool, Vec<ClientRequest>) {
         let selected = self
             .focused
             .filter(|session_id| self.sessions.contains_key(session_id))
             .or_else(|| self.thread_order().first().copied());
         self.overlay = Some(Overlay::Sessions {
             picker: Picker::new(),
+            scope,
             selected,
             confirm: None,
         });
@@ -1289,13 +1361,30 @@ impl App {
     /// Sessions matching the open session picker's query, in tree order.
     /// Empty when the session picker is closed.
     pub(crate) fn filtered_sessions(&self) -> Vec<SessionId> {
-        let Some(Overlay::Sessions { picker, .. }) = &self.overlay else {
+        let Some(Overlay::Sessions { picker, scope, .. }) = &self.overlay else {
             return Vec::new();
         };
         self.thread_order()
             .into_iter()
+            .filter(|session_id| {
+                scope.is_none_or(|root| self.is_descendant_or_self(*session_id, root))
+            })
             .filter(|session_id| picker.matches([self.sessions[session_id].summary.title.as_str()]))
             .collect()
+    }
+
+    fn is_descendant_or_self(&self, session_id: SessionId, root: SessionId) -> bool {
+        let mut cursor = Some(session_id);
+        while let Some(current) = cursor {
+            if current == root {
+                return true;
+            }
+            cursor = self
+                .sessions
+                .get(&current)
+                .and_then(|session| session.summary.parent_id);
+        }
+        false
     }
 
     /// The highlighted session in the picker, if it is still in the filtered
@@ -1954,6 +2043,71 @@ impl App {
             }
         }
         output
+    }
+
+    /// The child session created by a `spawn_agent` call, if the server has
+    /// recorded that linkage. Linear over sessions; the map is small and this
+    /// runs only for `spawn_agent` rows on screen.
+    pub fn child_spawned_by(&self, tool_call_id: qq_protocol::ToolCallId) -> Option<SessionId> {
+        self.sessions
+            .values()
+            .find(|session| {
+                session
+                    .summary
+                    .spawned_by
+                    .is_some_and(|origin| origin.tool_call_id == Some(tool_call_id))
+            })
+            .map(|session| session.summary.id)
+    }
+
+    /// The focused session's sibling `offset` places away in spawn order
+    /// (oldest-first), wrapping at either end. Roots are siblings of roots.
+    fn sibling(&self, offset: isize) -> Option<SessionId> {
+        let focused = self.focused?;
+        let parent = self.sessions.get(&focused)?.summary.parent_id;
+        let mut siblings = match parent {
+            Some(parent) => self.children_of(parent),
+            None => self.root_sessions(),
+        };
+        siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+        if siblings.len() < 2 {
+            return None;
+        }
+        let position = siblings.iter().position(|id| *id == focused)?;
+        let next = (position as isize + offset).rem_euclid(siblings.len() as isize) as usize;
+        Some(siblings[next])
+    }
+
+    /// Sessions with a tool call awaiting approval, in tree order.
+    pub(crate) fn sessions_awaiting_approval(&self) -> Vec<SessionId> {
+        self.thread_order()
+            .into_iter()
+            .filter(|id| !self.sessions[id].live.awaiting_approval.is_empty())
+            .collect()
+    }
+
+    /// The next session (after the focused one, wrapping) that is waiting
+    /// for an approval answer, excluding the focused session itself.
+    fn next_session_awaiting_approval(&self) -> Option<SessionId> {
+        let waiting = self.sessions_awaiting_approval();
+        let others: Vec<SessionId> = waiting
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != self.focused)
+            .collect();
+        if others.is_empty() {
+            return None;
+        }
+        let order = self.thread_order();
+        let focus_position = self
+            .focused
+            .and_then(|focused| order.iter().position(|id| *id == focused))
+            .unwrap_or(0);
+        others
+            .iter()
+            .copied()
+            .find(|id| order.iter().position(|o| o == id).unwrap_or(0) > focus_position)
+            .or_else(|| others.first().copied())
     }
 
     /// Direct children of `parent`, oldest-first.
@@ -2681,6 +2835,7 @@ mod tests {
                 "/models",
                 "/sessions",
                 "/resume",
+                "/agents",
                 "/new",
                 "/compact",
                 "/quit",
@@ -2690,7 +2845,7 @@ mod tests {
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.slash_selected(usize::MAX), 6);
+        assert_eq!(app.slash_selected(usize::MAX), 7);
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
@@ -4410,5 +4565,36 @@ mod tests {
             text: "x".repeat(LIVE_TAIL_BYTES * 3),
         }));
         assert!(app.sessions[&child.id].live.tail.len() <= LIVE_TAIL_BYTES);
+    }
+
+    #[test]
+    fn agents_picker_lists_only_the_focused_roots_subtree() {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let root = initial.sessions[0].id;
+        let mut child = summary_named(0x81, workspace_id, "child");
+        child.parent_id = Some(root);
+        let mut grandchild = summary_named(0x82, workspace_id, "grandchild");
+        grandchild.parent_id = Some(child.id);
+        let other_root = summary_named(0x83, workspace_id, "other root");
+        initial
+            .sessions
+            .extend([child.clone(), grandchild.clone(), other_root.clone()]);
+        app.apply_snapshot(initial);
+
+        // From deep in the tree, /agents scopes to the whole root's subtree.
+        app.focus_session(grandchild.id);
+        app.execute(Command::OpenAgents);
+        let mut listed = app.filtered_sessions();
+        listed.sort();
+        let mut expected = vec![root, child.id, grandchild.id];
+        expected.sort();
+        assert_eq!(listed, expected);
+        assert!(!app.filtered_sessions().contains(&other_root.id));
+
+        // /sessions lists everything.
+        app.execute(Command::OpenSessions);
+        assert_eq!(app.filtered_sessions().len(), 4);
     }
 }

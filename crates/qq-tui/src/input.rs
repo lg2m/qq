@@ -19,6 +19,9 @@ pub(crate) enum Overlay {
     Models(Picker),
     Sessions {
         picker: Picker,
+        /// When set, only this session and its descendants are listed: the
+        /// `/agents` view of one root's delegated work.
+        scope: Option<SessionId>,
         /// Identity of the highlighted session. Kept as an id rather than an
         /// index because the tree reorders when sessions are created or
         /// deleted underneath the open picker.
@@ -48,6 +51,7 @@ impl Overlay {
         picker.push_query(query);
         Self::Sessions {
             picker,
+            scope: None,
             selected,
             confirm,
         }

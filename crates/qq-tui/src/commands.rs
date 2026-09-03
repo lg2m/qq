@@ -12,6 +12,7 @@ use crate::settings::Action;
 pub(crate) enum Command {
     OpenModels,
     OpenSessions,
+    OpenAgents,
     ToggleSessions,
     NewRootSession,
     NewChildSession,
@@ -23,6 +24,11 @@ pub(crate) enum Command {
     PreviousLayout,
     ToggleToolDetail,
     ToggleSidebar,
+    FocusParent,
+    FocusFirstChild,
+    FocusNextSibling,
+    FocusPreviousSibling,
+    FocusNextApproval,
     Quit,
 }
 
@@ -49,7 +55,7 @@ pub(crate) struct CommandSpec {
 }
 
 /// Presentation order is invocation frequency, not alphabetical.
-pub(crate) const COMMANDS: [CommandSpec; 14] = [
+pub(crate) const COMMANDS: [CommandSpec; 20] = [
     CommandSpec {
         command: Command::OpenModels,
         title: "choose a model",
@@ -62,6 +68,13 @@ pub(crate) const COMMANDS: [CommandSpec; 14] = [
         title: "open sessions",
         category: Category::Session,
         slash: &["/sessions", "/resume"],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::OpenAgents,
+        title: "open the focused session's agent tree",
+        category: Category::Session,
+        slash: &["/agents"],
         action: None,
     },
     CommandSpec {
@@ -138,6 +151,41 @@ pub(crate) const COMMANDS: [CommandSpec; 14] = [
         command: Command::ToggleSidebar,
         title: "toggle the session sidebar",
         category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusParent,
+        title: "focus the parent session",
+        category: Category::Session,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusFirstChild,
+        title: "focus the first child session",
+        category: Category::Session,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusNextSibling,
+        title: "focus the next sibling session",
+        category: Category::Session,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusPreviousSibling,
+        title: "focus the previous sibling session",
+        category: Category::Session,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::FocusNextApproval,
+        title: "jump to the next session awaiting approval",
+        category: Category::Run,
         slash: &[],
         action: None,
     },

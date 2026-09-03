@@ -846,7 +846,18 @@ impl FrameRenderer {
         ]);
         body.extend_virtual(transcript);
         if let Some(focused) = app.focused {
-            let children = app.children_of(focused);
+            // Children already shown under their spawn call are not repeated.
+            let children: Vec<SessionId> = app
+                .children_of(focused)
+                .into_iter()
+                .filter(|child| {
+                    app.sessions[child]
+                        .summary
+                        .spawned_by
+                        .and_then(|origin| origin.tool_call_id)
+                        .is_none_or(|call| app.child_spawned_by(call) != Some(*child))
+                })
+                .collect();
             if !children.is_empty() {
                 body.push_line(Line::default());
                 body.push_line(Line::styled("  +-- related sessions", muted().bold()));
@@ -1078,6 +1089,7 @@ impl FrameRenderer {
                         app.tool_detail,
                         app.animation_tick,
                         width,
+                        &|call_id, width| child_rows(app, call_id, width),
                     ));
                     body.push_line(Line::default());
                 }
@@ -1090,6 +1102,7 @@ impl FrameRenderer {
                         app.tool_detail,
                         app.animation_tick,
                         width,
+                        &|call_id, width| child_rows(app, call_id, width),
                     ));
                 }
             } else {
@@ -1112,6 +1125,7 @@ impl FrameRenderer {
                             app.tool_detail,
                             app.animation_tick,
                             width,
+                            &|call_id, width| child_rows(app, call_id, width),
                         ));
                     }
                 }
@@ -1267,14 +1281,22 @@ impl FrameRenderer {
 /// bounded body rows. Running calls with buffered live output show a bounded
 /// tail of it at every detail level — a running command's output is the thing
 /// the user is waiting for.
+/// Rows rendered beneath a tool call that spawned a child session.
+type ChildRows<'a> = &'a dyn Fn(ToolCallId, usize) -> Vec<Line>;
+
 fn render_tool_calls(
     calls: &[&ToolCallSnapshot],
     live_output: &HashMap<ToolCallId, String>,
     detail: ToolDetail,
     tick: usize,
     width: usize,
+    children: ChildRows<'_>,
 ) -> Vec<Line> {
-    let quiet = |call: &ToolCallSnapshot| call.state == ToolCallState::Completed && !call.is_error;
+    let quiet = |call: &ToolCallSnapshot| {
+        call.state == ToolCallState::Completed
+            && !call.is_error
+            && children(call.id, width).is_empty()
+    };
     if detail == ToolDetail::Collapsed
         && calls.len() > TOOL_FOLD_THRESHOLD
         && calls.iter().all(|call| quiet(call))
@@ -1296,6 +1318,9 @@ fn render_tool_calls(
         {
             lines.extend(tool_live_output_lines(output, width));
         }
+        // A spawned child renders under the call that created it so the
+        // parent transcript shows delegated work in execution order.
+        lines.extend(children(call.id, width));
     }
     lines
 }
@@ -1700,6 +1725,30 @@ fn status_notice(app: &App, width: usize) -> Vec<Line> {
             width.max(1),
         ));
     }
+    // Approvals waiting in sessions the user is not looking at would
+    // otherwise stall silently. One row names them and how to jump.
+    let waiting: Vec<&str> = app
+        .sessions_awaiting_approval()
+        .into_iter()
+        .filter(|id| Some(*id) != app.focused)
+        .filter_map(|id| app.sessions.get(&id))
+        .map(|session| session.summary.title.as_str())
+        .collect();
+    if !waiting.is_empty() {
+        let mut line = Line::styled("  ? ", warning().bold());
+        line.push(
+            match waiting.as_slice() {
+                [one] => format!("approval needed in {one}"),
+                [first, rest @ ..] => {
+                    format!("approval needed in {first} and {} more", rest.len())
+                }
+                [] => String::new(),
+            },
+            warning().bold(),
+        );
+        line.push("  Ctrl-G jumps there", muted());
+        lines.push(truncate_line(line, width));
+    }
     lines
 }
 
@@ -1711,8 +1760,12 @@ fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line> {
     let confirm = app.session_picker_confirm();
     let selected = app.session_picker_selected();
     let filtered = app.filtered_sessions();
+    let scoped = matches!(
+        &app.overlay,
+        Some(crate::input::Overlay::Sessions { scope: Some(_), .. })
+    );
     let mut lines = vec![section(
-        "SESSIONS",
+        if scoped { "AGENTS" } else { "SESSIONS" },
         if confirm.is_some() {
             "y confirms, n or Esc cancels"
         } else {
@@ -1975,7 +2028,7 @@ fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
             focused_row = rows.len();
         }
         rows.push(session_line(app, session_id, width, &format!("│ {indent}")));
-        if let Some(status) = sidebar_status(app, session_id) {
+        if let Some(status) = live_status_line(app, session_id) {
             let mut line = Line::styled(format!("│ {indent}   "), muted());
             let used = line.width();
             let (text, style) = status;
@@ -1995,8 +2048,25 @@ fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
     lines
 }
 
-/// One-line status for a sidebar row, most urgent first.
-fn sidebar_status(app: &App, session_id: SessionId) -> Option<(String, Style)> {
+/// Rows for the child session a `spawn_agent` call created: its title and
+/// status glyph, then one status line (approval wait, active tool, live tail,
+/// or activity). Empty when the call has no recorded child.
+fn child_rows(app: &App, tool_call_id: ToolCallId, width: usize) -> Vec<Line> {
+    let Some(child) = app.child_spawned_by(tool_call_id) else {
+        return Vec::new();
+    };
+    let mut rows = vec![session_line(app, child, width, "       ↳ ")];
+    if let Some((text, style)) = live_status_line(app, child) {
+        let mut line = Line::styled("            ", muted());
+        let used = line.width();
+        line.push(preview(&text, width.saturating_sub(used)), style);
+        rows.push(truncate_line(line, width));
+    }
+    rows
+}
+
+/// One-line live status for a session row, most urgent first.
+fn live_status_line(app: &App, session_id: SessionId) -> Option<(String, Style)> {
     let session = app.sessions.get(&session_id)?;
     let live = &session.live;
     if !live.awaiting_approval.is_empty() {
@@ -2796,7 +2866,14 @@ mod tests {
             Some("@@ -1 +1 @@\n-old\n+new\n context"),
             false,
         );
-        let lines = render_tool_calls(&[&diff_call], &HashMap::new(), ToolDetail::Expanded, 0, 80);
+        let lines = render_tool_calls(
+            &[&diff_call],
+            &HashMap::new(),
+            ToolDetail::Expanded,
+            0,
+            80,
+            &|_, _| Vec::new(),
+        );
         let style_of = |lines: &[Line], needle: &str| {
             lines
                 .iter()
@@ -2824,6 +2901,7 @@ mod tests {
             ToolDetail::Expanded,
             0,
             80,
+            &|_, _| Vec::new(),
         );
         assert_eq!(style_of(&lines, "Edited src/lib.rs"), Some(normal().dim()));
     }
@@ -2843,7 +2921,14 @@ mod tests {
             diff: "- old line\n+ new line\n".to_owned(),
         });
 
-        let lines = render_tool_calls(&[&call], &HashMap::new(), ToolDetail::Expanded, 0, 80);
+        let lines = render_tool_calls(
+            &[&call],
+            &HashMap::new(),
+            ToolDetail::Expanded,
+            0,
+            80,
+            &|_, _| Vec::new(),
+        );
         let style_of = |needle: &str| {
             lines
                 .iter()
@@ -2857,7 +2942,14 @@ mod tests {
         assert!(style_of("replaced 1 occurrence").is_none());
 
         // Collapsed detail keeps the one-liner; the payload adds no rows.
-        let lines = render_tool_calls(&[&call], &HashMap::new(), ToolDetail::Collapsed, 0, 80);
+        let lines = render_tool_calls(
+            &[&call],
+            &HashMap::new(),
+            ToolDetail::Collapsed,
+            0,
+            80,
+            &|_, _| Vec::new(),
+        );
         assert_eq!(lines.len(), 1);
     }
 
@@ -2878,7 +2970,14 @@ mod tests {
         );
 
         for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
-            let rows = frame_rows(&render_tool_calls(&[&call], &live, detail, 0, 80));
+            let rows = frame_rows(&render_tool_calls(
+                &[&call],
+                &live,
+                detail,
+                0,
+                80,
+                &|_, _| Vec::new(),
+            ));
             assert!(rows[0].contains("shell"), "the spinner one-liner stays");
             let tail_start = rows.len() - MAX_LIVE_TAIL_ROWS;
             assert_eq!(
@@ -2907,6 +3006,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             20,
+            &|_, _| Vec::new(),
         ));
         assert_eq!(rows[1], format!("     {}", "x".repeat(15)));
         assert_eq!(rows[2], format!("     {}", "x".repeat(15)));
@@ -2923,6 +3023,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             80,
+            &|_, _| Vec::new(),
         ));
         assert_eq!(rows.len(), 1);
     }
@@ -3060,6 +3161,7 @@ mod tests {
                 ToolDetail::Collapsed,
                 0,
                 120,
+                &|_, _| Vec::new(),
             ));
             assert_eq!(rows, [expected]);
         }
@@ -3083,6 +3185,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             160,
+            &|_, _| Vec::new(),
         ));
 
         assert_eq!(rows.len(), 1);
@@ -3108,6 +3211,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             120,
+            &|_, _| Vec::new(),
         ));
 
         assert!(rows[0].contains("read_file {not json (1 line)"));
@@ -3130,6 +3234,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             120,
+            &|_, _| Vec::new(),
         ));
 
         assert_eq!(rows[0], "   ✗ read_file gone.txt");
@@ -3152,6 +3257,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             120,
+            &|_, _| Vec::new(),
         ));
         assert_eq!(
             rows,
@@ -3172,6 +3278,7 @@ mod tests {
             ToolDetail::Collapsed,
             1,
             120,
+            &|_, _| Vec::new(),
         ));
         assert_eq!(rows, ["   ◓ search \"x\" running"]);
     }
@@ -3207,6 +3314,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             120,
+            &|_, _| Vec::new(),
         ));
         assert_eq!(rows, ["   ▸ 6 tool calls (read_file ×4, search ×2)"]);
 
@@ -3219,6 +3327,7 @@ mod tests {
             ToolDetail::Collapsed,
             0,
             120,
+            &|_, _| Vec::new(),
         ));
         assert_eq!(rows.len(), 6);
 
@@ -3231,6 +3340,7 @@ mod tests {
             ToolDetail::Expanded,
             0,
             120,
+            &|_, _| Vec::new(),
         ));
         assert!(rows.len() > 6);
     }
@@ -3292,7 +3402,10 @@ mod tests {
         let references = calls.iter().collect::<Vec<_>>();
         for width in 0..24 {
             for detail in [ToolDetail::Collapsed, ToolDetail::Expanded] {
-                let lines = render_tool_calls(&references, &HashMap::new(), detail, 0, width);
+                let lines =
+                    render_tool_calls(&references, &HashMap::new(), detail, 0, width, &|_, _| {
+                        Vec::new()
+                    });
                 assert!(lines.iter().all(|line| line.width() <= width));
             }
         }
@@ -4073,5 +4186,251 @@ mod tests {
             rows_at(&mut app, 100).contains("SESSIONS  1 running"),
             "explicitly shown wins over width"
         );
+    }
+
+    #[test]
+    fn spawned_children_render_under_their_spawn_call_and_never_fold() {
+        let mut app = app_with_messages(1);
+        let workspace_id = app.workspace_id.unwrap();
+        let parent = app.focused.unwrap();
+        let run_id = RunId::from_bytes([2; 16]);
+        let spawn_call = tool_call_snapshot(
+            0x21,
+            "spawn_agent",
+            r#"{"task":"survey callers"}"#,
+            ToolCallState::Running,
+            None,
+            false,
+        );
+        // Four quiet reads plus the spawn call: without the child this run
+        // would fold into one counted line at collapsed detail.
+        let mut calls = vec![spawn_call.clone()];
+        for byte in 0x22..0x26 {
+            calls.push(tool_call_snapshot(
+                byte,
+                "read_file",
+                r#"{"path":"a.rs"}"#,
+                ToolCallState::Completed,
+                Some("ok"),
+                false,
+            ));
+        }
+        app.sessions.get_mut(&parent).unwrap().tool_calls = Some(calls);
+        let child_id = SessionId::from_bytes([0x30; 16]);
+        app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+            cursor: EventCursor {
+                store_id: StoreId::from_bytes([4; 16]),
+                workspace_id,
+                sequence: 2,
+            },
+            session_id: child_id,
+            run_id: Some(RunId::from_bytes([0x31; 16])),
+            caused_by: None,
+            occurred_at_ms: 2,
+            event: SessionEvent::SessionCreated {
+                session: SessionSummary {
+                    id: child_id,
+                    workspace_id,
+                    parent_id: Some(parent),
+                    spawned_by: Some(qq_protocol::SpawnOrigin {
+                        run_id,
+                        tool_call_id: Some(spawn_call.id),
+                    }),
+                    title: "survey callers".to_owned(),
+                    status: SessionStatus::Running,
+                    active_run_id: Some(RunId::from_bytes([0x31; 16])),
+                    activity: Some(qq_protocol::RunActivity::Reasoning),
+                    queued_prompts: 0,
+                    model: None,
+                    context_tokens: None,
+                    accounting: None,
+                    estimated_cost_usd_nanos: None,
+                    updated_at_ms: 2,
+                    last_outcome: None,
+                },
+            },
+        }));
+        app.sidebar = crate::app::Sidebar::Hidden;
+
+        let rows = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 40));
+        let spawn_row = rows
+            .iter()
+            .position(|row| row.contains("spawn_agent"))
+            .expect("spawn call is rendered, not folded");
+        assert!(rows[spawn_row + 1].contains("↳"));
+        assert!(rows[spawn_row + 1].contains("survey callers"));
+        assert!(rows[spawn_row + 2].contains("reasoning"));
+        assert!(
+            rows.iter().all(|row| !row.contains("tool calls")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("related sessions")),
+            "an inline child is not repeated below"
+        );
+
+        // A child with no recorded call attaches nowhere in the transcript
+        // but still appears in related sessions.
+        app.sessions.get_mut(&child_id).unwrap().summary.spawned_by = None;
+        let rows = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 40));
+        let spawn_row = rows
+            .iter()
+            .position(|row| row.contains("spawn_agent"))
+            .unwrap();
+        assert!(!rows[spawn_row + 1].contains("↳"));
+        assert!(rows.iter().any(|row| row.contains("related sessions")));
+    }
+
+    #[test]
+    fn background_approvals_surface_a_banner_that_ctrl_g_jumps_to() {
+        let mut app = app_with_messages(1);
+        app.sidebar = crate::app::Sidebar::Hidden;
+        let workspace_id = app.workspace_id.unwrap();
+        let parent = app.focused.unwrap();
+        let child_id = SessionId::from_bytes([0x40; 16]);
+        let run_id = RunId::from_bytes([0x41; 16]);
+        let mut sequence = 1;
+        let mut event = |session_id, event| {
+            sequence += 1;
+            ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: StoreId::from_bytes([4; 16]),
+                    workspace_id,
+                    sequence,
+                },
+                session_id,
+                run_id: Some(run_id),
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event,
+            })
+        };
+        app.apply_client_update(event(
+            child_id,
+            SessionEvent::SessionCreated {
+                session: SessionSummary {
+                    id: child_id,
+                    workspace_id,
+                    parent_id: Some(parent),
+                    spawned_by: None,
+                    title: "Deploy helper".to_owned(),
+                    status: SessionStatus::Running,
+                    active_run_id: Some(run_id),
+                    activity: None,
+                    queued_prompts: 0,
+                    model: None,
+                    context_tokens: None,
+                    accounting: None,
+                    estimated_cost_usd_nanos: None,
+                    updated_at_ms: 2,
+                    last_outcome: None,
+                },
+            },
+        ));
+        let call = ToolCallSnapshot {
+            id: ToolCallId::from_bytes([0x42; 16]),
+            session_id: child_id,
+            run_id,
+            turn_ordinal: 1,
+            call_ordinal: 0,
+            provider_call_id: "c".to_owned(),
+            name: "shell".to_owned(),
+            arguments: r#"{"command":"rm -rf build"}"#.to_owned(),
+            state: ToolCallState::AwaitingApproval,
+            result: None,
+            is_error: false,
+            display: None,
+        };
+        app.apply_client_update(event(
+            child_id,
+            SessionEvent::ToolApprovalRequested {
+                tool_call: call,
+                shell: None,
+                edit: None,
+            },
+        ));
+
+        // Focused on the parent: no modal, but the banner names the child.
+        assert_eq!(app.mode(), Mode::Compose);
+        let text = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 24)).join("\n");
+        assert!(text.contains("approval needed in Deploy helper"), "{text}");
+        assert!(text.contains("Ctrl-G"));
+
+        let (changed, requests) = app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(changed);
+        assert_eq!(app.focused, Some(child_id));
+        // The child is cold, so the jump fetches its body...
+        assert_eq!(requests.len(), 1);
+        // ...and the banner no longer names the session we are now in.
+        let text = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 24)).join("\n");
+        assert!(!text.contains("approval needed in"));
+    }
+
+    #[test]
+    fn alt_arrows_walk_the_session_tree_in_spawn_order() {
+        let mut app = app_with_messages(0);
+        app.sidebar = crate::app::Sidebar::Hidden;
+        let workspace_id = app.workspace_id.unwrap();
+        let root = app.focused.unwrap();
+        let mut sequence = 1;
+        let mut created = |app: &mut App, byte: u8, parent: Option<SessionId>, at: u64| {
+            sequence += 1;
+            let id = SessionId::from_bytes([byte; 16]);
+            app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: StoreId::from_bytes([4; 16]),
+                    workspace_id,
+                    sequence,
+                },
+                session_id: id,
+                run_id: None,
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event: SessionEvent::SessionCreated {
+                    session: SessionSummary {
+                        id,
+                        workspace_id,
+                        parent_id: parent,
+                        spawned_by: None,
+                        title: format!("s{byte}"),
+                        status: SessionStatus::Idle,
+                        active_run_id: None,
+                        activity: None,
+                        queued_prompts: 0,
+                        model: None,
+                        context_tokens: None,
+                        accounting: None,
+                        estimated_cost_usd_nanos: None,
+                        updated_at_ms: at,
+                        last_outcome: None,
+                    },
+                },
+            }));
+            id
+        };
+        let a = created(&mut app, 0x51, Some(root), 10);
+        let b = created(&mut app, 0x52, Some(root), 20);
+        let c = created(&mut app, 0x53, Some(root), 30);
+        let key = |code| TerminalEvent::Key(KeyEvent::new(code, KeyModifiers::ALT));
+
+        app.handle_terminal_event(key(KeyCode::Down));
+        assert_eq!(app.focused, Some(a), "first child is the oldest");
+        app.handle_terminal_event(key(KeyCode::Right));
+        assert_eq!(app.focused, Some(b));
+        app.handle_terminal_event(key(KeyCode::Right));
+        assert_eq!(app.focused, Some(c));
+        app.handle_terminal_event(key(KeyCode::Right));
+        assert_eq!(app.focused, Some(a), "siblings wrap");
+        app.handle_terminal_event(key(KeyCode::Left));
+        assert_eq!(app.focused, Some(c));
+        app.handle_terminal_event(key(KeyCode::Up));
+        assert_eq!(app.focused, Some(root));
+        // A lone root has no siblings; the key is a no-op.
+        let (changed, _) = app.handle_terminal_event(key(KeyCode::Right));
+        assert!(!changed);
+        assert_eq!(app.focused, Some(root));
     }
 }

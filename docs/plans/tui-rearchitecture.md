@@ -1,7 +1,7 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phases T0–T3 are complete (receipts below).
-Phases T4–T7 are proposed.
+Status: proposed 2026-09-02. Phases T0–T4 are complete (receipts below).
+Phases T5–T7 are proposed.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -401,6 +401,38 @@ Acceptance:
   frame of `SessionCreated`.
 - Approvals in background sessions are surfaced and answerable without losing
   focus context.
+
+#### T4 Completion Receipt — 2026-09-02
+
+All workspace gates green; 158 TUI tests. No render-bench change.
+
+- **Inline children.** `render_tool_calls` takes a child-rows callback; a
+  `spawn_agent` call whose `ToolCallId` matches a session's `spawned_by`
+  renders that child directly beneath it (`↳ title`, then the same live
+  status line the sidebar uses). A run with an inline child never folds into
+  the "N tool calls" summary, and the child is not repeated in the "related
+  sessions" list. Children without a recorded call (pre-version-12 stores)
+  keep appearing in that list.
+- **Navigation.** `FocusParent` / `FocusFirstChild` / `FocusNextSibling` /
+  `FocusPreviousSibling` on Alt-Up/Down/Left/Right; siblings are ordered by
+  `updated_at_ms` (spawn order) and wrap. `/agents` (reserved in the
+  protocol list alongside `/sessions`) opens the session picker scoped to the
+  focused session's root and its descendants; the header reads `AGENTS`.
+- **Workspace-wide approvals.** `sessions_awaiting_approval` derives from
+  `LiveStatus`, so it covers cold sessions. A status-area banner names the
+  first waiting non-focused session and how many more; `Ctrl-G`
+  (`FocusNextApproval`) jumps to the next one in tree order, after which the
+  existing approval mode answers it. Approvals are therefore answerable from
+  any session with one keystroke of context switch.
+
+Not done, deliberately: answering a background approval *without* switching
+focus. The modal reads the focused session's pending call; making it
+session-addressable is a small change but the jump-then-answer flow keeps the
+user looking at the diff or command they are approving, which is the safer
+default. Revisit with T6 split panes, where the second pane can host it.
+Cost on the inline child row is also deferred: `SessionAccounting` is on the
+summary but the row is already dense; the sidebar row is the better home once
+it gains a cost column.
 
 ### T5 — Composer And Busy Input
 
