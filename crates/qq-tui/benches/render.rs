@@ -44,6 +44,8 @@ fn main() {
     streaming_background(iterations);
     children_with_sidebar(iterations);
     keystroke_echo(iterations);
+    wheel_scroll(iterations);
+    golden_path_first_minute(iterations);
     tool_calls_32(iterations);
     sessions_200_with_sidebar(iterations);
     picker_open_close(iterations);
@@ -285,4 +287,49 @@ fn report(name: &str, nanos: u128, samples: usize, bytes: Vec<u8>) {
 
 fn micros(nanos: u128) -> String {
     format!("{:.1} us", nanos as f64 / 1_000.0)
+}
+
+/// One wheel notch over a long transcript, alternating direction so the
+/// viewport never pins at either end. The whole body is re-laid from cache
+/// and the visible window re-diffed: this is the cost of reading back.
+fn wheel_scroll(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
+    harness.settle_highlights();
+    black_box(harness.draw());
+    let mut up = true;
+    let samples = collect(iterations, || {
+        for _ in 0..4 {
+            if up {
+                harness.wheel_up();
+            } else {
+                harness.wheel_down();
+            }
+        }
+        up = !up;
+        harness.draw().len()
+    });
+    report_samples("wheel_scroll_4_rows_to_frame", &samples);
+}
+
+/// The first minute of a session from an empty transcript: prompt accepted,
+/// run started, a read, a failing test, an edit in flight, and the model's
+/// streaming explanation, drawn after every event. Measures the path a user
+/// actually waits on when they start work, end to end through the reducer.
+fn golden_path_first_minute(iterations: u32) {
+    let samples = collect(iterations, || {
+        let mut harness = BenchHarness::new(SIZE, 3, 0);
+        harness.hide_sidebar();
+        black_box(harness.draw());
+        let message = harness.golden_path();
+        let mut bytes = harness.draw().len();
+        harness.append(
+            0,
+            message,
+            " Then the reconnect test can assert on virtual time.",
+        );
+        bytes += harness.draw().len();
+        bytes
+    });
+    report_samples("golden_path_first_minute_total", &samples);
 }

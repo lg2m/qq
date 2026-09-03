@@ -149,10 +149,19 @@ mentions it. The mouse wheel scrolls the transcript; `PageUp`/`PageDown` and
 `Shift-Up`/`Shift-Down` scroll from the keyboard and `Ctrl-Home`/`Ctrl-End`
 jump to the top and the live tail. Hold Shift to select text with the mouse, or
 `/mouse` to hand the mouse back to the terminal. `Ctrl-R` searches the session's
-prompt history; `Ctrl-Up`/`Ctrl-Down` select a tool call and Enter expands it
-alone (or opens the child a `spawn_agent` call created); `Ctrl-O` expands
-every call and `Alt-R` the reasoning. Expanded rows show when a call started,
-finished or how long it has run, and when it last produced output.
+prompt history.
+
+Each tool call is one row: `● Edit  src/sse.rs  +12 −3  1.2s`, with a spinner
+and live elapsed time while it runs. `Ctrl-Up`/`Ctrl-Down` select a call and
+Enter expands it alone: a read or search shows the head of its result, an edit
+its diff with line numbers, a command the tail of its output; MCP tools list
+their arguments. Expanded rows also show when the call started, finished or how
+long it has run, and when it last produced output. Enter on a `spawn_agent` row
+opens the child instead. `Ctrl-O` folds quiet finished blocks to one summary
+row for reading back a long transcript, and `Alt-R` toggles reasoning. The
+rule above the composer shows the running activity, elapsed time, and time to
+first token, or the latest notice; the key hints for the current state sit at
+its right.
 
 With several agents, a sidebar groups sessions by what you should do about
 them (NEEDS YOU, WORKING, IDLE, DONE) with unread counts. It appears on its

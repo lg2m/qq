@@ -443,3 +443,56 @@ impl BenchHarness {
         id
     }
 }
+
+impl BenchHarness {
+    /// Scroll the transcript by one wheel notch toward older rows, as the
+    /// mouse would. Returns whether the viewport moved.
+    pub fn wheel_up(&mut self) -> bool {
+        self.app
+            .handle_terminal_event(Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .redraws()
+    }
+
+    /// Scroll back toward the live tail by one notch.
+    pub fn wheel_down(&mut self) -> bool {
+        self.app
+            .handle_terminal_event(Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .redraws()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_golden_path_draws_the_prompt_rows_and_streaming_text() {
+        let mut harness = BenchHarness::new((110, 24), 3, 0);
+        harness.hide_sidebar();
+        let message = harness.golden_path();
+        assert!(harness.append(0, message, " More."));
+        let frame = String::from_utf8_lossy(&harness.draw_full()).into_owned();
+        for needle in [
+            "make the sse reconnect test deterministic",
+            "Read",
+            "412 lines",
+            "exit 101",
+            "Edit",
+            "running",
+            "pausing the runtime clock",
+            "More.",
+        ] {
+            assert!(frame.contains(needle), "{needle} missing from frame");
+        }
+    }
+}

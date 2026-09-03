@@ -503,7 +503,11 @@ impl TranscriptCache {
                 viewport,
             );
         }
-        let body = self.threadline(highlighter, app, session_id, &viewport, width);
+        // Prose past a readable measure gets no wider: lines stay scannable
+        // on a wide screen, and the width-keyed caches see one width across
+        // every terminal wider than the cap.
+        let content_width = width.min(MAX_TRANSCRIPT_WIDTH);
+        let body = self.threadline(highlighter, app, session_id, &viewport, content_width);
         viewport.update(app.view, body.rows, height, body.preserve_tail_anchor);
         let offset = viewport.offset();
         let live_message_ranges = body.live_message_ranges.clone();

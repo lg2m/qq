@@ -59,6 +59,9 @@ const MAX_RENDER_WIDTH: u16 = 320;
 const MAX_RENDER_HEIGHT: u16 = 160;
 const MAX_LIVE_MARKDOWN_BYTES: usize = 32 * 1024;
 const MAX_VISIBLE_MESSAGES: usize = 64;
+/// Widest the transcript body lays out; the rest of a wider terminal is
+/// left blank rather than stretching prose past a readable line length.
+const MAX_TRANSCRIPT_WIDTH: usize = 120;
 const MAX_LIVE_MARKDOWN_ROWS: usize = MAX_RENDER_HEIGHT as usize;
 /// Completed messages at or below these bounds retain full markdown styling.
 /// Larger messages use a sparse plain-text row index so scrolling stays

@@ -1,14 +1,68 @@
 # TUI Refinement
 
-Status: F0–F6 landed 2026-09-03 (commits `8825c57`..`HEAD` on `main`).
-Deferred: `qq --bench-startup` (a loop test enforces the first-frame gate
-instead), the `!` shell passthrough cell, OSC 8 hyperlinks and OSC 11
-dark/light detection, `tui.ron` wiring for `status_line` (the setting exists
-in `SettingsBuilder`), and the protocol prerequisites below, which remain
-H-track work. Final bench (release, 160x48): every gate in
-[Speed Budgets](#speed-budgets) passes; `sessions_200_with_sidebar` 41 µs,
-`picker_open_close_cycle` 43 µs (from 523), `tool_calls_32_expanded` 61 µs
-p95.
+Status: F0–F6 landed 2026-09-03 (commits `8825c57`..`8aba404` on `main`),
+then revised the same day by the workflow-first rework below
+(`fca8acd`..`HEAD`). Read the rework section before the phase text: it
+removes several things F2, F5, and F6 built.
+
+## Workflow-First Rework (2026-09-03)
+
+Reviewing the finished F0–F6 surface as frames rather than as a checklist
+showed it had grown features faster than judgment: 50 commands, a tiling pane
+tree, two transcript layouts, named layout files, a one-line tool summary as
+the default while an agent worked, and mouse capture defaulted off so the
+wheel could not scroll. The rework re-ranked the priorities as fast use first,
+minimal second, code design third, visuals last, and cut accordingly.
+
+Removed, with the reasons recorded so they are not silently re-added:
+
+- Tiled panes (split/stack/close/zoom, focus and resize in four directions,
+  12 commands, `panes.rs` at 1029 lines) and `/layout save|load|list`. One
+  session is on screen at a time; two `qq` clients in a terminal multiplexer
+  give side-by-side, and the app no longer carries per-pane caches, hit
+  testing, or a viewport per tile. `Effect::{SaveLayout,LoadLayout,
+  ListLayouts}` and the `ron` dependency went with it.
+- The FoldFocus layout and its four commands. One transcript, always.
+- The `layout` key and four layout bindings in `tui.ron`; they are rejected
+  with an error naming the key. `StatusItem::Layout` is gone.
+- The permanent hint row. The composer rule carries status left (activity,
+  elapsed, ttft, notices, approvals waiting elsewhere) and hints right, with
+  status winning when width is tight. Chrome is title, rule, composer.
+- The `▸ Read ×2 …` summary as the default tool view, and raw JSON arguments
+  in expanded bodies.
+
+Changed:
+
+- Mouse capture is on at startup; `/mouse` hands it back; Shift-drag selects.
+  `Shift-Up`/`Shift-Down` scroll three rows from the keyboard.
+- One row per tool call is the default. Ctrl-O now folds quiet finished
+  blocks instead of expanding anything; bodies are per call (Ctrl-Up/Down +
+  Enter, or click) and curated: head of a read or search, numbered diff for
+  an edit, tail of a command, `key: value` arguments for MCP and unknown
+  tools only.
+- The sidebar is responsive: hidden with one session, automatic at 100
+  columns with more, a quarter of the width up to 28 columns. Sidebar live
+  status uses the row verbs (`edit`, `◇ approve run`), not raw tool names.
+- Code panels put the language label at the top left and drop the trailing
+  pad row. Transcript prose caps at 120 columns on wide terminals.
+- `/attention` and `/changes` are views, not panes: Esc or the same command
+  returns to the session they replaced.
+- Command table: 50 → 34. `RESERVED_CLIENT_SLASH_COMMANDS`: 21 → 16.
+
+Receipts (release, 160x48, after the rework): `steady_state_frame` 26 µs
+p95, `keystroke_to_frame` 33 µs, `wheel_scroll_4_rows_to_frame` 38 µs,
+`golden_path_first_minute_total` (snapshot → prompt → three tool events →
+streaming text, drawn after each) 39 µs, `tool_calls_32_rows` 26 µs,
+`tool_calls_32_folded` 16 µs, `tool_calls_32_expanded` 62 µs,
+`sessions_200_with_sidebar` 38 µs, `picker_open_close_cycle` 44 µs.
+`crates/qq-tui` is 1.5k lines smaller than at `8aba404` (−2598 +1132).
+
+Still deferred from F6: `qq --bench-startup` (a loop test enforces the
+first-frame gate instead), the `!` shell passthrough cell, OSC 8 hyperlinks
+and OSC 11 dark/light detection, `tui.ron` wiring for `status_line`, and the
+protocol prerequisites below, which remain H-track work.
+
+## Original Plan (F0–F6)
 
 This plan supersedes the structural claims in
 [`tui-rearchitecture.md`](./tui-rearchitecture.md): that plan's T0–T7 phases
