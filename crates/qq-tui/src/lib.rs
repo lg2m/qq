@@ -10,6 +10,7 @@ mod composer;
 #[cfg(any(test, feature = "bench-support"))]
 pub mod fixtures;
 mod input;
+mod model;
 mod panes;
 mod picker;
 mod render;

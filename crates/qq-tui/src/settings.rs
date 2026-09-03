@@ -17,11 +17,6 @@ impl Layout {
             Self::FoldFocus => Self::Threadline,
         }
     }
-
-    #[must_use]
-    pub const fn previous(self) -> Self {
-        self.next()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

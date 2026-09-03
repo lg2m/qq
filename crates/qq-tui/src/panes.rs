@@ -337,7 +337,7 @@ fn share(total: usize, ratio: f32) -> usize {
         return total;
     }
     // Truncation is intended; the remainder goes to the second child.
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation

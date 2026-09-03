@@ -1,11 +1,15 @@
 use crossterm::event::MouseEvent;
 use qq_protocol::{
-    MessageId, MessageRole, MessageState, RunId, RunOutcome, RunSnapshot, RunStatus, SessionEvent,
-    SessionStatus, TextChannel, TokenUsage, ToolCallId, ToolCallState, WorkspaceGrantOutcome,
+    MessageId, MessageRole, MessageSnapshot, MessageState, RunActivity, RunId, RunOutcome,
+    RunSnapshot, RunStatus, SessionEvent, SessionStatus, SessionSummary, TextChannel, TokenUsage,
+    ToolCallId, ToolCallState, WorkspaceGrantOutcome,
 };
 
 use super::*;
-use crate::fixtures;
+use crate::{
+    fixtures,
+    model::{LIVE_TAIL_BYTES, MAX_LIVE_TOOL_OUTPUT_BYTES},
+};
 
 fn id<T>(byte: u8, constructor: impl FnOnce([u8; 16]) -> T) -> T {
     constructor([byte; 16])
@@ -276,7 +280,7 @@ fn edit_previews_are_kept_only_while_the_approval_is_pending() {
     tool_call.state = ToolCallState::Running;
     app.apply_live_event(envelope(3, SessionEvent::ToolCallStarted { tool_call }));
     assert!(app.pending_approval_edit().is_none());
-    assert!(app.edit_previews.is_empty());
+    assert!(app.sessions[&session_id].edit_previews.is_empty());
 }
 
 #[test]
@@ -689,7 +693,10 @@ fn session_deleted_event_drops_state_and_refocuses_a_neighbor() {
             state: ToolCallState::Running,
             ..fixtures::tool_call(tool_call_id, deleted, "shell")
         });
-    app.live_tool_output
+    app.sessions
+        .get_mut(&deleted)
+        .unwrap()
+        .live_tool_output
         .insert(tool_call_id, "output tail".to_owned());
     app.open_sessions();
 
@@ -706,7 +713,6 @@ fn session_deleted_event_drops_state_and_refocuses_a_neighbor() {
 
     assert!(changed);
     assert!(!app.sessions.contains_key(&deleted));
-    assert!(!app.live_tool_output.contains_key(&tool_call_id));
     assert_eq!(app.focused(), Some(neighbor));
     assert_eq!(app.session_picker_selected(), Some(neighbor));
     // The refocus fetches the neighbor's transcript.
@@ -1439,7 +1445,10 @@ fn live_tool_output_keeps_a_bounded_tail_and_drops_on_terminal_states() {
     app.apply_live_event(delta(2, "hello "));
     app.apply_live_event(delta(3, "world\n"));
     assert_eq!(
-        app.live_tool_output.get(&tool_call_id).map(String::as_str),
+        app.sessions[&session_id]
+            .live_tool_output
+            .get(&tool_call_id)
+            .map(String::as_str),
         Some("hello world\n")
     );
 
@@ -1447,7 +1456,10 @@ fn live_tool_output_keeps_a_bounded_tail_and_drops_on_terminal_states() {
     // and trimming lands on a character boundary even when the bound
     // falls inside a multi-byte character.
     app.apply_live_event(delta(4, &"€".repeat(2 * MAX_LIVE_TOOL_OUTPUT_BYTES / 3)));
-    let buffer = app.live_tool_output.get(&tool_call_id).unwrap();
+    let buffer = app.sessions[&session_id]
+        .live_tool_output
+        .get(&tool_call_id)
+        .unwrap();
     assert!(buffer.len() <= MAX_LIVE_TOOL_OUTPUT_BYTES);
     assert!(buffer.len() > MAX_LIVE_TOOL_OUTPUT_BYTES - 4);
     assert!(buffer.chars().all(|character| character == '€'));
@@ -1466,15 +1478,15 @@ fn live_tool_output_keeps_a_bounded_tail_and_drops_on_terminal_states() {
             },
         },
     ));
-    assert!(app.live_tool_output.is_empty());
+    assert!(app.sessions[&session_id].live_tool_output.is_empty());
 
     // A session snapshot reload replaces live per-call state wholesale.
     app.apply_live_event(delta(6, "restarted\n"));
-    assert!(!app.live_tool_output.is_empty());
+    assert!(!app.sessions[&session_id].live_tool_output.is_empty());
     let mut reloaded = initial;
     reloaded.cursor.sequence = 7;
     app.apply_snapshot(reloaded);
-    assert!(app.live_tool_output.is_empty());
+    assert!(app.sessions[&session_id].live_tool_output.is_empty());
 }
 
 #[test]

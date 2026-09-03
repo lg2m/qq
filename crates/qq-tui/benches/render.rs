@@ -46,6 +46,10 @@ fn main() {
     streaming_background(iterations);
     children_with_sidebar(iterations);
     keystroke_echo(iterations);
+    tool_calls_32(iterations);
+    sessions_200_with_sidebar(iterations);
+    picker_open_close(iterations);
+    resize_horizontal(iterations);
 }
 
 /// Sixty-four completed messages, no changes between frames. Measures the
@@ -215,6 +219,59 @@ fn keystroke_echo(iterations: u32) {
         harness.draw().len()
     });
     report_samples("keystroke_to_frame", &samples);
+}
+
+/// Thirty-two completed tool calls in the visible run, collapsed and then
+/// expanded. Tool rows are rebuilt every frame today; the refinement plan
+/// budgets this at 60 µs p95.
+fn tool_calls_32(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, 4);
+    harness.hide_sidebar();
+    harness.add_tool_calls(32);
+    black_box(harness.draw());
+    let samples = collect(iterations, || harness.draw().len());
+    report_samples("tool_calls_32_frame", &samples);
+    harness.expand_tools();
+    black_box(harness.draw());
+    let samples = collect(iterations, || harness.draw().len());
+    report_samples("tool_calls_32_expanded_frame", &samples);
+}
+
+/// Two hundred sessions listed with the sidebar shown; the frame must scale
+/// with visible rows, not sessions.
+fn sessions_200_with_sidebar(iterations: u32) {
+    let mut harness = BenchHarness::with_sessions(SIZE, 200);
+    harness.show_sidebar();
+    black_box(harness.draw());
+    let samples = collect(iterations, || harness.draw().len());
+    report_samples("sessions_200_with_sidebar_frame", &samples);
+}
+
+/// Open and dismiss the session picker over a steady transcript. Any cache
+/// invalidation on overlay open shows up here as a relayout on close.
+fn picker_open_close(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 4, STEADY_MESSAGES);
+    harness.hide_sidebar();
+    harness.settle_highlights();
+    let samples = collect(iterations, || {
+        harness.open_and_close_session_picker();
+        0
+    });
+    report_samples("picker_open_close_cycle", &samples);
+}
+
+/// Alternate the width by one column and draw the full frame, as a user
+/// dragging a terminal edge does.
+fn resize_horizontal(iterations: u32) {
+    let mut harness = BenchHarness::new(SIZE, 1, STEADY_MESSAGES);
+    harness.hide_sidebar();
+    harness.settle_highlights();
+    let mut delta = 1;
+    let samples = collect(iterations, || {
+        delta = -delta;
+        harness.resize(delta).len()
+    });
+    report_samples("resize_horizontal_full_frame", &samples);
 }
 
 fn timed<T>(mut work: impl FnMut() -> T) -> (u128, T) {

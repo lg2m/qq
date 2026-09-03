@@ -31,7 +31,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     Layout,
-    app::{App, ToolDetail, terminal_safe_character},
+    app::{App, SessionView, ToolDetail, terminal_safe_character},
     input::{Mode, SessionConfirm},
     panes::{PaneId, Rect, Tile, Viewport},
     render::{

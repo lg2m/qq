@@ -3,13 +3,14 @@ use std::collections::{HashMap, VecDeque};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandRequest, EditPreview, MessageSnapshot, ModelDescriptor, ModelSelection, RunActivity,
-    RunId, SessionCommand, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
-    SessionSummary, SnapshotRequest, SteeringCapabilities, ToolCallSnapshot, ToolCallState,
-    WorkspaceId, WorkspaceSnapshot,
+    CommandRequest, EditPreview, ModelDescriptor, ModelSelection, SessionCommand,
+    SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SnapshotRequest,
+    SteeringCapabilities, ToolCallSnapshot, ToolCallState, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
+pub(crate) use crate::model::{LiveStatus, ReasoningDetail, SessionView};
+use crate::model::{MAX_PROMPT_HISTORY, MAX_QUEUED_DRAFTS, WARM_BODY_LIMIT};
 use crate::{
     Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Layout,
     Settings,
@@ -33,14 +34,10 @@ const MAX_RECENT_TOOL_CALLS: usize = 64;
 /// Per-call cap on buffered live tool output. The buffer is a display tail,
 /// not a record: the head drops first, and the persisted bounded result
 /// replaces the buffer when the call finishes.
-const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
-const MAX_PROMPT_HISTORY: usize = 100;
 const MOUSE_SCROLL_ROWS: usize = 3;
 /// Notices are deliberately ephemeral. At the 125 ms UI tick this keeps each
 /// notice visible for five seconds without making it permanent UI.
 const NOTICE_TICKS: u16 = 40;
-/// Locally queued drafts per session.
-const MAX_QUEUED_DRAFTS: usize = 8;
 /// Animation ticks (125 ms) within which a second Esc cancels the active run.
 const ESC_CANCEL_TICKS: usize = 16;
 
@@ -95,208 +92,6 @@ pub enum TuiError {
     Terminal(#[from] std::io::Error),
     #[error("TUI client stopped")]
     ClientStopped,
-}
-
-/// Warm transcript bodies kept loaded at once. The focused session is always
-/// warm; the rest are the most recently focused sessions so switching back
-/// costs no round trip.
-const WARM_BODY_LIMIT: usize = 8;
-/// Bytes of assistant text retained per session for the live status tail.
-const LIVE_TAIL_BYTES: usize = 256;
-
-/// Bytes of reasoning text retained per run.
-const MAX_REASONING_BYTES: usize = 16 * 1024;
-
-/// One run's displayable reasoning: text accumulated from `ReasoningDelta`
-/// events plus whether the block is still streaming.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Reasoning {
-    pub text: String,
-    pub streaming: bool,
-    /// Animation ticks observed while streaming, for an elapsed label.
-    pub ticks: usize,
-}
-
-impl Reasoning {
-    fn append(&mut self, text: &str) {
-        self.text.push_str(text);
-        if self.text.len() > MAX_REASONING_BYTES {
-            let mut start = self.text.len() - MAX_REASONING_BYTES;
-            while !self.text.is_char_boundary(start) {
-                start += 1;
-            }
-            self.text.drain(..start);
-        }
-    }
-}
-
-/// Whether reasoning blocks render as a collapsed one-liner or in full.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ReasoningDetail {
-    #[default]
-    Collapsed,
-    Expanded,
-}
-
-/// Cheap per-session liveness reduced from every event, whether or not the
-/// session's transcript body is loaded. This is what a sidebar or session
-/// list shows for the sessions the user is not looking at.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LiveStatus {
-    /// Last bytes of the newest assistant message, whitespace-collapsed.
-    pub tail: String,
-    /// The previous append ended in whitespace that has not yet been emitted
-    /// as a separator.
-    tail_space_pending: bool,
-    /// Name of the tool call currently running or awaiting approval.
-    pub active_tool: Option<String>,
-    /// Tool calls awaiting an approval answer. A set rather than a count so
-    /// replayed or repeated events cannot drift it.
-    pub awaiting_approval: std::collections::BTreeSet<qq_protocol::ToolCallId>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SessionView {
-    pub summary: SessionSummary,
-    /// `Some` only while the body is warm; `None` means summary-only.
-    pub messages: Option<Vec<MessageSnapshot>>,
-    pub tool_calls: Option<Vec<ToolCallSnapshot>>,
-    pub context_window: Option<u32>,
-    /// Latest replaceable liveness state for the active run, seeded from the
-    /// summary on load and replaced by `RunActivityChanged` events.
-    pub activity: Option<(RunId, RunActivity)>,
-    pub live: LiveStatus,
-    /// Provider-exposed reasoning per run, bounded, kept only for runs whose
-    /// messages are loaded. Display-only: never fed back to the model.
-    pub reasoning: HashMap<RunId, Reasoning>,
-    /// Focus clock at the last time this session was focused; orders warm
-    /// body eviction. Zero for never-focused sessions.
-    pub(crate) last_focused: u64,
-    pub(crate) loaded_through: u64,
-}
-
-impl SessionView {
-    pub(super) fn summary_only(
-        summary: SessionSummary,
-        context_window: Option<u32>,
-        loaded_through: u64,
-    ) -> Self {
-        let activity = summary.active_run_id.zip(summary.activity);
-        Self {
-            summary,
-            messages: None,
-            tool_calls: None,
-            context_window,
-            activity,
-            live: LiveStatus::default(),
-            reasoning: HashMap::new(),
-            last_focused: 0,
-            loaded_through,
-        }
-    }
-
-    /// Refresh the summary in place. Activity follows the summary when the
-    /// summary carries it or the run changed; a live event already applied
-    /// for the same run is kept when the summary is silent.
-    pub(super) fn set_summary(&mut self, summary: SessionSummary, context_window: Option<u32>) {
-        match (summary.active_run_id, summary.activity) {
-            (Some(run_id), Some(activity)) => self.activity = Some((run_id, activity)),
-            (Some(run_id), None) => {
-                if self.activity.is_some_and(|(active, _)| active != run_id) {
-                    self.activity = None;
-                }
-            }
-            (None, _) => self.activity = None,
-        }
-        self.summary = summary;
-        self.context_window = context_window;
-    }
-
-    pub(crate) fn is_warm(&self) -> bool {
-        self.messages.is_some()
-    }
-}
-
-impl LiveStatus {
-    /// Derive status from a loaded body, as after a snapshot.
-    fn from_body(messages: &[MessageSnapshot], tool_calls: &[ToolCallSnapshot]) -> Self {
-        let mut live = Self::default();
-        if let Some(message) = messages
-            .iter()
-            .rev()
-            .find(|message| message.role == qq_protocol::MessageRole::Assistant)
-        {
-            live.set_tail(&message.output);
-        }
-        for call in tool_calls {
-            live.note_tool_call(call);
-        }
-        live
-    }
-
-    /// Replace the tail with the last [`LIVE_TAIL_BYTES`] of `text`, with
-    /// whitespace collapsed to single spaces so it fits one row.
-    pub(super) fn set_tail(&mut self, text: &str) {
-        let mut start = text.len().saturating_sub(LIVE_TAIL_BYTES);
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        self.tail.clear();
-        self.tail_space_pending = false;
-        self.push_collapsed(&text[start..]);
-    }
-
-    fn push_collapsed(&mut self, text: &str) {
-        for character in text.chars() {
-            if character.is_whitespace() {
-                self.tail_space_pending = !self.tail.is_empty();
-            } else if let Some(character) = terminal_safe_character(character) {
-                if self.tail_space_pending {
-                    self.tail.push(' ');
-                    self.tail_space_pending = false;
-                }
-                self.tail.push(character);
-            }
-        }
-    }
-
-    /// Append streamed text and trim the front back to the byte bound.
-    pub(super) fn append_tail(&mut self, text: &str) {
-        if text.len() >= LIVE_TAIL_BYTES {
-            self.set_tail(text);
-            return;
-        }
-        self.push_collapsed(text);
-        if self.tail.len() > LIVE_TAIL_BYTES {
-            let mut start = self.tail.len() - LIVE_TAIL_BYTES;
-            while !self.tail.is_char_boundary(start) {
-                start += 1;
-            }
-            self.tail.drain(..start);
-        }
-    }
-
-    pub(super) fn note_tool_call(&mut self, call: &ToolCallSnapshot) {
-        match call.state {
-            ToolCallState::AwaitingApproval => {
-                self.awaiting_approval.insert(call.id);
-                self.active_tool = Some(call.name.clone());
-            }
-            ToolCallState::Running | ToolCallState::Requested => {
-                self.awaiting_approval.remove(&call.id);
-                self.active_tool = Some(call.name.clone());
-            }
-            ToolCallState::Completed
-            | ToolCallState::Failed
-            | ToolCallState::Denied
-            | ToolCallState::Interrupted => {
-                self.awaiting_approval.remove(&call.id);
-                if self.active_tool.as_deref() == Some(call.name.as_str()) {
-                    self.active_tool = None;
-                }
-            }
-        }
-    }
 }
 
 /// Whether the live session tree renders beside the transcript.
@@ -418,15 +213,11 @@ pub(crate) struct App {
     /// The open overlay, if any. At most one overlay owns input at a time.
     pub overlay: Option<Overlay>,
     pub composer: Composer,
-    prompt_history: HashMap<SessionId, VecDeque<String>>,
     history_position: Option<usize>,
     history_draft: Option<String>,
     /// Cursor into the slash autocomplete list. The query is the composer
     /// text itself, so only the cursor lives here.
     slash: Picker,
-    /// Drafts held locally (Alt-Enter) while the focused session runs; they
-    /// submit in order when it goes idle. Bounded by [`MAX_QUEUED_DRAFTS`].
-    drafts: HashMap<SessionId, VecDeque<String>>,
     /// Tick at which Esc was last pressed with nothing to dismiss; a second
     /// press within [`ESC_CANCEL_TICKS`] cancels the active run.
     esc_armed_at: Option<usize>,
@@ -466,12 +257,6 @@ pub(crate) struct App {
     recent_events: VecDeque<SessionEventEnvelope>,
     pending: HashMap<CommandId, PendingIntent>,
     answered_approvals: std::collections::HashSet<qq_protocol::ToolCallId>,
-    /// Diff previews carried by approval requests, kept only while the call
-    /// awaits an answer so the modal can show what an edit would change.
-    edit_previews: HashMap<qq_protocol::ToolCallId, EditPreview>,
-    /// Bounded tails of live streamed output per running tool call, dropped
-    /// when the call reaches a terminal state or the session state reloads.
-    pub live_tool_output: HashMap<qq_protocol::ToolCallId, String>,
     /// Requests produced while applying client updates (for example the
     /// snapshot fetch after a remote deletion refocuses), drained by the
     /// terminal loop after each update.
@@ -492,11 +277,9 @@ impl App {
             focus_clock: 0,
             overlay: None,
             composer: Composer::default(),
-            prompt_history: HashMap::new(),
             history_position: None,
             history_draft: None,
             slash: Picker::new(),
-            drafts: HashMap::new(),
             esc_armed_at: None,
             editor_requested: false,
             steering: None,
@@ -523,8 +306,6 @@ impl App {
             recent_events: VecDeque::new(),
             pending: HashMap::new(),
             answered_approvals: std::collections::HashSet::new(),
-            edit_previews: HashMap::new(),
-            live_tool_output: HashMap::new(),
             queued_requests: Vec::new(),
         }
     }
@@ -597,8 +378,6 @@ impl App {
                 self.overlay = None;
                 self.last_sequence = 0;
                 self.recent_events.clear();
-                self.edit_previews.clear();
-                self.live_tool_output.clear();
                 self.set_warning("session state reset after reconnecting".to_owned());
                 self.apply_snapshot(snapshot)
             }
@@ -851,22 +630,6 @@ impl App {
     /// `evict_cold_bodies` enforces the warm limit afterwards.
     fn install_session_snapshot(&mut self, snapshot: SessionSnapshot, loaded_through: u64) {
         let session_id = snapshot.summary.id;
-        // Live tool output for calls this body no longer reports as running
-        // would render forever; drop this session's buffers.
-        let running: std::collections::HashSet<_> = snapshot
-            .tool_calls
-            .iter()
-            .filter(|call| call.state == ToolCallState::Running)
-            .map(|call| call.id)
-            .collect();
-        self.live_tool_output.retain(|id, _| {
-            running.contains(id)
-                || self
-                    .sessions
-                    .get(&session_id)
-                    .and_then(|session| session.tool_calls.as_ref())
-                    .is_none_or(|calls| !calls.iter().any(|call| call.id == *id))
-        });
         let mut messages = snapshot.messages;
         retain_recent_messages(&mut messages);
         let history = messages
@@ -875,27 +638,33 @@ impl App {
             .map(|message| message.output.clone())
             .filter(|prompt| !prompt.trim().is_empty())
             .collect::<VecDeque<_>>();
-        self.prompt_history.insert(
-            session_id,
-            history
-                .into_iter()
-                .rev()
-                .take(MAX_PROMPT_HISTORY)
-                .rev()
-                .collect(),
-        );
         let mut tool_calls = snapshot.tool_calls;
         retain_recent_tool_calls(&mut tool_calls);
         let context_window = model_context_window(&self.models, snapshot.summary.model.as_deref());
-        let last_focused = self
-            .sessions
-            .get(&session_id)
-            .map_or(0, |session| session.last_focused);
+        let previous = self.sessions.remove(&session_id);
         let mut view = SessionView::summary_only(snapshot.summary, context_window, loaded_through);
         view.live = LiveStatus::from_body(&messages, &tool_calls);
+        view.prompt_history = history
+            .into_iter()
+            .rev()
+            .take(MAX_PROMPT_HISTORY)
+            .rev()
+            .collect();
+        if let Some(previous) = previous {
+            view.last_focused = previous.last_focused;
+            view.drafts = previous.drafts;
+            // Live tool output for calls this body no longer reports as
+            // running would render forever; keep only the running ones.
+            view.live_tool_output = previous.live_tool_output;
+            view.live_tool_output.retain(|id, _| {
+                tool_calls
+                    .iter()
+                    .any(|call| call.id == *id && call.state == ToolCallState::Running)
+            });
+            view.edit_previews = previous.edit_previews;
+        }
         view.messages = Some(messages);
         view.tool_calls = Some(tool_calls);
-        view.last_focused = last_focused;
         self.sessions.insert(session_id, view);
     }
 
@@ -949,12 +718,7 @@ impl App {
         let evict = warm.len() - keep;
         for (_, session_id) in warm.into_iter().take(evict) {
             if let Some(session) = self.sessions.get_mut(&session_id) {
-                if let Some(calls) = session.tool_calls.take() {
-                    for call in calls {
-                        self.live_tool_output.remove(&call.id);
-                    }
-                }
-                session.messages = None;
+                session.evict_body();
             }
         }
     }
@@ -1596,7 +1360,7 @@ impl App {
                 (true, Vec::new())
             }
             Command::PreviousLayout => {
-                self.layout = self.layout.previous();
+                self.layout = self.layout.next();
                 (true, Vec::new())
             }
             Command::ToggleToolDetail => {
@@ -2290,14 +2054,16 @@ impl App {
             self.set_warning("create a session before queueing a prompt".to_owned());
             return (true, Vec::new());
         };
-        let drafts = self.drafts.entry(session_id).or_default();
-        if drafts.len() >= MAX_QUEUED_DRAFTS {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return (false, Vec::new());
+        };
+        if session.drafts.len() >= MAX_QUEUED_DRAFTS {
             self.set_warning(format!(
                 "at most {MAX_QUEUED_DRAFTS} drafts can wait per session"
             ));
             return (true, Vec::new());
         }
-        drafts.push_back(prompt);
+        session.drafts.push_back(prompt);
         self.composer.clear();
         self.reset_history_browse();
         self.slash.select(0);
@@ -2317,17 +2083,17 @@ impl App {
             }
             // The draft just queued is newest; rotate so the previously
             // newest one comes back.
-            if let Some(drafts) = self.drafts.get_mut(&session_id)
-                && drafts.len() > 1
-                && let Some(just_queued) = drafts.pop_back()
+            if let Some(session) = self.sessions.get_mut(&session_id)
+                && session.drafts.len() > 1
+                && let Some(just_queued) = session.drafts.pop_back()
             {
-                drafts.push_front(just_queued);
+                session.drafts.push_front(just_queued);
             }
         }
         let Some(draft) = self
-            .drafts
+            .sessions
             .get_mut(&session_id)
-            .and_then(VecDeque::pop_back)
+            .and_then(|session| session.drafts.pop_back())
         else {
             return (false, Vec::new());
         };
@@ -2337,10 +2103,10 @@ impl App {
 
     /// Drafts waiting for `session_id` in submission order.
     pub(crate) fn queued_drafts(&self, session_id: SessionId) -> impl Iterator<Item = &str> {
-        self.drafts
+        self.sessions
             .get(&session_id)
             .into_iter()
-            .flatten()
+            .flat_map(|session| &session.drafts)
             .map(String::as_str)
     }
 
@@ -2349,9 +2115,9 @@ impl App {
     /// own run in order.
     pub(super) fn flush_draft(&mut self, session_id: SessionId) {
         let Some(draft) = self
-            .drafts
+            .sessions
             .get_mut(&session_id)
-            .and_then(VecDeque::pop_front)
+            .and_then(|session| session.drafts.pop_front())
         else {
             return;
         };
@@ -2360,13 +2126,8 @@ impl App {
     }
 
     fn record_prompt(&mut self, session_id: SessionId, prompt: &str) {
-        let history = self.prompt_history.entry(session_id).or_default();
-        if history.back().is_some_and(|previous| previous == prompt) {
-            return;
-        }
-        history.push_back(prompt.to_owned());
-        while history.len() > MAX_PROMPT_HISTORY {
-            history.pop_front();
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.record_prompt(prompt);
         }
     }
 
@@ -2374,7 +2135,11 @@ impl App {
         let Some(session_id) = self.focused() else {
             return false;
         };
-        let Some(history) = self.prompt_history.get(&session_id) else {
+        let Some(history) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| &session.prompt_history)
+        else {
             return false;
         };
         if history.is_empty() {
@@ -2482,7 +2247,11 @@ impl App {
 
     /// The diff preview carried by the pending approval's request, if any.
     pub(crate) fn pending_approval_edit(&self) -> Option<&EditPreview> {
-        self.edit_previews.get(&self.pending_approval()?.id)
+        let tool_call = self.pending_approval()?;
+        self.sessions
+            .get(&tool_call.session_id)?
+            .edit_previews
+            .get(&tool_call.id)
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {

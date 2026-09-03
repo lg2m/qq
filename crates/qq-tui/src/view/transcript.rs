@@ -782,8 +782,8 @@ impl TranscriptCache {
         self.append_message_indices(
             &mut focused,
             app,
+            session,
             messages,
-            session.tool_calls.as_deref().unwrap_or_default(),
             selected,
             content_width,
         );
@@ -847,12 +847,12 @@ impl TranscriptCache {
                 muted(),
             ));
         }
-        self.append_messages(
+        self.append_message_indices(
             &mut body,
             app,
+            session,
             messages,
-            session.tool_calls.as_deref().unwrap_or_default(),
-            hidden,
+            hidden..messages.len(),
             width,
         );
         for prompt in app.pending_prompts(session_id) {
@@ -881,34 +881,16 @@ impl TranscriptCache {
         body
     }
 
-    fn append_messages<'a>(
-        &'a self,
-        body: &mut VirtualBody<'a>,
-        app: &App,
-        messages: &[MessageSnapshot],
-        tool_calls: &[ToolCallSnapshot],
-        start: usize,
-        width: usize,
-    ) {
-        self.append_message_indices(
-            body,
-            app,
-            messages,
-            tool_calls,
-            start..messages.len(),
-            width,
-        );
-    }
-
     fn append_message_indices<'a>(
         &'a self,
         body: &mut VirtualBody<'a>,
         app: &App,
+        session: &SessionView,
         messages: &[MessageSnapshot],
-        tool_calls: &[ToolCallSnapshot],
         indices: impl IntoIterator<Item = usize>,
         width: usize,
     ) {
+        let tool_calls = session.tool_calls.as_deref().unwrap_or_default();
         for index in indices {
             let message = &messages[index];
             if !body.is_empty() {
@@ -957,7 +939,7 @@ impl TranscriptCache {
                 if head > 0 {
                     body.extend_owned(render_tool_calls(
                         &run_calls[..head],
-                        &app.live_tool_output,
+                        &session.live_tool_output,
                         app.tool_detail,
                         app.animation_tick,
                         width,
@@ -977,7 +959,7 @@ impl TranscriptCache {
                     body.push_line(Line::default());
                     body.extend_owned(render_tool_calls(
                         &run_calls[head..],
-                        &app.live_tool_output,
+                        &session.live_tool_output,
                         app.tool_detail,
                         app.animation_tick,
                         width,
@@ -1000,7 +982,7 @@ impl TranscriptCache {
                         body.push_line(Line::default());
                         body.extend_owned(render_tool_calls(
                             &orphan_calls,
-                            &app.live_tool_output,
+                            &session.live_tool_output,
                             app.tool_detail,
                             app.animation_tick,
                             width,

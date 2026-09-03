@@ -9,9 +9,8 @@ use qq_protocol::{
 };
 
 use super::{
-    App, Attention, MAX_LIVE_TOOL_OUTPUT_BYTES, MAX_RECENT_TOOL_CALLS, PendingIntent,
-    SNAPSHOT_MESSAGE_LIMIT, SNAPSHOT_SESSION_LIMIT, SessionView, format_bytes,
-    model_context_window,
+    App, Attention, MAX_RECENT_TOOL_CALLS, PendingIntent, SNAPSHOT_MESSAGE_LIMIT,
+    SNAPSHOT_SESSION_LIMIT, SessionView, format_bytes, model_context_window,
 };
 use crate::{
     ClientRequest,
@@ -140,10 +139,10 @@ impl App {
                         session_title: session.summary.title.clone(),
                     });
                 }
-                if let Some(edit) = edit {
-                    self.edit_previews.insert(tool_call.id, edit.clone());
-                }
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    if let Some(edit) = edit {
+                        session.edit_previews.insert(tool_call.id, edit.clone());
+                    }
                     session.live.note_tool_call(tool_call);
                 }
                 self.upsert_tool_call(tool_call.clone());
@@ -155,7 +154,9 @@ impl App {
                 tool_call_id,
                 chunk,
             } => {
-                self.append_live_tool_output(*tool_call_id, chunk);
+                if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    session.append_live_tool_output(*tool_call_id, chunk);
+                }
             }
             SessionEvent::ToolCallRequested { tool_call }
             | SessionEvent::ToolApprovalResolved { tool_call, .. }
@@ -172,13 +173,15 @@ impl App {
                 }
                 if tool_call.state != ToolCallState::AwaitingApproval {
                     self.answered_approvals.remove(&tool_call.id);
-                    self.edit_previews.remove(&tool_call.id);
-                }
-                if tool_call_state_is_terminal(tool_call.state) {
-                    // The persisted bounded result takes over from the tail.
-                    self.live_tool_output.remove(&tool_call.id);
                 }
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
+                    if tool_call.state != ToolCallState::AwaitingApproval {
+                        session.edit_previews.remove(&tool_call.id);
+                    }
+                    if tool_call_state_is_terminal(tool_call.state) {
+                        // The persisted bounded result takes over from the tail.
+                        session.live_tool_output.remove(&tool_call.id);
+                    }
                     session.live.note_tool_call(tool_call);
                 }
                 self.upsert_tool_call(tool_call.clone());
@@ -353,7 +356,6 @@ impl App {
         if !self.sessions.contains_key(&session_id) {
             return;
         }
-        self.drafts.remove(&session_id);
         // Every pane showing the deleted session moves to its neighbour in
         // thread order; the focused pane's replacement is fetched if cold.
         let showing: Vec<PaneId> = self.panes.panes_showing(session_id).collect();
@@ -379,8 +381,6 @@ impl App {
             return;
         };
         for call in removed.tool_calls.iter().flatten() {
-            self.live_tool_output.remove(&call.id);
-            self.edit_previews.remove(&call.id);
             self.answered_approvals.remove(&call.id);
         }
         self.pending.retain(|_, intent| {
@@ -499,21 +499,6 @@ impl App {
             .iter_mut()
             .rev()
             .find(|message| message.id == message_id)
-    }
-
-    /// Appends one live output chunk to a call's tail buffer, dropping the
-    /// oldest bytes past the bound. Trimming lands on a character boundary so
-    /// a chunk split mid-UTF-8 sequence still renders sanely.
-    fn append_live_tool_output(&mut self, tool_call_id: qq_protocol::ToolCallId, chunk: &str) {
-        let buffer = self.live_tool_output.entry(tool_call_id).or_default();
-        buffer.push_str(chunk);
-        if buffer.len() > MAX_LIVE_TOOL_OUTPUT_BYTES {
-            let mut start = buffer.len() - MAX_LIVE_TOOL_OUTPUT_BYTES;
-            while !buffer.is_char_boundary(start) {
-                start += 1;
-            }
-            buffer.drain(..start);
-        }
     }
 
     pub(super) fn upsert_tool_call(&mut self, tool_call: ToolCallSnapshot) {

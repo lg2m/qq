@@ -7,7 +7,8 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use qq_protocol::{
     MessageId, MessageSnapshot, MessageState, RunActivity, RunId, SessionEvent, SessionId,
-    SessionSnapshot, SessionStatus, SessionSummary, TextChannel, WorkspaceSnapshot,
+    SessionSnapshot, SessionStatus, SessionSummary, TextChannel, ToolCallId, ToolCallSnapshot,
+    WorkspaceSnapshot,
 };
 
 use crate::{ClientUpdate, TuiOptions, app::App, fixtures, view::FrameRenderer};
@@ -245,4 +246,76 @@ fn assistant_message(session_id: SessionId, index: u8, output: &str) -> MessageS
         created_at_ms: u64::from(index),
         ..fixtures::message(MessageId::from_bytes(bytes), session_id, output)
     }
+}
+
+impl BenchHarness {
+    /// A workspace with `sessions` root sessions listed in the sidebar; only
+    /// the first is warm. Sessions beyond 255 are not needed: the sidebar
+    /// cost is per visible row and the store cost is per session.
+    #[must_use]
+    pub fn with_sessions(size: (u16, u16), sessions: u8) -> Self {
+        Self::new(size, sessions, 8)
+    }
+
+    /// Load `count` completed tool calls into the focused session's most
+    /// recent run: a mix of reads, edits, and shell commands with results,
+    /// as an agent's working turn looks.
+    pub fn add_tool_calls(&mut self, count: u8) {
+        let run_id = run_id(0);
+        for index in 0..count {
+            let (name, arguments, result) = match index % 3 {
+                0 => (
+                    "read_file",
+                    format!(r#"{{"path":"crates/qq-tui/src/file_{index}.rs"}}"#),
+                    "fn main() {}\n".repeat(20),
+                ),
+                1 => (
+                    "edit_file",
+                    format!(r#"{{"path":"crates/qq-tui/src/file_{index}.rs","content":"x"}}"#),
+                    "edited".to_owned(),
+                ),
+                _ => (
+                    "shell",
+                    format!(r#"{{"command":"cargo test -p crate_{index}"}}"#),
+                    "test result: ok. 12 passed\n".to_owned(),
+                ),
+            };
+            let mut id = [0x50; 16];
+            id[15] = index;
+            let call = ToolCallSnapshot {
+                run_id,
+                turn_ordinal: u16::from(index) + 1,
+                call_ordinal: 0,
+                arguments,
+                result: Some(result),
+                ..fixtures::tool_call(ToolCallId::from_bytes(id), session_id(0), name)
+            };
+            self.apply(0, SessionEvent::ToolCallFinished { tool_call: call });
+        }
+    }
+
+    /// Open the session picker, then dismiss it. Measures overlay open and
+    /// close including any cache work they trigger.
+    pub fn open_and_close_session_picker(&mut self) {
+        self.app.execute(crate::commands::Command::OpenSessions);
+        black_box_draw(self);
+        self.app
+            .handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        black_box_draw(self);
+    }
+
+    /// Resize the terminal by `delta` columns and draw the full frame.
+    pub fn resize(&mut self, delta: i16) -> Vec<u8> {
+        self.size.0 = self.size.0.saturating_add_signed(delta).max(40);
+        self.draw_full()
+    }
+
+    /// Set `expanded` tool detail so expanded rows are rendered.
+    pub fn expand_tools(&mut self) {
+        self.app.tool_detail = crate::app::ToolDetail::Expanded;
+    }
+}
+
+fn black_box_draw(harness: &mut BenchHarness) {
+    std::hint::black_box(harness.draw());
 }
