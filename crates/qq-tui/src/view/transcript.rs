@@ -868,7 +868,14 @@ impl TranscriptCache {
             Line::default(),
         ]);
         let Some(session_id) = session_id else {
-            body.push_line(Line::styled("  Alt-N creates the first session.", muted()));
+            body.push_line(Line::styled(
+                format!(
+                    "  {} creates the first session.",
+                    app.chord_label(crate::commands::Command::NewRootSession)
+                        .unwrap_or_else(|| "/new".to_owned())
+                ),
+                muted(),
+            ));
             return body;
         };
         let Some(session) = app.sessions.get(&session_id) else {
@@ -949,7 +956,14 @@ impl TranscriptCache {
             ..VirtualBody::default()
         };
         let Some(session_id) = session_id else {
-            body.push_line(Line::styled("  Alt-N creates the first session.", muted()));
+            body.push_line(Line::styled(
+                format!(
+                    "  {} creates the first session.",
+                    app.chord_label(crate::commands::Command::NewRootSession)
+                        .unwrap_or_else(|| "/new".to_owned())
+                ),
+                muted(),
+            ));
             return body;
         };
         let Some(session) = app.sessions.get(&session_id) else {
@@ -1314,7 +1328,9 @@ pub(super) fn reasoning_rows(
             if !summary.is_empty() {
                 header.push(format!("  {summary}"), muted());
             }
-            header.push("  Ctrl-R", muted().dim());
+            if let Some(chord) = app.chord_label(crate::commands::Command::ToggleReasoning) {
+                header.push(format!("  {chord}"), muted());
+            }
             vec![truncate_line(header, width)]
         }
         crate::app::ReasoningDetail::Expanded => {

@@ -203,7 +203,14 @@ fn terminal_input_modes_enable_and_restore_keyboard_mouse_and_paste() {
     let restored = String::from_utf8(restored).unwrap();
     // Kitty keyboard protocol: DISAMBIGUATE | REPORT_EVENT_TYPES => 3
     assert!(entered.contains("\x1b[>3u"));
-    assert!(entered.contains("\x1b[?1000h"));
+    assert!(
+        !entered.contains("\x1b[?1000h"),
+        "mouse capture is off by default so terminal selection works"
+    );
+    assert_eq!(
+        String::from_utf8(mouse_capture_bytes(true).unwrap()).unwrap(),
+        "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h"
+    );
     assert!(entered.contains("\x1b[?2004h"));
     assert!(restored.contains("\x1b[?1000l"));
     assert!(restored.contains("\x1b[?2004l"));

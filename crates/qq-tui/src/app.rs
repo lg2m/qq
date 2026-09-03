@@ -17,7 +17,7 @@ use crate::{
     commands::{self, Command, SlashEntry},
     composer::Composer,
     effect::{Effect, Effects, Redraw},
-    input::{Mode, Overlay, SessionConfirm},
+    input::{Mode, Overlay},
     panes::{Axis, Direction, PaneId, Panes, Viewport},
     picker::Picker,
     terminal,
@@ -25,6 +25,7 @@ use crate::{
 };
 use reduce::{retain_recent_messages, retain_recent_tool_calls};
 
+mod pickers;
 mod reduce;
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
@@ -247,6 +248,9 @@ pub(crate) struct App {
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
     /// enough; the toggle command cycles through explicit on and off.
     pub sidebar: Sidebar,
+    /// Whether the terminal reports mouse events to us. Off by default so
+    /// native selection and copy keep working; `/mouse` turns it on.
+    pub(crate) mouse_capture: bool,
     /// Terminal width from the last resize event, so update paths can decide
     /// whether a change to an unshown session is visible at all. Zero until
     /// the first resize, which reads as "assume visible".
@@ -294,6 +298,7 @@ impl App {
             reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
             terminal_width: 0,
+            mouse_capture: false,
             themes: if options.themes.is_empty() {
                 vec![Theme::default()]
             } else {
@@ -473,53 +478,6 @@ impl App {
             ClientUpdate::SnapshotFailed(error) => {
                 self.set_warning(error.message().to_owned());
                 Effects::redraw(Redraw::Scheduled)
-            }
-        }
-    }
-
-    fn apply_models(
-        &mut self,
-        models: Vec<ModelDescriptor>,
-        selected_model: Option<ModelSelection>,
-    ) {
-        // Remember what the open model picker points at so the refreshed
-        // catalog keeps the cursor on the same model.
-        let selected = match &self.overlay {
-            Some(Overlay::Models(picker)) => {
-                let filtered = self.filtered_models();
-                filtered
-                    .get(picker.selected(filtered.len()))
-                    .and_then(|index| self.models.get(*index))
-                    .map(|model| (model.provider.clone(), model.model.clone()))
-            }
-            Some(Overlay::Sessions { .. } | Overlay::Themes { .. }) | None => None,
-        };
-        self.models = models.into_iter().map(Into::into).collect();
-        self.models.sort_by(|left, right| {
-            (&left.provider, &left.name, &left.model).cmp(&(
-                &right.provider,
-                &right.name,
-                &right.model,
-            ))
-        });
-        if let Some(selected_model) = selected_model {
-            self.model = selected_model;
-        }
-        for session in self.sessions.values_mut() {
-            session.context_window =
-                model_context_window(&self.models, session.summary.model.as_deref());
-        }
-        if matches!(self.overlay, Some(Overlay::Models(_))) {
-            let identities: Vec<(String, String)> = self
-                .filtered_models()
-                .into_iter()
-                .map(|index| {
-                    let model = &self.models[index];
-                    (model.provider.clone(), model.model.clone())
-                })
-                .collect();
-            if let Some(Overlay::Models(picker)) = &mut self.overlay {
-                picker.preserve(selected, identities);
             }
         }
     }
@@ -898,14 +856,7 @@ impl App {
             }
             Event::Paste(text) => {
                 let changed = match &mut self.overlay {
-                    Some(Overlay::Sessions { picker, .. }) => {
-                        let changed = picker.push_query(&text);
-                        self.reset_session_picker_selection();
-                        changed
-                    }
-                    Some(Overlay::Models(picker) | Overlay::Themes { picker, .. }) => {
-                        picker.push_query(&text)
-                    }
+                    Some(overlay) => overlay.push_query(&text),
                     None => self.push_composer_text(&text),
                 };
                 Effects::changed_now(changed)
@@ -948,9 +899,9 @@ impl App {
             return self.execute(Command::Quit);
         }
         match self.mode() {
-            Mode::Sessions => self.handle_session_picker_key(key),
-            Mode::Models => self.handle_model_picker_key(key),
-            Mode::Themes => self.handle_theme_picker_key(key),
+            Mode::Sessions | Mode::Models | Mode::Themes | Mode::Commands => {
+                self.handle_overlay_key(key)
+            }
             Mode::Approval => self.handle_approval_key(key),
             Mode::Compose => self.handle_compose_key(key),
         }
@@ -963,87 +914,20 @@ impl App {
             let changed = self.push_input('\n');
             return Effects::changed_now(changed);
         }
-        // Ctrl-Enter (or Ctrl-Q where the terminal cannot report it) queues
-        // the draft explicitly instead of sending it.
-        if (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
-            || (matches!(key.code, KeyCode::Char('q' | 'Q'))
-                && key.modifiers == KeyModifiers::CONTROL)
-        {
-            return self.execute(Command::QueueDraft);
-        }
-        if key.code == KeyCode::Up && key.modifiers == KeyModifiers::ALT {
-            return self.execute(Command::DequeueDraft);
-        }
-        if matches!(key.code, KeyCode::Char('e' | 'E')) && key.modifiers == KeyModifiers::ALT {
-            return self.execute(Command::OpenEditor);
-        }
         if key.code != KeyCode::Esc {
             self.esc_armed_at = None;
         }
         if let Some(result) = self.handle_slash_key(key.code) {
             return result;
         }
-        if let Some(action) = self.settings.action_for(key) {
-            return self.execute(commands::command_for_action(action));
+        // `?` on an empty composer opens help; typed into text it is a
+        // character like any other.
+        if key.code == KeyCode::Char('?') && self.composer.text.is_empty() {
+            return self.execute(Command::OpenHelp);
         }
-        // Ctrl-O cycles tool call detail. Checked after configured bindings so
-        // a user rebinding Ctrl-O keeps winning.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('o' | 'O'))
-        {
-            return self.execute(Command::ToggleToolDetail);
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('b' | 'B'))
-        {
-            return self.execute(Command::ToggleSidebar);
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('r' | 'R'))
-        {
-            return self.execute(Command::ToggleReasoning);
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('g' | 'G'))
-        {
-            return self.execute(Command::FocusNextApproval);
-        }
-        // Alt-arrows walk the session tree: down to the first child, left and
-        // right across siblings in spawn order. Alt-Up dequeues a draft (see
-        // above); Esc reaches the parent.
-        if key.modifiers == KeyModifiers::ALT {
-            let command = match key.code {
-                KeyCode::Down => Some(Command::FocusFirstChild),
-                KeyCode::Left => Some(Command::FocusPreviousSibling),
-                KeyCode::Right => Some(Command::FocusNextSibling),
-                // Panes: Alt-\ and Alt-- draw the divider they create;
-                // Alt-H/J/K/L move focus like a tiling window manager.
-                KeyCode::Char('\\') => Some(Command::SplitBeside),
-                KeyCode::Char('-') => Some(Command::SplitBelow),
-                KeyCode::Char('w' | 'W') => Some(Command::ClosePane),
-                KeyCode::Char('z' | 'Z') => Some(Command::ZoomPane),
-                KeyCode::Char('h') => Some(Command::FocusPaneLeft),
-                KeyCode::Char('j') => Some(Command::FocusPaneDown),
-                KeyCode::Char('k') => Some(Command::FocusPaneUp),
-                KeyCode::Char('l') => Some(Command::FocusPaneRight),
-                _ => None,
-            };
-            if let Some(command) = command {
-                return self.execute(command);
-            }
-        }
-        // Alt-Shift-H/J/K/L move the divider enclosing the focused pane.
-        if key.modifiers == KeyModifiers::ALT | KeyModifiers::SHIFT {
-            let command = match key.code {
-                KeyCode::Char('H') => Some(Command::ResizePaneLeft),
-                KeyCode::Char('J') => Some(Command::ResizePaneDown),
-                KeyCode::Char('K') => Some(Command::ResizePaneUp),
-                KeyCode::Char('L') => Some(Command::ResizePaneRight),
-                _ => None,
-            };
-            if let Some(command) = command {
-                return self.execute(command);
-            }
+        // Every chord lives in the command table; configured actions win.
+        if let Some(command) = commands::command_for_key(&self.settings, key) {
+            return self.execute(command);
         }
         match key.code {
             KeyCode::Esc => {
@@ -1166,104 +1050,6 @@ impl App {
         self.panes.focused().session
     }
 
-    /// The active theme. The theme picker previews by moving `theme`, so
-    /// this is always what the next frame should paint with.
-    pub(crate) fn theme(&self) -> &Theme {
-        &self.themes[self.theme.min(self.themes.len() - 1)]
-    }
-
-    fn open_themes(&mut self) -> Effects {
-        if self.themes.len() < 2 {
-            self.set_info(
-                "only the compiled `qq` theme is available; add themes/<name>.ron to choose"
-                    .to_owned(),
-            );
-            return Effects::redraw(Redraw::Immediate);
-        }
-        let mut picker = Picker::new();
-        picker.select(self.theme);
-        self.overlay = Some(Overlay::Themes {
-            picker,
-            restore: self.theme,
-        });
-        Effects::redraw(Redraw::Immediate)
-    }
-
-    /// Indexes into `themes` matching the open theme picker's query.
-    pub(crate) fn filtered_themes(&self) -> Vec<usize> {
-        let Some(Overlay::Themes { picker, .. }) = &self.overlay else {
-            return Vec::new();
-        };
-        self.themes
-            .iter()
-            .enumerate()
-            .filter(|(_, theme)| picker.matches([theme.name.as_str()]))
-            .map(|(index, _)| index)
-            .collect()
-    }
-
-    fn set_theme(&mut self, index: usize) -> bool {
-        if index >= self.themes.len() || index == self.theme {
-            return false;
-        }
-        self.theme = index;
-        self.theme_generation += 1;
-        true
-    }
-
-    /// Theme picker keys. Up/Down and typing preview the highlighted theme
-    /// immediately; Enter keeps it, Esc restores the theme that was active
-    /// when the picker opened.
-    fn handle_theme_picker_key(&mut self, key: KeyEvent) -> Effects {
-        let filtered = self.filtered_themes();
-        let Some(Overlay::Themes { picker, restore }) = &mut self.overlay else {
-            return Effects::none();
-        };
-        let restore = *restore;
-        let changed = match key.code {
-            KeyCode::Esc => {
-                self.overlay = None;
-                self.set_theme(restore);
-                return Effects::redraw(Redraw::Immediate);
-            }
-            KeyCode::Enter => {
-                let name = self.theme().name.clone();
-                self.overlay = None;
-                self.set_info(format!(
-                    "theme `{name}`; set `theme: \"{name}\"` in tui.ron to keep it"
-                ));
-                return Effects::redraw(Redraw::Immediate);
-            }
-            KeyCode::Up => {
-                picker.move_up();
-                true
-            }
-            KeyCode::Down => {
-                picker.move_down(filtered.len());
-                true
-            }
-            KeyCode::Backspace => picker.pop_query(),
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                let mut encoded = [0; 4];
-                picker.push_query(character.encode_utf8(&mut encoded))
-            }
-            _ => false,
-        };
-        if changed {
-            let filtered = self.filtered_themes();
-            if let Some(Overlay::Themes { picker, .. }) = &self.overlay
-                && let Some(index) = filtered.get(picker.selected(filtered.len()))
-            {
-                self.set_theme(*index);
-            }
-        }
-        Effects::changed_now(changed)
-    }
-
     /// An effect asking for the user's attention, or nothing while the
     /// terminal is focused: a focused user is already looking.
     pub(super) fn attention(&self, attention: Attention) -> Effects {
@@ -1373,6 +1159,8 @@ impl App {
     /// between them.
     pub(crate) fn execute(&mut self, command: Command) -> Effects {
         match command {
+            Command::OpenHelp => self.open_commands(true),
+            Command::OpenCommands => self.open_commands(false),
             Command::OpenModels => self.open_models(),
             Command::OpenThemes => self.open_themes(),
             Command::OpenSessions => self.open_sessions(),
@@ -1405,6 +1193,19 @@ impl App {
                 self.layout = self.layout.next();
                 Effects::redraw(Redraw::Immediate)
             }
+            Command::ToggleMouse => {
+                self.mouse_capture = !self.mouse_capture;
+                self.set_info(if self.mouse_capture {
+                    "mouse capture on: wheel scrolls, click focuses; terminal selection is off"
+                        .to_owned()
+                } else {
+                    "mouse capture off: terminal selection and copy work again".to_owned()
+                });
+                let mut effects = Effects::redraw(Redraw::Immediate);
+                effects.push(Effect::MouseCapture(self.mouse_capture));
+                effects
+            }
+            Command::PruneSessions => self.request_prune_confirmation(),
             Command::ToggleToolDetail => {
                 self.tool_detail = self.tool_detail.next();
                 Effects::redraw(Redraw::Immediate)
@@ -1496,111 +1297,6 @@ impl App {
         }
     }
 
-    fn open_models(&mut self) -> Effects {
-        if self.models.is_empty() {
-            self.set_warning("no authenticated providers have selectable models".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        }
-        self.overlay = Some(Overlay::Models(Picker::new()));
-        Effects::redraw(Redraw::Immediate)
-    }
-
-    /// Indexes into `models` matching the open model picker's query, in
-    /// catalog order. Empty when the model picker is closed.
-    pub(crate) fn filtered_models(&self) -> Vec<usize> {
-        let Some(Overlay::Models(picker)) = &self.overlay else {
-            return Vec::new();
-        };
-        self.models
-            .iter()
-            .enumerate()
-            .filter(|(_, option)| {
-                picker.matches([
-                    option.provider.as_str(),
-                    option.model.as_str(),
-                    option.name.as_deref().unwrap_or_default(),
-                ])
-            })
-            .map(|(index, _)| index)
-            .collect()
-    }
-
-    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Effects {
-        let filtered = self.filtered_models();
-        let Some(Overlay::Models(picker)) = &mut self.overlay else {
-            return Effects::none();
-        };
-        match key.code {
-            KeyCode::Esc => {
-                self.overlay = None;
-                Effects::redraw(Redraw::Immediate)
-            }
-            KeyCode::Up => {
-                picker.move_up();
-                Effects::redraw(Redraw::Immediate)
-            }
-            KeyCode::Down => {
-                picker.move_down(filtered.len());
-                Effects::redraw(Redraw::Immediate)
-            }
-            // Enter applies the model to the focused session; without a
-            // focus it keeps the historical create behavior. Ctrl-N always
-            // creates a session with the selected model.
-            KeyCode::Enter => {
-                let Some(model) = self.selected_picker_model(&filtered) else {
-                    return Effects::none();
-                };
-                let focused = self
-                    .focused()
-                    .filter(|session_id| self.sessions.contains_key(session_id));
-                let result = match focused {
-                    Some(session_id) => self.set_session_model(session_id, model),
-                    None => self.create_session_with_model(None, model),
-                };
-                if result
-                    .iter()
-                    .any(|effect| matches!(effect, Effect::Send(_)))
-                {
-                    self.overlay = None;
-                }
-                result
-            }
-            KeyCode::Char('n' | 'N') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let Some(model) = self.selected_picker_model(&filtered) else {
-                    return Effects::none();
-                };
-                let result = self.create_session_with_model(None, model);
-                if result
-                    .iter()
-                    .any(|effect| matches!(effect, Effect::Send(_)))
-                {
-                    self.overlay = None;
-                }
-                result
-            }
-            KeyCode::Backspace => Effects::changed_now(picker.pop_query()),
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                let mut encoded = [0; 4];
-                Effects::changed_now(picker.push_query(character.encode_utf8(&mut encoded)))
-            }
-            _ => Effects::none(),
-        }
-    }
-
-    fn selected_picker_model(&self, filtered: &[usize]) -> Option<ModelSelection> {
-        let Some(Overlay::Models(picker)) = &self.overlay else {
-            return None;
-        };
-        filtered
-            .get(picker.selected(filtered.len()))
-            .and_then(|index| self.models.get(*index))
-            .map(|option| option.selection.clone())
-    }
-
     /// Send one session command, remembering `intent` so the receipt or
     /// failure is attributed to the right session and can undo optimistic
     /// state. Every request that carries a `CommandId` goes through here.
@@ -1624,238 +1320,6 @@ impl App {
             PendingIntent::SetModel { session_id },
             SessionCommand::SetSessionModel { session_id, model },
         )
-    }
-
-    fn open_sessions(&mut self) -> Effects {
-        self.open_session_picker(None)
-    }
-
-    /// `/agents`: the focused session's root and every descendant, so the
-    /// user can see and jump between the agents one task fanned out into.
-    fn open_agents(&mut self) -> Effects {
-        let Some(focused) = self.focused() else {
-            self.set_warning("focus a session to view its agents".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
-        let mut root = focused;
-        while let Some(parent) = self
-            .sessions
-            .get(&root)
-            .and_then(|session| session.summary.parent_id)
-        {
-            root = parent;
-        }
-        self.open_session_picker(Some(root))
-    }
-
-    fn open_session_picker(&mut self, scope: Option<SessionId>) -> Effects {
-        let selected = self
-            .focused()
-            .filter(|session_id| self.sessions.contains_key(session_id))
-            .or_else(|| self.sessions.thread_order().first().copied());
-        self.overlay = Some(Overlay::Sessions {
-            picker: Picker::new(),
-            scope,
-            selected,
-            confirm: None,
-        });
-        Effects::redraw(Redraw::Immediate)
-    }
-
-    /// Sessions matching the open session picker's query, in tree order.
-    /// Empty when the session picker is closed.
-    pub(crate) fn filtered_sessions(&self) -> Vec<SessionId> {
-        let Some(Overlay::Sessions { picker, scope, .. }) = &self.overlay else {
-            return Vec::new();
-        };
-        self.sessions
-            .thread_order()
-            .iter()
-            .copied()
-            .filter(|session_id| {
-                scope.is_none_or(|root| self.is_descendant_or_self(*session_id, root))
-            })
-            .filter(|session_id| picker.matches([self.sessions[session_id].summary.title.as_str()]))
-            .collect()
-    }
-
-    fn is_descendant_or_self(&self, session_id: SessionId, root: SessionId) -> bool {
-        let mut cursor = Some(session_id);
-        while let Some(current) = cursor {
-            if current == root {
-                return true;
-            }
-            cursor = self
-                .sessions
-                .get(&current)
-                .and_then(|session| session.summary.parent_id);
-        }
-        false
-    }
-
-    /// The highlighted session in the picker, if it is still in the filtered
-    /// list.
-    pub(crate) fn session_picker_selected(&self) -> Option<SessionId> {
-        let Some(Overlay::Sessions { selected, .. }) = &self.overlay else {
-            return None;
-        };
-        (*selected).filter(|selected| self.filtered_sessions().contains(selected))
-    }
-
-    pub(crate) fn session_picker_confirm(&self) -> Option<SessionConfirm> {
-        match &self.overlay {
-            Some(Overlay::Sessions { confirm, .. }) => *confirm,
-            Some(Overlay::Models(_) | Overlay::Themes { .. }) | None => None,
-        }
-    }
-
-    fn handle_session_picker_key(&mut self, key: KeyEvent) -> Effects {
-        if let Some(confirm) = self.session_picker_confirm() {
-            return self.handle_session_picker_confirm_key(key, confirm);
-        }
-        let filtered = self.filtered_sessions();
-        let current = self.session_picker_selected();
-        let position = current.and_then(|current| filtered.iter().position(|id| *id == current));
-        match key.code {
-            KeyCode::Esc => {
-                self.overlay = None;
-                Effects::redraw(Redraw::Immediate)
-            }
-            KeyCode::Up => {
-                let next = filtered
-                    .get(position.unwrap_or_default().saturating_sub(1))
-                    .copied();
-                self.set_session_picker_selection(next);
-                Effects::redraw(Redraw::Immediate)
-            }
-            KeyCode::Down => {
-                let next = filtered
-                    .get(
-                        position
-                            .map(|position| position + 1)
-                            .unwrap_or_default()
-                            .min(filtered.len().saturating_sub(1)),
-                    )
-                    .copied();
-                self.set_session_picker_selection(next);
-                Effects::redraw(Redraw::Immediate)
-            }
-            KeyCode::Enter => {
-                let Some(current) = current else {
-                    return Effects::none();
-                };
-                self.overlay = None;
-                self.focus_session(current)
-            }
-            KeyCode::Backspace => {
-                let changed = self
-                    .overlay
-                    .as_mut()
-                    .is_some_and(|overlay| overlay.picker_mut().pop_query());
-                self.reset_session_picker_selection();
-                Effects::changed_now(changed)
-            }
-            // Ctrl-modified so plain letters keep feeding the search query.
-            KeyCode::Delete => self.request_delete_confirmation(current),
-            KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.request_delete_confirmation(current)
-            }
-            KeyCode::Char('p' | 'P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
-                    *confirm = Some(SessionConfirm::Prune);
-                }
-                Effects::redraw(Redraw::Immediate)
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                let mut encoded = [0; 4];
-                let text = character.encode_utf8(&mut encoded);
-                let changed = self
-                    .overlay
-                    .as_mut()
-                    .is_some_and(|overlay| overlay.picker_mut().push_query(text));
-                self.reset_session_picker_selection();
-                Effects::changed_now(changed)
-            }
-            _ => Effects::none(),
-        }
-    }
-
-    fn set_session_picker_selection(&mut self, next: Option<SessionId>) {
-        if let Some(Overlay::Sessions { selected, .. }) = &mut self.overlay {
-            *selected = next;
-        }
-    }
-
-    fn request_delete_confirmation(&mut self, selected: Option<SessionId>) -> Effects {
-        let Some(selected) = selected else {
-            return Effects::none();
-        };
-        if self
-            .sessions
-            .get(&selected)
-            .is_some_and(|session| session.summary.active_run_id.is_some())
-        {
-            self.set_warning("cancel the active run before deleting".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        }
-        if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
-            *confirm = Some(SessionConfirm::Delete(selected));
-        }
-        Effects::redraw(Redraw::Immediate)
-    }
-
-    fn handle_session_picker_confirm_key(
-        &mut self,
-        key: KeyEvent,
-        confirm: SessionConfirm,
-    ) -> Effects {
-        match key.code {
-            KeyCode::Char('y' | 'Y') => {
-                self.clear_session_picker_confirm();
-                match confirm {
-                    SessionConfirm::Delete(session_id) => self.delete_session(session_id),
-                    SessionConfirm::Prune => self.prune_sessions(),
-                }
-            }
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                self.clear_session_picker_confirm();
-                Effects::redraw(Redraw::Immediate)
-            }
-            _ => Effects::none(),
-        }
-    }
-
-    fn clear_session_picker_confirm(&mut self) {
-        if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
-            *confirm = None;
-        }
-    }
-
-    fn delete_session(&mut self, session_id: SessionId) -> Effects {
-        self.send(
-            PendingIntent::Delete { session_id },
-            SessionCommand::DeleteSession { session_id },
-        )
-    }
-
-    fn prune_sessions(&mut self) -> Effects {
-        let Some(workspace_id) = self.workspace_id else {
-            self.set_warning("workspace is still connecting".to_owned());
-            return Effects::redraw(Redraw::Immediate);
-        };
-        self.send(
-            PendingIntent::Prune,
-            SessionCommand::PruneSessions { workspace_id },
-        )
-    }
-
-    fn reset_session_picker_selection(&mut self) {
-        let first = self.filtered_sessions().first().copied();
-        self.set_session_picker_selection(first);
     }
 
     /// Focus a session. A warm body renders immediately with no request; a

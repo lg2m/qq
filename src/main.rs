@@ -959,7 +959,7 @@ mod tests {
 
         std::fs::write(
             path,
-            r#"(version: 1, bindings: (select_fold_focus: ["F1"]))"#,
+            r#"(version: 1, bindings: (select_fold_focus: ["F3"]))"#,
         )
         .unwrap();
         assert!(matches!(

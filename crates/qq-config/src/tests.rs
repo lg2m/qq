@@ -1007,10 +1007,10 @@ fn tui_defaults() -> TuiConfigDefaults {
     TuiConfigDefaults::new(
         TuiLayout::Threadline,
         [
-            (TuiAction::SelectThreadline, vec!["F1".to_owned()]),
-            (TuiAction::SelectFoldFocus, vec!["F2".to_owned()]),
-            (TuiAction::NextLayout, vec!["Ctrl-N".to_owned()]),
-            (TuiAction::PreviousLayout, vec!["Ctrl-P".to_owned()]),
+            (TuiAction::SelectThreadline, vec!["F3".to_owned()]),
+            (TuiAction::SelectFoldFocus, vec!["F4".to_owned()]),
+            (TuiAction::NextLayout, Vec::new()),
+            (TuiAction::PreviousLayout, Vec::new()),
             (TuiAction::ToggleNavigator, vec!["Ctrl-T".to_owned()]),
             (TuiAction::CreateRootSession, vec!["Alt-N".to_owned()]),
             (TuiAction::CreateChildSession, vec!["Alt-C".to_owned()]),

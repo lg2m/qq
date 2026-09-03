@@ -130,10 +130,10 @@ from the repository root to the current directory.
     layout: FoldFocus,
     theme: "qq",
     bindings: (
-        select_threadline: ["F1"],
-        select_fold_focus: ["F2"],
-        next_layout: ["Ctrl-N"],
-        previous_layout: ["Ctrl-P"],
+        select_threadline: ["F3"],
+        select_fold_focus: ["F4"],
+        next_layout: [],
+        previous_layout: [],
         toggle_navigator: ["Ctrl-T"],
         create_root_session: ["Alt-N"],
         create_child_session: ["Alt-C"],
@@ -145,6 +145,13 @@ from the repository root to the current directory.
 
 An omitted action inherits the previous layer. An empty list disables that
 action. Invalid chords and collisions are rejected before the TUI starts.
+
+Every other key lives in one command table. `?` on an empty composer, `F1`, or
+`/help` lists every command with its chord and slash name grouped by area;
+`Ctrl-K` or `/commands` opens the same list as a searchable palette that runs
+the highlighted command on Enter. Rebinding an action updates every hint that
+mentions it. Mouse capture is off so terminal selection and copy work; `/mouse`
+turns wheel scrolling and click-to-focus on.
 
 `theme` names a color theme. QQ ships `qq` (follows your terminal palette),
 `ink` and `ember` (its own), and ports of gruvbox, tokyonight, catppuccin,
@@ -171,9 +178,11 @@ until the run finishes and sends it as the next prompt; `Alt-Up` pulls the
 newest held draft back for editing. `Esc Esc` cancels the run. Steering is
 offered only when the server advertises it; otherwise Enter holds the draft.
 
-The interactive composer recognizes `/models`, `/theme`, `/new`, `/sessions`
-(also `/resume`), `/agents`, `/editor`, `/split`, `/stack`, `/close`, `/zoom`,
-`/compact`, and `/quit` (also `/exit`). `/compact`
+The interactive composer recognizes `/help`, `/commands`, `/models`, `/theme`,
+`/new`, `/sessions` (also `/resume`), `/agents`, `/prune`, `/layout`, `/mouse`,
+`/editor`, `/split`, `/stack`, `/close`, `/zoom`, `/compact`, and `/quit` (also
+`/exit`). Typing after the slash filters by subsequence, so `/mdl` finds
+`/models`. `/compact`
 summarizes an idle session's history into a compact context so long
 sessions keep going; stale read-only tool results are also pruned from
 model context automatically. `/models` applies the choice to the
@@ -186,4 +195,5 @@ command suggestions run immediately when selected with Enter or Tab. QQ names a
 session from its first prompt; `/sessions` supports typing to search those names
 before selecting one with Enter. In the session picker, Ctrl-D deletes the
 highlighted session (with confirmation; a session with an active run must be
-cancelled first) and Ctrl-P prunes every empty session in the workspace.
+cancelled first). `/prune` asks before deleting every empty session in the
+workspace.

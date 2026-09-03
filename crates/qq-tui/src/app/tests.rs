@@ -7,8 +7,10 @@ use qq_protocol::{
 
 use super::*;
 use crate::{
+    KeyChord,
     effect::{Effect, Effects},
     fixtures,
+    input::SessionConfirm,
     model::{LIVE_TAIL_BYTES, MAX_LIVE_TOOL_OUTPUT_BYTES},
     panes::Viewport,
 };
@@ -533,31 +535,33 @@ fn slash_autocomplete_filters_selects_and_executes_commands() {
             .iter()
             .map(|command| command.name)
             .collect::<Vec<_>>(),
-        [
-            "/models",
-            "/sessions",
-            "/resume",
-            "/agents",
-            "/theme",
-            "/new",
-            "/compact",
-            "/editor",
-            "/split",
-            "/stack",
-            "/close",
-            "/zoom",
-            "/quit",
-            "/exit"
-        ]
+        {
+            let mut reserved = qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.to_vec();
+            reserved.sort_unstable();
+            let mut here: Vec<_> = app
+                .filtered_slash_commands()
+                .iter()
+                .map(|command| command.name)
+                .collect();
+            here.sort_unstable();
+            assert_eq!(here, reserved);
+            app.filtered_slash_commands()
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>()
+        }
     );
+    let last = qq_protocol::RESERVED_CLIENT_SLASH_COMMANDS.len() - 1;
     for _ in 0..20 {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     }
-    assert_eq!(app.slash_selected(usize::MAX), 13);
+    assert_eq!(app.slash_selected(usize::MAX), last);
     for _ in 0..20 {
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     }
     assert_eq!(app.slash_selected(usize::MAX), 0);
+    // Down twice lands on /sessions (help, commands, sessions); Tab runs it.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert!(app.composer.text.is_empty());
@@ -695,10 +699,11 @@ fn session_picker_prunes_empty_sessions_after_a_confirm() {
     let mut app = App::new(TuiOptions::default());
     app.apply_snapshot(snapshot());
     let workspace_id = app.workspace_id.unwrap();
-    app.open_sessions();
-
+    // `/prune` opens the picker with the question armed; Ctrl-P no longer
+    // carries a destructive meaning anywhere.
+    app.composer.text = "/prune".to_owned();
     let (changed, requests) = app
-        .handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .split();
     assert!(changed);
     assert!(requests.is_empty());
@@ -1748,7 +1753,7 @@ fn ctrl_o_cycles_tool_detail_and_yields_to_overlays() {
     assert_eq!(app.tool_detail, ToolDetail::Collapsed);
 
     // Pickers own the keyboard; the toggle must not fire underneath them.
-    app.overlay = Some(Overlay::sessions("", None, None));
+    app.open_session_picker_with("", None, None);
     app.handle_key(ctrl_o);
     assert_eq!(app.tool_detail, ToolDetail::Collapsed);
 }
@@ -1872,7 +1877,7 @@ fn scrolling_clamps_at_the_oldest_row_and_the_live_tail() {
 fn transcript_scroll_controls_are_ignored_by_overlays() {
     let mut app = App::new(TuiOptions::default());
     app.update_transcript_viewport(100, 10, false);
-    app.overlay = Some(Overlay::models());
+    app.open_model_picker_for_test();
     let wheel = Event::Mouse(MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 0,
@@ -1886,7 +1891,7 @@ fn transcript_scroll_controls_are_ignored_by_overlays() {
     assert_eq!(app.transcript_scroll_offset(), 0);
 
     app.overlay = None;
-    app.overlay = Some(Overlay::sessions("", app.focused(), None));
+    app.open_session_picker_with("", app.focused(), None);
     assert!(!app.handle_terminal_event(wheel).split().0);
     assert!(!app.handle_terminal_event(page).split().0);
     assert_eq!(app.transcript_scroll_offset(), 0);
@@ -3031,4 +3036,88 @@ fn background_streaming_for_an_unshown_session_does_not_redraw_when_the_sidebar_
         )
     }));
     assert!(shown.redraws());
+}
+
+#[test]
+fn ctrl_k_opens_the_palette_and_enter_runs_the_highlighted_command() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Commands { help: false, .. })
+    ));
+
+    // Typing filters by title or slash name as a subsequence.
+    for character in "thm".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    let (picker, _) = app.command_picker().unwrap();
+    let titles: Vec<_> = picker.filtered().map(|(_, row)| row.spec.title).collect();
+    assert!(titles.contains(&"choose a theme"), "{titles:?}");
+
+    // Enter executes the highlighted command; the palette closes first.
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    app.execute(Command::OpenCommands);
+    for character in "toggle tool".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    let before = app.tool_detail;
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.overlay.is_none());
+    assert_ne!(app.tool_detail, before);
+}
+
+#[test]
+fn help_opens_from_question_mark_on_an_empty_composer_only() {
+    let mut app = App::new(TuiOptions::default());
+    app.apply_snapshot(snapshot());
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Commands { help: true, .. })
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.overlay.is_none());
+
+    app.composer.text = "what".to_owned();
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    assert!(app.overlay.is_none());
+    assert_eq!(app.composer.text, "what?");
+
+    // F1 and /help open the same view.
+    app.composer.clear();
+    app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Commands { help: true, .. })
+    ));
+}
+
+#[test]
+fn every_default_chord_reaches_its_command_through_the_table() {
+    use crate::commands::{COMMANDS, command_for_key};
+    let settings = Settings::default();
+    for spec in &COMMANDS {
+        for chord in spec.chords {
+            let parsed: KeyChord = chord.parse().unwrap();
+            let key = parsed.to_event();
+            assert_eq!(
+                command_for_key(&settings, key),
+                Some(spec.command),
+                "{chord} should invoke {:?}",
+                spec.command
+            );
+        }
+    }
+}
+
+#[test]
+fn ctrl_n_and_ctrl_p_no_longer_change_the_layout() {
+    let mut app = App::new(TuiOptions::default());
+    let layout = app.layout;
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(app.layout, layout);
 }

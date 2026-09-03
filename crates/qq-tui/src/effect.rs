@@ -27,6 +27,8 @@ pub(crate) enum Effect {
         level: NoticeLevel,
         text: String,
     },
+    /// Turn terminal mouse reporting on or off.
+    MouseCapture(bool),
     Quit,
 }
 
@@ -134,6 +136,7 @@ impl Effects {
         self.0.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, Effect> {
         self.0.iter()
     }
@@ -160,5 +163,15 @@ impl Effects {
     pub(crate) fn split(self) -> (bool, Vec<ClientRequest>) {
         let redrew = self.redraws();
         (redrew, self.into_requests())
+    }
+}
+
+impl Effects {
+    /// Whether this batch sends anything to the server.
+    #[must_use]
+    pub(crate) fn requests_anything(&self) -> bool {
+        self.0
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send(_)))
     }
 }

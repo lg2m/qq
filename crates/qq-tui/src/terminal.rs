@@ -248,6 +248,11 @@ where
                         existing.max(Redraw::Scheduled)
                     }));
                 }
+                Effect::MouseCapture(enabled) => {
+                    let bytes = mouse_capture_bytes(enabled)?;
+                    output.write_all(&bytes).await?;
+                    output.flush().await?;
+                }
                 Effect::Quit => quit = true,
             }
         }
@@ -323,6 +328,17 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Escape bytes that enable or disable mouse reporting.
+fn mouse_capture_bytes(enabled: bool) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if enabled {
+        execute!(bytes, EnableMouseCapture)?;
+    } else {
+        execute!(bytes, DisableMouseCapture)?;
+    }
+    Ok(bytes)
+}
+
 fn enable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
     // Kitty keyboard progressive enhancement lets compatible terminals report
     // modified keys such as Shift-Enter. Unsupported terminals ignore the CSI.
@@ -335,7 +351,6 @@ fn enable_input_modes(output: &mut impl io::Write) -> io::Result<()> {
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
         EnableBracketedPaste,
-        EnableMouseCapture,
         EnableFocusChange
     )
 }

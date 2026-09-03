@@ -359,6 +359,7 @@ impl App {
                 entry.insert(SessionView::summary_only(summary, context_window, 0));
             }
         }
+        self.refresh_session_picker();
     }
 
     /// Drops a deleted session from every client map, mirroring the server's
@@ -429,18 +430,12 @@ impl App {
                 })));
             }
         }
-        if let Some(Overlay::Sessions {
-            selected, confirm, ..
-        }) = &mut self.overlay
+        if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay
+            && matches!(confirm, Some(SessionConfirm::Delete(pending)) if *pending == session_id)
         {
-            if matches!(confirm, Some(SessionConfirm::Delete(pending)) if *pending == session_id) {
-                *confirm = None;
-            }
-            if *selected == Some(session_id) {
-                *selected = None;
-                self.reset_session_picker_selection();
-            }
+            *confirm = None;
         }
+        self.refresh_session_picker();
         effects
     }
 

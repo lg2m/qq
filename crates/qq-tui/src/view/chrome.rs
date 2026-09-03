@@ -95,7 +95,9 @@ pub(super) fn status_notice(app: &App, width: usize) -> Vec<Line> {
             },
             warning().bold(),
         );
-        line.push("  Ctrl-G jumps there", muted());
+        if let Some(chord) = app.chord_label(crate::commands::Command::FocusNextApproval) {
+            line.push(format!("  {chord} jumps there"), muted());
+        }
         lines.push(truncate_line(line, width));
     }
     lines
@@ -111,6 +113,9 @@ pub(super) fn queued_drafts(app: &App, width: usize) -> Vec<Line> {
         return Vec::new();
     }
     let count = drafts.len();
+    let edit_hint = app
+        .chord_label(crate::commands::Command::DequeueDraft)
+        .map_or_else(String::new, |chord| format!("  {chord} edits"));
     drafts
         .into_iter()
         .enumerate()
@@ -118,9 +123,9 @@ pub(super) fn queued_drafts(app: &App, width: usize) -> Vec<Line> {
             let mut line = Line::styled(" ~ ", warning());
             line.push(
                 if index + 1 == count {
-                    "queued  Alt-Up edits  "
+                    format!("queued{edit_hint}  ")
                 } else {
-                    "queued  "
+                    "queued  ".to_owned()
                 },
                 warning().dim(),
             );
@@ -284,32 +289,53 @@ pub(super) fn footer_workspace(app: &App, width: usize) -> Line {
     )
 }
 
+/// Rows the slash menu wants to show. The rule stays within `MAX_SLASH_ROWS`
+/// so it never hides more than a few transcript rows.
+const MAX_SLASH_ROWS: usize = 8;
+
+/// The slash-command menu: a boxed list anchored to the bottom of the body,
+/// drawn over the transcript. Rows are the matching commands with the cursor
+/// kept visible; the box has a top rule so it reads as a menu, not as text.
 pub(super) fn slash_autocomplete(app: &App, width: usize, height: usize) -> Vec<Line> {
     let commands = app.filtered_slash_commands();
+    if commands.is_empty() || height < 2 {
+        return Vec::new();
+    }
     let selected = app.slash_selected(commands.len());
-    let visible = height.min(commands.len());
+    let visible = height
+        .saturating_sub(1)
+        .min(MAX_SLASH_ROWS)
+        .min(commands.len());
     let start = selected
         .saturating_sub(visible.saturating_sub(1))
         .min(commands.len().saturating_sub(visible));
-    commands
-        .into_iter()
-        .enumerate()
-        .skip(start)
-        .take(visible)
-        .map(|(index, command)| {
-            let mut line = Line::styled(if index == selected { " > " } else { "   " }, accent());
-            line.push(
-                command.name,
-                if index == selected {
-                    normal().bold()
-                } else {
-                    normal()
-                },
-            );
-            line.push(format!("  {}", command.title), muted());
-            truncate_line(line, width)
-        })
-        .collect()
+    let name_column = commands
+        .iter()
+        .map(|command| command.name.len())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let mut lines = Vec::with_capacity(visible + 1);
+    let mut rule = Line::styled("─".repeat(width.min(2)), muted());
+    rule.push(" commands ", muted());
+    let used = rule.width();
+    rule.push("─".repeat(width.saturating_sub(used)), muted());
+    lines.push(truncate_line(rule, width));
+    for (index, command) in commands.iter().enumerate().skip(start).take(visible) {
+        let mut line = Line::styled(if index == selected { " > " } else { "   " }, accent());
+        line.push(
+            format!("{:<name_column$}", command.name),
+            if index == selected {
+                normal().bold()
+            } else {
+                normal()
+            },
+        );
+        line.push(command.title, muted());
+        pad_line(&mut line, width);
+        lines.push(truncate_line(line, width));
+    }
+    lines
 }
 
 pub(super) fn overlay_slash_autocomplete(body: &mut [Line], autocomplete: Vec<Line>) {

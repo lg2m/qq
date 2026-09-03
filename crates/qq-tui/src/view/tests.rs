@@ -1275,7 +1275,7 @@ fn completion_behind_an_overlay_preserves_the_scrolled_live_tail() {
         ),
     ));
     let live_offset = app.transcript_scroll_offset();
-    app.overlay = Some(crate::input::Overlay::models());
+    app.open_model_picker_for_test();
     renderer.frame_and_commit(&mut app, 80, 24);
 
     let session = app.sessions.get_mut(&session_id).unwrap();
@@ -1486,11 +1486,27 @@ fn composer_keeps_the_tail_when_max_rows_clip() {
 fn slash_autocomplete_is_filtered_above_the_composer() {
     let mut app = app_with_messages(1);
     app.composer.text = "/".to_owned();
-    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 20);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 30);
     let text = frame_text(&frame);
-    for command in ["/models", "/sessions", "/resume", "/new", "/quit", "/exit"] {
-        assert!(text.contains(command));
+    // The menu is a boxed list: a labelled rule, then at most eight rows
+    // with the cursor visible, so it never swallows the transcript.
+    assert!(text.contains(" commands "));
+    for command in ["/help", "/commands", "/sessions", "/resume", "/new"] {
+        assert!(text.contains(command), "{command}");
     }
+    assert!(
+        !text.contains("/exit"),
+        "rows past the cap stay hidden until the cursor reaches them"
+    );
+    for _ in 0..30 {
+        app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+    }
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 30);
+    let text = frame_text(&frame);
+    assert!(text.contains("/exit"));
 
     app.composer.text = "/qu".to_owned();
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 14);
@@ -1524,7 +1540,7 @@ fn session_picker_pins_search_and_keeps_the_selection_visible() {
             )
         }));
     }
-    app.overlay = Some(crate::input::Overlay::sessions("", selected, None));
+    app.open_session_picker_with("", selected, None);
 
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 12);
     let text = frame_text(&frame);
@@ -1537,7 +1553,7 @@ fn session_picker_pins_search_and_keeps_the_selection_visible() {
 #[test]
 fn session_picker_renders_an_empty_search_result() {
     let mut app = app_with_messages(0);
-    app.overlay = Some(crate::input::Overlay::sessions("missing", None, None));
+    app.open_session_picker_with("missing", None, None);
 
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 12);
     let text = frame_text(&frame);
@@ -1550,11 +1566,11 @@ fn session_picker_renders_an_empty_search_result() {
 fn session_picker_renders_delete_and_prune_confirmations() {
     let mut app = app_with_messages(0);
     let session_id = SESSION;
-    app.overlay = Some(crate::input::Overlay::sessions(
+    app.open_session_picker_with(
         "",
         Some(session_id),
         Some(SessionConfirm::Delete(session_id)),
-    ));
+    );
 
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
@@ -1573,7 +1589,8 @@ fn session_picker_renders_delete_and_prune_confirmations() {
     app.overlay.as_mut().unwrap().set_confirm(None);
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
-    assert!(text.contains("Ctrl-D deletes, Ctrl-P prunes empty"));
+    assert!(text.contains("Ctrl-D deletes"));
+    assert!(!text.contains("Ctrl-P"), "Ctrl-P is not a picker chord");
 }
 
 #[test]
@@ -1590,7 +1607,7 @@ fn model_picker_hint_reflects_apply_versus_create() {
             organization: None,
         },
     });
-    app.overlay = Some(crate::input::Overlay::models());
+    app.open_model_picker_for_test();
 
     let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
@@ -1755,8 +1772,8 @@ fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
         );
     }
 
-    // Ctrl-B hides it even when wide; a second press shows it again.
-    let toggle = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    // Ctrl-\ hides it even when wide; a second press shows it again.
+    let toggle = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
     app.handle_terminal_event(toggle.clone());
     assert!(!rows_at(&mut app, 160).contains("SESSIONS  1 running"));
     app.handle_terminal_event(toggle);

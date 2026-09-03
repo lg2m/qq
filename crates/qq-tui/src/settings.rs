@@ -63,7 +63,13 @@ impl KeyChord {
         Self { code, modifiers }
     }
 
-    fn matches(self, key: KeyEvent) -> bool {
+    /// The key event this chord describes, for tests that drive the app.
+    #[cfg(test)]
+    pub(crate) fn to_event(self) -> KeyEvent {
+        KeyEvent::new(self.code, self.modifiers)
+    }
+
+    pub(crate) fn matches(self, key: KeyEvent) -> bool {
         let code = match key.code {
             KeyCode::Char(character) => KeyCode::Char(character.to_ascii_lowercase()),
             code => code,
@@ -78,7 +84,18 @@ impl FromStr for KeyChord {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let mut modifiers = KeyModifiers::NONE;
         let mut code = None;
-        for part in value.split('-') {
+        // A trailing `-` names the minus key itself (`Alt--`), which a plain
+        // split would read as an empty token.
+        let (value_parts, literal_minus) = match value.strip_suffix("--") {
+            Some(prefix) => (format!("{prefix}-"), true),
+            None => (value.to_owned(), false),
+        };
+        let mut parts: Vec<&str> = value_parts.split('-').collect();
+        if literal_minus {
+            parts.pop();
+            parts.push("-");
+        }
+        for part in parts {
             match part.to_ascii_lowercase().as_str() {
                 "ctrl" | "control" if !modifiers.contains(KeyModifiers::CONTROL) => {
                     modifiers.insert(KeyModifiers::CONTROL);
@@ -123,6 +140,12 @@ impl fmt::Display for KeyChord {
             KeyCode::Down => formatter.write_str("Down"),
             KeyCode::Left => formatter.write_str("Left"),
             KeyCode::Right => formatter.write_str("Right"),
+            KeyCode::PageUp => formatter.write_str("PageUp"),
+            KeyCode::PageDown => formatter.write_str("PageDown"),
+            KeyCode::Home => formatter.write_str("Home"),
+            KeyCode::End => formatter.write_str("End"),
+            KeyCode::Delete => formatter.write_str("Delete"),
+            KeyCode::Backspace => formatter.write_str("Backspace"),
             _ => formatter.write_str("Key"),
         }
     }
@@ -138,6 +161,12 @@ fn parse_key_code(value: &str) -> Result<KeyCode, SettingsError> {
         "down" => Ok(KeyCode::Down),
         "left" => Ok(KeyCode::Left),
         "right" => Ok(KeyCode::Right),
+        "pageup" => Ok(KeyCode::PageUp),
+        "pagedown" => Ok(KeyCode::PageDown),
+        "home" => Ok(KeyCode::Home),
+        "end" => Ok(KeyCode::End),
+        "delete" | "del" => Ok(KeyCode::Delete),
+        "backspace" => Ok(KeyCode::Backspace),
         value if value.len() == 1 => Ok(KeyCode::Char(
             value.chars().next().expect("one-byte key has a character"),
         )),
@@ -216,10 +245,10 @@ impl Default for SettingsBuilder {
         Self {
             initial_layout: Layout::Threadline,
             bindings: vec![
-                binding(Action::SelectThreadline, &["F1"]),
-                binding(Action::SelectFoldFocus, &["F2"]),
-                binding(Action::NextLayout, &["Ctrl-N"]),
-                binding(Action::PreviousLayout, &["Ctrl-P"]),
+                binding(Action::SelectThreadline, &["F3"]),
+                binding(Action::SelectFoldFocus, &["F4"]),
+                binding(Action::NextLayout, &[]),
+                binding(Action::PreviousLayout, &[]),
                 binding(Action::ToggleNavigator, &["Ctrl-T"]),
                 binding(Action::CreateRootSession, &["Alt-N"]),
                 binding(Action::CreateChildSession, &["Alt-C"]),
@@ -325,7 +354,7 @@ mod tests {
     #[test]
     fn rejects_colliding_bindings() {
         let error = SettingsBuilder::default()
-            .bindings(Action::SelectFoldFocus, vec!["F1".parse().unwrap()])
+            .bindings(Action::SelectFoldFocus, vec!["F3".parse().unwrap()])
             .build()
             .unwrap_err();
 
