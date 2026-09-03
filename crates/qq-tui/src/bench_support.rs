@@ -6,12 +6,11 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use qq_protocol::{
-    EventCursor, MessageId, MessageRole, MessageSnapshot, MessageState, RunActivity, RunId,
-    SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
-    StoreId, TextChannel, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    MessageId, MessageSnapshot, MessageState, RunActivity, RunId, SessionEvent, SessionId,
+    SessionSnapshot, SessionStatus, SessionSummary, TextChannel, WorkspaceSnapshot,
 };
 
-use crate::{ClientUpdate, TuiOptions, app::App, view::FrameRenderer};
+use crate::{ClientUpdate, TuiOptions, app::App, fixtures, view::FrameRenderer};
 
 /// One TUI instance driven directly, without a terminal or client transport.
 pub struct BenchHarness {
@@ -40,12 +39,10 @@ impl BenchHarness {
     #[must_use]
     pub fn with_options(size: (u16, u16), sessions: u8, messages: u8, options: TuiOptions) -> Self {
         assert!(sessions >= 1, "at least one session is required");
-        let workspace_id = WorkspaceId::from_bytes([1; 16]);
         let summaries: Vec<SessionSummary> = (0..sessions)
-            .map(|index| summary(workspace_id, session_id(index), SessionStatus::Idle))
+            .map(|index| summary(session_id(index), SessionStatus::Idle))
             .collect();
         let focused = SessionSnapshot {
-            summary: summaries[0].clone(),
             messages: (0..messages)
                 .map(|index| {
                     let mut message = assistant_message(session_id(0), index, PARAGRAPH);
@@ -53,26 +50,13 @@ impl BenchHarness {
                     message
                 })
                 .collect(),
-            runs: Vec::new(),
-            tool_calls: Vec::new(),
-            has_older_tool_calls: false,
-            has_older_messages: false,
+            ..fixtures::session_snapshot(summaries[0].clone())
         };
         let mut app = App::new(options);
         app.apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
-            included: Vec::new(),
-            cursor: EventCursor {
-                store_id: StoreId::from_bytes([3; 16]),
-                workspace_id,
-                sequence: 1,
-            },
-            workspace: WorkspaceSummary {
-                id: workspace_id,
-                path: "/workspace".to_owned(),
-            },
             sessions: summaries,
             focused: Some(focused),
-            has_older_sessions: false,
+            ..fixtures::workspace_snapshot()
         }));
         app.apply_client_update(ClientUpdate::Connection(crate::ConnectionState::Live));
         Self {
@@ -92,11 +76,7 @@ impl BenchHarness {
         self.apply(
             index,
             SessionEvent::RunStarted {
-                session: summary(
-                    WorkspaceId::from_bytes([1; 16]),
-                    session_id(index),
-                    SessionStatus::Running,
-                ),
+                session: summary(session_id(index), SessionStatus::Running),
                 run_id,
                 plan: None,
             },
@@ -171,9 +151,7 @@ impl BenchHarness {
     /// Load `messages` completed assistant messages into session `index`
     /// through an included body, as the client's pre-warm does.
     pub fn warm_session(&mut self, index: u8, messages: u8) {
-        let workspace_id = WorkspaceId::from_bytes([1; 16]);
         let body = SessionSnapshot {
-            summary: summary(workspace_id, session_id(index), SessionStatus::Idle),
             messages: (0..messages)
                 .map(|row| {
                     let mut message = assistant_message(session_id(index), row, PARAGRAPH);
@@ -181,28 +159,17 @@ impl BenchHarness {
                     message
                 })
                 .collect(),
-            runs: Vec::new(),
-            tool_calls: Vec::new(),
-            has_older_tool_calls: false,
-            has_older_messages: false,
+            ..fixtures::session_snapshot(summary(session_id(index), SessionStatus::Idle))
         };
         let sequence = self.next_sequence;
         self.next_sequence += 1;
         self.app
             .apply_client_update(ClientUpdate::Snapshot(WorkspaceSnapshot {
-                cursor: EventCursor {
-                    store_id: StoreId::from_bytes([3; 16]),
-                    workspace_id,
-                    sequence,
-                },
-                workspace: WorkspaceSummary {
-                    id: workspace_id,
-                    path: "/workspace".to_owned(),
-                },
+                cursor: fixtures::cursor(sequence),
                 sessions: Vec::new(),
                 focused: None,
                 included: vec![body],
-                has_older_sessions: false,
+                ..fixtures::workspace_snapshot()
             }));
     }
 
@@ -241,19 +208,10 @@ impl BenchHarness {
     fn apply(&mut self, index: u8, event: SessionEvent) -> bool {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.app
-            .apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
-                cursor: EventCursor {
-                    store_id: StoreId::from_bytes([3; 16]),
-                    workspace_id: WorkspaceId::from_bytes([1; 16]),
-                    sequence,
-                },
-                session_id: session_id(index),
-                run_id: Some(run_id(index)),
-                caused_by: None,
-                occurred_at_ms: sequence,
-                event,
-            }))
+        let mut envelope = fixtures::envelope(sequence, session_id(index), event);
+        envelope.run_id = Some(run_id(index));
+        envelope.occurred_at_ms = sequence;
+        self.app.apply_client_update(ClientUpdate::Event(envelope))
     }
 }
 
@@ -269,25 +227,11 @@ fn run_id(index: u8) -> RunId {
     RunId::from_bytes(bytes)
 }
 
-fn summary(workspace_id: WorkspaceId, id: SessionId, status: SessionStatus) -> SessionSummary {
+fn summary(id: SessionId, status: SessionStatus) -> SessionSummary {
     SessionSummary {
-        activity: None,
-        spawned_by: None,
-        id,
-        workspace_id,
-        parent_id: None,
         title: format!("Session {}", id.as_bytes()[15]),
         status,
-        active_run_id: None,
-        queued_prompts: 0,
-        model: Some("openai/gpt-test".to_owned()),
-        profile: qq_protocol::AgentProfileId::default(),
-        correlation: qq_protocol::Correlation::default(),
-        context_tokens: None,
-        accounting: None,
-        estimated_cost_usd_nanos: Some(0),
-        updated_at_ms: 1,
-        last_outcome: None,
+        ..fixtures::session_summary(id)
     }
 }
 
@@ -296,15 +240,9 @@ fn assistant_message(session_id: SessionId, index: u8, output: &str) -> MessageS
     bytes[14] = session_id.as_bytes()[15];
     bytes[15] = index;
     MessageSnapshot {
-        id: MessageId::from_bytes(bytes),
-        session_id,
         run_id: run_id(session_id.as_bytes()[15]),
-        turn_ordinal: 1,
-        role: MessageRole::Assistant,
         state: MessageState::Streaming,
-        steering: false,
-        output: output.to_owned(),
-        refusal: String::new(),
         created_at_ms: u64::from(index),
+        ..fixtures::message(MessageId::from_bytes(bytes), session_id, output)
     }
 }
