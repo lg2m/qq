@@ -203,17 +203,15 @@ impl FrameRenderer {
         let body_width = width.saturating_sub(sidebar_width);
         let mode = app.mode();
         let mut body = match mode {
-            Mode::Models | Mode::Themes | Mode::Sessions | Mode::Approval => {
-                for cache in self.panes.values_mut() {
-                    cache.prune_all();
-                }
-                match mode {
-                    Mode::Models => model_picker(app, body_width, body_height),
-                    Mode::Themes => theme_picker(app, body_width, body_height),
-                    Mode::Sessions => session_picker(app, body_width, body_height),
-                    Mode::Approval | Mode::Compose => approval_prompt(app, body_width, body_height),
-                }
-            }
+            // Overlays hide the transcript; its caches stay warm so closing
+            // one costs no relayout or highlight storm. Memory stays bounded
+            // by the per-pane byte budget, not by pruning here.
+            Mode::Models | Mode::Themes | Mode::Sessions | Mode::Approval => match mode {
+                Mode::Models => model_picker(app, body_width, body_height),
+                Mode::Themes => theme_picker(app, body_width, body_height),
+                Mode::Sessions => session_picker(app, body_width, body_height),
+                Mode::Approval | Mode::Compose => approval_prompt(app, body_width, body_height),
+            },
             Mode::Compose => {
                 let mut body = self.panes_body(app, Rect::new(0, 2, body_width, body_height));
                 overlay_slash_autocomplete(

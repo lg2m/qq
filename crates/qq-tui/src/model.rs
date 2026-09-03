@@ -1,11 +1,15 @@
 //! Client-side session state reduced from server events: the per-session
-//! view with its warm body, live status, and reasoning.
+//! view with its warm body, live status, and reasoning, and the store that
+//! indexes the tree they form.
 
-use std::collections::{HashMap, VecDeque};
+use std::{
+    cell::OnceCell,
+    collections::{HashMap, VecDeque, hash_map},
+};
 
 use qq_protocol::{
-    EditPreview, MessageSnapshot, RunActivity, RunId, SessionSummary, ToolCallId, ToolCallSnapshot,
-    ToolCallState,
+    EditPreview, MessageSnapshot, RunActivity, RunId, SessionId, SessionSummary, ToolCallId,
+    ToolCallSnapshot, ToolCallState,
 };
 
 use crate::app::terminal_safe_character;
@@ -26,6 +30,154 @@ pub(super) const MAX_PROMPT_HISTORY: usize = 100;
 /// Drafts that may wait per session while it runs.
 pub(crate) const MAX_QUEUED_DRAFTS: usize = 8;
 
+/// Every session the client knows about, with the tree indexes the sidebar,
+/// pickers, and navigation read every frame.
+///
+/// Reads go through `get`; writes go through `get_mut`, `insert`, `remove`,
+/// `entry`, and `values_mut`, each of which drops the cached tree index so
+/// the next read rebuilds it once. A frame therefore pays for the index at
+/// most once per batch of mutations instead of once per call site.
+#[derive(Debug, Default)]
+pub(crate) struct SessionStore {
+    sessions: HashMap<SessionId, SessionView>,
+    index: OnceCell<TreeIndex>,
+}
+
+/// Derived tree shape, valid until the next mutation.
+#[derive(Debug, Default)]
+struct TreeIndex {
+    /// Depth-first order: roots newest-first, children oldest-first.
+    order: Vec<SessionId>,
+    depth: HashMap<SessionId, usize>,
+    /// Children oldest-first, keyed by parent; `None` holds the roots.
+    children: HashMap<Option<SessionId>, Vec<SessionId>>,
+    spawned_by_call: HashMap<ToolCallId, SessionId>,
+}
+
+impl SessionStore {
+    pub(crate) fn get(&self, id: &SessionId) -> Option<&SessionView> {
+        self.sessions.get(id)
+    }
+
+    pub(crate) fn get_mut(&mut self, id: &SessionId) -> Option<&mut SessionView> {
+        self.index.take();
+        self.sessions.get_mut(id)
+    }
+
+    pub(crate) fn contains_key(&self, id: &SessionId) -> bool {
+        self.sessions.contains_key(id)
+    }
+
+    pub(crate) fn insert(&mut self, id: SessionId, view: SessionView) -> Option<SessionView> {
+        self.index.take();
+        self.sessions.insert(id, view)
+    }
+
+    pub(crate) fn remove(&mut self, id: &SessionId) -> Option<SessionView> {
+        self.index.take();
+        self.sessions.remove(id)
+    }
+
+    pub(crate) fn entry(&mut self, id: SessionId) -> hash_map::Entry<'_, SessionId, SessionView> {
+        self.index.take();
+        self.sessions.entry(id)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.index.take();
+        self.sessions.clear();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &SessionView> {
+        self.sessions.values()
+    }
+
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut SessionView> {
+        self.index.take();
+        self.sessions.values_mut()
+    }
+
+    /// Every session in tree order: roots newest-first, each followed by
+    /// its descendants oldest-first.
+    pub(crate) fn thread_order(&self) -> &[SessionId] {
+        &self.index().order
+    }
+
+    /// Distance from the root; zero for roots and unknown sessions.
+    pub(crate) fn depth(&self, id: SessionId) -> usize {
+        self.index().depth.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Direct children of `parent`, oldest-first.
+    pub(crate) fn children_of(&self, parent: SessionId) -> &[SessionId] {
+        self.index()
+            .children
+            .get(&Some(parent))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Root sessions, oldest-first.
+    pub(crate) fn roots(&self) -> &[SessionId] {
+        self.index().children.get(&None).map_or(&[], Vec::as_slice)
+    }
+
+    /// The child session a `spawn_agent` call created, if any.
+    pub(crate) fn child_spawned_by(&self, tool_call_id: ToolCallId) -> Option<SessionId> {
+        self.index().spawned_by_call.get(&tool_call_id).copied()
+    }
+
+    fn index(&self) -> &TreeIndex {
+        self.index.get_or_init(|| {
+            let mut index = TreeIndex::default();
+            for session in self.sessions.values() {
+                index
+                    .children
+                    .entry(session.summary.parent_id)
+                    .or_default()
+                    .push(session.summary.id);
+                if let Some(origin) = session.summary.spawned_by
+                    && let Some(call) = origin.tool_call_id
+                {
+                    index.spawned_by_call.insert(call, session.summary.id);
+                }
+            }
+            for siblings in index.children.values_mut() {
+                siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
+            }
+            // Roots are newest-first; popping from the back yields the newest.
+            let mut stack: Vec<(SessionId, usize)> = index
+                .children
+                .get(&None)
+                .into_iter()
+                .flatten()
+                .map(|id| (*id, 0))
+                .collect();
+            index.order.reserve(self.sessions.len());
+            while let Some((session_id, depth)) = stack.pop() {
+                index.order.push(session_id);
+                index.depth.insert(session_id, depth);
+                if let Some(kids) = index.children.get(&Some(session_id)) {
+                    // Children render oldest-first, so push newest first to
+                    // be popped last.
+                    stack.extend(kids.iter().rev().map(|id| (*id, depth + 1)));
+                }
+            }
+            index
+        })
+    }
+}
+
+impl std::ops::Index<&SessionId> for SessionStore {
+    type Output = SessionView;
+
+    fn index(&self, id: &SessionId) -> &SessionView {
+        &self.sessions[id]
+    }
+}
 /// One run's displayable reasoning: text accumulated from `ReasoningDelta`
 /// events plus whether the block is still streaming.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

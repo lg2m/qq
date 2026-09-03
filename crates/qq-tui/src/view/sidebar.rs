@@ -82,11 +82,11 @@ pub(super) fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
     }
     lines.push(truncate_line(header, width));
     lines.push(Line::styled("│", muted()));
-    let order = app.thread_order();
+    let order = app.sessions.thread_order();
     let mut rows: Vec<Line> = Vec::new();
     let mut focused_row = 0;
-    for session_id in order {
-        let depth = app.depth(session_id);
+    for &session_id in order {
+        let depth = app.sessions.depth(session_id);
         let indent = "  ".repeat(depth.min(4));
         if app.focused() == Some(session_id) {
             focused_row = rows.len();
@@ -116,7 +116,7 @@ pub(super) fn sidebar(app: &App, width: usize, height: usize) -> Vec<Line> {
 /// status glyph, then one status line (approval wait, active tool, live tail,
 /// or activity). Empty when the call has no recorded child.
 pub(super) fn child_rows(app: &App, tool_call_id: ToolCallId, width: usize) -> Vec<Line> {
-    let Some(child) = app.child_spawned_by(tool_call_id) else {
+    let Some(child) = app.sessions.child_spawned_by(tool_call_id) else {
         return Vec::new();
     };
     let mut rows = vec![session_line(app, child, width, "       ↳ ")];

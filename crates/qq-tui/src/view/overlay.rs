@@ -55,7 +55,7 @@ pub(super) fn session_picker(app: &App, width: usize, height: usize) -> Vec<Line
     let mut results = Vec::with_capacity(filtered.len());
     let mut selected_row = 0;
     for session_id in filtered {
-        let depth = app.depth(session_id);
+        let depth = app.sessions.depth(session_id);
         let is_selected = selected == Some(session_id);
         if is_selected {
             selected_row = results.len();

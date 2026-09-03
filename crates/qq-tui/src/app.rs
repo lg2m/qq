@@ -3,13 +3,13 @@ use std::collections::{HashMap, VecDeque};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandRequest, EditPreview, ModelDescriptor, ModelSelection, SessionCommand,
+    CommandRequest, EditPreview, ModelDescriptor, ModelSelection, SessionCommand, SessionEvent,
     SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SnapshotRequest,
     SteeringCapabilities, ToolCallSnapshot, ToolCallState, WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
-pub(crate) use crate::model::{LiveStatus, ReasoningDetail, SessionView};
+pub(crate) use crate::model::{LiveStatus, ReasoningDetail, SessionStore, SessionView};
 use crate::model::{MAX_PROMPT_HISTORY, MAX_QUEUED_DRAFTS, WARM_BODY_LIMIT};
 use crate::{
     Action, ClientFailure, ClientPort, ClientRequest, ClientUpdate, ConnectionState, Layout,
@@ -213,7 +213,7 @@ pub(crate) struct App {
     pub models: Vec<ModelOption>,
     pub workspace_id: Option<WorkspaceId>,
     pub workspace_path: String,
-    pub sessions: HashMap<SessionId, SessionView>,
+    pub sessions: SessionStore,
     /// Tiled panes; the focused pane decides which session the composer,
     /// approvals, footers, and tree navigation act on.
     pub(crate) panes: Panes,
@@ -247,6 +247,10 @@ pub(crate) struct App {
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
     /// enough; the toggle command cycles through explicit on and off.
     pub sidebar: Sidebar,
+    /// Terminal width from the last resize event, so update paths can decide
+    /// whether a change to an unshown session is visible at all. Zero until
+    /// the first resize, which reads as "assume visible".
+    terminal_width: usize,
     /// Selectable themes and the index of the active one. Changing the
     /// index bumps `theme_generation` so the renderer repaints everything.
     pub(crate) themes: Vec<Theme>,
@@ -270,7 +274,7 @@ impl App {
             models: options.models,
             workspace_id: None,
             workspace_path: String::new(),
-            sessions: HashMap::new(),
+            sessions: SessionStore::default(),
             panes: Panes::default(),
             focus_clock: 0,
             overlay: None,
@@ -289,6 +293,7 @@ impl App {
             tool_detail: ToolDetail::default(),
             reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
+            terminal_width: 0,
             themes: if options.themes.is_empty() {
                 vec![Theme::default()]
             } else {
@@ -584,7 +589,7 @@ impl App {
                 self.set_focus_clock(focused_id);
             }
         } else if self.focused().is_none()
-            && let Some(first) = self.root_sessions().first().copied()
+            && let Some(first) = self.sessions.roots().first().copied()
         {
             self.set_focus(first);
         }
@@ -728,7 +733,7 @@ impl App {
             .sessions
             .get(&event.session_id)
             .is_some_and(|session| event.cursor.sequence <= session.loaded_through);
-        let mut effects = Effects::redraw(Redraw::Scheduled);
+        let mut effects = Effects::changed(self.event_is_visible(&event));
         if !already_loaded {
             let reduced = self.reduce_event(&event);
             effects.extend(self.absorb_notices(reduced));
@@ -741,6 +746,36 @@ impl App {
             self.recent_events.pop_front();
         }
         effects
+    }
+
+    /// Whether applying `event` can change anything on screen. Streaming text
+    /// and tool output for a session no pane shows only matter when the
+    /// sidebar (which shows every session's live tail) is visible; every
+    /// other event may move focus, attention, or chrome and always redraws.
+    fn event_is_visible(&self, event: &SessionEventEnvelope) -> bool {
+        let background_only = matches!(
+            event.event,
+            SessionEvent::TextAppended { .. }
+                | SessionEvent::ReasoningDelta { .. }
+                | SessionEvent::ToolCallOutputDelta { .. }
+                | SessionEvent::RunActivityChanged { .. }
+        );
+        if !background_only {
+            return true;
+        }
+        if self.panes.sessions().any(|shown| shown == event.session_id) {
+            return true;
+        }
+        // A child's live status renders under its spawn call in the parent.
+        if self
+            .sessions
+            .get(&event.session_id)
+            .and_then(|session| session.summary.parent_id)
+            .is_some_and(|parent| self.panes.sessions().any(|shown| shown == parent))
+        {
+            return true;
+        }
+        self.terminal_width == 0 || self.sidebar.visible(self.terminal_width)
     }
 
     fn set_notice_for(&mut self, session_id: Option<SessionId>, text: String, level: NoticeLevel) {
@@ -900,7 +935,10 @@ impl App {
                 self.terminal_focused = false;
                 Effects::redraw(Redraw::Immediate)
             }
-            Event::Resize(_, _) => Effects::redraw(Redraw::Immediate),
+            Event::Resize(columns, _) => {
+                self.terminal_width = usize::from(columns);
+                Effects::redraw(Redraw::Immediate)
+            }
             Event::Key(_) | Event::Mouse(_) => Effects::none(),
         }
     }
@@ -1391,7 +1429,7 @@ impl App {
             },
             Command::FocusFirstChild => match self
                 .focused()
-                .and_then(|focused| self.children_of(focused).first().copied())
+                .and_then(|focused| self.sessions.children_of(focused).first().copied())
             {
                 Some(child) => self.focus_session(child),
                 None => Effects::none(),
@@ -1614,7 +1652,7 @@ impl App {
         let selected = self
             .focused()
             .filter(|session_id| self.sessions.contains_key(session_id))
-            .or_else(|| self.thread_order().first().copied());
+            .or_else(|| self.sessions.thread_order().first().copied());
         self.overlay = Some(Overlay::Sessions {
             picker: Picker::new(),
             scope,
@@ -1630,8 +1668,10 @@ impl App {
         let Some(Overlay::Sessions { picker, scope, .. }) = &self.overlay else {
             return Vec::new();
         };
-        self.thread_order()
-            .into_iter()
+        self.sessions
+            .thread_order()
+            .iter()
+            .copied()
             .filter(|session_id| {
                 scope.is_none_or(|root| self.is_descendant_or_self(*session_id, root))
             })
@@ -2378,61 +2418,15 @@ impl App {
         session.context_window
     }
 
-    /// Every session in tree order: roots newest-first, each followed by its
-    /// descendants depth-first with siblings oldest-first. One pass groups
-    /// children by parent so the walk is linear in the number of sessions
-    /// plus sorting, not quadratic.
-    pub fn thread_order(&self) -> Vec<SessionId> {
-        let mut children: HashMap<Option<SessionId>, Vec<SessionId>> = HashMap::new();
-        for session in self.sessions.values() {
-            children
-                .entry(session.summary.parent_id)
-                .or_default()
-                .push(session.summary.id);
-        }
-        for siblings in children.values_mut() {
-            siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
-        }
-        let mut stack = children.remove(&None).unwrap_or_default();
-        // Roots are newest-first; popping from the back yields the newest.
-        let mut output = Vec::with_capacity(self.sessions.len());
-        while let Some(session_id) = stack.pop() {
-            output.push(session_id);
-            if let Some(mut kids) = children.remove(&Some(session_id)) {
-                // Children render oldest-first, so push newest first to be
-                // popped last.
-                kids.reverse();
-                stack.extend(kids);
-            }
-        }
-        output
-    }
-
-    /// The child session created by a `spawn_agent` call, if the server has
-    /// recorded that linkage. Linear over sessions; the map is small and this
-    /// runs only for `spawn_agent` rows on screen.
-    pub fn child_spawned_by(&self, tool_call_id: qq_protocol::ToolCallId) -> Option<SessionId> {
-        self.sessions
-            .values()
-            .find(|session| {
-                session
-                    .summary
-                    .spawned_by
-                    .is_some_and(|origin| origin.tool_call_id == Some(tool_call_id))
-            })
-            .map(|session| session.summary.id)
-    }
-
     /// The focused session's sibling `offset` places away in spawn order
     /// (oldest-first), wrapping at either end. Roots are siblings of roots.
     fn sibling(&self, offset: isize) -> Option<SessionId> {
         let focused = self.focused()?;
         let parent = self.sessions.get(&focused)?.summary.parent_id;
-        let mut siblings = match parent {
-            Some(parent) => self.children_of(parent),
-            None => self.root_sessions(),
+        let siblings = match parent {
+            Some(parent) => self.sessions.children_of(parent),
+            None => self.sessions.roots(),
         };
-        siblings.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
         if siblings.len() < 2 {
             return None;
         }
@@ -2443,8 +2437,10 @@ impl App {
 
     /// Sessions with a tool call awaiting approval, in tree order.
     pub(crate) fn sessions_awaiting_approval(&self) -> Vec<SessionId> {
-        self.thread_order()
-            .into_iter()
+        self.sessions
+            .thread_order()
+            .iter()
+            .copied()
             .filter(|id| !self.sessions[id].live.awaiting_approval.is_empty())
             .collect()
     }
@@ -2461,7 +2457,7 @@ impl App {
         if others.is_empty() {
             return None;
         }
-        let order = self.thread_order();
+        let order = self.sessions.thread_order();
         let focus_position = self
             .focused()
             .and_then(|focused| order.iter().position(|id| *id == focused))
@@ -2471,42 +2467,6 @@ impl App {
             .copied()
             .find(|id| order.iter().position(|o| o == id).unwrap_or(0) > focus_position)
             .or_else(|| others.first().copied())
-    }
-
-    /// Direct children of `parent`, oldest-first.
-    pub fn children_of(&self, parent: SessionId) -> Vec<SessionId> {
-        let mut children = self
-            .sessions
-            .values()
-            .filter(|session| session.summary.parent_id == Some(parent))
-            .map(|session| session.summary.id)
-            .collect::<Vec<_>>();
-        children.sort_by_key(|id| self.sessions[id].summary.updated_at_ms);
-        children
-    }
-
-    fn root_sessions(&self) -> Vec<SessionId> {
-        self.sessions
-            .values()
-            .filter(|session| session.summary.parent_id.is_none())
-            .map(|session| session.summary.id)
-            .collect()
-    }
-
-    pub fn depth(&self, session_id: SessionId) -> usize {
-        let mut depth = 0;
-        let mut cursor = self
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.summary.parent_id);
-        while let Some(parent) = cursor {
-            depth += 1;
-            cursor = self
-                .sessions
-                .get(&parent)
-                .and_then(|session| session.summary.parent_id);
-        }
-        depth
     }
 }
 

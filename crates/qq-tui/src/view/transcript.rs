@@ -1,4 +1,5 @@
 use super::*;
+use crate::render::Span;
 
 /// Retained rendering for one pane's transcript: completed messages cached
 /// by width, the settled prefix of streaming messages, and the row ranges
@@ -6,6 +7,8 @@ use super::*;
 #[derive(Default)]
 pub(crate) struct TranscriptCache {
     pub(super) markdown: HashMap<MessageId, CachedMarkdown>,
+    /// Sum of `CachedMarkdown::bytes` over `markdown`.
+    cached_bytes: usize,
     /// Monotonic counter bumped per `prepare_markdown`; stamps cache use.
     clock: u64,
     /// Settled rows of messages still streaming, keyed by message. Each entry
@@ -35,6 +38,32 @@ pub(super) struct CachedMarkdown {
     highlight_requested: bool,
     /// Frame counter at last use, for least-recently-used eviction.
     last_used: u64,
+    /// Approximate heap bytes held by `body`, for the byte budget.
+    bytes: usize,
+}
+
+/// Heap bytes one pane may hold in completed-message layouts. Larger than
+/// any single message the cache admits so the newest message always fits.
+const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+impl CachedMessageBody {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Markdown(lines) => lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.text.len() + std::mem::size_of::<Span>())
+                        .sum::<usize>()
+                        + std::mem::size_of::<Line>()
+                })
+                .sum(),
+            Self::Plain(index) => {
+                index.checkpoints.len() * std::mem::size_of::<PlainTextCheckpoint>()
+            }
+        }
+    }
 }
 
 impl CachedMarkdown {
@@ -379,6 +408,66 @@ impl<'a> VirtualBody<'a> {
         fit_height(rendered, height)
     }
 }
+/// Per-frame grouping of a session's messages and tool calls by run, built
+/// once per transcript layout so per-message questions are O(1).
+struct TurnIndex<'a> {
+    /// Index of the first assistant message of each run.
+    first_assistant: HashMap<RunId, usize>,
+    /// Indices of every assistant message, in transcript order, per run.
+    assistant_indices: HashMap<RunId, Vec<usize>>,
+    /// Tool calls per run sorted by (turn, call) ordinal.
+    calls: HashMap<RunId, Vec<&'a ToolCallSnapshot>>,
+}
+
+impl<'a> TurnIndex<'a> {
+    fn build(messages: &[MessageSnapshot], tool_calls: &'a [ToolCallSnapshot]) -> Self {
+        let mut first_assistant = HashMap::new();
+        let mut assistant_indices: HashMap<RunId, Vec<usize>> = HashMap::new();
+        for (index, message) in messages.iter().enumerate() {
+            if message.role == MessageRole::Assistant {
+                first_assistant.entry(message.run_id).or_insert(index);
+                assistant_indices
+                    .entry(message.run_id)
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut calls: HashMap<RunId, Vec<&ToolCallSnapshot>> = HashMap::new();
+        for call in tool_calls {
+            calls.entry(call.run_id).or_default().push(call);
+        }
+        for run_calls in calls.values_mut() {
+            run_calls.sort_by_key(|call| (call.turn_ordinal, call.call_ordinal));
+        }
+        Self {
+            first_assistant,
+            assistant_indices,
+            calls,
+        }
+    }
+
+    fn first_assistant(&self, run_id: RunId) -> Option<usize> {
+        self.first_assistant.get(&run_id).copied()
+    }
+
+    /// The turn ordinal of the next assistant message of the same run after
+    /// `index`, or `u16::MAX` when `index` holds the run's last one.
+    fn next_assistant_turn(&self, messages: &[MessageSnapshot], index: usize) -> u16 {
+        let run_id = messages[index].run_id;
+        self.assistant_indices
+            .get(&run_id)
+            .and_then(|indices| {
+                let position = indices.iter().position(|candidate| *candidate == index)?;
+                indices.get(position + 1)
+            })
+            .map_or(u16::MAX, |next| messages[*next].turn_ordinal)
+    }
+
+    fn calls_of(&self, run_id: RunId) -> &[&'a ToolCallSnapshot] {
+        self.calls.get(&run_id).map_or(&[], Vec::as_slice)
+    }
+}
+
 impl TranscriptCache {
     /// Render one pane: an optional title row when several panes share the
     /// screen, then the session transcript scrolled to the pane's viewport.
@@ -432,6 +521,7 @@ impl TranscriptCache {
     /// user's viewport when the transcript returns.
     pub(super) fn prune_all(&mut self) {
         self.markdown.clear();
+        self.cached_bytes = 0;
         self.live.clear();
     }
 
@@ -469,7 +559,13 @@ impl TranscriptCache {
             });
         match visible {
             Some(visible) => {
-                self.markdown.retain(|id, _| visible.contains(id));
+                self.markdown.retain(|id, cached| {
+                    let keep = visible.contains(id);
+                    if !keep {
+                        self.cached_bytes = self.cached_bytes.saturating_sub(cached.bytes);
+                    }
+                    keep
+                });
                 self.live.retain(|id, _| visible.contains(id));
                 self.live_message_ranges
                     .retain(|id, _| visible.contains(id));
@@ -628,16 +724,29 @@ impl TranscriptCache {
         } else {
             CachedMessageBody::Plain(PlainTextIndex::new(source, content_width))
         };
-        if !self.markdown.contains_key(&message.id)
-            && self.markdown.len() >= MAX_VISIBLE_MESSAGES
-            && let Some(stale) = self
+        let bytes = body.bytes();
+        if let Some(previous) = self.markdown.remove(&message.id) {
+            self.cached_bytes = self.cached_bytes.saturating_sub(previous.bytes);
+        }
+        // Evict least-recently-used layouts until both the entry count and
+        // the byte budget admit the new one.
+        while !self.markdown.is_empty()
+            && (self.markdown.len() >= MAX_VISIBLE_MESSAGES
+                || self.cached_bytes + bytes > MAX_CACHE_BYTES)
+        {
+            let Some(stale) = self
                 .markdown
                 .iter()
                 .min_by_key(|(_, cached)| cached.last_used)
                 .map(|(id, _)| *id)
-        {
-            self.markdown.remove(&stale);
+            else {
+                break;
+            };
+            if let Some(removed) = self.markdown.remove(&stale) {
+                self.cached_bytes = self.cached_bytes.saturating_sub(removed.bytes);
+            }
         }
+        self.cached_bytes += bytes;
         let cached = CachedMarkdown {
             width,
             output_bytes: message.output.len(),
@@ -646,6 +755,7 @@ impl TranscriptCache {
             body,
             highlight_requested: !needs_highlight,
             last_used: self.clock,
+            bytes,
         };
         let key = cached.key(message.id);
         let mut cached = cached;
@@ -713,14 +823,16 @@ impl TranscriptCache {
         if let Some(focused) = session_id {
             // Children already shown under their spawn call are not repeated.
             let children: Vec<SessionId> = app
+                .sessions
                 .children_of(focused)
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|child| {
                     app.sessions[child]
                         .summary
                         .spawned_by
                         .and_then(|origin| origin.tool_call_id)
-                        .is_none_or(|call| app.child_spawned_by(call) != Some(*child))
+                        .is_none_or(|call| app.sessions.child_spawned_by(call) != Some(*child))
                 })
                 .collect();
             if !children.is_empty() {
@@ -810,7 +922,7 @@ impl TranscriptCache {
             );
             body.push_line(line);
         }
-        for child in app.children_of(session_id) {
+        for &child in app.sessions.children_of(session_id) {
             body.push_line(session_line(app, child, content_width, "  > "));
         }
         body
@@ -905,6 +1017,10 @@ impl TranscriptCache {
         width: usize,
     ) {
         let tool_calls = session.tool_calls.as_deref().unwrap_or_default();
+        // One pass over messages and calls answers every per-message question
+        // below (first assistant message of a run, next assistant turn, calls
+        // by run) so the loop is linear in messages plus calls.
+        let turns = TurnIndex::build(messages, tool_calls);
         for index in indices {
             let message = &messages[index];
             if !body.is_empty() {
@@ -921,24 +1037,17 @@ impl TranscriptCache {
                 // turns, legacy turn 0 messages) attach after the nearest
                 // preceding assistant message of the run; the run's first
                 // rendered message also collects any earlier orphan turns.
-                let first_of_run = !messages[..index].iter().any(|earlier| {
-                    earlier.role == MessageRole::Assistant && earlier.run_id == message.run_id
-                });
-                let next_turn = messages[index + 1..]
-                    .iter()
-                    .find(|later| {
-                        later.role == MessageRole::Assistant && later.run_id == message.run_id
-                    })
-                    .map_or(u16::MAX, |later| later.turn_ordinal);
-                let mut run_calls = tool_calls
+                let first_of_run = turns.first_assistant(message.run_id) == Some(index);
+                let next_turn = turns.next_assistant_turn(messages, index);
+                let run_calls: Vec<&ToolCallSnapshot> = turns
+                    .calls_of(message.run_id)
                     .iter()
                     .filter(|tool_call| {
-                        tool_call.run_id == message.run_id
-                            && tool_call.turn_ordinal < next_turn
+                        tool_call.turn_ordinal < next_turn
                             && (first_of_run || tool_call.turn_ordinal >= message.turn_ordinal)
                     })
-                    .collect::<Vec<_>>();
-                run_calls.sort_by_key(|tool_call| (tool_call.turn_ordinal, tool_call.call_ordinal));
+                    .copied()
+                    .collect();
                 // Call-only turns before the run's first message executed
                 // before its text streamed: render that head group ahead of
                 // the message so execution order holds from the first block.
@@ -982,20 +1091,12 @@ impl TranscriptCache {
                 }
             } else {
                 self.append_message(body, message, width);
-                let has_assistant_message = messages.iter().any(|candidate| {
-                    candidate.role == MessageRole::Assistant && candidate.run_id == message.run_id
-                });
-                if !has_assistant_message {
-                    let mut orphan_calls = tool_calls
-                        .iter()
-                        .filter(|tool_call| tool_call.run_id == message.run_id)
-                        .collect::<Vec<_>>();
-                    orphan_calls
-                        .sort_by_key(|tool_call| (tool_call.turn_ordinal, tool_call.call_ordinal));
+                if turns.first_assistant(message.run_id).is_none() {
+                    let orphan_calls = turns.calls_of(message.run_id);
                     if !orphan_calls.is_empty() {
                         body.push_line(Line::default());
                         body.extend_owned(render_tool_calls(
-                            &orphan_calls,
+                            orphan_calls,
                             &session.live_tool_output,
                             app.tool_detail,
                             app.animation_tick,

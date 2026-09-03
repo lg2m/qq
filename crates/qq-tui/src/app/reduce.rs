@@ -376,7 +376,7 @@ impl App {
         let refocus = if showing.is_empty() {
             None
         } else {
-            let order = self.thread_order();
+            let order = self.sessions.thread_order();
             order
                 .iter()
                 .position(|candidate| *candidate == session_id)

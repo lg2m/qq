@@ -2962,3 +2962,73 @@ fn the_reducer_returns_notices_and_attention_as_effects_instead_of_mutating_them
             .any(|effect| matches!(effect, Effect::Attention(Attention::RunFinished { .. })))
     );
 }
+
+#[test]
+fn background_streaming_for_an_unshown_session_does_not_redraw_when_the_sidebar_is_hidden() {
+    let (mut app, first, other) = two_session_app();
+    assert_eq!(app.focused(), Some(first));
+    app.sidebar = Sidebar::Hidden;
+    app.handle_terminal_event(Event::Resize(100, 30));
+    let run_id = id(0x60, RunId::from_bytes);
+    let message_id = id(0x61, MessageId::from_bytes);
+    let mut sequence = 1;
+    let mut event = |event: SessionEvent| {
+        sequence += 1;
+        ClientUpdate::Event(SessionEventEnvelope {
+            run_id: Some(run_id),
+            ..fixtures::envelope(sequence, other, event)
+        })
+    };
+    // Structural changes always redraw: focus, chrome, or attention may move.
+    let started = app.apply_client_update(event(SessionEvent::AssistantMessageStarted {
+        message: MessageSnapshot {
+            run_id,
+            state: MessageState::Streaming,
+            ..fixtures::message(message_id, other, "")
+        },
+    }));
+    assert!(started.redraws());
+
+    // A text delta for a session shown in no pane, with the sidebar hidden,
+    // changes nothing on screen.
+    let delta = app.apply_client_update(event(SessionEvent::TextAppended {
+        message_id,
+        channel: TextChannel::Output,
+        text: "more".to_owned(),
+    }));
+    assert!(!delta.redraws(), "nothing visible changed");
+    // The model still advanced.
+    assert!(
+        app.sessions[&other]
+            .messages
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|message| message.output == "more")
+    );
+
+    // With the sidebar showing, the live tail is visible and the delta redraws.
+    app.sidebar = Sidebar::Shown;
+    let delta = app.apply_client_update(event(SessionEvent::TextAppended {
+        message_id,
+        channel: TextChannel::Output,
+        text: " text".to_owned(),
+    }));
+    assert!(delta.redraws());
+
+    // And a delta for the shown session redraws regardless.
+    app.sidebar = Sidebar::Hidden;
+    let shown = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+        run_id: Some(run_id),
+        ..fixtures::envelope(
+            99,
+            first,
+            SessionEvent::TextAppended {
+                message_id: id(0x62, MessageId::from_bytes),
+                channel: TextChannel::Output,
+                text: "x".to_owned(),
+            },
+        )
+    }));
+    assert!(shown.redraws());
+}
