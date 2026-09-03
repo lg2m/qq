@@ -174,7 +174,7 @@ fn transcript_renders_replayed_tool_activity_collapsed() {
         false,
     )]);
 
-    let frame = FrameRenderer::default().frame(&mut app, 100, 30);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 30);
     let rows = frame_rows(&frame);
 
     assert!(
@@ -258,7 +258,7 @@ fn steering_rows_say_what_they_are_at_every_state() {
         }
     }
 
-    let frame = FrameRenderer::default().frame(&mut app, 100, 40);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 40);
     let rows = frame_rows(&frame);
     let header_before = |needle: &str| {
         let at = rows.iter().position(|row| row.contains(needle)).unwrap();
@@ -691,7 +691,7 @@ fn approval_prompts_render_edit_previews_as_colored_diffs() {
         )
     }));
 
-    let frame = FrameRenderer::default().frame(&mut app, 80, 24);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 24);
     let rows = frame_rows(&frame);
 
     assert!(rows.iter().any(|row| row.contains("file: src/lib.rs")));
@@ -980,12 +980,12 @@ fn detail_cycling_reveals_arguments_and_result_tails() {
     let mut renderer = FrameRenderer::default();
     let ctrl_o = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
 
-    let collapsed = frame_rows(&renderer.frame(&mut app, 100, 30));
+    let collapsed = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
     assert!(!collapsed.iter().any(|row| row.contains("beta")));
     assert!(collapsed.iter().any(|row| row.contains("tools: collapsed")));
 
     app.handle_terminal_event(ctrl_o.clone());
-    let expanded = frame_rows(&renderer.frame(&mut app, 100, 30));
+    let expanded = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
     assert!(
         expanded
             .iter()
@@ -995,7 +995,7 @@ fn detail_cycling_reveals_arguments_and_result_tails() {
     assert!(expanded.iter().any(|row| row.contains("tools: expanded")));
 
     app.handle_terminal_event(ctrl_o);
-    let collapsed = frame_rows(&renderer.frame(&mut app, 100, 30));
+    let collapsed = frame_rows(&renderer.frame_and_commit(&mut app, 100, 30));
     assert!(!collapsed.iter().any(|row| row.contains("beta")));
 }
 
@@ -1236,7 +1236,7 @@ fn completing_a_long_live_message_preserves_a_scrolled_tail_anchor() {
         .join("\n");
 
     let mut renderer = FrameRenderer::default();
-    renderer.frame(&mut app, 80, 24);
+    renderer.frame_and_commit(&mut app, 80, 24);
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::PageUp,
@@ -1249,7 +1249,7 @@ fn completing_a_long_live_message_preserves_a_scrolled_tail_anchor() {
     let session = app.sessions.get_mut(&session_id).unwrap();
     session.messages.as_mut().unwrap()[0].state = MessageState::Complete;
     session.loaded_through += 1;
-    renderer.frame(&mut app, 80, 24);
+    renderer.frame_and_commit(&mut app, 80, 24);
 
     assert_eq!(app.transcript_scroll_offset(), live_offset);
 }
@@ -1267,7 +1267,7 @@ fn completion_behind_an_overlay_preserves_the_scrolled_live_tail() {
         .join("\n");
 
     let mut renderer = FrameRenderer::default();
-    renderer.frame(&mut app, 80, 24);
+    renderer.frame_and_commit(&mut app, 80, 24);
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::PageUp,
@@ -1276,14 +1276,14 @@ fn completion_behind_an_overlay_preserves_the_scrolled_live_tail() {
     ));
     let live_offset = app.transcript_scroll_offset();
     app.overlay = Some(crate::input::Overlay::models());
-    renderer.frame(&mut app, 80, 24);
+    renderer.frame_and_commit(&mut app, 80, 24);
 
     let session = app.sessions.get_mut(&session_id).unwrap();
     session.messages.as_mut().unwrap()[0].state = MessageState::Complete;
     session.loaded_through += 1;
-    renderer.frame(&mut app, 80, 24);
+    renderer.frame_and_commit(&mut app, 80, 24);
     app.overlay = None;
-    renderer.frame(&mut app, 80, 24);
+    renderer.frame_and_commit(&mut app, 80, 24);
 
     assert_eq!(app.transcript_scroll_offset(), live_offset);
 }
@@ -1305,20 +1305,20 @@ fn completing_a_live_message_does_not_move_an_older_history_viewport() {
         .join("\n");
 
     let mut renderer = FrameRenderer::default();
-    renderer.frame(&mut app, 80, 24);
+    renderer.frame_and_commit(&mut app, 80, 24);
     let page_up = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::PageUp,
         crossterm::event::KeyModifiers::NONE,
     ));
     while app.handle_terminal_event(page_up.clone()).split().0 {}
-    let before = renderer.frame(&mut app, 80, 24);
+    let before = renderer.frame_and_commit(&mut app, 80, 24);
     assert!(frame_text(&before).contains("HISTORY-ROW-0000"));
     let history_offset = app.transcript_scroll_offset();
 
     let session = app.sessions.get_mut(&session_id).unwrap();
     session.messages.as_mut().unwrap()[1].state = MessageState::Complete;
     session.loaded_through += 1;
-    let after = renderer.frame(&mut app, 80, 24);
+    let after = renderer.frame_and_commit(&mut app, 80, 24);
 
     assert!(frame_text(&after).contains("HISTORY-ROW-0000"));
     assert!(app.transcript_scroll_offset() > history_offset);
@@ -1372,7 +1372,7 @@ fn refreshed_chrome_shows_identity_status_and_session_metrics() {
     let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
     session.summary.context_tokens = Some(64_000);
     session.context_window = Some(128_000);
-    let frame = FrameRenderer::default().frame(&mut app, 80, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 12);
     let rows = frame_rows(&frame);
 
     assert!(rows[0].contains(&format!("qq  {VERSION} {GIT_COMMIT}")));
@@ -1459,7 +1459,7 @@ fn header_only_qualifies_local_when_the_connection_has_a_problem() {
 #[test]
 fn threadline_has_no_vertical_message_rails() {
     let mut app = app_with_messages(2);
-    let frame = FrameRenderer::default().frame(&mut app, 80, 14);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 14);
 
     assert!(frame_rows(&frame).iter().all(|row| !row.contains("  |  ")));
 }
@@ -1486,14 +1486,14 @@ fn composer_keeps_the_tail_when_max_rows_clip() {
 fn slash_autocomplete_is_filtered_above_the_composer() {
     let mut app = app_with_messages(1);
     app.composer.text = "/".to_owned();
-    let frame = FrameRenderer::default().frame(&mut app, 80, 20);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 20);
     let text = frame_text(&frame);
     for command in ["/models", "/sessions", "/resume", "/new", "/quit", "/exit"] {
         assert!(text.contains(command));
     }
 
     app.composer.text = "/qu".to_owned();
-    let frame = FrameRenderer::default().frame(&mut app, 80, 14);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 14);
     let text = frame_text(&frame);
 
     assert!(text.contains("/quit"));
@@ -1526,7 +1526,7 @@ fn session_picker_pins_search_and_keeps_the_selection_visible() {
     }
     app.overlay = Some(crate::input::Overlay::sessions("", selected, None));
 
-    let frame = FrameRenderer::default().frame(&mut app, 80, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 12);
     let text = frame_text(&frame);
 
     assert!(text.contains("SESSIONS"));
@@ -1539,7 +1539,7 @@ fn session_picker_renders_an_empty_search_result() {
     let mut app = app_with_messages(0);
     app.overlay = Some(crate::input::Overlay::sessions("missing", None, None));
 
-    let frame = FrameRenderer::default().frame(&mut app, 80, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 80, 12);
     let text = frame_text(&frame);
 
     assert!(text.contains("search: missing"));
@@ -1556,7 +1556,7 @@ fn session_picker_renders_delete_and_prune_confirmations() {
         Some(SessionConfirm::Delete(session_id)),
     ));
 
-    let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
     assert!(text.contains("y confirms, n or Esc cancels"));
     assert!(text.contains("delete 'Session'? y deletes, n keeps"));
@@ -1565,13 +1565,13 @@ fn session_picker_renders_delete_and_prune_confirmations() {
         .as_mut()
         .unwrap()
         .set_confirm(Some(SessionConfirm::Prune));
-    let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
     assert!(text.contains("delete every empty session in this workspace?"));
 
     // Without a pending confirmation the hint advertises both actions.
     app.overlay.as_mut().unwrap().set_confirm(None);
-    let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
     assert!(text.contains("Ctrl-D deletes, Ctrl-P prunes empty"));
 }
@@ -1592,12 +1592,12 @@ fn model_picker_hint_reflects_apply_versus_create() {
     });
     app.overlay = Some(crate::input::Overlay::models());
 
-    let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
     assert!(text.contains("Enter sets the session model, Ctrl-N creates a session"));
 
     app.panes.focused_mut().session = None;
-    let frame = FrameRenderer::default().frame(&mut app, 100, 12);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 100, 12);
     let text = frame_text(&frame);
     assert!(text.contains("Enter creates session"));
 }
@@ -1629,13 +1629,13 @@ fn transcript_viewport_renders_rows_above_the_tail_and_clamps_at_the_top() {
 fn page_up_replaces_the_rendered_live_tail_with_older_transcript_rows() {
     let mut app = app_with_messages(10);
     let mut renderer = FrameRenderer::default();
-    let tail = renderer.frame(&mut app, 80, 12);
+    let tail = renderer.frame_and_commit(&mut app, 80, 12);
 
     app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
         KeyCode::PageUp,
         KeyModifiers::NONE,
     )));
-    let scrolled = renderer.frame(&mut app, 80, 12);
+    let scrolled = renderer.frame_and_commit(&mut app, 80, 12);
 
     assert!(frame_text(&tail).contains("row 9"));
     assert!(!frame_text(&scrolled).contains("row 9"));
@@ -1660,7 +1660,7 @@ fn page_up_reaches_the_beginning_of_a_long_completed_message() {
             .join("\n")
     );
     let mut renderer = FrameRenderer::default();
-    let tail = renderer.frame(&mut app, 80, 12);
+    let tail = renderer.frame_and_commit(&mut app, 80, 12);
 
     for _ in 0..100 {
         app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
@@ -1668,7 +1668,7 @@ fn page_up_reaches_the_beginning_of_a_long_completed_message() {
             KeyModifiers::NONE,
         )));
     }
-    let top = renderer.frame(&mut app, 80, 12);
+    let top = renderer.frame_and_commit(&mut app, 80, 12);
 
     assert!(frame_text(&tail).contains("END-LONG-MESSAGE"));
     assert!(!frame_text(&tail).contains("BEGIN-LONG-MESSAGE"));
@@ -1731,7 +1731,7 @@ fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
     assert!(!app.sessions[&child_id].is_warm());
 
     let rows_at = |app: &mut App, width| {
-        frame_rows(&FrameRenderer::default().frame(app, width, 24)).join("\n")
+        frame_rows(&FrameRenderer::default().frame_and_commit(app, width, 24)).join("\n")
     };
     let narrow = rows_at(&mut app, 100);
     assert!(
@@ -1739,7 +1739,7 @@ fn sidebar_appears_at_wide_widths_and_shows_live_status_for_cold_sessions() {
         "auto-hidden when narrow"
     );
 
-    let wide_frame = FrameRenderer::default().frame(&mut app, 160, 24);
+    let wide_frame = FrameRenderer::default().frame_and_commit(&mut app, 160, 24);
     let wide = frame_rows(&wide_frame).join("\n");
     assert!(wide.contains("SESSIONS  1 running"), "{wide}");
     assert!(wide.contains("Survey callers"));
@@ -1821,7 +1821,7 @@ fn spawned_children_render_under_their_spawn_call_and_never_fold() {
     }));
     app.sidebar = crate::app::Sidebar::Hidden;
 
-    let rows = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 40));
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 40));
     let spawn_row = rows
         .iter()
         .position(|row| row.contains("spawn_agent"))
@@ -1841,7 +1841,7 @@ fn spawned_children_render_under_their_spawn_call_and_never_fold() {
     // A child with no recorded call attaches nowhere in the transcript
     // but still appears in related sessions.
     app.sessions.get_mut(&child_id).unwrap().summary.spawned_by = None;
-    let rows = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 40));
+    let rows = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 40));
     let spawn_row = rows
         .iter()
         .position(|row| row.contains("spawn_agent"))
@@ -1900,7 +1900,7 @@ fn background_approvals_surface_a_banner_that_ctrl_g_jumps_to() {
 
     // Focused on the parent: no modal, but the banner names the child.
     assert_eq!(app.mode(), Mode::Compose);
-    let text = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 24)).join("\n");
+    let text = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24)).join("\n");
     assert!(text.contains("approval needed in Deploy helper"), "{text}");
     assert!(text.contains("Ctrl-G"));
 
@@ -1915,7 +1915,7 @@ fn background_approvals_surface_a_banner_that_ctrl_g_jumps_to() {
     // The child is cold, so the jump fetches its body...
     assert_eq!(requests.len(), 1);
     // ...and the banner no longer names the session we are now in.
-    let text = frame_rows(&FrameRenderer::default().frame(&mut app, 100, 24)).join("\n");
+    let text = frame_rows(&FrameRenderer::default().frame_and_commit(&mut app, 100, 24)).join("\n");
     assert!(!text.contains("approval needed in"));
 }
 
@@ -2062,7 +2062,7 @@ fn two_panes_render_side_by_side_with_titles_and_a_divider() {
     app.sidebar = crate::app::Sidebar::Hidden;
     app.execute(Command::SplitBeside);
     app.focus_session(other);
-    let frame = FrameRenderer::default().frame(&mut app, 101, 24);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 101, 24);
     let rows = frame_rows(&frame);
     // Row 2 is the pane title row: the left pane is unfocused, the right
     // pane carries the focus marker and its title.
@@ -2095,7 +2095,7 @@ fn stacked_panes_share_the_width_and_scroll_independently() {
     app.sidebar = crate::app::Sidebar::Hidden;
     app.execute(Command::SplitBelow);
     let mut renderer = FrameRenderer::default();
-    renderer.frame(&mut app, 80, 40);
+    renderer.frame_and_commit(&mut app, 80, 40);
     let (tiles, dividers) = app.panes.layout(crate::panes::Rect::new(0, 2, 80, 34));
     assert_eq!(tiles.len(), 2);
     assert_eq!(dividers[0].height, 1);
@@ -2111,7 +2111,7 @@ fn stacked_panes_share_the_width_and_scroll_independently() {
             crossterm::event::KeyModifiers::NONE,
         ),
     ));
-    let frame = renderer.frame(&mut app, 80, 40);
+    let frame = renderer.frame_and_commit(&mut app, 80, 40);
     assert!(app.viewport(bottom).unwrap().offset() > 0);
     assert_eq!(app.viewport(top).unwrap().offset(), 0);
     let rows = frame_rows(&frame);
@@ -2130,7 +2130,7 @@ fn a_height_only_resize_keeps_every_pane_cache() {
     app.execute(Command::SplitBeside);
     app.focus_session(other);
     let mut renderer = FrameRenderer::default();
-    renderer.frame(&mut app, 101, 24);
+    renderer.frame_and_commit(&mut app, 101, 24);
     let ids = app.panes.ids();
     let cached_before: Vec<usize> = ids
         .iter()
@@ -2142,7 +2142,7 @@ fn a_height_only_resize_keeps_every_pane_cache() {
         .map(|id| renderer.cache(*id).markdown.values().next().unwrap().width)
         .collect();
 
-    renderer.frame(&mut app, 101, 30);
+    renderer.frame_and_commit(&mut app, 101, 30);
     for (id, width) in ids.iter().zip(widths) {
         let cache = renderer.cache(*id);
         assert_eq!(cache.markdown.len(), 4);
@@ -2150,7 +2150,7 @@ fn a_height_only_resize_keeps_every_pane_cache() {
     }
     // Closing a pane drops its cache on the next frame.
     app.execute(Command::ClosePane);
-    renderer.frame(&mut app, 101, 30);
+    renderer.frame_and_commit(&mut app, 101, 30);
     assert_eq!(renderer.panes.len(), 1);
 }
 
@@ -2160,7 +2160,7 @@ fn a_narrow_frame_shows_only_the_focused_pane_and_no_divider() {
     app.sidebar = crate::app::Sidebar::Hidden;
     app.execute(Command::SplitBeside);
     app.focus_session(other);
-    let frame = FrameRenderer::default().frame(&mut app, 40, 16);
+    let frame = FrameRenderer::default().frame_and_commit(&mut app, 40, 16);
     let text = frame_text(&frame);
     assert!(text.contains("other 1"));
     assert!(!text.contains("row 1"));

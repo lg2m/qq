@@ -82,9 +82,31 @@ pub(crate) struct FrameRenderer {
     /// bake in colors, so a theme change discards every layout and forces
     /// a full repaint.
     theme_generation: u64,
+    /// Viewports reconciled while building the last frame. `draw` hands them
+    /// back to the app after the frame is composed; `frame` itself never
+    /// mutates the model.
+    viewport_updates: Vec<ViewportUpdate>,
+    /// Tiles laid out for the last frame, for the same hand-back.
+    tiles: Vec<Tile>,
+}
+
+/// A pane's viewport after reconciling it with the body drawn this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewportUpdate {
+    pub(crate) pane: PaneId,
+    pub(crate) viewport: Viewport,
 }
 
 impl FrameRenderer {
+    /// Hand the geometry decided while building the last frame back to the
+    /// model: reconciled viewports and the tiles on screen.
+    pub(crate) fn commit(&mut self, app: &mut App) {
+        for update in self.viewport_updates.drain(..) {
+            app.set_viewport(update.pane, update.viewport);
+        }
+        app.panes.remember_tiles(std::mem::take(&mut self.tiles));
+    }
+
     /// Forget the previous frame so the next draw repaints every row, after
     /// something else (an external editor) wrote to the terminal.
     pub(crate) fn invalidate(&mut self) {
@@ -99,6 +121,7 @@ impl FrameRenderer {
         let width = actual_size.0.clamp(1, MAX_RENDER_WIDTH);
         let height = actual_size.1.clamp(1, MAX_RENDER_HEIGHT);
         let frame = self.frame(app, usize::from(width), usize::from(height));
+        self.commit(app);
         let resized = self.size != Some(actual_size);
         let mut output = Vec::with_capacity(4096);
         queue!(&mut output, BeginSynchronizedUpdate)?;
@@ -131,8 +154,12 @@ impl FrameRenderer {
         Ok(output)
     }
 
-    fn frame(&mut self, app: &mut App, width: usize, height: usize) -> Vec<Line> {
+    /// Build one frame from the model without changing it. Viewport clamps
+    /// computed along the way are queued in `viewport_updates` for `draw`.
+    fn frame(&mut self, app: &App, width: usize, height: usize) -> Vec<Line> {
         theme::activate(app.theme().palette);
+        self.viewport_updates.clear();
+        self.tiles.clear();
         if self.theme_generation != app.theme_generation {
             self.theme_generation = app.theme_generation;
             self.panes.clear();
@@ -220,8 +247,9 @@ impl FrameRenderer {
     /// with dividers between siblings. Each pane renders through its own
     /// cache at its own width, so resizing one split re-lays only the panes
     /// whose width changed.
-    fn panes_body(&mut self, app: &mut App, area: Rect) -> Vec<Line> {
+    fn panes_body(&mut self, app: &App, area: Rect) -> Vec<Line> {
         let (tiles, dividers) = app.panes.layout(area);
+        self.tiles.clone_from(&tiles);
         let visible: HashSet<PaneId> = tiles.iter().map(|tile| tile.pane).collect();
         // Caches for closed or hidden panes are dropped; a hidden pane pays a
         // one-time relayout when it comes back, which is cheaper than holding
@@ -234,7 +262,9 @@ impl FrameRenderer {
         {
             let tile = *tile;
             let cache = self.panes.entry(tile.pane).or_default();
-            return cache.pane(&mut self.highlighter, app, tile, false);
+            let (lines, update) = cache.pane(&mut self.highlighter, app, tile, false);
+            self.viewport_updates.push(update);
+            return lines;
         }
         let multiple = tiles.len() > 1;
         // Every visible piece — pane rows or a divider — in x order. Each row
@@ -244,7 +274,8 @@ impl FrameRenderer {
         let mut pieces: Vec<(Rect, Piece)> = Vec::with_capacity(tiles.len() + dividers.len());
         for tile in tiles {
             let cache = self.panes.entry(tile.pane).or_default();
-            let lines = cache.pane(&mut self.highlighter, app, tile, multiple);
+            let (lines, update) = cache.pane(&mut self.highlighter, app, tile, multiple);
+            self.viewport_updates.push(update);
             pieces.push((tile.rect, Piece::Pane(lines)));
         }
         for divider in dividers {
@@ -360,3 +391,18 @@ enum Piece {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl FrameRenderer {
+    /// Build a frame and hand its geometry back to the app, as `draw` does.
+    pub(crate) fn frame_and_commit(
+        &mut self,
+        app: &mut App,
+        width: usize,
+        height: usize,
+    ) -> Vec<Line> {
+        let frame = self.frame(app, width, height);
+        self.commit(app);
+        frame
+    }
+}

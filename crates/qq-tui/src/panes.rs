@@ -538,8 +538,10 @@ impl Panes {
     }
 
     /// Lay every visible pane out inside `rect`. Zoomed or too small, only
-    /// the focused path is shown. The tiles are remembered for hit-testing.
-    pub(crate) fn layout(&mut self, rect: Rect) -> (Vec<Tile>, Vec<Rect>) {
+    /// the focused path is shown. Pure: hand the tiles to `remember_tiles`
+    /// once the frame is drawn so hit-testing and neighbour navigation see
+    /// what is on screen.
+    pub(crate) fn layout(&self, rect: Rect) -> (Vec<Tile>, Vec<Rect>) {
         let mut tiles = Vec::with_capacity(self.panes.len());
         let mut dividers = Vec::new();
         if self.zoomed {
@@ -551,8 +553,12 @@ impl Panes {
             self.root
                 .layout(rect, self.focused, &mut tiles, &mut dividers);
         }
-        self.tiles.clone_from(&tiles);
         (tiles, dividers)
+    }
+
+    /// Record the tiles of the frame just drawn.
+    pub(crate) fn remember_tiles(&mut self, tiles: Vec<Tile>) {
+        self.tiles = tiles;
     }
 
     /// The pane under a frame coordinate on the last layout.
@@ -588,9 +594,9 @@ mod tests {
     }
 
     fn tiles_of(panes: &mut Panes, rect: Rect) -> Vec<(PaneId, Rect)> {
-        panes
-            .layout(rect)
-            .0
+        let (tiles, _) = panes.layout(rect);
+        panes.remember_tiles(tiles.clone());
+        tiles
             .into_iter()
             .map(|tile| (tile.pane, tile.rect))
             .collect()
@@ -670,7 +676,7 @@ mod tests {
         let a = panes.focused_id();
         let b = panes.split(Axis::Columns).unwrap();
         let c = panes.split(Axis::Rows).unwrap();
-        panes.layout(Rect::new(0, 0, 101, 21));
+        tiles_of(&mut panes, Rect::new(0, 0, 101, 21));
         assert_eq!(panes.focused_id(), c);
         assert!(panes.focus_direction(Direction::Up));
         assert_eq!(panes.focused_id(), b);
@@ -750,7 +756,7 @@ mod tests {
         let mut panes = Panes::default();
         let a = panes.focused_id();
         let b = panes.split(Axis::Columns).unwrap();
-        panes.layout(Rect::new(0, 2, 101, 20));
+        tiles_of(&mut panes, Rect::new(0, 2, 101, 20));
         assert_eq!(panes.hit(10, 5), Some(a));
         assert_eq!(panes.hit(60, 5), Some(b));
         assert_eq!(panes.hit(50, 5), None, "the divider belongs to no pane");

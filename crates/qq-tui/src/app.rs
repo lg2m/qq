@@ -1236,19 +1236,10 @@ impl App {
         effects
     }
 
-    /// Reconcile pane `id`'s viewport with the body laid out this frame.
-    pub(crate) fn update_viewport(
-        &mut self,
-        id: PaneId,
-        body_rows: usize,
-        height: usize,
-        preserve_tail_anchor: bool,
-    ) {
-        let layout = self.layout;
+    /// Install the viewport the renderer reconciled for pane `id` this frame.
+    pub(crate) fn set_viewport(&mut self, id: PaneId, viewport: Viewport) {
         if let Some(pane) = self.panes.get_mut(id) {
-            let context = (pane.session, layout);
-            pane.viewport
-                .update(context, body_rows, height, preserve_tail_anchor);
+            pane.viewport = viewport;
         }
     }
 
@@ -1260,8 +1251,11 @@ impl App {
         height: usize,
         preserve_tail_anchor: bool,
     ) {
-        let id = self.panes.focused_id();
-        self.update_viewport(id, body_rows, height, preserve_tail_anchor);
+        let layout = self.layout;
+        let pane = self.panes.focused_mut();
+        let context = (pane.session, layout);
+        pane.viewport
+            .update(context, body_rows, height, preserve_tail_anchor);
     }
 
     #[cfg(test)]

@@ -386,10 +386,10 @@ impl TranscriptCache {
     pub(super) fn pane(
         &mut self,
         highlighter: &mut Highlighter,
-        app: &mut App,
+        app: &App,
         tile: Tile,
         titled: bool,
-    ) -> Vec<Line> {
+    ) -> (Vec<Line>, ViewportUpdate) {
         let width = tile.rect.width;
         let session_id = app.panes.get(tile.pane).and_then(|pane| pane.session);
         let focused = app.panes.focused_id() == tile.pane;
@@ -398,19 +398,33 @@ impl TranscriptCache {
             lines.push(pane_title(app, session_id, focused, width));
         }
         let body_height = tile.rect.height.saturating_sub(lines.len());
-        let viewport = app.viewport(tile.pane).cloned().unwrap_or_default();
+        let mut viewport = app.viewport(tile.pane).cloned().unwrap_or_default();
         let body = match app.layout {
             Layout::Threadline => self.threadline(highlighter, app, session_id, &viewport, width),
             Layout::FoldFocus => self.fold_focus(highlighter, app, session_id, &viewport, width),
         };
-        app.update_viewport(tile.pane, body.rows, body_height, body.preserve_tail_anchor);
-        let offset = app.viewport(tile.pane).map_or(0, Viewport::offset);
+        // The viewport is reconciled against this frame's body here, on a
+        // copy; the caller hands it back to the app after composition so
+        // rendering never writes into the model mid-frame.
+        viewport.update(
+            (session_id, app.layout),
+            body.rows,
+            body_height,
+            body.preserve_tail_anchor,
+        );
+        let offset = viewport.offset();
         let live_message_ranges = body.live_message_ranges.clone();
         let rows = body.viewport(app, body_height, offset);
         drop(body);
         self.live_message_ranges = live_message_ranges.into_iter().collect();
         lines.extend(rows);
-        fit_height(lines, tile.rect.height)
+        (
+            fit_height(lines, tile.rect.height),
+            ViewportUpdate {
+                pane: tile.pane,
+                viewport,
+            },
+        )
     }
 
     /// Drop every cached layout, keeping live-row anchors: an overlay hides

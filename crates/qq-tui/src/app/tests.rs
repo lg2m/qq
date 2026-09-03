@@ -10,6 +10,7 @@ use crate::{
     effect::{Effect, Effects},
     fixtures,
     model::{LIVE_TAIL_BYTES, MAX_LIVE_TOOL_OUTPUT_BYTES},
+    panes::Viewport,
 };
 
 fn id<T>(byte: u8, constructor: impl FnOnce([u8; 16]) -> T) -> T {
@@ -2509,7 +2510,8 @@ fn splitting_inherits_the_session_and_pane_commands_route_through_keys() {
     // layout has produced geometry.
     app.handle_key(alt('-'));
     assert_eq!(app.panes.len(), 3);
-    app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
+    let (tiles, _) = app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
+    app.panes.remember_tiles(tiles);
     let before = app.panes.focused_id();
     let (changed, _) = app.handle_key(alt('k')).split();
     assert!(changed);
@@ -2590,7 +2592,8 @@ fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus
     assert_eq!(requests.len(), 1, "cold body is requested");
     // The user moves back to the first pane before the body arrives.
     app.execute(Command::FocusPaneLeft);
-    app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
+    let (tiles, _) = app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
+    app.panes.remember_tiles(tiles);
     let (moved, _) = app.execute(Command::FocusPaneLeft).split();
     assert!(moved);
     assert_eq!(app.focused(), Some(first));
@@ -2651,12 +2654,20 @@ fn the_mouse_scrolls_the_pane_under_the_cursor_and_clicks_focus_it() {
     app.execute(Command::SplitBeside);
     app.focus_session(other);
     let (tiles, _) = app.panes.layout(crate::panes::Rect::new(0, 2, 161, 40));
+    app.panes.remember_tiles(tiles.clone());
     let left = tiles[0];
     let right = tiles[1];
     assert_eq!(app.panes.focused_id(), right.pane);
     // Give both panes a scrollable body.
     for tile in [left, right] {
-        app.update_viewport(tile.pane, 200, 40, false);
+        let mut viewport = Viewport::default();
+        viewport.update(
+            (app.panes.get(tile.pane).unwrap().session, app.layout),
+            200,
+            40,
+            false,
+        );
+        app.set_viewport(tile.pane, viewport);
     }
     let mouse = |kind, column: usize, row: usize| {
         Event::Mouse(MouseEvent {
