@@ -34,10 +34,11 @@ pub enum Action {
     CreateRootSession,
     CreateChildSession,
     CancelRun,
+    InterruptRun,
 }
 
 impl Action {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::SelectThreadline,
         Self::SelectFoldFocus,
         Self::NextLayout,
@@ -46,6 +47,7 @@ impl Action {
         Self::CreateRootSession,
         Self::CreateChildSession,
         Self::CancelRun,
+        Self::InterruptRun,
     ];
 
     /// Every bindable action.
@@ -227,6 +229,7 @@ impl Default for SettingsBuilder {
                 binding(Action::CreateRootSession, &["Alt-N"]),
                 binding(Action::CreateChildSession, &["Alt-C"]),
                 binding(Action::CancelRun, &["Ctrl-X"]),
+                binding(Action::InterruptRun, &["Alt-S"]),
             ],
         }
     }

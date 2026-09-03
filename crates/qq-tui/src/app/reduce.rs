@@ -184,9 +184,9 @@ impl App {
                 self.upsert_tool_call(tool_call.clone());
             }
             // Steering rows are user messages of the active run; the TUI
-            // renders them in transcript order and tracks their state. It
-            // does not yet offer a steering composer; that is client work
-            // scheduled after the backend contract.
+            // renders them in transcript order and tracks their state. The
+            // composer sends them (`App::steer_run`); the row is installed
+            // from the event so it is durable before it is shown.
             SessionEvent::SteeringQueued { message, .. } => {
                 self.push_message(message.clone());
             }

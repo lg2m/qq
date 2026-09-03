@@ -20,10 +20,11 @@ pub enum TuiAction {
     CreateRootSession,
     CreateChildSession,
     CancelRun,
+    InterruptRun,
 }
 
 impl TuiAction {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::SelectThreadline,
         Self::SelectFoldFocus,
         Self::NextLayout,
@@ -32,6 +33,7 @@ impl TuiAction {
         Self::CreateRootSession,
         Self::CreateChildSession,
         Self::CancelRun,
+        Self::InterruptRun,
     ];
 }
 
@@ -197,10 +199,11 @@ struct BindingsDocument {
     create_root_session: Option<Vec<String>>,
     create_child_session: Option<Vec<String>>,
     cancel_run: Option<Vec<String>>,
+    interrupt_run: Option<Vec<String>>,
 }
 
 impl BindingsDocument {
-    fn entries(&self) -> [(TuiAction, Option<&[String]>); 8] {
+    fn entries(&self) -> [(TuiAction, Option<&[String]>); 9] {
         [
             (
                 TuiAction::SelectThreadline,
@@ -222,6 +225,7 @@ impl BindingsDocument {
                 self.create_child_session.as_deref(),
             ),
             (TuiAction::CancelRun, self.cancel_run.as_deref()),
+            (TuiAction::InterruptRun, self.interrupt_run.as_deref()),
         ]
     }
 }

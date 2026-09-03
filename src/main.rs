@@ -677,6 +677,7 @@ fn parse_tui_action(value: &str) -> Option<config::TuiAction> {
         "create_root_session" => Some(config::TuiAction::CreateRootSession),
         "create_child_session" => Some(config::TuiAction::CreateChildSession),
         "cancel_run" => Some(config::TuiAction::CancelRun),
+        "interrupt_run" => Some(config::TuiAction::InterruptRun),
         _ => None,
     }
 }
@@ -705,6 +706,7 @@ fn config_action(action: qq_tui::Action) -> config::TuiAction {
         qq_tui::Action::CreateRootSession => config::TuiAction::CreateRootSession,
         qq_tui::Action::CreateChildSession => config::TuiAction::CreateChildSession,
         qq_tui::Action::CancelRun => config::TuiAction::CancelRun,
+        qq_tui::Action::InterruptRun => config::TuiAction::InterruptRun,
     }
 }
 
@@ -718,6 +720,7 @@ fn tui_action(action: config::TuiAction) -> qq_tui::Action {
         config::TuiAction::CreateRootSession => qq_tui::Action::CreateRootSession,
         config::TuiAction::CreateChildSession => qq_tui::Action::CreateChildSession,
         config::TuiAction::CancelRun => qq_tui::Action::CancelRun,
+        config::TuiAction::InterruptRun => qq_tui::Action::InterruptRun,
     }
 }
 
@@ -731,6 +734,7 @@ fn tui_action_name(action: qq_tui::Action) -> &'static str {
         qq_tui::Action::CreateRootSession => "create_root_session",
         qq_tui::Action::CreateChildSession => "create_child_session",
         qq_tui::Action::CancelRun => "cancel_run",
+        qq_tui::Action::InterruptRun => "interrupt_run",
     }
 }
 

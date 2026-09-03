@@ -35,10 +35,14 @@ pub(crate) enum Command {
     QueueDraft,
     /// Pull the newest locally queued draft back into the composer.
     DequeueDraft,
-    /// Redirect the active run with the composer text. Present in the table
-    /// so surfaces can show it, but unavailable until the server advertises
-    /// steering (H3); `Submit` falls back to queueing meanwhile.
+    /// Add the composer text to the active run at its next model/tool
+    /// boundary. Available only while the server advertises boundary
+    /// steering; `Submit` falls back to queueing otherwise.
     SteerRun,
+    /// Abort the active run's in-flight turn now and steer it with the
+    /// composer text. Available only while the server advertises interrupt
+    /// steering.
+    InterruptRun,
     /// Edit the draft in `$VISUAL` or `$EDITOR`.
     OpenEditor,
     /// Split the focused pane; the new pane sits beside it.
@@ -83,7 +87,7 @@ pub(crate) struct CommandSpec {
 }
 
 /// Presentation order is invocation frequency, not alphabetical.
-pub(crate) const COMMANDS: [CommandSpec; 38] = [
+pub(crate) const COMMANDS: [CommandSpec; 39] = [
     CommandSpec {
         command: Command::OpenModels,
         title: "choose a model",
@@ -251,6 +255,13 @@ pub(crate) const COMMANDS: [CommandSpec; 38] = [
         category: Category::Run,
         slash: &[],
         action: None,
+    },
+    CommandSpec {
+        command: Command::InterruptRun,
+        title: "interrupt the active run and steer it with the draft",
+        category: Category::Run,
+        slash: &[],
+        action: Some(Action::InterruptRun),
     },
     CommandSpec {
         command: Command::OpenEditor,

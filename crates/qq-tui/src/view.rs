@@ -1384,16 +1384,8 @@ impl TranscriptCache {
         message: &MessageSnapshot,
         width: usize,
     ) {
-        let (prefix, prefix_style, role, role_style) = message_presentation(message.role);
-        let mut header = Line::styled(prefix, prefix_style);
-        header.push(role, role_style);
-        if !matches!(message.state, MessageState::Complete) {
-            header.push(
-                format!("  {}", message_state_label(message.state)),
-                status_style(message.state),
-            );
-        }
-        body.push_line(truncate_line(header, width));
+        let (prefix, prefix_style, _, _) = message_presentation(message.role);
+        body.push_line(truncate_line(message_header(message), width));
         let content_start = body.rows;
         if message_is_terminal(message) {
             let Some(cached) = self.markdown.get(&message.id) else {
@@ -1496,16 +1488,8 @@ impl TranscriptCache {
         } else {
             self.refresh_live(message, width);
         }
-        let (prefix, prefix_style, role, role_style) = message_presentation(message.role);
-        let mut header = Line::styled(prefix, prefix_style);
-        header.push(role, role_style);
-        if !matches!(message.state, MessageState::Complete) {
-            header.push(
-                format!("  {}", message_state_label(message.state)),
-                status_style(message.state),
-            );
-        }
-        let mut lines = vec![truncate_line(header, width)];
+        let (prefix, prefix_style, _, _) = message_presentation(message.role);
+        let mut lines = vec![truncate_line(message_header(message), width)];
         if message_is_terminal(message) {
             match &self.markdown.get(&message.id).expect("message cached").body {
                 CachedMessageBody::Markdown(body) => lines.extend_from_slice(body),
@@ -2753,6 +2737,34 @@ fn section(title: &str, subtitle: &str) -> Line {
     line
 }
 
+/// The `▌ YOU  streaming` style row that opens a message. Steering rows keep
+/// the user prefix but say what they are: injected mid-run, not a new prompt,
+/// with a lifecycle (waiting for a boundary, applied, superseded) in words the
+/// run's own messages never use.
+fn message_header(message: &MessageSnapshot) -> Line {
+    let (prefix, prefix_style, role, role_style) = message_presentation(message.role);
+    let mut header = Line::styled(prefix, prefix_style);
+    header.push(role, role_style);
+    if message.steering {
+        let (label, style) = match message.state {
+            MessageState::Queued => ("steering  waiting for the next turn", warning()),
+            MessageState::Complete => ("steered", muted()),
+            MessageState::Cancelled => ("steering  run finished first", warning()),
+            MessageState::Streaming | MessageState::Failed | MessageState::Interrupted => (
+                message_state_label(message.state),
+                status_style(message.state),
+            ),
+        };
+        header.push(format!("  {label}"), style);
+    } else if !matches!(message.state, MessageState::Complete) {
+        header.push(
+            format!("  {}", message_state_label(message.state)),
+            status_style(message.state),
+        );
+    }
+    header
+}
+
 fn message_state_label(state: MessageState) -> &'static str {
     match state {
         MessageState::Queued => "queued",
@@ -3108,6 +3120,55 @@ mod tests {
             rows.iter()
                 .any(|row| row.contains("read_file note.txt") && row.contains("running"))
         );
+    }
+
+    #[test]
+    fn steering_rows_say_what_they_are_at_every_state() {
+        let mut app = app_with_messages(4);
+        let session = app.sessions.get_mut(&app.focused().unwrap()).unwrap();
+        session.summary.status = SessionStatus::Running;
+        let active_run_id = RunId::from_bytes([2; 16]);
+        session.summary.active_run_id = Some(active_run_id);
+        let messages = session.messages.as_mut().unwrap();
+        for (index, (state, text)) in [
+            (MessageState::Complete, "the model turn"),
+            (MessageState::Queued, "pending steer"),
+            (MessageState::Complete, "applied steer"),
+            (MessageState::Cancelled, "late steer"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            messages[index].run_id = active_run_id;
+            messages[index].state = state;
+            messages[index].output = text.to_owned();
+            if index > 0 {
+                messages[index].role = MessageRole::User;
+                messages[index].steering = true;
+            }
+        }
+
+        let frame = FrameRenderer::default().frame(&mut app, 100, 40);
+        let rows = frame_rows(&frame);
+        let header_before = |needle: &str| {
+            let at = rows.iter().position(|row| row.contains(needle)).unwrap();
+            rows[..at]
+                .iter()
+                .rev()
+                .find(|row| row.contains("YOU"))
+                .cloned()
+                .unwrap()
+        };
+        assert!(header_before("pending steer").contains("steering  waiting for the next turn"));
+        assert!(
+            header_before("applied steer")
+                .trim_end()
+                .ends_with("steered")
+        );
+        assert!(header_before("late steer").contains("steering  run finished first"));
+        // A steering row never shows the plain "queued" of a queued prompt,
+        // which would read as a new run waiting its turn.
+        assert!(!rows.iter().any(|row| row.contains("YOU  queued")));
     }
 
     #[test]

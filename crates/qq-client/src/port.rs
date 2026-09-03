@@ -2,7 +2,7 @@ use std::future::Future;
 
 use qq_protocol::{
     CommandId, CommandReceipt, CommandRequest, ModelDescriptor, SessionEventEnvelope,
-    SnapshotRequest, WorkspaceSnapshot,
+    SnapshotRequest, SteeringCapabilities, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,10 @@ pub enum ClientUpdate {
         models: Vec<ModelDescriptor>,
         selected: Option<qq_protocol::ModelSelection>,
     },
+    /// The server's advertised steering support. Arrives once per
+    /// connection after bootstrap; absent until then, so the TUI treats
+    /// steering as unavailable and queues instead.
+    Steering(SteeringCapabilities),
     Event(SessionEventEnvelope),
     CommandResult {
         command_id: CommandId,

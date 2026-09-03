@@ -5,8 +5,8 @@ use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
     CommandRequest, EditPreview, MessageSnapshot, ModelDescriptor, ModelSelection, RunActivity,
     RunId, SessionCommand, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
-    SessionSummary, SnapshotRequest, ToolCallSnapshot, ToolCallState, WorkspaceId,
-    WorkspaceSnapshot,
+    SessionSummary, SnapshotRequest, SteeringCapabilities, ToolCallSnapshot, ToolCallState,
+    WorkspaceId, WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -388,6 +388,12 @@ enum PendingIntent {
     Cancel {
         session_id: SessionId,
     },
+    /// A steering message in flight; `text` returns to the composer if the
+    /// server refuses it.
+    Steer {
+        session_id: SessionId,
+        text: String,
+    },
     Compact {
         session_id: SessionId,
     },
@@ -427,9 +433,10 @@ pub(crate) struct App {
     /// Set when the user asked to edit the draft externally. The loop takes
     /// it, suspends the terminal, runs the editor, and hands the text back.
     editor_requested: bool,
-    /// Server capability gate for `Command::SteerRun`; false until the
-    /// capability document exists.
-    steering_available: bool,
+    /// The server's advertised steering support. `None` until the capability
+    /// document arrives, which reads as "unavailable": `Submit` queues and
+    /// the steering commands say why.
+    steering: Option<SteeringCapabilities>,
     pub connection: ConnectionState,
     pub status: Option<String>,
     /// Session owning the current transient notice. A notice never follows
@@ -492,7 +499,7 @@ impl App {
             drafts: HashMap::new(),
             esc_armed_at: None,
             editor_requested: false,
-            steering_available: false,
+            steering: None,
             connection: ConnectionState::Connecting,
             status: None,
             status_session_id: None,
@@ -599,6 +606,10 @@ impl App {
                 self.apply_models(models, selected);
                 true
             }
+            ClientUpdate::Steering(capabilities) => {
+                self.steering = Some(capabilities);
+                false
+            }
             ClientUpdate::Event(event) => self.apply_live_event(event),
             ClientUpdate::CommandResult { command_id, result } => {
                 match result {
@@ -644,7 +655,20 @@ impl App {
                             );
                         }
                         if matches!(receipt.outcome, CommandOutcome::RunAlreadyFinished { .. }) {
-                            self.set_warning("run already finished".to_owned());
+                            // A steer that lost the race to the finishing run was never
+                            // applied; hand the text back rather than losing it.
+                            if let Some(PendingIntent::Steer { session_id, text }) = intent
+                                && self.focused() == Some(session_id)
+                                && self.composer.text.is_empty()
+                            {
+                                self.composer.replace(text);
+                                self.set_warning(
+                                    "run finished before it could be steered; draft restored"
+                                        .to_owned(),
+                                );
+                            } else {
+                                self.set_warning("run already finished".to_owned());
+                            }
                         }
                         match &receipt.outcome {
                             CommandOutcome::CompactionQueued { session_id, .. } => {
@@ -1027,6 +1051,7 @@ impl App {
         let status_session_id = match &intent {
             Some(PendingIntent::Prompt { session_id, .. })
             | Some(PendingIntent::Cancel { session_id })
+            | Some(PendingIntent::Steer { session_id, .. })
             | Some(PendingIntent::Compact { session_id }) => Some(*session_id),
             Some(PendingIntent::Approval { tool_call_id }) => self
                 .sessions
@@ -1038,6 +1063,7 @@ impl App {
         };
         match intent {
             Some(PendingIntent::Prompt { session_id, text })
+            | Some(PendingIntent::Steer { session_id, text })
                 if self.focused() == Some(session_id) && self.composer.text.is_empty() =>
             {
                 self.composer.replace(text);
@@ -1629,18 +1655,24 @@ impl App {
             Command::QueueDraft => self.queue_draft(),
             Command::DequeueDraft => self.dequeue_draft(),
             Command::SteerRun => {
-                if self.steering_available {
-                    // H3 supplies the steering command; until then the flag
-                    // is never set, so this arm is unreachable in practice.
-                    self.set_warning("steering is not wired to a protocol command yet".to_owned());
-                } else {
-                    self.set_warning(
-                        "this server does not support steering; the draft was queued instead"
-                            .to_owned(),
-                    );
-                    return self.queue_draft();
+                if self.steering.is_some_and(|steering| steering.boundary) {
+                    return self.steer_run(false);
                 }
-                (true, Vec::new())
+                self.set_warning(
+                    "this server does not support steering; the draft was queued instead"
+                        .to_owned(),
+                );
+                self.queue_draft()
+            }
+            Command::InterruptRun => {
+                if self.steering.is_some_and(|steering| steering.interrupt) {
+                    return self.steer_run(true);
+                }
+                self.set_warning(
+                    "this server does not support interrupting a run; the draft was queued instead"
+                        .to_owned(),
+                );
+                self.queue_draft()
             }
             Command::FocusNextApproval => match self.next_session_awaiting_approval() {
                 Some(session_id) => self.focus_session(session_id),
@@ -2157,12 +2189,61 @@ impl App {
             .get(&session_id)
             .is_some_and(|session| session.summary.active_run_id.is_some());
         if running {
-            if self.steering_available {
-                return self.execute(Command::SteerRun);
+            if self.steering.is_some_and(|steering| steering.boundary) {
+                return self.steer_run(false);
             }
             return self.queue_draft();
         }
         self.submit_text(session_id, prompt)
+    }
+
+    /// Send the draft to the focused session's active run as steering. The
+    /// caller has checked the capability; this only checks there is a run.
+    /// With `interrupt`, the run's in-flight turn is aborted first.
+    fn steer_run(&mut self, interrupt: bool) -> (bool, Vec<ClientRequest>) {
+        let text = self.composer.expanded().trim().to_owned();
+        if text.is_empty() {
+            return (false, Vec::new());
+        }
+        let Some(session_id) = self.focused() else {
+            self.set_warning("create a session before steering a run".to_owned());
+            return (true, Vec::new());
+        };
+        let Some(run_id) = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.summary.active_run_id)
+        else {
+            self.set_warning("focused session has no active run to steer".to_owned());
+            return (true, Vec::new());
+        };
+        let Ok(command_id) = CommandId::generate() else {
+            self.set_warning("secure randomness is unavailable".to_owned());
+            return (true, Vec::new());
+        };
+        self.record_prompt(session_id, &text);
+        self.composer.clear();
+        self.reset_history_browse();
+        self.slash.select(0);
+        self.esc_armed_at = None;
+        self.pending.insert(
+            command_id,
+            PendingIntent::Steer {
+                session_id,
+                text: text.clone(),
+            },
+        );
+        (
+            true,
+            vec![ClientRequest::Command(CommandRequest {
+                command_id,
+                command: SessionCommand::SteerRun {
+                    run_id,
+                    input: vec![qq_protocol::InputPart::text(text)],
+                    interrupt,
+                },
+            })],
+        )
     }
 
     /// Send `prompt` to `session_id` as a new run.
@@ -2558,6 +2639,8 @@ impl App {
             })
     }
 
+    /// Prompts and steering sent to `session_id` whose receipt has not
+    /// arrived; shown optimistically until the server's row replaces them.
     pub fn pending_prompts(&self, session_id: SessionId) -> impl Iterator<Item = &str> {
         self.pending
             .values()
@@ -2565,9 +2648,14 @@ impl App {
                 PendingIntent::Prompt {
                     session_id: candidate,
                     text,
+                }
+                | PendingIntent::Steer {
+                    session_id: candidate,
+                    text,
                 } if *candidate == session_id => Some(text.as_str()),
                 PendingIntent::Create
                 | PendingIntent::Prompt { .. }
+                | PendingIntent::Steer { .. }
                 | PendingIntent::Cancel { .. }
                 | PendingIntent::Compact { .. }
                 | PendingIntent::Approval { .. } => None,
@@ -5363,6 +5451,192 @@ mod tests {
                 .unwrap()
                 .contains("does not support steering")
         );
+
+        // A server that steers at boundaries but cannot interrupt: Alt-S
+        // queues with its own explanation rather than sending a plain steer
+        // the user did not ask for.
+        app.apply_client_update(ClientUpdate::Steering(SteeringCapabilities {
+            boundary: true,
+            interrupt: false,
+            max_pending_per_run: 4,
+        }));
+        app.composer.text = "stop".to_owned();
+        let (_, requests) = app.handle_key(alt('s'));
+        assert!(requests.is_empty());
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["go left", "stop"]
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("does not support interrupting")
+        );
+    }
+
+    fn steering_app() -> (
+        App,
+        SessionId,
+        RunId,
+        impl FnMut(SessionEvent) -> ClientUpdate,
+    ) {
+        let (mut app, session_id, run_id, event) = running_app();
+        app.apply_client_update(ClientUpdate::Steering(SteeringCapabilities {
+            boundary: true,
+            interrupt: true,
+            max_pending_per_run: 4,
+        }));
+        (app, session_id, run_id, event)
+    }
+
+    #[test]
+    fn enter_steers_the_active_run_when_the_server_advertises_it() {
+        let (mut app, session_id, run_id, _) = steering_app();
+        app.composer.text = "also check the tests".to_owned();
+
+        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one steer command, got {requests:?}");
+        };
+        assert_eq!(
+            request.command,
+            SessionCommand::SteerRun {
+                run_id,
+                input: vec![qq_protocol::InputPart::text("also check the tests")],
+                interrupt: false,
+            }
+        );
+        // Nothing is queued locally, the composer is clear, and the text
+        // shows as pending until the server's steering row replaces it.
+        assert_eq!(app.queued_drafts(session_id).count(), 0);
+        assert!(app.composer.text.is_empty());
+        assert_eq!(
+            app.pending_prompts(session_id).collect::<Vec<_>>(),
+            ["also check the tests"]
+        );
+    }
+
+    #[test]
+    fn alt_s_interrupts_and_steers_and_disarms_esc() {
+        let (mut app, _, run_id, _) = steering_app();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.esc_armed_at.is_some());
+        app.composer.text = "wrong file".to_owned();
+
+        let (_, requests) = app.handle_key(alt('s'));
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one steer command, got {requests:?}");
+        };
+        assert_eq!(
+            request.command,
+            SessionCommand::SteerRun {
+                run_id,
+                input: vec![qq_protocol::InputPart::text("wrong file")],
+                interrupt: true,
+            }
+        );
+        assert!(app.esc_armed_at.is_none());
+    }
+
+    #[test]
+    fn steer_with_an_empty_draft_or_no_run_sends_nothing() {
+        let (mut app, _, _, _) = steering_app();
+        let (changed, requests) = app.execute(Command::InterruptRun);
+        assert!(!changed);
+        assert!(requests.is_empty());
+
+        let mut idle = App::new(TuiOptions::default());
+        idle.apply_snapshot(snapshot());
+        idle.apply_client_update(ClientUpdate::Steering(SteeringCapabilities {
+            boundary: true,
+            interrupt: true,
+            max_pending_per_run: 4,
+        }));
+        idle.composer.text = "hello".to_owned();
+        let (_, requests) = idle.execute(Command::SteerRun);
+        assert!(requests.is_empty());
+        assert!(app.status.is_none());
+        assert!(idle.status.as_deref().unwrap().contains("no active run"));
+        assert_eq!(idle.composer.text, "hello");
+
+        // Enter on an idle session still submits a new prompt.
+        let (_, requests) = idle.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one submit, got {requests:?}");
+        };
+        assert!(matches!(
+            request.command,
+            SessionCommand::SubmitPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn refused_or_late_steering_returns_the_draft_to_the_composer() {
+        let (mut app, session_id, run_id, _) = steering_app();
+        app.composer.text = "first".to_owned();
+        let (_, requests) = app.execute(Command::SteerRun);
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one steer command");
+        };
+        app.apply_client_update(ClientUpdate::CommandResult {
+            command_id: request.command_id,
+            result: Err(ClientFailure::new("too many pending steering messages")),
+        });
+        assert_eq!(app.composer.text, "first");
+        assert_eq!(app.pending_prompts(session_id).count(), 0);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("too many pending steering messages")
+        );
+
+        // The run finished before the steer landed: the receipt is a success
+        // that applied nothing, so the text comes back with a warning.
+        let (_, requests) = app.execute(Command::SteerRun);
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one steer command");
+        };
+        app.apply_client_update(ClientUpdate::CommandResult {
+            command_id: request.command_id,
+            result: Ok(qq_protocol::CommandReceipt {
+                command_id: request.command_id,
+                outcome: CommandOutcome::RunAlreadyFinished {
+                    run_id,
+                    outcome: qq_protocol::RunOutcome::Completed,
+                },
+                committed_through: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id: app.workspace_id.unwrap(),
+                    sequence: 9,
+                },
+            }),
+        });
+        assert_eq!(app.composer.text, "first");
+        assert!(app.status.as_deref().unwrap().contains("draft restored"));
+
+        // A steer that was recorded clears the pending row; the transcript
+        // row arrives through `steering_queued` like any other message.
+        let (_, requests) = app.execute(Command::SteerRun);
+        let [ClientRequest::Command(request)] = requests.as_slice() else {
+            panic!("expected one steer command");
+        };
+        app.apply_client_update(ClientUpdate::CommandResult {
+            command_id: request.command_id,
+            result: Ok(qq_protocol::CommandReceipt {
+                command_id: request.command_id,
+                outcome: CommandOutcome::SteeringQueued {
+                    run_id,
+                    message_id: id(0x77, qq_protocol::MessageId::from_bytes),
+                },
+                committed_through: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id: app.workspace_id.unwrap(),
+                    sequence: 10,
+                },
+            }),
+        });
+        assert!(app.composer.text.is_empty());
+        assert_eq!(app.pending_prompts(session_id).count(), 0);
     }
 
     fn alt(character: char) -> KeyEvent {

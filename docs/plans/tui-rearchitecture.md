@@ -1,6 +1,7 @@
 # TUI Rearchitecture
 
-Status: complete 2026-09-02. Every phase T0–T7 has landed (receipts below).
+Status: complete 2026-09-02. Every phase T0–T7 has landed (receipts below),
+including the T5 steering work that waited on H3.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -51,7 +52,7 @@ repeated here.
 | Render library | Keep the hand-rolled `Style`/`Span`/`Line` types and row diff; no ratatui | Minimal dependencies; row diff is already correct. Add in-row changed-span emission only if measured. |
 | Frame model | Retained per-message line cache and per-pane damage; rebuild only the streaming tail and chrome | Removes the per-frame O(visible transcript) rebuild. |
 | Default view | One focused transcript plus a live session sidebar; split panes available | The sidebar is cheap and always live; panes need per-pane state and arrive after the store supports them. |
-| Busy input | Enter steers when the server advertises steering, otherwise queues; Alt+Enter queues explicitly; Esc Esc interrupts | Designed for steering now; availability is capability-driven, never inferred. |
+| Busy input | Enter steers when the server advertises steering, otherwise queues; Alt-S interrupts and steers; Ctrl-Enter queues explicitly; Esc Esc cancels | Designed for steering now; availability is capability-driven, never inferred. |
 | Command surface | One `Command` registry drives keybindings, palette, slash commands, and footer hints | Removes the three duplicate pickers and the index-coupled slash table. |
 | Protocol | Additive only: spawn linkage, per-session body fetch, activity in snapshots | Enough for children and warm multi-body without a redesign. |
 
@@ -480,6 +481,7 @@ All workspace gates green; 168 TUI tests. Render bench unchanged.
 - **Steering.** `Command::SteerRun` exists in the table; `steering_available`
   is `false` until the capability document (H3) sets it, so the command warns
   and falls back to queueing. Tested as a fixture of that fallback.
+  *Completed after H3 landed (protocol 13); see the addendum below.*
 - **Reasoning.** `ReasoningDelta` accumulates per run (16 KiB bound, warm
   sessions only, dropped when the run's messages are trimmed). A collapsed
   `∴ thought for Ns  <first paragraph>` row precedes the run's first
@@ -492,6 +494,43 @@ All workspace gates green; 168 TUI tests. Render bench unchanged.
   editor, non-zero exit, and I/O failures each surface as a typed
   `EditorError` warning with the draft intact. The loop test injects a
   scripted editor.
+
+#### T5 Addendum: Steering — 2026-09-02
+
+Landed once H3 shipped `steer_run` and `POST /v1/capabilities` (protocol 13).
+The TUI consumes the contract; it defines none of it.
+
+- **Capability-driven.** The client fetches the capability document on the
+  same background task as the model catalog (never gating first paint, and
+  restarted with it after a recovery) and forwards `ClientUpdate::Steering`.
+  `App.steering: Option<SteeringCapabilities>` stays `None` until then, which
+  reads as unavailable: Enter holds the draft, and the steering commands say
+  why they queued instead. `boundary` and `interrupt` are gated separately, so
+  a server that steers but cannot interrupt turns Alt-S into a queue with its
+  own explanation rather than a plain steer the user did not ask for.
+- **Commands.** Enter during a run sends `steer_run` with `interrupt: false`.
+  `Command::InterruptRun` (new `Action::InterruptRun`, default `Alt-S`,
+  configurable as `interrupt_run` in `tui.ron`) sends `interrupt: true`. Both
+  use the expanded draft, record it in prompt history, and disarm a pending
+  Esc-Esc. Ctrl-X cancel and Ctrl-Enter queue are unchanged.
+- **Optimism with a receipt.** The draft shows as `YOU / PENDING` under
+  `PendingIntent::Steer` until the receipt. A rejection (`400`, over the
+  per-run bound, offline) returns the text to an empty composer with the
+  error. A `run_already_finished` receipt is a success that applied nothing,
+  so it also restores the draft with a warning instead of the generic "run
+  already finished". `steering_queued` clears the pending row; the transcript
+  row arrives through the event so it is durable before it is shown.
+- **Transcript.** A `steering: true` user row keeps the `▌ YOU` prefix but
+  labels its lifecycle in words the run's own messages never use:
+  `steering  waiting for the next turn` (queued), `steered` (applied),
+  `steering  run finished first` (superseded). It never shows the bare
+  `queued` of a queued prompt, which would read as a new run waiting its turn.
+- **Tests.** Fallbacks for no document and for boundary-only servers; Enter
+  and Alt-S request shapes; empty draft and idle session send nothing and
+  Enter still submits when idle; refusal, late receipt, and success each
+  settle the pending row correctly; steering row labels at every state; the
+  `interrupt_run` binding round-trips through `tui.ron`. 203 TUI tests, 54
+  config tests. Render bench unchanged.
 
 ### T6 — Split Panes
 

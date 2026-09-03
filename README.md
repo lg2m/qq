@@ -138,6 +138,7 @@ from the repository root to the current directory.
         create_root_session: ["Alt-N"],
         create_child_session: ["Alt-C"],
         cancel_run: ["Ctrl-X"],
+        interrupt_run: ["Alt-S"],
     ),
 )
 ```
@@ -160,6 +161,15 @@ side by side, `Alt--` stacks it, `Alt-W` closes it, `Alt-Z` zooms it, and
 shows one session; the composer, approvals, and footer follow the focused pane.
 When the terminal is unfocused, an approval request or a finished run rings
 the terminal bell and posts an OSC 9 desktop notification where supported.
+
+While a run is executing, Enter steers it: the draft joins the run at its
+next model/tool boundary and appears in the transcript as a `steering` row
+until it is applied. `Alt-S` interrupts first (the in-flight model turn or
+tool is aborted, partial text stands) and then steers, for when the run is
+heading the wrong way right now. `Ctrl-Enter` instead holds the draft locally
+until the run finishes and sends it as the next prompt; `Alt-Up` pulls the
+newest held draft back for editing. `Esc Esc` cancels the run. Steering is
+offered only when the server advertises it; otherwise Enter holds the draft.
 
 The interactive composer recognizes `/models`, `/theme`, `/new`, `/sessions`
 (also `/resume`), `/agents`, `/editor`, `/split`, `/stack`, `/close`, `/zoom`,

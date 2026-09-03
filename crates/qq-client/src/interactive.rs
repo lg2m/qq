@@ -373,6 +373,17 @@ async fn load_tui_models(
     create_initial_session: bool,
     updates: mpsc::Sender<ClientUpdate>,
 ) {
+    // Capabilities ride the same background task as the catalog: neither
+    // gates first paint, and both restart together after a recovery. A
+    // failure leaves steering unadvertised, which the TUI treats as absent.
+    if let Ok(capabilities) = client.capabilities(None).await
+        && updates
+            .send(ClientUpdate::Steering(capabilities.steering))
+            .await
+            .is_err()
+    {
+        return;
+    }
     let Ok(models) = client
         .models(ModelCatalogRequest {
             workspace: workspace.to_string_lossy().into_owned(),

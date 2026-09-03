@@ -975,7 +975,7 @@ fn tui_config_allows_disabling_an_action() {
     let tree = TempTree::new();
     tree.write(
         "work/.qq/tui.ron",
-        r#"(version: 1, bindings: (cancel_run: []))"#,
+        r#"(version: 1, bindings: (cancel_run: [], interrupt_run: ["Ctrl-Shift-S"]))"#,
     );
 
     let snapshot = tree
@@ -984,6 +984,10 @@ fn tui_config_allows_disabling_an_action() {
         .unwrap();
 
     assert!(binding_labels(snapshot.settings(), TuiAction::CancelRun).is_empty());
+    assert_eq!(
+        binding_labels(snapshot.settings(), TuiAction::InterruptRun),
+        ["Ctrl-Shift-S"]
+    );
 }
 
 fn binding_labels(settings: &TuiConfigSettings, action: TuiAction) -> Vec<String> {
@@ -1011,6 +1015,7 @@ fn tui_defaults() -> TuiConfigDefaults {
             (TuiAction::CreateRootSession, vec!["Alt-N".to_owned()]),
             (TuiAction::CreateChildSession, vec!["Alt-C".to_owned()]),
             (TuiAction::CancelRun, vec!["Ctrl-X".to_owned()]),
+            (TuiAction::InterruptRun, vec!["Alt-S".to_owned()]),
         ],
     )
     .unwrap()
