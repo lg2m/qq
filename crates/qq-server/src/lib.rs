@@ -29,10 +29,14 @@ use directories::ProjectDirs;
 use futures_util::StreamExt;
 use qq_core::SessionEventStream;
 use qq_protocol::{
-    CommandReceipt, CommandRequest, LocalConnectionError, LocalServerConnection, MAX_EVENT_BYTES,
-    MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES,
-    ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION, ServerInfo, SessionCommand,
-    SnapshotRequest, SubscribeRequest, WorkspaceId, WorkspaceSnapshot,
+    AgentProfileSummary, ApprovalMode, BudgetLimitKind, CAPABILITIES_VERSION, CapabilitiesRequest,
+    CommandReceipt, CommandRequest, InputPartKind, LimitCapabilities, LocalConnectionError,
+    LocalServerConnection, MAX_CORRELATION_ENTRIES, MAX_EVENT_BYTES, MAX_INPUT_FILE_BYTES,
+    MAX_INPUT_FILE_PARTS, MAX_INPUT_PARTS, MAX_INPUT_TEXT_BYTES, MAX_MODEL_BYTES,
+    MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES, ModelCatalogRequest,
+    ModelDescriptor, PROTOCOL_VERSION, ServerCapabilities, ServerInfo, SessionCommand,
+    SessionCommandKind, SnapshotRequest, SteeringCapabilities, SubscribeRequest, WorkspaceId,
+    WorkspaceSnapshot, validate_input,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -67,6 +71,9 @@ pub type SnapshotFuture =
 pub type ModelsFuture = Pin<
     Box<dyn Future<Output = Result<Vec<ModelDescriptor>, ServerHandlerError>> + Send + 'static>,
 >;
+pub type ProfilesFuture = Pin<
+    Box<dyn Future<Output = Result<Vec<AgentProfileSummary>, ServerHandlerError>> + Send + 'static>,
+>;
 
 /// Root-supplied application seam for durable session requests.
 pub trait ServerHandler: Send + Sync + 'static {
@@ -79,6 +86,13 @@ pub trait ServerHandler: Send + Sync + 'static {
     }
 
     fn models(&self, _request: ModelCatalogRequest) -> ModelsFuture {
+        Box::pin(async { Err(ServerHandlerError::Unavailable) })
+    }
+
+    /// The agent profiles a workspace's configuration declares, for the
+    /// capability document. Everything else in that document is owned by the
+    /// transport and the protocol crate.
+    fn profiles(&self, _workspace_id: WorkspaceId) -> ProfilesFuture {
         Box::pin(async { Err(ServerHandlerError::Unavailable) })
     }
 
@@ -527,6 +541,7 @@ fn router(handler: Arc<dyn ServerHandler>, connection: ServerConnection) -> Rout
     };
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/capabilities", post(capabilities))
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/workspaces/snapshot", post(workspace_snapshot))
         .route("/v1/models", post(models))
@@ -534,11 +549,13 @@ fn router(handler: Arc<dyn ServerHandler>, connection: ServerConnection) -> Rout
         .route("/v1/sessions/prompts", post(submit_prompt))
         .route("/v1/sessions/approval-mode", post(set_approval_mode))
         .route("/v1/sessions/model", post(set_session_model))
+        .route("/v1/sessions/profile", post(set_session_profile))
         .route("/v1/sessions/delete", post(delete_session))
         .route("/v1/sessions/prune", post(prune_sessions))
         .route("/v1/sessions/compact", post(compact_session))
         .route("/v1/sessions/compact/rollback", post(rollback_compaction))
         .route("/v1/runs/cancel", post(cancel_run))
+        .route("/v1/runs/steer", post(steer_run))
         .route("/v1/tools/approvals", post(respond_tool_approval))
         .route(
             "/v1/workspaces/{workspace_id}/events",
@@ -611,6 +628,23 @@ async fn cancel_run(
 ) -> Response {
     session_command(state, body, |command| {
         matches!(command, SessionCommand::CancelRun { .. })
+    })
+    .await
+}
+
+async fn steer_run(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::SteerRun { .. })
+    })
+    .await
+}
+
+async fn set_session_profile(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    session_command(state, body, |command| {
+        matches!(command, SessionCommand::SetSessionProfile { .. })
     })
     .await
 }
@@ -704,9 +738,113 @@ async fn session_command(
         Ok(request) if expected(&request.command) => request,
         Ok(_) | Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
     };
+    // Structured input is bounded at the transport, before the handler can
+    // admit anything durably: an oversized or malformed part is a client
+    // error, never a queued run.
+    let input = match &request.command {
+        SessionCommand::SubmitPrompt { input, .. } | SessionCommand::SteerRun { input, .. } => {
+            Some(input.as_slice())
+        }
+        SessionCommand::ResolveWorkspace { .. }
+        | SessionCommand::CreateSession { .. }
+        | SessionCommand::CancelRun { .. }
+        | SessionCommand::RespondToolApproval { .. }
+        | SessionCommand::SetApprovalMode { .. }
+        | SessionCommand::SetSessionModel { .. }
+        | SessionCommand::SetSessionProfile { .. }
+        | SessionCommand::DeleteSession { .. }
+        | SessionCommand::PruneSessions { .. }
+        | SessionCommand::CompactSession { .. }
+        | SessionCommand::RollbackCompaction { .. } => None,
+    };
+    if let Some(input) = input
+        && let Err(error) = validate_input(input)
+    {
+        return api_error(StatusCode::BAD_REQUEST, &format!("invalid input: {error}"));
+    }
     match state.handler.command(request).await {
         Ok(receipt) => Json(receipt).into_response(),
         Err(error) => handler_error_response(error),
+    }
+}
+
+async fn capabilities(
+    State(state): State<AppState>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let Ok(_permit) = Arc::clone(&state.session_requests).try_acquire_owned() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many requests are active",
+        );
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
+    };
+    let request = if body.is_empty() {
+        CapabilitiesRequest::default()
+    } else {
+        match serde_json::from_slice::<CapabilitiesRequest>(&body) {
+            Ok(request) => request,
+            Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
+        }
+    };
+    let profiles = match request.workspace_id {
+        None => None,
+        Some(workspace_id) => match state.handler.profiles(workspace_id).await {
+            Ok(profiles) => Some(profiles),
+            Err(error) => return handler_error_response(error),
+        },
+    };
+    Json(server_capabilities(&state.connection, profiles)).into_response()
+}
+
+/// The capability document this server build advertises. Every bound is the
+/// constant the transport or runtime actually enforces, so a client that
+/// formats behavior from this document never trips a limit it was not told.
+fn server_capabilities(
+    connection: &ServerConnection,
+    profiles: Option<Vec<AgentProfileSummary>>,
+) -> ServerCapabilities {
+    ServerCapabilities {
+        version: CAPABILITIES_VERSION,
+        protocol_version: PROTOCOL_VERSION,
+        server_version: connection.server_info().version.clone(),
+        input_parts: InputPartKind::ALL.to_vec(),
+        commands: SessionCommandKind::ALL.to_vec(),
+        steering: SteeringCapabilities {
+            boundary: true,
+            interrupt: true,
+            max_pending_per_run: qq_core::MAX_PENDING_STEERING,
+        },
+        limits: LimitCapabilities {
+            supported: BudgetLimitKind::ALL.to_vec(),
+            max_request_bytes: MAX_REQUEST_BYTES as u64,
+            max_event_bytes: MAX_EVENT_BYTES as u64,
+            max_input_parts: u16::try_from(MAX_INPUT_PARTS).unwrap_or(u16::MAX),
+            max_input_text_bytes: MAX_INPUT_TEXT_BYTES as u64,
+            max_input_file_parts: u16::try_from(MAX_INPUT_FILE_PARTS).unwrap_or(u16::MAX),
+            max_input_file_bytes: MAX_INPUT_FILE_BYTES as u64,
+            max_pending_prompts: qq_core::MAX_PENDING_PROMPTS,
+            max_children: qq_core::MAX_SPAWNED_CHILDREN_PER_RUN,
+            max_concurrent_children: qq_core::MAX_CONCURRENT_CHILDREN_PER_RUN,
+            max_child_depth: qq_core::MAX_CHILD_DEPTH,
+            max_correlation_entries: u16::try_from(MAX_CORRELATION_ENTRIES).unwrap_or(u16::MAX),
+        },
+        approvals: vec![
+            "approve_once".to_owned(),
+            "approve_for_session".to_owned(),
+            "approve_for_workspace".to_owned(),
+            "deny".to_owned(),
+        ],
+        approval_modes: vec![
+            ApprovalMode::ReadOnly,
+            ApprovalMode::Ask,
+            ApprovalMode::Auto,
+            ApprovalMode::Full,
+        ],
+        profiles,
     }
 }
 
@@ -1592,8 +1730,11 @@ mod tests {
             command_id: qq_protocol::CommandId::generate().unwrap(),
             command: SessionCommand::SubmitPrompt {
                 session_id,
-                prompt: "/review focus on cancellation".to_owned(),
+                input: vec![qq_protocol::InputPart::text(
+                    "/review focus on cancellation".to_owned(),
+                )],
                 limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         };
 
@@ -1615,10 +1756,359 @@ mod tests {
             assert_eq!(captured.len(), 1);
             assert!(matches!(
                 &captured[0].command,
-                SessionCommand::SubmitPrompt { prompt, .. }
-                    if prompt == "/review focus on cancellation"
+                SessionCommand::SubmitPrompt { input, .. }
+                    if input.as_slice() == [qq_protocol::InputPart::text("/review focus on cancellation")]
             ));
         }
+        server.shutdown().await.unwrap();
+    }
+
+    /// A handler with a command journal: identical replays return the stored
+    /// receipt, a reused id with a different body is a conflict. Mirrors the
+    /// durable runtime's contract so route-level idempotency is testable
+    /// without SQLite.
+    struct JournalHandler {
+        journal: Mutex<Vec<(CommandRequest, CommandReceipt)>>,
+        handled: Arc<Mutex<Vec<SessionCommand>>>,
+    }
+
+    impl ServerHandler for JournalHandler {
+        fn command(&self, request: CommandRequest) -> CommandFuture {
+            let mut journal = self.journal.lock().unwrap();
+            if let Some((stored, receipt)) = journal
+                .iter()
+                .find(|(stored, _)| stored.command_id == request.command_id)
+            {
+                let receipt = receipt.clone();
+                return if stored.command == request.command {
+                    Box::pin(async move { Ok(receipt) })
+                } else {
+                    Box::pin(async {
+                        Err(ServerHandlerError::InvalidRequest(
+                            "command ID was reused with different content".to_owned(),
+                        ))
+                    })
+                };
+            }
+            let run_id = qq_protocol::RunId::from_bytes([4; 16]);
+            let outcome = match &request.command {
+                SessionCommand::SubmitPrompt { session_id, .. } => CommandOutcome::PromptQueued {
+                    session_id: *session_id,
+                    run_id,
+                    queue_position: 1,
+                },
+                SessionCommand::SteerRun { run_id, .. } => CommandOutcome::SteeringQueued {
+                    run_id: *run_id,
+                    message_id: qq_protocol::MessageId::from_bytes([9; 16]),
+                },
+                SessionCommand::CancelRun { run_id } => {
+                    CommandOutcome::CancellationRequested { run_id: *run_id }
+                }
+                SessionCommand::RespondToolApproval { tool_call_id, .. } => {
+                    CommandOutcome::ToolApprovalResolved {
+                        tool_call_id: *tool_call_id,
+                        resolution: qq_protocol::ApprovalResolution::ApprovedOnce,
+                    }
+                }
+                SessionCommand::SetSessionProfile {
+                    session_id,
+                    profile,
+                } => CommandOutcome::SessionProfileSet {
+                    session_id: *session_id,
+                    profile: profile.clone(),
+                },
+                _ => {
+                    return Box::pin(async {
+                        Err(ServerHandlerError::InvalidRequest(
+                            "unexpected command".to_owned(),
+                        ))
+                    });
+                }
+            };
+            let receipt = CommandReceipt {
+                command_id: request.command_id,
+                committed_through: EventCursor {
+                    store_id: StoreId::from_bytes([1; 16]),
+                    workspace_id: WorkspaceId::from_bytes([2; 16]),
+                    sequence: u64::try_from(journal.len()).unwrap() + 1,
+                },
+                outcome,
+            };
+            self.handled.lock().unwrap().push(request.command.clone());
+            journal.push((request, receipt.clone()));
+            Box::pin(async move { Ok(receipt) })
+        }
+
+        fn profiles(&self, workspace_id: WorkspaceId) -> ProfilesFuture {
+            Box::pin(async move {
+                if workspace_id == WorkspaceId::from_bytes([2; 16]) {
+                    Ok(vec![AgentProfileSummary {
+                        id: qq_protocol::AgentProfileId::default(),
+                        model: Some("openai/gpt-5.6".to_owned()),
+                        approval_mode: ApprovalMode::Auto,
+                    }])
+                } else {
+                    Err(ServerHandlerError::InvalidRequest(
+                        "workspace was not found".to_owned(),
+                    ))
+                }
+            })
+        }
+    }
+
+    async fn post(
+        server: &ServerHandle,
+        path: &str,
+        body: &impl Serialize,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(server.connection().endpoint(path))
+            .bearer_auth(server.connection().expose_bearer_token())
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn retried_commands_replay_receipts_and_conflicting_reuse_is_rejected() {
+        let directory = TestDirectory::new();
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ServerHandler> = Arc::new(JournalHandler {
+            journal: Mutex::new(Vec::new()),
+            handled: Arc::clone(&handled),
+        });
+        let server = start_test_server(directory.paths(), handler).await;
+        let session_id = SessionId::from_bytes([3; 16]);
+        let run_id = qq_protocol::RunId::from_bytes([4; 16]);
+        let commands: [(&str, SessionCommand); 5] = [
+            (
+                "/v1/sessions/prompts",
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    input: vec![qq_protocol::InputPart::text("go")],
+                    limits: qq_protocol::RunLimits::default(),
+                    correlation: qq_protocol::Correlation::default(),
+                },
+            ),
+            (
+                "/v1/runs/steer",
+                SessionCommand::SteerRun {
+                    run_id,
+                    input: vec![qq_protocol::InputPart::text("also tests")],
+                    interrupt: true,
+                },
+            ),
+            (
+                "/v1/tools/approvals",
+                SessionCommand::RespondToolApproval {
+                    run_id,
+                    tool_call_id: qq_protocol::ToolCallId::from_bytes([5; 16]),
+                    decision: qq_protocol::ApprovalDecision::ApproveOnce,
+                },
+            ),
+            ("/v1/runs/cancel", SessionCommand::CancelRun { run_id }),
+            (
+                "/v1/sessions/profile",
+                SessionCommand::SetSessionProfile {
+                    session_id,
+                    profile: qq_protocol::AgentProfileId::new("review").unwrap(),
+                },
+            ),
+        ];
+        for (path, command) in commands {
+            let request = CommandRequest {
+                command_id: qq_protocol::CommandId::generate().unwrap(),
+                command,
+            };
+            let (status, first) = post(&server, path, &request).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {first}");
+            let (status, replay) = post(&server, path, &request).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(replay, first, "{path}: a retry must replay the receipt");
+            // Same id, different body: rejected, and the handler never ran it.
+            let conflicting = CommandRequest {
+                command_id: request.command_id,
+                command: SessionCommand::CancelRun {
+                    run_id: qq_protocol::RunId::from_bytes([0xee; 16]),
+                },
+            };
+            let (status, body) = post(&server, "/v1/runs/cancel", &conflicting).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body["error"].as_str().unwrap().contains("reused"));
+        }
+        assert_eq!(
+            handled.lock().unwrap().len(),
+            5,
+            "each command ran exactly once"
+        );
+
+        // A body on the wrong route never reaches the handler.
+        let misrouted = CommandRequest {
+            command_id: qq_protocol::CommandId::generate().unwrap(),
+            command: SessionCommand::CancelRun { run_id },
+        };
+        let (status, _) = post(&server, "/v1/runs/steer", &misrouted).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(handled.lock().unwrap().len(), 5);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_and_oversized_input_fails_before_the_handler() {
+        let directory = TestDirectory::new();
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let handler: Arc<dyn ServerHandler> = Arc::new(JournalHandler {
+            journal: Mutex::new(Vec::new()),
+            handled: Arc::clone(&handled),
+        });
+        let server = start_test_server(directory.paths(), handler).await;
+        let session_id = SessionId::from_bytes([3; 16]);
+        let bad_inputs = [
+            serde_json::json!([]),
+            serde_json::json!([{"type": "text", "text": "   "}]),
+            serde_json::json!([{"type": "workspace_file", "path": "/etc/passwd"}]),
+            serde_json::json!([{"type": "image", "url": "x"}]),
+            serde_json::json!([{"type": "text", "text": "x", "extra": 1}]),
+            serde_json::json!([{"type": "text", "text": "a".repeat(MAX_INPUT_TEXT_BYTES + 1)}]),
+        ];
+        for input in bad_inputs {
+            let body = serde_json::json!({
+                "command_id": qq_protocol::CommandId::generate().unwrap(),
+                "command": {"type": "submit_prompt", "session_id": session_id, "input": input},
+            });
+            let (status, _) = post(&server, "/v1/sessions/prompts", &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let body = serde_json::json!({
+                "command_id": qq_protocol::CommandId::generate().unwrap(),
+                "command": {"type": "steer_run", "run_id": qq_protocol::RunId::from_bytes([4; 16]), "input": input},
+            });
+            let (status, _) = post(&server, "/v1/runs/steer", &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        // Unknown command fields and a bad profile id are rejected by the
+        // strict decoder before the handler too.
+        for command in [
+            serde_json::json!({"type": "submit_prompt", "session_id": session_id, "input": [{"type":"text","text":"x"}], "prompt": "legacy"}),
+            serde_json::json!({"type": "set_session_profile", "session_id": session_id, "profile": "Not Valid"}),
+            serde_json::json!({"type": "submit_prompt", "session_id": session_id, "input": [{"type":"text","text":"x"}], "correlation": {"k": "v".repeat(300)}}),
+        ] {
+            let path = if command["type"] == "set_session_profile" {
+                "/v1/sessions/profile"
+            } else {
+                "/v1/sessions/prompts"
+            };
+            let body = serde_json::json!({
+                "command_id": qq_protocol::CommandId::generate().unwrap(),
+                "command": command,
+            });
+            let (status, _) = post(&server, path, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        // Oversized bodies are refused at the transport.
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(server.connection().endpoint("/v1/sessions/prompts"))
+            .bearer_auth(server.connection().expose_bearer_token())
+            .header("content-type", "application/json")
+            .body(vec![b' '; MAX_REQUEST_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            handled.lock().unwrap().is_empty(),
+            "nothing reached the handler"
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capabilities_document_advertises_bounds_commands_and_workspace_profiles() {
+        let directory = TestDirectory::new();
+        let handler: Arc<dyn ServerHandler> = Arc::new(JournalHandler {
+            journal: Mutex::new(Vec::new()),
+            handled: Arc::new(Mutex::new(Vec::new())),
+        });
+        let server = start_test_server(directory.paths(), handler).await;
+        let (status, body) =
+            post(&server, "/v1/capabilities", &CapabilitiesRequest::default()).await;
+        assert_eq!(status, StatusCode::OK);
+        let capabilities: ServerCapabilities = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(capabilities.version, CAPABILITIES_VERSION);
+        assert_eq!(capabilities.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(capabilities.input_parts, InputPartKind::ALL.to_vec());
+        assert_eq!(capabilities.commands, SessionCommandKind::ALL.to_vec());
+        assert!(capabilities.steering.boundary && capabilities.steering.interrupt);
+        assert_eq!(
+            capabilities.steering.max_pending_per_run,
+            qq_core::MAX_PENDING_STEERING
+        );
+        assert_eq!(capabilities.limits.supported, BudgetLimitKind::ALL.to_vec());
+        assert_eq!(
+            capabilities.limits.max_request_bytes,
+            MAX_REQUEST_BYTES as u64
+        );
+        assert_eq!(capabilities.limits.max_child_depth, 1);
+        assert_eq!(
+            capabilities.limits.max_children,
+            qq_core::MAX_SPAWNED_CHILDREN_PER_RUN
+        );
+        assert!(capabilities.profiles.is_none());
+        assert_eq!(body["approvals"][3], "deny");
+
+        let (status, body) = post(
+            &server,
+            "/v1/capabilities",
+            &CapabilitiesRequest {
+                workspace_id: Some(WorkspaceId::from_bytes([2; 16])),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let capabilities: ServerCapabilities = serde_json::from_value(body).unwrap();
+        let profiles = capabilities.profiles.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].id.is_default());
+
+        let (status, _) = post(
+            &server,
+            "/v1/capabilities",
+            &CapabilitiesRequest {
+                workspace_id: Some(WorkspaceId::from_bytes([7; 16])),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post(&server, "/v1/capabilities", &serde_json::json!({"nope": 1})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Version skew: a client built against an older struct still reads a
+        // newer server's health and capabilities documents.
+        let health: serde_json::Value = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(server.connection().endpoint("/v1/health"))
+            .bearer_auth(server.connection().expose_bearer_token())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut future_health = health.clone();
+        future_health["future_field"] = serde_json::json!({"a": 1});
+        let decoded: ServerInfo = serde_json::from_value(future_health).unwrap();
+        assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
         server.shutdown().await.unwrap();
     }
 

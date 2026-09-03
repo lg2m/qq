@@ -840,6 +840,67 @@ impl Store {
         .await
     }
 
+    pub(super) async fn apply_steering(
+        &self,
+        claimed: &ClaimedRun,
+        message_id: MessageId,
+        turn_ordinal: u16,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            apply_steering_message(connection, store_id, &claimed, message_id, turn_ordinal)
+        })
+        .await
+    }
+
+    pub(super) async fn record_interrupted(
+        &self,
+        claimed: &ClaimedRun,
+        turn_ordinal: u16,
+    ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            record_run_interrupted(connection, store_id, &claimed, turn_ordinal)
+        })
+        .await
+    }
+
+    /// The steering messages of a run that are recorded but not yet applied,
+    /// with their provider-visible text, in order. Used once when the run
+    /// loop starts so steering that arrived between claim and start is not
+    /// stranded.
+    pub(super) async fn pending_steering(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<crate::runtime::SteeringMessage>, SessionRuntimeError> {
+        self.call(Priority::Control, move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, output FROM messages
+                     WHERE run_id = ?1 AND steering = 1 AND state = 'queued' ORDER BY ordinal",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let rows = statement
+                .query_map([run_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            rows.into_iter()
+                .map(|(id, text)| {
+                    Ok(crate::runtime::SteeringMessage {
+                        message_id: parse_id(&id)?,
+                        text,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
     pub(super) async fn append_reasoning(
         &self,
         claimed: &ClaimedRun,

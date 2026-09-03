@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 13
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -82,7 +82,18 @@ run and `spawn_agent` call that created a child), `SessionSummary.activity`
 (the active run's latest liveness state), and `SnapshotRequest.include_sessions`
 with the matching `WorkspaceSnapshot.included` bodies. Every addition defaults
 when absent, but older `deny_unknown_fields` decoders reject summaries that
-carry the new fields.
+carry the new fields. Version 13 completed the backend contract: `submit_prompt`
+carries a bounded `input` part list instead of a `prompt` string; sessions
+select a configured `profile` (`create_session.profile`,
+`set_session_profile`, `SessionSummary.profile`); accepted runs record their
+plan identity (`run_started.plan`, `RunSnapshot.plan`); active runs take
+`steer_run` input with optional interruption and the matching
+`steering_queued`/`steering_applied`/`steering_superseded`/`run_interrupted`
+events; `RunLimits` gained input/output token, tool-output-byte, and child
+bounds with their `BudgetLimitKind`s; sessions and runs carry opaque
+`correlation`; `POST /v1/capabilities` describes the server; and `ServerInfo`
+plus the capability document tolerate unknown fields so version skew is
+reported rather than failing to decode.
 
 Clients and servers must agree on this value.
 
@@ -225,6 +236,7 @@ and return a `CommandReceipt` unless noted.
 
 ```text
 GET  /v1/health
+POST /v1/capabilities
 POST /v1/workspaces/resolve
 POST /v1/workspaces/snapshot
 POST /v1/models
@@ -232,9 +244,12 @@ POST /v1/sessions
 POST /v1/sessions/prompts
 POST /v1/sessions/approval-mode
 POST /v1/sessions/model
+POST /v1/sessions/profile
 POST /v1/sessions/delete
 POST /v1/sessions/prune
 POST /v1/sessions/compact
+POST /v1/sessions/compact/rollback
+POST /v1/runs/steer
 POST /v1/runs/cancel
 POST /v1/tools/approvals
 GET  /v1/workspaces/{workspace_id}/events
@@ -251,11 +266,67 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 9,
+  "protocol_version": 13,
   "version": "0.1.0",
   "pid": 12345
 }
 ```
+
+`ServerInfo` tolerates unknown fields so a client built against an older
+revision still reads a newer server's answer and reports the mismatch.
+
+### `POST /v1/capabilities`
+
+The versioned capability document. Clients format supported behavior from it
+rather than inferring it from provider names or trial commands. The request is
+optional-bodied:
+
+```json
+{ "workspace_id": "..." }
+```
+
+Response `ServerCapabilities` (abridged; see
+`crates/qq-protocol/tests/fixtures/v13/capabilities.json` for the full golden):
+
+```json
+{
+  "version": 1,
+  "protocol_version": 13,
+  "server_version": "0.1.0",
+  "input_parts": ["text", "workspace_file"],
+  "commands": ["resolve_workspace", "create_session", "submit_prompt", "steer_run", "..."],
+  "steering": { "boundary": true, "interrupt": true, "max_pending_per_run": 4 },
+  "limits": {
+    "supported": ["duration", "model_turns", "tool_calls", "total_tokens", "cost", "cost_unknown",
+                  "input_tokens", "output_tokens", "tokens_unknown", "tool_output_bytes"],
+    "max_request_bytes": 1048576,
+    "max_event_bytes": 1048576,
+    "max_input_parts": 32,
+    "max_input_text_bytes": 131072,
+    "max_input_file_parts": 8,
+    "max_input_file_bytes": 262144,
+    "max_pending_prompts": 16,
+    "max_children": 8,
+    "max_concurrent_children": 3,
+    "max_child_depth": 1,
+    "max_correlation_entries": 8
+  },
+  "approvals": ["approve_once", "approve_for_session", "approve_for_workspace", "deny"],
+  "approval_modes": ["read_only", "ask", "auto", "full"],
+  "profiles": [
+    { "id": "default", "model": "openai/gpt-5.6", "approval_mode": "auto" },
+    { "id": "review", "model": "anthropic/claude-x", "approval_mode": "read_only" }
+  ]
+}
+```
+
+`version` is the document schema version; additive fields do not bump it. The
+response tolerates unknown fields (a newer server may add sections). `profiles`
+is present only when the request named a workspace, because profiles come from
+that workspace's layered configuration; `default` is always first and reflects
+the top-level configuration. Provider and model capabilities stay on
+`POST /v1/models`. Every bound is the constant the transport or runtime
+enforces.
 
 ### Command envelope
 
@@ -324,7 +395,9 @@ existing workspace row when the path was seen before.
       "max_output_tokens": 8192,
       "organization": null
     },
-    "approval_mode": "ask"
+    "approval_mode": "ask",
+    "profile": "review",
+    "correlation": { "thread": "t-1" }
   }
 }
 ```
@@ -335,6 +408,18 @@ existing workspace row when the path was seen before.
 | `parent_id` | no | Optional parent session |
 | `model` | yes | `ModelSelection`; fields inside may be omitted |
 | `approval_mode` | no | Defaults to `ask` |
+| `profile` | no | `AgentProfileId`; defaults to `default`. Lowercase letters, digits, hyphens; ≤ 64 bytes |
+| `correlation` | no | Opaque string map, ≤ 8 entries, keys ≤ 64 B, values ≤ 256 B, ≤ 2 KiB total |
+
+The profile names a bundle of defaults declared in the workspace
+configuration's `profiles` map (model, organization, output cap, approval
+mode). It is recorded on the session and applied when each run is claimed:
+the session's explicit `model` selection wins over the profile, which wins
+over the top-level configuration. A profile the configuration does not
+declare fails the run at claim time with a `configuration` failure naming the
+profile; `POST /v1/capabilities` lists the profiles a workspace declares.
+`correlation` is stored and echoed on `SessionSummary` for attribution; QQ
+never interprets it or treats it as authorization.
 
 Outcome:
 
@@ -358,10 +443,36 @@ affects only sessions created afterwards.
   "command": {
     "type": "submit_prompt",
     "session_id": "...",
-    "prompt": "Explain how sessions are stored."
+    "input": [
+      { "type": "text", "text": "Explain how sessions are stored." }
+    ]
   }
 }
 ```
+
+`input` is a bounded list of typed parts:
+
+| `type` | Fields | Notes |
+| --- | --- | --- |
+| `text` | `text` | Verbatim user text |
+| `workspace_file` | `path`, optional `expected_hash` | A workspace-relative file attached by reference |
+
+Bounds, enforced by the transport before the handler and again by the runtime
+before durable admission: 1–32 parts; text totals ≤ 128 KiB and is not all
+whitespace unless a file is attached; ≤ 8 file parts; paths are non-empty,
+relative, NUL-free, ≤ 4 KiB. Admission performs no I/O. File parts are read
+through the session's workspace capability when the run starts: each file must
+be a regular UTF-8 file inside the workspace of ≤ 256 KiB, the resolved message
+must total ≤ 1 MiB, and when `expected_hash` (hex SHA-256) is present the bytes
+must still hash to it. Any violation fails the run before its first provider
+request with an `invalid_command` failure naming the path; the command that
+queued it succeeded. The transcript row (`prompt_queued.message.output`)
+carries the text parts verbatim and each attachment as an `@path` placeholder;
+the model sees the file contents fenced after the text. Attached files are
+recorded in the session file state, so a later edit satisfies the
+read-before-write rule without a redundant read. Image parts are not defined in
+this revision; the capability document's `input_parts` lists what a server
+accepts.
 
 The optional `limits` object imposes core-owned budgets on the run:
 
@@ -369,19 +480,35 @@ The optional `limits` object imposes core-owned budgets on the run:
 {
   "type": "submit_prompt",
   "session_id": "...",
-  "prompt": "Refactor the parser.",
+  "input": [{ "type": "text", "text": "Refactor the parser." }],
   "limits": {
     "max_duration_ms": 600000,
     "max_model_turns": 40,
     "max_tool_calls": 200,
     "max_total_tokens": 2000000,
-    "max_cost_usd_nanos": 2000000000
-  }
+    "max_cost_usd_nanos": 2000000000,
+    "max_input_tokens": 1500000,
+    "max_output_tokens": 500000,
+    "max_tool_output_bytes": 4000000,
+    "max_children": 4,
+    "max_concurrent_children": 2
+  },
+  "correlation": { "job": "j-1" }
 }
 ```
 
 Every field is optional and must be greater than zero when present; an
-unknown field or a zero value is rejected as an invalid request. Limits are
+unknown field or a zero value is rejected as an invalid request.
+`max_children` and `max_concurrent_children` must not exceed the runtime
+ceilings the capability document advertises (8 and 3); they lower the bound
+for this run, and a refused spawn is reported to the model as a tool error
+rather than settling the run. Sub-agent depth is fixed at 1 and advertised,
+not accepted as a limit. `max_input_tokens` counts fresh plus cached input;
+`max_output_tokens` counts output; both settle with their own kind, and a
+provider turn that omits usage under any token bound settles as
+`tokens_unknown`. `max_tool_output_bytes` counts tool results as the model
+receives them (after per-result truncation). `correlation` is stored on the
+run and echoed on `RunSnapshot`. Limits are
 persisted with the run and enforced by the runtime, not the client, so every
 surface observes the same outcome. The wall clock starts at admission and
 spans provider retries, tool execution, and sub-agent work. When the turn or
@@ -432,7 +559,65 @@ Outcomes:
 ```
 
 A live cancel emits `cancellation_requested` and eventually `run_finished`
-with a cancelled/interrupted outcome once the runtime stops the work.
+with a cancelled/interrupted outcome once the runtime stops the work. Steering
+still queued for the run is superseded (`steering_superseded`) in the same
+transaction that settles it.
+
+### `POST /v1/runs/steer`
+
+```json
+{
+  "command_id": "...",
+  "command": {
+    "type": "steer_run",
+    "run_id": "...",
+    "input": [{ "type": "text", "text": "also check the tests" }],
+    "interrupt": false
+  }
+}
+```
+
+Adds user input to a run that is already executing. Four operations on a live
+run are distinct:
+
+| Intent | Command | Effect |
+| --- | --- | --- |
+| Queue the next prompt | `submit_prompt` | A new run after this one finishes |
+| Steer at the next boundary | `steer_run` (`interrupt: false`) | Input joins the current run's context after the turn in flight completes and its tool results are appended |
+| Interrupt and steer | `steer_run` (`interrupt: true`) | The in-flight provider stream, approval wait, or tool execution is aborted so the boundary arrives now, then the input joins |
+| Cancel | `cancel_run` | Durable terminal `cancelled` outcome |
+
+`input` obeys the same bounds as `submit_prompt` (workspace file parts are
+rendered as placeholders; steering attaches no files). At most 4 steering
+messages may be pending per run; the fifth is a `400`. Only a `running`
+prompt run can be steered: a queued run (`400`, not yet started; submit a
+prompt or cancel instead), a compaction run, or an unknown run is refused.
+Steering never rewrites a provider request already known to be possibly
+delivered: when the model returns no tool calls but steering is pending, the
+run continues with the steering instead of completing.
+
+With `interrupt`, text the model already streamed is kept as the partial
+assistant turn; tool calls it had begun are dropped (nothing executed), tool
+calls awaiting approval or executing settle as `interrupted` with an error
+result, and `run_interrupted` is published. If no steering is pending when the
+boundary arrives (the client raced a finishing turn), the run continues with a
+runtime notice so the transcript stays provider-valid.
+
+Outcomes:
+
+```json
+{ "type": "steering_queued", "run_id": "...", "message_id": "..." }
+```
+
+```json
+{ "type": "run_already_finished", "run_id": "...", "outcome": { "type": "completed" } }
+```
+
+The `message_id` names a user `MessageSnapshot` with `steering: true`,
+published on `steering_queued` in state `queued`. `steering_applied` moves it
+to `complete` and reports the `turn_ordinal` whose request first carried it;
+`steering_superseded` moves it to `cancelled` when the run settled first.
+Replaying the command returns the same receipt without queuing again.
 
 ### `POST /v1/tools/approvals`
 
@@ -569,6 +754,33 @@ Outcome:
 ```
 
 Emits `session_updated` carrying the full refreshed `SessionSummary`.
+
+### `POST /v1/sessions/profile`
+
+```json
+{
+  "command_id": "...",
+  "command": {
+    "type": "set_session_profile",
+    "session_id": "...",
+    "profile": "fast"
+  }
+}
+```
+
+Repoints the session's agent profile. Takes effect when the next run is
+claimed; an executing run keeps the plan it started with. The name must be
+well-formed; whether the workspace configuration declares it is decided at
+claim time, where an unknown profile fails that run with a `configuration`
+failure.
+
+Outcome:
+
+```json
+{ "type": "session_profile_set", "session_id": "...", "profile": "fast" }
+```
+
+Emits `session_updated`.
 
 ### `POST /v1/sessions/delete`
 
@@ -876,7 +1088,11 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `session_updated` | `session` | Non-run session mutation (model repointed, compaction queued) |
 | `session_deleted` | `session_id` | Session and its rows deleted; earlier events remain |
 | `prompt_queued` | `session`, `message`, `run`, `queue_position` | User prompt accepted |
-| `run_started` | `session`, `run_id` | Run leaves the queue |
+| `run_started` | `session`, `run_id`, optional `plan` | Run leaves the queue; `plan` is its fixed `RunPlanIdentity` |
+| `steering_queued` | `run_id`, `message` | Steering input durably recorded (message `steering: true`, state `queued`) |
+| `steering_applied` | `run_id`, `message_id`, `turn_ordinal` | Steering entered model context for that turn |
+| `steering_superseded` | `run_id`, `message_id` | Run finished before the steering applied |
+| `run_interrupted` | `run_id`, `turn_ordinal` | An interrupting steer aborted the turn in flight |
 | `assistant_message_started` | `message` | A model turn's message begins streaming |
 | `text_appended` | `message_id`, `channel`, `text` | Output or refusal delta |
 | `model_turn_completed` | `run_id`, `turn_ordinal`, `model`, optional `usage`, optional `estimated_cost_usd_nanos` | A provider inference and its accounting committed |
@@ -1187,10 +1403,41 @@ tool_calls
 total_tokens
 cost
 cost_unknown
+input_tokens
+output_tokens
+tokens_unknown
+tool_output_bytes
 ```
 
 `cost_unknown` means a cost cap was imposed but a provider turn (of the run or
 of a sub-agent) omitted usage, so spend could no longer be measured.
+`tokens_unknown` is the same signal for any token bound (`max_total_tokens`,
+`max_input_tokens`, `max_output_tokens`): a caller must never believe a token
+bound held when the provider stopped reporting usage.
+
+### Run plan identity
+
+```json
+{
+  "profile": "review",
+  "descriptor_version": 2,
+  "digest": "aaaa…",
+  "credential_epoch": 3
+}
+```
+
+`RunPlanIdentity` is fixed when a run starts and carried on `run_started` and
+`RunSnapshot.plan`. `digest` is the SHA-256 of the secret-free
+`AgentPlanDescriptor` the run was compiled from (provider shape, model,
+workspace, prompt version, instructions, tool catalog, MCP declarations, retry
+policy, configuration sources, profile); two runs with equal digests were
+admitted with behaviorally identical plans. `credential_epoch` is the opaque
+credential-store generation that authorized the plan; it moves on rotation
+without changing the digest. A later configuration or credential refresh
+compiles a new plan for later runs and never changes an accepted run's
+identity. Historical runs and runs that failed before compilation carry no
+`plan`. The descriptor itself is persisted beside the run but is not on the
+wire.
 
 `RunFailureKind` values:
 
@@ -1286,6 +1533,13 @@ Current server/client bounds that affect interoperability:
 | Workspace path field | 4 KiB |
 | Model id field | 512 bytes |
 | Organization field | 512 bytes |
+| Capabilities response (client read limit) | 256 KiB |
+| Input parts per prompt or steer | 1..=32 |
+| Input text per prompt or steer | 128 KiB |
+| Workspace file parts per prompt | 8, each ≤ 256 KiB, resolved total ≤ 1 MiB |
+| Pending steering per run | 4 |
+| Correlation map | 8 entries, key ≤ 64 B, value ≤ 256 B, ≤ 2 KiB |
+| Agent profile id | 64 bytes |
 | Snapshot `session_limit` | 1..=512 |
 | Bootstrap snapshot used by the shipped TUI client | 512 sessions / 256 messages |
 
@@ -1306,7 +1560,17 @@ When changing the protocol:
 Additive optional fields may be introduced carefully with serde defaults, but
 clients generated against older structs will ignore unknown response fields
 only if their decoders allow it. The server continues to reject unknown fields
-on inbound request bodies that opt into `deny_unknown_fields`.
+on inbound request bodies that opt into `deny_unknown_fields`. Two response
+types deliberately tolerate unknown fields: `ServerInfo` and
+`ServerCapabilities` (with its sections), so an older client can read a newer
+server's version and report the skew. Events, snapshots, and every inbound
+type stay strict.
+
+Golden encodings for every command, receipt, event, and the capability
+document live under `crates/qq-protocol/tests/fixtures/v13/` and are checked
+byte-for-byte by `crates/qq-protocol/tests/wire_fixtures.rs`. A wire change
+fails that test first; regenerate the goldens with `QQ_UPDATE_FIXTURES=1`
+after bumping `PROTOCOL_VERSION`.
 
 ## Non-Goals
 
@@ -1314,7 +1578,8 @@ The current protocol does not define:
 
 - Multi-user identity or ACLs beyond the single local bearer token
 - Per-session SSE streams (streams are workspace-scoped)
-- Binary attachment upload APIs
+- Binary attachment upload APIs (workspace files attach by reference; image
+  parts are not yet defined)
 - Interactive PTY multiplexing
 - Client-to-client messaging
 - Partial event patch frames (events are whole JSON objects)

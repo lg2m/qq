@@ -335,8 +335,68 @@ cache has hard entry and estimated-byte bounds, evicts least-recently-used
 inactive generations, never evicts a generation an active run holds, fails
 admission explicitly when pinned generations exhaust the bound, compiles one
 generation per key at a time under refresh storms, and refuses loads after
-shutdown. The digest and epoch are not yet persisted or exposed on the wire;
-that is protocol work owned by the harness plan's Phase 3.
+shutdown.
+
+A run's `RunPlanIdentity` — the selected profile, descriptor version, digest,
+and credential epoch — is written in the same statement that moves the run to
+`running`, beside the resolved model and the canonical descriptor JSON. It is
+carried on `run_started` and `RunSnapshot.plan`. A later refresh never touches
+that row.
+
+### Agent Profiles
+
+An `AgentProfileId` names a bundle of per-session defaults declared in the
+configuration's `profiles` map: model route, organization, output cap, and
+approval mode. `default` is implicit and cannot be declared. `qq-config`
+validates names and routes at merge time exactly like the top-level model;
+the root resolves a profile when compiling a plan (explicit session selection
+wins over the profile, which wins over the top-level configuration) and keys
+the plan cache by profile, so two profiles that happen to resolve identically
+are still distinct plans because the caller selected them by name. The
+profile is part of the descriptor and therefore the digest. A profile the
+configuration no longer declares fails the run that needs it with a
+`configuration` failure; `POST /v1/capabilities` lists what a workspace
+declares. `qq-config` does not depend on `qq-protocol`; the root translates.
+
+### Structured Input And Steering
+
+A prompt is a bounded list of `InputPart`s (text, workspace file by
+reference). The transport and the durable admission path validate the parts
+syntactically and perform no I/O; the transcript row carries the text with
+`@path` placeholders. File parts resolve when the run starts, through the
+plan's workspace capability, bounded and optionally hash-checked, and record
+into the session file state. Any failure there settles the run with a typed
+`invalid_command` outcome before the first provider request; the command that
+queued it already succeeded, which is the point: admission stays fast and
+pure, and a stale attachment is a run outcome, not a transport error.
+
+Steering adds user input to an executing run. The session layer records the
+message durably (`steering: true`, state `queued`), then hands it to the run
+loop over a bounded per-run channel (`MAX_PENDING_STEERING`, the same bound
+admission enforces) held in `SessionRuntimeInner.steering`. The loop applies
+steering only at a boundary: after a turn's tool results are appended, or in
+place of completing when the model returned no tool calls. A provider request
+already sent is never rewritten. An interrupting steer bumps a per-run watch
+generation the loop observes inside the provider stream `select!`, the
+approval wait, and the tool execution `select!`: the in-flight future is
+dropped (which kills a shell process group and abandons MCP and child
+awaits), streamed text stands as the partial turn, tool calls the model had
+begun are discarded because their arguments may be incomplete, and calls
+awaiting approval or executing settle as interrupted with an error result so
+the transcript stays provider-valid. Applied steering is persisted with the
+ordinal of the turn whose request first carried it; context assembly replays
+it before that turn, after the preceding tool results, so the durable
+transcript and the requests the provider saw agree. Steering still queued
+when a run settles is superseded in the settlement transaction. A replayed
+`steer_run` returns its receipt without re-queuing.
+
+Run limits are core-owned. `BudgetMeter` charges turns, tool calls, tokens
+(total, input, output), tool-output bytes, and cost as the loop observes them
+and settles every accepted bound with exactly one `BudgetLimitKind`; lost usage
+under any token bound is the explicit `tokens_unknown`, never a silent pass.
+Child count and concurrency bounds lower the runtime ceilings for one run and
+are enforced as typed spawn refusals the model can act on, not terminal
+outcomes; depth is fixed at one and advertised.
 
 Protocol codecs, request-time authorization, framing, retry policy, and
 transport are internal implementation details. Shared protocol behavior is

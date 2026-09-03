@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod approval;
+mod input;
 mod mcp;
 pub mod plan;
 mod runtime;
@@ -44,12 +45,14 @@ use runtime::{
 };
 
 pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult};
+pub use runtime::MAX_PENDING_STEERING;
 pub use sessions::{
-    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, ReviewFuture,
-    ReviewRequest, ReviewVerdict, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
-    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
-    SpawnModelValidationFuture, WorkerRuntimeLoadFuture, WorkspaceGrantAuthority,
-    WorkspaceGrantSeed,
+    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, MAX_CHILD_DEPTH,
+    MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_PENDING_PROMPTS, MAX_SPAWNED_CHILDREN_PER_RUN,
+    ReviewFuture, ReviewRequest, ReviewVerdict, RuntimeLoadError, RuntimeLoadFuture,
+    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
+    SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
+    WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
@@ -77,6 +80,56 @@ const MAX_PARALLEL_READS: usize = 4;
 const SHELL_OUTPUT_QUEUE_CAPACITY: usize = 16;
 const CONTEXT_MESSAGE_FRAMING_BYTES: u64 = 16;
 const CONTEXT_BLOCK_FRAMING_BYTES: u64 = 16;
+/// Sent to the model when an interrupt left the transcript ending on an
+/// assistant message with no steering to inject.
+const INTERRUPT_CONTINUE_NOTICE: &str = "[QQ runtime notice; not a user instruction]\nThe previous \
+turn was interrupted by the user. Continue from where it stopped.";
+const INTERRUPTED_TOOL_RESULT: &str =
+    "Tool execution was interrupted before a durable result was recorded.";
+
+enum StreamStep<T> {
+    Interrupted,
+    Event(Option<T>),
+}
+
+/// Resolves when an interrupting steer newer than `handled` arrives; pending
+/// forever for runs without steering.
+async fn interrupt_requested(steering: &mut Option<runtime::SteeringReceiver>, handled: u64) {
+    match steering {
+        Some(steering) => loop {
+            if *steering.interrupts.borrow() > handled {
+                return;
+            }
+            if steering.interrupts.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Drains every steering message that is ready and appends each as a user
+/// message. Returns the ids applied, in order, or `None` when nothing was
+/// pending. Never waits: steering that arrives after this point waits for
+/// the next boundary.
+fn apply_steering(
+    steering: &mut Option<runtime::SteeringReceiver>,
+    messages: &mut Vec<Message>,
+    irreducible_message_bytes: &mut u64,
+    _turn_ordinal: u16,
+) -> Option<Vec<qq_protocol::MessageId>> {
+    let steering = steering.as_mut()?;
+    let mut applied = Vec::new();
+    while let Ok(message) = steering.messages.try_recv() {
+        let user = Message::user(message.text);
+        *irreducible_message_bytes =
+            irreducible_message_bytes.saturating_add(measure_message(&user));
+        messages.push(user);
+        applied.push(message.message_id);
+    }
+    (!applied.is_empty()).then_some(applied)
+}
+
 struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
@@ -102,6 +155,8 @@ pub(crate) struct RunCapabilities {
     /// Full-transcript recall for `search_history`. Session runs install one;
     /// direct runs have no durable history to search.
     history: Option<Arc<dyn HistorySearcher>>,
+    /// Steering input from the session layer. Direct runs have none.
+    steering: Option<runtime::SteeringReceiver>,
 }
 
 impl RunCapabilities {
@@ -115,6 +170,7 @@ impl RunCapabilities {
             limits: RunLimits::default(),
             pricing: None,
             history: None,
+            steering: None,
         }
     }
 
@@ -147,6 +203,11 @@ impl RunCapabilities {
         self
     }
 
+    pub(crate) fn with_steering(mut self, steering: runtime::SteeringReceiver) -> Self {
+        self.steering = Some(steering);
+        self
+    }
+
     pub(crate) const fn restricted() -> Self {
         Self {
             spawner: None,
@@ -160,9 +221,15 @@ impl RunCapabilities {
                 max_tool_calls: None,
                 max_total_tokens: None,
                 max_cost_usd_nanos: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_tool_output_bytes: None,
+                max_children: None,
+                max_concurrent_children: None,
             },
             pricing: None,
             history: None,
+            steering: None,
         }
     }
 }
@@ -311,7 +378,10 @@ impl Runtime {
     /// Runs one command with read-only tools scoped to `workspace`.
     pub fn run_in_workspace(&self, command: RunCommand, workspace: PathBuf) -> RunStream {
         public_run_stream(
-            self.run_messages_in_workspace(vec![Message::user(command.into_prompt())], workspace),
+            self.run_messages_in_workspace(
+                vec![Message::user(input::render_text(command.input()))],
+                workspace,
+            ),
             self.context_window,
         )
     }
@@ -477,7 +547,7 @@ impl plan::CompiledAgentPlan {
         };
         public_run_stream(
             self.execute(
-                vec![Message::user(command.into_prompt())],
+                vec![Message::user(input::render_text(command.input()))],
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(StaticPolicyGate {
                     mode: ApprovalMode::Ask,
@@ -518,7 +588,12 @@ impl plan::CompiledAgentPlan {
                 limits,
                 pricing,
                 history,
+                steering,
             } = capabilities;
+            let mut steering = steering;
+            let mut handled_interrupt = steering
+                .as_ref()
+                .map_or(0, |steering| *steering.interrupts.borrow());
             let max_output_tokens = max_output_tokens
                 .unwrap_or(model_max_output_tokens)
                 .min(model_max_output_tokens);
@@ -722,7 +797,7 @@ impl plan::CompiledAgentPlan {
                 // failing the run — but only while nothing user-visible has
                 // streamed, so a retry can never duplicate output.
                 let mut attempt = 1_u32;
-                let (blocks, pending_calls, terminal_usage) = 'turn: loop {
+                let (blocks, pending_calls, terminal_usage, interrupted_turn) = 'turn: loop {
                 let request = ModelRequest::new(
                     Arc::clone(&model),
                     messages.clone(),
@@ -748,30 +823,57 @@ impl plan::CompiledAgentPlan {
                 let mut reasoning_bytes = 0_usize;
                 let mut open_reasoning = None;
                 let mut turn_streamed = false;
+                let mut interrupted_turn = false;
                 let deadline = budget.deadline();
 
                 loop {
                     // The wall clock bounds a hanging provider too: an
                     // elapsed deadline settles the run without waiting for a
                     // stream event that may never arrive.
-                    let event = match deadline {
-                        Some(deadline) => tokio::select! {
-                            biased;
-                            () = tokio::time::sleep_until(deadline) => {
-                                let exhaustion = budget.exhaustion(
-                                    BudgetLimitKind::Duration,
-                                    false,
-                                    tokio::time::Instant::now(),
-                                );
-                                yield RuntimeEvent::BudgetExhausted { exhaustion };
-                                return;
-                            }
-                            event = provider_events.next() => event,
-                        },
-                        None => provider_events.next().await,
+                    // An interrupting steer ends the stream here. Text that
+                    // already streamed is kept as the partial turn; tool
+                    // calls the model had begun are dropped, because their
+                    // arguments may be incomplete and nothing has executed.
+                    let interrupt = async {
+                        match &mut steering {
+                            Some(steering) => loop {
+                                if *steering.interrupts.borrow() > handled_interrupt {
+                                    break;
+                                }
+                                if steering.interrupts.changed().await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            },
+                            None => std::future::pending().await,
+                        }
                     };
-                    let Some(event) = event else {
-                        break;
+                    let event = tokio::select! {
+                        biased;
+                        () = async {
+                            match deadline {
+                                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            let exhaustion = budget.exhaustion(
+                                BudgetLimitKind::Duration,
+                                false,
+                                tokio::time::Instant::now(),
+                            );
+                            yield RuntimeEvent::BudgetExhausted { exhaustion };
+                            return;
+                        }
+                        () = interrupt => StreamStep::Interrupted,
+                        event = provider_events.next() => StreamStep::Event(event),
+                    };
+                    let event = match event {
+                        StreamStep::Interrupted => {
+                            interrupted_turn = true;
+                            completed = true;
+                            break;
+                        }
+                        StreamStep::Event(Some(event)) => event,
+                        StreamStep::Event(None) => break,
                     };
                     match event {
                         Ok(ProviderEvent::ReasoningStarted { kind }) => {
@@ -1049,7 +1151,16 @@ impl plan::CompiledAgentPlan {
                     return;
                 }
 
-                break 'turn (blocks, pending_calls, terminal_usage);
+                if interrupted_turn {
+                    handled_interrupt = steering
+                        .as_ref()
+                        .map_or(handled_interrupt, |steering| *steering.interrupts.borrow());
+                    // Only fully streamed calls could be executed; an interrupt
+                    // executes none, so the partial turn carries text alone.
+                    blocks.retain(|block| matches!(block, TurnBlock::Text(_)));
+                    pending_calls.clear();
+                }
+                break 'turn (blocks, pending_calls, terminal_usage, interrupted_turn);
                 };
 
                 compatible_request = terminal_usage.map(|usage| {
@@ -1122,6 +1233,39 @@ impl plan::CompiledAgentPlan {
                 budget.charge_turn(terminal_usage);
                 budget.charge_tool_calls(calls.len());
 
+                if interrupted_turn {
+                    yield RuntimeEvent::Interrupted { turn_ordinal };
+                    if assistant.has_content() {
+                        irreducible_message_bytes = irreducible_message_bytes
+                            .saturating_add(measure_message(&assistant));
+                        messages.push(assistant);
+                    }
+                    // The interrupt exists to apply steering now. Nothing
+                    // queued means the client raced a finishing run; continue
+                    // with the next turn so the model resumes from its text.
+                    if let Some(applied) = apply_steering(
+                        &mut steering,
+                        &mut messages,
+                        &mut irreducible_message_bytes,
+                        turn_ordinal.saturating_add(1),
+                    ) {
+                        for message_id in applied {
+                            yield RuntimeEvent::SteeringApplied {
+                                message_id,
+                                turn_ordinal: turn_ordinal.saturating_add(1),
+                            };
+                        }
+                    }
+                    if messages.last().is_some_and(|message| message.role() == Role::Assistant) {
+                        // Providers require alternation; an interrupted turn
+                        // with no steering to inject cannot be resent as-is.
+                        messages.push(Message::user(INTERRUPT_CONTINUE_NOTICE));
+                        irreducible_message_bytes = irreducible_message_bytes
+                            .saturating_add(measure_message(messages.last().expect("just pushed")));
+                    }
+                    continue;
+                }
+
                 if budget_final_turn {
                     // The reserved final response has been persisted; the
                     // run settles with the limit that spent its budget.
@@ -1167,6 +1311,28 @@ impl plan::CompiledAgentPlan {
                     continue;
                 }
                 if calls.is_empty() {
+                    // Steering that arrived during the final turn is not
+                    // dropped: the run continues with it instead of
+                    // completing, exactly as if the model had called a tool.
+                    if let Some(applied) = apply_steering(
+                        &mut steering,
+                        &mut messages,
+                        &mut irreducible_message_bytes,
+                        turn_ordinal.saturating_add(1),
+                    ) {
+                        irreducible_message_bytes = irreducible_message_bytes
+                            .saturating_add(measure_message(&assistant));
+                        let steering_messages = messages.split_off(messages.len() - applied.len());
+                        messages.push(assistant);
+                        messages.extend(steering_messages);
+                        for message_id in applied {
+                            yield RuntimeEvent::SteeringApplied {
+                                message_id,
+                                turn_ordinal: turn_ordinal.saturating_add(1),
+                            };
+                        }
+                        continue;
+                    }
                     yield RuntimeEvent::Completed;
                     return;
                 }
@@ -1180,11 +1346,42 @@ impl plan::CompiledAgentPlan {
                 // arguments never reach the gate: there is nothing executable
                 // to approve, so they short-circuit to their tool error below.
                 let mut results = vec![None; calls.len()];
+                let mut turn_interrupted_in_tools = false;
                 for (index, call) in calls.iter().enumerate() {
                     if call.argument_error.is_some() {
                         continue;
                     }
-                    match gate.resolve(call).await {
+                    if turn_interrupted_in_tools {
+                        // Calls behind an interrupted approval wait never
+                        // execute; they settle like calls behind a cancel.
+                        results[index] = Some(tools::ToolExecutionResult {
+                            content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                            is_error: true,
+                            file_state: None,
+                        });
+                        continue;
+                    }
+                    // An approval wait is a boundary too: an interrupting
+                    // steer withdraws the pending request instead of leaving
+                    // the user to answer a question the steer made moot.
+                    let decision = {
+                        let interrupt = interrupt_requested(&mut steering, handled_interrupt);
+                        tokio::select! {
+                            biased;
+                            () = interrupt => None,
+                            decision = gate.resolve(call) => Some(decision),
+                        }
+                    };
+                    let Some(decision) = decision else {
+                        turn_interrupted_in_tools = true;
+                        results[index] = Some(tools::ToolExecutionResult {
+                            content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                            is_error: true,
+                            file_state: None,
+                        });
+                        continue;
+                    };
+                    match decision {
                         GateDecision::Execute => {}
                         GateDecision::Deny { message } => {
                             results[index] = Some(tools::ToolExecutionResult {
@@ -1203,7 +1400,7 @@ impl plan::CompiledAgentPlan {
                 let approved = calls
                     .iter()
                     .enumerate()
-                    .filter(|(index, _)| results[*index].is_none())
+                    .filter(|(index, _)| results[*index].is_none() && !turn_interrupted_in_tools)
                     .map(|(_, call)| call.clone())
                     .collect::<Vec<_>>();
                 for call in &approved {
@@ -1343,12 +1540,26 @@ impl plan::CompiledAgentPlan {
                         // drain the channel while the call runs so long
                         // commands render as they print.
                         let call_id = call.id;
+                        let mut call_id_holder = Some(call.clone());
                         let (delta_sender, mut deltas) =
                             tokio::sync::mpsc::channel::<String>(SHELL_OUTPUT_QUEUE_CAPACITY);
                         let mut execution = Box::pin(execute_one(call, Some(delta_sender)));
                         let (call, result, child_cost) = loop {
+                            let interrupt = interrupt_requested(&mut steering, handled_interrupt);
                             tokio::select! {
                                 biased;
+                                () = interrupt => {
+                                    // Dropping the execution kills a shell
+                                    // process group and abandons MCP/child
+                                    // awaits; bounded blocking reads finish on
+                                    // their thread and are discarded.
+                                    drop(execution);
+                                    break (call_id_holder.take().expect("call retained"), tools::ToolExecutionResult {
+                                        content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                                        is_error: true,
+                                        file_state: None,
+                                    }, None);
+                                }
                                 chunk = deltas.recv() => match chunk {
                                     Some(chunk) => {
                                         yield RuntimeEvent::ToolCallOutputDelta { id: call_id, chunk };
@@ -1360,6 +1571,7 @@ impl plan::CompiledAgentPlan {
                                 completed = &mut execution => break completed,
                             }
                         };
+                        let interrupted_here = result.content == INTERRUPTED_TOOL_RESULT && result.is_error && result.file_state.is_none() && steering.as_ref().is_some_and(|steering| *steering.interrupts.borrow() > handled_interrupt);
                         // Chunks sent in the execution's final poll may still
                         // be buffered; drain them before the terminal event.
                         while let Ok(chunk) = deltas.try_recv() {
@@ -1379,13 +1591,29 @@ impl plan::CompiledAgentPlan {
                             file_state: result.file_state,
                             display,
                         };
+                        if interrupted_here {
+                            turn_interrupted_in_tools = true;
+                            break;
+                        }
                     }
                 } else {
                     let mut executions = futures_stream::iter(
                         approved.into_iter().map(|call| execute_one(call, None)),
                     )
                         .buffer_unordered(MAX_PARALLEL_READS);
-                    while let Some((call, result, child_cost)) = executions.next().await {
+                    loop {
+                        let interrupt = interrupt_requested(&mut steering, handled_interrupt);
+                        let next = tokio::select! {
+                            biased;
+                            () = interrupt => {
+                                turn_interrupted_in_tools = true;
+                                break;
+                            }
+                            next = executions.next() => next,
+                        };
+                        let Some((call, result, child_cost)) = next else {
+                            break;
+                        };
                         if let Some(cost) = child_cost {
                             budget.charge_child(cost);
                         }
@@ -1400,11 +1628,36 @@ impl plan::CompiledAgentPlan {
                         };
                     }
                 }
+                if turn_interrupted_in_tools {
+                    handled_interrupt = steering
+                        .as_ref()
+                        .map_or(handled_interrupt, |steering| *steering.interrupts.borrow());
+                    // Calls that never finished settle as interrupted so the
+                    // transcript stays provider-valid: one result per call.
+                    for (index, call) in calls.iter().enumerate() {
+                        if results[index].is_none() {
+                            results[index] = Some(tools::ToolExecutionResult {
+                                content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                                is_error: true,
+                                file_state: None,
+                            });
+                            yield RuntimeEvent::ToolCallFinished {
+                                id: call.id,
+                                result: INTERRUPTED_TOOL_RESULT.to_owned(),
+                                is_error: true,
+                                file_state: None,
+                                display: None,
+                            };
+                        }
+                    }
+                    yield RuntimeEvent::Interrupted { turn_ordinal };
+                }
                 let result_blocks = calls
                     .iter()
                     .zip(results.into_iter())
                     .map(|(call, result)| {
                         let result = result.expect("every bounded tool execution completed");
+                        budget.charge_tool_output(result.content.len());
                         ContentBlock::ToolResult {
                             call_id: call.provider_call_id.clone(),
                             content: result.content,
@@ -1416,6 +1669,22 @@ impl plan::CompiledAgentPlan {
                 irreducible_message_bytes = irreducible_message_bytes
                     .saturating_add(measure_message(&tool_results));
                 messages.push(tool_results);
+                // The boundary: every result of this turn is in context, and
+                // the next request has not been built. Steering joins here as
+                // a user message after the tool results.
+                if let Some(applied) = apply_steering(
+                    &mut steering,
+                    &mut messages,
+                    &mut irreducible_message_bytes,
+                    turn_ordinal.saturating_add(1),
+                ) {
+                    for message_id in applied {
+                        yield RuntimeEvent::SteeringApplied {
+                            message_id,
+                            turn_ordinal: turn_ordinal.saturating_add(1),
+                        };
+                    }
+                }
             }
 
             yield RuntimeEvent::Failed {
@@ -1480,7 +1749,10 @@ fn public_run_stream(mut events: RuntimeStream, context_window: Option<u32>) -> 
                 | RuntimeEvent::ToolCallStarted { .. }
                 | RuntimeEvent::ToolCallDenied { .. }
                 | RuntimeEvent::ToolCallOutputDelta { .. }
-                | RuntimeEvent::ToolCallFinished { .. } => {}
+                | RuntimeEvent::ToolCallFinished { .. }
+                // Direct runs have no steering channel, so these never fire.
+                | RuntimeEvent::SteeringApplied { .. }
+                | RuntimeEvent::Interrupted { .. } => {}
                 RuntimeEvent::Completed => {
                     yield RunEvent::Completed;
                     return;

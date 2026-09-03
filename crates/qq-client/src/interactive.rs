@@ -423,6 +423,8 @@ async fn load_tui_models(
                 parent_id: None,
                 model: selection,
                 approval_mode: qq_protocol::ApprovalMode::default(),
+                profile: qq_protocol::AgentProfileId::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await
@@ -473,6 +475,8 @@ async fn bootstrap_tui(
                     parent_id: None,
                     model: model.clone(),
                     approval_mode: qq_protocol::ApprovalMode::default(),
+                    profile: qq_protocol::AgentProfileId::default(),
+                    correlation: qq_protocol::Correlation::default(),
                 },
             )
             .await?;

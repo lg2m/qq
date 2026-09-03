@@ -1219,6 +1219,8 @@ pub enum ConfigKey {
     Policy,
     Mcp,
     McpServer(String),
+    Profiles,
+    Profile(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1261,6 +1263,7 @@ pub struct ConfigProvenance {
     reviewer_model: Option<SourceIdentity>,
     max_output_tokens: Option<SourceIdentity>,
     providers: BTreeMap<String, SourceIdentity>,
+    profiles: BTreeMap<String, SourceIdentity>,
     grant_tools: BTreeMap<String, SourceIdentity>,
     grant_shell_prefixes: BTreeMap<String, SourceIdentity>,
 }
@@ -1356,6 +1359,7 @@ pub struct ConfigSnapshot {
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
+    profiles: BTreeMap<String, AgentProfileConfig>,
     policy: EffectivePolicy,
     grants: PolicyGrants,
     reports: Vec<SourceReport>,
@@ -1363,10 +1367,76 @@ pub struct ConfigSnapshot {
     probed_paths: Vec<PathBuf>,
 }
 
+/// Longest agent profile name in bytes. Mirrors the protocol's identifier
+/// bound so a configured name is always representable on the wire.
+pub const MAX_PROFILE_NAME_BYTES: usize = 64;
+
+/// Per-session approval policy a profile may preselect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileApprovalMode {
+    ReadOnly,
+    Ask,
+    Auto,
+    Full,
+}
+
+/// One configured agent profile. Every field is optional: an absent value
+/// falls back to the top-level configuration, so a profile only records what
+/// it changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentProfileConfig {
+    model: Option<String>,
+    organization: Option<String>,
+    max_output_tokens: Option<u32>,
+    approval_mode: Option<ProfileApprovalMode>,
+}
+
+impl AgentProfileConfig {
+    /// The profile's model route, already validated against the configured
+    /// providers and policy.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    #[must_use]
+    pub fn organization(&self) -> Option<&str> {
+        self.organization.as_deref()
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
+    #[must_use]
+    pub const fn approval_mode(&self) -> Option<ProfileApprovalMode> {
+        self.approval_mode
+    }
+}
+
 impl ConfigSnapshot {
     #[must_use]
     pub fn organization(&self) -> Option<&str> {
         self.organization.as_deref()
+    }
+
+    /// Configured agent profiles by name, excluding the implicit `default`.
+    #[must_use]
+    pub const fn profiles(&self) -> &BTreeMap<String, AgentProfileConfig> {
+        &self.profiles
+    }
+
+    /// The named profile, or `None` for a name the configuration does not
+    /// declare. `default` always resolves to an empty profile (top-level
+    /// values apply).
+    #[must_use]
+    pub fn profile(&self, name: &str) -> Option<AgentProfileConfig> {
+        if name == "default" {
+            return Some(AgentProfileConfig::default());
+        }
+        self.profiles.get(name).cloned()
     }
 
     #[must_use]
@@ -1548,6 +1618,11 @@ pub enum ConfigError {
     InvalidTrustDigest { digest: String },
     #[error("model must be configured")]
     ModelRequired,
+    #[error(
+        "agent profile name {0:?} is invalid; use 1-64 lowercase letters, digits, or hyphens, \
+         and never `default`"
+    )]
+    InvalidProfileName(String),
     #[error("model route must use provider/model syntax: {0:?}")]
     InvalidModelRoute(String),
     #[error("model route selects an unknown or disabled provider: {0}")]

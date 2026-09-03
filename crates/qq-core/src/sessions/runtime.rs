@@ -28,6 +28,23 @@ impl LoadedRuntime {
         resolved_model: ResolvedModel,
         workspace: PathBuf,
     ) -> Result<Self, PlanCompileError> {
+        Self::compile_blocking_for_profile(
+            runtime,
+            resolved_model,
+            workspace,
+            qq_protocol::AgentProfileId::default(),
+        )
+    }
+
+    /// [`Self::compile_blocking`] for a named agent profile. Embedders that
+    /// realize profiles themselves record which one the plan implements so
+    /// the run's persisted identity names it.
+    pub fn compile_blocking_for_profile(
+        runtime: &Runtime,
+        resolved_model: ResolvedModel,
+        workspace: PathBuf,
+        profile_id: qq_protocol::AgentProfileId,
+    ) -> Result<Self, PlanCompileError> {
         if runtime.model.as_ref() != resolved_model.provider_model.as_str()
             || runtime.max_output_tokens != resolved_model.max_output_tokens
             || runtime.context_window != resolved_model.context_window
@@ -46,7 +63,8 @@ impl LoadedRuntime {
             workspace,
         )
         .with_spawn_model_routes(runtime.spawn_model_routes.to_vec())
-        .with_turn_retry_policy(runtime.turn_retry);
+        .with_turn_retry_policy(runtime.turn_retry)
+        .with_profile_id(profile_id);
         if let Some(registry) = &runtime.mcp {
             profile = profile.with_mcp(Arc::clone(registry), Vec::new());
         }
@@ -100,6 +118,9 @@ pub trait RuntimeLoader: Send + Sync + 'static {
 pub struct RuntimeLoadRequest {
     pub workspace: String,
     pub model: ModelSelection,
+    /// Configured agent profile the session selected. Loaders that know no
+    /// profiles accept `default` and reject anything else.
+    pub profile: qq_protocol::AgentProfileId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -264,6 +285,9 @@ pub(super) struct SessionRuntimeInner {
     pub(super) max_active_runs: usize,
     pub(super) schedule: mpsc::Sender<()>,
     pub(super) cancellations: Mutex<HashMap<RunId, watch::Sender<bool>>>,
+    /// Live steering channels for executing prompt runs, registered when the
+    /// run loop starts and removed when it settles.
+    pub(super) steering: Mutex<HashMap<RunId, crate::runtime::SteeringSender>>,
     approvals: Mutex<HashMap<ToolCallId, PendingApproval>>,
     pub(super) approval_timeout: Duration,
     wakeups: Mutex<HashMap<WorkspaceId, watch::Sender<u64>>>,
@@ -397,6 +421,7 @@ impl SessionRuntime {
             max_active_runs: options.max_active_runs,
             schedule,
             cancellations: Mutex::new(HashMap::new()),
+            steering: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             approval_timeout: options.approval_timeout,
             wakeups: Mutex::new(HashMap::new()),
@@ -445,6 +470,14 @@ impl SessionRuntime {
             SessionCommand::RespondToolApproval { tool_call_id, .. } => Some(*tool_call_id),
             _ => None,
         };
+        let steer = match &command {
+            SessionCommand::SteerRun {
+                run_id,
+                input,
+                interrupt,
+            } => Some((*run_id, crate::input::render_text(input), *interrupt)),
+            _ => None,
+        };
         let should_schedule = matches!(command, SessionCommand::SubmitPrompt { .. });
         // Config grants merge into the session's grant set at creation
         // (tools.md "Grant Lifetimes"): the workspace's effective grants are
@@ -485,6 +518,22 @@ impl SessionRuntime {
         if let Some(tool_call_id) = signal_approval {
             self.inner.resolve_approval(tool_call_id);
         }
+        // The row is durable (the receipt names its id). A replayed command
+        // returns the same receipt without re-queuing: the first delivery
+        // already reached the loop, or the run finished and superseded it.
+        if let (Some((run_id, text, interrupt)), CommandOutcome::SteeringQueued { message_id, .. }) =
+            (steer, &applied.receipt.outcome)
+            && !applied.replayed
+        {
+            self.inner.steer(
+                run_id,
+                crate::runtime::SteeringMessage {
+                    message_id: *message_id,
+                    text: text.trim().to_owned(),
+                },
+                interrupt,
+            );
+        }
         if applied.grant_promotion_pending {
             self.request_grant_promotions();
         }
@@ -493,6 +542,18 @@ impl SessionRuntime {
             self.request_schedule();
         }
         Ok(applied.receipt)
+    }
+
+    /// The canonical path a resolved workspace id names, for callers that
+    /// consult workspace-scoped configuration (capabilities) outside a run.
+    pub async fn workspace_path(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<String, SessionRuntimeError> {
+        if *self.inner.shutdown.borrow() || *self.inner.failed.borrow() {
+            return Err(SessionRuntimeError::Unavailable);
+        }
+        self.inner.store.workspace_path(workspace_id).await
     }
 
     pub async fn snapshot(
@@ -704,6 +765,34 @@ impl SessionRuntimeInner {
         }
     }
 
+    /// Hands a durably recorded steering message to the executing run. A run
+    /// that is no longer registered finished (or is finishing); its
+    /// settlement marks the message superseded, so nothing is lost here.
+    pub(super) fn steer(
+        &self,
+        run_id: RunId,
+        message: crate::runtime::SteeringMessage,
+        interrupt: bool,
+    ) {
+        let Ok(steering) = self.steering.lock() else {
+            return;
+        };
+        let Some(sender) = steering.get(&run_id) else {
+            return;
+        };
+        // The channel is sized to `MAX_PENDING_STEERING`, the same bound the
+        // durable admission enforces, so a full channel means the store and
+        // the loop disagree only transiently; the message stays `queued` and
+        // settles superseded with the run if it never applies.
+        match sender.messages.try_send(message) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {}
+        }
+        if interrupt {
+            sender.interrupt();
+        }
+    }
+
     pub(super) fn register_approval(
         &self,
         tool_call_id: ToolCallId,
@@ -752,8 +841,16 @@ pub enum SessionRuntimeError {
     EmptyPrompt,
     #[error("prompt exceeds the session limit")]
     PromptTooLarge,
-    #[error("run limits must be greater than zero")]
+    #[error("run limits must be greater than zero and within the runtime ceilings")]
     InvalidRunLimits,
+    #[error("invalid input: {0}")]
+    InvalidInput(qq_protocol::InputError),
+    #[error("run is not executing a prompt, so it cannot be steered")]
+    RunNotSteerable,
+    #[error("run steering queue is full")]
+    SteeringQueueFull,
+    #[error("agent profile {0} is not declared by the workspace configuration")]
+    UnknownProfile(qq_protocol::AgentProfileId),
     #[error("session has no compaction to roll back")]
     NoCompactionToRollBack,
     #[error("workspace was not found")]

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use qq_protocol::{
-    BudgetExhaustion, ContentHash, ReasoningKind, RunActivity, RunFailureKind, RunPromptIdentity,
-    TokenUsage, ToolCallDisplay, ToolCallId,
+    BudgetExhaustion, ContentHash, MessageId, ReasoningKind, RunActivity, RunFailureKind,
+    RunPromptIdentity, TokenUsage, ToolCallDisplay, ToolCallId,
 };
 use qq_provider::Message;
 use sha2::{Digest, Sha256};
@@ -115,6 +115,20 @@ pub(crate) enum RuntimeEvent {
         /// A UI-facing payload persisted with the result (the applied diff of
         /// a successful edit). Never enters model context.
         display: Option<ToolCallDisplay>,
+    },
+    /// Queued steering entered model context: the message will be part of
+    /// the request for `turn_ordinal`. Emitted at the boundary, before that
+    /// turn is prepared.
+    SteeringApplied {
+        message_id: MessageId,
+        turn_ordinal: u16,
+    },
+    /// An interrupting steer aborted turn `turn_ordinal` in flight. Emitted
+    /// after the partial turn (if any text streamed) is committed via
+    /// `AssistantTurnCompleted` and before its unfinished calls are settled;
+    /// the store marks every call of the turn still open as interrupted.
+    Interrupted {
+        turn_ordinal: u16,
     },
     Completed,
     Failed {

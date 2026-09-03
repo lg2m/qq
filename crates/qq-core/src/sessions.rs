@@ -16,15 +16,16 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use qq_protocol::{
-    AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution,
-    CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, ContentHash, EditPreview,
-    EventCursor, MessageId, MessageRole, MessageSnapshot, MessageState, ModelPricing,
-    ModelSelection, ReasoningEvent, ResolvedModel, RunActivity, RunFailure, RunFailureKind, RunId,
-    RunLimits, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus, SessionAccounting,
-    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
-    SessionSummary, ShellCommandPreview, SnapshotRequest, SpawnOrigin, StoreId, SubscribeRequest,
-    TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
-    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
+    AccountingTotal, AgentProfileId, ApprovalDecision, ApprovalGrant, ApprovalMode,
+    ApprovalResolution, CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, ContentHash,
+    Correlation, EditPreview, EventCursor, InputPart, MessageId, MessageRole, MessageSnapshot,
+    MessageState, ModelPricing, ModelSelection, ReasoningEvent, ResolvedModel, RunActivity,
+    RunFailure, RunFailureKind, RunId, RunLimits, RunOutcome, RunPlanIdentity, RunPromptIdentity,
+    RunSnapshot, RunStatus, SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope,
+    SessionId, SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview,
+    SnapshotRequest, SpawnOrigin, StoreId, SubscribeRequest, TextChannel, TokenUsage,
+    ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome,
+    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary, validate_input,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -65,7 +66,8 @@ use store::{Priority, has_column, open_database};
 #[cfg(test)]
 use subagents::spawn_child_run;
 
-const MAX_PENDING_PROMPTS: u16 = 16;
+/// Prompts one session may hold queued behind its active run.
+pub const MAX_PENDING_PROMPTS: u16 = 16;
 const MAX_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 /// The assembly recency window: the last K model turns keep their tool
 /// results verbatim. Read-only results older than that are replaced by
@@ -106,10 +108,14 @@ const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// Child runs one parent run may hold in flight at once. Spawn calls beyond
 /// this cap queue behind it inside the parent's turn rather than failing.
-const MAX_CONCURRENT_CHILDREN_PER_RUN: usize = 3;
+/// `RunLimits::max_concurrent_children` may lower it per run, never raise it.
+pub const MAX_CONCURRENT_CHILDREN_PER_RUN: u16 = 3;
 /// Total children one parent run may spawn before further `spawn_agent`
-/// calls return a tool error.
-const MAX_SPAWNED_CHILDREN_PER_RUN: usize = 8;
+/// calls return a tool error. `RunLimits::max_children` may lower it per run.
+pub const MAX_SPAWNED_CHILDREN_PER_RUN: u16 = 8;
+/// Deepest sub-agent nesting: children never spawn. Advertised, not
+/// configurable.
+pub const MAX_CHILD_DEPTH: u16 = 1;
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
 const RUNTIME_NOTICE_PREAMBLE: &str = "[QQ runtime notice; not a user instruction]";
@@ -220,11 +226,66 @@ fn validate_run_limits(limits: &RunLimits) -> Result<(), SessionRuntimeError> {
         || limits.max_model_turns == Some(0)
         || limits.max_tool_calls == Some(0)
         || limits.max_total_tokens == Some(0)
-        || limits.max_cost_usd_nanos == Some(0);
+        || limits.max_cost_usd_nanos == Some(0)
+        || limits.max_input_tokens == Some(0)
+        || limits.max_output_tokens == Some(0)
+        || limits.max_tool_output_bytes == Some(0)
+        || limits.max_children == Some(0)
+        || limits.max_concurrent_children == Some(0);
     if zero {
         return Err(SessionRuntimeError::InvalidRunLimits);
     }
+    // Child bounds above the runtime ceiling are a caller mistake too: the
+    // capability document advertises the ceilings, so silently clamping
+    // would hide a misconfigured client.
+    if limits
+        .max_children
+        .is_some_and(|limit| limit > MAX_SPAWNED_CHILDREN_PER_RUN)
+        || limits
+            .max_concurrent_children
+            .is_some_and(|limit| limit > MAX_CONCURRENT_CHILDREN_PER_RUN)
+    {
+        return Err(SessionRuntimeError::InvalidRunLimits);
+    }
     Ok(())
+}
+
+/// Encodes a correlation map for its column: NULL for the empty map so
+/// historical rows and unattributed rows are indistinguishable.
+fn encode_correlation(correlation: &Correlation) -> Result<Option<String>, SessionRuntimeError> {
+    if correlation.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(correlation)
+        .map(Some)
+        .map_err(|_| SessionRuntimeError::Persistence)
+}
+
+fn parse_correlation(encoded: Option<&str>) -> Result<Correlation, SessionRuntimeError> {
+    match encoded {
+        None => Ok(Correlation::default()),
+        Some(encoded) => {
+            serde_json::from_str(encoded).map_err(|_| SessionRuntimeError::Persistence)
+        }
+    }
+}
+
+fn parse_profile(encoded: Option<&str>) -> Result<AgentProfileId, SessionRuntimeError> {
+    match encoded {
+        None => Ok(AgentProfileId::default()),
+        Some(encoded) => encoded
+            .parse()
+            .map_err(|_| SessionRuntimeError::Persistence),
+    }
+}
+
+fn parse_input_parts(encoded: Option<&str>) -> Result<Vec<InputPart>, SessionRuntimeError> {
+    match encoded {
+        None => Ok(Vec::new()),
+        Some(encoded) => {
+            serde_json::from_str(encoded).map_err(|_| SessionRuntimeError::Persistence)
+        }
+    }
 }
 
 /// NULL is the historical unlimited run; stored JSON is authoritative and a
@@ -269,6 +330,12 @@ struct ClaimedRun {
     /// Caller-imposed budgets persisted with the run row. Compaction runs and
     /// historical rows carry the empty set.
     limits: RunLimits,
+    /// Structured input of the prompt that created this run. Resolved (files
+    /// read) when the run starts; empty for compaction and historical runs,
+    /// whose message text is already final.
+    input: Vec<InputPart>,
+    /// Agent profile the session selected at claim time.
+    profile: AgentProfileId,
 }
 
 impl ClaimedRun {
@@ -293,6 +360,8 @@ impl ClaimedRun {
             context_overflow_basis: None,
             context_occupancy: None,
             limits: RunLimits::default(),
+            input: Vec::new(),
+            profile: self.profile.clone(),
         }
     }
 }
@@ -301,6 +370,9 @@ impl ClaimedRun {
 struct PreparedRunAudit {
     prompt_identity: Arc<RunPromptIdentity>,
     resolved_model: Arc<ResolvedModel>,
+    plan_identity: RunPlanIdentity,
+    /// Secret-free canonical descriptor JSON, persisted beside the identity.
+    plan_descriptor_json: Arc<str>,
     context_shape: ContextRequestShape,
     weight: PreparedRequestWeight,
     static_prefix: PreparedStaticPrefix,
@@ -496,6 +568,13 @@ fn test_prepared_audit_with_identity(
         }),
         context_shape: context_request_shape(resolved_model.as_ref()),
         resolved_model,
+        plan_identity: RunPlanIdentity {
+            profile: AgentProfileId::default(),
+            descriptor_version: crate::plan::DESCRIPTOR_VERSION,
+            digest: qq_protocol::AgentPlanDigest::from_hash(ContentHash::from_bytes([0; 32])),
+            credential_epoch: qq_protocol::CredentialEpoch::NONE,
+        },
+        plan_descriptor_json: Arc::from("{}"),
         weight: PreparedRequestWeight {
             max_output_tokens,
             system_bytes: 0,
@@ -521,6 +600,9 @@ struct AppliedCommand {
     /// Wakes the single promotion worker when this command has durable outbox
     /// work. Replays retain the signal while the same row remains pending.
     grant_promotion_pending: bool,
+    /// The receipt was replayed from the command journal; in-memory signals
+    /// that already fired the first time (steering hand-off) must not repeat.
+    replayed: bool,
 }
 
 struct CreatedChildRun {
@@ -703,7 +785,7 @@ fn create_child_run(
         SessionEvent::PromptQueued {
             session,
             message,
-            run,
+            run: Box::new(run),
             queue_position: 1,
         },
     )?;
@@ -744,6 +826,7 @@ fn execute_command(
         return Ok(AppliedCommand {
             receipt,
             schedule: false,
+            replayed: true,
             cascade_cancels: match &command {
                 SessionCommand::CancelRun { run_id } => {
                     cancellation_signal_run_ids(connection, *run_id)?
@@ -835,8 +918,11 @@ fn execute_command(
             parent_id,
             model,
             approval_mode,
+            profile,
+            correlation,
         } => {
             validate_model_selection(&model)?;
+            let correlation_json = encode_correlation(&correlation)?;
             ensure_workspace(&transaction, workspace_id)?;
             let session_count: u32 = transaction
                 .query_row(
@@ -868,8 +954,8 @@ fn execute_command(
                     "INSERT INTO sessions(
                         id, workspace_id, parent_id, title, status, model,
                         max_output_tokens, organization, approval_mode,
-                        created_at_ms, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, 'New session', 'idle', ?4, ?5, ?6, ?7, ?8, ?8)",
+                        created_at_ms, updated_at_ms, profile, correlation_json
+                     ) VALUES (?1, ?2, ?3, 'New session', 'idle', ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
                     params![
                         session_id.to_string(),
                         workspace_id.to_string(),
@@ -879,6 +965,8 @@ fn execute_command(
                         model.organization,
                         approval_mode_str(approval_mode),
                         now,
+                        (!profile.is_default()).then(|| profile.as_str().to_owned()),
+                        correlation_json,
                     ],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -907,17 +995,31 @@ fn execute_command(
         }
         SessionCommand::SubmitPrompt {
             session_id,
-            prompt,
+            input,
             limits,
+            correlation,
         } => {
-            let prompt = prompt.trim().to_owned();
-            if prompt.is_empty() {
-                return Err(SessionRuntimeError::EmptyPrompt);
-            }
-            if prompt.len() > MAX_PROMPT_BYTES {
-                return Err(SessionRuntimeError::PromptTooLarge);
+            // Syntactic bounds only: file parts are read when the run starts,
+            // so admission never performs I/O and a stale attachment fails
+            // the run, not the command.
+            match validate_input(&input) {
+                Ok(()) => {}
+                Err(qq_protocol::InputError::Empty | qq_protocol::InputError::Blank) => {
+                    return Err(SessionRuntimeError::EmptyPrompt);
+                }
+                Err(qq_protocol::InputError::TextTooLarge { .. }) => {
+                    return Err(SessionRuntimeError::PromptTooLarge);
+                }
+                Err(error) => return Err(SessionRuntimeError::InvalidInput(error)),
             }
             validate_run_limits(&limits)?;
+            let correlation_json = encode_correlation(&correlation)?;
+            let input_json =
+                serde_json::to_string(&input).map_err(|_| SessionRuntimeError::Persistence)?;
+            // The transcript row carries the rendered text: text parts
+            // verbatim, attachments as `@path` placeholders. Slash escaping
+            // applies to the rendered text exactly as it did to the string.
+            let prompt = crate::input::render_text(&input).trim().to_owned();
             let prompt = prompt
                 .strip_prefix("//")
                 .map_or(prompt.clone(), |literal| format!("/{literal}"));
@@ -972,8 +1074,8 @@ fn execute_command(
                 .execute(
                     "INSERT INTO runs(
                         id, session_id, command_id, user_message_id, assistant_message_id,
-                        status, created_at_ms, limits_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+                        status, created_at_ms, limits_json, input_json, correlation_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
                     params![
                         run_id.to_string(),
                         session_id.to_string(),
@@ -982,14 +1084,17 @@ fn execute_command(
                         assistant_message_id.to_string(),
                         now,
                         limits_json,
+                        input_json,
+                        correlation_json,
                     ],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             transaction
                 .execute(
                     "INSERT INTO messages(
-                        id, session_id, run_id, ordinal, role, state, output, created_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, 'user', 'queued', ?5, ?6)",
+                        id, session_id, run_id, ordinal, role, state, output, created_at_ms,
+                        input_json
+                     ) VALUES (?1, ?2, ?3, ?4, 'user', 'queued', ?5, ?6, ?7)",
                     params![
                         message_id.to_string(),
                         session_id.to_string(),
@@ -997,6 +1102,7 @@ fn execute_command(
                         ordinal,
                         prompt,
                         now,
+                        input_json,
                     ],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1031,7 +1137,7 @@ fn execute_command(
                 SessionEvent::PromptQueued {
                     session: summary,
                     message,
-                    run,
+                    run: Box::new(run),
                     queue_position: next_queued,
                 },
             )?;
@@ -1047,6 +1153,125 @@ fn execute_command(
                 },
                 true,
             )
+        }
+        SessionCommand::SteerRun {
+            run_id,
+            input,
+            interrupt: _,
+        } => {
+            match validate_input(&input) {
+                Ok(()) => {}
+                Err(qq_protocol::InputError::Empty | qq_protocol::InputError::Blank) => {
+                    return Err(SessionRuntimeError::EmptyPrompt);
+                }
+                Err(qq_protocol::InputError::TextTooLarge { .. }) => {
+                    return Err(SessionRuntimeError::PromptTooLarge);
+                }
+                Err(error) => return Err(SessionRuntimeError::InvalidInput(error)),
+            }
+            let (session_id, status, stored_outcome, kind) = transaction
+                .query_row(
+                    "SELECT session_id, status, outcome_json, kind FROM runs WHERE id = ?1",
+                    [run_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .ok_or(SessionRuntimeError::RunNotFound)?;
+            let session_id = parse_id(&session_id)?;
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            if let Some(outcome) = stored_outcome {
+                let outcome =
+                    serde_json::from_str(&outcome).map_err(|_| SessionRuntimeError::Persistence)?;
+                let sequence = workspace_sequence(&transaction, workspace_id)?;
+                (
+                    CommandReceipt {
+                        command_id,
+                        committed_through: EventCursor {
+                            store_id,
+                            workspace_id,
+                            sequence,
+                        },
+                        outcome: CommandOutcome::RunAlreadyFinished { run_id, outcome },
+                    },
+                    false,
+                )
+            } else {
+                // Only an executing prompt run has a boundary to steer at. A
+                // queued run has not started: the client submits a new prompt
+                // or cancels instead. Compaction runs take no user input.
+                if status != "running" || parse_run_kind(&kind)? != RunKind::Prompt {
+                    return Err(SessionRuntimeError::RunNotSteerable);
+                }
+                let pending: u16 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages
+                         WHERE run_id = ?1 AND steering = 1 AND state = 'queued'",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                if pending >= crate::runtime::MAX_PENDING_STEERING {
+                    return Err(SessionRuntimeError::SteeringQueueFull);
+                }
+                let message_id =
+                    MessageId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+                let ordinal: u64 = transaction
+                    .query_row(
+                        "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM messages WHERE session_id = ?1",
+                        [session_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let input_json =
+                    serde_json::to_string(&input).map_err(|_| SessionRuntimeError::Persistence)?;
+                let text = crate::input::render_text(&input).trim().to_owned();
+                transaction
+                    .execute(
+                        "INSERT INTO messages(
+                            id, session_id, run_id, ordinal, role, state, output, created_at_ms,
+                            input_json, steering
+                         ) VALUES (?1, ?2, ?3, ?4, 'user', 'queued', ?5, ?6, ?7, 1)",
+                        params![
+                            message_id.to_string(),
+                            session_id.to_string(),
+                            run_id.to_string(),
+                            ordinal,
+                            text,
+                            now,
+                            input_json,
+                        ],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let message = load_message(&transaction, message_id)?;
+                let event = append_event(
+                    &transaction,
+                    EventContext {
+                        store_id,
+                        workspace_id,
+                        session_id,
+                        run_id: Some(run_id),
+                        caused_by: Some(command_id),
+                        occurred_at_ms: now,
+                    },
+                    SessionEvent::SteeringQueued { run_id, message },
+                )?;
+                (
+                    CommandReceipt {
+                        command_id,
+                        committed_through: event.cursor,
+                        outcome: CommandOutcome::SteeringQueued { run_id, message_id },
+                    },
+                    false,
+                )
+            }
         }
         SessionCommand::CancelRun { run_id } => {
             let (session_id, status, stored_outcome) = transaction
@@ -1444,6 +1669,46 @@ fn execute_command(
                 false,
             )
         }
+        SessionCommand::SetSessionProfile {
+            session_id,
+            profile,
+        } => {
+            let workspace_id = session_workspace(&transaction, session_id)?;
+            transaction
+                .execute(
+                    "UPDATE sessions SET profile = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                    params![
+                        session_id.to_string(),
+                        (!profile.is_default()).then(|| profile.as_str().to_owned()),
+                        now,
+                    ],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let summary = load_session_summary(&transaction, session_id)?;
+            let event = append_event(
+                &transaction,
+                EventContext {
+                    store_id,
+                    workspace_id,
+                    session_id,
+                    run_id: None,
+                    caused_by: Some(command_id),
+                    occurred_at_ms: now,
+                },
+                SessionEvent::SessionUpdated { session: summary },
+            )?;
+            (
+                CommandReceipt {
+                    command_id,
+                    committed_through: event.cursor,
+                    outcome: CommandOutcome::SessionProfileSet {
+                        session_id,
+                        profile,
+                    },
+                },
+                false,
+            )
+        }
         SessionCommand::DeleteSession { session_id } => {
             let workspace_id = session_workspace(&transaction, session_id)?;
             let event = delete_idle_session(
@@ -1700,6 +1965,7 @@ fn execute_command(
         schedule,
         cascade_cancels,
         grant_promotion_pending,
+        replayed: false,
     })
 }
 
@@ -1741,7 +2007,8 @@ fn reserve_next_run_recoverable(
                     r.context_compaction_attempted,
                     (SELECT c.request_json FROM commands c WHERE c.id = r.command_id),
                     s.pending_context_overflow_basis_json,
-                    s.context_tokens, s.context_occupancy_json, r.limits_json
+                    s.context_tokens, s.context_occupancy_json, r.limits_json,
+                    r.input_json, s.profile
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
@@ -1774,6 +2041,8 @@ fn reserve_next_run_recoverable(
                     row.get::<_, Option<u64>>(13)?,
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
                 ))
             },
         )
@@ -1796,11 +2065,15 @@ fn reserve_next_run_recoverable(
         context_tokens,
         context_occupancy_json,
         limits_json,
+        input_json,
+        profile,
     )) = row
     else {
         return Ok(None);
     };
     let limits = parse_run_limits(limits_json.as_deref())?;
+    let input = parse_input_parts(input_json.as_deref())?;
+    let profile = parse_profile(profile.as_deref())?;
     let run_id: RunId = parse_id(&run)?;
     let session_id: SessionId = parse_id(&session)?;
     let command_id: CommandId = parse_id(&command)?;
@@ -1811,8 +2084,8 @@ fn reserve_next_run_recoverable(
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             let literal_slash = matches!(
                 &request,
-                SessionCommand::SubmitPrompt { prompt, .. }
-                    if prompt.trim().starts_with("//")
+                SessionCommand::SubmitPrompt { input, .. }
+                    if crate::input::render_text(input).trim().starts_with("//")
             );
             (true, literal_slash)
         }
@@ -1947,6 +2220,8 @@ fn reserve_next_run_recoverable(
         context_overflow_basis,
         context_occupancy,
         limits,
+        input,
+        profile,
     }))
 }
 
@@ -1971,17 +2246,23 @@ fn start_reserved_run(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let resolved_model = serde_json::to_string(audit.resolved_model.as_ref())
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    let plan_identity = serde_json::to_string(&audit.plan_identity)
+        .map_err(|_| SessionRuntimeError::Persistence)?;
     let context_base_bytes = prepared_context_bytes(audit.weight)?;
     let now = now_ms();
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    // Plan identity and its descriptor are fixed in the same statement that
+    // starts the run: a later configuration or credential refresh compiles a
+    // new plan for later runs and never touches this row.
     let run_started = transaction
         .execute(
             "UPDATE runs
              SET status = 'running', started_at_ms = ?3,
                  prompt_identity_json = ?4, resolved_model_json = ?5,
-                 context_base_bytes = ?6, context_increment_bytes = 0
+                 context_base_bytes = ?6, context_increment_bytes = 0,
+                 plan_identity_json = ?7, plan_descriptor_json = ?8
              WHERE id = ?1 AND session_id = ?2 AND status = 'queued'
                AND outcome_json IS NULL AND cancel_requested = 0",
             params![
@@ -1991,6 +2272,8 @@ fn start_reserved_run(
                 prompt_identity,
                 resolved_model,
                 context_base_bytes,
+                plan_identity,
+                audit.plan_descriptor_json.as_ref(),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2035,6 +2318,7 @@ fn start_reserved_run(
         SessionEvent::RunStarted {
             session: summary,
             run_id: claimed.run_id,
+            plan: Some(Box::new(audit.plan_identity.clone())),
         },
     )?;
     transaction
@@ -2057,6 +2341,8 @@ fn start_auto_compaction(
     let prompt_identity = serde_json::to_string(audit.prompt_identity.as_ref())
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let resolved_model = serde_json::to_string(audit.resolved_model.as_ref())
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let plan_identity = serde_json::to_string(&audit.plan_identity)
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let context_base_bytes = prepared_context_bytes(audit.weight)?;
     let now = now_ms();
@@ -2093,10 +2379,10 @@ fn start_auto_compaction(
                  status, kind, auto_compaction, auto_compaction_for_run_id,
                  prompt_identity_json,
                  resolved_model_json, context_base_bytes, context_increment_bytes,
-                 created_at_ms, started_at_ms
+                 created_at_ms, started_at_ms, plan_identity_json, plan_descriptor_json
              ) VALUES (
                  ?1, ?2, ?3, ?4, ?5, 'running', 'compaction', 1, ?6, ?7,
-                 ?8, ?9, 0, ?10, ?10
+                 ?8, ?9, 0, ?10, ?10, ?11, ?12
              )",
             params![
                 run_id.to_string(),
@@ -2109,6 +2395,8 @@ fn start_auto_compaction(
                 resolved_model,
                 context_base_bytes,
                 now,
+                plan_identity,
+                audit.plan_descriptor_json.as_ref(),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2141,6 +2429,7 @@ fn start_auto_compaction(
         SessionEvent::RunStarted {
             session: summary,
             run_id,
+            plan: Some(Box::new(audit.plan_identity.clone())),
         },
     )?;
     transaction
@@ -2164,6 +2453,8 @@ fn start_auto_compaction(
             context_overflow_basis: None,
             context_occupancy: None,
             limits: RunLimits::default(),
+            input: Vec::new(),
+            profile: original.profile.clone(),
         },
         started,
     )))
@@ -2686,6 +2977,175 @@ fn start_tool_call(
 }
 
 /// Appends replaceable liveness information for an active run. Activity is
+/// Marks queued steering as applied (`complete`) and publishes the boundary
+/// it entered at. The message is now model context for `turn_ordinal` and
+/// every later request of the run.
+fn apply_steering_message(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    message_id: MessageId,
+    turn_ordinal: u16,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let changed = transaction
+        .execute(
+            "UPDATE messages SET state = 'complete', turn_ordinal = ?3
+             WHERE id = ?1 AND run_id = ?2 AND steering = 1 AND state = 'queued'",
+            params![
+                message_id.to_string(),
+                claimed.run_id.to_string(),
+                turn_ordinal
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if changed != 1 {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now_ms(),
+        },
+        SessionEvent::SteeringApplied {
+            run_id: claimed.run_id,
+            message_id,
+            turn_ordinal,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
+}
+
+/// Records that an interrupting steer aborted `turn_ordinal`: every tool call
+/// of the run still open settles as interrupted (the loop already yielded
+/// their finished events, so this is the durable half), then the event.
+fn record_run_interrupted(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    turn_ordinal: u16,
+) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let mut events = Vec::new();
+    let mut statement = transaction
+        .prepare(
+            "SELECT id FROM tool_calls
+             WHERE run_id = ?1 AND state IN ('requested', 'awaiting_approval', 'running')
+             ORDER BY turn_ordinal, call_ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let ids = statement
+        .query_map([claimed.run_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+    for id in ids {
+        let id = parse_id::<ToolCallId>(&id)?;
+        transaction
+            .execute(
+                "UPDATE tool_calls
+                 SET state = 'interrupted', result = ?2, is_error = 1, finished_at_ms = ?3
+                 WHERE id = ?1",
+                params![id.to_string(), INTERRUPTED_TOOL_RESULT, now],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        let tool_call = load_tool_call(&transaction, id)?;
+        events.push(append_event(
+            &transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by: Some(claimed.command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::ToolCallFinished { tool_call },
+        )?);
+    }
+    events.push(append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::RunInterrupted {
+            run_id: claimed.run_id,
+            turn_ordinal,
+        },
+    )?);
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(events)
+}
+
+/// Steering still queued when a run settles never reached the model: the
+/// rows move to `cancelled` and each is published as superseded.
+fn supersede_pending_steering(
+    transaction: &Transaction<'_>,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    now: u64,
+    events: &mut Vec<SessionEventEnvelope>,
+) -> Result<(), SessionRuntimeError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT id FROM messages
+             WHERE run_id = ?1 AND steering = 1 AND state = 'queued' ORDER BY ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let ids = statement
+        .query_map([claimed.run_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+    for id in ids {
+        let message_id = parse_id::<MessageId>(&id)?;
+        transaction
+            .execute(
+                "UPDATE messages SET state = 'cancelled' WHERE id = ?1",
+                [message_id.to_string()],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        events.push(append_event(
+            transaction,
+            EventContext {
+                store_id,
+                workspace_id: claimed.workspace_id,
+                session_id: claimed.session_id,
+                run_id: Some(claimed.run_id),
+                caused_by: Some(claimed.command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::SteeringSuperseded {
+                run_id: claimed.run_id,
+                message_id,
+            },
+        )?);
+    }
+    Ok(())
+}
+
 /// retained in the event log for reconnect/replay, but does not alter model
 /// context or transcript rows.
 fn append_run_activity(
@@ -3484,13 +3944,15 @@ fn complete_run(
     let transaction = connection
         .transaction()
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let mut events = vec![finalize_run(
+    let mut events = Vec::new();
+    supersede_pending_steering(&transaction, store_id, claimed, now_ms(), &mut events)?;
+    events.push(finalize_run(
         &transaction,
         store_id,
         claimed,
         outcome,
         accounting,
-    )?];
+    )?);
     append_parent_session_update(
         &transaction,
         store_id,
@@ -4176,6 +4638,8 @@ fn settle_panicked_execution(
                 context_overflow_basis: None,
                 context_occupancy: None,
                 limits: RunLimits::default(),
+                input: Vec::new(),
+                profile: original.profile.clone(),
             };
             events.push(complete_run_in_transaction(
                 &transaction,
@@ -4530,6 +4994,8 @@ fn recover_interrupted_runs(
             context_overflow_basis: None,
             context_occupancy: None,
             limits: RunLimits::default(),
+            input: Vec::new(),
+            profile: AgentProfileId::default(),
         };
         let event =
             complete_run_in_transaction(&transaction, store_id, &claimed, RunOutcome::Interrupted)?;
@@ -5094,7 +5560,7 @@ fn load_session_summary(
                      (SELECT outcome_json FROM runs
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
                       ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1),
-                     s.owner_run_id, s.spawned_by_tool_call_id
+                     s.owner_run_id, s.spawned_by_tool_call_id, s.profile, s.correlation_json
               FROM sessions s WHERE s.id = ?1",
             [session_id.to_string()],
             |row| {
@@ -5111,6 +5577,8 @@ fn load_session_summary(
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -5131,6 +5599,8 @@ fn load_session_summary(
                 last_outcome,
                 owner_run,
                 spawned_by_call,
+                profile,
+                correlation,
             )| {
                 let direct_cost = accounting.direct.estimated_cost_usd_nanos;
                 let active_run_id: Option<RunId> = active.as_deref().map(parse_id).transpose()?;
@@ -5156,6 +5626,8 @@ fn load_session_summary(
                     activity,
                     queued_prompts: queued,
                     model,
+                    profile: parse_profile(profile.as_deref())?,
+                    correlation: parse_correlation(correlation.as_deref())?,
                     context_tokens,
                     accounting: Some(accounting),
                     estimated_cost_usd_nanos: direct_cost,
@@ -5213,9 +5685,10 @@ fn load_message(
     connection: &Connection,
     message_id: MessageId,
 ) -> Result<MessageSnapshot, SessionRuntimeError> {
-    let (session, run, turn_ordinal, role, state, output, refusal, created) = connection
+    let (session, run, turn_ordinal, role, state, output, refusal, created, steering) = connection
         .query_row(
-            "SELECT session_id, run_id, turn_ordinal, role, state, output, refusal, created_at_ms
+            "SELECT session_id, run_id, turn_ordinal, role, state, output, refusal, created_at_ms,
+                    steering
              FROM messages WHERE id = ?1",
             [message_id.to_string()],
             |row| {
@@ -5228,6 +5701,7 @@ fn load_message(
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, u64>(7)?,
+                    row.get::<_, bool>(8)?,
                 ))
             },
         )
@@ -5240,6 +5714,7 @@ fn load_message(
         turn_ordinal,
         role: parse_message_role(&role)?,
         state: parse_message_state(&state)?,
+        steering,
         output,
         refusal,
         created_at_ms: created,
@@ -5387,7 +5862,7 @@ fn load_model_context_with_rewrite_status(
         .prepare(
             "SELECT id FROM messages
              WHERE session_id = ?1 AND ordinal <= ?2 AND ordinal > ?3
-               AND role = 'user'
+               AND role = 'user' AND steering = 0
                AND state IN ('complete', 'cancelled', 'failed', 'interrupted')
              ORDER BY ordinal",
         )
@@ -5872,7 +6347,32 @@ fn append_run_turns(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     drop(statement);
+    // Applied steering carries the ordinal of the turn whose request first
+    // included it; it is replayed as a user message immediately before that
+    // turn, after the preceding turn's tool results.
+    let mut statement = transaction
+        .prepare(
+            "SELECT turn_ordinal, output FROM messages
+             WHERE run_id = ?1 AND steering = 1 AND state = 'complete'
+             ORDER BY turn_ordinal, ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut steering = statement
+        .query_map([run_id.to_string()], |row| {
+            Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<std::collections::VecDeque<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
     for (turn_ordinal, content_json) in turns {
+        while steering
+            .front()
+            .is_some_and(|(applied_before, _)| *applied_before <= turn_ordinal)
+        {
+            let (_, text) = steering.pop_front().expect("front was just checked");
+            context.push(Message::user(text));
+        }
         let content: Vec<ContentBlock> =
             serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
                 .map_err(|_| SessionRuntimeError::Persistence)?
@@ -5925,6 +6425,12 @@ fn append_run_turns(
         if !results.is_empty() {
             context.push(Message::tool_results(results));
         }
+    }
+    // Steering applied for a turn that never committed (the run settled
+    // first) still reached the model's request; keep it so the transcript
+    // the user saw is the transcript the next run continues from.
+    for (_, text) in steering {
+        context.push(Message::user(text));
     }
     Ok(())
 }
@@ -5998,7 +6504,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
         .query_row(
             "SELECT session_id, status, outcome_json, prompt_identity_json,
                     resolved_model_json, usage_json, context_tokens,
-                    estimated_cost_usd_nanos, limits_json
+                    estimated_cost_usd_nanos, limits_json, plan_identity_json, correlation_json
              FROM runs WHERE id = ?1",
             [run_id.to_string()],
             |row| {
@@ -6012,6 +6518,8 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     row.get::<_, Option<u64>>(6)?,
                     row.get::<_, Option<u64>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -6027,6 +6535,8 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                 context_tokens,
                 cost,
                 limits,
+                plan_identity,
+                correlation,
             )| {
                 Ok(RunSnapshot {
                     id: run_id,
@@ -6049,6 +6559,13 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                         .transpose()
                         .map_err(|_| SessionRuntimeError::Persistence)?
                         .map(Box::new),
+                    plan: plan_identity
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRuntimeError::Persistence)?
+                        .map(Box::new),
+                    correlation: parse_correlation(correlation.as_deref())?,
                     usage: usage
                         .as_deref()
                         .map(serde_json::from_str)
@@ -7281,7 +7798,13 @@ mod tests {
                 )
                 .map(|runtime| runtime.with_context_window(resolved_model.context_window))
                 .map(|runtime| {
-                    loaded_runtime_with_model(runtime, &request.workspace, resolved_model)
+                    LoadedRuntime::compile_blocking_for_profile(
+                        &runtime,
+                        resolved_model,
+                        PathBuf::from(&request.workspace),
+                        request.profile,
+                    )
+                    .expect("test plan compiles")
                 })
                 .map_err(|error| RuntimeLoadError {
                     kind: RunFailureKind::Configuration,
@@ -8037,6 +8560,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: mode,
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -8068,8 +8593,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: prompt.to_owned(),
+                    input: vec![InputPart::text(prompt.to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -8163,6 +8689,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: mode,
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -8181,8 +8709,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "mutate something".to_owned(),
+                    input: vec![InputPart::text("mutate something".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -8240,6 +8769,721 @@ mod tests {
                 },
             )
             .await
+    }
+
+    async fn steer(
+        runtime: &SessionRuntime,
+        run_id: RunId,
+        text: &str,
+        interrupt: bool,
+    ) -> Result<CommandReceipt, SessionRuntimeError> {
+        runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SteerRun {
+                    run_id,
+                    input: vec![InputPart::text(text)],
+                    interrupt,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn steering_is_applied_at_the_next_boundary_and_replays_in_context() {
+        // Two tool turns then a text turn. The approval wait on turn one is
+        // the hold point: steering queued there must enter the request for
+        // turn two, after turn one's tool result.
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "shell",
+            r#"{"command":"true"}"#,
+            2,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let receipt = steer(
+            &harness.runtime,
+            harness.run_id,
+            "also check the tests",
+            false,
+        )
+        .await
+        .unwrap();
+        let CommandOutcome::SteeringQueued { message_id, .. } = receipt.outcome else {
+            panic!("steering must be queued")
+        };
+        // Replaying the exact command returns the same receipt and queues
+        // nothing new.
+        respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveForSession {
+                grant: ApprovalGrant::ShellPrefix {
+                    prefix: "true".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let observed = collect_through_finished_generously(&mut harness.events).await;
+        let queued = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SteeringQueued { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("steering queued event");
+        assert_eq!(queued.id, message_id);
+        assert!(queued.steering);
+        assert_eq!(queued.state, MessageState::Queued);
+        assert_eq!(queued.output, "also check the tests");
+        let applied = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SteeringApplied {
+                    message_id: applied,
+                    turn_ordinal,
+                    ..
+                } if *applied == message_id => Some(*turn_ordinal),
+                _ => None,
+            })
+            .expect("steering applied event");
+        assert_eq!(applied, 2);
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::SteeringSuperseded { .. })),
+        );
+        let finished = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(finished, RunOutcome::Completed);
+
+        // The provider saw the steering as a user message after turn one's
+        // tool result and before turn two's request; turn three carries it too.
+        let requests = harness.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        let second = requests[1].messages();
+        let position = second
+            .iter()
+            .position(|message| {
+                message.role() == Role::User
+                    && message
+                        .content()
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text { text } if text == "also check the tests"))
+            })
+            .expect("steering must be in the second request");
+        assert_eq!(position, second.len() - 1);
+        assert!(matches!(
+            second[position - 1].content().first(),
+            Some(ContentBlock::ToolResult { .. })
+        ));
+        assert!(requests[2].messages().iter().any(|message| {
+            message
+                .content()
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == "also check the tests"))
+        }));
+
+        // Durable context assembly for the next run interleaves it the same
+        // way, and the snapshot shows the row complete.
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest::new(
+                harness.workspace_id,
+                Some(harness.session_id),
+                8,
+                32,
+            ))
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        let row = focused
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        assert!(row.steering);
+        assert_eq!(row.state, MessageState::Complete);
+        assert_eq!(row.turn_ordinal, 2);
+        let store = Store::open(harness._directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let session_id = harness.session_id;
+        let context = store
+            .call(Priority::Control, move |connection| {
+                let transaction = connection.transaction().unwrap();
+                load_model_context(&transaction, session_id, u64::MAX)
+            })
+            .await
+            .unwrap();
+        let steering_index = context
+            .iter()
+            .position(|message| {
+                message.role() == Role::User
+                    && message
+                        .content()
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text { text } if text == "also check the tests"))
+            })
+            .expect("steering replays in durable context");
+        assert!(matches!(
+            context[steering_index - 1].content().first(),
+            Some(ContentBlock::ToolResult { .. })
+        ));
+        assert_eq!(context[steering_index + 1].role(), Role::Assistant);
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupting_steer_withdraws_the_pending_approval_and_continues() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "shell",
+            r#"{"command":"true"}"#,
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        let receipt = steer(
+            &harness.runtime,
+            harness.run_id,
+            "stop, do it differently",
+            true,
+        )
+        .await
+        .unwrap();
+        let CommandOutcome::SteeringQueued { message_id, .. } = receipt.outcome else {
+            panic!("steering must be queued")
+        };
+        let observed = collect_through_finished_generously(&mut harness.events).await;
+        let interrupted = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunInterrupted { turn_ordinal, .. } => Some(*turn_ordinal),
+                _ => None,
+            })
+            .expect("interrupt event");
+        assert_eq!(interrupted, 1);
+        let settled = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::ToolCallFinished { tool_call: call } if call.id == tool_call.id => {
+                    Some(call.clone())
+                }
+                _ => None,
+            })
+            .expect("the pending call settles");
+        assert_eq!(settled.state, ToolCallState::Interrupted);
+        assert!(settled.is_error);
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::SteeringApplied { message_id: applied, turn_ordinal: 2, .. }
+                if *applied == message_id
+        )));
+        let finished = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(finished, RunOutcome::Completed);
+        // Answering the withdrawn approval afterwards is refused: it is no
+        // longer pending.
+        let late = respond_approval(
+            &harness.runtime,
+            harness.run_id,
+            tool_call.id,
+            ApprovalDecision::ApproveOnce,
+        )
+        .await;
+        assert!(
+            matches!(
+                late,
+                Err(SessionRuntimeError::ApprovalNotPending)
+                    | Err(SessionRuntimeError::RunNotFound)
+            ),
+            "{late:?}"
+        );
+        let requests = harness.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        let second = requests[1].messages();
+        // Assistant call, interrupted tool result, then the steering.
+        let last = second.last().unwrap();
+        assert_eq!(last.role(), Role::User);
+        assert!(second[second.len() - 2]
+            .content()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { content, is_error: true, .. } if content == INTERRUPTED_TOOL_RESULT)));
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn steering_bounds_and_refusals_are_typed() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "shell",
+            r#"{"command":"true"}"#,
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (_, tool_call) = collect_until_approval_requested(&mut harness.events).await;
+        for index in 0..crate::runtime::MAX_PENDING_STEERING {
+            steer(
+                &harness.runtime,
+                harness.run_id,
+                &format!("note {index}"),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            steer(&harness.runtime, harness.run_id, "one too many", false).await,
+            Err(SessionRuntimeError::SteeringQueueFull)
+        );
+        assert_eq!(
+            steer(&harness.runtime, harness.run_id, "   ", false).await,
+            Err(SessionRuntimeError::EmptyPrompt)
+        );
+        assert_eq!(
+            steer(&harness.runtime, RunId::from_bytes([9; 16]), "x", false).await,
+            Err(SessionRuntimeError::RunNotFound)
+        );
+        // A queued (not yet running) run cannot be steered.
+        let queued = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    input: vec![InputPart::text("follow-up")],
+                    limits: RunLimits::default(),
+                    correlation: Correlation::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: queued_run, ..
+        } = queued.outcome
+        else {
+            panic!("queued")
+        };
+        assert_eq!(
+            steer(&harness.runtime, queued_run, "too early", false).await,
+            Err(SessionRuntimeError::RunNotSteerable)
+        );
+        // Cancelling the run supersedes everything still queued.
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun {
+                    run_id: harness.run_id,
+                },
+            )
+            .await
+            .unwrap();
+        let _ = tool_call;
+        let observed = collect_through_finished_generously(&mut harness.events).await;
+        let superseded = observed
+            .iter()
+            .filter(|event| matches!(event.event, SessionEvent::SteeringSuperseded { .. }))
+            .count();
+        assert_eq!(
+            superseded,
+            usize::from(crate::runtime::MAX_PENDING_STEERING)
+        );
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { outcome: RunOutcome::Cancelled, run_id, .. } if *run_id == harness.run_id
+        )));
+        // Steering a finished run reports the terminal outcome, idempotently.
+        let done = steer(&harness.runtime, harness.run_id, "late", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            done.outcome,
+            CommandOutcome::RunAlreadyFinished {
+                outcome: RunOutcome::Cancelled,
+                ..
+            }
+        ));
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_identity_correlation_and_profile_persist_and_survive_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("sessions.sqlite3");
+        let initial = test_resolved_model("test/model", "wire-a", 64, None);
+        let configured = Arc::new(StdMutex::new(initial));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let loader = Arc::new(MutableResolvedLoader {
+            resolved_model: Arc::clone(&configured),
+            requests,
+        });
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(database_path.clone()),
+            loader.clone(),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let correlation = Correlation::new(
+            [("thread".to_owned(), "t-42".to_owned())]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        let created = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id,
+                    parent_id: None,
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(64),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::Auto,
+                    profile: AgentProfileId::new("review").unwrap(),
+                    correlation: correlation.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_correlation =
+            Correlation::new([("job".to_owned(), "j-1".to_owned())].into_iter().collect()).unwrap();
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    input: vec![InputPart::text("work")],
+                    limits: RunLimits::default(),
+                    correlation: run_correlation.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        let observed = collect_through_finished(&mut events).await;
+        let started_plan = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunStarted { plan, .. } => plan.clone(),
+                _ => None,
+            })
+            .expect("run started carries plan identity");
+        assert_eq!(started_plan.profile.as_str(), "review");
+        assert_eq!(
+            started_plan.descriptor_version,
+            crate::plan::DESCRIPTOR_VERSION
+        );
+        // The loader received the session's profile.
+        let requests_seen = loader.requests.lock().unwrap().len();
+        assert_eq!(requests_seen, 1);
+
+        let snapshot = runtime
+            .snapshot(SnapshotRequest::new(workspace_id, Some(session_id), 8, 8))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.sessions[0].profile.as_str(), "review");
+        assert_eq!(snapshot.sessions[0].correlation, correlation);
+        let run = snapshot
+            .focused
+            .as_ref()
+            .unwrap()
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .unwrap();
+        assert_eq!(run.plan.as_deref(), Some(&*started_plan));
+        assert_eq!(run.correlation, run_correlation);
+
+        // Refresh the configuration: a later run compiles a new plan with a
+        // new digest, and the earlier run's identity is untouched.
+        configured.lock().unwrap().provider_model = "wire-b".to_owned();
+        let second = submit_prompt_to(&runtime, session_id, "again").await;
+        let observed = collect_through_finished(&mut events).await;
+        let second_plan = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunStarted {
+                    plan, run_id: id, ..
+                } if *id == second => plan.clone(),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(second_plan.digest, started_plan.digest);
+        runtime.shutdown().await.unwrap();
+
+        let reopened = SessionRuntime::open(SessionRuntimeOptions::new(database_path), loader)
+            .await
+            .unwrap();
+        let snapshot = reopened
+            .snapshot(SnapshotRequest::new(workspace_id, Some(session_id), 8, 8))
+            .await
+            .unwrap();
+        let runs = &snapshot.focused.as_ref().unwrap().runs;
+        let first = runs.iter().find(|run| run.id == run_id).unwrap();
+        assert_eq!(first.plan.as_deref(), Some(&*started_plan));
+        let stored_descriptor: String = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap()
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT plan_descriptor_json FROM runs WHERE id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        let descriptor: crate::plan::AgentPlanDescriptor =
+            serde_json::from_str(&stored_descriptor).unwrap();
+        assert_eq!(descriptor.digest().unwrap(), started_plan.digest);
+        assert_eq!(descriptor.model.provider_model, "wire-a");
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_file_parts_attach_at_start_and_stale_hashes_fail_before_provider_work() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.md"), "remember the tests\n").unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let loader = Arc::new(MutableResolvedLoader {
+            resolved_model: Arc::new(StdMutex::new(test_resolved_model(
+                "test/model",
+                "wire-a",
+                64,
+                None,
+            ))),
+            requests: Arc::clone(&requests),
+        });
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            loader,
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let queued = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    input: vec![
+                        InputPart::text("Summarize"),
+                        InputPart::WorkspaceFile {
+                            path: "notes.md".to_owned(),
+                            expected_hash: None,
+                        },
+                    ],
+                    limits: RunLimits::default(),
+                    correlation: Correlation::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = queued.outcome else {
+            panic!("unexpected receipt")
+        };
+        let observed = collect_through_finished(&mut events).await;
+        let queued_message = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::PromptQueued { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // The transcript row carries the placeholder, never file bytes.
+        assert_eq!(queued_message.output, "Summarize\n@notes.md");
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::RunFinished { outcome: RunOutcome::Completed, run_id: id, .. } if *id == run_id
+        )));
+        {
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            let prompt = captured[0].messages().last().unwrap();
+            let text = prompt
+                .content()
+                .iter()
+                .find_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(text.starts_with("Summarize\n\n<attached-file path=\"notes.md\">"));
+            assert!(text.contains("remember the tests"));
+        }
+        // The attachment recorded the file so an edit is not "unread".
+        let files: Vec<(String, String)> = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap()
+            .call(Priority::Control, move |connection| {
+                let mut statement = connection
+                    .prepare("SELECT path, content_hash FROM session_files WHERE session_id = ?1")
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let rows = statement
+                    .query_map([session_id.to_string()], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|_| SessionRuntimeError::Persistence)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            0,
+            "attachment hashes stay in the run's live file state; \
+            they are not durable session rows until a tool records them"
+        );
+
+        // A stale hash fails the run with a typed outcome and no provider call.
+        let stale = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    input: vec![InputPart::WorkspaceFile {
+                        path: "notes.md".to_owned(),
+                        expected_hash: Some(ContentHash::from_bytes([7; 32])),
+                    }],
+                    limits: RunLimits::default(),
+                    correlation: Correlation::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued {
+            run_id: stale_run, ..
+        } = stale.outcome
+        else {
+            panic!("unexpected receipt")
+        };
+        let observed = collect_through_finished(&mut events).await;
+        let outcome = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished {
+                    outcome, run_id, ..
+                } if *run_id == stale_run => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let RunOutcome::Failed { failure } = outcome else {
+            panic!("stale attachment must fail the run: {outcome:?}")
+        };
+        assert_eq!(failure.kind, RunFailureKind::InvalidCommand);
+        assert!(failure.message.contains("changed"), "{}", failure.message);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no provider request for the failed run"
+        );
+
+        // Malformed parts never reach durable admission.
+        let escaped = runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    input: vec![InputPart::WorkspaceFile {
+                        path: "/etc/passwd".to_owned(),
+                        expected_hash: None,
+                    }],
+                    limits: RunLimits::default(),
+                    correlation: Correlation::default(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            escaped,
+            Err(SessionRuntimeError::InvalidInput(
+                qq_protocol::InputError::AbsolutePath { .. }
+            ))
+        ));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_limits_are_validated_against_the_runtime_ceilings() {
+        let (_directory, runtime) = test_runtime().await;
+        let (workspace_id, _) = resolve_workspace(&runtime, _directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        for limits in [
+            RunLimits {
+                max_children: Some(MAX_SPAWNED_CHILDREN_PER_RUN + 1),
+                ..RunLimits::default()
+            },
+            RunLimits {
+                max_concurrent_children: Some(MAX_CONCURRENT_CHILDREN_PER_RUN + 1),
+                ..RunLimits::default()
+            },
+            RunLimits {
+                max_tool_output_bytes: Some(0),
+                ..RunLimits::default()
+            },
+        ] {
+            let result = runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::SubmitPrompt {
+                        session_id,
+                        input: vec![InputPart::text("x")],
+                        limits,
+                        correlation: Correlation::default(),
+                    },
+                )
+                .await;
+            assert_eq!(result, Err(SessionRuntimeError::InvalidRunLimits));
+        }
+        runtime.shutdown().await.unwrap();
     }
 
     async fn test_runtime() -> (TempDir, SessionRuntime) {
@@ -8841,8 +10085,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "known overflow".to_owned(),
+                    input: vec![InputPart::text("known overflow".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -9146,8 +10391,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "first run".to_owned(),
+                    input: vec![InputPart::text("first run".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -9250,8 +10496,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "second run".to_owned(),
+                    input: vec![InputPart::text("second run".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -9335,8 +10582,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "first run".to_owned(),
+                    input: vec![InputPart::text("first run".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -9411,8 +10659,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "do work".to_owned(),
+                    input: vec![InputPart::text("do work".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -9578,8 +10827,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: kept,
-                    prompt: "keep me".to_owned(),
+                    input: vec![InputPart::text("keep me".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -9698,7 +10948,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(
             !connection
@@ -9825,7 +11075,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -9893,7 +11143,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         let (display_json, result) = connection
             .query_row(
@@ -9952,7 +11202,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -10017,7 +11267,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -10105,7 +11355,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -10161,7 +11411,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -10205,7 +11455,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         for column in [
             "model_json",
@@ -10272,7 +11522,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -10346,7 +11596,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         let command_id_not_null: bool = connection
             .query_row(
@@ -10385,7 +11635,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -10455,7 +11705,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -10547,7 +11797,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         let preparing_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -10670,7 +11920,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         let occupancy_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -10776,7 +12026,7 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                "20"
+                "21"
             );
         }
     }
@@ -10897,7 +12147,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         // A historical child keeps its parent run but has no recorded call:
         // the summary says so explicitly instead of inventing one.
@@ -10965,7 +12215,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
         let shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -11047,7 +12297,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "20"
+            "21"
         );
     }
 
@@ -11963,8 +13213,9 @@ mod tests {
             CommandId::from_bytes([9; 16]),
             SessionCommand::SubmitPrompt {
                 session_id,
-                prompt: "continue".to_owned(),
+                input: vec![InputPart::text("continue".to_owned())],
                 limits: qq_protocol::RunLimits::default(),
+                correlation: Correlation::default(),
             },
             &WorkspaceGrantSeed::default(),
         )
@@ -12077,6 +13328,8 @@ mod tests {
             context_overflow_basis: None,
             context_occupancy: None,
             limits: RunLimits::default(),
+            input: Vec::new(),
+            profile: AgentProfileId::default(),
         };
         (
             directory,
@@ -12288,6 +13541,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -12300,8 +13555,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "x".to_owned(),
+                    input: vec![InputPart::text("x".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -12369,8 +13625,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: claimed.session_id,
-                    prompt: "continue".to_owned(),
+                    input: vec![InputPart::text("continue".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -12408,8 +13665,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: claimed.session_id,
-                    prompt: "continue".to_owned(),
+                    input: vec![InputPart::text("continue".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -12858,6 +14116,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -12870,8 +14130,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "x".to_owned(),
+                    input: vec![InputPart::text("x".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -13122,6 +14383,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode,
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -13255,8 +14518,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "do work".to_owned(),
+                    input: vec![InputPart::text("do work".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -13347,8 +14611,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "say hello".to_owned(),
+                    input: vec![InputPart::text("say hello".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -13777,8 +15042,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt,
+                    input: vec![InputPart::text(prompt)],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -14091,8 +15357,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "y".repeat(MAX_PROMPT_BYTES),
+                    input: vec![InputPart::text("y".repeat(MAX_PROMPT_BYTES))],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -14140,8 +15407,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "y".repeat(MAX_PROMPT_BYTES),
+                    input: vec![InputPart::text("y".repeat(MAX_PROMPT_BYTES))],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -14434,8 +15702,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "cancel this".to_owned(),
+                    input: vec![InputPart::text("cancel this".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -15176,8 +16445,9 @@ mod tests {
                     CommandId::generate().unwrap(),
                     SessionCommand::SubmitPrompt {
                         session_id,
-                        prompt: prompt.to_owned(),
+                        input: vec![InputPart::text(prompt.to_owned())],
                         limits: qq_protocol::RunLimits::default(),
+                        correlation: Correlation::default(),
                     },
                 )
                 .await
@@ -15253,8 +16523,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "first prompt".to_owned(),
+                    input: vec![InputPart::text("first prompt".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -15367,8 +16638,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "second prompt".to_owned(),
+                    input: vec![InputPart::text("second prompt".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -15414,8 +16686,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "reason until cancelled".to_owned(),
+                    input: vec![InputPart::text("reason until cancelled".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -15473,8 +16746,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "Say hello".to_owned(),
+                    input: vec![InputPart::text("Say hello".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -15843,8 +17117,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "inspect the note".to_owned(),
+                    input: vec![InputPart::text("inspect the note".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -15923,8 +17198,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "what did you read?".to_owned(),
+                    input: vec![InputPart::text("what did you read?".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16340,6 +17616,8 @@ mod tests {
                             organization: None,
                         },
                         approval_mode: ApprovalMode::default(),
+                        profile: AgentProfileId::default(),
+                        correlation: Correlation::default(),
                     },
                 )
                 .await
@@ -16352,8 +17630,9 @@ mod tests {
                     CommandId::generate().unwrap(),
                     SessionCommand::SubmitPrompt {
                         session_id,
-                        prompt: "inspect the note".to_owned(),
+                        input: vec![InputPart::text("inspect the note".to_owned())],
                         limits: qq_protocol::RunLimits::default(),
+                        correlation: Correlation::default(),
                     },
                 )
                 .await
@@ -16415,8 +17694,9 @@ mod tests {
                     CommandId::generate().unwrap(),
                     SessionCommand::SubmitPrompt {
                         session_id,
-                        prompt: "continue".to_owned(),
+                        input: vec![InputPart::text("continue".to_owned())],
                         limits: qq_protocol::RunLimits::default(),
+                        correlation: Correlation::default(),
                     },
                 )
                 .await
@@ -16490,6 +17770,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16502,8 +17784,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "inspect the tool boundaries".to_owned(),
+                    input: vec![InputPart::text("inspect the tool boundaries".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16633,8 +17916,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue safely".to_owned(),
+                    input: vec![InputPart::text("continue safely".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16668,8 +17952,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue safely".to_owned(),
+                    input: vec![InputPart::text("continue safely".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16794,6 +18079,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16806,8 +18093,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "this prompt never started".to_owned(),
+                    input: vec![InputPart::text("this prompt never started".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16845,8 +18133,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue after cancellation".to_owned(),
+                    input: vec![InputPart::text("continue after cancellation".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16904,6 +18193,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16916,8 +18207,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "begin the task".to_owned(),
+                    input: vec![InputPart::text("begin the task".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -16970,8 +18262,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue from durable work".to_owned(),
+                    input: vec![InputPart::text("continue from durable work".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17029,6 +18322,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17041,8 +18336,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "legacy prompt".to_owned(),
+                    input: vec![InputPart::text("legacy prompt".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17105,8 +18401,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue from the legacy store".to_owned(),
+                    input: vec![InputPart::text("continue from the legacy store".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17164,6 +18461,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17176,8 +18475,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "finish the migration".to_owned(),
+                    input: vec![InputPart::text("finish the migration".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17201,8 +18501,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "grow the context".to_owned(),
+                    input: vec![InputPart::text("grow the context".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17310,8 +18611,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "y".repeat(MAX_PROMPT_BYTES),
+                    input: vec![InputPart::text("y".repeat(MAX_PROMPT_BYTES))],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17359,8 +18661,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "inspect the note".to_owned(),
+                    input: vec![InputPart::text("inspect the note".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17510,6 +18813,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17522,8 +18827,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "read".to_owned(),
+                    input: vec![InputPart::text("read".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17674,6 +18980,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17686,8 +18994,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "read".to_owned(),
+                    input: vec![InputPart::text("read".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17783,8 +19092,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue".to_owned(),
+                    input: vec![InputPart::text("continue".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17832,6 +19142,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17844,8 +19156,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "read".to_owned(),
+                    input: vec![InputPart::text("read".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17901,8 +19214,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "continue".to_owned(),
+                    input: vec![InputPart::text("continue".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -17980,8 +19294,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "fill the context".to_owned(),
+                    input: vec![InputPart::text("fill the context".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18278,8 +19593,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "too late".to_owned(),
+                    input: vec![InputPart::text("too late".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18307,8 +19623,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "converge".to_owned(),
+                    input: vec![InputPart::text("converge".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18362,8 +19679,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "persist me".to_owned(),
+                    input: vec![InputPart::text("persist me".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18440,8 +19758,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "retry the read".to_owned(),
+                    input: vec![InputPart::text("retry the read".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18512,8 +19831,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
-                    prompt: "fail initialization".to_owned(),
+                    input: vec![InputPart::text("fail initialization".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18531,8 +19851,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: second_session,
-                    prompt: "must not load".to_owned(),
+                    input: vec![InputPart::text("must not load".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18659,8 +19980,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
-                    prompt: "wait at start".to_owned(),
+                    input: vec![InputPart::text("wait at start".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18679,8 +20001,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: second_session,
-                    prompt: "fail initialization".to_owned(),
+                    input: vec![InputPart::text("fail initialization".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18800,8 +20123,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: started_session,
-                    prompt: "start but do not poll".to_owned(),
+                    input: vec![InputPart::text("start but do not poll".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18820,8 +20144,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: failing_session,
-                    prompt: "fail settlement".to_owned(),
+                    input: vec![InputPart::text("fail settlement".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -18936,8 +20261,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "poisoned registry".to_owned(),
+                    input: vec![InputPart::text("poisoned registry".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19036,8 +20362,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "recover me".to_owned(),
+                    input: vec![InputPart::text("recover me".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19176,8 +20503,9 @@ mod tests {
                     CommandId::generate().unwrap(),
                     SessionCommand::SubmitPrompt {
                         session_id,
-                        prompt: prompt.to_owned(),
+                        input: vec![InputPart::text(prompt.to_owned())],
                         limits: qq_protocol::RunLimits::default(),
+                        correlation: Correlation::default(),
                     },
                 )
                 .await
@@ -19240,6 +20568,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19252,8 +20582,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "wait".to_owned(),
+                    input: vec![InputPart::text("wait".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19266,8 +20597,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "later".to_owned(),
+                    input: vec![InputPart::text("later".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19430,6 +20762,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19443,8 +20777,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "old".to_owned(),
+                    input: vec![InputPart::text("old".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19466,8 +20801,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "new".to_owned(),
+                    input: vec![InputPart::text("new".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19563,6 +20899,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19575,8 +20913,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "known provider overflow".to_owned(),
+                    input: vec![InputPart::text("known provider overflow".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19723,6 +21062,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19735,8 +21076,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "resume after legacy crash".to_owned(),
+                    input: vec![InputPart::text("resume after legacy crash".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19927,8 +21269,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
-                    prompt: "first".to_owned(),
+                    input: vec![InputPart::text("first".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -19946,8 +21289,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: second_session,
-                    prompt: "second".to_owned(),
+                    input: vec![InputPart::text("second".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -20071,8 +21415,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "block during load".to_owned(),
+                    input: vec![InputPart::text("block during load".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -20221,8 +21566,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "large".to_owned(),
+                    input: vec![InputPart::text("large".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -20334,8 +21680,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: first_session,
-                    prompt: "first-a".to_owned(),
+                    input: vec![InputPart::text("first-a".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -20355,8 +21702,9 @@ mod tests {
                     CommandId::generate().unwrap(),
                     SessionCommand::SubmitPrompt {
                         session_id,
-                        prompt: prompt.to_owned(),
+                        input: vec![InputPart::text(prompt.to_owned())],
                         limits: qq_protocol::RunLimits::default(),
+                        correlation: Correlation::default(),
                     },
                 )
                 .await
@@ -22293,8 +23641,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "now edit it".to_owned(),
+                    input: vec![InputPart::text("now edit it".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -22453,8 +23802,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "mutate again".to_owned(),
+                    input: vec![InputPart::text("mutate again".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -22538,6 +23888,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::Ask,
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -22550,8 +23902,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "mutate".to_owned(),
+                    input: vec![InputPart::text("mutate".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -23142,6 +24495,8 @@ mod tests {
                         organization: None,
                     },
                     approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -23154,8 +24509,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "delegate work".to_owned(),
+                    input: vec![InputPart::text("delegate work".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -23225,8 +24581,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: prompt.to_owned(),
+                    input: vec![InputPart::text(prompt.to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -24532,10 +25889,9 @@ mod tests {
             loop {
                 let event = harness.events.next().await.unwrap().unwrap();
                 let started = match &event.event {
-                    SessionEvent::RunStarted { session, run_id }
-                        if *run_id != parent_run
-                            && session.parent_id == Some(harness.session_id) =>
-                    {
+                    SessionEvent::RunStarted {
+                        session, run_id, ..
+                    } if *run_id != parent_run && session.parent_id == Some(harness.session_id) => {
                         Some((session.clone(), *run_id))
                     }
                     _ => None,
@@ -24754,10 +26110,9 @@ mod tests {
             loop {
                 let event = harness.events.next().await.unwrap().unwrap();
                 let child = match &event.event {
-                    SessionEvent::RunStarted { session, run_id }
-                        if *run_id != parent_run
-                            && session.parent_id == Some(harness.session_id) =>
-                    {
+                    SessionEvent::RunStarted {
+                        session, run_id, ..
+                    } if *run_id != parent_run && session.parent_id == Some(harness.session_id) => {
                         Some((session.id, *run_id))
                     }
                     _ => None,
@@ -24893,13 +26248,18 @@ mod tests {
             context_overflow_basis: None,
             context_occupancy: None,
             limits: RunLimits::default(),
+            input: Vec::new(),
+            profile: AgentProfileId::default(),
         };
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),
             parent,
             ToolCallId::from_bytes([0x5a; 16]),
-            Arc::new(Semaphore::new(1)),
-            Arc::new(AtomicUsize::new(0)),
+            subagents::SpawnBudget {
+                slots: Arc::new(Semaphore::new(1)),
+                spawned: Arc::new(AtomicUsize::new(0)),
+                max_children: usize::from(MAX_SPAWNED_CHILDREN_PER_RUN),
+            },
             "research".to_owned(),
             None,
         ));
@@ -24939,7 +26299,7 @@ mod tests {
         let parent_requests = Arc::new(StdMutex::new(Vec::new()));
         let parent: Arc<dyn Provider> = Arc::new(MultiSpawnProvider {
             requests: Arc::clone(&parent_requests),
-            spawns: MAX_CONCURRENT_CHILDREN_PER_RUN + 1,
+            spawns: usize::from(MAX_CONCURRENT_CHILDREN_PER_RUN) + 1,
             arguments: |index| format!(r#"{{"task":"task {index}","model":"test/child"}}"#),
             turn: StdMutex::new(0),
         });
@@ -24958,13 +26318,16 @@ mod tests {
                 .iter()
                 .filter(|event| matches!(event.event, SessionEvent::SessionCreated { .. }))
                 .count(),
-            MAX_CONCURRENT_CHILDREN_PER_RUN + 1
+            usize::from(MAX_CONCURRENT_CHILDREN_PER_RUN) + 1
         );
-        assert!(peak.load(Ordering::Acquire) <= MAX_CONCURRENT_CHILDREN_PER_RUN);
+        assert!(peak.load(Ordering::Acquire) <= usize::from(MAX_CONCURRENT_CHILDREN_PER_RUN));
         assert!(peak.load(Ordering::Acquire) >= 1);
         let parent_reqs = parent_requests.lock().unwrap();
         let results = parent_reqs[1].messages()[2].content();
-        assert_eq!(results.len(), MAX_CONCURRENT_CHILDREN_PER_RUN + 1);
+        assert_eq!(
+            results.len(),
+            usize::from(MAX_CONCURRENT_CHILDREN_PER_RUN) + 1
+        );
         for block in results {
             assert!(matches!(
                 block,
@@ -24984,7 +26347,7 @@ mod tests {
         let parent_requests = Arc::new(StdMutex::new(Vec::new()));
         let parent: Arc<dyn Provider> = Arc::new(MultiSpawnProvider {
             requests: Arc::clone(&parent_requests),
-            spawns: MAX_SPAWNED_CHILDREN_PER_RUN + 1,
+            spawns: usize::from(MAX_SPAWNED_CHILDREN_PER_RUN) + 1,
             arguments: |index| format!(r#"{{"task":"task {index}","model":"test/child"}}"#),
             turn: StdMutex::new(0),
         });
@@ -25003,11 +26366,11 @@ mod tests {
                 .iter()
                 .filter(|event| matches!(event.event, SessionEvent::SessionCreated { .. }))
                 .count(),
-            MAX_SPAWNED_CHILDREN_PER_RUN
+            usize::from(MAX_SPAWNED_CHILDREN_PER_RUN)
         );
         let parent_reqs = parent_requests.lock().unwrap();
         let results = parent_reqs[1].messages()[2].content();
-        assert_eq!(results.len(), MAX_SPAWNED_CHILDREN_PER_RUN + 1);
+        assert_eq!(results.len(), usize::from(MAX_SPAWNED_CHILDREN_PER_RUN) + 1);
         let errors = results
             .iter()
             .filter(|block| {
@@ -25029,7 +26392,7 @@ mod tests {
             })
             .count();
         assert_eq!(errors, 1);
-        assert_eq!(successes, MAX_SPAWNED_CHILDREN_PER_RUN);
+        assert_eq!(successes, usize::from(MAX_SPAWNED_CHILDREN_PER_RUN));
         drop(parent_reqs);
         assert!(matches!(
             finished_outcome(&observed, run_id),
@@ -25232,8 +26595,9 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "loop".to_owned(),
+                    input: vec![InputPart::text("loop".to_owned())],
                     limits,
+                    correlation: Correlation::default(),
                 },
             )
             .await
@@ -25509,11 +26873,12 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: harness.session_id,
-                    prompt: "loop".to_owned(),
+                    input: vec![InputPart::text("loop")],
                     limits: RunLimits {
                         max_model_turns: Some(0),
                         ..RunLimits::default()
                     },
+                    correlation: Correlation::default(),
                 },
             )
             .await;

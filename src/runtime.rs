@@ -24,16 +24,19 @@ use qq_core::{
     },
 };
 use qq_protocol::{
-    ApprovalGrant, CapabilitySupport, CommandRequest, GenerationCapabilities, ModelCatalogRequest,
-    ModelDescriptor, ModelSelection, PromptCacheCapabilities, ProviderRequestShapeIdentity,
-    ProviderRequestShapeVersion, ResolvedModel, ResolvedModelVersion, RunFailureKind,
-    SnapshotRequest, SubscribeRequest, WorkspaceGrantOutcome,
+    AgentProfileId, AgentProfileSummary, ApprovalGrant, ApprovalMode, CapabilitySupport,
+    CommandRequest, GenerationCapabilities, ModelCatalogRequest, ModelDescriptor, ModelSelection,
+    PromptCacheCapabilities, ProviderRequestShapeIdentity, ProviderRequestShapeVersion,
+    ResolvedModel, ResolvedModelVersion, RunFailureKind, SnapshotRequest, SubscribeRequest,
+    WorkspaceGrantOutcome, WorkspaceId,
 };
 use qq_provider::{
     BedrockAuth as ProviderBedrockAuth, EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe,
     ProviderCompiler, ProviderError, ProviderRecipe, SecretRef,
 };
-use qq_server::{CommandFuture, ModelsFuture, ServerHandler, ServerHandlerError, SnapshotFuture};
+use qq_server::{
+    CommandFuture, ModelsFuture, ProfilesFuture, ServerHandler, ServerHandlerError, SnapshotFuture,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -202,6 +205,52 @@ impl RuntimeFactory {
             }
         }
         self.model_options_with_discovery(snapshot, &discovered)
+    }
+
+    /// The agent profiles a workspace's configuration declares, `default`
+    /// first, each with its effective model and approval mode. Blocking:
+    /// loads configuration.
+    pub fn profiles_for(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<AgentProfileSummary>, RuntimeBuildError> {
+        let snapshot = self.snapshot_for_selection(workspace, &ModelSelection::default())?;
+        let default_route = snapshot.model().as_str().to_owned();
+        let mut profiles = Vec::with_capacity(snapshot.profiles().len() + 1);
+        profiles.push(AgentProfileSummary {
+            id: AgentProfileId::default(),
+            model: Some(default_route.clone()),
+            approval_mode: ApprovalMode::default(),
+        });
+        for (name, profile) in snapshot.profiles() {
+            let id = match AgentProfileId::new(name.clone()) {
+                Ok(id) => id,
+                // The configuration loader validates names with the same rule;
+                // a disagreement is a bug worth surfacing, not skipping.
+                Err(error) => {
+                    return Err(RuntimeBuildError::Config(ConfigError::InvalidProfileName(
+                        format!("{name}: {error}"),
+                    )));
+                }
+            };
+            profiles.push(AgentProfileSummary {
+                id,
+                model: Some(
+                    profile
+                        .model()
+                        .map_or_else(|| default_route.clone(), str::to_owned),
+                ),
+                approval_mode: profile
+                    .approval_mode()
+                    .map_or(ApprovalMode::default(), |mode| match mode {
+                        qq_config::ProfileApprovalMode::ReadOnly => ApprovalMode::ReadOnly,
+                        qq_config::ProfileApprovalMode::Ask => ApprovalMode::Ask,
+                        qq_config::ProfileApprovalMode::Auto => ApprovalMode::Auto,
+                        qq_config::ProfileApprovalMode::Full => ApprovalMode::Full,
+                    }),
+            });
+        }
+        Ok(profiles)
     }
 
     pub fn models_for(
@@ -441,7 +490,20 @@ impl RuntimeFactory {
         &self,
         request: &LoadRequest,
     ) -> Result<Arc<CompiledAgentPlan>, RuntimeBuildError> {
-        self.plan_with_lookup(request).map(|(plan, _)| plan)
+        self.plan_with_lookup(request, &AgentProfileId::default())
+            .map(|(plan, _)| plan)
+    }
+
+    /// [`Self::plan_for`] under a configured agent profile. The request's
+    /// overrides win over the profile, which wins over the top-level
+    /// configuration.
+    pub fn plan_for_profile(
+        &self,
+        request: &LoadRequest,
+        profile: &AgentProfileId,
+    ) -> Result<Arc<CompiledAgentPlan>, RuntimeBuildError> {
+        self.plan_with_lookup(request, profile)
+            .map(|(plan, _)| plan)
     }
 
     /// [`Self::plan_for`] plus how the plan was obtained, for tests and
@@ -449,6 +511,7 @@ impl RuntimeFactory {
     pub fn plan_with_lookup(
         &self,
         request: &LoadRequest,
+        profile: &AgentProfileId,
     ) -> Result<(Arc<CompiledAgentPlan>, PlanLookup), RuntimeBuildError> {
         let workspace = qq_config::canonical_working_directory(request.cwd())?;
         let key = PlanKey {
@@ -458,13 +521,13 @@ impl RuntimeFactory {
                 max_output_tokens: request.overrides().max_output_tokens(),
                 organization: request.overrides().organization().map(str::to_owned),
             },
+            profile: profile.clone(),
             explicit_config_path: request.explicit_path().map(Path::to_owned),
             explicit_config_content: request.explicit_content().map(str::to_owned),
         };
-        let lookup = self
-            .inner
-            .plans
-            .load(key, || self.compile_generation(request, &workspace));
+        let lookup = self.inner.plans.load(key, || {
+            self.compile_generation(request, profile, &workspace)
+        });
         match lookup {
             Ok(result) => Ok(result),
             Err(PlanCacheError::Compile(error)) => Err(error),
@@ -486,6 +549,7 @@ impl RuntimeFactory {
     fn compile_generation(
         &self,
         request: &LoadRequest,
+        profile_id: &AgentProfileId,
         workspace: &Path,
     ) -> Result<CompiledGeneration, RuntimeBuildError> {
         // The credential index is fingerprinted before secrets are read so a
@@ -494,6 +558,34 @@ impl RuntimeFactory {
             SourceFingerprint::capture(self.inner.credentials.paths().index_file());
         let epoch = self.inner.credentials.epoch()?;
         let snapshot = self.load(request)?;
+        // A named profile supplies defaults beneath the request's explicit
+        // overrides. Resolving it needs the merged configuration, so the load
+        // repeats with the profile's values applied where the request left a
+        // gap; the second load probes the same paths, so revalidation is
+        // unchanged.
+        let snapshot = match snapshot.profile(profile_id.as_str()) {
+            None => return Err(RuntimeBuildError::UnknownProfile(profile_id.clone())),
+            Some(profile) if profile == qq_config::AgentProfileConfig::default() => snapshot,
+            Some(profile) => {
+                let mut overrides = request.overrides().clone();
+                if request.overrides().model().is_none()
+                    && let Some(model) = profile.model()
+                {
+                    overrides = overrides.with_model(model.to_owned());
+                }
+                if request.overrides().organization().is_none()
+                    && let Some(organization) = profile.organization()
+                {
+                    overrides = overrides.with_organization(organization.to_owned());
+                }
+                if request.overrides().max_output_tokens().is_none()
+                    && let Some(cap) = profile.max_output_tokens()
+                {
+                    overrides = overrides.with_max_output_tokens(cap);
+                }
+                self.load(&request.clone().with_overrides(overrides))?
+            }
+        };
         let resolved_model = self.resolved_model_for_snapshot(&snapshot)?;
         let provider_id = snapshot.model().provider();
         let provider_config = snapshot
@@ -517,7 +609,8 @@ impl RuntimeFactory {
             AgentProfile::new(provider, descriptor, resolved_model, workspace.to_owned())
                 .with_spawn_model_routes(spawn_model_routes)
                 .with_provenance(provenance)
-                .with_credential_epoch(epoch);
+                .with_credential_epoch(epoch)
+                .with_profile_id(profile_id.clone());
         if let Some(wired) =
             self.inner
                 .mcp
@@ -1007,7 +1100,7 @@ impl RuntimeLoader for RuntimeFactory {
                     overrides = overrides.with_organization(organization);
                 }
                 load = load.with_overrides(overrides);
-                let plan = factory.plan_for(&load)?;
+                let plan = factory.plan_for_profile(&load, &request.profile)?;
                 Ok::<_, RuntimeBuildError>(LoadedRuntime { plan })
             })
             .await;
@@ -1385,6 +1478,26 @@ impl ServerHandler for RuntimeHandler {
         })
     }
 
+    fn profiles(&self, workspace_id: WorkspaceId) -> ProfilesFuture {
+        let runtime = self.durable.clone();
+        let factory = self.factory.clone();
+        Box::pin(async move {
+            let workspace = runtime
+                .workspace_path(workspace_id)
+                .await
+                .map_err(map_session_runtime_error)?;
+            tokio::task::spawn_blocking(move || factory.profiles_for(&workspace))
+                .await
+                .map_err(|_| ServerHandlerError::Internal)?
+                .map_err(|error| match error.failure_kind() {
+                    RunFailureKind::Configuration | RunFailureKind::Policy => {
+                        ServerHandlerError::InvalidRequest(error.to_string())
+                    }
+                    _ => ServerHandlerError::Internal,
+                })
+        })
+    }
+
     fn subscribe(
         &self,
         request: SubscribeRequest,
@@ -1402,6 +1515,9 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> ServerHandlerError {
         | SessionRuntimeError::EmptyPrompt
         | SessionRuntimeError::PromptTooLarge
         | SessionRuntimeError::InvalidRunLimits
+        | SessionRuntimeError::InvalidInput(_)
+        | SessionRuntimeError::RunNotSteerable
+        | SessionRuntimeError::UnknownProfile(_)
         | SessionRuntimeError::NoCompactionToRollBack
         | SessionRuntimeError::WorkspaceNotFound
         | SessionRuntimeError::SessionNotFound
@@ -1421,6 +1537,7 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> ServerHandlerError {
             ServerHandlerError::InvalidRequest(error.to_string())
         }
         SessionRuntimeError::QueueFull
+        | SessionRuntimeError::SteeringQueueFull
         | SessionRuntimeError::WorkspaceLimitReached
         | SessionRuntimeError::SessionLimitReached
         | SessionRuntimeError::CommandLimitReached
@@ -1619,6 +1736,8 @@ pub enum RuntimeBuildError {
     PlanCacheFull,
     #[error("plan cache has been shut down")]
     PlanCacheShutDown,
+    #[error("agent profile {0} is not declared by the workspace configuration")]
+    UnknownProfile(AgentProfileId),
     #[error(transparent)]
     Plan(#[from] PlanCompileError),
     #[error(transparent)]
@@ -1651,7 +1770,9 @@ impl RuntimeBuildError {
                 qq_provider::ProviderErrorKind::Response => RunFailureKind::ProviderResponse,
                 qq_provider::ProviderErrorKind::Protocol => RunFailureKind::ProviderProtocol,
             },
-            Self::Mcp(_) | Self::UnknownModel { .. } => RunFailureKind::Configuration,
+            Self::Mcp(_) | Self::UnknownModel { .. } | Self::UnknownProfile(_) => {
+                RunFailureKind::Configuration
+            }
             Self::UnauthenticatedProvider(_) => RunFailureKind::Authentication,
             Self::Runtime(_)
             | Self::UnknownProvider(_)
@@ -1933,6 +2054,8 @@ mod tests {
                             organization: None,
                         },
                         approval_mode: qq_protocol::ApprovalMode::Ask,
+                        profile: qq_protocol::AgentProfileId::default(),
+                        correlation: qq_protocol::Correlation::default(),
                     },
                 )
                 .await
@@ -1949,8 +2072,11 @@ mod tests {
                 CommandId::generate().unwrap(),
                 SessionCommand::SubmitPrompt {
                     session_id: sessions[0],
-                    prompt: "/review focus on cancellation".to_owned(),
+                    input: vec![qq_protocol::InputPart::text(
+                        "/review focus on cancellation".to_owned(),
+                    )],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: qq_protocol::Correlation::default(),
                 },
             )
             .await
@@ -1979,8 +2105,11 @@ mod tests {
             command_id: CommandId::generate().unwrap(),
             command: SessionCommand::SubmitPrompt {
                 session_id: sessions[1],
-                prompt: "/review focus on cancellation".to_owned(),
+                input: vec![qq_protocol::InputPart::text(
+                    "/review focus on cancellation".to_owned(),
+                )],
                 limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         };
         let response = reqwest::Client::builder()
@@ -3601,16 +3730,22 @@ mod tests {
         let factory = fixture.factory_with_credentials(credentials.clone());
         let request = fixture.request(r#"(version: 1, model: "openai/gpt-5.6")"#);
 
-        let (first, lookup) = factory.plan_with_lookup(&request).unwrap();
+        let (first, lookup) = factory
+            .plan_with_lookup(&request, &AgentProfileId::default())
+            .unwrap();
         assert_eq!(lookup, PlanLookup::Compiled);
-        let (hit, lookup) = factory.plan_with_lookup(&request).unwrap();
+        let (hit, lookup) = factory
+            .plan_with_lookup(&request, &AgentProfileId::default())
+            .unwrap();
         assert_eq!(lookup, PlanLookup::Hit);
         assert!(Arc::ptr_eq(&first, &hit));
 
         credentials
             .set("openai/default", "sk-second-secret", false)
             .unwrap();
-        let (rotated, lookup) = factory.plan_with_lookup(&request).unwrap();
+        let (rotated, lookup) = factory
+            .plan_with_lookup(&request, &AgentProfileId::default())
+            .unwrap();
         assert_eq!(lookup, PlanLookup::Compiled);
         assert!(!Arc::ptr_eq(&first, &rotated));
         assert_eq!(first.digest(), rotated.digest());
@@ -3628,6 +3763,103 @@ mod tests {
             assert!(!debug.contains("sk-first-secret"));
             assert!(!debug.contains("sk-second-secret"));
         }
+    }
+
+    #[test]
+    fn profiles_select_defaults_key_the_plan_cache_and_reject_unknown_names() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let config = fixture.path("work/.qq/config.ron");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            r#"(
+                version: 1,
+                model: "custom/test-model",
+                max_output_tokens: 64,
+                providers: {
+                    "custom": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                        models: {
+                            "test-model": (name: "Test model"),
+                            "big-model": (name: "Big model"),
+                        },
+                    ),
+                },
+                profiles: {
+                    "review": Profile(model: "custom/big-model", approval_mode: read_only),
+                    "tight": Profile(max_output_tokens: 16),
+                },
+            )"#,
+        )
+        .unwrap();
+        let request = LoadRequest::new(fixture.path("work"));
+        factory.inner.config.grant_pending_trust(&request).unwrap();
+
+        let review = AgentProfileId::new("review").unwrap();
+        let (default_plan, lookup) = factory
+            .plan_with_lookup(&request, &AgentProfileId::default())
+            .unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        let (review_plan, lookup) = factory.plan_with_lookup(&request, &review).unwrap();
+        // A different profile is a different cache slot and a different plan.
+        assert_eq!(lookup, PlanLookup::Compiled);
+        assert_ne!(review_plan.digest(), default_plan.digest());
+        assert_eq!(review_plan.resolved_model().provider_model, "big-model");
+        assert_eq!(review_plan.resolved_model().max_output_tokens, 64);
+        assert_eq!(review_plan.identity().profile, review);
+        assert_eq!(
+            factory.plan_with_lookup(&request, &review).unwrap().1,
+            PlanLookup::Hit
+        );
+        assert_eq!(
+            factory
+                .plan_with_lookup(&request, &AgentProfileId::default())
+                .unwrap()
+                .1,
+            PlanLookup::Hit
+        );
+
+        // Profile values sit beneath explicit request overrides.
+        let tight = AgentProfileId::new("tight").unwrap();
+        let tight_plan = factory.plan_for_profile(&request, &tight).unwrap();
+        assert_eq!(tight_plan.resolved_model().max_output_tokens, 16);
+        let overridden = request
+            .clone()
+            .with_overrides(request.overrides().clone().with_max_output_tokens(32));
+        let overridden_plan = factory.plan_for_profile(&overridden, &tight).unwrap();
+        assert_eq!(overridden_plan.resolved_model().max_output_tokens, 32);
+
+        let unknown = AgentProfileId::new("nope").unwrap();
+        let error = factory.plan_for_profile(&request, &unknown).unwrap_err();
+        assert!(matches!(&error, RuntimeBuildError::UnknownProfile(name) if *name == unknown));
+        assert_eq!(error.failure_kind(), RunFailureKind::Configuration);
+
+        // The capability document lists default first with effective values.
+        let profiles = factory
+            .profiles_for(fixture.path("work").to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "review", "tight"]
+        );
+        assert_eq!(profiles[0].model.as_deref(), Some("custom/test-model"));
+        assert_eq!(profiles[0].approval_mode, ApprovalMode::Auto);
+        assert_eq!(profiles[1].model.as_deref(), Some("custom/big-model"));
+        assert_eq!(profiles[1].approval_mode, ApprovalMode::ReadOnly);
+        assert_eq!(profiles[2].model.as_deref(), Some("custom/test-model"));
     }
 
     #[test]
@@ -3666,29 +3898,42 @@ mod tests {
         let request = LoadRequest::new(fixture.path("work"));
         factory.inner.config.grant_pending_trust(&request).unwrap();
 
-        let (first, lookup) = factory.plan_with_lookup(&request).unwrap();
+        let (first, lookup) = factory
+            .plan_with_lookup(&request, &AgentProfileId::default())
+            .unwrap();
         assert_eq!(lookup, PlanLookup::Compiled);
         assert_eq!(first.resolved_model().max_output_tokens, 64);
         assert_eq!(
-            factory.plan_with_lookup(&request).unwrap().1,
+            factory
+                .plan_with_lookup(&request, &AgentProfileId::default())
+                .unwrap()
+                .1,
             PlanLookup::Hit
         );
 
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&config, document(96)).unwrap();
         factory.inner.config.grant_pending_trust(&request).unwrap();
-        let (edited, lookup) = factory.plan_with_lookup(&request).unwrap();
+        let (edited, lookup) = factory
+            .plan_with_lookup(&request, &AgentProfileId::default())
+            .unwrap();
         assert_eq!(lookup, PlanLookup::Compiled);
         assert_eq!(edited.resolved_model().max_output_tokens, 96);
         assert_ne!(first.digest(), edited.digest());
 
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&config, "(version: 1, model: ").unwrap();
-        assert!(factory.plan_with_lookup(&request).is_err());
+        assert!(
+            factory
+                .plan_with_lookup(&request, &AgentProfileId::default())
+                .is_err()
+        );
         // The previous valid generation survives the failed refresh.
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&config, document(96)).unwrap();
-        let (recovered, _) = factory.plan_with_lookup(&request).unwrap();
+        let (recovered, _) = factory
+            .plan_with_lookup(&request, &AgentProfileId::default())
+            .unwrap();
         assert_eq!(recovered.digest(), edited.digest());
     }
 
@@ -3753,7 +3998,7 @@ mod tests {
                 "descriptor leaked {forbidden}"
             );
         }
-        assert!(canonical.starts_with("qq-agent-plan-descriptor-v1\0{"));
+        assert!(canonical.starts_with("qq-agent-plan-descriptor-v2\0{"));
     }
 
     #[test]
@@ -3806,14 +4051,18 @@ mod tests {
             )
             .unwrap();
             let started = std::time::Instant::now();
-            let (_, lookup) = factory.plan_with_lookup(&request).unwrap();
+            let (_, lookup) = factory
+                .plan_with_lookup(&request, &AgentProfileId::default())
+                .unwrap();
             cold_compile.push(started.elapsed());
             assert_eq!(lookup, PlanLookup::Compiled);
         }
         let mut warm = Vec::with_capacity(iterations as usize);
         for _ in 0..iterations {
             let started = std::time::Instant::now();
-            let (_, lookup) = factory.plan_with_lookup(&request).unwrap();
+            let (_, lookup) = factory
+                .plan_with_lookup(&request, &AgentProfileId::default())
+                .unwrap();
             warm.push(started.elapsed());
             assert_eq!(lookup, PlanLookup::Hit);
         }

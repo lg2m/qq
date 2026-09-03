@@ -174,6 +174,9 @@ async fn settle_unstartable_reservation_with_retry(
     if let Ok(mut cancellations) = inner.cancellations.lock() {
         cancellations.remove(&claimed.run_id);
     }
+    if let Ok(mut steering) = inner.steering.lock() {
+        steering.remove(&claimed.run_id);
+    }
     inner.clear_run_approvals(claimed.run_id);
     inner
         .settlements

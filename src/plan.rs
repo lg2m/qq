@@ -15,7 +15,7 @@ use std::{
 };
 
 use qq_core::plan::{CompiledAgentPlan, SourceFingerprint};
-use qq_protocol::{AgentPlanDigest, CredentialEpoch, ModelSelection};
+use qq_protocol::{AgentPlanDigest, AgentProfileId, CredentialEpoch, ModelSelection};
 use thiserror::Error;
 
 /// Hard admission bounds. Active generations count toward `max_bytes` and are
@@ -45,6 +45,7 @@ impl Default for PlanCacheLimits {
 pub struct PlanKey {
     pub workspace: PathBuf,
     pub model: ModelSelection,
+    pub profile: AgentProfileId,
     pub explicit_config_path: Option<PathBuf>,
     pub explicit_config_content: Option<String>,
 }
@@ -327,6 +328,7 @@ mod tests {
                 max_output_tokens: None,
                 organization: None,
             },
+            profile: AgentProfileId::default(),
             explicit_config_path: None,
             explicit_config_content: None,
         }

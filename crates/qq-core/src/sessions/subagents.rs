@@ -10,18 +10,31 @@ pub(super) struct SessionSubagentSpawner {
     /// Bounds this run's children in flight; excess spawn calls in one turn
     /// wait here rather than erroring.
     slots: Arc<Semaphore>,
-    /// Children this run has spawned so far, capped at
-    /// [`MAX_SPAWNED_CHILDREN_PER_RUN`].
+    /// Children this run has spawned so far, capped at `max_children`.
     spawned: Arc<AtomicUsize>,
+    /// The effective total-children bound: the caller's `max_children` when
+    /// imposed (admission already capped it), else the runtime ceiling.
+    max_children: usize,
 }
 
 impl SessionSubagentSpawner {
     pub(super) fn new(inner: Arc<SessionRuntimeInner>, parent: ClaimedRun) -> Self {
+        let concurrent = parent
+            .limits
+            .max_concurrent_children
+            .map_or(usize::from(MAX_CONCURRENT_CHILDREN_PER_RUN), usize::from)
+            .min(usize::from(MAX_CONCURRENT_CHILDREN_PER_RUN));
+        let max_children = parent
+            .limits
+            .max_children
+            .map_or(usize::from(MAX_SPAWNED_CHILDREN_PER_RUN), usize::from)
+            .min(usize::from(MAX_SPAWNED_CHILDREN_PER_RUN));
         Self {
             inner,
             parent,
-            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CHILDREN_PER_RUN)),
+            slots: Arc::new(Semaphore::new(concurrent)),
             spawned: Arc::new(AtomicUsize::new(0)),
+            max_children,
         }
     }
 }
@@ -31,11 +44,20 @@ impl SubagentSpawner for SessionSubagentSpawner {
         let inner = Arc::clone(&self.inner);
         let parent = self.parent.clone();
         let slots = Arc::clone(&self.slots);
-        let spawned = Arc::clone(&self.spawned);
-        Box::pin(async move {
-            spawn_child_run(inner, parent, call_id, slots, spawned, task, model).await
-        })
+        let budget = SpawnBudget {
+            slots,
+            spawned: Arc::clone(&self.spawned),
+            max_children: self.max_children,
+        };
+        Box::pin(async move { spawn_child_run(inner, parent, call_id, budget, task, model).await })
     }
+}
+
+/// The per-run child bookkeeping one spawn call draws from.
+pub(super) struct SpawnBudget {
+    pub(super) slots: Arc<Semaphore>,
+    pub(super) spawned: Arc<AtomicUsize>,
+    pub(super) max_children: usize,
 }
 
 /// A child that never ran spent nothing. Failed children report their real
@@ -62,15 +84,22 @@ pub(super) async fn spawn_child_run(
     inner: Arc<SessionRuntimeInner>,
     parent: ClaimedRun,
     call_id: ToolCallId,
-    slots: Arc<Semaphore>,
-    spawned: Arc<AtomicUsize>,
+    budget: SpawnBudget,
     task: String,
     model: Option<String>,
 ) -> SpawnAgentOutcome {
-    // The budget counts attempts, so a failing spawn also consumes it.
-    if spawned.fetch_add(1, Ordering::AcqRel) >= MAX_SPAWNED_CHILDREN_PER_RUN {
+    let SpawnBudget {
+        slots,
+        spawned,
+        max_children,
+    } = budget;
+    // The budget counts attempts, so a failing spawn also consumes it. A
+    // refused spawn is a tool error the model can act on, never a terminal
+    // outcome: ending the parent because it asked for one child too many
+    // would discard the work it already did.
+    if spawned.fetch_add(1, Ordering::AcqRel) >= max_children {
         return spawn_error(format!(
-            "this run already spawned {MAX_SPAWNED_CHILDREN_PER_RUN} sub-agents; \
+            "this run already spawned {max_children} sub-agents; \
              continue with what they returned"
         ));
     }
@@ -117,6 +146,7 @@ pub(super) async fn spawn_child_run(
         .load(RuntimeLoadRequest {
             workspace: parent.workspace.clone(),
             model: selection.clone(),
+            profile: parent.profile.clone(),
         })
         .await
     {
@@ -146,6 +176,11 @@ pub(super) async fn spawn_child_run(
         max_tool_calls: None,
         max_total_tokens: None,
         max_cost_usd_nanos: parent.limits.max_cost_usd_nanos,
+        max_input_tokens: None,
+        max_output_tokens: None,
+        max_tool_output_bytes: None,
+        max_children: None,
+        max_concurrent_children: None,
     };
     let created = match inner
         .store

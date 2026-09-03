@@ -1,0 +1,282 @@
+//! Structured input resolution.
+//!
+//! Admission validates input parts syntactically (see
+//! [`qq_protocol::validate_input`]); this module turns them into one user
+//! message when the run starts. Text parts are concatenated verbatim.
+//! Workspace file parts are read through the run's workspace capability,
+//! bounded, optionally hash-checked, and rendered as fenced attachments after
+//! the text. Each attached file is recorded in the session's file state so a
+//! later edit satisfies the read-before-write rule without a redundant read.
+
+use std::{io::Read as _, path::Path, sync::Arc};
+
+use qq_protocol::{
+    InputPart, MAX_INPUT_FILE_BYTES, MAX_RESOLVED_INPUT_BYTES, RunFailureKind, validate_input,
+};
+use thiserror::Error;
+
+use crate::workspace::{FileState, Workspace, content_hash};
+
+/// Why input parts could not become a message. Every variant fails the run
+/// before its first provider request as `RunFailureKind::InvalidCommand`.
+#[derive(Debug, Error)]
+pub(crate) enum InputResolutionError {
+    #[error("{0}")]
+    Invalid(#[from] qq_protocol::InputError),
+    #[error("workspace file {path:?}: {message}")]
+    Path { path: String, message: String },
+    #[error("workspace file {path:?} is not a regular file")]
+    NotAFile { path: String },
+    #[error("workspace file {path:?} could not be read: {message}")]
+    Read { path: String, message: String },
+    #[error("workspace file {path:?} exceeds {MAX_INPUT_FILE_BYTES} bytes")]
+    FileTooLarge { path: String },
+    #[error("workspace file {path:?} is not valid UTF-8")]
+    NotUtf8 { path: String },
+    #[error("workspace file {path:?} changed: expected content hash {expected}, found {actual}")]
+    HashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("resolved input exceeds {MAX_RESOLVED_INPUT_BYTES} bytes")]
+    TooLarge,
+}
+
+impl InputResolutionError {
+    pub(crate) const fn failure_kind(&self) -> RunFailureKind {
+        RunFailureKind::InvalidCommand
+    }
+}
+
+/// The text a list of parts renders to without touching the filesystem: text
+/// parts verbatim, file parts as placeholders naming the path. Used for
+/// titles, transcript rows, and history search, where attachment bytes do
+/// not belong.
+pub(crate) fn render_text(parts: &[InputPart]) -> String {
+    let mut text = String::new();
+    for part in parts {
+        match part {
+            InputPart::Text { text: chunk } => text.push_str(chunk),
+            InputPart::WorkspaceFile { path, .. } => {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push('@');
+                text.push_str(path);
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
+/// Reads every file part and renders the provider-visible message text.
+/// Blocking: call from `spawn_blocking` or a dedicated thread.
+pub(crate) fn resolve_blocking(
+    parts: &[InputPart],
+    workspace: &Workspace,
+    file_state: &Arc<FileState>,
+) -> Result<String, InputResolutionError> {
+    validate_input(parts)?;
+    let mut text = String::new();
+    let mut attachments = String::new();
+    for part in parts {
+        match part {
+            InputPart::Text { text: chunk } => text.push_str(chunk),
+            InputPart::WorkspaceFile {
+                path,
+                expected_hash,
+            } => {
+                let contained = match workspace.contained_path(path) {
+                    Ok(contained) => contained,
+                    Err(error) => {
+                        return Err(InputResolutionError::Path {
+                            path: path.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                };
+                if !workspace.root().is_file(&contained) {
+                    return Err(InputResolutionError::NotAFile { path: path.clone() });
+                }
+                let file = match workspace.root().open(&contained) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        return Err(InputResolutionError::Read {
+                            path: path.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                };
+                let mut bytes = Vec::new();
+                let cap = u64::try_from(MAX_INPUT_FILE_BYTES).unwrap_or(u64::MAX);
+                if let Err(error) = file.take(cap + 1).read_to_end(&mut bytes) {
+                    return Err(InputResolutionError::Read {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    });
+                }
+                if bytes.len() > MAX_INPUT_FILE_BYTES {
+                    return Err(InputResolutionError::FileTooLarge { path: path.clone() });
+                }
+                let actual = content_hash(&bytes);
+                if let Some(expected) = expected_hash {
+                    let expected = expected.to_string();
+                    if expected != actual {
+                        return Err(InputResolutionError::HashMismatch {
+                            path: path.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+                }
+                let content = match String::from_utf8(bytes) {
+                    Ok(content) => content,
+                    Err(_) => return Err(InputResolutionError::NotUtf8 { path: path.clone() }),
+                };
+                let recorded = contained.to_string_lossy().into_owned();
+                file_state.record(recorded, actual);
+                render_attachment(&mut attachments, &contained, &content);
+            }
+        }
+    }
+    if !attachments.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&attachments);
+    }
+    if text.len() > MAX_RESOLVED_INPUT_BYTES {
+        return Err(InputResolutionError::TooLarge);
+    }
+    Ok(text)
+}
+
+fn render_attachment(into: &mut String, path: &Path, content: &str) {
+    // A fence longer than any backtick run inside the file (and never shorter
+    // than four) keeps the content unambiguous for the model.
+    let longest_run = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(3) + 1);
+    into.push_str("\n<attached-file path=\"");
+    into.push_str(&path.to_string_lossy());
+    into.push_str("\">\n");
+    into.push_str(&fence);
+    into.push('\n');
+    into.push_str(content);
+    if !content.ends_with('\n') {
+        into.push('\n');
+    }
+    into.push_str(&fence);
+    into.push_str("\n</attached-file>\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace() -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# Notes\n\nuse ``` fences\n").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/data.txt"), b"tail no newline").unwrap();
+        std::fs::write(dir.path().join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        (dir, workspace)
+    }
+
+    #[test]
+    fn text_and_files_render_with_safe_fences_and_record_file_state() {
+        let (_dir, workspace) = workspace();
+        let state = Arc::new(FileState::default());
+        let parts = vec![
+            InputPart::text("Summarize:"),
+            InputPart::WorkspaceFile {
+                path: "notes.md".to_owned(),
+                expected_hash: None,
+            },
+            InputPart::WorkspaceFile {
+                path: "./sub/data.txt".to_owned(),
+                expected_hash: None,
+            },
+        ];
+        let text = resolve_blocking(&parts, &workspace, &state).unwrap();
+        assert!(text.starts_with("Summarize:\n\n<attached-file path=\"notes.md\">\n````\n# Notes"));
+        assert!(text.contains("````\n</attached-file>\n\n<attached-file path=\"sub/data.txt\">\n````\ntail no newline\n````\n</attached-file>\n"));
+        assert_eq!(
+            state.recorded("notes.md").unwrap(),
+            content_hash(b"# Notes\n\nuse ``` fences\n")
+        );
+        assert!(state.recorded("sub/data.txt").is_some());
+        assert_eq!(
+            render_text(&parts),
+            "Summarize:\n@notes.md\n@./sub/data.txt\n"
+        );
+    }
+
+    #[test]
+    fn every_failure_is_typed_and_happens_before_any_provider_work() {
+        let (_dir, workspace) = workspace();
+        let state = Arc::new(FileState::default());
+        let file = |path: &str, hash: Option<[u8; 32]>| InputPart::WorkspaceFile {
+            path: path.to_owned(),
+            expected_hash: hash.map(qq_protocol::ContentHash::from_bytes),
+        };
+        assert!(matches!(
+            resolve_blocking(&[], &workspace, &state),
+            Err(InputResolutionError::Invalid(_))
+        ));
+        assert!(matches!(
+            resolve_blocking(&[file("../etc/passwd", None)], &workspace, &state),
+            Err(InputResolutionError::Path { .. })
+        ));
+        assert!(matches!(
+            resolve_blocking(&[file("sub", None)], &workspace, &state),
+            Err(InputResolutionError::NotAFile { .. })
+        ));
+        assert!(matches!(
+            resolve_blocking(&[file("missing.txt", None)], &workspace, &state),
+            Err(InputResolutionError::Path { .. })
+        ));
+        assert!(matches!(
+            resolve_blocking(&[file("bin.dat", None)], &workspace, &state),
+            Err(InputResolutionError::NotUtf8 { .. })
+        ));
+        let Err(InputResolutionError::HashMismatch {
+            expected, actual, ..
+        }) = resolve_blocking(&[file("notes.md", Some([9; 32]))], &workspace, &state)
+        else {
+            panic!("stale hash must be reported")
+        };
+        assert_eq!(expected, "09".repeat(32));
+        assert_eq!(actual, content_hash(b"# Notes\n\nuse ``` fences\n"));
+        assert!(state.recorded("bin.dat").is_none());
+        let error = InputResolutionError::TooLarge;
+        assert_eq!(error.failure_kind(), RunFailureKind::InvalidCommand);
+    }
+
+    #[test]
+    fn oversized_attachments_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big.txt"),
+            "x".repeat(MAX_INPUT_FILE_BYTES + 1),
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        let state = Arc::new(FileState::default());
+        assert!(matches!(
+            resolve_blocking(
+                &[InputPart::WorkspaceFile {
+                    path: "big.txt".to_owned(),
+                    expected_hash: None,
+                }],
+                &workspace,
+                &state
+            ),
+            Err(InputResolutionError::FileTooLarge { .. })
+        ));
+    }
+}

@@ -8,9 +8,11 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use qq_protocol::{
-    CommandId, CommandReceipt, CommandRequest, EventCursor, LocalServerConnection, MAX_EVENT_BYTES,
-    MAX_REQUEST_BYTES, ModelCatalogRequest, ModelDescriptor, SessionCommand, SessionEventEnvelope,
-    SnapshotRequest, WorkspaceId, WorkspaceSnapshot,
+    AgentProfileId, ApprovalDecision, CapabilitiesRequest, CommandId, CommandReceipt,
+    CommandRequest, Correlation, EventCursor, InputPart, LocalServerConnection, MAX_EVENT_BYTES,
+    MAX_REQUEST_BYTES, ModelCatalogRequest, ModelDescriptor, RunId, RunLimits, ServerCapabilities,
+    SessionCommand, SessionEventEnvelope, SessionId, SnapshotRequest, ToolCallId, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -31,9 +33,14 @@ const MAX_SSE_WIRE_EVENT_BYTES: usize = MAX_EVENT_BYTES + 16 * 1024;
 const MAX_SSE_LINE_BYTES: usize = MAX_SSE_WIRE_EVENT_BYTES;
 const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CAPABILITIES_BYTES: usize = 256 * 1024;
 
 /// Authenticated coordinates discovered from private local metadata.
 pub type Connection = LocalServerConnection;
+
+fn fresh_command_id() -> Result<CommandId, ClientError> {
+    CommandId::generate().map_err(|_| ClientError::Unavailable)
+}
 
 pub type SessionEventStream =
     Pin<Box<dyn Stream<Item = Result<SessionEventEnvelope, ClientError>> + Send + 'static>>;
@@ -64,10 +71,12 @@ impl SessionClient {
             SessionCommand::ResolveWorkspace { .. } => "/v1/workspaces/resolve",
             SessionCommand::CreateSession { .. } => "/v1/sessions",
             SessionCommand::SubmitPrompt { .. } => "/v1/sessions/prompts",
+            SessionCommand::SteerRun { .. } => "/v1/runs/steer",
             SessionCommand::CancelRun { .. } => "/v1/runs/cancel",
             SessionCommand::RespondToolApproval { .. } => "/v1/tools/approvals",
             SessionCommand::SetApprovalMode { .. } => "/v1/sessions/approval-mode",
             SessionCommand::SetSessionModel { .. } => "/v1/sessions/model",
+            SessionCommand::SetSessionProfile { .. } => "/v1/sessions/profile",
             SessionCommand::DeleteSession { .. } => "/v1/sessions/delete",
             SessionCommand::PruneSessions { .. } => "/v1/sessions/prune",
             SessionCommand::CompactSession { .. } => "/v1/sessions/compact",
@@ -80,6 +89,114 @@ impl SessionClient {
                 command,
             },
             MAX_ERROR_BODY_BYTES,
+        )
+        .await
+    }
+
+    /// Queues a new run on `session` from structured input. Every command id
+    /// is fresh; callers that need retry idempotency use [`Self::command`]
+    /// with their own id.
+    pub async fn submit(
+        &self,
+        session_id: SessionId,
+        input: Vec<InputPart>,
+        limits: RunLimits,
+        correlation: Correlation,
+    ) -> Result<CommandReceipt, ClientError> {
+        self.command(
+            fresh_command_id()?,
+            SessionCommand::SubmitPrompt {
+                session_id,
+                input,
+                limits,
+                correlation,
+            },
+        )
+        .await
+    }
+
+    /// Adds input to an executing run at its next model/tool boundary.
+    pub async fn steer(
+        &self,
+        run_id: RunId,
+        input: Vec<InputPart>,
+    ) -> Result<CommandReceipt, ClientError> {
+        self.command(
+            fresh_command_id()?,
+            SessionCommand::SteerRun {
+                run_id,
+                input,
+                interrupt: false,
+            },
+        )
+        .await
+    }
+
+    /// Aborts the run's in-flight provider stream or tool and applies `input`
+    /// at the boundary that creates.
+    pub async fn interrupt(
+        &self,
+        run_id: RunId,
+        input: Vec<InputPart>,
+    ) -> Result<CommandReceipt, ClientError> {
+        self.command(
+            fresh_command_id()?,
+            SessionCommand::SteerRun {
+                run_id,
+                input,
+                interrupt: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn cancel(&self, run_id: RunId) -> Result<CommandReceipt, ClientError> {
+        self.command(fresh_command_id()?, SessionCommand::CancelRun { run_id })
+            .await
+    }
+
+    pub async fn approve(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        decision: ApprovalDecision,
+    ) -> Result<CommandReceipt, ClientError> {
+        self.command(
+            fresh_command_id()?,
+            SessionCommand::RespondToolApproval {
+                run_id,
+                tool_call_id,
+                decision,
+            },
+        )
+        .await
+    }
+
+    pub async fn set_profile(
+        &self,
+        session_id: SessionId,
+        profile: AgentProfileId,
+    ) -> Result<CommandReceipt, ClientError> {
+        self.command(
+            fresh_command_id()?,
+            SessionCommand::SetSessionProfile {
+                session_id,
+                profile,
+            },
+        )
+        .await
+    }
+
+    /// The server's versioned capability document. Pass a workspace to
+    /// include its configured agent profiles.
+    pub async fn capabilities(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<ServerCapabilities, ClientError> {
+        self.post_json(
+            "/v1/capabilities",
+            &CapabilitiesRequest { workspace_id },
+            MAX_CAPABILITIES_BYTES,
         )
         .await
     }

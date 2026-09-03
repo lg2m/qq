@@ -4,8 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 use crate::{
-    CommandId, MessageId, ReasoningKind, RunFailureKind, RunId, SessionId, StoreId, ToolCallId,
-    WorkspaceId,
+    AgentProfileId, CommandId, Correlation, InputPart, MessageId, ReasoningKind, RunFailureKind,
+    RunId, RunPlanIdentity, SessionId, StoreId, ToolCallId, WorkspaceId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,7 +355,7 @@ pub struct EditPreview {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionCommand {
     ResolveWorkspace {
         path: String,
@@ -367,15 +367,39 @@ pub enum SessionCommand {
         model: ModelSelection,
         #[serde(default)]
         approval_mode: ApprovalMode,
+        /// Configured agent profile the session runs under. `default` when
+        /// omitted. Rejected when the workspace configuration does not declare
+        /// the profile.
+        #[serde(default, skip_serializing_if = "AgentProfileId::is_default")]
+        profile: AgentProfileId,
+        #[serde(default, skip_serializing_if = "Correlation::is_empty")]
+        correlation: Correlation,
     },
     SubmitPrompt {
         session_id: SessionId,
-        prompt: String,
+        /// Bounded typed input; see [`crate::validate_input`] for the limits
+        /// the server enforces before durable admission.
+        input: Vec<InputPart>,
         /// Core-owned budgets for the run this prompt creates. Every accepted
         /// limit settles as a typed `RunOutcome::BudgetExhausted`; an absent
         /// or empty value imposes no limit beyond the runtime's own bounds.
         #[serde(default, skip_serializing_if = "RunLimits::is_empty")]
         limits: RunLimits,
+        #[serde(default, skip_serializing_if = "Correlation::is_empty")]
+        correlation: Correlation,
+    },
+    /// Adds user input to a run that is already executing. The input is
+    /// injected as a user message at the next safe model/tool boundary, so a
+    /// provider request already in flight is never rewritten. With
+    /// `interrupt`, the in-flight provider stream or tool is aborted first so
+    /// the boundary arrives now; partial assistant text is kept and unstarted
+    /// tool calls settle as interrupted. Distinct from `SubmitPrompt`, which
+    /// queues a new run, and `CancelRun`, which ends the run.
+    SteerRun {
+        run_id: RunId,
+        input: Vec<InputPart>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        interrupt: bool,
     },
     CancelRun {
         run_id: RunId,
@@ -394,6 +418,13 @@ pub enum SessionCommand {
     SetSessionModel {
         session_id: SessionId,
         model: ModelSelection,
+    },
+    /// Repoints the session's agent profile. Takes effect when the next run
+    /// is claimed. Rejected when the workspace configuration does not declare
+    /// the profile.
+    SetSessionProfile {
+        session_id: SessionId,
+        profile: AgentProfileId,
     },
     /// Deletes an idle session and every row it owns. Refused while the
     /// session has an active run; the client cancels first.
@@ -419,6 +450,66 @@ pub enum SessionCommand {
     RollbackCompaction {
         session_id: SessionId,
     },
+}
+
+impl SessionCommand {
+    #[must_use]
+    pub const fn kind(&self) -> SessionCommandKind {
+        match self {
+            Self::ResolveWorkspace { .. } => SessionCommandKind::ResolveWorkspace,
+            Self::CreateSession { .. } => SessionCommandKind::CreateSession,
+            Self::SubmitPrompt { .. } => SessionCommandKind::SubmitPrompt,
+            Self::SteerRun { .. } => SessionCommandKind::SteerRun,
+            Self::CancelRun { .. } => SessionCommandKind::CancelRun,
+            Self::RespondToolApproval { .. } => SessionCommandKind::RespondToolApproval,
+            Self::SetApprovalMode { .. } => SessionCommandKind::SetApprovalMode,
+            Self::SetSessionModel { .. } => SessionCommandKind::SetSessionModel,
+            Self::SetSessionProfile { .. } => SessionCommandKind::SetSessionProfile,
+            Self::DeleteSession { .. } => SessionCommandKind::DeleteSession,
+            Self::PruneSessions { .. } => SessionCommandKind::PruneSessions,
+            Self::CompactSession { .. } => SessionCommandKind::CompactSession,
+            Self::RollbackCompaction { .. } => SessionCommandKind::RollbackCompaction,
+        }
+    }
+}
+
+/// The tag vocabulary of [`SessionCommand`], advertised by server capabilities
+/// and used by transports to check that a body matches its route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCommandKind {
+    ResolveWorkspace,
+    CreateSession,
+    SubmitPrompt,
+    SteerRun,
+    CancelRun,
+    RespondToolApproval,
+    SetApprovalMode,
+    SetSessionModel,
+    SetSessionProfile,
+    DeleteSession,
+    PruneSessions,
+    CompactSession,
+    RollbackCompaction,
+}
+
+impl SessionCommandKind {
+    /// Every command this protocol revision routes, in declaration order.
+    pub const ALL: [Self; 13] = [
+        Self::ResolveWorkspace,
+        Self::CreateSession,
+        Self::SubmitPrompt,
+        Self::SteerRun,
+        Self::CancelRun,
+        Self::RespondToolApproval,
+        Self::SetApprovalMode,
+        Self::SetSessionModel,
+        Self::SetSessionProfile,
+        Self::DeleteSession,
+        Self::PruneSessions,
+        Self::CompactSession,
+        Self::RollbackCompaction,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,6 +541,12 @@ pub enum CommandOutcome {
         run_id: RunId,
         queue_position: u16,
     },
+    /// The steering input was recorded and will be applied at the run's next
+    /// boundary (or now, when interruption was requested).
+    SteeringQueued {
+        run_id: RunId,
+        message_id: MessageId,
+    },
     CancellationRequested {
         run_id: RunId,
     },
@@ -468,6 +565,10 @@ pub enum CommandOutcome {
     SessionModelSet {
         session_id: SessionId,
         model: ModelSelection,
+    },
+    SessionProfileSet {
+        session_id: SessionId,
+        profile: AgentProfileId,
     },
     SessionDeleted {
         session_id: SessionId,
@@ -534,6 +635,27 @@ pub struct RunLimits {
     /// whose usage the provider omits settles as `cost_unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd_nanos: Option<u64>,
+    /// Fresh input plus cache-read plus cache-write tokens, summed over every
+    /// provider turn of the run and its sub-agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    /// Output tokens summed over every provider turn of the run and its
+    /// sub-agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// Bytes of tool results fed back to the model across the run, after the
+    /// runtime's per-result truncation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_output_bytes: Option<u64>,
+    /// Sub-agents this run may spawn in total. Capped by the runtime's hard
+    /// ceiling; a refused spawn is reported to the model as a tool error, not
+    /// as a terminal outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_children: Option<u16>,
+    /// Sub-agents this run may have executing at once. Capped by the
+    /// runtime's hard ceiling; excess spawns wait for a slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_children: Option<u16>,
 }
 
 impl RunLimits {
@@ -544,6 +666,11 @@ impl RunLimits {
             && self.max_tool_calls.is_none()
             && self.max_total_tokens.is_none()
             && self.max_cost_usd_nanos.is_none()
+            && self.max_input_tokens.is_none()
+            && self.max_output_tokens.is_none()
+            && self.max_tool_output_bytes.is_none()
+            && self.max_children.is_none()
+            && self.max_concurrent_children.is_none()
     }
 }
 
@@ -570,6 +697,28 @@ pub enum BudgetLimitKind {
     /// A cost cap was imposed but a provider turn omitted usage, so spend
     /// could no longer be measured. Never labelled a provider failure.
     CostUnknown,
+    InputTokens,
+    OutputTokens,
+    /// A token cap was imposed but a provider turn omitted usage, so the
+    /// count could no longer be measured. Never labelled a provider failure.
+    TokensUnknown,
+    ToolOutputBytes,
+}
+
+impl BudgetLimitKind {
+    /// Every kind this protocol revision can settle, in declaration order.
+    pub const ALL: [Self; 10] = [
+        Self::Duration,
+        Self::ModelTurns,
+        Self::ToolCalls,
+        Self::TotalTokens,
+        Self::Cost,
+        Self::CostUnknown,
+        Self::InputTokens,
+        Self::OutputTokens,
+        Self::TokensUnknown,
+        Self::ToolOutputBytes,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,6 +839,12 @@ pub struct SessionSummary {
     pub queued_prompts: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Agent profile the session's next run is claimed under. `default` on
+    /// rows written before profiles existed.
+    #[serde(default, skip_serializing_if = "AgentProfileId::is_default")]
+    pub profile: AgentProfileId,
+    #[serde(default, skip_serializing_if = "Correlation::is_empty")]
+    pub correlation: Correlation,
     /// Input-token total of the latest measured prompt turn for this
     /// session. This is session state rather than arbitrary run history:
     /// compaction and model changes clear it until the next prompt turn.
@@ -724,6 +879,13 @@ pub struct RunSnapshot {
     /// historical runs and runs that failed before runtime resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<Box<ResolvedModel>>,
+    /// Profile, plan digest, and credential epoch the run was admitted with.
+    /// Absent while queued, on historical runs, and on runs that failed
+    /// before plan compilation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Box<RunPlanIdentity>>,
+    #[serde(default, skip_serializing_if = "Correlation::is_empty")]
+    pub correlation: Correlation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
     /// Input-token total (fresh input + cache reads + cache writes) of the
@@ -951,6 +1113,11 @@ pub struct MessageSnapshot {
     pub turn_ordinal: u16,
     pub role: MessageRole,
     pub state: MessageState,
+    /// A user message added by `SteerRun` while the run executed, rather than
+    /// the prompt that created the run. `queued` until applied at a boundary,
+    /// then `complete`; `cancelled` when the run finished first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub steering: bool,
     pub output: String,
     pub refusal: String,
     pub created_at_ms: u64,
@@ -1094,12 +1261,42 @@ pub enum SessionEvent {
     PromptQueued {
         session: SessionSummary,
         message: MessageSnapshot,
-        run: RunSnapshot,
+        run: Box<RunSnapshot>,
         queue_position: u16,
     },
     RunStarted {
         session: SessionSummary,
         run_id: RunId,
+        /// Fixed behavioral identity of the run. Absent only on envelopes
+        /// written before plan identity was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<Box<RunPlanIdentity>>,
+    },
+    /// Steering input was durably recorded against an executing run.
+    SteeringQueued {
+        run_id: RunId,
+        message: MessageSnapshot,
+    },
+    /// Queued steering entered model context at the given boundary. The
+    /// message's state moves to `complete`.
+    SteeringApplied {
+        run_id: RunId,
+        message_id: MessageId,
+        /// The model turn whose request first carried the steering.
+        turn_ordinal: u16,
+    },
+    /// The run finished before the steering could be applied. The message's
+    /// state moves to `cancelled`.
+    SteeringSuperseded {
+        run_id: RunId,
+        message_id: MessageId,
+    },
+    /// An interrupting steer aborted the in-flight provider stream or tool
+    /// calls of the given turn. Partial assistant text of that turn stands;
+    /// tool calls that had not finished settle as interrupted.
+    RunInterrupted {
+        run_id: RunId,
+        turn_ordinal: u16,
     },
     /// Replaceable liveness information for an active run. This describes
     /// harness/provider state, not assistant transcript content.
@@ -1665,6 +1862,7 @@ mod tests {
             turn_ordinal: 2,
             role: MessageRole::Assistant,
             state: MessageState::Streaming,
+            steering: false,
             output: "checking".to_owned(),
             refusal: String::new(),
             created_at_ms: 11,
@@ -1817,6 +2015,8 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
+                profile: AgentProfileId::default(),
+                correlation: Correlation::default(),
                 context_tokens: None,
                 accounting: None,
                 estimated_cost_usd_nanos: None,
@@ -1871,6 +2071,8 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model-b".to_owned()),
+                profile: AgentProfileId::default(),
+                correlation: Correlation::default(),
                 context_tokens: Some(12_500),
                 accounting: None,
                 estimated_cost_usd_nanos: None,
@@ -1924,6 +2126,8 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
+                profile: AgentProfileId::default(),
+                correlation: Correlation::default(),
                 context_tokens: None,
                 accounting: None,
                 estimated_cost_usd_nanos: None,
@@ -2144,6 +2348,8 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("test/model".to_owned()),
+                profile: AgentProfileId::default(),
+                correlation: Correlation::default(),
                 context_tokens: Some(16),
                 accounting: None,
                 estimated_cost_usd_nanos: None,
@@ -2213,6 +2419,8 @@ mod tests {
                     cache_write_usage: false,
                 },
             })),
+            plan: None,
+            correlation: Correlation::default(),
             usage: Some(TokenUsage {
                 input_tokens: 30,
                 cache_read_input_tokens: 4,
@@ -2312,8 +2520,10 @@ mod tests {
         // Adding request-shape identity to the nested descriptor breaks older
         // `deny_unknown_fields` clients, so negotiation rejects version 8 peers.
         // Version 12 added optional `spawned_by`/`activity` on summaries and
-        // `include_sessions`/`included` on snapshots.
-        assert_eq!(crate::PROTOCOL_VERSION, 12);
+        // `include_sessions`/`included` on snapshots. Version 13 replaced the
+        // prompt string with input parts and added profiles, plan identity,
+        // steering, correlation, and capabilities.
+        assert_eq!(crate::PROTOCOL_VERSION, 13);
         let mut invalid = serde_json::to_value(&run).unwrap();
         invalid["resolved_model"]["future_control"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());
@@ -2326,7 +2536,7 @@ mod tests {
         let historical = serde_json::json!({
             "type": "submit_prompt",
             "session_id": SessionId::generate().unwrap(),
-            "prompt": "hello",
+            "input": [{"type": "text", "text": "hello"}],
         });
         let SessionCommand::SubmitPrompt { limits, .. } =
             serde_json::from_value::<SessionCommand>(historical).unwrap()
@@ -2336,8 +2546,9 @@ mod tests {
         assert!(limits.is_empty());
         let bare = SessionCommand::SubmitPrompt {
             session_id: SessionId::generate().unwrap(),
-            prompt: "hello".to_owned(),
+            input: vec![InputPart::text("hello")],
             limits: RunLimits::default(),
+            correlation: Correlation::default(),
         };
         assert!(serde_json::to_value(&bare).unwrap().get("limits").is_none());
 
@@ -2347,11 +2558,17 @@ mod tests {
             max_tool_calls: Some(40),
             max_total_tokens: Some(200_000),
             max_cost_usd_nanos: Some(1_500_000_000),
+            max_input_tokens: None,
+            max_output_tokens: Some(8_000),
+            max_tool_output_bytes: None,
+            max_children: Some(2),
+            max_concurrent_children: None,
         };
         let limited = SessionCommand::SubmitPrompt {
             session_id: SessionId::generate().unwrap(),
-            prompt: "hello".to_owned(),
+            input: vec![InputPart::text("hello")],
             limits,
+            correlation: Correlation::default(),
         };
         let encoded = serde_json::to_value(&limited).unwrap();
         assert_eq!(encoded["limits"]["max_model_turns"], 4);
@@ -2379,6 +2596,186 @@ mod tests {
         assert_eq!(
             serde_json::to_value(RunStatus::BudgetExhausted).unwrap(),
             "budget_exhausted"
+        );
+    }
+    #[test]
+    fn steering_profile_and_correlation_wire_shapes_are_stable() {
+        let steer = SessionCommand::SteerRun {
+            run_id: id(4),
+            input: vec![InputPart::text("focus on tests")],
+            interrupt: true,
+        };
+        let encoded = serde_json::to_value(&steer).unwrap();
+        assert_eq!(encoded["type"], "steer_run");
+        assert_eq!(encoded["interrupt"], true);
+        assert_eq!(encoded["input"][0]["type"], "text");
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            steer
+        );
+        let plain = SessionCommand::SteerRun {
+            run_id: id(4),
+            input: vec![InputPart::text("x")],
+            interrupt: false,
+        };
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("interrupt")
+                .is_none()
+        );
+        assert_eq!(steer.kind(), SessionCommandKind::SteerRun);
+        assert_eq!(
+            serde_json::to_value(SessionCommandKind::SetSessionProfile).unwrap(),
+            "set_session_profile"
+        );
+        assert_eq!(SessionCommandKind::ALL.len(), 13);
+
+        let create = SessionCommand::CreateSession {
+            workspace_id: id(2),
+            parent_id: None,
+            model: ModelSelection::default(),
+            approval_mode: ApprovalMode::Ask,
+            profile: AgentProfileId::new("review").unwrap(),
+            correlation: Correlation::new(std::collections::BTreeMap::from([(
+                "thread".to_owned(),
+                "t1".to_owned(),
+            )]))
+            .unwrap(),
+        };
+        let encoded = serde_json::to_value(&create).unwrap();
+        assert_eq!(encoded["profile"], "review");
+        assert_eq!(encoded["correlation"]["thread"], "t1");
+        assert_eq!(
+            serde_json::from_value::<SessionCommand>(encoded).unwrap(),
+            create
+        );
+        let minimal = serde_json::json!({
+            "type": "create_session",
+            "workspace_id": id::<WorkspaceId>(2),
+            "model": {},
+        });
+        let SessionCommand::CreateSession {
+            profile,
+            correlation,
+            ..
+        } = serde_json::from_value::<SessionCommand>(minimal).unwrap()
+        else {
+            panic!("unexpected command")
+        };
+        assert!(profile.is_default());
+        assert!(correlation.is_empty());
+
+        let outcomes = [
+            (
+                CommandOutcome::SteeringQueued {
+                    run_id: id(4),
+                    message_id: id(9),
+                },
+                "steering_queued",
+            ),
+            (
+                CommandOutcome::SessionProfileSet {
+                    session_id: id(3),
+                    profile: AgentProfileId::default(),
+                },
+                "session_profile_set",
+            ),
+        ];
+        for (outcome, tag) in outcomes {
+            let encoded = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(encoded["type"], tag);
+            assert_eq!(
+                serde_json::from_value::<CommandOutcome>(encoded).unwrap(),
+                outcome
+            );
+        }
+
+        let identity = RunPlanIdentity {
+            profile: AgentProfileId::default(),
+            descriptor_version: 2,
+            digest: crate::AgentPlanDigest::from_hash(ContentHash::from_bytes([7; 32])),
+            credential_epoch: crate::CredentialEpoch::new(1),
+        };
+        let events = [
+            (
+                SessionEvent::SteeringApplied {
+                    run_id: id(4),
+                    message_id: id(9),
+                    turn_ordinal: 3,
+                },
+                "steering_applied",
+            ),
+            (
+                SessionEvent::SteeringSuperseded {
+                    run_id: id(4),
+                    message_id: id(9),
+                },
+                "steering_superseded",
+            ),
+            (
+                SessionEvent::RunInterrupted {
+                    run_id: id(4),
+                    turn_ordinal: 3,
+                },
+                "run_interrupted",
+            ),
+        ];
+        for (event, tag) in events {
+            let encoded = serde_json::to_value(&event).unwrap();
+            assert_eq!(encoded["type"], tag);
+            assert_eq!(
+                serde_json::from_value::<SessionEvent>(encoded).unwrap(),
+                event
+            );
+        }
+        // Legacy run_started envelopes carry no plan; new ones carry the
+        // identity verbatim.
+        let legacy = serde_json::json!({
+            "type": "run_started",
+            "session": serde_json::to_value(SessionSummary {
+                activity: None,
+                spawned_by: None,
+                id: id(3),
+                workspace_id: id(2),
+                parent_id: None,
+                title: "s".to_owned(),
+                status: SessionStatus::Running,
+                active_run_id: Some(id(4)),
+                queued_prompts: 0,
+                model: None,
+                profile: AgentProfileId::default(),
+                correlation: Correlation::default(),
+                context_tokens: None,
+                accounting: None,
+                estimated_cost_usd_nanos: None,
+                updated_at_ms: 1,
+                last_outcome: None,
+            }).unwrap(),
+            "run_id": id::<RunId>(4),
+        });
+        let SessionEvent::RunStarted { plan, .. } =
+            serde_json::from_value::<SessionEvent>(legacy).unwrap()
+        else {
+            panic!("unexpected event")
+        };
+        assert!(plan.is_none());
+        let started = serde_json::to_value(SessionEvent::RunStarted {
+            session: serde_json::from_value(serde_json::json!({
+                "id": id::<SessionId>(3), "workspace_id": id::<WorkspaceId>(2),
+                "title": "s", "status": "idle", "queued_prompts": 0, "updated_at_ms": 1
+            }))
+            .unwrap(),
+            run_id: id(4),
+            plan: Some(Box::new(identity.clone())),
+        })
+        .unwrap();
+        assert_eq!(started["plan"]["descriptor_version"], 2);
+        assert_eq!(started["plan"]["credential_epoch"], 1);
+        assert_eq!(BudgetLimitKind::ALL.len(), 10);
+        assert_eq!(
+            serde_json::to_value(BudgetLimitKind::ToolOutputBytes).unwrap(),
+            "tool_output_bytes"
         );
     }
 }

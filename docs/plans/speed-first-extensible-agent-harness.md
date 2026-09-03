@@ -3,7 +3,11 @@
 Status: Phase 0 complete 2026-09-01. Phase 1 complete 2026-09-02 (R4, R5, H1).
 Phase 2 complete 2026-09-02: H2 compiled agent plans, secret-free descriptors,
 credential epochs, and the bounded revalidating plan cache landed and measured.
-Implementation Phases 3–7 and tasks H3–H12 remain proposed.
+Phase 3 complete 2026-09-03 for H3 plus the H4 fixture suite: protocol 13
+(input parts, profiles, plan identity, steering, limits, capabilities,
+correlation), the Rust client path, and conformance fixtures landed and
+measured. The H4 external Python client is deferred to a consumer request.
+Implementation Phases 4–7 and tasks H5–H12 remain proposed.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -944,7 +948,7 @@ authentication, and stronger durability.
 | Terminal | One-shot only | Durable process handles, cursors, leases, monitors, optional PTY |
 | Provider footprint | AWS SDK always linked through provider crate (resolved by H1) | Feature-gate heavy adapter families internally |
 | Embedding | No profile/plan plane (resolved by H2) | `AgentProfile` plus cached `CompiledAgentPlan` |
-| Protocol | Text-only and weak active control | Input parts, profile, plan digest, limits, steering, capabilities |
+| Protocol | Text-only and weak active control (resolved by H3) | Input parts, profile, plan digest, limits, steering, capabilities |
 | Observability | Incomplete end-to-end evidence | Admission, compile, send, TTFT, persist, deliver, tool, replay spans |
 
 ### Reject
@@ -992,8 +996,8 @@ redefine their schemas, migrations, tool contracts, or tests.
 | H0 | Complete: current-runtime speed, size, RSS, replay, and concurrency baseline | None | `xtask`, existing benches |
 | H1 | Cargo feature/dependency profiles, full/minimal baselines, and budget gates | H0 | Root, `qq-provider` |
 | H2 | Complete: immutable live `CompiledAgentPlan`, secret-free descriptor, and bounded cache | H1, R5 | Root, config, core, provider |
-| H3 | Input parts, profiles, plan identity, limits, steering, capabilities, and correlation | H2 | `qq-protocol`, server, client |
-| H4 | Client conformance fixtures and first external SDK | H3 | `qq-client`, external adapter |
+| H3 | Complete: input parts, profiles, plan identity, limits, steering, capabilities, and correlation | H2 | `qq-protocol`, server, client |
+| H4 | Fixtures complete; first external SDK deferred to a real consumer | H3 | `qq-client`, external adapter |
 | H5 | Declarative addon/agent-pack manifest | H2, real consumer | Root, config |
 | H6 | Progressive skill and capability catalog compilation | H2, H5 | Root, core, MCP |
 | H7 | Embedded external-tool host beside MCP | H2, real embedder | Core, MCP, root |
@@ -1380,6 +1384,152 @@ Acceptance:
 
 Implement H3, then H4. H3 may expose plan identity because H2 already supplies
 the secret-free descriptor and digest.
+
+Status: complete 2026-09-03 for H3 and the H4 fixture suite. Receipt follows.
+
+#### H3 Completion Receipt — 2026-09-03
+
+Before H3 the wire contract was text-only: `submit_prompt.prompt` was one
+string, sessions had no profile concept, accepted runs recorded a resolved
+model but not the plan they ran under, the only live-run control was
+cancellation, `RunLimits` covered five families, nothing described a server
+beyond `protocol_version`, every struct rejected unknown fields in both
+directions, and a client could learn what the server supported only by
+trying.
+
+Landed as protocol version 13, schema version 21, descriptor version 2
+(squashed as one commit on `main`):
+
+- `qq-protocol`: `InputPart::{Text, WorkspaceFile}` with pure `validate_input`
+  and its bounds; `Correlation` (bounded opaque map); `AgentProfileId`
+  (validated slug, `default` implicit); `RunPlanIdentity`; `SteerRun`
+  (`interrupt` flag) with `SteeringQueued` and the `steering_queued` /
+  `steering_applied` / `steering_superseded` / `run_interrupted` events;
+  `SetSessionProfile` / `SessionProfileSet`; `RunLimits` gains
+  `max_input_tokens`, `max_output_tokens`, `max_tool_output_bytes`,
+  `max_children`, `max_concurrent_children` and `BudgetLimitKind` gains
+  `InputTokens`, `OutputTokens`, `TokensUnknown`, `ToolOutputBytes`;
+  `SessionSummary.{profile, correlation}`, `RunSnapshot.{plan, correlation}`,
+  `MessageSnapshot.steering`, `RunStarted.plan`; `ServerCapabilities`
+  (`CAPABILITIES_VERSION = 1`) and `CapabilitiesRequest`; `SessionCommandKind`
+  and `InputPartKind` vocabularies; `ServerInfo` and the capability document
+  tolerate unknown fields, everything inbound stays strict (`SessionCommand`
+  and `InputPart` now carry `deny_unknown_fields`). `PromptQueued.run` is
+  boxed to keep the event enum small.
+- `qq-core`: schema 21 adds `sessions.{profile, correlation_json}`,
+  `runs.{input_json, correlation_json, plan_identity_json,
+  plan_descriptor_json}`, `messages.{input_json, steering}`. Admission
+  validates parts without I/O; `input::resolve_blocking` reads file parts
+  through the plan's workspace at run start, records them in file state, and
+  fails the run (`invalid_command`) on any violation before provider work.
+  Plan identity and the canonical descriptor are written in the
+  `status = 'running'` statement. Steering: durable row, bounded per-run
+  channel in `SessionRuntimeInner.steering`, boundary injection after tool
+  results or in place of completion, interrupt observed in the provider
+  stream, approval wait, and tool `select!`s, interrupted calls settle with an
+  error result, applied steering persisted with its turn ordinal and replayed
+  in that position by context assembly, pending steering superseded at
+  settlement, replayed commands never re-queue. `BudgetMeter` charges the new
+  families with typed exhaustion; child bounds lower the spawner's ceiling
+  and refuse as tool errors. `RuntimeLoadRequest.profile`;
+  `LoadedRuntime::compile_blocking_for_profile`. `MAX_PENDING_STEERING = 4`,
+  `MAX_CHILD_DEPTH = 1`, and the child ceilings are public for capabilities.
+- `qq-config`: `profiles: { name: Profile(model, organization,
+  max_output_tokens, approval_mode) | Remove }` layered by name like `mcp`,
+  validated at merge (name shape, route on a configured provider, policy cap),
+  `default` undeclarable, `ConfigSnapshot::{profiles, profile}`,
+  `ConfigKey::{Profiles, Profile}`, provenance. No dependency on
+  `qq-protocol`.
+- Root: `RuntimeFactory::plan_for_profile`; `PlanKey.profile`; profile values
+  resolve beneath request overrides inside `compile_generation`; the
+  descriptor records the profile (v2 golden
+  `bc19398a…6267`); `RuntimeBuildError::UnknownProfile` →
+  `configuration`; `RuntimeFactory::profiles_for` and
+  `RuntimeHandler::profiles` for the capability document;
+  `SessionRuntime::workspace_path`.
+- `qq-server`: `POST /v1/capabilities`, `/v1/runs/steer`,
+  `/v1/sessions/profile`; input parts validated at the transport before the
+  handler; `ServerHandler::profiles`.
+- `qq-client`: routes for the new commands; typed `submit`, `steer`,
+  `interrupt`, `cancel`, `approve`, `set_profile`, `capabilities`.
+- TUI, headless, xtask, and Harbor fixtures adapt to the new shapes (the TUI
+  renders steering rows and states but offers no steering composer yet).
+
+Acceptance:
+
+- an external process can create (with profile and correlation), run
+  (structured input, limits), approve, steer, interrupt, cancel, disconnect,
+  reconnect, and resume through the documented routes; the Rust client
+  exposes each as a typed call
+  (`retried_commands_replay_receipts_and_conflicting_reuse_is_rejected`,
+  `steering_is_applied_at_the_next_boundary_and_replays_in_context`,
+  `interrupting_steer_withdraws_the_pending_approval_and_continues`);
+- retries cannot duplicate prompts, approvals, steering, or cancellation: a
+  reused `command_id` replays the stored receipt and a conflicting body is
+  refused, at the route and in the durable journal;
+- clients learn supported input parts, commands, steering, limit kinds,
+  bounds, approval vocabulary, and workspace profiles from
+  `/v1/capabilities`, and read a newer server's `ServerInfo`/capabilities
+  without a decode failure
+  (`capabilities_document_advertises_bounds_commands_and_workspace_profiles`,
+  `inbound_types_reject_unknown_fields_and_response_types_tolerate_them`);
+- malformed or oversized input fails at the transport (`400`) and at durable
+  admission before any row is written; a stale or escaping attachment fails
+  the run before provider work
+  (`malformed_and_oversized_input_fails_before_the_handler`,
+  `workspace_file_parts_attach_at_start_and_stale_hashes_fail_before_provider_work`);
+- accepted runs carry a fixed `RunPlanIdentity` that survives configuration
+  refresh and restart; the persisted descriptor re-digests to it
+  (`plan_identity_correlation_and_profile_persist_and_survive_refresh`);
+- profiles key the plan cache, resolve beneath explicit overrides, and an
+  undeclared profile is a typed configuration failure
+  (`profiles_select_defaults_key_the_plan_cache_and_reject_unknown_names`,
+  `agent_profiles_layer_by_name_validate_routes_and_never_declare_default`);
+- steering bounds and refusals are typed: queue of 4, blank input, unknown or
+  queued or finished runs, superseded on cancel
+  (`steering_bounds_and_refusals_are_typed`);
+- every new limit family settles with its own kind and lost usage under a
+  token bound is `tokens_unknown`
+  (`split_token_and_tool_output_bounds_settle_with_their_own_kinds`);
+- 24 golden wire fixtures under `crates/qq-protocol/tests/fixtures/v13/` are
+  checked byte-for-byte; and
+- no second execution implementation exists: the server, TUI, headless
+  adapter, and `qq ask` all run the same `CompiledAgentPlan::execute`.
+
+Measurements at exact revision `27afe89` (clean detached recorder, 100
+samples, 69 metrics, all 61 budgets green):
+
+| Metric | Phase 2 (`2375928`) | Phase 3 (`27afe89`) |
+| --- | ---: | ---: |
+| Submit start to provider entry p95 | 16.5 ms | 17.0 ms |
+| Durable direct command acknowledgement p95 | 5.8 ms | 5.9 ms |
+| HTTP command acknowledgement p95 | 3.7 ms | 6.2 ms |
+| Eight-stream output service gap p95 | 47.0 ms | 46.0 ms |
+| 1 MiB / 512 KiB scaling ratio | 1.919x | 1.895x |
+| Release binary | 64.02 MB | 65.31 MB |
+| Idle server RSS p95 | 17.89 MB | 18.04 MB |
+| `plan_compile` (embedded profile) | 20.9 µs | 21.5 µs |
+| `plan_descriptor_digest` | 1.78 µs | 1.72 µs |
+| Compiled plan estimated heap | 7.0 KiB | 8.2 KiB |
+| `plan_for` cold / warm | 180 µs / 6.1 µs | 180 µs / 6.2 µs |
+
+The submit path now serializes the input part list into the run and message
+rows and the plan identity plus descriptor JSON into the start statement; the
+p95 moved by 0.5 ms and stays inside its budget. The HTTP acknowledgement
+median is unchanged (3.4 ms); its p95 sits on the same ~6 ms durable-commit
+tail that the direct `command_ack_ns` path shows in both phases (about ten of
+one hundred samples), so the 100-sample p95 lands on either side of that
+cluster from run to run. The budget holds. The binary grew 1.3 MB for the new
+types, routes, and fixtures.
+
+Not in scope, per the phase split: image input parts (the capability document
+advertises the accepted kinds so they are additive), a steering composer in
+the TUI, freezing the MCP catalog into a generation (H6), agent-pack manifests
+(H5), and the external Python reference client, which waits for a real
+consumer so its shape is driven by use rather than guessed.
+
+Phase 3 is complete for the backend contract.
+
 
 Deliverables:
 

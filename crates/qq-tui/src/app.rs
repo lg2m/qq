@@ -2121,6 +2121,8 @@ impl App {
                     parent_id,
                     model,
                     approval_mode: ApprovalMode::default(),
+                    profile: qq_protocol::AgentProfileId::default(),
+                    correlation: qq_protocol::Correlation::default(),
                 },
             })],
         )
@@ -2189,8 +2191,9 @@ impl App {
                 command_id,
                 command: SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt,
+                    input: vec![qq_protocol::InputPart::text(prompt)],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: qq_protocol::Correlation::default(),
                 },
             })],
         )
@@ -2852,6 +2855,8 @@ mod tests {
                 active_run_id: None,
                 queued_prompts: 0,
                 model: Some("openai/gpt-test".to_owned()),
+                profile: qq_protocol::AgentProfileId::default(),
+                correlation: qq_protocol::Correlation::default(),
                 context_tokens: None,
                 accounting: None,
                 estimated_cost_usd_nanos: Some(0),
@@ -2870,6 +2875,8 @@ mod tests {
                     active_run_id: None,
                     queued_prompts: 0,
                     model: Some("openai/gpt-test".to_owned()),
+                    profile: qq_protocol::AgentProfileId::default(),
+                    correlation: qq_protocol::Correlation::default(),
                     context_tokens: None,
                     accounting: None,
                     estimated_cost_usd_nanos: Some(0),
@@ -3318,15 +3325,19 @@ mod tests {
             command:
                 SessionCommand::SubmitPrompt {
                     session_id: _,
-                    prompt,
+                    input,
                     limits: _,
+                    correlation: _,
                 },
             ..
         }) = &requests[0]
         else {
             panic!("runtime slash invocation must use the ordinary prompt command")
         };
-        assert_eq!(prompt, "/frobnicate the context");
+        assert_eq!(
+            input.as_slice(),
+            &[qq_protocol::InputPart::text("/frobnicate the context")]
+        );
         assert!(app.composer.text.is_empty());
         assert_eq!(app.status, None);
     }
@@ -3466,6 +3477,8 @@ mod tests {
             active_run_id: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            profile: qq_protocol::AgentProfileId::default(),
+            correlation: qq_protocol::Correlation::default(),
             context_tokens: None,
             accounting: None,
             estimated_cost_usd_nanos: Some(0),
@@ -3603,6 +3616,8 @@ mod tests {
             active_run_id: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            profile: qq_protocol::AgentProfileId::default(),
+            correlation: qq_protocol::Correlation::default(),
             context_tokens: None,
             accounting: None,
             estimated_cost_usd_nanos: Some(0),
@@ -3761,6 +3776,8 @@ mod tests {
             outcome: Some(RunOutcome::Completed),
             prompt_identity: None,
             resolved_model: None,
+            plan: None,
+            correlation: qq_protocol::Correlation::default(),
             usage: Some(TokenUsage {
                 input_tokens: 10_000,
                 cache_read_input_tokens: 2_000,
@@ -3869,22 +3886,25 @@ mod tests {
                     turn_ordinal: 0,
                     role: MessageRole::User,
                     state: MessageState::Queued,
+                    steering: false,
                     output: "question".to_owned(),
                     refusal: String::new(),
                     created_at_ms: 2,
                 },
-                run: RunSnapshot {
+                run: Box::new(RunSnapshot {
                     id: run_id,
                     session_id,
                     status: RunStatus::Queued,
                     outcome: None,
                     prompt_identity: None,
                     resolved_model: None,
+                    plan: None,
+                    correlation: qq_protocol::Correlation::default(),
                     usage: None,
                     context_tokens: None,
                     estimated_cost_usd_nanos: None,
                     limits: None,
-                },
+                }),
                 queue_position: 1,
             },
         ));
@@ -3898,6 +3918,7 @@ mod tests {
             SessionEvent::RunStarted {
                 session: summary,
                 run_id,
+                plan: None,
             },
         ));
         app.apply_live_event(envelope(
@@ -3910,6 +3931,7 @@ mod tests {
                     turn_ordinal: 1,
                     role: MessageRole::Assistant,
                     state: MessageState::Streaming,
+                    steering: false,
                     output: "a".to_owned(),
                     refusal: String::new(),
                     created_at_ms: 4,
@@ -3952,6 +3974,8 @@ mod tests {
             outcome: Some(RunOutcome::Completed),
             prompt_identity: None,
             resolved_model: None,
+            plan: None,
+            correlation: qq_protocol::Correlation::default(),
             usage: Some(TokenUsage {
                 input_tokens: 40_000,
                 cache_read_input_tokens: 12_000,
@@ -4400,6 +4424,7 @@ mod tests {
             turn_ordinal: 1,
             role: MessageRole::Assistant,
             state: MessageState::Streaming,
+            steering: false,
             output: String::new(),
             refusal: String::new(),
             created_at_ms: 2,
@@ -4554,6 +4579,7 @@ mod tests {
                 turn_ordinal: 1,
                 role: MessageRole::Assistant,
                 state: MessageState::Streaming,
+                steering: false,
                 output: String::new(),
                 refusal: String::new(),
                 created_at_ms: 2,
@@ -4609,6 +4635,8 @@ mod tests {
             active_run_id: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            profile: qq_protocol::AgentProfileId::default(),
+            correlation: qq_protocol::Correlation::default(),
             context_tokens: None,
             accounting: None,
             estimated_cost_usd_nanos: Some(0),
@@ -4638,6 +4666,7 @@ mod tests {
                 turn_ordinal: 0,
                 role: MessageRole::Assistant,
                 state: MessageState::Complete,
+                steering: false,
                 output: index.to_string(),
                 refusal: String::new(),
                 created_at_ms: index as u64,
@@ -4656,6 +4685,7 @@ mod tests {
             turn_ordinal: 0,
             role: MessageRole::Assistant,
             state: MessageState::Complete,
+            steering: false,
             output: "newest".to_owned(),
             refusal: String::new(),
             created_at_ms: u64::MAX,
@@ -4680,6 +4710,7 @@ mod tests {
             turn_ordinal,
             role,
             state,
+            steering: false,
             output: output.to_owned(),
             refusal: String::new(),
             created_at_ms: u64::from(byte),
@@ -4899,6 +4930,8 @@ mod tests {
             activity: None,
             queued_prompts: 0,
             model: Some("openai/gpt-test".to_owned()),
+            profile: qq_protocol::AgentProfileId::default(),
+            correlation: qq_protocol::Correlation::default(),
             context_tokens: None,
             accounting: None,
             estimated_cost_usd_nanos: Some(0),
@@ -4917,6 +4950,7 @@ mod tests {
                 turn_ordinal: 1,
                 role: MessageRole::Assistant,
                 state: MessageState::Complete,
+                steering: false,
                 output: output.to_owned(),
                 refusal: String::new(),
                 created_at_ms: 1,
@@ -5090,6 +5124,7 @@ mod tests {
             turn_ordinal: 1,
             role: MessageRole::Assistant,
             state: MessageState::Streaming,
+            steering: false,
             output: String::new(),
             refusal: String::new(),
             created_at_ms: 1,
@@ -5272,9 +5307,9 @@ mod tests {
         assert!(matches!(
             requests.as_slice(),
             [ClientRequest::Command(CommandRequest {
-                command: SessionCommand::SubmitPrompt { prompt, .. },
+                command: SessionCommand::SubmitPrompt { input, .. },
                 ..
-            })] if prompt == "follow up"
+            })] if input.as_slice() == [qq_protocol::InputPart::text("follow up")]
         ));
         assert!(app.queued_drafts(session_id).next().is_none());
     }

@@ -183,6 +183,33 @@ impl App {
                 }
                 self.upsert_tool_call(tool_call.clone());
             }
+            // Steering rows are user messages of the active run; the TUI
+            // renders them in transcript order and tracks their state. It
+            // does not yet offer a steering composer; that is client work
+            // scheduled after the backend contract.
+            SessionEvent::SteeringQueued { message, .. } => {
+                self.push_message(message.clone());
+            }
+            SessionEvent::SteeringApplied { message_id, .. }
+            | SessionEvent::SteeringSuperseded { message_id, .. } => {
+                let state = match &envelope.event {
+                    SessionEvent::SteeringApplied { .. } => MessageState::Complete,
+                    _ => MessageState::Cancelled,
+                };
+                if let Some(messages) = self
+                    .sessions
+                    .get_mut(&envelope.session_id)
+                    .and_then(|session| session.messages.as_mut())
+                    && let Some(message) = messages
+                        .iter_mut()
+                        .find(|message| message.id == *message_id)
+                {
+                    message.state = state;
+                }
+            }
+            // The interrupted turn's tool calls arrive as ordinary finished
+            // events; nothing else changes on screen.
+            SessionEvent::RunInterrupted { .. } => {}
             // The follow-through of an approve-for-workspace decision. A
             // failure is informational: the session grant already stands.
             SessionEvent::WorkspaceGrantPromoted { outcome, .. } => {

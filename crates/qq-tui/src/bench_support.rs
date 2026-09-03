@@ -92,6 +92,7 @@ impl BenchHarness {
                     SessionStatus::Running,
                 ),
                 run_id,
+                plan: None,
             },
         );
         self.apply(
@@ -268,6 +269,8 @@ fn summary(workspace_id: WorkspaceId, id: SessionId, status: SessionStatus) -> S
         active_run_id: None,
         queued_prompts: 0,
         model: Some("openai/gpt-test".to_owned()),
+        profile: qq_protocol::AgentProfileId::default(),
+        correlation: qq_protocol::Correlation::default(),
         context_tokens: None,
         accounting: None,
         estimated_cost_usd_nanos: Some(0),
@@ -287,6 +290,7 @@ fn assistant_message(session_id: SessionId, index: u8, output: &str) -> MessageS
         turn_ordinal: 1,
         role: MessageRole::Assistant,
         state: MessageState::Streaming,
+        steering: false,
         output: output.to_owned(),
         refusal: String::new(),
         created_at_ms: u64::from(index),

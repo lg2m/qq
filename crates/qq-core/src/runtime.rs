@@ -4,6 +4,7 @@ mod gate;
 mod history;
 mod prompt;
 mod retry;
+mod steering;
 mod subagent;
 
 pub(crate) use budget::{BUDGET_FINAL_RESPONSE_NOTICE, BudgetDecision, BudgetMeter};
@@ -19,6 +20,8 @@ pub(crate) use history::{
 pub(crate) use prompt::{AGENT_PROMPT_VERSION, agent_system_prompt, tool_schema_measurement};
 pub use retry::TurnRetryPolicy;
 pub(crate) use retry::{attempts_message, is_transient_provider_failure};
+pub use steering::MAX_PENDING_STEERING;
+pub(crate) use steering::{SteeringMessage, SteeringReceiver, SteeringSender, steering_channel};
 pub(crate) use subagent::{
     SPAWN_UNAVAILABLE_RESULT, SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner,
 };

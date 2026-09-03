@@ -158,8 +158,9 @@ async fn submit_prompt(runtime: &SessionRuntime, session_id: qq_protocol::Sessio
         runtime,
         SessionCommand::SubmitPrompt {
             session_id,
-            prompt: "ping the server".to_owned(),
+            input: vec![qq_protocol::InputPart::text("ping the server".to_owned())],
             limits: qq_protocol::RunLimits::default(),
+            correlation: qq_protocol::Correlation::default(),
         },
     )
     .await;
@@ -231,6 +232,8 @@ async fn ask_mode_gates_mcp_calls_and_an_exact_name_grant_auto_approves() {
                     organization: None,
                 },
                 approval_mode: ApprovalMode::Ask,
+                profile: qq_protocol::AgentProfileId::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await

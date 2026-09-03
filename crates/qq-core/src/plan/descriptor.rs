@@ -1,6 +1,6 @@
 //! The secret-free, canonically encoded account of a compiled plan.
 
-use qq_protocol::{AgentPlanDigest, ContentHash, PromptVersion, ResolvedModel};
+use qq_protocol::{AgentPlanDigest, AgentProfileId, ContentHash, PromptVersion, ResolvedModel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -10,10 +10,10 @@ use crate::TurnRetryPolicy;
 /// Version of the descriptor's canonical encoding. Bump it whenever a field is
 /// added, removed, renamed, or its normalization changes, so historical digests
 /// are never compared against a different encoding.
-pub const DESCRIPTOR_VERSION: u16 = 1;
+pub const DESCRIPTOR_VERSION: u16 = 2;
 
 /// Domain separator prepended to the canonical bytes before hashing.
-const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v1\0";
+const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v2\0";
 
 /// Where a credential comes from, without its value. Two plans that read the
 /// same environment variable or stored credential name share a reference and
@@ -149,6 +149,8 @@ impl From<TurnRetryPolicy> for RetryPolicyDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct AgentPlanDescriptor {
     pub version: u16,
+    /// The configured agent profile the plan realizes.
+    pub profile: AgentProfileId,
     /// Provider adapter build identity (crate version and compiled families).
     pub adapter_build: String,
     pub provider: ProviderDescriptor,

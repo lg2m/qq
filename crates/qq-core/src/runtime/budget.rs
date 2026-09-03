@@ -23,6 +23,12 @@ pub(crate) struct BudgetMeter {
     /// Total input plus output tokens across every turn, `None` once a turn
     /// omitted usage while a token or cost bound was imposed.
     tokens: Option<u64>,
+    /// Fresh plus cached input tokens across every turn; `None` like `tokens`.
+    input_tokens: Option<u64>,
+    /// Output tokens across every turn; `None` like `tokens`.
+    output_tokens: Option<u64>,
+    /// Bytes of tool results fed back to the model after truncation.
+    tool_output_bytes: u64,
     /// Estimated spend, `None` once unmeasurable under a cost bound.
     cost_usd_nanos: Option<u64>,
     /// The limit that spent the work budget once the reserved final response
@@ -51,6 +57,9 @@ impl BudgetMeter {
             turns: 0,
             tool_calls: 0,
             tokens: Some(0),
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            tool_output_bytes: 0,
             cost_usd_nanos: Some(0),
             final_response_requested: None,
         }
@@ -69,13 +78,19 @@ impl BudgetMeter {
         self.turns = self.turns.saturating_add(1);
         match usage {
             Some(usage) => {
+                let input = usage
+                    .input_tokens
+                    .saturating_add(usage.cache_read_input_tokens)
+                    .saturating_add(usage.cache_write_input_tokens);
                 self.tokens = self.tokens.map(|total| {
                     total
-                        .saturating_add(usage.input_tokens)
-                        .saturating_add(usage.cache_read_input_tokens)
-                        .saturating_add(usage.cache_write_input_tokens)
+                        .saturating_add(input)
                         .saturating_add(usage.output_tokens)
                 });
+                self.input_tokens = self.input_tokens.map(|total| total.saturating_add(input));
+                self.output_tokens = self
+                    .output_tokens
+                    .map(|total| total.saturating_add(usage.output_tokens));
                 self.cost_usd_nanos = self.cost_usd_nanos.and_then(|total| {
                     let pricing = self.pricing.as_ref()?;
                     let cost = crate::sessions::run_cost(usage, pricing)?;
@@ -84,9 +99,18 @@ impl BudgetMeter {
             }
             None => {
                 self.tokens = None;
+                self.input_tokens = None;
+                self.output_tokens = None;
                 self.cost_usd_nanos = None;
             }
         }
+    }
+
+    /// Charges the bytes of one turn's tool results as the model will see them.
+    pub(crate) fn charge_tool_output(&mut self, bytes: usize) {
+        self.tool_output_bytes = self
+            .tool_output_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
     pub(crate) fn charge_tool_calls(&mut self, count: usize) {
@@ -119,14 +143,35 @@ impl BudgetMeter {
         {
             return Some(BudgetLimitKind::Cost);
         }
-        if let Some(limit) = limits.max_total_tokens {
-            match self.tokens {
-                Some(tokens) if tokens > limit => return Some(BudgetLimitKind::TotalTokens),
-                // Token accounting lost without a cost bound: fail closed on
-                // the token bound the caller did impose.
-                None => return Some(BudgetLimitKind::TotalTokens),
-                Some(_) => {}
-            }
+        // Token accounting lost under any token bound fails closed with the
+        // explicit "unknown" kind: the caller must not believe a bound held
+        // when the provider stopped reporting usage.
+        let token_bound = limits.max_total_tokens.is_some()
+            || limits.max_input_tokens.is_some()
+            || limits.max_output_tokens.is_some();
+        if token_bound && self.tokens.is_none() {
+            return Some(BudgetLimitKind::TokensUnknown);
+        }
+        if let (Some(limit), Some(tokens)) = (limits.max_total_tokens, self.tokens)
+            && tokens > limit
+        {
+            return Some(BudgetLimitKind::TotalTokens);
+        }
+        if let (Some(limit), Some(tokens)) = (limits.max_input_tokens, self.input_tokens)
+            && tokens > limit
+        {
+            return Some(BudgetLimitKind::InputTokens);
+        }
+        if let (Some(limit), Some(tokens)) = (limits.max_output_tokens, self.output_tokens)
+            && tokens > limit
+        {
+            return Some(BudgetLimitKind::OutputTokens);
+        }
+        if limits
+            .max_tool_output_bytes
+            .is_some_and(|limit| self.tool_output_bytes > limit)
+        {
+            return Some(BudgetLimitKind::ToolOutputBytes);
         }
         if limits
             .max_tool_calls
@@ -185,11 +230,18 @@ impl BudgetMeter {
         // The reserve is one more provider turn. A tripped wall clock or an
         // unmeasurable cost cannot afford it; the countable bounds can.
         let affordable = match kind {
-            BudgetLimitKind::Duration | BudgetLimitKind::CostUnknown => false,
-            BudgetLimitKind::Cost | BudgetLimitKind::TotalTokens => {
-                // Cost and tokens are only observed after a turn; permitting
-                // the final response bounds the overshoot to one tool-free
-                // reply, which the caller accepted by imposing the cap.
+            BudgetLimitKind::Duration
+            | BudgetLimitKind::CostUnknown
+            | BudgetLimitKind::TokensUnknown => false,
+            BudgetLimitKind::Cost
+            | BudgetLimitKind::TotalTokens
+            | BudgetLimitKind::InputTokens
+            | BudgetLimitKind::OutputTokens
+            | BudgetLimitKind::ToolOutputBytes => {
+                // Cost, tokens, and tool bytes are only observed after a turn;
+                // permitting the final response bounds the overshoot to one
+                // tool-free reply, which the caller accepted by imposing the
+                // cap.
                 true
             }
             BudgetLimitKind::ModelTurns | BudgetLimitKind::ToolCalls => true,
@@ -224,15 +276,30 @@ impl BudgetMeter {
                 limits.max_tool_calls.unwrap_or_default(),
                 self.tool_calls
             ),
-            BudgetLimitKind::TotalTokens => match self.tokens {
-                Some(tokens) => format!(
-                    "the run's {tokens} total tokens exceeded its {} token budget",
-                    limits.max_total_tokens.unwrap_or_default()
-                ),
-                None => "the run's token usage became unknown, so its token budget could not \
-                         be enforced"
-                    .to_owned(),
-            },
+            BudgetLimitKind::TotalTokens => format!(
+                "the run's {} total tokens exceeded its {} token budget",
+                self.tokens.unwrap_or_default(),
+                limits.max_total_tokens.unwrap_or_default()
+            ),
+            BudgetLimitKind::InputTokens => format!(
+                "the run's {} input tokens exceeded its {} input token budget",
+                self.input_tokens.unwrap_or_default(),
+                limits.max_input_tokens.unwrap_or_default()
+            ),
+            BudgetLimitKind::OutputTokens => format!(
+                "the run's {} output tokens exceeded its {} output token budget",
+                self.output_tokens.unwrap_or_default(),
+                limits.max_output_tokens.unwrap_or_default()
+            ),
+            BudgetLimitKind::TokensUnknown => {
+                "the run's token usage became unknown, so its token budget could not be enforced"
+                    .to_owned()
+            }
+            BudgetLimitKind::ToolOutputBytes => format!(
+                "the run's {} bytes of tool output exceeded its {} byte budget",
+                self.tool_output_bytes,
+                limits.max_tool_output_bytes.unwrap_or_default()
+            ),
             BudgetLimitKind::Cost => format!(
                 "the run's estimated cost exceeded its budget ({} > {} USD nanos)",
                 self.cost_usd_nanos.unwrap_or_default(),
@@ -400,5 +467,79 @@ mod tests {
         let mut priceless = BudgetMeter::new(limits, None, now);
         priceless.charge_turn(Some(usage(1, 1)));
         assert_eq!(priceless.exceeded(now), None);
+    }
+    #[test]
+    fn split_token_and_tool_output_bounds_settle_with_their_own_kinds() {
+        let now = Instant::now();
+        let mut meter = BudgetMeter::new(
+            RunLimits {
+                max_input_tokens: Some(100),
+                ..RunLimits::default()
+            },
+            None,
+            now,
+        );
+        meter.charge_turn(Some(usage(60, 500)));
+        assert_eq!(meter.exceeded(now), None);
+        meter.charge_turn(Some(usage(60, 0)));
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::InputTokens));
+        assert!(
+            meter
+                .exhaustion(BudgetLimitKind::InputTokens, false, now)
+                .message
+                .contains("120 input tokens")
+        );
+
+        let mut meter = BudgetMeter::new(
+            RunLimits {
+                max_output_tokens: Some(10),
+                ..RunLimits::default()
+            },
+            None,
+            now,
+        );
+        meter.charge_turn(Some(usage(1_000, 11)));
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::OutputTokens));
+        assert_eq!(
+            meter.before_turn(now, 0),
+            BudgetDecision::FinalResponse(BudgetLimitKind::OutputTokens)
+        );
+
+        // Lost usage under any token bound is the explicit unknown kind, which
+        // cannot afford a final response.
+        let mut meter = BudgetMeter::new(
+            RunLimits {
+                max_output_tokens: Some(10),
+                ..RunLimits::default()
+            },
+            None,
+            now,
+        );
+        meter.charge_turn(None);
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::TokensUnknown));
+        let BudgetDecision::Exhausted(exhaustion) = meter.before_turn(now, 0) else {
+            panic!("unknown tokens must settle immediately")
+        };
+        assert_eq!(exhaustion.limit, BudgetLimitKind::TokensUnknown);
+        assert!(!exhaustion.final_response);
+
+        let mut meter = BudgetMeter::new(
+            RunLimits {
+                max_tool_output_bytes: Some(1_000),
+                ..RunLimits::default()
+            },
+            None,
+            now,
+        );
+        meter.charge_tool_output(600);
+        assert_eq!(meter.exceeded(now), None);
+        meter.charge_tool_output(401);
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::ToolOutputBytes));
+        assert!(
+            meter
+                .exhaustion(BudgetLimitKind::ToolOutputBytes, true, now)
+                .message
+                .contains("1001 bytes")
+        );
     }
 }

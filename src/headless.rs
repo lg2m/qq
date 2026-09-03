@@ -472,6 +472,8 @@ async fn submit(
             parent_id: None,
             model: options.model.clone(),
             approval_mode: options.approval.approval_mode(),
+            profile: qq_protocol::AgentProfileId::default(),
+            correlation: qq_protocol::Correlation::default(),
         },
     )
     .await?;
@@ -487,7 +489,7 @@ async fn submit(
         sessions,
         SessionCommand::SubmitPrompt {
             session_id,
-            prompt: options.prompt.clone(),
+            input: vec![qq_protocol::InputPart::text(options.prompt.clone())],
             limits: RunLimits {
                 max_duration_ms: options
                     .timeout
@@ -496,7 +498,13 @@ async fn submit(
                 max_tool_calls: None,
                 max_total_tokens: None,
                 max_cost_usd_nanos: options.max_cost_usd_nanos,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_tool_output_bytes: None,
+                max_children: None,
+                max_concurrent_children: None,
             },
+            correlation: qq_protocol::Correlation::default(),
         },
     )
     .await?;
@@ -776,7 +784,11 @@ fn settle(outcome: &RunOutcome, interrupted: bool) -> (HeadlessStatus, Option<St
                 | BudgetLimitKind::ToolCalls
                 | BudgetLimitKind::TotalTokens
                 | BudgetLimitKind::Cost
-                | BudgetLimitKind::CostUnknown => HeadlessStatus::BudgetExhausted,
+                | BudgetLimitKind::CostUnknown
+                | BudgetLimitKind::InputTokens
+                | BudgetLimitKind::OutputTokens
+                | BudgetLimitKind::TokensUnknown
+                | BudgetLimitKind::ToolOutputBytes => HeadlessStatus::BudgetExhausted,
             };
             (status, Some(exhaustion.message.clone()))
         }

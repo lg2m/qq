@@ -2206,6 +2206,8 @@ impl RuntimeFixture {
                 parent_id: None,
                 model: benchmark_model(),
                 approval_mode,
+                profile: qq_protocol::AgentProfileId::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await?;
@@ -2884,8 +2886,9 @@ async fn direct_pipeline_workloads(
             generate_id("submit-prompt command")?,
             SessionCommand::SubmitPrompt {
                 session_id,
-                prompt: "respond with deterministic text".to_owned(),
+                input: vec![qq_protocol::InputPart::text("respond with deterministic text".to_owned())],
                 limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await?;
@@ -2992,8 +2995,11 @@ async fn replay_workload(
         generate_id("replay prompt command")?,
         SessionCommand::SubmitPrompt {
             session_id,
-            prompt: "create replay fixture".to_owned(),
+            input: vec![qq_protocol::InputPart::text(
+                "create replay fixture".to_owned(),
+            )],
             limits: qq_protocol::RunLimits::default(),
+            correlation: qq_protocol::Correlation::default(),
         },
     )
     .await?;
@@ -3132,6 +3138,8 @@ async fn http_pipeline_workloads(
                 parent_id: None,
                 model: benchmark_model(),
                 approval_mode: ApprovalMode::ReadOnly,
+                profile: qq_protocol::AgentProfileId::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await?;
@@ -3154,8 +3162,9 @@ async fn http_pipeline_workloads(
             generate_id("HTTP submit-prompt command")?,
             SessionCommand::SubmitPrompt {
                 session_id,
-                prompt: "respond over HTTP".to_owned(),
+                input: vec![qq_protocol::InputPart::text("respond over HTTP".to_owned())],
                 limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await?;
@@ -3235,6 +3244,8 @@ async fn http_reconnect_workload(
             parent_id: None,
             model: benchmark_model(),
             approval_mode: ApprovalMode::ReadOnly,
+            profile: qq_protocol::AgentProfileId::default(),
+            correlation: qq_protocol::Correlation::default(),
         },
     )
     .await?;
@@ -3251,8 +3262,11 @@ async fn http_reconnect_workload(
         generate_id("HTTP reconnect prompt command")?,
         SessionCommand::SubmitPrompt {
             session_id,
-            prompt: "create HTTP replay fixture".to_owned(),
+            input: vec![qq_protocol::InputPart::text(
+                "create HTTP replay fixture".to_owned(),
+            )],
             limits: qq_protocol::RunLimits::default(),
+            correlation: qq_protocol::Correlation::default(),
         },
     )
     .await?;
@@ -3460,8 +3474,11 @@ async fn measure_tool(
                 generate_id("tool prompt command")?,
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "use the requested tool once".to_owned(),
+                    input: vec![qq_protocol::InputPart::text(
+                        "use the requested tool once".to_owned(),
+                    )],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: qq_protocol::Correlation::default(),
                 },
             )
             .await?;
@@ -3500,8 +3517,9 @@ async fn cancellation_workloads(
                 generate_id("hanging prompt command")?,
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: "wait until cancelled".to_owned(),
+                    input: vec![qq_protocol::InputPart::text("wait until cancelled".to_owned())],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: qq_protocol::Correlation::default(),
                 },
             )
             .await?;
@@ -3612,8 +3630,11 @@ async fn measure_long_stream(bytes: usize, samples: u16) -> Result<(Vec<u64>, bo
                 generate_id("long-stream prompt command")?,
                 SessionCommand::SubmitPrompt {
                     session_id,
-                    prompt: format!("emit exactly {bytes} benchmark bytes"),
+                    input: vec![qq_protocol::InputPart::text(format!(
+                        "emit exactly {bytes} benchmark bytes"
+                    ))],
                     limits: qq_protocol::RunLimits::default(),
+                    correlation: qq_protocol::Correlation::default(),
                 },
             )
             .await?;
@@ -3820,8 +3841,11 @@ async fn r4_reasoning_sample() -> Result<R4WorkerSample, PerfError> {
             generate_id("R4 reasoning command")?,
             SessionCommand::SubmitPrompt {
                 session_id,
-                prompt: "emit the reasoning fixture".to_owned(),
+                input: vec![qq_protocol::InputPart::text(
+                    "emit the reasoning fixture".to_owned(),
+                )],
                 limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await?;
@@ -3890,8 +3914,11 @@ async fn r4_shell_sample() -> Result<R4WorkerSample, PerfError> {
             generate_id("R4 shell command")?,
             SessionCommand::SubmitPrompt {
                 session_id,
-                prompt: "stream the long shell fixture".to_owned(),
+                input: vec![qq_protocol::InputPart::text(
+                    "stream the long shell fixture".to_owned(),
+                )],
                 limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
             },
         )
         .await?;
@@ -4014,8 +4041,11 @@ async fn r4_eight_stream_sample() -> Result<R4WorkerSample, PerfError> {
                     generate_id("R4 concurrent stream command")?,
                     SessionCommand::SubmitPrompt {
                         session_id,
-                        prompt: "emit the paced stream fixture".to_owned(),
+                        input: vec![qq_protocol::InputPart::text(
+                            "emit the paced stream fixture".to_owned(),
+                        )],
                         limits: qq_protocol::RunLimits::default(),
+                        correlation: qq_protocol::Correlation::default(),
                     },
                 )
                 .await?;
@@ -4187,8 +4217,11 @@ async fn r4_restart_sample() -> Result<R4WorkerSample, PerfError> {
         generate_id("R4 restart command")?,
         SessionCommand::SubmitPrompt {
             session_id,
-            prompt: "emit the restart fixture".to_owned(),
+            input: vec![qq_protocol::InputPart::text(
+                "emit the restart fixture".to_owned(),
+            )],
             limits: qq_protocol::RunLimits::default(),
+            correlation: qq_protocol::Correlation::default(),
         },
     )
     .await?;
@@ -4712,8 +4745,11 @@ async fn measure_load_profile(
                         generate_id("load prompt command")?,
                         SessionCommand::SubmitPrompt {
                             session_id,
-                            prompt: "complete the load fixture".to_owned(),
+                            input: vec![qq_protocol::InputPart::text(
+                                "complete the load fixture".to_owned(),
+                            )],
                             limits: qq_protocol::RunLimits::default(),
+                            correlation: qq_protocol::Correlation::default(),
                         },
                     )
                     .await?;

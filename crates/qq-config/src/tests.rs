@@ -1829,3 +1829,81 @@ fn theme_documents_fail_fast_on_every_documented_error() {
     let discovered = loader.discover_themes(&tree.path("work")).unwrap();
     assert_eq!(discovered.len(), 1);
 }
+
+#[test]
+fn agent_profiles_layer_by_name_validate_routes_and_never_declare_default() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(
+            version: 1,
+            model: "openai/gpt-5.6",
+            profiles: {
+                "review": Profile(model: "anthropic/claude-x", approval_mode: read_only),
+                "fast": Profile(max_output_tokens: 512),
+                "scratch": Profile(model: "openai/gpt-mini"),
+            },
+        )"#,
+    );
+    // The workspace layer removes one and repoints another after trust.
+    tree.write(
+        "work/qq.ron",
+        r#"(version: 1, profiles: {"scratch": Remove, "fast": Profile(model: "openai/gpt-5.6", organization: "acme")})"#,
+    );
+    let request = tree.request();
+    tree.loader().grant_pending_trust(&request).unwrap();
+    let snapshot = tree.loader().load(&request).unwrap();
+    assert_eq!(
+        snapshot.profiles().keys().collect::<Vec<_>>(),
+        ["fast", "review"]
+    );
+    let review = snapshot.profile("review").unwrap();
+    assert_eq!(review.model(), Some("anthropic/claude-x"));
+    assert_eq!(review.approval_mode(), Some(ProfileApprovalMode::ReadOnly));
+    assert_eq!(review.max_output_tokens(), None);
+    let fast = snapshot.profile("fast").unwrap();
+    assert_eq!(fast.model(), Some("openai/gpt-5.6"));
+    assert_eq!(fast.organization(), Some("acme"));
+    assert_eq!(
+        fast.max_output_tokens(),
+        None,
+        "workspace entries replace whole declarations"
+    );
+    assert_eq!(
+        snapshot.profile("default"),
+        Some(AgentProfileConfig::default())
+    );
+    assert_eq!(snapshot.profile("scratch"), None);
+    assert_eq!(snapshot.profile("missing"), None);
+
+    let origin = SourceIdentity::virtual_source(SourceKind::Compiled, "test");
+    let parse = |body: &str| {
+        let (mut state, _) = document::MergeState::compiled();
+        let document = document::Document::parse(
+            &format!(r#"(version: 1, model: "openai/gpt-5.6", profiles: {{{body}}})"#),
+            &origin,
+        )
+        .unwrap();
+        state.apply_document(&document, &origin, true);
+        state.finish(Vec::new(), Vec::new())
+    };
+    assert!(matches!(
+        parse(r#""default": Profile(model: "openai/gpt-5.6")"#),
+        Err(ConfigError::InvalidProfileName(name)) if name == "default"
+    ));
+    assert!(matches!(
+        parse(r#""Bad_Name": Profile(approval_mode: ask)"#),
+        Err(ConfigError::InvalidProfileName(_))
+    ));
+    assert!(matches!(
+        parse(r#""x": Profile(model: "nope/model")"#),
+        Err(ConfigError::UnknownProvider(provider)) if provider == "nope"
+    ));
+    assert!(matches!(
+        parse(r#""x": Profile(model: "not-a-route")"#),
+        Err(ConfigError::InvalidModelRoute(_))
+    ));
+    assert!(
+        parse(r#""x": Profile(max_output_tokens: 8), "y-2": Profile(approval_mode: full)"#).is_ok()
+    );
+}

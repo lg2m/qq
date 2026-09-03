@@ -18,7 +18,10 @@ use std::{
     sync::Arc,
 };
 
-use qq_protocol::{AgentPlanDigest, CredentialEpoch, InstructionHash, ResolvedModel};
+use qq_protocol::{
+    AgentPlanDigest, AgentProfileId, CredentialEpoch, InstructionHash, ResolvedModel,
+    RunPlanIdentity,
+};
 use qq_provider::{Provider, ToolSpec};
 use thiserror::Error;
 
@@ -49,6 +52,7 @@ pub struct AgentProfile {
     adapter_build: String,
     provenance: Vec<String>,
     credential_epoch: CredentialEpoch,
+    profile_id: AgentProfileId,
 }
 
 impl AgentProfile {
@@ -72,6 +76,7 @@ impl AgentProfile {
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
             credential_epoch: CredentialEpoch::NONE,
+            profile_id: AgentProfileId::default(),
         }
     }
 
@@ -91,6 +96,7 @@ impl AgentProfile {
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
             credential_epoch: CredentialEpoch::NONE,
+            profile_id: AgentProfileId::default(),
         }
     }
 
@@ -135,6 +141,15 @@ impl AgentProfile {
     #[must_use]
     pub fn with_credential_epoch(mut self, epoch: CredentialEpoch) -> Self {
         self.credential_epoch = epoch;
+        self
+    }
+
+    /// The configured agent profile this plan realizes. Part of the digest:
+    /// two profiles that happen to resolve identically are still distinct
+    /// plans, because the caller selected them by name.
+    #[must_use]
+    pub fn with_profile_id(mut self, profile_id: AgentProfileId) -> Self {
+        self.profile_id = profile_id;
         self
     }
 }
@@ -183,6 +198,7 @@ pub struct CompiledAgentPlan {
     search_history_index: usize,
     resolved_model: Arc<ResolvedModel>,
     descriptor: Arc<AgentPlanDescriptor>,
+    descriptor_json: Arc<str>,
     digest: AgentPlanDigest,
     credential_epoch: CredentialEpoch,
     instruction_sources: Vec<SourceFingerprint>,
@@ -218,6 +234,7 @@ impl CompiledAgentPlan {
             adapter_build,
             provenance,
             credential_epoch,
+            profile_id,
         } = profile;
         let mut runtime = Runtime::with_provider(
             provider,
@@ -256,6 +273,7 @@ impl CompiledAgentPlan {
 
         let descriptor = AgentPlanDescriptor {
             version: DESCRIPTOR_VERSION,
+            profile: profile_id,
             adapter_build,
             provider: provider_descriptor,
             model: resolved_model.clone(),
@@ -277,7 +295,16 @@ impl CompiledAgentPlan {
             provenance,
         };
         let digest = descriptor.digest()?;
-        let estimated_bytes = descriptor.canonical_bytes()?.len()
+        let descriptor_json = match serde_json::to_string(&descriptor) {
+            Ok(json) => json,
+            Err(error) => {
+                return Err(PlanCompileError::Encode {
+                    message: error.to_string(),
+                });
+            }
+        };
+        let estimated_bytes = descriptor_json.len()
+            + descriptor.canonical_bytes()?.len()
             + instructions.content_len()
             + usize::try_from(static_schema.bytes).unwrap_or(usize::MAX)
             + std::mem::size_of::<Self>();
@@ -289,6 +316,7 @@ impl CompiledAgentPlan {
             spawn_agent_index,
             search_history_index,
             resolved_model: Arc::new(resolved_model),
+            descriptor_json: Arc::from(descriptor_json),
             descriptor: Arc::new(descriptor),
             digest,
             credential_epoch,
@@ -312,6 +340,17 @@ impl CompiledAgentPlan {
         self.credential_epoch
     }
 
+    /// The wire identity persisted on runs admitted from this plan.
+    #[must_use]
+    pub fn identity(&self) -> RunPlanIdentity {
+        RunPlanIdentity {
+            profile: self.descriptor.profile.clone(),
+            descriptor_version: self.descriptor.version,
+            digest: self.digest,
+            credential_epoch: self.credential_epoch,
+        }
+    }
+
     #[must_use]
     pub fn resolved_model(&self) -> &Arc<ResolvedModel> {
         &self.resolved_model
@@ -320,6 +359,17 @@ impl CompiledAgentPlan {
     #[must_use]
     pub fn workspace_path(&self) -> &Path {
         self.workspace.path()
+    }
+
+    /// The opened workspace capability, for resolving input attachments.
+    pub(crate) fn workspace_handle(&self) -> Workspace {
+        self.workspace.clone()
+    }
+
+    /// The canonical descriptor JSON persisted beside a run's identity.
+    #[must_use]
+    pub fn descriptor_json(&self) -> &Arc<str> {
+        &self.descriptor_json
     }
 
     #[must_use]
@@ -454,6 +504,7 @@ mod tests {
     fn golden_descriptor() -> AgentPlanDescriptor {
         AgentPlanDescriptor {
             version: DESCRIPTOR_VERSION,
+            profile: AgentProfileId::new("review").unwrap(),
             adapter_build: "qq-provider/0.1.0+bedrock".to_owned(),
             provider: provider_descriptor(),
             model: resolved_model(),
@@ -488,13 +539,17 @@ mod tests {
     fn canonical_encoding_and_digest_are_stable() {
         let descriptor = golden_descriptor();
         let bytes = descriptor.canonical_bytes().unwrap();
-        assert!(bytes.starts_with(b"qq-agent-plan-descriptor-v1\0{\"version\":1,"));
+        assert!(
+            bytes.starts_with(
+                b"qq-agent-plan-descriptor-v2\0{\"version\":2,\"profile\":\"review\","
+            )
+        );
         // The golden digest pins the canonical encoding. A change here means
         // DESCRIPTOR_VERSION must be bumped and every recorded digest is
         // from a different encoding.
         assert_eq!(
             descriptor.digest().unwrap().to_string(),
-            "b04a4fbe97c15db302c2a6d002180ea4aad7b7612eb7686086263d667d2be069"
+            "bc19398a8c594852d138c594d5725b9812f0eb21869652177eb9d952f4a86267"
         );
         let round_trip: AgentPlanDescriptor =
             serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v1\0".len()..]).unwrap();

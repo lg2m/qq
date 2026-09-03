@@ -13,11 +13,12 @@ use serde::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    AwsAuth, BedrockAuth, ConfigError, ConfigKey, ConfigProvenance, ConfigSnapshot, Connection,
-    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MCP_CALL_TIMEOUT_SECONDS, DEFAULT_MCP_MAX_CONCURRENT_CALLS,
-    EffectivePolicy, HttpAccess, HttpCredential, InputModality, MAX_MCP_CALL_TIMEOUT_SECONDS,
-    MAX_MCP_MAX_CONCURRENT_CALLS, McpServerConfig, McpTransport, ModelMetadata, ModelPricing,
-    ModelRoute, PolicyGrants, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind,
+    AgentProfileConfig, AwsAuth, BedrockAuth, ConfigError, ConfigKey, ConfigProvenance,
+    ConfigSnapshot, Connection, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MCP_CALL_TIMEOUT_SECONDS,
+    DEFAULT_MCP_MAX_CONCURRENT_CALLS, EffectivePolicy, HttpAccess, HttpCredential, InputModality,
+    MAX_MCP_CALL_TIMEOUT_SECONDS, MAX_MCP_MAX_CONCURRENT_CALLS, MAX_PROFILE_NAME_BYTES,
+    McpServerConfig, McpTransport, ModelMetadata, ModelPricing, ModelRoute, PolicyGrants,
+    ProfileApprovalMode, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind,
     RuntimeOverrides, SecretRef, SourceIdentity, SourceKind, SourceReport, WorkspaceGrant,
 };
 
@@ -489,8 +490,30 @@ pub(super) struct Document {
     providers: Field<UniqueMap<String, ProviderEntryPatch>>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     mcp: Field<UniqueMap<String, McpServerPatch>>,
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    profiles: Field<UniqueMap<String, ProfilePatch>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy: Option<PolicyPatch>,
+}
+
+/// One named agent profile: a bundle of per-session defaults selected by
+/// name at session creation. Entries replace whole declarations by name and
+/// `Remove` deletes a profile declared by an earlier layer. `default` is
+/// implicit (the top-level values) and may not be declared.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum ProfilePatch {
+    Profile {
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        organization: Option<String>,
+        #[serde(default)]
+        max_output_tokens: Option<u32>,
+        #[serde(default)]
+        approval_mode: Option<ProfileApprovalMode>,
+    },
+    Remove,
 }
 
 impl Document {
@@ -665,6 +688,12 @@ impl Document {
             touched.push(ConfigKey::Mcp);
             if let Field::Set(servers) = &self.mcp {
                 touched.extend(servers.0.keys().cloned().map(ConfigKey::McpServer));
+            }
+        }
+        if self.profiles.is_present() {
+            touched.push(ConfigKey::Profiles);
+            if let Field::Set(profiles) = &self.profiles {
+                touched.extend(profiles.0.keys().cloned().map(ConfigKey::Profile));
             }
         }
         if self.policy.is_some() {
@@ -1031,6 +1060,7 @@ pub(super) struct MergeState {
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
+    profiles: BTreeMap<String, AgentProfileConfig>,
     policy: EffectivePolicy,
     provenance: ConfigProvenance,
 }
@@ -1099,6 +1129,7 @@ impl MergeState {
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 providers,
                 mcp: BTreeMap::new(),
+                profiles: BTreeMap::new(),
                 policy: EffectivePolicy {
                     allow_shell_prefixes: VCS_READ_ONLY_PRESETS
                         .iter()
@@ -1144,8 +1175,52 @@ impl MergeState {
         }
         self.apply_providers(&document.providers, source);
         self.apply_mcp(&document.mcp);
+        self.apply_profiles(&document.profiles, source);
         if let Some(policy) = &document.policy {
             self.compose_policy(policy, source);
+        }
+    }
+
+    fn apply_profiles(
+        &mut self,
+        patch: &Field<UniqueMap<String, ProfilePatch>>,
+        source: &SourceIdentity,
+    ) {
+        match patch {
+            Field::Missing => {}
+            Field::Clear => {
+                self.profiles.clear();
+                self.provenance.profiles.clear();
+            }
+            Field::Set(patches) => {
+                for (name, patch) in &patches.0 {
+                    match patch {
+                        ProfilePatch::Remove => {
+                            self.profiles.remove(name);
+                            self.provenance.profiles.remove(name);
+                        }
+                        ProfilePatch::Profile {
+                            model,
+                            organization,
+                            max_output_tokens,
+                            approval_mode,
+                        } => {
+                            self.profiles.insert(
+                                name.clone(),
+                                AgentProfileConfig {
+                                    model: model.clone(),
+                                    organization: organization.clone(),
+                                    max_output_tokens: *max_output_tokens,
+                                    approval_mode: *approval_mode,
+                                },
+                            );
+                            self.provenance
+                                .profiles
+                                .insert(name.clone(), source.clone());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1460,6 +1535,39 @@ impl MergeState {
             }
             enforce_policy(&self.policy, route, self.max_output_tokens, &self.providers)?;
         }
+        // Profiles are validated like the top-level selection: a well-formed
+        // name, a parseable route on a configured provider, and a policy-
+        // permitted cap. `default` names the implicit profile and cannot be
+        // declared, so the two never disagree.
+        for (name, profile) in &self.profiles {
+            if name == "default"
+                || name.is_empty()
+                || name.len() > MAX_PROFILE_NAME_BYTES
+                || !name
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                return Err(ConfigError::InvalidProfileName(name.clone()));
+            }
+            if let Some(route) = &profile.model {
+                let route = ModelRoute::parse(route.clone())?;
+                if !self.providers.contains_key(route.provider()) {
+                    return Err(ConfigError::UnknownProvider(route.provider().to_owned()));
+                }
+                enforce_policy(
+                    &self.policy,
+                    &route,
+                    profile.max_output_tokens.unwrap_or(self.max_output_tokens),
+                    &self.providers,
+                )?;
+            } else if let Some(cap) = profile.max_output_tokens {
+                enforce_policy(&self.policy, &model, cap, &self.providers)?;
+            }
+        }
         let grants = resolve_policy_grants(&self.policy, &self.mcp);
         Ok(ConfigSnapshot {
             organization: self.organization,
@@ -1469,6 +1577,7 @@ impl MergeState {
             max_output_tokens: self.max_output_tokens,
             providers: self.providers,
             mcp: self.mcp,
+            profiles: self.profiles,
             policy: self.policy,
             grants,
             reports,

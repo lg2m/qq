@@ -84,7 +84,8 @@ async fn prepare_execution(
     // Take the only full transcript before cloning run metadata into gates or
     // spawners. ClaimedRun clones after this point stay scalar/empty instead
     // of duplicating up to 4 MiB per tool call.
-    let messages = std::mem::take(&mut claimed.messages);
+    let mut messages = std::mem::take(&mut claimed.messages);
+    let input = std::mem::take(&mut claimed.input);
     let gate: Arc<dyn ToolGate> = if internal {
         Arc::new(CompactionRunGate)
     } else {
@@ -113,6 +114,58 @@ async fn prepare_execution(
             };
         }
     };
+    // Structured input resolves here, before the first provider request:
+    // file parts are read through the plan's workspace capability and
+    // recorded in the session file state. The assembled context already ends
+    // with the rendered prompt text (placeholders for attachments); the
+    // resolved text replaces it. A missing, changed, or oversized attachment
+    // fails the run with a typed outcome and no provider work.
+    if !internal
+        && input
+            .iter()
+            .any(|part| matches!(part, qq_protocol::InputPart::WorkspaceFile { .. }))
+    {
+        let workspace = loaded.plan.workspace_handle();
+        let state = Arc::clone(&file_state);
+        let parts = input;
+        let resolved = tokio::select! {
+            result = tokio::task::spawn_blocking(move || {
+                crate::input::resolve_blocking(&parts, &workspace, &state)
+            }) => result,
+            changed = cancellation.changed() => {
+                tool_cancellation.store(true, Ordering::Release);
+                return if changed.is_ok() && *cancellation.borrow() {
+                    Err(RunOutcome::Cancelled)
+                } else {
+                    Err(RunOutcome::Interrupted)
+                };
+            }
+        };
+        let text = match resolved {
+            Ok(Ok(text)) => text,
+            Ok(Err(error)) => {
+                tool_cancellation.store(true, Ordering::Release);
+                return Err(RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: error.failure_kind(),
+                        message: truncate_utf8(error.to_string(), MAX_FAILURE_MESSAGE_BYTES),
+                    },
+                });
+            }
+            Err(_) => {
+                tool_cancellation.store(true, Ordering::Release);
+                return Err(internal_failure("input resolution stopped unexpectedly"));
+            }
+        };
+        match messages.pop() {
+            Some(prompt) if prompt.role() == Role::User => messages.push(Message::user(text)),
+            Some(_) | None => {
+                return Err(internal_failure(
+                    "assembled context did not end with the run's prompt",
+                ));
+            }
+        }
+    }
     let capabilities = if internal {
         RunCapabilities::restricted()
             .without_tools()
@@ -152,12 +205,44 @@ async fn prepare_execution(
             };
             RunCapabilities::user(spawner)
         };
+        let (sender, receiver) = crate::runtime::steering_channel();
+        // Steering recorded between claim and start (the run was already
+        // `running` for admission purposes) is queued into the channel now
+        // so the first boundary applies it.
+        match inner.store.pending_steering(claimed.run_id).await {
+            Ok(pending) => {
+                for message in pending {
+                    match sender.messages.try_send(message) {
+                        Ok(()) => {}
+                        // The channel and the durable bound are the same size.
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(error) => {
+                tool_cancellation.store(true, Ordering::Release);
+                return Err(persistence_failure(
+                    "failed to load pending steering",
+                    &error,
+                ));
+            }
+        }
+        match inner.steering.lock() {
+            Ok(mut steering) => {
+                steering.insert(claimed.run_id, sender);
+            }
+            Err(_) => {
+                tool_cancellation.store(true, Ordering::Release);
+                return Err(internal_failure("steering registry is poisoned"));
+            }
+        }
         base.with_limits(claimed.limits, loaded.resolved_model().pricing.clone())
             .with_history(Arc::new(SessionHistorySearcher::new(
                 Arc::clone(inner),
                 claimed.session_id,
                 claimed.run_id,
             )))
+            .with_steering(receiver)
     }
     .with_literal_slash(claimed.literal_slash);
     // The claimed workspace is the plan's workspace: the loader compiled the
@@ -214,6 +299,8 @@ async fn prepare_execution(
                     audit: PreparedRunAudit {
                         prompt_identity,
                         resolved_model: Arc::new(resolved_model),
+                        plan_identity: loaded.plan.identity(),
+                        plan_descriptor_json: Arc::clone(loaded.plan.descriptor_json()),
                         context_shape,
                         weight,
                         static_prefix,
@@ -250,6 +337,7 @@ pub(super) async fn execute_run(
     let mut load = inner.loader.load(RuntimeLoadRequest {
         workspace: claimed.workspace.clone(),
         model: claimed.model.clone(),
+        profile: claimed.profile.clone(),
     });
     let loaded = tokio::select! {
         result = &mut load => match result {
@@ -1669,6 +1757,50 @@ async fn execute_started_run(
                         return;
                     }
                     flush_at = None;
+                }
+            }
+            RunInput::Event(Some(RuntimeEvent::SteeringApplied {
+                message_id,
+                turn_ordinal,
+            })) => {
+                match inner
+                    .store
+                    .apply_steering(&claimed, message_id, turn_ordinal)
+                    .await
+                {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist applied steering", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            RunInput::Event(Some(RuntimeEvent::Interrupted { turn_ordinal })) => {
+                // The partial turn's text was committed by the preceding
+                // `AssistantTurnCompleted`; drop any buffered live tool output
+                // (the interrupted result replaces it) and settle the rows.
+                pending_tool_call = None;
+                pending_tool_output.clear();
+                match inner.store.record_interrupted(&claimed, turn_ordinal).await {
+                    Ok(events) => {
+                        for event in events {
+                            inner.notify(event.cursor);
+                        }
+                    }
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist the interrupted turn", &error),
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
             RunInput::Event(Some(RuntimeEvent::Completed)) => {

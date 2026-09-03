@@ -381,12 +381,13 @@ pub(in crate::sessions) fn open_database(
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20") => {}
+        Some("10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21") => {
+        }
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20")
+        Some("11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
     ) {
         let transaction = connection
             .transaction()
@@ -404,7 +405,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20")
+        Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
     ) {
         let transaction = connection
             .transaction()
@@ -422,7 +423,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20")
+        Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
     ) {
         let transaction = connection
             .transaction()
@@ -440,7 +441,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("14" | "15" | "16" | "17" | "18" | "19" | "20")
+        Some("14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
     ) {
         let transaction = connection
             .transaction()
@@ -459,7 +460,7 @@ pub(in crate::sessions) fn open_database(
     validate_model_turn_audit_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("15" | "16" | "17" | "18" | "19" | "20")
+        Some("15" | "16" | "17" | "18" | "19" | "20" | "21")
     ) {
         let transaction = connection
             .transaction()
@@ -492,7 +493,7 @@ pub(in crate::sessions) fn open_database(
     validate_linear_streaming_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("16" | "17" | "18" | "19" | "20")
+        Some("16" | "17" | "18" | "19" | "20" | "21")
     ) {
         let transaction = connection
             .transaction()
@@ -511,7 +512,10 @@ pub(in crate::sessions) fn open_database(
     if !has_column(&connection, "runs", "resolved_model_json")? {
         return Err(SessionRuntimeError::Persistence);
     }
-    if !matches!(schema_version.as_deref(), Some("17" | "18" | "19" | "20")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("17" | "18" | "19" | "20" | "21")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -528,7 +532,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_preparing_run_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("18" | "19" | "20")) {
+    if !matches!(schema_version.as_deref(), Some("18" | "19" | "20" | "21")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -545,7 +549,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_context_occupancy_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("19" | "20")) {
+    if !matches!(schema_version.as_deref(), Some("19" | "20" | "21")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -562,7 +566,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_run_limits_schema(&connection)?;
-    if schema_version.as_deref() != Some("20") {
+    if !matches!(schema_version.as_deref(), Some("20" | "21")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -570,6 +574,21 @@ pub(in crate::sessions) fn open_database(
         transaction
             .execute(
                 "UPDATE metadata SET value = '20' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if schema_version.as_deref() != Some("21") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_contract_columns(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '21' WHERE key = 'schema_version'",
                 [],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -1266,6 +1285,36 @@ fn add_sessions_spawned_by_tool_call_column(
                 [],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    Ok(())
+}
+
+/// Schema 21: the protocol-13 backend contract. Sessions carry a selected
+/// agent profile and opaque correlation; runs carry their structured input,
+/// correlation, and the secret-free plan identity and descriptor fixed at
+/// start; user messages carry their structured input and a steering flag.
+/// Every column is additive and nullable so historical rows read back as
+/// `default` profile, empty correlation, and no plan identity.
+fn add_contract_columns(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    const COLUMNS: [(&str, &str, &str); 8] = [
+        ("sessions", "profile", "TEXT"),
+        ("sessions", "correlation_json", "TEXT"),
+        ("runs", "input_json", "TEXT"),
+        ("runs", "correlation_json", "TEXT"),
+        ("runs", "plan_identity_json", "TEXT"),
+        ("runs", "plan_descriptor_json", "TEXT"),
+        ("messages", "input_json", "TEXT"),
+        ("messages", "steering", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (table, column, kind) in COLUMNS {
+        if !has_column(connection, table, column)? {
+            connection
+                .execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
     }
     Ok(())
 }
