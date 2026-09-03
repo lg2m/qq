@@ -35,7 +35,7 @@ pub use descriptor::{
 pub use fingerprint::SourceFingerprint;
 
 use crate::{
-    Runtime, RuntimeConfigError, TurnRetryPolicy,
+    ContextCache, ContextSource, Runtime, RuntimeConfigError, TurnRetryPolicy,
     catalog::{
         EffectClass, HostContribution, StaticTool, ToolCatalog, ToolHost, select_tools_spec,
     },
@@ -117,6 +117,8 @@ pub struct AgentProfile {
     credential_epoch: CredentialEpoch,
     profile_id: AgentProfileId,
     pack: Option<PackSelection>,
+    context_sources: Vec<Arc<dyn ContextSource>>,
+    context_cache: Option<Arc<ContextCache>>,
 }
 
 impl AgentProfile {
@@ -143,6 +145,8 @@ impl AgentProfile {
             credential_epoch: CredentialEpoch::NONE,
             profile_id: AgentProfileId::default(),
             pack: None,
+            context_sources: Vec::new(),
+            context_cache: None,
         }
     }
 
@@ -170,7 +174,28 @@ impl AgentProfile {
             credential_epoch: CredentialEpoch::NONE,
             profile_id: AgentProfileId::default(),
             pack: None,
+            context_sources: runtime
+                .context_sources
+                .iter()
+                .map(|registered| Arc::clone(&registered.source))
+                .collect(),
+            context_cache: Some(Arc::clone(&runtime.context_cache)),
         }
+    }
+
+    /// Registers a bounded pre-turn context source for runs of this plan.
+    /// See [`Runtime::with_context_source`].
+    #[must_use]
+    pub fn with_context_source(mut self, source: Arc<dyn ContextSource>) -> Self {
+        self.context_sources.push(source);
+        self
+    }
+
+    /// Shares a context cache across plans (the root passes one per factory).
+    #[must_use]
+    pub fn with_context_cache(mut self, cache: Arc<ContextCache>) -> Self {
+        self.context_cache = Some(cache);
+        self
     }
 
     /// Selects an agent pack's resources for this plan. The persona is read
@@ -342,6 +367,8 @@ impl CompiledAgentPlan {
             credential_epoch,
             profile_id,
             pack,
+            context_sources,
+            context_cache,
         } = profile;
         let mut runtime = Runtime::with_provider(
             provider,
@@ -351,6 +378,12 @@ impl CompiledAgentPlan {
         .with_context_window(resolved_model.context_window)
         .with_turn_retry_policy(turn_retry)
         .with_spawn_model_routes(spawn_model_routes);
+        for source in context_sources {
+            runtime = runtime.with_context_source(source);
+        }
+        if let Some(cache) = context_cache {
+            runtime = runtime.with_context_cache(cache);
+        }
         let mut config_grants = Vec::new();
         let mut host_handles = Vec::with_capacity(hosts.len());
         let mut contributions = Vec::with_capacity(hosts.len());

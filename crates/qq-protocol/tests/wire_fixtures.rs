@@ -454,6 +454,7 @@ fn version_14_commands_receipts_events_and_capabilities_match_their_goldens() {
                 selected_guidance: None,
                 catalog_digest: Some(hash(9)),
                 exposure: Some(ToolExposure::Full),
+                context_sources: Vec::new(),
             })),
             resolved_model: Some(Box::new(resolved_model())),
             plan: Some(Box::new(plan_identity())),

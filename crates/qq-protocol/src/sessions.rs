@@ -1094,6 +1094,36 @@ pub enum ToolExposure {
     Progressive,
 }
 
+/// How one context source contributed to a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSourceOutcome {
+    Fetched,
+    FetchedTruncated,
+    Cached,
+    CachedTruncated,
+    TimedOut,
+    Unavailable,
+    Refused,
+    Invalid,
+}
+
+/// One context source consulted before a run's first provider request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSourceRecord {
+    pub name: String,
+    pub version: String,
+    pub outcome: ContextSourceOutcome,
+    pub items: u32,
+    pub bytes: u64,
+    /// Hash of the items that entered the prompt, when any did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// All-or-none identity of the system prefix prepared for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1115,6 +1145,9 @@ pub struct RunPromptIdentity {
     pub catalog_digest: Option<ContentHash>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure: Option<ToolExposure>,
+    /// Context sources consulted for this run, in registration order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_sources: Vec<ContextSourceRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2410,6 +2443,15 @@ mod tests {
                 })),
                 catalog_digest: Some("e".repeat(64).parse().unwrap()),
                 exposure: Some(ToolExposure::Progressive),
+                context_sources: vec![ContextSourceRecord {
+                    name: "memory".to_owned(),
+                    version: "1".to_owned(),
+                    outcome: ContextSourceOutcome::Fetched,
+                    items: 2,
+                    bytes: 512,
+                    content_hash: Some("f".repeat(64).parse().unwrap()),
+                    message: None,
+                }],
             })),
             resolved_model: Some(Box::new(ResolvedModel {
                 version: ResolvedModelVersion::new(1).unwrap(),

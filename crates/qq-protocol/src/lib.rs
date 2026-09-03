@@ -37,17 +37,17 @@ pub use qq_reasoning::{ReasoningEvent, ReasoningKind};
 pub use sessions::{
     AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution,
     BudgetExhaustion, BudgetLimitKind, CapabilitySupport, CommandOutcome, CommandReceipt,
-    CommandRequest, ContentHash, ContentHashError, CursorError, EditPreview, EventCursor,
-    GenerationCapabilities, GuidanceIdentity, GuidanceKind, InstructionHash, InstructionHashError,
-    MAX_INCLUDED_SESSIONS, MessageRole, MessageSnapshot, MessageState, ModelCatalogRequest,
-    ModelDescriptor, ModelPricing, ModelPricingTier, ModelSelection, PromptCacheCapabilities,
-    PromptVersion, ProviderRequestShapeIdentity, ProviderRequestShapeVersion, ResolvedModel,
-    ResolvedModelVersion, RunActivity, RunFailure, RunLimits, RunOutcome, RunPromptIdentity,
-    RunSnapshot, RunStatus, SessionAccounting, SessionCommand, SessionCommandKind, SessionEvent,
-    SessionEventEnvelope, SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview,
-    SnapshotRequest, SpawnOrigin, SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay,
-    ToolCallSnapshot, ToolCallState, ToolExposure, WorkspaceGrantOutcome, WorkspaceSnapshot,
-    WorkspaceSummary,
+    CommandRequest, ContentHash, ContentHashError, ContextSourceOutcome, ContextSourceRecord,
+    CursorError, EditPreview, EventCursor, GenerationCapabilities, GuidanceIdentity, GuidanceKind,
+    InstructionHash, InstructionHashError, MAX_INCLUDED_SESSIONS, MessageRole, MessageSnapshot,
+    MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing, ModelPricingTier,
+    ModelSelection, PromptCacheCapabilities, PromptVersion, ProviderRequestShapeIdentity,
+    ProviderRequestShapeVersion, ResolvedModel, ResolvedModelVersion, RunActivity, RunFailure,
+    RunLimits, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus, SessionAccounting,
+    SessionCommand, SessionCommandKind, SessionEvent, SessionEventEnvelope, SessionSnapshot,
+    SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest, SpawnOrigin,
+    SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallSnapshot, ToolCallState,
+    ToolExposure, WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
 };
 
 pub const PROTOCOL_VERSION: u16 = 14;
@@ -148,6 +148,9 @@ pub enum RunFailureKind {
     Authentication,
     Policy,
     Server,
+    /// A fail-closed context source could not supply its context before the
+    /// run's first provider request.
+    ContextSource,
     ProviderConfiguration,
     ProviderAuthentication,
     ProviderRateLimited,

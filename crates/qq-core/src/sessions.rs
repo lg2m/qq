@@ -567,6 +567,7 @@ fn test_prepared_audit_with_identity(
             selected_guidance: None,
             catalog_digest: None,
             exposure: None,
+            context_sources: Vec::new(),
         }),
         context_shape: context_request_shape(resolved_model.as_ref()),
         resolved_model,

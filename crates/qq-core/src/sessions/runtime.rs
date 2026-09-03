@@ -70,6 +70,10 @@ impl LoadedRuntime {
         for host in runtime.hosts.iter() {
             profile = profile.with_host(HostSnapshot::capture_blocking(Arc::clone(host)));
         }
+        for registered in runtime.context_sources.iter() {
+            profile = profile.with_context_source(Arc::clone(&registered.source));
+        }
+        profile = profile.with_context_cache(Arc::clone(&runtime.context_cache));
         Ok(Self {
             plan: CompiledAgentPlan::compile_blocking(profile)?,
         })

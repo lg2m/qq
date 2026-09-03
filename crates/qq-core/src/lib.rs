@@ -27,6 +27,7 @@ use thiserror::Error;
 
 mod approval;
 pub mod catalog;
+pub mod context_source;
 pub mod hosts;
 mod input;
 pub mod plan;
@@ -45,6 +46,10 @@ use runtime::{
     tool_schema_measurement,
 };
 
+pub use context_source::{
+    ContextBudget, ContextBundle, ContextCache, ContextFetchFuture, ContextItem, ContextRequest,
+    ContextSource, ContextSourceError, FailPolicy, MAX_CONTEXT_SOURCES,
+};
 pub use hosts::{
     EMBEDDED_TOOL_PREFIX, EmbeddedHostError, EmbeddedToolFuture, EmbeddedToolHandler,
     EmbeddedToolHost, EmbeddedToolHostBuilder, ExternalToolHost, HostCallError, HostCallFuture,
@@ -368,6 +373,9 @@ pub struct Runtime {
     /// External tool hosts in contribution order. A compiled plan snapshots
     /// their catalogs; direct runs snapshot them per run.
     pub(crate) hosts: Arc<[Arc<dyn ExternalToolHost>]>,
+    /// Pre-turn context sources in registration order, with the shared cache.
+    pub(crate) context_sources: Arc<[context_source::RegisteredSource]>,
+    pub(crate) context_cache: Arc<ContextCache>,
     spawn_model_routes: Arc<[String]>,
     turn_retry: TurnRetryPolicy,
 }
@@ -401,6 +409,8 @@ impl Runtime {
             max_output_tokens,
             context_window: None,
             hosts: Arc::from([]),
+            context_sources: Arc::from([]),
+            context_cache: Arc::new(ContextCache::default()),
             spawn_model_routes: Arc::from([]),
             turn_retry: TurnRetryPolicy::default(),
         })
@@ -456,6 +466,28 @@ impl Runtime {
         let mut hosts = self.hosts.to_vec();
         hosts.push(host);
         self.hosts = hosts.into();
+        self
+    }
+
+    /// Registers a bounded pre-turn context source. Sources are consulted
+    /// once per run, concurrently, before the first provider request; at
+    /// most [`MAX_CONTEXT_SOURCES`] may be registered and later ones are
+    /// ignored with no effect on the run.
+    #[must_use]
+    pub fn with_context_source(mut self, source: Arc<dyn ContextSource>) -> Self {
+        if self.context_sources.len() >= MAX_CONTEXT_SOURCES {
+            return self;
+        }
+        let mut sources = self.context_sources.to_vec();
+        sources.push(context_source::RegisteredSource::new(source));
+        self.context_sources = sources.into();
+        self
+    }
+
+    /// Replaces the shared context cache (bounds are the embedder's call).
+    #[must_use]
+    pub fn with_context_cache(mut self, cache: Arc<ContextCache>) -> Self {
+        self.context_cache = cache;
         self
     }
 
@@ -683,6 +715,9 @@ impl plan::CompiledAgentPlan {
         let pack_roots = Arc::clone(&plan.pack_roots);
         let persona = plan.persona.clone();
         let hosts = Arc::clone(&plan.hosts);
+        let context_sources = Arc::clone(&plan.runtime.context_sources);
+        let context_cache = Arc::clone(&plan.runtime.context_cache);
+        let profile_name = plan.descriptor().profile.as_str().to_owned();
         let turn_retry = plan.runtime.turn_retry;
         Box::pin(stream! {
             let RunCapabilities {
@@ -764,6 +799,58 @@ impl plan::CompiledAgentPlan {
                     }
                 },
             };
+            // Context sources run once, after guidance and before any
+            // provider work, each under its own deadline. Their output is
+            // appended to this run's system prompt only; nothing durable
+            // changes. A fail-closed failure settles the run here.
+            let mut context_blocks = String::new();
+            let mut context_records = Vec::new();
+            if !context_sources.is_empty() {
+                let latest_user_text = messages
+                    .last()
+                    .filter(|message| message.role() == Role::User)
+                    .map(|message| {
+                        message
+                            .content()
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. } => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                let request = context_source::ContextRequest {
+                    profile: profile_name.clone(),
+                    workspace: workspace.path().display().to_string(),
+                    latest_user_text,
+                    budget: context_source::ContextBudget::default(),
+                };
+                match context_source::fetch_all(
+                    &context_sources,
+                    &context_cache,
+                    request,
+                    Arc::clone(&cancelled),
+                )
+                .await
+                {
+                    Ok(rendered) => {
+                        for context in rendered {
+                            context_blocks.push_str(&context.text);
+                            context_records.push(context.record);
+                        }
+                    }
+                    Err((message, record)) => {
+                        context_records.push(record);
+                        yield RuntimeEvent::Failed {
+                            kind: RunFailureKind::ContextSource,
+                            message,
+                        };
+                        return;
+                    }
+                }
+            }
             // The plan's catalog is the tool list: the static tools this run
             // may use (the sub-agent tool only when it may spawn, recall only
             // for durable session runs) plus every external tool under full
@@ -789,18 +876,22 @@ impl plan::CompiledAgentPlan {
             } else {
                 catalog.specs_with_pins(&base_specs, &pins)
             };
-            let system: Arc<str> = Arc::from(agent_system_prompt(
-                workspace.path(),
-                &base_specs,
-                catalog.index_text().map(Arc::as_ref),
-                // Disclosure follows the guidance capability: restricted runs
-                // (compaction, model-authored child tasks) neither list nor
-                // load skills.
-                if allow_guidance { skills.disclosure_text() } else { None },
-                workspace_instructions,
-                persona.as_deref(),
-                selected_guidance.as_ref(),
-            ));
+            let system: Arc<str> = Arc::from({
+                let mut system = agent_system_prompt(
+                    workspace.path(),
+                    &base_specs,
+                    catalog.index_text().map(Arc::as_ref),
+                    // Disclosure follows the guidance capability: restricted
+                    // runs (compaction, model-authored child tasks) neither
+                    // list nor load skills.
+                    if allow_guidance { skills.disclosure_text() } else { None },
+                    workspace_instructions,
+                    persona.as_deref(),
+                    selected_guidance.as_ref(),
+                );
+                system.push_str(&context_blocks);
+                system
+            });
             let mut tool_schema = tool_schema_measurement(&tool_specs);
             let system_prompt_hash = ContentHash::from_bytes(Sha256::digest(system.as_bytes()).into());
             let mut prompt_identity = Some(Arc::new(RunPromptIdentity {
@@ -816,6 +907,7 @@ impl plan::CompiledAgentPlan {
                         catalog::Exposure::Full => qq_protocol::ToolExposure::Full,
                         catalog::Exposure::Progressive => qq_protocol::ToolExposure::Progressive,
                     }),
+                    context_sources: context_records,
                 }));
             // Only the transcript preceding the accepted prompt can be
             // replaced by a between-run compaction. Everything appended by
