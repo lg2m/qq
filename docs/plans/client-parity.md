@@ -1,6 +1,6 @@
 # Client Parity
 
-Status: active. Sequenced between Phase 4 and Phase 5 of
+Status: Tier 1 complete 2026-09-03; Tier 2 next. Sequenced between Phase 4 and Phase 5 of
 `speed-first-extensible-agent-harness.md`. Phase 5 (H10) stays gated on R6 and
 a platform threat model; Phase 6 needs an actual client; Phase 7 qualifies the
 TUI as a first-class path. None of them should start while the shipped clients
@@ -152,4 +152,20 @@ change must not add work to the per-event reduce path beyond a field copy.
 
 ## Receipts
 
-Record each landed item here with its commit and the test that covers it.
+### Tier 1 — 2026-09-03
+
+| Item | Commit | Behavior | Evidence |
+| --- | --- | --- | --- |
+| T1.1 | `87e70ab` | `qq-client` fetches capabilities with the workspace id and forwards the whole document as `ClientUpdate::Capabilities(Arc<..>)`; `ClientRequest::Capabilities` re-fetches on demand; TUI derives steering from it | `runtime::tests::tui_client_delivers_workspace_capabilities_and_refreshes_them` drives `TuiClient` against a real server: initial document carries `profiles`, a pack trusted afterwards appears on refresh |
+| T1.2 | `fcc9c77` | `/profile` picker over advertised profiles (mode, model, `pack@version`); Enter sends `SetSessionProfile` for the focused idle session, refuses a running one locally, or sets the default for new sessions; `Profile` status item shows `as <name>`; `qq run --profile` validates before any session exists and records `profile` in the trial record | TUI: `profile_picker_*` (4 tests), `top_row_names_a_non_default_profile_only`; headless: `the_selected_profile_reaches_the_loader_and_the_trial_record`; live: `qq run --profile reviewer --format jsonl` records `"profile":"reviewer"` |
+| T1.3 | `93ade0d` | **Protocol 15**: `SessionSummary.approval_mode` (defaults to `auto` on decode so persisted events replay); `set_approval_mode` publishes `session_updated`; `/approval` picker with per-mode meaning; `ApprovalMode` status item names anything other than `auto` (warning style for `full`); protocol.md mode table corrected (`auto` is the default, `full` exists) | core: `auto_mode_executes_mutating_tools_after_a_mode_change` asserts the summary event and receipt cursor; TUI: `approval_picker_*`, `approval_mode_chosen_without_a_focused_session_*`, render `approval_mode_picker_and_badge_*`; goldens `fixtures/v15/`; harbor fixtures regenerated |
+| T1.4 | `f6e9e49` | Additive `SkillCapabilities.entries`; slash completion lists client commands then workspace commands/skills; command accept leaves `/name ` for arguments, skill accept submits `/name`; `/skills` picker grouped by kind with sources and `explicit only` marks | commands: `workspace_guidance_joins_the_list_after_client_commands`; TUI: `slash_completion_offers_workspace_commands_and_skills_*`, `skills_picker_*`; render `skills_picker_groups_commands_before_skills_with_sources`; e2e asserts a real `SKILL.md` description arrives |
+
+Reserved client slash commands: 16 → 19 (`/profile`, `/approval`, `/skills`).
+Workspace guidance can no longer take those names; `docs/design/tools.md` and
+the `design-skill-or-pack` skill reference the constant instead of a list.
+
+Not done in Tier 1: `qq run` steering and approve-for-session/workspace
+(T2.6). Python is absent on the development host, so
+`benchmarks/harbor/tests/test_atif.py` was not run after the fixture
+regeneration; the Rust `harbor_atif_fixtures` test covers the shape.
