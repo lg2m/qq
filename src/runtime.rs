@@ -19,8 +19,8 @@ use qq_core::{
     SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
     WorkspaceGrantAuthority, WorkspaceGrantSeed,
     plan::{
-        AgentProfile, CompiledAgentPlan, CredentialReference, HostSnapshot, PlanCompileError,
-        ProviderDescriptor, SourceFingerprint,
+        AgentProfile, CompiledAgentPlan, CredentialReference, HostSnapshot, PackSelection,
+        PlanCompileError, ProviderDescriptor, SourceFingerprint,
     },
 };
 use qq_protocol::{
@@ -221,6 +221,7 @@ impl RuntimeFactory {
         profiles.push(AgentProfileSummary {
             id: AgentProfileId::default(),
             model: Some(default_route.clone()),
+            pack: None,
             approval_mode: ApprovalMode::default(),
         });
         for (name, profile) in snapshot.profiles() {
@@ -241,6 +242,10 @@ impl RuntimeFactory {
                         .model()
                         .map_or_else(|| default_route.clone(), str::to_owned),
                 ),
+                pack: profile.pack().map(|reference| qq_protocol::PackSummary {
+                    id: reference.pack().to_owned(),
+                    version: reference.version().to_owned(),
+                }),
                 approval_mode: profile
                     .approval_mode()
                     .map_or(ApprovalMode::default(), |mode| match mode {
@@ -564,7 +569,49 @@ impl RuntimeFactory {
         // repeats with the profile's values applied where the request left a
         // gap; the second load probes the same paths, so revalidation is
         // unchanged.
-        let snapshot = match snapshot.profile(profile_id.as_str()) {
+        let selected_profile = snapshot.profile(profile_id.as_str());
+        // A pack-declared profile brings its pack's resources and, when it
+        // names MCP servers, restricts which declared servers join this plan.
+        let pack_selection = match selected_profile.as_ref().and_then(|p| p.pack()) {
+            None => None,
+            Some(reference) => {
+                let pack = &snapshot.packs()[reference.pack()];
+                if let Some(minimum) = pack.requires().protocol
+                    && minimum > qq_protocol::PROTOCOL_VERSION
+                {
+                    return Err(RuntimeBuildError::PackRequiresNewerProtocol {
+                        pack: reference.pack().to_owned(),
+                        required: minimum,
+                        supported: qq_protocol::PROTOCOL_VERSION,
+                    });
+                }
+                let profile = reference.profile();
+                let relative = |path: &Path| {
+                    path.strip_prefix(reference.directory())
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .expect("pack paths were validated to stay inside the pack")
+                };
+                Some((
+                    PackSelection {
+                        id: reference.pack().to_owned(),
+                        version: reference.version().to_owned(),
+                        manifest_digest: reference.manifest_digest().to_owned(),
+                        directory: reference.directory().to_owned(),
+                        persona: profile.prompt().map(relative),
+                        skill_roots: profile.skill_roots().iter().map(|p| relative(p)).collect(),
+                        command_roots: profile
+                            .command_roots()
+                            .iter()
+                            .map(|p| relative(p))
+                            .collect(),
+                        tool_allow: profile.tools().allow.clone(),
+                        tool_deny: profile.tools().deny.clone(),
+                    },
+                    profile.mcp().map(<[String]>::to_vec),
+                ))
+            }
+        };
+        let snapshot = match selected_profile {
             None => return Err(RuntimeBuildError::UnknownProfile(profile_id.clone())),
             Some(profile) if profile == qq_config::AgentProfileConfig::default() => snapshot,
             Some(profile) => {
@@ -612,11 +659,19 @@ impl RuntimeFactory {
                 .with_provenance(provenance)
                 .with_credential_epoch(epoch)
                 .with_profile_id(profile_id.clone());
-        if let Some(wired) =
-            self.inner
-                .mcp
-                .registry_for_snapshot(&self.inner.credentials, epoch, &snapshot)?
-        {
+        let mcp_subset = match pack_selection {
+            Some((selection, subset)) => {
+                profile = profile.with_pack(selection);
+                subset
+            }
+            None => None,
+        };
+        if let Some(wired) = self.inner.mcp.registry_for_snapshot(
+            &self.inner.credentials,
+            epoch,
+            &snapshot,
+            mcp_subset.as_deref(),
+        )? {
             // The catalog is snapshotted here, on the blocking compile
             // thread, so the plan holds an immutable tool list and the cache
             // can revalidate it against the manager's generation.
@@ -1800,6 +1855,14 @@ pub enum RuntimeBuildError {
     PlanCacheShutDown,
     #[error("agent profile {0} is not declared by the workspace configuration")]
     UnknownProfile(AgentProfileId),
+    #[error(
+        "agent pack {pack} requires protocol version {required}; this build supports {supported}"
+    )]
+    PackRequiresNewerProtocol {
+        pack: String,
+        required: u16,
+        supported: u16,
+    },
     #[error(transparent)]
     Plan(#[from] PlanCompileError),
     #[error(transparent)]
@@ -1832,9 +1895,10 @@ impl RuntimeBuildError {
                 qq_provider::ProviderErrorKind::Response => RunFailureKind::ProviderResponse,
                 qq_provider::ProviderErrorKind::Protocol => RunFailureKind::ProviderProtocol,
             },
-            Self::Mcp(_) | Self::UnknownModel { .. } | Self::UnknownProfile(_) => {
-                RunFailureKind::Configuration
-            }
+            Self::Mcp(_)
+            | Self::UnknownModel { .. }
+            | Self::UnknownProfile(_)
+            | Self::PackRequiresNewerProtocol { .. } => RunFailureKind::Configuration,
             Self::UnauthenticatedProvider(_) => RunFailureKind::Authentication,
             Self::Runtime(_)
             | Self::UnknownProvider(_)
@@ -3922,6 +3986,143 @@ mod tests {
         assert_eq!(profiles[1].model.as_deref(), Some("custom/big-model"));
         assert_eq!(profiles[1].approval_mode, ApprovalMode::ReadOnly);
         assert_eq!(profiles[2].model.as_deref(), Some("custom/test-model"));
+    }
+
+    #[test]
+    fn pack_profiles_compile_persona_skills_tool_policy_and_mcp_subsets_into_plans() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let config = fixture.path("work/.qq/config.ron");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            r#"(
+                version: 1,
+                model: "custom/test-model",
+                max_output_tokens: 64,
+                providers: {
+                    "custom": Custom(
+                        connection: (
+                            base_url: "http://127.0.0.1:1/v1",
+                            api: OpenAiResponses,
+                            auth: NoAuth,
+                        ),
+                        models: { "test-model": (name: "Test model") },
+                    ),
+                },
+                mcp: {
+                    "notes": Stdio(command: "qq-test-no-such-notes"),
+                    "tickets": Stdio(command: "qq-test-no-such-tickets"),
+                },
+            )"#,
+        )
+        .unwrap();
+        for (path, content) in [
+            (
+                "work/.qq/packs/review-kit/pack.ron",
+                r#"(
+                    schema: 1,
+                    id: "review-kit",
+                    version: "1.0.0",
+                    profiles: {
+                        "reviewer": Profile(
+                            approval_mode: read_only,
+                            prompt: "persona.md",
+                            skills: ["skills"],
+                            tools: (deny: ["shell", "write_file"]),
+                            mcp: ["notes"],
+                        ),
+                    },
+                )"#,
+            ),
+            ("work/.qq/packs/review-kit/persona.md", "Persona v1.\n"),
+            (
+                "work/.qq/packs/review-kit/skills/audit/SKILL.md",
+                "---\ndescription: Audit it\n---\nbody\n",
+            ),
+        ] {
+            let path = fixture.path(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let request = LoadRequest::new(fixture.path("work"));
+        factory.inner.config.grant_pending_trust(&request).unwrap();
+
+        let reviewer = AgentProfileId::new("reviewer").unwrap();
+        let (plan, lookup) = factory.plan_with_lookup(&request, &reviewer).unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        let descriptor = plan.descriptor();
+        let pack = descriptor.pack.as_ref().unwrap();
+        assert_eq!(
+            (pack.id.as_str(), pack.version.as_str()),
+            ("review-kit", "1.0.0")
+        );
+        assert_eq!(pack.tool_deny, ["shell", "write_file"]);
+        assert!(pack.persona_hash.is_some());
+        // Only the referenced MCP server joins this plan.
+        assert_eq!(descriptor.mcp_servers.len(), 1);
+        assert_eq!(descriptor.mcp_servers[0].name, "notes");
+        let names: Vec<&str> = plan.catalog().names().collect();
+        assert!(!names.contains(&"shell") && !names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file") && names.contains(&"load_skill"));
+        assert_eq!(plan.skills().disclosed_count(), 1);
+        assert_eq!(
+            plan.skills()
+                .entries()
+                .iter()
+                .find(|e| e.name == "audit")
+                .unwrap()
+                .source,
+            "pack:review-kit/skills/audit/SKILL.md"
+        );
+        // The default profile sees both servers and every static tool.
+        let default_plan = factory.plan_for(&request).unwrap();
+        assert_eq!(default_plan.descriptor().mcp_servers.len(), 2);
+        assert!(default_plan.descriptor().pack.is_none());
+        assert!(default_plan.catalog().names().any(|n| n == "shell"));
+
+        // Warm lookups do no discovery and hit the cache.
+        assert_eq!(
+            factory.plan_with_lookup(&request, &reviewer).unwrap().1,
+            PlanLookup::Hit
+        );
+        // Editing the persona recompiles; the old plan stays valid for holders.
+        fs::write(
+            fixture.path("work/.qq/packs/review-kit/persona.md"),
+            "Persona v2.\n",
+        )
+        .unwrap();
+        let (edited, lookup) = factory.plan_with_lookup(&request, &reviewer).unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        assert_ne!(edited.digest(), plan.digest());
+        assert_eq!(plan.descriptor().pack.as_ref().unwrap().version, "1.0.0");
+
+        // The capability document names the pack behind the profile.
+        let profiles = factory
+            .profiles_for(fixture.path("work").to_str().unwrap())
+            .unwrap();
+        let summary = profiles.iter().find(|p| p.id == reviewer).unwrap();
+        assert_eq!(summary.pack.as_ref().unwrap().id, "review-kit");
+        assert_eq!(summary.approval_mode, ApprovalMode::ReadOnly);
+
+        // A pack that needs a newer protocol fails as configuration.
+        fs::write(
+            fixture.path("work/.qq/packs/review-kit/pack.ron"),
+            r#"(schema: 1, id: "review-kit", version: "9", requires: (protocol: 999),
+                profiles: { "reviewer": Profile(max_output_tokens: 8) })"#,
+        )
+        .unwrap();
+        let error = factory.plan_for_profile(&request, &reviewer).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeBuildError::PackRequiresNewerProtocol { required: 999, .. }
+        ));
+        assert_eq!(error.failure_kind(), RunFailureKind::Configuration);
     }
 
     #[test]

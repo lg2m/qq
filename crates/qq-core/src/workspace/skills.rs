@@ -41,8 +41,13 @@ pub(crate) const LOAD_SKILL_TOOL: &str = "load_skill";
 pub struct SkillEntry {
     pub kind: SkillKind,
     pub name: String,
-    /// Workspace-relative path of the document.
+    /// Path of the document: workspace-relative for workspace roots, or
+    /// `pack:<id>/<relative>` for documents a pack contributes.
     pub source: String,
+    /// Which opened root holds the document: `None` for the workspace,
+    /// `Some(index)` for the plan's pack roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<usize>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     /// Whether the model may load this document itself.
@@ -68,7 +73,7 @@ impl From<SkillKind> for GuidanceKind {
 /// A root the index scans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillRoot {
-    /// Workspace-relative directory.
+    /// Directory relative to the root's opened capability.
     pub(crate) directory: String,
     pub(crate) kind: SkillKind,
     /// `true` for `dir/<name>/SKILL.md`, `false` for `dir/<name>.md`.
@@ -77,48 +82,56 @@ pub(crate) struct SkillRoot {
     pub(crate) disclosed: bool,
     /// Native roots shadow compatibility roots of the same name.
     pub(crate) native: bool,
+    /// Which opened capability the directory is relative to: `None` for the
+    /// workspace, `Some(index)` for a pack root handed to the compiler.
+    pub(crate) root: Option<usize>,
+    /// Prefix for `source` (`pack:<id>/`) so a document's provenance names
+    /// its pack; empty for the workspace.
+    pub(crate) source_prefix: String,
 }
 
 impl SkillRoot {
     /// The roots every workspace is scanned for, native first.
     pub(crate) fn workspace_defaults() -> Vec<Self> {
         vec![
-            Self {
-                directory: ".qq/commands".to_owned(),
-                kind: SkillKind::Command,
-                nested: false,
-                disclosed: true,
-                native: true,
-            },
-            Self {
-                directory: ".qq/skills".to_owned(),
-                kind: SkillKind::Skill,
-                nested: true,
-                disclosed: true,
-                native: true,
-            },
-            Self {
-                directory: ".agents/skills".to_owned(),
-                kind: SkillKind::Skill,
-                nested: true,
-                disclosed: false,
-                native: false,
-            },
-            Self {
-                directory: ".claude/commands".to_owned(),
-                kind: SkillKind::Command,
-                nested: false,
-                disclosed: false,
-                native: false,
-            },
-            Self {
-                directory: ".claude/skills".to_owned(),
-                kind: SkillKind::Skill,
-                nested: true,
-                disclosed: false,
-                native: false,
-            },
+            Self::workspace(".qq/commands", SkillKind::Command, false, true, true),
+            Self::workspace(".qq/skills", SkillKind::Skill, true, true, true),
+            Self::workspace(".agents/skills", SkillKind::Skill, true, false, false),
+            Self::workspace(".claude/commands", SkillKind::Command, false, false, false),
+            Self::workspace(".claude/skills", SkillKind::Skill, true, false, false),
         ]
+    }
+
+    fn workspace(
+        directory: &str,
+        kind: SkillKind,
+        nested: bool,
+        disclosed: bool,
+        native: bool,
+    ) -> Self {
+        Self {
+            directory: directory.to_owned(),
+            kind,
+            nested,
+            disclosed,
+            native,
+            root: None,
+            source_prefix: String::new(),
+        }
+    }
+
+    /// A root inside pack `pack_id`, opened as capability `root`. Pack
+    /// documents are native (they shadow compatibility roots) and disclosed.
+    pub(crate) fn pack(pack_id: &str, root: usize, directory: &str, kind: SkillKind) -> Self {
+        Self {
+            directory: directory.to_owned(),
+            kind,
+            nested: matches!(kind, SkillKind::Skill),
+            disclosed: true,
+            native: true,
+            root: Some(root),
+            source_prefix: format!("pack:{pack_id}/"),
+        }
     }
 
     fn document_path(&self, name: &str) -> String {
@@ -126,6 +139,17 @@ impl SkillRoot {
             format!("{}/{name}/SKILL.md", self.directory)
         } else {
             format!("{}/{name}.md", self.directory)
+        }
+    }
+
+    fn resolve<'a>(
+        &self,
+        workspace: &'a Workspace,
+        packs: &'a [Workspace],
+    ) -> Option<&'a Workspace> {
+        match self.root {
+            None => Some(workspace),
+            Some(index) => packs.get(index),
         }
     }
 }
@@ -162,6 +186,7 @@ impl SkillIndex {
     /// cache can revalidate with `stat`s alone.
     pub(crate) fn compile_blocking(
         workspace: &Workspace,
+        packs: &[Workspace],
         roots: &[SkillRoot],
     ) -> (Self, Vec<SourceFingerprint>) {
         let mut fingerprints = Vec::with_capacity(roots.len());
@@ -169,10 +194,13 @@ impl SkillIndex {
         let mut native_names: BTreeMap<String, ()> = BTreeMap::new();
         let mut truncated = false;
         for root in roots {
+            let Some(opened) = root.resolve(workspace, packs) else {
+                continue;
+            };
             fingerprints.push(SourceFingerprint::capture(
-                workspace.path().join(&root.directory),
+                opened.path().join(&root.directory),
             ));
-            let listing = match workspace.root().read_dir(&root.directory) {
+            let listing = match opened.root().read_dir(&root.directory) {
                 Ok(listing) => listing,
                 // An absent or unreadable root contributes nothing; the
                 // fingerprint records what was observed.
@@ -220,8 +248,8 @@ impl SkillIndex {
                     truncated = true;
                     break;
                 }
-                let source = root.document_path(&name);
-                let Some(description) = read_description(workspace, &source) else {
+                let relative = root.document_path(&name);
+                let Some(description) = read_description(opened, &relative) else {
                     // Not a regular readable file at the expected path.
                     continue;
                 };
@@ -231,7 +259,8 @@ impl SkillIndex {
                 entries.push(SkillEntry {
                     kind: root.kind,
                     name,
-                    source,
+                    source: format!("{}{relative}", root.source_prefix),
+                    root: root.root,
                     description,
                     disclosed: root.disclosed,
                 });
@@ -335,6 +364,14 @@ impl SkillIndex {
             [] => SkillResolution::Unknown,
             [one] => SkillResolution::One(one),
             _ => SkillResolution::Ambiguous(matches),
+        }
+    }
+
+    /// The document's path relative to its root capability.
+    pub(crate) fn relative_source(entry: &SkillEntry) -> &str {
+        match entry.source.strip_prefix("pack:") {
+            Some(rest) => rest.split_once('/').map_or(rest, |(_, path)| path),
+            None => entry.source.as_str(),
         }
     }
 
@@ -480,7 +517,7 @@ mod tests {
             (".qq/skills/notdir.md", "ignored\n"),
         ]);
         let (index, fingerprints) =
-            SkillIndex::compile_blocking(&workspace, &SkillRoot::workspace_defaults());
+            SkillIndex::compile_blocking(&workspace, &[], &SkillRoot::workspace_defaults());
         assert_eq!(fingerprints.len(), 5);
         let names: Vec<(&str, bool)> = index
             .entries()
@@ -526,7 +563,8 @@ mod tests {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let (_dir, workspace) = workspace_with(&refs);
-        let (index, _) = SkillIndex::compile_blocking(&workspace, &SkillRoot::workspace_defaults());
+        let (index, _) =
+            SkillIndex::compile_blocking(&workspace, &[], &SkillRoot::workspace_defaults());
         assert!(matches!(index.resolve("dup"), SkillResolution::Ambiguous(e) if e.len() == 2));
         assert!(index.resolve_disclosed("dup").is_none());
         assert_eq!(index.len(), MAX_INDEXED_SKILLS);
@@ -553,8 +591,8 @@ mod tests {
 
         let (_a, wa) = workspace_with(&[(".qq/commands/x.md", "---\ndescription: one\n---\n")]);
         let (_b, wb) = workspace_with(&[(".qq/commands/x.md", "---\ndescription: two\n---\n")]);
-        let (ia, _) = SkillIndex::compile_blocking(&wa, &SkillRoot::workspace_defaults());
-        let (ib, _) = SkillIndex::compile_blocking(&wb, &SkillRoot::workspace_defaults());
+        let (ia, _) = SkillIndex::compile_blocking(&wa, &[], &SkillRoot::workspace_defaults());
+        let (ib, _) = SkillIndex::compile_blocking(&wb, &[], &SkillRoot::workspace_defaults());
         assert_ne!(ia.digest(), ib.digest());
         assert_eq!(
             SkillIndex::empty().digest(),

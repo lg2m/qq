@@ -173,6 +173,7 @@ pub(crate) fn parse_invocation(
 /// time; this reads, bounds, and hashes the content at invocation.
 pub(crate) fn load(
     workspace: &Workspace,
+    packs: &[Workspace],
     index: &super::skills::SkillIndex,
     request: GuidanceRequest,
     cancelled: &AtomicBool,
@@ -193,12 +194,14 @@ pub(crate) fn load(
             });
         }
     };
-    load_entry(workspace, entry, cancelled)
+    load_entry(workspace, packs, entry, cancelled)
 }
 
-/// Reads one indexed document's body with the guidance bounds.
+/// Reads one indexed document's body with the guidance bounds, from the
+/// workspace or the pack root the index recorded for it.
 pub(crate) fn load_entry(
     workspace: &Workspace,
+    packs: &[Workspace],
     entry: &super::skills::SkillEntry,
     cancelled: &AtomicBool,
 ) -> Result<SelectedGuidance, GuidanceError> {
@@ -207,8 +210,15 @@ pub(crate) fn load_entry(
     if cancelled.load(Ordering::Acquire) {
         return Err(GuidanceError::Cancelled);
     }
+    let workspace = match entry.root {
+        None => workspace,
+        Some(index) => packs.get(index).ok_or_else(|| GuidanceError::Unknown {
+            name: entry.name.clone(),
+        })?,
+    };
+    let relative = super::skills::SkillIndex::relative_source(entry);
     let resolved = workspace
-        .contained_path(&candidate.path)
+        .contained_path(relative)
         .map_err(|source| GuidanceError::Resolve {
             path: candidate.path.clone(),
             source,

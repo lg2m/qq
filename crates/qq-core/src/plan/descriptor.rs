@@ -131,6 +131,21 @@ pub struct ToolCatalogDescriptor {
     pub config_grants: Vec<String>,
 }
 
+/// The agent pack a plan realizes, when its profile came from one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackDescriptor {
+    pub id: String,
+    pub version: String,
+    /// Hex SHA-256 of the manifest bytes.
+    pub manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_deny: Vec<String>,
+}
+
 /// The compiled skill/command index: what the model can be told about and
 /// what `/name` resolves to, without any document body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +199,8 @@ pub struct AgentPlanDescriptor {
     pub instruction_source: Option<String>,
     pub tools: ToolCatalogDescriptor,
     pub skills: SkillIndexDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<PackDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerDescriptor>,
     pub retry: RetryPolicyDescriptor,

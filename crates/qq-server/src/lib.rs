@@ -1891,6 +1891,7 @@ mod tests {
                         id: qq_protocol::AgentProfileId::default(),
                         model: Some("openai/gpt-5.6".to_owned()),
                         approval_mode: ApprovalMode::Auto,
+                        pack: None,
                     }])
                 } else {
                     Err(ServerHandlerError::InvalidRequest(

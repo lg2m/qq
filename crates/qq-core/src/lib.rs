@@ -680,6 +680,8 @@ impl plan::CompiledAgentPlan {
         let model_max_output_tokens = plan.runtime.max_output_tokens;
         let catalog = Arc::clone(&plan.catalog);
         let skills = Arc::clone(&plan.skills);
+        let pack_roots = Arc::clone(&plan.pack_roots);
+        let persona = plan.persona.clone();
         let hosts = Arc::clone(&plan.hosts);
         let turn_retry = plan.runtime.turn_retry;
         Box::pin(stream! {
@@ -738,6 +740,7 @@ impl plan::CompiledAgentPlan {
                 None => None,
                 Some(request) => match workspace::prepare_guidance(
                     workspace.clone(),
+                    Arc::clone(&pack_roots),
                     Arc::clone(&skills),
                     Arc::clone(&cancelled),
                     request,
@@ -795,6 +798,7 @@ impl plan::CompiledAgentPlan {
                 // load skills.
                 if allow_guidance { skills.disclosure_text() } else { None },
                 workspace_instructions,
+                persona.as_deref(),
                 selected_guidance.as_ref(),
             ));
             let mut tool_schema = tool_schema_measurement(&tool_specs);
@@ -1561,6 +1565,7 @@ impl plan::CompiledAgentPlan {
                     let cancelled = Arc::clone(&cancelled);
                     let catalog = Arc::clone(&catalog);
                     let skills = Arc::clone(&skills);
+                    let pack_roots = Arc::clone(&pack_roots);
                     let hosts = Arc::clone(&hosts);
                     let spawner = spawner.clone();
                     let history = history.clone();
@@ -1658,6 +1663,7 @@ impl plan::CompiledAgentPlan {
                                 match serde_json::from_str::<workspace::skills::LoadSkillArgs>(&call.arguments) {
                                     Ok(arguments) => match workspace::load_disclosed_skill(
                                         workspace,
+                                        pack_roots,
                                         skills,
                                         cancelled,
                                         arguments.name.trim().to_owned(),
@@ -4975,14 +4981,21 @@ mod tests {
     fn agent_prompt_teaches_delegation_only_when_spawn_agent_is_declared() {
         let workspace = std::path::Path::new("/tmp/qq-prompt-test");
         let instructions = workspace::WorkspaceInstructions::empty();
-        let without =
-            agent_system_prompt(workspace, &tools::specs(), None, None, &instructions, None);
+        let without = agent_system_prompt(
+            workspace,
+            &tools::specs(),
+            None,
+            None,
+            &instructions,
+            None,
+            None,
+        );
         assert!(!without.contains("spawn_agent"));
         assert!(!without.contains("Delegation:"));
 
         let mut specs = tools::specs();
         specs.push(tools::spawn_agent_spec(&[]));
-        let with = agent_system_prompt(workspace, &specs, None, None, &instructions, None);
+        let with = agent_system_prompt(workspace, &specs, None, None, &instructions, None, None);
         assert!(with.contains("spawn_agent"));
         assert!(with.contains("Delegation:"));
         assert!(with.contains("independent questions"));

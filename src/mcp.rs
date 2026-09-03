@@ -178,17 +178,27 @@ impl McpRegistryCache {
     /// Returns the shared registry for the snapshot's MCP declarations with
     /// their secret-free descriptors, or `None` when no servers are declared.
     /// `epoch` is the credential epoch the bearer secrets are resolved under.
+    /// `subset` restricts the plan to the named servers (a pack profile's
+    /// `mcp` list); `None` admits every declared server. The registry key
+    /// covers the admitted set, so two profiles with different subsets hold
+    /// different managers and never share a connection they were not given.
     pub(crate) fn registry_for_snapshot(
         &self,
         credentials: &CredentialStore,
         epoch: CredentialEpoch,
         snapshot: &ConfigSnapshot,
+        subset: Option<&[String]>,
     ) -> Result<Option<WiredMcp>, RuntimeBuildError> {
-        if snapshot.mcp_servers().is_empty() {
+        let admitted: Vec<(&String, &McpServerConfig)> = snapshot
+            .mcp_servers()
+            .iter()
+            .filter(|(name, _)| subset.is_none_or(|names| names.contains(*name)))
+            .collect();
+        if admitted.is_empty() {
             return Ok(None);
         }
-        let mut descriptors = Vec::with_capacity(snapshot.mcp_servers().len());
-        for (name, server) in snapshot.mcp_servers() {
+        let mut descriptors = Vec::with_capacity(admitted.len());
+        for (name, server) in &admitted {
             descriptors.push(describe_server(name, server));
         }
         let key = RegistryKey {
@@ -214,8 +224,8 @@ impl McpRegistryCache {
         }
 
         // Secrets are resolved only on a miss, after the key is known.
-        let mut settings = Vec::with_capacity(snapshot.mcp_servers().len());
-        for (name, server) in snapshot.mcp_servers() {
+        let mut settings = Vec::with_capacity(admitted.len());
+        for (name, server) in &admitted {
             settings.push(resolve_server(name, server, credentials)?);
         }
         let registry = Arc::new(WiredMcpRegistry {

@@ -25,6 +25,7 @@ pub(crate) fn agent_system_prompt(
     tool_index: Option<&str>,
     skill_index: Option<&str>,
     workspace_instructions: &WorkspaceInstructions,
+    persona: Option<&crate::plan::Persona>,
     selected_guidance: Option<&SelectedGuidance>,
 ) -> String {
     let mut tool_names = String::new();
@@ -95,6 +96,9 @@ pub(crate) fn agent_system_prompt(
         prompt.push_str(index.trim_end());
     }
     workspace_instructions.append_to_prompt(&mut prompt);
+    if let Some(persona) = persona {
+        persona.append_to_prompt(&mut prompt);
+    }
     if let Some(guidance) = selected_guidance {
         guidance.append_to_prompt(&mut prompt);
     }

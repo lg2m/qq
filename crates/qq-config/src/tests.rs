@@ -1989,3 +1989,260 @@ fn agent_profiles_layer_by_name_validate_routes_and_never_declare_default() {
         parse(r#""x": Profile(max_output_tokens: 8), "y-2": Profile(approval_mode: full)"#).is_ok()
     );
 }
+
+#[test]
+fn agent_packs_are_discovered_validated_layered_and_trust_gated() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, model: "openai/gpt-5.6")"#,
+    );
+    // A global pack: two profiles, a prompt, a skill root, and an MCP server.
+    tree.write(
+        "global/packs/review-kit/pack.ron",
+        r#"(
+            schema: 1,
+            id: "review-kit",
+            version: "1.2.0",
+            name: "Review Kit",
+            requires: (protocol: 14),
+            profiles: {
+                "reviewer": Profile(
+                    model: "anthropic/claude-x",
+                    approval_mode: read_only,
+                    prompt: "prompts/reviewer.md",
+                    skills: ["skills"],
+                    tools: (allow: ["read_file", "search", "mcp__notes__*"], deny: ["shell"]),
+                    mcp: ["notes"],
+                ),
+                "fixer": Profile(max_output_tokens: 2048, commands: ["commands"]),
+            },
+            mcp: {
+                "notes": Stdio(command: "notes-mcp", args: ["serve"], eager: false),
+            },
+        )"#,
+    );
+    tree.write(
+        "global/packs/review-kit/prompts/reviewer.md",
+        "Review carefully.\n",
+    );
+    // A directory without a manifest is not a pack and is ignored.
+    tree.write("global/packs/junk/README.md", "not a pack\n");
+    // A project pack that would shadow the global one by id, plus a project
+    // profile that shadows a pack profile by name.
+    tree.write(
+        "work/.qq/packs/review-kit/pack.ron",
+        r#"(
+            schema: 1,
+            id: "review-kit",
+            version: "2.0.0",
+            profiles: { "reviewer": Profile(model: "openai/gpt-mini") },
+        )"#,
+    );
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, mcp: { "notes": Stdio(command: "project-notes", eager: true) }, profiles: { "fixer": Profile(model: "openai/gpt-5.6") })"#,
+    );
+    let request = tree.request();
+
+    // Untrusted project: only the global pack contributes; the project's
+    // config is partially applied and its packs are held back.
+    let untrusted = tree.loader().load(&request);
+    let Err(ConfigError::TrustRequired { .. }) = untrusted else {
+        panic!("project mcp requires trust: {untrusted:?}");
+    };
+    tree.loader().grant_pending_trust(&request).unwrap();
+    let snapshot = tree.loader().load(&request).unwrap();
+
+    let pack = &snapshot.packs()["review-kit"];
+    assert_eq!(
+        pack.version(),
+        "2.0.0",
+        "the nearer pack replaces the global one"
+    );
+    assert_eq!(pack.source().kind(), SourceKind::Project);
+    assert_eq!(pack.manifest_digest().len(), 64);
+    assert_eq!(snapshot.packs().len(), 1);
+    // Pack profiles sit beneath configured ones: `fixer` is the configured
+    // profile (the global pack's `fixer` is gone with the global pack anyway),
+    // `reviewer` comes from the project pack.
+    let reviewer = snapshot.profile("reviewer").unwrap();
+    assert_eq!(reviewer.model(), Some("openai/gpt-mini"));
+    let reference = reviewer.pack().unwrap();
+    assert_eq!(reference.pack(), "review-kit");
+    assert_eq!(reference.version(), "2.0.0");
+    assert!(reference.profile().prompt().is_none());
+    let fixer = snapshot.profile("fixer").unwrap();
+    assert_eq!(fixer.model(), Some("openai/gpt-5.6"));
+    assert!(fixer.pack().is_none());
+    assert_eq!(
+        snapshot.provenance().profile("reviewer").unwrap().kind(),
+        SourceKind::Project
+    );
+    assert!(snapshot.provenance().pack("review-kit").is_some());
+    // The configured MCP server wins over any pack declaration of the name.
+    assert_eq!(
+        snapshot.mcp_servers()["notes"].transport(),
+        &McpTransport::Stdio {
+            command: "project-notes".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    );
+    assert!(
+        snapshot
+            .probed_paths()
+            .iter()
+            .any(|path| path.ends_with("packs/review-kit/pack.ron")),
+        "manifests are probed so a cache can revalidate"
+    );
+
+    // Remove the project pack: the global one is back with its full shape.
+    std::fs::remove_dir_all(tree.path("work/.qq/packs")).unwrap();
+    let snapshot = tree.loader().load(&request).unwrap();
+    let pack = &snapshot.packs()["review-kit"];
+    assert_eq!(pack.version(), "1.2.0");
+    assert_eq!(pack.name(), Some("Review Kit"));
+    assert_eq!(pack.requires().protocol, Some(14));
+    let reviewer = snapshot.profile("reviewer").unwrap();
+    assert_eq!(reviewer.model(), Some("anthropic/claude-x"));
+    assert_eq!(
+        reviewer.approval_mode(),
+        Some(ProfileApprovalMode::ReadOnly)
+    );
+    let profile = reviewer.pack().unwrap().profile();
+    assert!(profile.prompt().unwrap().ends_with("prompts/reviewer.md"));
+    assert_eq!(profile.skill_roots().len(), 1);
+    assert!(profile.tools().permits("read_file"));
+    assert!(profile.tools().permits("mcp__notes__search"));
+    assert!(!profile.tools().permits("shell"));
+    assert!(
+        !profile.tools().permits("edit_file"),
+        "allow lists are exclusive"
+    );
+    assert_eq!(profile.mcp(), Some(&["notes".to_owned()][..]));
+    // The pack's MCP server is admitted because the configuration no longer
+    // declares one of that name... except the project config still does.
+    assert_eq!(
+        snapshot.mcp_servers()["notes"].transport(),
+        &McpTransport::Stdio {
+            command: "project-notes".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    );
+
+    // Explicit declarations win over discovery and `Remove` drops a pack.
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, packs: { "review-kit": Remove })"#,
+    );
+    tree.loader().grant_pending_trust(&request).unwrap();
+    let snapshot = tree.loader().load(&request).unwrap();
+    assert!(snapshot.packs().is_empty());
+    assert_eq!(snapshot.profile("reviewer"), None);
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, packs: { "review-kit": Pack(path: "../vendor/review-kit") })"#,
+    );
+    tree.write(
+        "work/vendor/review-kit/pack.ron",
+        r#"(schema: 1, id: "review-kit", version: "3.0.0", profiles: { "reviewer": Profile(max_output_tokens: 1024) })"#,
+    );
+    tree.loader().grant_pending_trust(&request).unwrap();
+    let snapshot = tree.loader().load(&request).unwrap();
+    assert_eq!(snapshot.packs()["review-kit"].version(), "3.0.0");
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, packs: { "ghost": Pack(path: "nowhere") })"#,
+    );
+    tree.loader().grant_pending_trust(&request).unwrap();
+    assert!(matches!(
+        tree.loader().load(&request),
+        Err(ConfigError::PackMissing { id, .. }) if id == "ghost"
+    ));
+}
+
+#[test]
+fn agent_pack_manifests_fail_fast_on_every_documented_error() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, model: "openai/gpt-5.6")"#,
+    );
+    let request = tree.request();
+    let load_with = |manifest: &str| {
+        let _ = std::fs::remove_dir_all(tree.path("global/packs"));
+        tree.write("global/packs/kit/pack.ron", manifest);
+        tree.loader().load(&request)
+    };
+    assert!(matches!(
+        load_with(r#"(schema: 2, id: "kit", version: "1")"#),
+        Err(ConfigError::UnsupportedPackSchema { schema: 2, .. })
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "other", version: "1")"#),
+        Err(ConfigError::InvalidPack { message, .. }) if message.contains("does not match its directory")
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "")"#),
+        Err(ConfigError::InvalidPack { message, .. }) if message.contains("version")
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "1", profiles: { "default": Profile(max_output_tokens: 1) })"#),
+        Err(ConfigError::InvalidProfileName(name)) if name == "kit/default"
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "1", profiles: { "p": Profile(prompt: "../escape.md") })"#),
+        Err(ConfigError::InvalidPack { message, .. }) if message.contains("stay inside the pack")
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "1", profiles: { "p": Profile(tools: (allow: ["bad name"])) })"#),
+        Err(ConfigError::InvalidPack { message, .. }) if message.contains("invalid tool rule")
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "1", profiles: { "p": Profile(mcp: ["nope"]) })"#),
+        Err(ConfigError::InvalidPack { message, .. }) if message.contains("undeclared MCP server")
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "1", mcp: { "s": Remove })"#),
+        Err(ConfigError::InvalidPack { message, .. }) if message.contains("cannot be a removal")
+    ));
+    assert!(matches!(
+        load_with(
+            r#"(schema: 1, id: "kit", version: "1", mcp: { "s": Http(url: "https://x", bearer: Value("tok")) })"#
+        ),
+        Err(ConfigError::LiteralSecretForbidden { .. })
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "1", profiles: { "p": Profile(model: "nobody/x") })"#),
+        Err(ConfigError::UnknownProvider(provider)) if provider == "nobody"
+    ));
+    assert!(matches!(
+        load_with(r#"(schema: 1, id: "kit", version: "1", extra: 1)"#),
+        Err(ConfigError::Parse { .. })
+    ));
+    // Two packs claiming one profile is a conflict, not a silent winner.
+    let _ = std::fs::remove_dir_all(tree.path("global/packs"));
+    tree.write(
+        "global/packs/a/pack.ron",
+        r#"(schema: 1, id: "a", version: "1", profiles: { "p": Profile(max_output_tokens: 1) })"#,
+    );
+    tree.write(
+        "global/packs/b/pack.ron",
+        r#"(schema: 1, id: "b", version: "1", profiles: { "p": Profile(max_output_tokens: 1) })"#,
+    );
+    assert!(matches!(
+        tree.loader().load(&request),
+        Err(ConfigError::PackProfileConflict { profile, packs }) if profile == "p" && packs == "a, b"
+    ));
+    // Tool policy semantics.
+    let policy = PackToolPolicy {
+        allow: vec!["mcp__*".to_owned()],
+        deny: vec!["mcp__srv__danger".to_owned()],
+    };
+    assert!(policy.permits("mcp__srv__safe"));
+    assert!(!policy.permits("mcp__srv__danger"));
+    assert!(!policy.permits("read_file"));
+    assert!(PackToolPolicy::default().permits("anything"));
+}

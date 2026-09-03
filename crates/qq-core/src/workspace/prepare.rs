@@ -156,6 +156,7 @@ pub(crate) async fn prepare_workspace(
 /// before its first provider request, and only when the prompt named guidance.
 pub(crate) async fn prepare_guidance(
     workspace: Workspace,
+    packs: Arc<[Workspace]>,
     index: Arc<super::skills::SkillIndex>,
     cancelled: Arc<AtomicBool>,
     request: GuidanceRequest,
@@ -170,7 +171,7 @@ pub(crate) async fn prepare_guidance(
             return Err(WorkspacePreparationError::Cancelled);
         }
         Ok(super::guidance::load(
-            &workspace, &index, request, &cancelled,
+            &workspace, &packs, &index, request, &cancelled,
         )?)
     })
     .await
@@ -182,6 +183,7 @@ pub(crate) async fn prepare_guidance(
 /// error rather than a run failure when the name is unknown or undisclosed.
 pub(crate) async fn load_disclosed_skill(
     workspace: Workspace,
+    packs: Arc<[Workspace]>,
     index: Arc<super::skills::SkillIndex>,
     cancelled: Arc<AtomicBool>,
     name: String,
@@ -198,7 +200,9 @@ pub(crate) async fn load_disclosed_skill(
         let Some(entry) = index.resolve_disclosed(&name) else {
             return Err(GuidanceError::Unknown { name }.into());
         };
-        Ok(super::guidance::load_entry(&workspace, entry, &cancelled)?)
+        Ok(super::guidance::load_entry(
+            &workspace, &packs, entry, &cancelled,
+        )?)
     })
     .await
     .map_err(|source| WorkspacePreparationError::Stopped { source })?

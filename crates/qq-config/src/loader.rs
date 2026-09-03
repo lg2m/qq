@@ -76,6 +76,20 @@ pub(super) fn load(
     let mut reports = vec![compiled_report];
     let mut pending = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut admitted_packs = 0_usize;
+
+    // Discovered packs are the lowest lane: global first, then each project
+    // directory root-to-leaf, so a nearer pack of the same id replaces a
+    // farther one. Explicit `packs` entries in any layer apply as that layer
+    // is merged (below) and therefore win over discovery.
+    for pack in crate::pack::discover(
+        &loader.paths.global_dir.join("packs"),
+        SourceKind::Global,
+        probes,
+        &mut admitted_packs,
+    )? {
+        merged.admit_pack(pack);
+    }
 
     if let Some(organization) = organization
         && let Some((document, source)) =
@@ -110,6 +124,24 @@ pub(super) fn load(
     }
 
     for directory in project_directories(&cwd, probes) {
+        // Project packs are sensitive (they may declare MCP servers), so
+        // they are admitted only when the project's configuration is
+        // trusted, exactly like `mcp` in `.qq/config.ron`. An untrusted
+        // project contributes no packs and no pending-trust entry of its
+        // own: trusting the directory's configuration admits them.
+        let project_trusted = trust.project_trusted(&directory, probes)?;
+        if project_trusted {
+            for pack in crate::pack::discover(
+                &directory.join(".qq").join("packs"),
+                SourceKind::Project,
+                probes,
+                &mut admitted_packs,
+            )? {
+                merged.admit_pack(pack);
+            }
+        } else {
+            probes.record(&directory.join(".qq").join("packs"));
+        }
         if let Some(candidate) =
             discover_file(directory.join("qq.ron"), SourceKind::Project, false, probes)?
         {
@@ -433,7 +465,7 @@ pub(super) struct Probes {
 }
 
 impl Probes {
-    fn record(&mut self, path: &Path) {
+    pub(super) fn record(&mut self, path: &Path) {
         if !self.paths.iter().any(|recorded| recorded == path) {
             self.paths.push(path.to_owned());
         }
@@ -496,6 +528,9 @@ fn apply_document(
     };
     let sensitive = pending_digest.is_none();
     merged.apply_document(&document, &source, sensitive);
+    if sensitive {
+        apply_explicit_packs(&document, &source, merged)?;
+    }
     let status = if let Some(digest) = pending_digest {
         pending.push(PendingTrust::new(source.clone(), digest));
         SourceStatus::PartiallyAppliedPendingTrust
@@ -504,6 +539,59 @@ fn apply_document(
     };
     reports.push(SourceReport::new(source, status, document.touched()));
     Ok(())
+}
+
+/// Applies a layer's explicit `packs` entries. Paths resolve relative to the
+/// declaring file; virtual sources (inline, MDM, remote) may only use
+/// absolute paths. Discovery is not repeated here: an explicit entry names
+/// exactly one directory.
+fn apply_explicit_packs(
+    document: &Document,
+    source: &SourceIdentity,
+    merged: &mut MergeState,
+) -> Result<(), ConfigError> {
+    use crate::document::{Field, PackPatch};
+    match document.packs() {
+        Field::Missing => Ok(()),
+        Field::Clear => {
+            merged.clear_packs();
+            Ok(())
+        }
+        Field::Set(patches) => {
+            let mut probes = Probes::default();
+            for (id, patch) in &patches.0 {
+                match patch {
+                    PackPatch::Remove => merged.remove_pack(id),
+                    PackPatch::Pack { path } => {
+                        let path = Path::new(path);
+                        let resolved = if path.is_absolute() {
+                            path.to_owned()
+                        } else if let Some(declaring) = source.path().and_then(Path::parent) {
+                            declaring.join(path)
+                        } else {
+                            return Err(ConfigError::InvalidPack {
+                                origin: source.clone(),
+                                message: format!(
+                                    "pack {id:?} path must be absolute in a {:?} source",
+                                    source.kind()
+                                ),
+                            });
+                        };
+                        if !resolved.join(crate::pack::PACK_MANIFEST_FILE).is_file() {
+                            return Err(ConfigError::PackMissing {
+                                id: id.clone(),
+                                path: resolved,
+                            });
+                        }
+                        let pack =
+                            crate::pack::load_explicit(&resolved, id, source.kind(), &mut probes)?;
+                        merged.admit_pack(pack);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Canonicalizes a working directory the way every configuration load does,
@@ -828,6 +916,40 @@ impl TrustState {
         self.records
             .iter()
             .any(|record| record.path == path && record.digest == digest)
+    }
+
+    /// Whether every sensitive configuration file under `directory` (its
+    /// `qq.ron` and `.qq/config.ron` plus fragments) is trusted, or none
+    /// declares anything sensitive. Packs under the directory follow this
+    /// decision so trusting a project admits its packs.
+    pub(super) fn project_trusted(
+        &self,
+        directory: &Path,
+        probes: &mut Probes,
+    ) -> Result<bool, ConfigError> {
+        let mut candidates = Vec::new();
+        if let Some(candidate) =
+            discover_file(directory.join("qq.ron"), SourceKind::Project, false, probes)?
+        {
+            candidates.push(candidate);
+        }
+        candidates.extend(discover_layer_directory(
+            &directory.join(".qq"),
+            "config.ron",
+            "config.d",
+            SourceKind::Project,
+            probes,
+        )?);
+        for candidate in candidates {
+            let (source, content) = read_candidate(&candidate)?;
+            let document = Document::parse(&content, &source)?;
+            if let Some(digest) = document.sensitive_digest()?
+                && !self.contains(&candidate.path, &digest)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn insert(&mut self, path: PathBuf, digest: String) {

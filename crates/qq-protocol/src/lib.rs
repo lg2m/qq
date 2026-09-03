@@ -13,7 +13,7 @@ mod plan;
 mod sessions;
 
 pub use capabilities::{
-    AgentProfileSummary, CAPABILITIES_VERSION, CapabilitiesRequest, LimitCapabilities,
+    AgentProfileSummary, CAPABILITIES_VERSION, CapabilitiesRequest, LimitCapabilities, PackSummary,
     ServerCapabilities, SkillCapabilities, SteeringCapabilities, ToolCapabilities, ToolHostSummary,
     WorkspaceToolCapabilities,
 };

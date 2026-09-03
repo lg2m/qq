@@ -16,6 +16,7 @@ mod document;
 mod loader;
 mod managed;
 mod models;
+pub mod pack;
 mod promote;
 mod providers;
 mod remote;
@@ -23,6 +24,10 @@ mod theme;
 mod tui;
 
 pub use loader::canonical_working_directory;
+pub use pack::{
+    AgentPack, MAX_PACK_MANIFEST_BYTES, MAX_PACK_PROMPT_BYTES, MAX_PACKS, PACK_MANIFEST_FILE,
+    PACK_SCHEMA_VERSION, PackProfile, PackRequirements, PackToolPolicy,
+};
 pub use qq_provider::{SecretLiteral, SecretRef, XAI_CREDENTIAL_ENDPOINT};
 pub use theme::{
     AnsiColor, COMPILED_THEMES, DEFAULT_THEME, Rgb, ThemeColor, ThemeColors, ThemeDocument,
@@ -1222,6 +1227,8 @@ pub enum ConfigKey {
     McpServer(String),
     Profiles,
     Profile(String),
+    Packs,
+    Pack(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1265,11 +1272,24 @@ pub struct ConfigProvenance {
     max_output_tokens: Option<SourceIdentity>,
     providers: BTreeMap<String, SourceIdentity>,
     profiles: BTreeMap<String, SourceIdentity>,
+    packs: BTreeMap<String, SourceIdentity>,
     grant_tools: BTreeMap<String, SourceIdentity>,
     grant_shell_prefixes: BTreeMap<String, SourceIdentity>,
 }
 
 impl ConfigProvenance {
+    /// The manifest that declared pack `id`.
+    #[must_use]
+    pub fn pack(&self, id: &str) -> Option<&SourceIdentity> {
+        self.packs.get(id)
+    }
+
+    /// The layer (or pack manifest) that declared profile `name`.
+    #[must_use]
+    pub fn profile(&self, name: &str) -> Option<&SourceIdentity> {
+        self.profiles.get(name)
+    }
+
     #[must_use]
     pub const fn organization(&self) -> Option<&SourceIdentity> {
         self.organization.as_ref()
@@ -1361,6 +1381,7 @@ pub struct ConfigSnapshot {
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
     profiles: BTreeMap<String, AgentProfileConfig>,
+    packs: BTreeMap<String, AgentPack>,
     policy: EffectivePolicy,
     grants: PolicyGrants,
     reports: Vec<SourceReport>,
@@ -1391,9 +1412,64 @@ pub struct AgentProfileConfig {
     organization: Option<String>,
     max_output_tokens: Option<u32>,
     approval_mode: Option<ProfileApprovalMode>,
+    /// Set when this profile came from an agent pack rather than `profiles`.
+    pack: Option<PackProfileRef>,
+}
+
+/// The pack resources behind a pack-declared profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackProfileRef {
+    pack: String,
+    version: String,
+    manifest_digest: String,
+    directory: PathBuf,
+    profile: PackProfile,
+}
+
+impl PackProfileRef {
+    pub(crate) fn new(pack: &AgentPack, profile: PackProfile) -> Self {
+        Self {
+            pack: pack.id().to_owned(),
+            version: pack.version().to_owned(),
+            manifest_digest: pack.manifest_digest().to_owned(),
+            directory: pack.directory().to_owned(),
+            profile,
+        }
+    }
+
+    #[must_use]
+    pub fn pack(&self) -> &str {
+        &self.pack
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &PackProfile {
+        &self.profile
+    }
 }
 
 impl AgentProfileConfig {
+    /// The pack resources this profile carries, when it came from a pack.
+    #[must_use]
+    pub const fn pack(&self) -> Option<&PackProfileRef> {
+        self.pack.as_ref()
+    }
+
     /// The profile's model route, already validated against the configured
     /// providers and policy.
     #[must_use]
@@ -1424,9 +1500,16 @@ impl ConfigSnapshot {
     }
 
     /// Configured agent profiles by name, excluding the implicit `default`.
+    /// Pack-declared profiles are included beneath configured ones.
     #[must_use]
     pub const fn profiles(&self) -> &BTreeMap<String, AgentProfileConfig> {
         &self.profiles
+    }
+
+    /// Every admitted agent pack by id.
+    #[must_use]
+    pub const fn packs(&self) -> &BTreeMap<String, AgentPack> {
+        &self.packs
     }
 
     /// The named profile, or `None` for a name the configuration does not
@@ -1626,6 +1709,19 @@ pub enum ConfigError {
     InvalidProfileName(String),
     #[error("model route must use provider/model syntax: {0:?}")]
     InvalidModelRoute(String),
+    #[error("agent pack manifest {origin} declares unsupported schema {schema}; expected 1")]
+    UnsupportedPackSchema { origin: SourceIdentity, schema: u32 },
+    #[error("agent pack manifest {origin} is invalid: {message}")]
+    InvalidPack {
+        origin: SourceIdentity,
+        message: String,
+    },
+    #[error("more than {limit} agent packs are declared")]
+    TooManyPacks { limit: usize },
+    #[error("agent profile {profile:?} is declared by more than one pack: {packs}")]
+    PackProfileConflict { profile: String, packs: String },
+    #[error("explicitly declared agent pack {id:?} was not found at {path}")]
+    PackMissing { id: String, path: PathBuf },
     #[error("model route selects an unknown or disabled provider: {0}")]
     UnknownProvider(String),
     #[error("managed policy {rule} was violated: {message}")]

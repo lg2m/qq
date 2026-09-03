@@ -137,6 +137,16 @@ pub struct AgentProfileSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub approval_mode: ApprovalMode,
+    /// Set when the profile is declared by an agent pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<PackSummary>,
+}
+
+/// The agent pack behind a profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackSummary {
+    pub id: String,
+    pub version: String,
 }
 
 #[cfg(test)]

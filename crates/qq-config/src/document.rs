@@ -63,7 +63,13 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-struct UniqueMap<K: Ord, V>(BTreeMap<K, V>);
+pub(super) struct UniqueMap<K: Ord, V>(pub(super) BTreeMap<K, V>);
+
+impl<K: Ord, V> Default for UniqueMap<K, V> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
 
 impl<'de, K, V> Deserialize<'de> for UniqueMap<K, V>
 where
@@ -84,7 +90,7 @@ enum ClearMarker {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-enum Field<T> {
+pub(super) enum Field<T> {
     #[default]
     Missing,
     Set(T),
@@ -362,7 +368,7 @@ impl ProviderEntryPatch {
 /// deletes a server declared by an earlier layer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-enum McpServerPatch {
+pub(super) enum McpServerPatch {
     Stdio {
         command: String,
         #[serde(default)]
@@ -395,7 +401,7 @@ enum McpServerPatch {
 }
 
 impl McpServerPatch {
-    fn contains_literal_secret(&self) -> bool {
+    pub(super) fn contains_literal_secret(&self) -> bool {
         matches!(
             self,
             Self::Http {
@@ -492,8 +498,23 @@ pub(super) struct Document {
     mcp: Field<UniqueMap<String, McpServerPatch>>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     profiles: Field<UniqueMap<String, ProfilePatch>>,
+    /// Explicitly declared agent packs by id: a directory containing
+    /// `pack.ron`, or `Remove` to drop a pack an earlier layer declared or
+    /// discovered.
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    packs: Field<UniqueMap<String, PackPatch>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy: Option<PolicyPatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) enum PackPatch {
+    Pack {
+        /// Pack directory, absolute or relative to the declaring file.
+        path: String,
+    },
+    Remove,
 }
 
 /// One named agent profile: a bundle of per-session defaults selected by
@@ -591,7 +612,14 @@ impl Document {
             || self.reviewer_model.is_present()
             || self.providers.is_present()
             || self.mcp.is_present()
+            || self.packs.is_present()
             || self.policy.as_ref().is_some_and(PolicyPatch::has_grants)
+    }
+
+    /// Explicit pack declarations, for the loader to resolve against the
+    /// declaring file's directory.
+    pub(super) const fn packs(&self) -> &Field<UniqueMap<String, PackPatch>> {
+        &self.packs
     }
 
     pub(super) fn sensitive_digest(&self) -> Result<Option<String>, ConfigError> {
@@ -622,6 +650,8 @@ impl Document {
             #[serde(skip_serializing_if = "Option::is_none")]
             mcp: Option<&'a Field<UniqueMap<String, McpServerPatch>>>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            packs: Option<&'a Field<UniqueMap<String, PackPatch>>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             policy_grants: Option<GrantsProjection<'a>>,
         }
 
@@ -639,6 +669,7 @@ impl Document {
                 .then_some(&self.reviewer_model),
             providers: present(&self.providers),
             mcp: present(&self.mcp),
+            packs: present(&self.packs),
             policy_grants: self
                 .policy
                 .as_ref()
@@ -694,6 +725,12 @@ impl Document {
             touched.push(ConfigKey::Profiles);
             if let Field::Set(profiles) = &self.profiles {
                 touched.extend(profiles.0.keys().cloned().map(ConfigKey::Profile));
+            }
+        }
+        if self.packs.is_present() {
+            touched.push(ConfigKey::Packs);
+            if let Field::Set(packs) = &self.packs {
+                touched.extend(packs.0.keys().cloned().map(ConfigKey::Pack));
             }
         }
         if self.policy.is_some() {
@@ -1061,6 +1098,8 @@ pub(super) struct MergeState {
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
     profiles: BTreeMap<String, AgentProfileConfig>,
+    /// Packs admitted so far, by id. Later layers replace or remove by id.
+    packs: BTreeMap<String, crate::pack::AgentPack>,
     policy: EffectivePolicy,
     provenance: ConfigProvenance,
 }
@@ -1130,6 +1169,7 @@ impl MergeState {
                 providers,
                 mcp: BTreeMap::new(),
                 profiles: BTreeMap::new(),
+                packs: BTreeMap::new(),
                 policy: EffectivePolicy {
                     allow_shell_prefixes: VCS_READ_ONLY_PRESETS
                         .iter()
@@ -1181,6 +1221,24 @@ impl MergeState {
         }
     }
 
+    /// Adds or replaces a discovered or explicitly declared pack.
+    pub(super) fn admit_pack(&mut self, pack: crate::pack::AgentPack) {
+        self.provenance
+            .packs
+            .insert(pack.id().to_owned(), pack.source().clone());
+        self.packs.insert(pack.id().to_owned(), pack);
+    }
+
+    pub(super) fn remove_pack(&mut self, id: &str) {
+        self.packs.remove(id);
+        self.provenance.packs.remove(id);
+    }
+
+    pub(super) fn clear_packs(&mut self) {
+        self.packs.clear();
+        self.provenance.packs.clear();
+    }
+
     fn apply_profiles(
         &mut self,
         patch: &Field<UniqueMap<String, ProfilePatch>>,
@@ -1212,6 +1270,7 @@ impl MergeState {
                                     organization: organization.clone(),
                                     max_output_tokens: *max_output_tokens,
                                     approval_mode: *approval_mode,
+                                    pack: None,
                                 },
                             );
                             self.provenance
@@ -1379,71 +1438,76 @@ impl MergeState {
     }
 
     fn apply_mcp(&mut self, patch: &Field<UniqueMap<String, McpServerPatch>>) {
-        match patch {
-            Field::Missing => {}
-            Field::Clear => self.mcp.clear(),
-            Field::Set(patches) => {
-                for (name, patch) in &patches.0 {
-                    match patch {
-                        McpServerPatch::Remove => {
-                            self.mcp.remove(name);
-                        }
-                        McpServerPatch::Stdio {
-                            command,
-                            args,
-                            env,
-                            eager,
-                            allow,
-                            call_timeout_seconds,
-                            max_concurrent_calls,
-                        } => {
-                            self.mcp.insert(
-                                name.clone(),
-                                McpServerConfig::new(
-                                    McpTransport::Stdio {
-                                        command: command.clone(),
-                                        args: args.clone(),
-                                        env: env.clone(),
-                                    },
-                                    *eager,
-                                    allow.clone(),
-                                    call_timeout_seconds
-                                        .unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECONDS),
-                                    max_concurrent_calls
-                                        .unwrap_or(DEFAULT_MCP_MAX_CONCURRENT_CALLS),
-                                ),
-                            );
-                        }
-                        McpServerPatch::Http {
-                            url,
-                            bearer,
-                            eager,
-                            allow,
-                            call_timeout_seconds,
-                            max_concurrent_calls,
-                        } => {
-                            self.mcp.insert(
-                                name.clone(),
-                                McpServerConfig::new(
-                                    McpTransport::Http {
-                                        url: url.clone(),
-                                        bearer: bearer.clone(),
-                                    },
-                                    *eager,
-                                    allow.clone(),
-                                    call_timeout_seconds
-                                        .unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECONDS),
-                                    max_concurrent_calls
-                                        .unwrap_or(DEFAULT_MCP_MAX_CONCURRENT_CALLS),
-                                ),
-                            );
-                        }
+        apply_mcp_into(&mut self.mcp, patch);
+    }
+}
+
+fn apply_mcp_into(
+    mcp: &mut BTreeMap<String, McpServerConfig>,
+    patch: &Field<UniqueMap<String, McpServerPatch>>,
+) {
+    match patch {
+        Field::Missing => {}
+        Field::Clear => mcp.clear(),
+        Field::Set(patches) => {
+            for (name, patch) in &patches.0 {
+                match patch {
+                    McpServerPatch::Remove => {
+                        mcp.remove(name);
+                    }
+                    McpServerPatch::Stdio {
+                        command,
+                        args,
+                        env,
+                        eager,
+                        allow,
+                        call_timeout_seconds,
+                        max_concurrent_calls,
+                    } => {
+                        mcp.insert(
+                            name.clone(),
+                            McpServerConfig::new(
+                                McpTransport::Stdio {
+                                    command: command.clone(),
+                                    args: args.clone(),
+                                    env: env.clone(),
+                                },
+                                *eager,
+                                allow.clone(),
+                                call_timeout_seconds.unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECONDS),
+                                max_concurrent_calls.unwrap_or(DEFAULT_MCP_MAX_CONCURRENT_CALLS),
+                            ),
+                        );
+                    }
+                    McpServerPatch::Http {
+                        url,
+                        bearer,
+                        eager,
+                        allow,
+                        call_timeout_seconds,
+                        max_concurrent_calls,
+                    } => {
+                        mcp.insert(
+                            name.clone(),
+                            McpServerConfig::new(
+                                McpTransport::Http {
+                                    url: url.clone(),
+                                    bearer: bearer.clone(),
+                                },
+                                *eager,
+                                allow.clone(),
+                                call_timeout_seconds.unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECONDS),
+                                max_concurrent_calls.unwrap_or(DEFAULT_MCP_MAX_CONCURRENT_CALLS),
+                            ),
+                        );
                     }
                 }
             }
         }
     }
+}
 
+impl MergeState {
     fn provider_for_patch(&mut self, name: &str, kind: ProviderKind) -> &mut ProviderConfig {
         let provider = self.providers.entry(name.to_owned()).or_insert_with(|| {
             let mut provider = crate::providers::builtin(kind);
@@ -1519,10 +1583,60 @@ impl MergeState {
     }
 
     pub(super) fn finish(
-        self,
+        mut self,
         reports: Vec<SourceReport>,
         probed_paths: Vec<PathBuf>,
     ) -> Result<ConfigSnapshot, ConfigError> {
+        // Packs contribute beneath the configuration: their MCP servers join
+        // where the configuration declared none of that name, and their
+        // profiles join where no configured profile claims the name. Two
+        // packs claiming one profile name is an error rather than a silent
+        // winner; a configured profile shadowing a pack profile is allowed
+        // because the configuration is the operator's override lane.
+        let mut pack_profiles: BTreeMap<String, (String, AgentProfileConfig)> = BTreeMap::new();
+        for (pack_id, pack) in &self.packs {
+            for (name, patch) in pack.mcp() {
+                if !self.mcp.contains_key(name) {
+                    let mut patched = BTreeMap::new();
+                    patched.insert(name.clone(), patch.clone());
+                    let field = Field::Set(UniqueMap(patched));
+                    // Reuse the ordinary MCP application so validation and
+                    // defaults are identical to config-declared servers.
+                    let mut scratch = std::mem::take(&mut self.mcp);
+                    apply_mcp_into(&mut scratch, &field);
+                    self.mcp = scratch;
+                }
+            }
+            for (name, profile) in pack.profiles() {
+                if self.profiles.contains_key(name) {
+                    continue;
+                }
+                if let Some((other, _)) = pack_profiles.get(name) {
+                    return Err(ConfigError::PackProfileConflict {
+                        profile: name.clone(),
+                        packs: format!("{other}, {pack_id}"),
+                    });
+                }
+                pack_profiles.insert(
+                    name.clone(),
+                    (
+                        pack_id.clone(),
+                        AgentProfileConfig {
+                            model: profile.model().map(str::to_owned),
+                            organization: profile.organization().map(str::to_owned),
+                            max_output_tokens: profile.max_output_tokens(),
+                            approval_mode: profile.approval_mode(),
+                            pack: Some(crate::PackProfileRef::new(pack, profile.clone())),
+                        },
+                    ),
+                );
+            }
+        }
+        for (name, (pack_id, profile)) in pack_profiles {
+            let source = self.packs[&pack_id].source().clone();
+            self.profiles.insert(name.clone(), profile);
+            self.provenance.profiles.insert(name, source);
+        }
         let model = ModelRoute::parse(self.model.ok_or(ConfigError::ModelRequired)?)?;
         let worker_model = self.worker_model.map(ModelRoute::parse).transpose()?;
         let reviewer_model = self.reviewer_model.map(ModelRoute::parse).transpose()?;
@@ -1567,6 +1681,21 @@ impl MergeState {
             } else if let Some(cap) = profile.max_output_tokens {
                 enforce_policy(&self.policy, &model, cap, &self.providers)?;
             }
+            // A pack profile that names MCP servers must name declared ones.
+            if let Some(reference) = &profile.pack
+                && let Some(servers) = reference.profile.mcp()
+            {
+                for server in servers {
+                    if !self.mcp.contains_key(server) {
+                        return Err(ConfigError::InvalidPack {
+                            origin: self.packs[&reference.pack].source().clone(),
+                            message: format!(
+                                "profile {name:?} references undeclared MCP server {server:?}"
+                            ),
+                        });
+                    }
+                }
+            }
         }
         let grants = resolve_policy_grants(&self.policy, &self.mcp);
         Ok(ConfigSnapshot {
@@ -1578,6 +1707,7 @@ impl MergeState {
             providers: self.providers,
             mcp: self.mcp,
             profiles: self.profiles,
+            packs: self.packs,
             policy: self.policy,
             grants,
             reports,
