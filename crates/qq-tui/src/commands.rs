@@ -23,12 +23,23 @@ pub(crate) enum Command {
     NextLayout,
     PreviousLayout,
     ToggleToolDetail,
+    ToggleReasoning,
     ToggleSidebar,
     FocusParent,
     FocusFirstChild,
     FocusNextSibling,
     FocusPreviousSibling,
     FocusNextApproval,
+    /// Hold the composer text locally until the active run finishes.
+    QueueDraft,
+    /// Pull the newest locally queued draft back into the composer.
+    DequeueDraft,
+    /// Redirect the active run with the composer text. Present in the table
+    /// so surfaces can show it, but unavailable until the server advertises
+    /// steering (H3); `Submit` falls back to queueing meanwhile.
+    SteerRun,
+    /// Edit the draft in `$VISUAL` or `$EDITOR`.
+    OpenEditor,
     Quit,
 }
 
@@ -55,7 +66,7 @@ pub(crate) struct CommandSpec {
 }
 
 /// Presentation order is invocation frequency, not alphabetical.
-pub(crate) const COMMANDS: [CommandSpec; 20] = [
+pub(crate) const COMMANDS: [CommandSpec; 25] = [
     CommandSpec {
         command: Command::OpenModels,
         title: "choose a model",
@@ -148,6 +159,13 @@ pub(crate) const COMMANDS: [CommandSpec; 20] = [
         action: None,
     },
     CommandSpec {
+        command: Command::ToggleReasoning,
+        title: "toggle reasoning detail",
+        category: Category::View,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
         command: Command::ToggleSidebar,
         title: "toggle the session sidebar",
         category: Category::View,
@@ -187,6 +205,34 @@ pub(crate) const COMMANDS: [CommandSpec; 20] = [
         title: "jump to the next session awaiting approval",
         category: Category::Run,
         slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::QueueDraft,
+        title: "queue the draft until the run finishes",
+        category: Category::Run,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::DequeueDraft,
+        title: "edit the newest queued draft",
+        category: Category::Run,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::SteerRun,
+        title: "steer the active run with the draft",
+        category: Category::Run,
+        slash: &[],
+        action: None,
+    },
+    CommandSpec {
+        command: Command::OpenEditor,
+        title: "edit the draft in $EDITOR",
+        category: Category::System,
+        slash: &["/editor"],
         action: None,
     },
     CommandSpec {

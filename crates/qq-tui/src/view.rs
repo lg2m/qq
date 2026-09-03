@@ -19,7 +19,7 @@ use crossterm::{
     terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use qq_protocol::{
-    MessageId, MessageRole, MessageSnapshot, MessageState, SessionId, SessionStatus,
+    MessageId, MessageRole, MessageSnapshot, MessageState, RunId, SessionId, SessionStatus,
     ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
 };
 use unicode_width::UnicodeWidthChar;
@@ -455,6 +455,13 @@ impl<'a> VirtualBody<'a> {
 }
 
 impl FrameRenderer {
+    /// Forget the previous frame so the next draw repaints every row, after
+    /// something else (an external editor) wrote to the terminal.
+    pub(crate) fn invalidate(&mut self) {
+        self.previous.clear();
+        self.size = None;
+    }
+
     /// Render one frame for a terminal of `actual_size` columns and rows and
     /// return the bytes that bring the terminal from the previous frame to
     /// this one. Only changed rows are emitted unless the size changed.
@@ -518,9 +525,11 @@ impl FrameRenderer {
             .saturating_sub(fixed_chrome_rows)
             .saturating_sub(1)
             .max(1);
+        let draft_lines = queued_drafts(app, width);
         let composer_lines = composer(app, width, max_composer_rows);
         let body_height = height
             .saturating_sub(fixed_chrome_rows)
+            .saturating_sub(draft_lines.len())
             .saturating_sub(composer_lines.len());
         // The sidebar takes a fixed column on the right; the body renders in
         // what remains so its cache keys see one stable width per layout.
@@ -569,6 +578,7 @@ impl FrameRenderer {
         }
         lines.extend(body);
         lines.extend(status_lines);
+        lines.extend(draft_lines);
         lines.extend(composer_lines);
         lines.push(footer_context(app, width));
         lines.push(footer_workspace(app, width));
@@ -1092,6 +1102,13 @@ impl FrameRenderer {
                         &|call_id, width| child_rows(app, call_id, width),
                     ));
                     body.push_line(Line::default());
+                }
+                if first_of_run {
+                    let rows = reasoning_rows(app, message.session_id, message.run_id, width);
+                    if !rows.is_empty() {
+                        body.extend_owned(rows);
+                        body.push_line(Line::default());
+                    }
                 }
                 self.append_message(body, message, width);
                 if run_calls.len() > head {
@@ -2108,6 +2125,118 @@ fn pad_line(line: &mut Line, width: usize) {
     }
 }
 
+/// Rows for a run's provider-exposed reasoning. Collapsed: one line with the
+/// state and length, or the first sentence when there is room. Expanded: the
+/// bounded text laid out as plain prose under a dimmed rail. Empty when the
+/// run produced no reasoning.
+fn reasoning_rows(app: &App, session_id: SessionId, run_id: RunId, width: usize) -> Vec<Line> {
+    let Some(reasoning) = app
+        .sessions
+        .get(&session_id)
+        .and_then(|session| session.reasoning.get(&run_id))
+    else {
+        return Vec::new();
+    };
+    if reasoning.text.is_empty() && !reasoning.streaming {
+        return Vec::new();
+    }
+    let seconds = reasoning.ticks / 8;
+    let mut header = Line::styled(" ∴ ", muted());
+    if reasoning.streaming {
+        header.push(
+            format!(
+                "{} thinking… {seconds}s",
+                TOOL_SPINNER[app.animation_tick % TOOL_SPINNER.len()]
+            ),
+            muted().italic(),
+        );
+    } else {
+        header.push(format!("thought for {seconds}s"), muted().italic());
+    }
+    match app.reasoning_detail {
+        crate::app::ReasoningDetail::Collapsed => {
+            // First paragraph only: the collapsed row is a glance, not the text.
+            let first = reasoning.text.split("\n\n").next().unwrap_or_default();
+            let summary = preview(first, width.saturating_sub(header.width() + 12));
+            if !summary.is_empty() {
+                header.push(format!("  {summary}"), muted());
+            }
+            header.push("  Ctrl-R", muted().dim());
+            vec![truncate_line(header, width)]
+        }
+        crate::app::ReasoningDetail::Expanded => {
+            let mut rows = vec![truncate_line(header, width)];
+            let content_width = width.saturating_sub(3).max(1);
+            for paragraph in reasoning.text.split("\n\n") {
+                for line in paragraph.lines() {
+                    let safe = line
+                        .chars()
+                        .filter_map(terminal_safe_character)
+                        .collect::<String>();
+                    for wrapped in wrap_line(Line::styled(safe, muted().italic()), content_width) {
+                        let mut row = Line::styled(" ┆ ", muted().dim());
+                        for span in wrapped.spans {
+                            row.push(span.text, span.style);
+                        }
+                        rows.push(row);
+                    }
+                }
+            }
+            rows
+        }
+    }
+}
+
+/// Drafts held locally while the focused session runs, oldest first. Each
+/// takes one row; the newest is the one Alt-Up brings back.
+fn queued_drafts(app: &App, width: usize) -> Vec<Line> {
+    let Some(session_id) = app.focused else {
+        return Vec::new();
+    };
+    let drafts: Vec<&str> = app.queued_drafts(session_id).collect();
+    if drafts.is_empty() {
+        return Vec::new();
+    }
+    let count = drafts.len();
+    drafts
+        .into_iter()
+        .enumerate()
+        .map(|(index, draft)| {
+            let mut line = Line::styled(" ~ ", warning());
+            line.push(
+                if index + 1 == count {
+                    "queued  Alt-Up edits  "
+                } else {
+                    "queued  "
+                },
+                warning().dim(),
+            );
+            line.push(
+                preview(draft, width.saturating_sub(line.width())),
+                normal().dim(),
+            );
+            truncate_line(line, width)
+        })
+        .collect()
+}
+
+/// One logical composer line with paste placeholders styled as tokens so the
+/// user can tell them from typed text.
+fn composer_row(part: &str) -> Line {
+    let mut line = Line::default();
+    let mut rest = part;
+    while let Some(start) = rest.find("[Pasted #") {
+        let Some(len) = rest[start..].find(']') else {
+            break;
+        };
+        line.push(&rest[..start], normal());
+        line.push(&rest[start..=start + len], accent().italic());
+        rest = &rest[start + len + 1..];
+    }
+    line.push(rest, normal());
+    line
+}
+
 fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
     let max_rows = max_rows.max(1);
     let caret = if app.animation_tick.is_multiple_of(2) {
@@ -2135,7 +2264,7 @@ fn composer(app: &App, width: usize, max_rows: usize) -> Vec<Line> {
         let content_rows = if part.is_empty() {
             vec![Line::default()]
         } else {
-            wrap_line_chars(Line::styled(part, normal()), content_width)
+            wrap_line_chars(composer_row(part), content_width)
         };
         for (row_index, content) in content_rows.into_iter().enumerate() {
             let mut row = if line_index == 0 && row_index == 0 {
@@ -4426,11 +4555,82 @@ mod tests {
         assert_eq!(app.focused, Some(a), "siblings wrap");
         app.handle_terminal_event(key(KeyCode::Left));
         assert_eq!(app.focused, Some(c));
-        app.handle_terminal_event(key(KeyCode::Up));
+        // Esc walks up to the parent (Alt-Up belongs to the draft queue).
+        app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
         assert_eq!(app.focused, Some(root));
         // A lone root has no siblings; the key is a no-op.
         let (changed, _) = app.handle_terminal_event(key(KeyCode::Right));
         assert!(!changed);
         assert_eq!(app.focused, Some(root));
+    }
+
+    #[test]
+    fn reasoning_renders_collapsed_above_the_runs_message_and_expands_on_toggle() {
+        let mut app = app_with_messages(0);
+        app.sidebar = crate::app::Sidebar::Hidden;
+        let workspace_id = app.workspace_id.unwrap();
+        let session_id = app.focused.unwrap();
+        let run_id = RunId::from_bytes([0x66; 16]);
+        let mut sequence = 1;
+        let mut event = |event: SessionEvent| {
+            sequence += 1;
+            ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: StoreId::from_bytes([4; 16]),
+                    workspace_id,
+                    sequence,
+                },
+                session_id,
+                run_id: Some(run_id),
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event,
+            })
+        };
+        let kind = qq_protocol::ReasoningKind::Summary;
+        app.apply_client_update(event(SessionEvent::ReasoningStarted { run_id, kind }));
+        app.apply_client_update(event(SessionEvent::ReasoningDelta {
+            run_id,
+            kind,
+            text: "First consider the callers.\n\nThen the tests.".to_owned(),
+        }));
+        app.apply_client_update(event(SessionEvent::ReasoningCompleted { run_id, kind }));
+        app.apply_client_update(event(SessionEvent::AssistantMessageStarted {
+            message: MessageSnapshot {
+                id: MessageId::from_bytes([0x67; 16]),
+                session_id,
+                run_id,
+                turn_ordinal: 1,
+                role: MessageRole::Assistant,
+                state: MessageState::Streaming,
+                output: "The answer.".to_owned(),
+                refusal: String::new(),
+                created_at_ms: 1,
+            },
+        }));
+
+        let rows = frame_rows(&transcript_lines(&app, 80));
+        let reasoning_row = rows
+            .iter()
+            .position(|row| row.contains("thought for"))
+            .expect("collapsed reasoning row");
+        let message_row = rows.iter().position(|row| row.contains("QQ")).unwrap();
+        assert!(reasoning_row < message_row, "{rows:?}");
+        assert!(rows[reasoning_row].contains("First consider the callers."));
+        assert!(!rows.iter().any(|row| row.contains("Then the tests.")));
+        // Reasoning never leaks into the assistant message body.
+        assert!(
+            !app.sessions[&session_id].messages.as_ref().unwrap()[0]
+                .output
+                .contains("consider")
+        );
+
+        app.execute(crate::commands::Command::ToggleReasoning);
+        let rows = frame_rows(&transcript_lines(&app, 80));
+        assert!(rows.iter().any(|row| row.contains("Then the tests.")));
+        assert!(rows.iter().any(|row| row.contains("┆")));
     }
 }

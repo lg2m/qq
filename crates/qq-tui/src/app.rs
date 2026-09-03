@@ -40,6 +40,10 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 /// Notices are deliberately ephemeral. At the 125 ms UI tick this keeps each
 /// notice visible for five seconds without making it permanent UI.
 const NOTICE_TICKS: u16 = 40;
+/// Locally queued drafts per session.
+const MAX_QUEUED_DRAFTS: usize = 8;
+/// Animation ticks (125 ms) within which a second Esc cancels the active run.
+const ESC_CANCEL_TICKS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoticeLevel {
@@ -98,6 +102,40 @@ const WARM_BODY_LIMIT: usize = 8;
 /// Bytes of assistant text retained per session for the live status tail.
 const LIVE_TAIL_BYTES: usize = 256;
 
+/// Bytes of reasoning text retained per run.
+const MAX_REASONING_BYTES: usize = 16 * 1024;
+
+/// One run's displayable reasoning: text accumulated from `ReasoningDelta`
+/// events plus whether the block is still streaming.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Reasoning {
+    pub text: String,
+    pub streaming: bool,
+    /// Animation ticks observed while streaming, for an elapsed label.
+    pub ticks: usize,
+}
+
+impl Reasoning {
+    fn append(&mut self, text: &str) {
+        self.text.push_str(text);
+        if self.text.len() > MAX_REASONING_BYTES {
+            let mut start = self.text.len() - MAX_REASONING_BYTES;
+            while !self.text.is_char_boundary(start) {
+                start += 1;
+            }
+            self.text.drain(..start);
+        }
+    }
+}
+
+/// Whether reasoning blocks render as a collapsed one-liner or in full.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReasoningDetail {
+    #[default]
+    Collapsed,
+    Expanded,
+}
+
 /// Cheap per-session liveness reduced from every event, whether or not the
 /// session's transcript body is loaded. This is what a sidebar or session
 /// list shows for the sessions the user is not looking at.
@@ -126,6 +164,9 @@ pub(crate) struct SessionView {
     /// summary on load and replaced by `RunActivityChanged` events.
     pub activity: Option<(RunId, RunActivity)>,
     pub live: LiveStatus,
+    /// Provider-exposed reasoning per run, bounded, kept only for runs whose
+    /// messages are loaded. Display-only: never fed back to the model.
+    pub reasoning: HashMap<RunId, Reasoning>,
     /// Focus clock at the last time this session was focused; orders warm
     /// body eviction. Zero for never-focused sessions.
     pub(crate) last_focused: u64,
@@ -146,6 +187,7 @@ impl SessionView {
             context_window,
             activity,
             live: LiveStatus::default(),
+            reasoning: HashMap::new(),
             last_focused: 0,
             loaded_through,
         }
@@ -359,6 +401,18 @@ pub(crate) struct App {
     /// Cursor into the slash autocomplete list. The query is the composer
     /// text itself, so only the cursor lives here.
     slash: Picker,
+    /// Drafts held locally (Alt-Enter) while the focused session runs; they
+    /// submit in order when it goes idle. Bounded by [`MAX_QUEUED_DRAFTS`].
+    drafts: HashMap<SessionId, VecDeque<String>>,
+    /// Tick at which Esc was last pressed with nothing to dismiss; a second
+    /// press within [`ESC_CANCEL_TICKS`] cancels the active run.
+    esc_armed_at: Option<usize>,
+    /// Set when the user asked to edit the draft externally. The loop takes
+    /// it, suspends the terminal, runs the editor, and hands the text back.
+    editor_requested: bool,
+    /// Server capability gate for `Command::SteerRun`; false until the
+    /// capability document exists.
+    steering_available: bool,
     pub connection: ConnectionState,
     pub status: Option<String>,
     /// Session owning the current transient notice. A notice never follows
@@ -369,6 +423,7 @@ pub(crate) struct App {
     pub animation_tick: usize,
     pub quit: bool,
     pub tool_detail: ToolDetail,
+    pub reasoning_detail: ReasoningDetail,
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
     /// enough; the toggle command cycles through explicit on and off.
     pub sidebar: Sidebar,
@@ -407,6 +462,10 @@ impl App {
             history_position: None,
             history_draft: None,
             slash: Picker::new(),
+            drafts: HashMap::new(),
+            esc_armed_at: None,
+            editor_requested: false,
+            steering_available: false,
             connection: ConnectionState::Connecting,
             status: None,
             status_session_id: None,
@@ -415,6 +474,7 @@ impl App {
             animation_tick: 0,
             quit: false,
             tool_detail: ToolDetail::default(),
+            reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
             transcript_viewport: TranscriptViewport::default(),
             last_sequence: 0,
@@ -441,6 +501,43 @@ impl App {
 
     pub fn take_requests(&mut self) -> Vec<ClientRequest> {
         std::mem::take(&mut self.queued_requests)
+    }
+
+    /// Whether the user asked for an external editor since the last call.
+    /// Returns the current expanded draft to seed the editor with.
+    pub fn take_editor_request(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.editor_requested) {
+            return None;
+        }
+        Some(self.composer.expanded())
+    }
+
+    /// The external editor could not deliver text; the draft stays as it was.
+    pub fn note_editor_failure(&mut self, reason: &str) {
+        self.set_warning(reason.to_owned());
+    }
+
+    /// Install text returned by the external editor. `None` means it exited
+    /// without changing the draft.
+    pub fn apply_editor_result(&mut self, text: Option<String>) -> bool {
+        let Some(text) = text else {
+            self.set_info("external editor made no changes".to_owned());
+            return true;
+        };
+        let mut sanitized = String::with_capacity(text.len().min(MAX_INPUT_BYTES));
+        for character in text.chars() {
+            if sanitized.len() + character.len_utf8() > MAX_INPUT_BYTES {
+                break;
+            }
+            if let Some(character) = composer_character(character) {
+                sanitized.push(character);
+            }
+        }
+        let trimmed = sanitized.trim_end().to_owned();
+        self.composer.replace(trimmed);
+        self.reset_history_browse();
+        self.slash.select(0);
+        true
     }
 
     pub fn apply_client_update(&mut self, update: ClientUpdate) -> bool {
@@ -953,6 +1050,23 @@ impl App {
             let changed = self.push_input('\n');
             return (changed, Vec::new());
         }
+        // Ctrl-Enter (or Ctrl-Q where the terminal cannot report it) queues
+        // the draft explicitly instead of sending it.
+        if (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (matches!(key.code, KeyCode::Char('q' | 'Q'))
+                && key.modifiers == KeyModifiers::CONTROL)
+        {
+            return self.execute(Command::QueueDraft);
+        }
+        if key.code == KeyCode::Up && key.modifiers == KeyModifiers::ALT {
+            return self.execute(Command::DequeueDraft);
+        }
+        if matches!(key.code, KeyCode::Char('e' | 'E')) && key.modifiers == KeyModifiers::ALT {
+            return self.execute(Command::OpenEditor);
+        }
+        if key.code != KeyCode::Esc {
+            self.esc_armed_at = None;
+        }
         if let Some(result) = self.handle_slash_key(key.code) {
             return result;
         }
@@ -972,15 +1086,20 @@ impl App {
             return self.execute(Command::ToggleSidebar);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('r' | 'R'))
+        {
+            return self.execute(Command::ToggleReasoning);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('g' | 'G'))
         {
             return self.execute(Command::FocusNextApproval);
         }
-        // Alt-arrows walk the session tree: up to the parent, down to the
-        // first child, left and right across siblings in spawn order.
+        // Alt-arrows walk the session tree: down to the first child, left and
+        // right across siblings in spawn order. Alt-Up dequeues a draft (see
+        // above); Esc reaches the parent.
         if key.modifiers == KeyModifiers::ALT {
             let command = match key.code {
-                KeyCode::Up => Some(Command::FocusParent),
                 KeyCode::Down => Some(Command::FocusFirstChild),
                 KeyCode::Left => Some(Command::FocusPreviousSibling),
                 KeyCode::Right => Some(Command::FocusNextSibling),
@@ -1001,6 +1120,25 @@ impl App {
                     self.status = None;
                     return (true, Vec::new());
                 }
+                // While a run is active, Esc twice within a short window cancels
+                // it; the first press only arms and shows the hint.
+                let running = self
+                    .focused
+                    .and_then(|id| self.sessions.get(&id))
+                    .is_some_and(|session| session.summary.active_run_id.is_some());
+                if running {
+                    let now = self.animation_tick;
+                    if self
+                        .esc_armed_at
+                        .is_some_and(|armed| now.wrapping_sub(armed) <= ESC_CANCEL_TICKS)
+                    {
+                        self.esc_armed_at = None;
+                        return self.cancel_run();
+                    }
+                    self.esc_armed_at = Some(now);
+                    self.set_info("press Esc again to cancel the run".to_owned());
+                    return (true, Vec::new());
+                }
                 if let Some(parent) = self
                     .focused
                     .and_then(|focused| self.sessions.get(&focused)?.summary.parent_id)
@@ -1018,6 +1156,18 @@ impl App {
                 let changed = self.scroll_transcript_down(self.transcript_viewport.height);
                 (changed, Vec::new())
             }
+            KeyCode::Backspace
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                let changed = self.composer.kill_word_back();
+                if changed {
+                    self.reset_history_browse();
+                    self.slash.select(0);
+                }
+                (changed, Vec::new())
+            }
             KeyCode::Backspace => {
                 let changed = self.composer.backspace();
                 if changed {
@@ -1033,8 +1183,33 @@ impl App {
                 }
                 (changed, Vec::new())
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                (self.composer.move_word_left(), Vec::new())
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                (self.composer.move_word_right(), Vec::new())
+            }
             KeyCode::Left => (self.composer.move_left(), Vec::new()),
             KeyCode::Right => (self.composer.move_right(), Vec::new()),
+            KeyCode::Home => (self.composer.move_line_start(), Vec::new()),
+            KeyCode::End => (self.composer.move_line_end(), Vec::new()),
+            KeyCode::Char(character) if key.modifiers == KeyModifiers::CONTROL => {
+                let changed = match character.to_ascii_lowercase() {
+                    'a' => self.composer.move_line_start(),
+                    'e' => self.composer.move_line_end(),
+                    'w' => self.composer.kill_word_back(),
+                    'k' => self.composer.kill_to_line_end(),
+                    'u' => self.composer.kill_to_line_start(),
+                    'y' => self.composer.yank(),
+                    'z' | '_' => self.composer.undo(),
+                    _ => return (false, Vec::new()),
+                };
+                if changed {
+                    self.reset_history_browse();
+                    self.slash.select(0);
+                }
+                (changed, Vec::new())
+            }
             KeyCode::Up => {
                 let changed = self.composer.move_up() || self.browse_prompt_history(false);
                 (changed, Vec::new())
@@ -1159,6 +1334,13 @@ impl App {
                 self.tool_detail = self.tool_detail.next();
                 (true, Vec::new())
             }
+            Command::ToggleReasoning => {
+                self.reasoning_detail = match self.reasoning_detail {
+                    ReasoningDetail::Collapsed => ReasoningDetail::Expanded,
+                    ReasoningDetail::Expanded => ReasoningDetail::Collapsed,
+                };
+                (true, Vec::new())
+            }
             Command::ToggleSidebar => {
                 self.sidebar = self.sidebar.next();
                 (true, Vec::new())
@@ -1185,6 +1367,26 @@ impl App {
                 Some(sibling) => self.focus_session(sibling),
                 None => (false, Vec::new()),
             },
+            Command::OpenEditor => {
+                self.editor_requested = true;
+                (true, Vec::new())
+            }
+            Command::QueueDraft => self.queue_draft(),
+            Command::DequeueDraft => self.dequeue_draft(),
+            Command::SteerRun => {
+                if self.steering_available {
+                    // H3 supplies the steering command; until then the flag
+                    // is never set, so this arm is unreachable in practice.
+                    self.set_warning("steering is not wired to a protocol command yet".to_owned());
+                } else {
+                    self.set_warning(
+                        "this server does not support steering; the draft was queued instead"
+                            .to_owned(),
+                    );
+                    return self.queue_draft();
+                }
+                (true, Vec::new())
+            }
             Command::FocusNextApproval => match self.next_session_awaiting_approval() {
                 Some(session_id) => self.focus_session(session_id),
                 None => {
@@ -1670,7 +1872,7 @@ impl App {
     }
 
     fn submit_prompt(&mut self) -> (bool, Vec<ClientRequest>) {
-        let prompt = self.composer.text.trim().to_owned();
+        let prompt = self.composer.expanded().trim().to_owned();
         if prompt.is_empty() {
             return (false, Vec::new());
         }
@@ -1690,6 +1892,24 @@ impl App {
             self.set_warning("create a session before sending a prompt".to_owned());
             return (true, Vec::new());
         };
+        // Enter during an active run steers when the server supports it and
+        // otherwise holds the draft locally until the run finishes. Sending
+        // it to the server queue now would lose the ability to edit it.
+        let running = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.summary.active_run_id.is_some());
+        if running {
+            if self.steering_available {
+                return self.execute(Command::SteerRun);
+            }
+            return self.queue_draft();
+        }
+        self.submit_text(session_id, prompt)
+    }
+
+    /// Send `prompt` to `session_id` as a new run.
+    fn submit_text(&mut self, session_id: SessionId, prompt: String) -> (bool, Vec<ClientRequest>) {
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
             return (true, Vec::new());
@@ -1719,6 +1939,85 @@ impl App {
                 },
             })],
         )
+    }
+
+    /// Hold the composer text for the focused session until its run ends.
+    fn queue_draft(&mut self) -> (bool, Vec<ClientRequest>) {
+        let prompt = self.composer.expanded().trim().to_owned();
+        if prompt.is_empty() {
+            return (false, Vec::new());
+        }
+        let Some(session_id) = self.focused else {
+            self.set_warning("create a session before queueing a prompt".to_owned());
+            return (true, Vec::new());
+        };
+        let drafts = self.drafts.entry(session_id).or_default();
+        if drafts.len() >= MAX_QUEUED_DRAFTS {
+            self.set_warning(format!(
+                "at most {MAX_QUEUED_DRAFTS} drafts can wait per session"
+            ));
+            return (true, Vec::new());
+        }
+        drafts.push_back(prompt);
+        self.composer.clear();
+        self.reset_history_browse();
+        self.slash.select(0);
+        (true, Vec::new())
+    }
+
+    /// Pull the newest queued draft back into the composer for editing. A
+    /// non-empty composer is queued first so nothing is lost.
+    fn dequeue_draft(&mut self) -> (bool, Vec<ClientRequest>) {
+        let Some(session_id) = self.focused else {
+            return (false, Vec::new());
+        };
+        if !self.composer.text.is_empty() {
+            let (changed, _) = self.queue_draft();
+            if !changed {
+                return (false, Vec::new());
+            }
+            // The draft just queued is newest; rotate so the previously
+            // newest one comes back.
+            if let Some(drafts) = self.drafts.get_mut(&session_id)
+                && drafts.len() > 1
+                && let Some(just_queued) = drafts.pop_back()
+            {
+                drafts.push_front(just_queued);
+            }
+        }
+        let Some(draft) = self
+            .drafts
+            .get_mut(&session_id)
+            .and_then(VecDeque::pop_back)
+        else {
+            return (false, Vec::new());
+        };
+        self.composer.replace(draft);
+        (true, Vec::new())
+    }
+
+    /// Drafts waiting for `session_id` in submission order.
+    pub(crate) fn queued_drafts(&self, session_id: SessionId) -> impl Iterator<Item = &str> {
+        self.drafts
+            .get(&session_id)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    }
+
+    /// Submit the oldest waiting draft once the session goes idle. Called by
+    /// the reducer on `RunFinished`; one draft per run so each becomes its
+    /// own run in order.
+    pub(super) fn flush_draft(&mut self, session_id: SessionId) {
+        let Some(draft) = self
+            .drafts
+            .get_mut(&session_id)
+            .and_then(VecDeque::pop_front)
+        else {
+            return;
+        };
+        let (_, requests) = self.submit_text(session_id, draft);
+        self.queued_requests.extend(requests);
     }
 
     fn record_prompt(&mut self, session_id: SessionId, prompt: &str) {
@@ -1911,17 +2210,22 @@ impl App {
         true
     }
 
+    /// Insert pasted text. The sanitized content goes through the composer's
+    /// paste path, which collapses large pastes to a placeholder; the byte
+    /// bound applies to the expanded content so a placeholder cannot hide an
+    /// oversized prompt.
     fn push_composer_text(&mut self, text: &str) -> bool {
-        let before = self.composer.text.len();
+        let mut sanitized = String::with_capacity(text.len().min(MAX_INPUT_BYTES));
+        let budget = MAX_INPUT_BYTES.saturating_sub(self.composer.expanded().len());
         for character in text.chars() {
-            if self.composer.text.len() + character.len_utf8() > MAX_INPUT_BYTES {
+            if sanitized.len() + character.len_utf8() > budget {
                 break;
             }
             if let Some(character) = composer_character(character) {
-                self.composer.insert(character);
+                sanitized.push(character);
             }
         }
-        let changed = self.composer.text.len() != before;
+        let changed = self.composer.paste(&sanitized);
         if changed {
             self.reset_history_browse();
             self.slash.select(0);
@@ -1975,6 +2279,13 @@ impl App {
 
     pub fn advance_animation(&mut self) -> bool {
         self.animation_tick = self.animation_tick.wrapping_add(1);
+        for session in self.sessions.values_mut() {
+            for reasoning in session.reasoning.values_mut() {
+                if reasoning.streaming {
+                    reasoning.ticks += 1;
+                }
+            }
+        }
         let active = self
             .sessions
             .values()
@@ -2352,10 +2663,17 @@ mod tests {
     fn paste_preserves_newlines_in_the_composer() {
         let mut app = App::new(TuiOptions::default());
         let (changed, requests) =
-            app.handle_terminal_event(Event::Paste("alpha\r\nbeta\ngamma".to_owned()));
+            app.handle_terminal_event(Event::Paste("alpha\r\nbeta".to_owned()));
         assert!(changed);
         assert!(requests.is_empty());
-        assert_eq!(app.composer.text, "alpha\nbeta\ngamma");
+        assert_eq!(app.composer.text, "alpha\nbeta");
+
+        // Three or more lines collapse to a placeholder; the submitted prompt
+        // carries the real content with CRLF normalized.
+        app.composer.clear();
+        app.handle_terminal_event(Event::Paste("alpha\r\nbeta\ngamma".to_owned()));
+        assert_eq!(app.composer.text, "[Pasted #1 3 lines]");
+        assert_eq!(app.composer.expanded(), "alpha\nbeta\ngamma");
     }
 
     #[test]
@@ -2838,6 +3156,7 @@ mod tests {
                 "/agents",
                 "/new",
                 "/compact",
+                "/editor",
                 "/quit",
                 "/exit"
             ]
@@ -2845,7 +3164,7 @@ mod tests {
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        assert_eq!(app.slash_selected(usize::MAX), 7);
+        assert_eq!(app.slash_selected(usize::MAX), 8);
         for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
@@ -4596,5 +4915,152 @@ mod tests {
         // /sessions lists everything.
         app.execute(Command::OpenSessions);
         assert_eq!(app.filtered_sessions().len(), 4);
+    }
+
+    /// A snapshot whose one session is mid-run, plus the envelope builder for
+    /// follow-up events on it.
+    fn running_app() -> (
+        App,
+        SessionId,
+        RunId,
+        impl FnMut(SessionEvent) -> ClientUpdate,
+    ) {
+        let mut app = App::new(TuiOptions::default());
+        let mut initial = snapshot();
+        let workspace_id = initial.workspace.id;
+        let session_id = initial.sessions[0].id;
+        let run_id = id(0x90, RunId::from_bytes);
+        for summary in initial
+            .sessions
+            .iter_mut()
+            .chain(initial.focused.iter_mut().map(|body| &mut body.summary))
+        {
+            summary.status = SessionStatus::Running;
+            summary.active_run_id = Some(run_id);
+        }
+        app.apply_snapshot(initial);
+        let mut sequence = 1;
+        let event = move |event: SessionEvent| {
+            sequence += 1;
+            ClientUpdate::Event(SessionEventEnvelope {
+                cursor: EventCursor {
+                    store_id: id(3, StoreId::from_bytes),
+                    workspace_id,
+                    sequence,
+                },
+                session_id,
+                run_id: Some(run_id),
+                caused_by: None,
+                occurred_at_ms: sequence,
+                event,
+            })
+        };
+        (app, session_id, run_id, event)
+    }
+
+    #[test]
+    fn enter_during_a_run_queues_the_draft_and_it_submits_when_the_run_ends() {
+        let (mut app, session_id, run_id, mut event) = running_app();
+        app.composer.text = "follow up".to_owned();
+        let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(changed);
+        assert!(
+            requests.is_empty(),
+            "nothing is sent while the run is active"
+        );
+        assert!(app.composer.text.is_empty());
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["follow up"]
+        );
+
+        // Ctrl-Enter queues explicitly as well; drafts keep order.
+        app.composer.text = "second".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["follow up", "second"]
+        );
+
+        // Alt-Up brings the newest back for editing.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(app.composer.text, "second");
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["follow up"]
+        );
+        app.composer.clear();
+
+        // The run finishes idle: the oldest draft becomes the next run.
+        let mut summary = app.sessions[&session_id].summary.clone();
+        summary.status = SessionStatus::Idle;
+        summary.active_run_id = None;
+        app.apply_client_update(event(SessionEvent::RunFinished {
+            session: summary,
+            run_id,
+            outcome: RunOutcome::Completed,
+            usage: None,
+            context_tokens: None,
+        }));
+        let requests = app.take_requests();
+        assert!(matches!(
+            requests.as_slice(),
+            [ClientRequest::Command(CommandRequest {
+                command: SessionCommand::SubmitPrompt { prompt, .. },
+                ..
+            })] if prompt == "follow up"
+        ));
+        assert!(app.queued_drafts(session_id).next().is_none());
+    }
+
+    #[test]
+    fn esc_twice_cancels_the_active_run_but_once_only_arms() {
+        let (mut app, session_id, run_id, _) = running_app();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let (changed, requests) = app.handle_key(esc);
+        assert!(changed);
+        assert!(requests.is_empty());
+        assert!(app.status.as_deref().unwrap().contains("Esc again"));
+
+        // Typing disarms.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let (_, requests) = app.handle_key(esc);
+        assert!(requests.is_empty(), "disarmed by intervening input");
+
+        let (_, requests) = app.handle_key(esc);
+        assert!(matches!(
+            requests.as_slice(),
+            [ClientRequest::Command(CommandRequest {
+                command: SessionCommand::CancelRun { run_id: cancelled },
+                ..
+            })] if *cancelled == run_id
+        ));
+        assert!(app.sessions[&session_id].summary.active_run_id.is_some());
+
+        // Too slow: the arm expires.
+        let (_, _) = app.handle_key(esc);
+        for _ in 0..=ESC_CANCEL_TICKS {
+            app.advance_animation();
+        }
+        let (_, requests) = app.handle_key(esc);
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn steer_falls_back_to_queueing_until_the_server_advertises_it() {
+        let (mut app, session_id, _, _) = running_app();
+        app.composer.text = "go left".to_owned();
+        let (_, requests) = app.execute(Command::SteerRun);
+        assert!(requests.is_empty());
+        assert_eq!(
+            app.queued_drafts(session_id).collect::<Vec<_>>(),
+            ["go left"]
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("does not support steering")
+        );
     }
 }

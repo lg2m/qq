@@ -63,12 +63,38 @@ impl App {
                     session.activity = Some((*run_id, *activity));
                 }
             }
-            // Reasoning has its own display channel. Until that channel is
-            // rendered, these events still update liveness via
-            // RunActivityChanged and must not enter the assistant transcript.
-            SessionEvent::ReasoningStarted { .. }
-            | SessionEvent::ReasoningDelta { .. }
-            | SessionEvent::ReasoningCompleted { .. } => {}
+            // Reasoning is display-only and must never enter the assistant
+            // transcript. It accumulates per run for warm sessions so the
+            // collapsed row above the run's message can expand on demand.
+            SessionEvent::ReasoningStarted { run_id, .. } => {
+                if let Some(session) = self
+                    .sessions
+                    .get_mut(&envelope.session_id)
+                    .filter(|session| session.is_warm())
+                {
+                    session.reasoning.entry(*run_id).or_default().streaming = true;
+                }
+            }
+            SessionEvent::ReasoningDelta { run_id, text, .. } => {
+                if let Some(session) = self
+                    .sessions
+                    .get_mut(&envelope.session_id)
+                    .filter(|session| session.is_warm())
+                {
+                    let reasoning = session.reasoning.entry(*run_id).or_default();
+                    reasoning.streaming = true;
+                    reasoning.append(text);
+                }
+            }
+            SessionEvent::ReasoningCompleted { run_id, .. } => {
+                if let Some(reasoning) = self
+                    .sessions
+                    .get_mut(&envelope.session_id)
+                    .and_then(|session| session.reasoning.get_mut(run_id))
+                {
+                    reasoning.streaming = false;
+                }
+            }
             SessionEvent::AssistantMessageStarted { message } => {
                 // A new turn's message means every earlier turn of the run
                 // has committed; the server finalized those messages inside
@@ -210,6 +236,21 @@ impl App {
                     view.live.active_tool = None;
                     view.live.awaiting_approval.clear();
                 }
+                if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
+                    if let Some(reasoning) = view.reasoning.get_mut(run_id) {
+                        reasoning.streaming = false;
+                    }
+                    // Reasoning for runs whose messages were trimmed away is
+                    // unreachable from the transcript; drop it.
+                    if let Some(messages) = view.messages.as_ref() {
+                        let retained: std::collections::HashSet<_> =
+                            messages.iter().map(|message| message.run_id).collect();
+                        view.reasoning.retain(|run, _| retained.contains(run));
+                    }
+                }
+                if session.active_run_id.is_none() && session.queued_prompts == 0 {
+                    self.flush_draft(envelope.session_id);
+                }
                 if let Some(messages) = self
                     .sessions
                     .get_mut(&envelope.session_id)
@@ -276,6 +317,7 @@ impl App {
         if !self.sessions.contains_key(&session_id) {
             return;
         }
+        self.drafts.remove(&session_id);
         let refocus = if self.focused == Some(session_id) {
             let order = self.thread_order();
             order

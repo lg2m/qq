@@ -45,10 +45,82 @@ where
     let _terminal = TerminalGuard::enter()?;
     let events = EventStream::new();
     let output = tokio::io::stdout();
-    run_loop(client, app, events, output, terminal::size, shutdown)
-        .await
-        .map(drop)
+    run_loop(
+        client,
+        app,
+        events,
+        output,
+        terminal::size,
+        shutdown,
+        external_editor,
+    )
+    .await
+    .map(drop)
 }
+
+/// Edit `draft` in `$VISUAL` or `$EDITOR`. The terminal leaves raw mode and
+/// its input modes for the editor's lifetime; the caller redraws afterwards.
+/// Runs on the blocking pool because the editor owns the TTY until it exits.
+/// `None` means the editor was unavailable, failed, or left the text
+/// unchanged.
+fn external_editor(draft: String) -> EditorFuture {
+    Box::pin(async move {
+        let Some(command) = std::env::var_os("VISUAL")
+            .or_else(|| std::env::var_os("EDITOR"))
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(EditorError::NotConfigured);
+        };
+        let mut output = stdout();
+        // Leave the alternate-screen chrome intact but hand the TTY over.
+        let _ = disable_input_modes(&mut output);
+        let _ = execute!(output, Show);
+        let _ = terminal::disable_raw_mode();
+        let result = tokio::task::spawn_blocking(move || {
+            let file = tempfile::Builder::new()
+                .prefix("qq-draft-")
+                .suffix(".md")
+                .tempfile()
+                .map_err(EditorError::Io)?;
+            std::fs::write(file.path(), &draft).map_err(EditorError::Io)?;
+            // `$EDITOR` may carry arguments (`code --wait`); split on
+            // whitespace, which matches how shells treat the variable.
+            let command = command.to_string_lossy();
+            let mut parts = command.split_whitespace();
+            let program = parts.next().ok_or(EditorError::NotConfigured)?;
+            let status = std::process::Command::new(program)
+                .args(parts)
+                .arg(file.path())
+                .status()
+                .map_err(EditorError::Io)?;
+            if !status.success() {
+                return Err(EditorError::Exited(status.code()));
+            }
+            let edited = std::fs::read_to_string(file.path()).map_err(EditorError::Io)?;
+            Ok((edited != draft).then_some(edited))
+        })
+        .await
+        .unwrap_or(Err(EditorError::NotConfigured));
+        let _ = terminal::enable_raw_mode();
+        let _ = enable_input_modes(&mut output);
+        let _ = execute!(output, Hide, Clear(ClearType::All), MoveTo(0, 0));
+        result
+    })
+}
+
+/// Why an external edit produced no text.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EditorError {
+    #[error("set $VISUAL or $EDITOR to edit the draft externally")]
+    NotConfigured,
+    #[error("the editor exited with status {}", .0.map_or("unknown".to_owned(), |code| code.to_string()))]
+    Exited(Option<i32>),
+    #[error("the editor could not run: {0}")]
+    Io(io::Error),
+}
+
+pub(crate) type EditorFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<Option<String>, EditorError>> + Send>>;
 
 /// When the next frame is drawn relative to pending state changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,13 +140,14 @@ enum Redraw {
 ///
 /// `size` is queried once at start and again after each `Resize` event rather
 /// than every frame.
-pub(crate) async fn run_loop<P, E, W, S, F>(
+pub(crate) async fn run_loop<P, E, W, S, F, X>(
     mut client: P,
     mut app: App,
     mut terminal_events: E,
     mut output: W,
     mut size: S,
     shutdown: F,
+    mut editor: X,
 ) -> Result<App, TuiError>
 where
     P: ClientPort,
@@ -82,6 +155,7 @@ where
     W: AsyncWrite + Unpin,
     S: FnMut() -> io::Result<(u16, u16)>,
     F: Future<Output = io::Result<()>>,
+    X: FnMut(String) -> EditorFuture,
 {
     tokio::pin!(shutdown);
     let mut renderer = FrameRenderer::default();
@@ -93,6 +167,22 @@ where
     let mut redraw = Redraw::Immediate;
 
     loop {
+        // An external edit owns the terminal until it returns; nothing else
+        // can usefully happen meanwhile, so it runs inline here rather than
+        // as a select arm. Client updates queue in the channel and drain
+        // afterwards.
+        if let Some(draft) = app.take_editor_request() {
+            match editor(draft).await {
+                Ok(text) => {
+                    app.apply_editor_result(text);
+                }
+                Err(error) => {
+                    app.note_editor_failure(&error.to_string());
+                }
+            }
+            renderer.invalidate();
+            redraw = Redraw::Immediate;
+        }
         if redraw == Redraw::Immediate {
             let bytes = renderer.draw(&mut app, terminal_size)?;
             output.write_all(&bytes).await?;
@@ -340,11 +430,15 @@ mod tests {
         }
     }
 
+    /// Next scripted editor outcome, plus every draft the loop handed over.
+    type EditorScript = Arc<Mutex<(Option<Result<Option<String>, EditorError>>, Vec<String>)>>;
+
     struct Harness {
         updates: mpsc::UnboundedSender<ClientUpdate>,
         events: mpsc::UnboundedSender<io::Result<Event>>,
         sent: Arc<Mutex<Vec<ClientRequest>>>,
         frames: FrameLog,
+        editor_script: EditorScript,
         port: Option<FakePort>,
         event_stream: Option<EventQueue>,
     }
@@ -359,6 +453,7 @@ mod tests {
                 events,
                 sent: Arc::clone(&sent),
                 frames: FrameLog::default(),
+                editor_script: Arc::new(Mutex::new((None, Vec::new()))),
                 port: Some(FakePort {
                     updates: update_rx,
                     sent,
@@ -385,6 +480,7 @@ mod tests {
             let port = self.port.take().expect("harness runs once");
             let events = self.event_stream.take().expect("harness runs once");
             let frames = self.frames.clone();
+            let scripted = std::sync::Arc::clone(&self.editor_script);
             tokio::spawn(run_loop(
                 port,
                 app,
@@ -392,6 +488,14 @@ mod tests {
                 frames,
                 || Ok((100, 30)),
                 std::future::pending(),
+                move |draft| {
+                    let scripted = std::sync::Arc::clone(&scripted);
+                    Box::pin(async move {
+                        let mut guard = scripted.lock().expect("editor script lock");
+                        guard.1.push(draft);
+                        guard.0.take().unwrap_or(Err(EditorError::NotConfigured))
+                    })
+                },
             ))
         }
 
@@ -684,5 +788,45 @@ mod tests {
         task.await.expect("loop task").expect("loop exits cleanly");
         assert!(plain_seen, "a plain frame should have been drawn first");
         assert!(highlighted_seen, "the highlighted frame never arrived");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_hands_the_draft_to_the_external_editor_and_installs_the_result() {
+        let mut harness = Harness::new(64);
+        harness.editor_script.lock().unwrap().0 = Some(Ok(Some("edited\nprompt\n".to_owned())));
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        harness.update(ClientUpdate::Snapshot(snapshot(1, Vec::new())));
+        harness.settle().await;
+        for character in "draft".chars() {
+            harness.key(KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        harness.key(KeyCode::Char('e'), KeyModifiers::ALT);
+        harness.settle().await;
+        harness.quit();
+        let app = task.await.expect("loop task").expect("loop exits cleanly");
+
+        let script = harness.editor_script.lock().unwrap();
+        assert_eq!(script.1, ["draft"], "the editor received the draft");
+        assert_eq!(app.composer.text, "edited\nprompt");
+        // The screen is repainted in full after the editor owned the TTY.
+        let frames = harness.frames.frames();
+        let last = frame_text(frames.last().unwrap());
+        assert!(last.contains("\x1b[2J"), "full clear after external edit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_reports_a_missing_editor_and_keeps_the_draft() {
+        let mut harness = Harness::new(64);
+        let task = harness.spawn(App::new(TuiOptions::default()));
+        harness.update(ClientUpdate::Snapshot(snapshot(1, Vec::new())));
+        harness.settle().await;
+        harness.key(KeyCode::Char('x'), KeyModifiers::NONE);
+        harness.key(KeyCode::Char('e'), KeyModifiers::ALT);
+        harness.settle().await;
+        harness.quit();
+        let app = task.await.expect("loop task").expect("loop exits cleanly");
+        assert_eq!(app.composer.text, "x");
+        let (status, _) = app.visible_status().expect("a warning is shown");
+        assert!(status.contains("$EDITOR"), "{status}");
     }
 }

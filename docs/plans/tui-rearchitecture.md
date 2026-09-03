@@ -1,7 +1,7 @@
 # TUI Rearchitecture
 
-Status: proposed 2026-09-02. Phases T0–T4 are complete (receipts below).
-Phases T5–T7 are proposed.
+Status: proposed 2026-09-02. Phases T0–T5 are complete (receipts below).
+Phases T6–T7 are proposed.
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
@@ -454,6 +454,45 @@ Acceptance:
 - Editor behaviors are tested.
 - The queued-prompt list is bounded.
 - Steering availability is capability-driven with a fixture.
+
+#### T5 Completion Receipt — 2026-09-02
+
+All workspace gates green; 168 TUI tests. Render bench unchanged.
+
+- **Composer.** Ctrl-Left/Right word motion, Home/End and Ctrl-A/E, Ctrl-W
+  and Alt-Backspace kill word, Ctrl-K/U kill to line end/start, Ctrl-Y yank
+  from a one-slot kill ring, Ctrl-Z/Ctrl-_ undo (64 snapshots, coalesced on
+  word boundaries). Pastes of three or more lines or 512+ bytes collapse to
+  `[Pasted #n N lines]`; the placeholder is one token for cursor motion and
+  deletion, and `Composer::expanded()` substitutes the content on submit.
+  The 64 KiB input bound applies to the expanded text.
+- **Busy input.** Enter during an active run holds the draft locally instead
+  of sending it; Ctrl-Enter (or Ctrl-Q) queues explicitly; Alt-Up pulls the
+  newest draft back for editing (queueing any current text first). Drafts
+  render above the composer, are capped at eight per session, and flush one
+  per `RunFinished` in order so each becomes its own run. Local drafts were
+  chosen over the server queue because the server queue is not editable and
+  the user was typing to *this* run's outcome.
+- **Esc.** With a run active, Esc arms and shows "press Esc again to cancel";
+  a second Esc within 16 animation ticks (2 s) cancels. Any other key disarms.
+  Without a run, Esc still dismisses errors then walks to the parent. Alt-Up
+  therefore moved off tree navigation; parent is Esc, the rest stay on
+  Alt-Down/Left/Right.
+- **Steering.** `Command::SteerRun` exists in the table; `steering_available`
+  is `false` until the capability document (H3) sets it, so the command warns
+  and falls back to queueing. Tested as a fixture of that fallback.
+- **Reasoning.** `ReasoningDelta` accumulates per run (16 KiB bound, warm
+  sessions only, dropped when the run's messages are trimmed). A collapsed
+  `∴ thought for Ns  <first paragraph>` row precedes the run's first
+  assistant message; Ctrl-R expands to the full text under a `┆` rail. It
+  never enters `MessageSnapshot.output`.
+- **External editor.** Alt-E or `/editor` (reserved in the protocol list)
+  hands the expanded draft to `$VISUAL`/`$EDITOR` via a temp file. The loop
+  runs the editor inline (nothing else can use the TTY meanwhile), leaves raw
+  mode and input modes for its lifetime, then repaints every row. Missing
+  editor, non-zero exit, and I/O failures each surface as a typed
+  `EditorError` warning with the draft intact. The loop test injects a
+  scripted editor.
 
 ### T6 — Split Panes
 
