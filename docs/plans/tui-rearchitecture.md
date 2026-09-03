@@ -1,7 +1,11 @@
 # TUI Rearchitecture
 
 Status: complete 2026-09-02. Every phase T0–T7 has landed (receipts below),
-including the T5 steering work that waited on H3.
+including the T5 steering work that waited on H3. The module split in
+[Target Module Layout](#target-module-layout) was not carried out; `app.rs`
+and `view.rs` remain monolithic. That structural work, plus the UI and
+multi-agent surface built on it, is owned by
+[`tui-refinement.md`](./tui-refinement.md).
 
 This plan makes the `qq` TUI the fastest visible surface among the audited
 harnesses while making it possible to create sessions instantly, watch an agent
