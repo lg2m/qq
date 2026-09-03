@@ -2539,6 +2539,133 @@ mod tests {
         handler.shutdown().await.unwrap();
     }
 
+    /// The interactive client delivers the workspace-scoped capability
+    /// document (profiles included) after bootstrap and again on request, so
+    /// a TUI can list profiles without a restart after a pack is added.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tui_client_delivers_workspace_capabilities_and_refreshes_them() {
+        use qq_client::{ClientPort as _, ClientRequest, ClientUpdate};
+
+        let fixture = RuntimeFixture::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::create_dir_all(fixture.path("work/.qq")).unwrap();
+        fs::write(
+            fixture.path("work/.qq/config.ron"),
+            r#"(version: 1, model: "custom/test-model", providers: { "custom": Custom(connection: (base_url: "http://127.0.0.1:1/v1", api: OpenAiResponses, auth: NoAuth), models: { "test-model": (name: "Test model") }) })"#,
+        )
+        .unwrap();
+        let model_runtime = Arc::new(
+            Runtime::new(
+                CapturingProvider {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                "test/model",
+                256,
+            )
+            .unwrap(),
+        );
+        let durable = SessionRuntime::open(
+            SessionRuntimeOptions::new(fixture.path("sessions.sqlite3")),
+            Arc::new(FixedRuntimeLoader {
+                runtime: model_runtime,
+            }),
+        )
+        .await
+        .unwrap();
+        let handler = Arc::new(RuntimeHandler {
+            durable,
+            factory: fixture.factory(),
+        });
+        let server = match qq_server::start(
+            handler.clone(),
+            ServerOptions::new(ServerPaths::new(fixture.path("server"))),
+        )
+        .await
+        .unwrap()
+        {
+            StartOutcome::Started(server) => server,
+            StartOutcome::Existing(_) => panic!("test unexpectedly found a running server"),
+        };
+        // Project configuration is sensitive: capabilities for an untrusted
+        // workspace fail as configuration, and the client leaves the document
+        // unadvertised. Trust it up front, as `qq trust` would.
+        let request = LoadRequest::new(fixture.path("work"));
+        handler
+            .factory
+            .inner
+            .config
+            .grant_pending_trust(&request)
+            .unwrap();
+        let mut tui = qq_client::TuiClient::start(
+            server.connection().clone(),
+            fixture.path("work"),
+            ModelSelection {
+                model: Some("custom/test-model".to_owned()),
+                max_output_tokens: Some(256),
+                organization: None,
+            },
+            None,
+            false,
+            || std::future::ready(None),
+        )
+        .unwrap();
+        async fn next_capabilities(
+            tui: &mut qq_client::TuiClient,
+        ) -> Arc<qq_protocol::ServerCapabilities> {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), tui.recv())
+                    .await
+                    .expect("client update")
+                    .expect("client alive")
+                {
+                    ClientUpdate::Capabilities(capabilities) => return capabilities,
+                    ClientUpdate::SnapshotFailed(failure) => panic!("{}", failure.message()),
+                    _ => {}
+                }
+            }
+        }
+        let initial = next_capabilities(&mut tui).await;
+        let profiles = initial
+            .profiles
+            .as_deref()
+            .expect("workspace-scoped document");
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].id.is_default());
+        assert!(initial.workspace_tools.is_some());
+        assert!(initial.steering.boundary);
+
+        // A pack dropped into the trusted workspace appears on refresh.
+        fs::create_dir_all(fixture.path("work/.qq/packs/kit")).unwrap();
+        fs::write(
+            fixture.path("work/.qq/packs/kit/pack.ron"),
+            r#"(schema: 1, id: "kit", version: "1.0.0", profiles: { "reviewer": (approval_mode: read_only) })"#,
+        )
+        .unwrap();
+        handler
+            .factory
+            .inner
+            .config
+            .grant_pending_trust(&request)
+            .unwrap();
+        tui.try_send(ClientRequest::Capabilities).unwrap();
+        let refreshed = next_capabilities(&mut tui).await;
+        let profiles = refreshed.profiles.as_deref().unwrap();
+        let reviewer = profiles
+            .iter()
+            .find(|profile| profile.id.as_str() == "reviewer")
+            .expect("pack profile advertised");
+        assert_eq!(reviewer.approval_mode, qq_protocol::ApprovalMode::ReadOnly);
+        assert_eq!(reviewer.pack.as_ref().unwrap().id, "kit");
+
+        drop(tui);
+        server.shutdown().await.unwrap();
+        handler.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn runtime_factory_can_be_dropped_in_async_context() {
         let fixture = RuntimeFixture::new();

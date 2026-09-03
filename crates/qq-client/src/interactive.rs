@@ -257,6 +257,7 @@ async fn run_tui_client(
                     let Some(request) = request else { return; };
                     dispatch_tui_request(
                         client.clone(),
+                        workspace_id,
                         request,
                         Arc::clone(&request_permits),
                         updates.clone(),
@@ -375,10 +376,11 @@ async fn load_tui_models(
 ) {
     // Capabilities ride the same background task as the catalog: neither
     // gates first paint, and both restart together after a recovery. A
-    // failure leaves steering unadvertised, which the TUI treats as absent.
-    if let Ok(capabilities) = client.capabilities(None).await
+    // failure leaves them unadvertised, which the TUI treats as absent. The
+    // workspace scope is what makes profiles and skills part of the document.
+    if let Ok(capabilities) = client.capabilities(Some(workspace_id)).await
         && updates
-            .send(ClientUpdate::Steering(capabilities.steering))
+            .send(ClientUpdate::Capabilities(Arc::new(capabilities)))
             .await
             .is_err()
     {
@@ -550,6 +552,7 @@ async fn recover_tui_client(
 
 fn dispatch_tui_request(
     client: SessionClient,
+    workspace_id: WorkspaceId,
     request: ClientRequest,
     permits: Arc<Semaphore>,
     updates: mpsc::Sender<ClientUpdate>,
@@ -563,6 +566,9 @@ fn dispatch_tui_request(
             ClientRequest::Snapshot(_) => ClientUpdate::SnapshotFailed(TuiClientFailure::new(
                 "too many client requests are active",
             )),
+            // A refresh that cannot run now is simply not delivered: the TUI
+            // keeps the document it has and the user can ask again.
+            ClientRequest::Capabilities => return,
         };
         let _ = updates.try_send(update);
         return;
@@ -583,6 +589,10 @@ fn dispatch_tui_request(
                 Err(error) => {
                     ClientUpdate::SnapshotFailed(TuiClientFailure::new(error.to_string()))
                 }
+            },
+            ClientRequest::Capabilities => match client.capabilities(Some(workspace_id)).await {
+                Ok(capabilities) => ClientUpdate::Capabilities(Arc::new(capabilities)),
+                Err(_) => return,
             },
         };
         let _permit = permit;

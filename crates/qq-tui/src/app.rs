@@ -1,11 +1,15 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution, CommandId, CommandOutcome,
-    CommandRequest, EditPreview, ModelDescriptor, ModelSelection, SessionCommand, SessionEvent,
-    SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SnapshotRequest,
-    SteeringCapabilities, ToolCallSnapshot, ToolCallState, WorkspaceId, WorkspaceSnapshot,
+    CommandRequest, EditPreview, ModelDescriptor, ModelSelection, ServerCapabilities,
+    SessionCommand, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus,
+    SnapshotRequest, SteeringCapabilities, ToolCallSnapshot, ToolCallState, WorkspaceId,
+    WorkspaceSnapshot,
 };
 use thiserror::Error;
 
@@ -260,10 +264,10 @@ pub(crate) struct App {
     /// Tick at which Esc was last pressed with nothing to dismiss; a second
     /// press within [`ESC_CANCEL_TICKS`] cancels the active run.
     esc_armed_at: Option<usize>,
-    /// The server's advertised steering support. `None` until the capability
-    /// document arrives, which reads as "unavailable": `Submit` queues and
-    /// the steering commands say why.
-    steering: Option<SteeringCapabilities>,
+    /// The server's workspace-scoped capability document. `None` until it
+    /// arrives, which reads as "unavailable": `Submit` queues instead of
+    /// steering, and the profile and approval pickers say why.
+    capabilities: Option<Arc<ServerCapabilities>>,
     pub connection: ConnectionState,
     pub status: Option<String>,
     /// Session owning the current transient notice. A notice never follows
@@ -330,7 +334,7 @@ impl App {
             history_draft: None,
             slash: Picker::new(),
             esc_armed_at: None,
-            steering: None,
+            capabilities: None,
             connection: ConnectionState::Connecting,
             status: None,
             status_session_id: None,
@@ -422,8 +426,8 @@ impl App {
                 self.apply_models(models, selected);
                 Effects::redraw(Redraw::Scheduled)
             }
-            ClientUpdate::Steering(capabilities) => {
-                self.steering = Some(capabilities);
+            ClientUpdate::Capabilities(capabilities) => {
+                self.capabilities = Some(capabilities);
                 Effects::none()
             }
             ClientUpdate::Event(event) => self.apply_live_event(event),
@@ -1148,6 +1152,12 @@ impl App {
         self.view.session()
     }
 
+    fn steering(&self) -> Option<SteeringCapabilities> {
+        self.capabilities
+            .as_deref()
+            .map(|capabilities| capabilities.steering)
+    }
+
     /// Show a workspace-wide view. Invoking the one already shown returns to
     /// the transcript, so `/attention` toggles.
     fn show_workspace_view(&mut self, view: View) -> Effects {
@@ -1295,7 +1305,7 @@ impl App {
             Command::QueueDraft => self.queue_draft(),
             Command::DequeueDraft => self.dequeue_draft(),
             Command::SteerRun => {
-                if self.steering.is_some_and(|steering| steering.boundary) {
+                if self.steering().is_some_and(|steering| steering.boundary) {
                     return self.steer_run(false);
                 }
                 self.set_warning(
@@ -1305,7 +1315,7 @@ impl App {
                 self.queue_draft()
             }
             Command::InterruptRun => {
-                if self.steering.is_some_and(|steering| steering.interrupt) {
+                if self.steering().is_some_and(|steering| steering.interrupt) {
                     return self.steer_run(true);
                 }
                 self.set_warning(
@@ -1476,7 +1486,7 @@ impl App {
             .get(&session_id)
             .is_some_and(|session| session.summary.active_run_id.is_some());
         if running {
-            if self.steering.is_some_and(|steering| steering.boundary) {
+            if self.steering().is_some_and(|steering| steering.boundary) {
                 return self.steer_run(false);
             }
             return self.queue_draft();
@@ -2227,7 +2237,7 @@ impl App {
         if !running {
             return ComposerMode::Send;
         }
-        if self.steering.is_some_and(|steering| steering.boundary) {
+        if self.steering().is_some_and(|steering| steering.boundary) {
             ComposerMode::Steer
         } else {
             ComposerMode::Queue

@@ -1,14 +1,18 @@
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use qq_protocol::{
-    CommandId, CommandReceipt, CommandRequest, ModelDescriptor, SessionEventEnvelope,
-    SnapshotRequest, SteeringCapabilities, WorkspaceSnapshot,
+    CommandId, CommandReceipt, CommandRequest, ModelDescriptor, ServerCapabilities,
+    SessionEventEnvelope, SnapshotRequest, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientRequest {
     Command(CommandRequest),
     Snapshot(SnapshotRequest),
+    /// Re-read the workspace-scoped capability document. Profiles and skills
+    /// compile lazily from workspace files, so a client asks again after an
+    /// edit rather than restarting.
+    Capabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,10 +24,11 @@ pub enum ClientUpdate {
         models: Vec<ModelDescriptor>,
         selected: Option<qq_protocol::ModelSelection>,
     },
-    /// The server's advertised steering support. Arrives once per
-    /// connection after bootstrap; absent until then, so the TUI treats
-    /// steering as unavailable and queues instead.
-    Steering(SteeringCapabilities),
+    /// The server's workspace-scoped capability document. Arrives once per
+    /// connection after bootstrap and again per `ClientRequest::Capabilities`;
+    /// absent until then, so the TUI treats steering, profiles, and approval
+    /// modes as unavailable. Shared because pickers hold it while it renders.
+    Capabilities(Arc<ServerCapabilities>),
     Event(SessionEventEnvelope),
     CommandResult {
         command_id: CommandId,

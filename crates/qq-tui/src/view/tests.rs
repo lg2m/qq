@@ -1537,11 +1537,9 @@ fn the_composer_glyph_says_what_enter_will_do() {
         frame_rows(&lines)[0].starts_with(" ⇥ "),
         "queue while running without steering"
     );
-    app.apply_client_update(ClientUpdate::Steering(qq_protocol::SteeringCapabilities {
-        boundary: true,
-        interrupt: true,
-        max_pending_per_run: 4,
-    }));
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        fixtures::steering_capabilities(),
+    )));
     let (lines, _) = composer(&app, 40, 2);
     assert!(
         frame_rows(&lines)[0].starts_with(" ↦ "),
@@ -2642,11 +2640,9 @@ fn a_background_approval_is_answered_in_place_without_moving_focus() {
 fn shift_n_denies_and_steers_with_an_amendment() {
     let (mut app, _, child_id, run_id, call_id) = app_with_child_awaiting_approval();
     app.focus_session(child_id);
-    app.apply_client_update(ClientUpdate::Steering(qq_protocol::SteeringCapabilities {
-        boundary: true,
-        interrupt: true,
-        max_pending_per_run: 4,
-    }));
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        fixtures::steering_capabilities(),
+    )));
     assert_eq!(app.mode(), Mode::Approval);
     let key = |code, modifiers| TerminalEvent::Key(KeyEvent::new(code, modifiers));
     app.handle_terminal_event(key(KeyCode::Char('N'), KeyModifiers::SHIFT));

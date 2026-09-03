@@ -289,6 +289,8 @@ fn apply_send_failure(
             result: Err(error),
         },
         ClientRequest::Snapshot(_) => ClientUpdate::SnapshotFailed(error),
+        // A refresh that never left keeps the document the app already has.
+        ClientRequest::Capabilities => return Effects::none(),
     };
     app.apply_client_update(update)
 }

@@ -2299,11 +2299,13 @@ fn steer_falls_back_to_queueing_until_the_server_advertises_it() {
     // A server that steers at boundaries but cannot interrupt: Alt-S
     // queues with its own explanation rather than sending a plain steer
     // the user did not ask for.
-    app.apply_client_update(ClientUpdate::Steering(SteeringCapabilities {
-        boundary: true,
-        interrupt: false,
-        max_pending_per_run: 4,
-    }));
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        fixtures::capabilities(SteeringCapabilities {
+            boundary: true,
+            interrupt: false,
+            max_pending_per_run: 4,
+        }),
+    )));
     app.composer.text = "stop".to_owned();
     let (_, requests) = app.handle_key(alt('s')).split();
     assert!(requests.is_empty());
@@ -2326,11 +2328,9 @@ fn steering_app() -> (
     impl FnMut(SessionEvent) -> ClientUpdate,
 ) {
     let (mut app, session_id, run_id, event) = running_app();
-    app.apply_client_update(ClientUpdate::Steering(SteeringCapabilities {
-        boundary: true,
-        interrupt: true,
-        max_pending_per_run: 4,
-    }));
+    app.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        fixtures::steering_capabilities(),
+    )));
     (app, session_id, run_id, event)
 }
 
@@ -2394,11 +2394,9 @@ fn steer_with_an_empty_draft_or_no_run_sends_nothing() {
 
     let mut idle = App::new(TuiOptions::default());
     idle.apply_snapshot(snapshot());
-    idle.apply_client_update(ClientUpdate::Steering(SteeringCapabilities {
-        boundary: true,
-        interrupt: true,
-        max_pending_per_run: 4,
-    }));
+    idle.apply_client_update(ClientUpdate::Capabilities(std::sync::Arc::new(
+        fixtures::steering_capabilities(),
+    )));
     idle.composer.text = "hello".to_owned();
     let (_, requests) = idle.execute(Command::SteerRun).split();
     assert!(requests.is_empty());

@@ -6,9 +6,10 @@
 //! (`session(2)`, `tool_call(7)`) and assert on them without ceremony.
 
 use qq_protocol::{
-    Correlation, EventCursor, MessageId, MessageRole, MessageSnapshot, MessageState, RunId,
-    RunSnapshot, RunStatus, SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot,
-    SessionStatus, SessionSummary, StoreId, ToolCallId, ToolCallSnapshot, ToolCallState,
+    ApprovalMode, Correlation, EventCapabilities, EventCursor, LimitCapabilities, MessageId,
+    MessageRole, MessageSnapshot, MessageState, RunId, RunSnapshot, RunStatus, ServerCapabilities,
+    SessionEvent, SessionEventEnvelope, SessionId, SessionSnapshot, SessionStatus, SessionSummary,
+    SteeringCapabilities, StoreId, ToolCallId, ToolCallSnapshot, ToolCallState, ToolCapabilities,
     WorkspaceId, WorkspaceSnapshot, WorkspaceSummary,
 };
 
@@ -164,4 +165,75 @@ pub fn envelope(sequence: u64, session_id: SessionId, event: SessionEvent) -> Se
         occurred_at_ms: 1,
         event,
     }
+}
+
+/// A capability document with steering and every approval mode enabled and
+/// no profiles beyond `default`; tests that need profiles set `profiles`.
+#[must_use]
+pub fn capabilities(steering: SteeringCapabilities) -> ServerCapabilities {
+    ServerCapabilities {
+        version: qq_protocol::CAPABILITIES_VERSION,
+        protocol_version: qq_protocol::PROTOCOL_VERSION,
+        server_version: "test".to_owned(),
+        input_parts: qq_protocol::InputPartKind::ALL.to_vec(),
+        commands: qq_protocol::SessionCommandKind::ALL.to_vec(),
+        steering,
+        limits: LimitCapabilities {
+            supported: qq_protocol::BudgetLimitKind::ALL.to_vec(),
+            max_request_bytes: 1 << 20,
+            max_event_bytes: 1 << 20,
+            max_input_parts: 16,
+            max_input_text_bytes: 64 * 1024,
+            max_input_file_parts: 8,
+            max_input_file_bytes: 1 << 20,
+            max_pending_prompts: 8,
+            max_children: 8,
+            max_concurrent_children: 4,
+            max_child_depth: 2,
+            max_correlation_entries: 8,
+        },
+        approvals: [
+            "approve_once",
+            "approve_for_session",
+            "approve_for_workspace",
+            "deny",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        approval_modes: vec![
+            ApprovalMode::ReadOnly,
+            ApprovalMode::Ask,
+            ApprovalMode::Auto,
+            ApprovalMode::Full,
+        ],
+        profiles: Some(Vec::new()),
+        tools: ToolCapabilities {
+            max_catalog_tools: 128,
+            max_tool_schema_bytes: 32 * 1024,
+            max_catalog_schema_bytes: 256 * 1024,
+            full_exposure_tools: 32,
+            full_exposure_schema_bytes: 64 * 1024,
+            max_pinned_tools: 16,
+            max_indexed_skills: 64,
+            external_prefixes: vec!["mcp__".to_owned(), "embedded__".to_owned()],
+        },
+        workspace_tools: None,
+        events: EventCapabilities {
+            post_commit: true,
+            replay_page: 256,
+            max_subscriptions: 64,
+            max_event_bytes: 1 << 20,
+            retention_bounded: false,
+        },
+    }
+}
+
+/// Steering fully supported: the document most tests want.
+#[must_use]
+pub fn steering_capabilities() -> ServerCapabilities {
+    capabilities(SteeringCapabilities {
+        boundary: true,
+        interrupt: true,
+        max_pending_per_run: 4,
+    })
 }
