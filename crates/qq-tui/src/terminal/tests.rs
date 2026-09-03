@@ -232,7 +232,7 @@ async fn loop_draws_first_frame_then_only_when_state_changes() {
 
     harness.quit();
     let app = task.await.expect("loop task").expect("loop exits cleanly");
-    assert!(app.quit);
+    assert_eq!(app.connection, ConnectionState::Live);
 }
 
 #[tokio::test(start_paused = true)]

@@ -1310,7 +1310,7 @@ fn completing_a_live_message_does_not_move_an_older_history_viewport() {
         crossterm::event::KeyCode::PageUp,
         crossterm::event::KeyModifiers::NONE,
     ));
-    while app.handle_terminal_event(page_up.clone()).0 {}
+    while app.handle_terminal_event(page_up.clone()).split().0 {}
     let before = renderer.frame(&mut app, 80, 24);
     assert!(frame_text(&before).contains("HISTORY-ROW-0000"));
     let history_offset = app.transcript_scroll_offset();
@@ -1904,10 +1904,12 @@ fn background_approvals_surface_a_banner_that_ctrl_g_jumps_to() {
     assert!(text.contains("approval needed in Deploy helper"), "{text}");
     assert!(text.contains("Ctrl-G"));
 
-    let (changed, requests) = app.handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
-        KeyCode::Char('g'),
-        KeyModifiers::CONTROL,
-    )));
+    let (changed, requests) = app
+        .handle_terminal_event(TerminalEvent::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )))
+        .split();
     assert!(changed);
     assert_eq!(app.focused(), Some(child_id));
     // The child is cold, so the jump fetches its body...
@@ -1967,7 +1969,7 @@ fn alt_arrows_walk_the_session_tree_in_spawn_order() {
     )));
     assert_eq!(app.focused(), Some(root));
     // A lone root has no siblings; the key is a no-op.
-    let (changed, _) = app.handle_terminal_event(key(KeyCode::Right));
+    let (changed, _) = app.handle_terminal_event(key(KeyCode::Right)).split();
     assert!(!changed);
     assert_eq!(app.focused(), Some(root));
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::Future,
     io::{self, stdout},
 };
@@ -23,6 +24,7 @@ use tokio::{
 use crate::{
     ClientPort, ClientRequest, ClientUpdate,
     app::{App, TuiError},
+    effect::{Effect, Effects, Redraw},
     view::FrameRenderer,
 };
 
@@ -122,18 +124,6 @@ pub(crate) enum EditorError {
 pub(crate) type EditorFuture =
     std::pin::Pin<Box<dyn Future<Output = Result<Option<String>, EditorError>> + Send>>;
 
-/// When the next frame is drawn relative to pending state changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Redraw {
-    /// Nothing changed since the last frame.
-    Clean,
-    /// Streamed or background changes; coalesce until the frame tick.
-    Scheduled,
-    /// User input; draw before waiting on anything else so typing echoes
-    /// without a tick's latency.
-    Immediate,
-}
-
 /// The event loop with every terminal dependency injected so it runs without a
 /// TTY in tests and benchmarks. Returns the final application state so callers
 /// can inspect it after the loop exits.
@@ -164,39 +154,20 @@ where
     frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     animation_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut terminal_size = size()?;
-    let mut redraw = Redraw::Immediate;
+    // The most urgent redraw requested since the last frame, if any.
+    let mut redraw = Some(Redraw::Immediate);
 
     loop {
-        // An external edit owns the terminal until it returns; nothing else
-        // can usefully happen meanwhile, so it runs inline here rather than
-        // as a select arm. Client updates queue in the channel and drain
-        // afterwards.
-        if let Some(draft) = app.take_editor_request() {
-            match editor(draft).await {
-                Ok(text) => {
-                    app.apply_editor_result(text);
-                }
-                Err(error) => {
-                    app.note_editor_failure(&error.to_string());
-                }
-            }
-            renderer.invalidate();
-            redraw = Redraw::Immediate;
-        }
-        if let Some(attention) = app.take_attention() {
-            output.write_all(&attention_bytes(&attention)).await?;
-            output.flush().await?;
-        }
-        if redraw == Redraw::Immediate {
+        if redraw == Some(Redraw::Immediate) {
             let bytes = renderer.draw(&mut app, terminal_size)?;
             output.write_all(&bytes).await?;
             output.flush().await?;
-            redraw = Redraw::Clean;
+            redraw = None;
             // The tick would otherwise fire right after this frame for a
             // change already drawn.
             frame_tick.reset();
         }
-        tokio::select! {
+        let effects = tokio::select! {
             biased;
             result = &mut shutdown => {
                 result?;
@@ -208,17 +179,7 @@ where
                         if let Event::Resize(columns, rows) = event {
                             terminal_size = (columns, rows);
                         }
-                        let (changed, requests) = app.handle_terminal_event(event);
-                        if changed {
-                            redraw = Redraw::Immediate;
-                        }
-                        for request in requests {
-                            if let Err(error) = client.try_send(request.clone())
-                                && apply_send_failure(&mut app, request, error)
-                            {
-                                redraw = Redraw::Immediate;
-                            }
-                        }
+                        app.handle_terminal_event(event)
                     }
                     Some(Err(error)) => return Err(TuiError::Terminal(error)),
                     None => break,
@@ -228,35 +189,59 @@ where
                 let Some(update) = update else {
                     return Err(TuiError::ClientStopped);
                 };
-                if app.apply_client_update(update) {
-                    redraw = redraw.max(Redraw::Scheduled);
-                }
-                for request in app.take_requests() {
-                    if let Err(error) = client.try_send(request.clone())
-                        && apply_send_failure(&mut app, request, error)
-                    {
-                        redraw = redraw.max(Redraw::Scheduled);
-                    }
-                }
+                app.apply_client_update(update)
             }
             highlighted = renderer.highlighter.next() => {
-                if renderer.apply_highlight(highlighted) {
-                    redraw = redraw.max(Redraw::Scheduled);
-                }
+                Effects::changed(renderer.apply_highlight(highlighted))
             }
             _ = animation_tick.tick(), if app.has_activity() => {
-                if app.advance_animation() {
-                    redraw = redraw.max(Redraw::Scheduled);
-                }
+                Effects::changed(app.advance_animation())
             }
-            _ = frame_tick.tick(), if redraw != Redraw::Clean => {
+            _ = frame_tick.tick(), if redraw.is_some() => {
                 let bytes = renderer.draw(&mut app, terminal_size)?;
                 output.write_all(&bytes).await?;
                 output.flush().await?;
-                redraw = Redraw::Clean;
+                redraw = None;
+                Effects::none()
+            }
+        };
+        // Effects may produce more effects (a failed send is reported back
+        // through the app); apply until the queue drains.
+        let mut queue: VecDeque<Effect> = effects.into_iter().collect();
+        let mut quit = false;
+        while let Some(effect) = queue.pop_front() {
+            match effect {
+                Effect::Redraw(level) => {
+                    redraw = Some(redraw.map_or(level, |existing| existing.max(level)));
+                }
+                Effect::Send(request) => {
+                    if let Err(error) = client.try_send(request.clone()) {
+                        queue.extend(apply_send_failure(&mut app, request, error));
+                    }
+                }
+                Effect::Editor(draft) => {
+                    // An external edit owns the terminal until it returns;
+                    // nothing else can usefully happen meanwhile. Client
+                    // updates queue in the channel and drain afterwards.
+                    match editor(draft).await {
+                        Ok(text) => {
+                            app.apply_editor_result(text);
+                        }
+                        Err(error) => {
+                            app.note_editor_failure(&error.to_string());
+                        }
+                    }
+                    renderer.invalidate();
+                    redraw = Some(Redraw::Immediate);
+                }
+                Effect::Attention(attention) => {
+                    output.write_all(&attention_bytes(&attention)).await?;
+                    output.flush().await?;
+                }
+                Effect::Quit => quit = true,
             }
         }
-        if app.quit {
+        if quit {
             break;
         }
     }
@@ -278,7 +263,11 @@ fn attention_bytes(attention: &crate::app::Attention) -> Vec<u8> {
     format!("\x07\x1b]9;{text}\x07").into_bytes()
 }
 
-fn apply_send_failure(app: &mut App, request: ClientRequest, error: crate::ClientFailure) -> bool {
+fn apply_send_failure(
+    app: &mut App,
+    request: ClientRequest,
+    error: crate::ClientFailure,
+) -> Effects {
     let update = match request {
         ClientRequest::Command(command) => ClientUpdate::CommandResult {
             command_id: command.command_id,

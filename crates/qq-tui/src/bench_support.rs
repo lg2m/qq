@@ -107,11 +107,12 @@ impl BenchHarness {
 
     /// Type one character into the composer.
     pub fn keystroke(&mut self, character: char) -> bool {
-        let (changed, _) = self.app.handle_terminal_event(Event::Key(KeyEvent::new(
-            KeyCode::Char(character),
-            KeyModifiers::NONE,
-        )));
-        changed
+        self.app
+            .handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )))
+            .redraws()
     }
 
     /// Build and diff one frame, returning the terminal bytes it would emit.
@@ -178,8 +179,11 @@ impl BenchHarness {
     /// new pane. The session must already be warm.
     pub fn split_beside_showing(&mut self, index: u8) {
         self.app.execute(crate::commands::Command::SplitBeside);
-        let (_, requests) = self.app.focus_session(session_id(index));
-        assert!(requests.is_empty(), "bench sessions must be warm");
+        let effects = self.app.focus_session(session_id(index));
+        assert!(
+            effects.requests().next().is_none(),
+            "bench sessions must be warm"
+        );
     }
 
     /// Draw until every scheduled highlight has landed, as the event loop
@@ -212,7 +216,9 @@ impl BenchHarness {
         let mut envelope = fixtures::envelope(sequence, session_id(index), event);
         envelope.run_id = Some(run_id(index));
         envelope.occurred_at_ms = sequence;
-        self.app.apply_client_update(ClientUpdate::Event(envelope))
+        self.app
+            .apply_client_update(ClientUpdate::Event(envelope))
+            .redraws()
     }
 }
 

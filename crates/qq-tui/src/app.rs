@@ -16,6 +16,7 @@ use crate::{
     Settings,
     commands::{self, Command, SlashEntry},
     composer::Composer,
+    effect::{Effect, Effects, Redraw},
     input::{Mode, Overlay, SessionConfirm},
     panes::{Axis, Direction, PaneId, Panes, Viewport},
     picker::Picker,
@@ -221,9 +222,6 @@ pub(crate) struct App {
     /// Tick at which Esc was last pressed with nothing to dismiss; a second
     /// press within [`ESC_CANCEL_TICKS`] cancels the active run.
     esc_armed_at: Option<usize>,
-    /// Set when the user asked to edit the draft externally. The loop takes
-    /// it, suspends the terminal, runs the editor, and hands the text back.
-    editor_requested: bool,
     /// The server's advertised steering support. `None` until the capability
     /// document arrives, which reads as "unavailable": `Submit` queues and
     /// the steering commands say why.
@@ -236,7 +234,6 @@ pub(crate) struct App {
     pub(crate) status_level: NoticeLevel,
     status_ticks_left: u16,
     pub animation_tick: usize,
-    pub quit: bool,
     pub tool_detail: ToolDetail,
     pub reasoning_detail: ReasoningDetail,
     /// Session sidebar visibility. `Auto` shows it when the terminal is wide
@@ -250,17 +247,10 @@ pub(crate) struct App {
     /// Whether the terminal window has keyboard focus, from the terminal's
     /// focus events. Assumed focused until told otherwise.
     terminal_focused: bool,
-    /// Something happened that deserves the user's attention while the
-    /// terminal was unfocused; the loop takes it and rings the terminal.
-    attention: Option<Attention>,
     last_sequence: u64,
     recent_events: VecDeque<SessionEventEnvelope>,
     pending: HashMap<CommandId, PendingIntent>,
     answered_approvals: std::collections::HashSet<qq_protocol::ToolCallId>,
-    /// Requests produced while applying client updates (for example the
-    /// snapshot fetch after a remote deletion refocuses), drained by the
-    /// terminal loop after each update.
-    queued_requests: Vec<ClientRequest>,
 }
 
 impl App {
@@ -281,7 +271,6 @@ impl App {
             history_draft: None,
             slash: Picker::new(),
             esc_armed_at: None,
-            editor_requested: false,
             steering: None,
             connection: ConnectionState::Connecting,
             status: None,
@@ -289,7 +278,6 @@ impl App {
             status_level: NoticeLevel::Info,
             status_ticks_left: 0,
             animation_tick: 0,
-            quit: false,
             tool_detail: ToolDetail::default(),
             reasoning_detail: ReasoningDetail::default(),
             sidebar: Sidebar::default(),
@@ -301,12 +289,10 @@ impl App {
             theme: 0,
             theme_generation: 0,
             terminal_focused: true,
-            attention: None,
             last_sequence: 0,
             recent_events: VecDeque::new(),
             pending: HashMap::new(),
             answered_approvals: std::collections::HashSet::new(),
-            queued_requests: Vec::new(),
         }
     }
 
@@ -320,19 +306,6 @@ impl App {
             None if self.pending_approval().is_some() => Mode::Approval,
             None => Mode::Compose,
         }
-    }
-
-    pub fn take_requests(&mut self) -> Vec<ClientRequest> {
-        std::mem::take(&mut self.queued_requests)
-    }
-
-    /// Whether the user asked for an external editor since the last call.
-    /// Returns the current expanded draft to seed the editor with.
-    pub fn take_editor_request(&mut self) -> Option<String> {
-        if !std::mem::take(&mut self.editor_requested) {
-            return None;
-        }
-        Some(self.composer.expanded())
     }
 
     /// The external editor could not deliver text; the draft stays as it was.
@@ -363,11 +336,11 @@ impl App {
         true
     }
 
-    pub fn apply_client_update(&mut self, update: ClientUpdate) -> bool {
+    pub fn apply_client_update(&mut self, update: ClientUpdate) -> Effects {
         match update {
             ClientUpdate::Connection(connection) => {
                 self.connection = connection;
-                true
+                Effects::redraw(Redraw::Scheduled)
             }
             ClientUpdate::Snapshot(snapshot) => self.apply_snapshot(snapshot),
             ClientUpdate::ResetSnapshot(snapshot) => {
@@ -383,11 +356,11 @@ impl App {
             }
             ClientUpdate::Models { models, selected } => {
                 self.apply_models(models, selected);
-                true
+                Effects::redraw(Redraw::Scheduled)
             }
             ClientUpdate::Steering(capabilities) => {
                 self.steering = Some(capabilities);
-                false
+                Effects::none()
             }
             ClientUpdate::Event(event) => self.apply_live_event(event),
             ClientUpdate::CommandResult { command_id, result } => {
@@ -482,11 +455,11 @@ impl App {
                     }
                     Err(error) => self.reject_pending(command_id, error),
                 }
-                true
+                Effects::redraw(Redraw::Scheduled)
             }
             ClientUpdate::SnapshotFailed(error) => {
                 self.set_warning(error.message().to_owned());
-                true
+                Effects::redraw(Redraw::Scheduled)
             }
         }
     }
@@ -538,14 +511,14 @@ impl App {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: WorkspaceSnapshot) -> bool {
+    fn apply_snapshot(&mut self, snapshot: WorkspaceSnapshot) -> Effects {
         let initial = self.workspace_id.is_none();
         if self
             .workspace_id
             .is_some_and(|workspace| workspace != snapshot.workspace.id)
         {
             self.set_warning("server returned a snapshot for another workspace".to_owned());
-            return true;
+            return Effects::redraw(Redraw::Scheduled);
         }
         let snapshot_focus = snapshot.focused.as_ref().map(|focused| focused.summary.id);
         // A late snapshot for a session no pane shows any more is stale
@@ -554,7 +527,7 @@ impl App {
             && self.focused().is_some()
             && snapshot_focus.is_some_and(|id| !self.panes.sessions().any(|shown| shown == id))
         {
-            return false;
+            return Effects::none();
         }
         if snapshot.cursor.sequence < self.last_sequence
             && self
@@ -563,7 +536,7 @@ impl App {
                 .is_none_or(|event| event.cursor.sequence > snapshot.cursor.sequence + 1)
         {
             self.set_warning("snapshot was too stale; reconnecting is required".to_owned());
-            return true;
+            return Effects::redraw(Redraw::Scheduled);
         }
 
         let snapshot_sequence = snapshot.cursor.sequence;
@@ -620,10 +593,11 @@ impl App {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let mut effects = Effects::redraw(Redraw::Scheduled);
         for event in replay {
-            self.reduce_event(&event);
+            effects.extend(self.reduce_event(&event));
         }
-        true
+        effects
     }
 
     /// Load one session's transcript body. Other warm bodies are untouched;
@@ -723,21 +697,21 @@ impl App {
         }
     }
 
-    fn apply_live_event(&mut self, event: SessionEventEnvelope) -> bool {
+    fn apply_live_event(&mut self, event: SessionEventEnvelope) -> Effects {
         if self
             .workspace_id
             .is_some_and(|workspace| workspace != event.cursor.workspace_id)
         {
             self.set_warning("server sent an event for another workspace".to_owned());
-            return true;
+            return Effects::redraw(Redraw::Scheduled);
         }
         if event.cursor.sequence <= self.last_sequence {
-            return false;
+            return Effects::none();
         }
         if self.last_sequence != 0 && event.cursor.sequence != self.last_sequence + 1 {
             self.connection = ConnectionState::Replaying;
             self.set_warning("session event gap detected".to_owned());
-            return true;
+            return Effects::redraw(Redraw::Scheduled);
         }
         self.workspace_id.get_or_insert(event.cursor.workspace_id);
         self.last_sequence = event.cursor.sequence;
@@ -745,8 +719,9 @@ impl App {
             .sessions
             .get(&event.session_id)
             .is_some_and(|session| event.cursor.sequence <= session.loaded_through);
+        let mut effects = Effects::redraw(Redraw::Scheduled);
         if !already_loaded {
-            self.reduce_event(&event);
+            effects.extend(self.reduce_event(&event));
         }
         if let Some(command_id) = event.caused_by {
             self.pending.remove(&command_id);
@@ -755,7 +730,7 @@ impl App {
         while self.recent_events.len() > MAX_RECENT_EVENTS {
             self.recent_events.pop_front();
         }
-        true
+        effects
     }
 
     fn set_notice_for(&mut self, session_id: Option<SessionId>, text: String, level: NoticeLevel) {
@@ -841,7 +816,7 @@ impl App {
         self.set_error_for(status_session_id, error.message().to_owned());
     }
 
-    pub fn handle_terminal_event(&mut self, event: Event) -> (bool, Vec<ClientRequest>) {
+    pub fn handle_terminal_event(&mut self, event: Event) -> Effects {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key)
@@ -858,7 +833,7 @@ impl App {
                     }
                     None => self.push_composer_text(&text),
                 };
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             Event::Mouse(mouse) if self.overlay.is_none() => {
                 // The wheel scrolls the pane under the cursor; a click focuses
@@ -875,23 +850,22 @@ impl App {
                     MouseEventKind::Down(_) => self.focus_pane(under),
                     _ => false,
                 };
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             Event::FocusGained => {
                 self.terminal_focused = true;
-                self.attention = None;
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Event::FocusLost => {
                 self.terminal_focused = false;
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
-            Event::Resize(_, _) => (true, Vec::new()),
-            Event::Key(_) | Event::Mouse(_) => (false, Vec::new()),
+            Event::Resize(_, _) => Effects::redraw(Redraw::Immediate),
+            Event::Key(_) | Event::Mouse(_) => Effects::none(),
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+    fn handle_key(&mut self, key: KeyEvent) -> Effects {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.execute(Command::Quit);
         }
@@ -904,12 +878,12 @@ impl App {
         }
     }
 
-    fn handle_compose_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+    fn handle_compose_key(&mut self, key: KeyEvent) -> Effects {
         // Newline chords insert into the composer. Handle them before slash
         // completion and configured bindings so they never submit.
         if is_composer_newline_key(key) {
             let changed = self.push_input('\n');
-            return (changed, Vec::new());
+            return Effects::changed_now(changed);
         }
         // Ctrl-Enter (or Ctrl-Q where the terminal cannot report it) queues
         // the draft explicitly instead of sending it.
@@ -1002,7 +976,7 @@ impl App {
                     && self.status_session_id == self.focused()
                 {
                     self.status = None;
-                    return (true, Vec::new());
+                    return Effects::redraw(Redraw::Immediate);
                 }
                 // While a run is active, Esc twice within a short window cancels
                 // it; the first press only arms and shows the hint.
@@ -1021,7 +995,7 @@ impl App {
                     }
                     self.esc_armed_at = Some(now);
                     self.set_info("press Esc again to cancel the run".to_owned());
-                    return (true, Vec::new());
+                    return Effects::redraw(Redraw::Immediate);
                 }
                 if let Some(parent) = self
                     .focused()
@@ -1029,11 +1003,11 @@ impl App {
                 {
                     return self.focus_session(parent);
                 }
-                (false, Vec::new())
+                Effects::none()
             }
             KeyCode::Enter => self.submit_prompt(),
-            KeyCode::PageUp => (self.scroll_focused_page(true), Vec::new()),
-            KeyCode::PageDown => (self.scroll_focused_page(false), Vec::new()),
+            KeyCode::PageUp => Effects::changed_now(self.scroll_focused_page(true)),
+            KeyCode::PageDown => Effects::changed_now(self.scroll_focused_page(false)),
             KeyCode::Backspace
                 if key
                     .modifiers
@@ -1044,7 +1018,7 @@ impl App {
                     self.reset_history_browse();
                     self.slash.select(0);
                 }
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             KeyCode::Backspace => {
                 let changed = self.composer.backspace();
@@ -1052,25 +1026,25 @@ impl App {
                     self.reset_history_browse();
                     self.slash.select(0);
                 }
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             KeyCode::Delete => {
                 let changed = self.composer.delete();
                 if changed {
                     self.reset_history_browse();
                 }
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                (self.composer.move_word_left(), Vec::new())
+                Effects::changed_now(self.composer.move_word_left())
             }
             KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                (self.composer.move_word_right(), Vec::new())
+                Effects::changed_now(self.composer.move_word_right())
             }
-            KeyCode::Left => (self.composer.move_left(), Vec::new()),
-            KeyCode::Right => (self.composer.move_right(), Vec::new()),
-            KeyCode::Home => (self.composer.move_line_start(), Vec::new()),
-            KeyCode::End => (self.composer.move_line_end(), Vec::new()),
+            KeyCode::Left => Effects::changed_now(self.composer.move_left()),
+            KeyCode::Right => Effects::changed_now(self.composer.move_right()),
+            KeyCode::Home => Effects::changed_now(self.composer.move_line_start()),
+            KeyCode::End => Effects::changed_now(self.composer.move_line_end()),
             KeyCode::Char(character) if key.modifiers == KeyModifiers::CONTROL => {
                 let changed = match character.to_ascii_lowercase() {
                     'a' => self.composer.move_line_start(),
@@ -1080,21 +1054,21 @@ impl App {
                     'u' => self.composer.kill_to_line_start(),
                     'y' => self.composer.yank(),
                     'z' | '_' => self.composer.undo(),
-                    _ => return (false, Vec::new()),
+                    _ => return Effects::none(),
                 };
                 if changed {
                     self.reset_history_browse();
                     self.slash.select(0);
                 }
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             KeyCode::Up => {
                 let changed = self.composer.move_up() || self.browse_prompt_history(false);
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             KeyCode::Down => {
                 let changed = self.composer.move_down() || self.browse_prompt_history(true);
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             KeyCode::Char(character)
                 if !key
@@ -1102,9 +1076,9 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 let changed = self.push_input(character);
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
-            _ => (false, Vec::new()),
+            _ => Effects::none(),
         }
     }
 
@@ -1120,13 +1094,13 @@ impl App {
         &self.themes[self.theme.min(self.themes.len() - 1)]
     }
 
-    fn open_themes(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn open_themes(&mut self) -> Effects {
         if self.themes.len() < 2 {
             self.set_info(
                 "only the compiled `qq` theme is available; add themes/<name>.ron to choose"
                     .to_owned(),
             );
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         }
         let mut picker = Picker::new();
         picker.select(self.theme);
@@ -1134,7 +1108,7 @@ impl App {
             picker,
             restore: self.theme,
         });
-        (true, Vec::new())
+        Effects::redraw(Redraw::Immediate)
     }
 
     /// Indexes into `themes` matching the open theme picker's query.
@@ -1162,17 +1136,17 @@ impl App {
     /// Theme picker keys. Up/Down and typing preview the highlighted theme
     /// immediately; Enter keeps it, Esc restores the theme that was active
     /// when the picker opened.
-    fn handle_theme_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+    fn handle_theme_picker_key(&mut self, key: KeyEvent) -> Effects {
         let filtered = self.filtered_themes();
         let Some(Overlay::Themes { picker, restore }) = &mut self.overlay else {
-            return (false, Vec::new());
+            return Effects::none();
         };
         let restore = *restore;
         let changed = match key.code {
             KeyCode::Esc => {
                 self.overlay = None;
                 self.set_theme(restore);
-                return (true, Vec::new());
+                return Effects::redraw(Redraw::Immediate);
             }
             KeyCode::Enter => {
                 let name = self.theme().name.clone();
@@ -1180,7 +1154,7 @@ impl App {
                 self.set_info(format!(
                     "theme `{name}`; set `theme: \"{name}\"` in tui.ron to keep it"
                 ));
-                return (true, Vec::new());
+                return Effects::redraw(Redraw::Immediate);
             }
             KeyCode::Up => {
                 picker.move_up();
@@ -1209,21 +1183,17 @@ impl App {
                 self.set_theme(*index);
             }
         }
-        (changed, Vec::new())
+        Effects::changed_now(changed)
     }
 
-    /// Take the pending attention request, if any. The loop rings the
-    /// terminal once per request.
-    pub(crate) fn take_attention(&mut self) -> Option<Attention> {
-        self.attention.take()
-    }
-
-    /// Record something the user should notice. Only fires while the
-    /// terminal is unfocused: a focused user is already looking.
-    pub(super) fn request_attention(&mut self, attention: Attention) {
+    /// An effect asking for the user's attention, or nothing while the
+    /// terminal is focused: a focused user is already looking.
+    pub(super) fn attention(&self, attention: Attention) -> Effects {
+        let mut effects = Effects::none();
         if !self.terminal_focused {
-            self.attention = Some(attention);
+            effects.push(Effect::Attention(attention));
         }
+        effects
     }
 
     /// Reconcile pane `id`'s viewport with the body laid out this frame.
@@ -1282,20 +1252,20 @@ impl App {
 
     /// Split the focused pane. The new pane inherits the session and takes
     /// focus, so nothing needs fetching.
-    fn split_pane(&mut self, axis: Axis) -> (bool, Vec<ClientRequest>) {
+    fn split_pane(&mut self, axis: Axis) -> Effects {
         match self.panes.split(axis) {
-            Some(_) => (true, Vec::new()),
+            Some(_) => Effects::redraw(Redraw::Immediate),
             None => {
                 self.set_warning(format!(
                     "at most {} panes can be open",
                     crate::panes::MAX_PANES
                 ));
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
         }
     }
 
-    fn close_pane(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn close_pane(&mut self) -> Effects {
         let closed = self.panes.close();
         if closed.is_some() {
             self.reset_history_browse();
@@ -1303,7 +1273,7 @@ impl App {
         } else {
             self.set_info("the last pane stays open".to_owned());
         }
-        (true, Vec::new())
+        Effects::redraw(Redraw::Immediate)
     }
 
     /// Move focus to a neighbouring pane. Focus changes the session the
@@ -1319,17 +1289,17 @@ impl App {
         true
     }
 
-    fn focus_pane_direction(&mut self, direction: Direction) -> (bool, Vec<ClientRequest>) {
+    fn focus_pane_direction(&mut self, direction: Direction) -> Effects {
         match self.panes.neighbour(direction) {
-            Some(id) => (self.focus_pane(id), Vec::new()),
-            None => (false, Vec::new()),
+            Some(id) => Effects::changed_now(self.focus_pane(id)),
+            None => Effects::none(),
         }
     }
 
     /// Run one command from the registry. Every command surface — keybinding,
     /// slash entry, and later the palette — ends here so behavior cannot drift
     /// between them.
-    pub(crate) fn execute(&mut self, command: Command) -> (bool, Vec<ClientRequest>) {
+    pub(crate) fn execute(&mut self, command: Command) -> Effects {
         match command {
             Command::OpenModels => self.open_models(),
             Command::OpenThemes => self.open_themes(),
@@ -1338,7 +1308,7 @@ impl App {
             Command::ToggleSessions => {
                 if matches!(self.overlay, Some(Overlay::Sessions { .. })) {
                     self.overlay = None;
-                    (true, Vec::new())
+                    Effects::redraw(Redraw::Immediate)
                 } else {
                     self.open_sessions()
                 }
@@ -1349,73 +1319,74 @@ impl App {
             Command::CancelRun => self.cancel_run(),
             Command::SelectThreadline => {
                 self.layout = Layout::Threadline;
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Command::SelectFoldFocus => {
                 self.layout = Layout::FoldFocus;
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Command::NextLayout => {
                 self.layout = self.layout.next();
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Command::PreviousLayout => {
                 self.layout = self.layout.next();
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Command::ToggleToolDetail => {
                 self.tool_detail = self.tool_detail.next();
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Command::ToggleReasoning => {
                 self.reasoning_detail = match self.reasoning_detail {
                     ReasoningDetail::Collapsed => ReasoningDetail::Expanded,
                     ReasoningDetail::Expanded => ReasoningDetail::Collapsed,
                 };
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Command::ToggleSidebar => {
                 self.sidebar = self.sidebar.next();
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             Command::FocusParent => match self
                 .focused()
                 .and_then(|focused| self.sessions.get(&focused)?.summary.parent_id)
             {
                 Some(parent) => self.focus_session(parent),
-                None => (false, Vec::new()),
+                None => Effects::none(),
             },
             Command::FocusFirstChild => match self
                 .focused()
                 .and_then(|focused| self.children_of(focused).first().copied())
             {
                 Some(child) => self.focus_session(child),
-                None => (false, Vec::new()),
+                None => Effects::none(),
             },
             Command::FocusNextSibling => match self.sibling(1) {
                 Some(sibling) => self.focus_session(sibling),
-                None => (false, Vec::new()),
+                None => Effects::none(),
             },
             Command::FocusPreviousSibling => match self.sibling(-1) {
                 Some(sibling) => self.focus_session(sibling),
-                None => (false, Vec::new()),
+                None => Effects::none(),
             },
             Command::OpenEditor => {
-                self.editor_requested = true;
-                (true, Vec::new())
+                let mut effects = Effects::redraw(Redraw::Immediate);
+                effects.push(Effect::Editor(self.composer.expanded()));
+                effects
             }
             Command::SplitBeside => self.split_pane(Axis::Columns),
             Command::SplitBelow => self.split_pane(Axis::Rows),
             Command::ClosePane => self.close_pane(),
-            Command::ZoomPane => (self.panes.toggle_zoom(), Vec::new()),
+            Command::ZoomPane => Effects::changed_now(self.panes.toggle_zoom()),
             Command::FocusPaneLeft => self.focus_pane_direction(Direction::Left),
             Command::FocusPaneRight => self.focus_pane_direction(Direction::Right),
             Command::FocusPaneUp => self.focus_pane_direction(Direction::Up),
             Command::FocusPaneDown => self.focus_pane_direction(Direction::Down),
-            Command::ResizePaneLeft => (self.panes.resize(Direction::Left), Vec::new()),
-            Command::ResizePaneRight => (self.panes.resize(Direction::Right), Vec::new()),
-            Command::ResizePaneUp => (self.panes.resize(Direction::Up), Vec::new()),
-            Command::ResizePaneDown => (self.panes.resize(Direction::Down), Vec::new()),
+            Command::ResizePaneLeft => Effects::changed_now(self.panes.resize(Direction::Left)),
+            Command::ResizePaneRight => Effects::changed_now(self.panes.resize(Direction::Right)),
+            Command::ResizePaneUp => Effects::changed_now(self.panes.resize(Direction::Up)),
+            Command::ResizePaneDown => Effects::changed_now(self.panes.resize(Direction::Down)),
             Command::QueueDraft => self.queue_draft(),
             Command::DequeueDraft => self.dequeue_draft(),
             Command::SteerRun => {
@@ -1442,23 +1413,24 @@ impl App {
                 Some(session_id) => self.focus_session(session_id),
                 None => {
                     self.set_info("no session is waiting for approval".to_owned());
-                    (true, Vec::new())
+                    Effects::redraw(Redraw::Immediate)
                 }
             },
             Command::Quit => {
-                self.quit = true;
-                (true, Vec::new())
+                let mut effects = Effects::redraw(Redraw::Immediate);
+                effects.push(Effect::Quit);
+                effects
             }
         }
     }
 
-    fn open_models(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn open_models(&mut self) -> Effects {
         if self.models.is_empty() {
             self.set_warning("no authenticated providers have selectable models".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         }
         self.overlay = Some(Overlay::Models(Picker::new()));
-        (true, Vec::new())
+        Effects::redraw(Redraw::Immediate)
     }
 
     /// Indexes into `models` matching the open model picker's query, in
@@ -1481,30 +1453,30 @@ impl App {
             .collect()
     }
 
-    fn handle_model_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Effects {
         let filtered = self.filtered_models();
         let Some(Overlay::Models(picker)) = &mut self.overlay else {
-            return (false, Vec::new());
+            return Effects::none();
         };
         match key.code {
             KeyCode::Esc => {
                 self.overlay = None;
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             KeyCode::Up => {
                 picker.move_up();
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             KeyCode::Down => {
                 picker.move_down(filtered.len());
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             // Enter applies the model to the focused session; without a
             // focus it keeps the historical create behavior. Ctrl-N always
             // creates a session with the selected model.
             KeyCode::Enter => {
                 let Some(model) = self.selected_picker_model(&filtered) else {
-                    return (false, Vec::new());
+                    return Effects::none();
                 };
                 let focused = self
                     .focused()
@@ -1513,34 +1485,37 @@ impl App {
                     Some(session_id) => self.set_session_model(session_id, model),
                     None => self.create_session_with_model(None, model),
                 };
-                if !result.1.is_empty() {
+                if result
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Send(_)))
+                {
                     self.overlay = None;
                 }
                 result
             }
             KeyCode::Char('n' | 'N') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let Some(model) = self.selected_picker_model(&filtered) else {
-                    return (false, Vec::new());
+                    return Effects::none();
                 };
                 let result = self.create_session_with_model(None, model);
-                if !result.1.is_empty() {
+                if result
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Send(_)))
+                {
                     self.overlay = None;
                 }
                 result
             }
-            KeyCode::Backspace => (picker.pop_query(), Vec::new()),
+            KeyCode::Backspace => Effects::changed_now(picker.pop_query()),
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 let mut encoded = [0; 4];
-                (
-                    picker.push_query(character.encode_utf8(&mut encoded)),
-                    Vec::new(),
-                )
+                Effects::changed_now(picker.push_query(character.encode_utf8(&mut encoded)))
             }
-            _ => (false, Vec::new()),
+            _ => Effects::none(),
         }
     }
 
@@ -1554,37 +1529,30 @@ impl App {
             .map(|option| option.selection.clone())
     }
 
-    fn set_session_model(
-        &mut self,
-        session_id: SessionId,
-        model: ModelSelection,
-    ) -> (bool, Vec<ClientRequest>) {
+    fn set_session_model(&mut self, session_id: SessionId, model: ModelSelection) -> Effects {
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         // Remember the pick as the client default so /new and later creates
         // keep using it until the user chooses another model.
         self.model = model.clone();
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::SetSessionModel { session_id, model },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::SetSessionModel { session_id, model },
+        }))
     }
 
-    fn open_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn open_sessions(&mut self) -> Effects {
         self.open_session_picker(None)
     }
 
     /// `/agents`: the focused session's root and every descendant, so the
     /// user can see and jump between the agents one task fanned out into.
-    fn open_agents(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn open_agents(&mut self) -> Effects {
         let Some(focused) = self.focused() else {
             self.set_warning("focus a session to view its agents".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let mut root = focused;
         while let Some(parent) = self
@@ -1597,7 +1565,7 @@ impl App {
         self.open_session_picker(Some(root))
     }
 
-    fn open_session_picker(&mut self, scope: Option<SessionId>) -> (bool, Vec<ClientRequest>) {
+    fn open_session_picker(&mut self, scope: Option<SessionId>) -> Effects {
         let selected = self
             .focused()
             .filter(|session_id| self.sessions.contains_key(session_id))
@@ -1608,7 +1576,7 @@ impl App {
             selected,
             confirm: None,
         });
-        (true, Vec::new())
+        Effects::redraw(Redraw::Immediate)
     }
 
     /// Sessions matching the open session picker's query, in tree order.
@@ -1656,7 +1624,7 @@ impl App {
         }
     }
 
-    fn handle_session_picker_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+    fn handle_session_picker_key(&mut self, key: KeyEvent) -> Effects {
         if let Some(confirm) = self.session_picker_confirm() {
             return self.handle_session_picker_confirm_key(key, confirm);
         }
@@ -1666,14 +1634,14 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.overlay = None;
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             KeyCode::Up => {
                 let next = filtered
                     .get(position.unwrap_or_default().saturating_sub(1))
                     .copied();
                 self.set_session_picker_selection(next);
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             KeyCode::Down => {
                 let next = filtered
@@ -1685,11 +1653,11 @@ impl App {
                     )
                     .copied();
                 self.set_session_picker_selection(next);
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             KeyCode::Enter => {
                 let Some(current) = current else {
-                    return (false, Vec::new());
+                    return Effects::none();
                 };
                 self.overlay = None;
                 self.focus_session(current)
@@ -1700,7 +1668,7 @@ impl App {
                     .as_mut()
                     .is_some_and(|overlay| overlay.picker_mut().pop_query());
                 self.reset_session_picker_selection();
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
             // Ctrl-modified so plain letters keep feeding the search query.
             KeyCode::Delete => self.request_delete_confirmation(current),
@@ -1711,7 +1679,7 @@ impl App {
                 if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
                     *confirm = Some(SessionConfirm::Prune);
                 }
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
             KeyCode::Char(character)
                 if !key
@@ -1725,9 +1693,9 @@ impl App {
                     .as_mut()
                     .is_some_and(|overlay| overlay.picker_mut().push_query(text));
                 self.reset_session_picker_selection();
-                (changed, Vec::new())
+                Effects::changed_now(changed)
             }
-            _ => (false, Vec::new()),
+            _ => Effects::none(),
         }
     }
 
@@ -1737,12 +1705,9 @@ impl App {
         }
     }
 
-    fn request_delete_confirmation(
-        &mut self,
-        selected: Option<SessionId>,
-    ) -> (bool, Vec<ClientRequest>) {
+    fn request_delete_confirmation(&mut self, selected: Option<SessionId>) -> Effects {
         let Some(selected) = selected else {
-            return (false, Vec::new());
+            return Effects::none();
         };
         if self
             .sessions
@@ -1750,19 +1715,19 @@ impl App {
             .is_some_and(|session| session.summary.active_run_id.is_some())
         {
             self.set_warning("cancel the active run before deleting".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         }
         if let Some(Overlay::Sessions { confirm, .. }) = &mut self.overlay {
             *confirm = Some(SessionConfirm::Delete(selected));
         }
-        (true, Vec::new())
+        Effects::redraw(Redraw::Immediate)
     }
 
     fn handle_session_picker_confirm_key(
         &mut self,
         key: KeyEvent,
         confirm: SessionConfirm,
-    ) -> (bool, Vec<ClientRequest>) {
+    ) -> Effects {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
                 self.clear_session_picker_confirm();
@@ -1773,9 +1738,9 @@ impl App {
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 self.clear_session_picker_confirm();
-                (true, Vec::new())
+                Effects::redraw(Redraw::Immediate)
             }
-            _ => (false, Vec::new()),
+            _ => Effects::none(),
         }
     }
 
@@ -1785,36 +1750,30 @@ impl App {
         }
     }
 
-    fn delete_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
+    fn delete_session(&mut self, session_id: SessionId) -> Effects {
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::DeleteSession { session_id },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::DeleteSession { session_id },
+        }))
     }
 
-    fn prune_sessions(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn prune_sessions(&mut self) -> Effects {
         let Some(workspace_id) = self.workspace_id else {
             self.set_warning("workspace is still connecting".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::PruneSessions { workspace_id },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::PruneSessions { workspace_id },
+        }))
     }
 
     fn reset_session_picker_selection(&mut self) {
@@ -1824,7 +1783,7 @@ impl App {
 
     /// Focus a session. A warm body renders immediately with no request; a
     /// cold one shows its summary and live tail while its body is fetched.
-    pub(crate) fn focus_session(&mut self, session_id: SessionId) -> (bool, Vec<ClientRequest>) {
+    pub(crate) fn focus_session(&mut self, session_id: SessionId) -> Effects {
         self.set_focus(session_id);
         self.reset_history_browse();
         self.evict_cold_bodies();
@@ -1833,24 +1792,21 @@ impl App {
             .get(&session_id)
             .is_some_and(SessionView::is_warm)
         {
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         }
         let Some(workspace_id) = self.workspace_id else {
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
-        (
-            true,
-            vec![ClientRequest::Snapshot(SnapshotRequest {
-                workspace_id,
-                focused_session_id: Some(session_id),
-                include_sessions: Vec::new(),
-                session_limit: SNAPSHOT_SESSION_LIMIT,
-                message_limit: SNAPSHOT_MESSAGE_LIMIT,
-            })],
-        )
+        Effects::send_now(ClientRequest::Snapshot(SnapshotRequest {
+            workspace_id,
+            focused_session_id: Some(session_id),
+            include_sessions: Vec::new(),
+            session_limit: SNAPSHOT_SESSION_LIMIT,
+            message_limit: SNAPSHOT_MESSAGE_LIMIT,
+        }))
     }
 
-    fn create_session(&mut self, parent_id: Option<SessionId>) -> (bool, Vec<ClientRequest>) {
+    fn create_session(&mut self, parent_id: Option<SessionId>) -> Effects {
         let model = self.model_for_new_session();
         self.create_session_with_model(parent_id, model)
     }
@@ -1887,47 +1843,44 @@ impl App {
         &mut self,
         parent_id: Option<SessionId>,
         model: ModelSelection,
-    ) -> (bool, Vec<ClientRequest>) {
+    ) -> Effects {
         if !model.model.as_ref().is_some_and(|route| {
             route
                 .split_once('/')
                 .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
         }) {
             self.set_warning("choose a model with /models before creating a session".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         }
         let Some(workspace_id) = self.workspace_id else {
             self.set_warning("workspace is still connecting".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         // Keep the chosen model as the client default for the rest of this TUI
         // process until /models picks something else.
         self.model = model.clone();
         self.pending.insert(command_id, PendingIntent::Create);
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::CreateSession {
-                    workspace_id,
-                    parent_id,
-                    model,
-                    approval_mode: ApprovalMode::default(),
-                    profile: qq_protocol::AgentProfileId::default(),
-                    correlation: qq_protocol::Correlation::default(),
-                },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::CreateSession {
+                workspace_id,
+                parent_id,
+                model,
+                approval_mode: ApprovalMode::default(),
+                profile: qq_protocol::AgentProfileId::default(),
+                correlation: qq_protocol::Correlation::default(),
+            },
+        }))
     }
 
-    fn submit_prompt(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn submit_prompt(&mut self) -> Effects {
         let prompt = self.composer.expanded().trim().to_owned();
         if prompt.is_empty() {
-            return (false, Vec::new());
+            return Effects::none();
         }
         // Reserved composer commands stay client-side. Every other leading
         // slash is submitted through the ordinary command path so the shared
@@ -1943,7 +1896,7 @@ impl App {
         }
         let Some(session_id) = self.focused() else {
             self.set_warning("create a session before sending a prompt".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         // Enter during an active run steers when the server supports it and
         // otherwise holds the draft locally until the run finishes. Sending
@@ -1964,14 +1917,14 @@ impl App {
     /// Send the draft to the focused session's active run as steering. The
     /// caller has checked the capability; this only checks there is a run.
     /// With `interrupt`, the run's in-flight turn is aborted first.
-    fn steer_run(&mut self, interrupt: bool) -> (bool, Vec<ClientRequest>) {
+    fn steer_run(&mut self, interrupt: bool) -> Effects {
         let text = self.composer.expanded().trim().to_owned();
         if text.is_empty() {
-            return (false, Vec::new());
+            return Effects::none();
         }
         let Some(session_id) = self.focused() else {
             self.set_warning("create a session before steering a run".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let Some(run_id) = self
             .sessions
@@ -1979,11 +1932,11 @@ impl App {
             .and_then(|session| session.summary.active_run_id)
         else {
             self.set_warning("focused session has no active run to steer".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         self.record_prompt(session_id, &text);
         self.composer.clear();
@@ -1997,24 +1950,21 @@ impl App {
                 text: text.clone(),
             },
         );
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::SteerRun {
-                    run_id,
-                    input: vec![qq_protocol::InputPart::text(text)],
-                    interrupt,
-                },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::SteerRun {
+                run_id,
+                input: vec![qq_protocol::InputPart::text(text)],
+                interrupt,
+            },
+        }))
     }
 
     /// Send `prompt` to `session_id` as a new run.
-    fn submit_text(&mut self, session_id: SessionId, prompt: String) -> (bool, Vec<ClientRequest>) {
+    fn submit_text(&mut self, session_id: SessionId, prompt: String) -> Effects {
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         self.record_prompt(session_id, &prompt);
         self.composer.clear();
@@ -2030,56 +1980,52 @@ impl App {
                 text: prompt.clone(),
             },
         );
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::SubmitPrompt {
-                    session_id,
-                    input: vec![qq_protocol::InputPart::text(prompt)],
-                    limits: qq_protocol::RunLimits::default(),
-                    correlation: qq_protocol::Correlation::default(),
-                },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::SubmitPrompt {
+                session_id,
+                input: vec![qq_protocol::InputPart::text(prompt)],
+                limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
+            },
+        }))
     }
 
     /// Hold the composer text for the focused session until its run ends.
-    fn queue_draft(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn queue_draft(&mut self) -> Effects {
         let prompt = self.composer.expanded().trim().to_owned();
         if prompt.is_empty() {
-            return (false, Vec::new());
+            return Effects::none();
         }
         let Some(session_id) = self.focused() else {
             self.set_warning("create a session before queueing a prompt".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let Some(session) = self.sessions.get_mut(&session_id) else {
-            return (false, Vec::new());
+            return Effects::none();
         };
         if session.drafts.len() >= MAX_QUEUED_DRAFTS {
             self.set_warning(format!(
                 "at most {MAX_QUEUED_DRAFTS} drafts can wait per session"
             ));
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         }
         session.drafts.push_back(prompt);
         self.composer.clear();
         self.reset_history_browse();
         self.slash.select(0);
-        (true, Vec::new())
+        Effects::redraw(Redraw::Immediate)
     }
 
     /// Pull the newest queued draft back into the composer for editing. A
     /// non-empty composer is queued first so nothing is lost.
-    fn dequeue_draft(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn dequeue_draft(&mut self) -> Effects {
         let Some(session_id) = self.focused() else {
-            return (false, Vec::new());
+            return Effects::none();
         };
         if !self.composer.text.is_empty() {
-            let (changed, _) = self.queue_draft();
-            if !changed {
-                return (false, Vec::new());
+            if self.queue_draft().is_empty() {
+                return Effects::none();
             }
             // The draft just queued is newest; rotate so the previously
             // newest one comes back.
@@ -2095,10 +2041,10 @@ impl App {
             .get_mut(&session_id)
             .and_then(|session| session.drafts.pop_back())
         else {
-            return (false, Vec::new());
+            return Effects::none();
         };
         self.composer.replace(draft);
-        (true, Vec::new())
+        Effects::redraw(Redraw::Immediate)
     }
 
     /// Drafts waiting for `session_id` in submission order.
@@ -2113,16 +2059,15 @@ impl App {
     /// Submit the oldest waiting draft once the session goes idle. Called by
     /// the reducer on `RunFinished`; one draft per run so each becomes its
     /// own run in order.
-    pub(super) fn flush_draft(&mut self, session_id: SessionId) {
+    pub(super) fn flush_draft(&mut self, session_id: SessionId) -> Effects {
         let Some(draft) = self
             .sessions
             .get_mut(&session_id)
             .and_then(|session| session.drafts.pop_front())
         else {
-            return;
+            return Effects::none();
         };
-        let (_, requests) = self.submit_text(session_id, draft);
-        self.queued_requests.extend(requests);
+        self.submit_text(session_id, draft)
     }
 
     fn record_prompt(&mut self, session_id: SessionId, prompt: &str) {
@@ -2179,10 +2124,10 @@ impl App {
         self.history_draft = None;
     }
 
-    fn compact_session(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn compact_session(&mut self) -> Effects {
         let Some(session_id) = self.focused() else {
             self.set_warning("create a session before compacting".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         if self
             .sessions
@@ -2190,28 +2135,25 @@ impl App {
             .is_some_and(|session| session.summary.status != SessionStatus::Idle)
         {
             self.set_warning("compaction needs an idle session; wait or cancel first".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         }
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         self.pending
             .insert(command_id, PendingIntent::Compact { session_id });
         self.set_info("compacting session...".to_owned());
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::CompactSession { session_id },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::CompactSession { session_id },
+        }))
     }
 
-    fn cancel_run(&mut self) -> (bool, Vec<ClientRequest>) {
+    fn cancel_run(&mut self) -> Effects {
         let Some(session_id) = self.focused() else {
             self.set_warning("focused session has no active run".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let Some(run_id) = self
             .sessions
@@ -2219,21 +2161,18 @@ impl App {
             .and_then(|session| session.summary.active_run_id)
         else {
             self.set_warning("focused session has no active run".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         self.pending
             .insert(command_id, PendingIntent::Cancel { session_id });
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::CancelRun { run_id },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::CancelRun { run_id },
+        }))
     }
 
     /// The focused session's oldest unanswered tool approval, if any.
@@ -2254,7 +2193,7 @@ impl App {
             .get(&tool_call.id)
     }
 
-    fn handle_approval_key(&mut self, key: KeyEvent) -> (bool, Vec<ClientRequest>) {
+    fn handle_approval_key(&mut self, key: KeyEvent) -> Effects {
         if matches!(self.settings.action_for(key), Some(Action::CancelRun)) {
             return self.cancel_run();
         }
@@ -2265,13 +2204,13 @@ impl App {
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                 self.respond_to_approval(ApprovalChoice::Deny)
             }
-            _ => (false, Vec::new()),
+            _ => Effects::none(),
         }
     }
 
-    fn respond_to_approval(&mut self, choice: ApprovalChoice) -> (bool, Vec<ClientRequest>) {
+    fn respond_to_approval(&mut self, choice: ApprovalChoice) -> Effects {
         let Some(tool_call) = self.pending_approval() else {
-            return (false, Vec::new());
+            return Effects::none();
         };
         let tool_call_id = tool_call.id;
         let run_id = tool_call.run_id;
@@ -2287,22 +2226,19 @@ impl App {
         };
         let Ok(command_id) = CommandId::generate() else {
             self.set_warning("secure randomness is unavailable".to_owned());
-            return (true, Vec::new());
+            return Effects::redraw(Redraw::Immediate);
         };
         self.answered_approvals.insert(tool_call_id);
         self.pending
             .insert(command_id, PendingIntent::Approval { tool_call_id });
-        (
-            true,
-            vec![ClientRequest::Command(CommandRequest {
-                command_id,
-                command: SessionCommand::RespondToolApproval {
-                    run_id,
-                    tool_call_id,
-                    decision,
-                },
-            })],
-        )
+        Effects::send_now(ClientRequest::Command(CommandRequest {
+            command_id,
+            command: SessionCommand::RespondToolApproval {
+                run_id,
+                tool_call_id,
+                decision,
+            },
+        }))
     }
 
     fn push_input(&mut self, character: char) -> bool {
@@ -2341,7 +2277,7 @@ impl App {
         changed
     }
 
-    fn handle_slash_key(&mut self, code: KeyCode) -> Option<(bool, Vec<ClientRequest>)> {
+    fn handle_slash_key(&mut self, code: KeyCode) -> Option<Effects> {
         // Only navigation and acceptance keys consult the list; ordinary typing
         // must not pay for building it.
         if !matches!(
@@ -2358,11 +2294,11 @@ impl App {
         match code {
             KeyCode::Up => {
                 self.slash.move_up();
-                Some((true, Vec::new()))
+                Some(Effects::redraw(Redraw::Immediate))
             }
             KeyCode::Down => {
                 self.slash.move_down(entries.len());
-                Some((true, Vec::new()))
+                Some(Effects::redraw(Redraw::Immediate))
             }
             KeyCode::Enter | KeyCode::Tab => {
                 let command = entries[self.slash.selected(entries.len())].command;

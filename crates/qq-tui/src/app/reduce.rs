@@ -14,12 +14,14 @@ use super::{
 };
 use crate::{
     ClientRequest,
+    effect::{Effect, Effects},
     input::{Overlay, SessionConfirm},
     panes::PaneId,
 };
 
 impl App {
-    pub(super) fn reduce_event(&mut self, envelope: &SessionEventEnvelope) {
+    pub(super) fn reduce_event(&mut self, envelope: &SessionEventEnvelope) -> Effects {
+        let mut effects = Effects::none();
         match &envelope.event {
             SessionEvent::SessionCreated { session } => {
                 let mine = envelope
@@ -35,7 +37,7 @@ impl App {
                 self.upsert_summary(session.clone());
             }
             SessionEvent::SessionDeleted { session_id } => {
-                self.remove_session(*session_id);
+                effects.extend(self.remove_session(*session_id));
             }
             SessionEvent::PromptQueued {
                 session, message, ..
@@ -135,9 +137,9 @@ impl App {
                 if tool_call.state != ToolCallState::AwaitingApproval {
                     self.answered_approvals.remove(&tool_call.id);
                 } else if let Some(session) = self.sessions.get(&envelope.session_id) {
-                    self.request_attention(Attention::ApprovalRequested {
+                    effects.extend(self.attention(Attention::ApprovalRequested {
                         session_title: session.summary.title.clone(),
-                    });
+                    }));
                 }
                 if let Some(session) = self.sessions.get_mut(&envelope.session_id) {
                     if let Some(edit) = edit {
@@ -267,9 +269,9 @@ impl App {
                 ..
             } => {
                 self.upsert_summary(session.clone());
-                self.request_attention(Attention::RunFinished {
+                effects.extend(self.attention(Attention::RunFinished {
                     session_title: session.title.clone(),
-                });
+                }));
                 if let Some(view) = self.sessions.get_mut(&envelope.session_id) {
                     view.activity = None;
                     view.live.active_tool = None;
@@ -288,7 +290,7 @@ impl App {
                     }
                 }
                 if session.active_run_id.is_none() && session.queued_prompts == 0 {
-                    self.flush_draft(envelope.session_id);
+                    effects.extend(self.flush_draft(envelope.session_id));
                 }
                 if let Some(messages) = self
                     .sessions
@@ -334,6 +336,7 @@ impl App {
                 }
             }
         }
+        effects
     }
 
     pub(super) fn upsert_summary(&mut self, summary: SessionSummary) {
@@ -352,9 +355,10 @@ impl App {
     /// cascade: its children become roots, its per-call display state and
     /// optimistic prompts are discarded, and a deleted focus moves to the
     /// nearest remaining session (or clears).
-    pub(super) fn remove_session(&mut self, session_id: SessionId) {
+    pub(super) fn remove_session(&mut self, session_id: SessionId) -> Effects {
+        let mut effects = Effects::none();
         if !self.sessions.contains_key(&session_id) {
-            return;
+            return effects;
         }
         // Every pane showing the deleted session moves to its neighbour in
         // thread order; the focused pane's replacement is fetched if cold.
@@ -378,7 +382,7 @@ impl App {
                 })
         };
         let Some(removed) = self.sessions.remove(&session_id) else {
-            return;
+            return effects;
         };
         for call in removed.tool_calls.iter().flatten() {
             self.answered_approvals.remove(&call.id);
@@ -406,14 +410,13 @@ impl App {
                 .and_then(|next| self.sessions.get(&next))
                 .is_some_and(SessionView::is_warm);
             if let (Some(next), Some(workspace_id), false) = (refocus, self.workspace_id, warm) {
-                self.queued_requests
-                    .push(ClientRequest::Snapshot(SnapshotRequest {
-                        workspace_id,
-                        focused_session_id: Some(next),
-                        include_sessions: Vec::new(),
-                        session_limit: SNAPSHOT_SESSION_LIMIT,
-                        message_limit: SNAPSHOT_MESSAGE_LIMIT,
-                    }));
+                effects.push(Effect::Send(ClientRequest::Snapshot(SnapshotRequest {
+                    workspace_id,
+                    focused_session_id: Some(next),
+                    include_sessions: Vec::new(),
+                    session_limit: SNAPSHOT_SESSION_LIMIT,
+                    message_limit: SNAPSHOT_MESSAGE_LIMIT,
+                })));
             }
         }
         if let Some(Overlay::Sessions {
@@ -428,6 +431,7 @@ impl App {
                 self.reset_session_picker_selection();
             }
         }
+        effects
     }
 
     /// Marks a run's still-streaming assistant messages complete through the

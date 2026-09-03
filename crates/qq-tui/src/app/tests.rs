@@ -7,6 +7,7 @@ use qq_protocol::{
 
 use super::*;
 use crate::{
+    effect::{Effect, Effects},
     fixtures,
     model::{LIVE_TAIL_BYTES, MAX_LIVE_TOOL_OUTPUT_BYTES},
 };
@@ -23,7 +24,9 @@ fn snapshot() -> WorkspaceSnapshot {
 fn shift_enter_inserts_a_newline_without_submitting() {
     let mut app = App::new(TuiOptions::default());
     app.composer.text = "hello".to_owned();
-    let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        .split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.composer.text, "hello\n");
@@ -34,13 +37,16 @@ fn alt_enter_and_ctrl_j_insert_newlines_without_submitting() {
     let mut app = App::new(TuiOptions::default());
     app.composer.text = "hello".to_owned();
 
-    let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+        .split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.composer.text, "hello\n");
 
-    let (changed, requests) =
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))
+        .split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.composer.text, "hello\n\n");
@@ -49,7 +55,9 @@ fn alt_enter_and_ctrl_j_insert_newlines_without_submitting() {
 #[test]
 fn paste_preserves_newlines_in_the_composer() {
     let mut app = App::new(TuiOptions::default());
-    let (changed, requests) = app.handle_terminal_event(Event::Paste("alpha\r\nbeta".to_owned()));
+    let (changed, requests) = app
+        .handle_terminal_event(Event::Paste("alpha\r\nbeta".to_owned()))
+        .split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.composer.text, "alpha\nbeta");
@@ -68,7 +76,9 @@ fn submit_is_optimistic_but_restores_a_rejected_prompt() {
     app.apply_snapshot(snapshot());
     app.composer.text = "hello".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
         panic!("expected command")
     };
@@ -103,11 +113,15 @@ fn approval_prompt_captures_keys_and_sends_the_decision() {
     );
 
     // The prompt captures ordinary typing instead of the composer.
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .split();
     assert!(requests.is_empty());
     assert!(app.composer.text.is_empty());
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .split();
     let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
         panic!("expected a command")
     };
@@ -121,7 +135,9 @@ fn approval_prompt_captures_keys_and_sends_the_decision() {
     );
     // Answered approvals stop prompting until the server responds.
     assert!(app.pending_approval().is_none());
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .split();
     assert!(requests.is_empty());
 
     // A failed command re-opens the prompt so the user can answer again.
@@ -131,7 +147,9 @@ fn approval_prompt_captures_keys_and_sends_the_decision() {
     });
     assert!(app.pending_approval().is_some());
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .split();
     let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
         panic!("expected a command")
     };
@@ -159,7 +177,9 @@ fn approve_for_session_grants_shell_commands_as_prefixes() {
         ..fixtures::tool_call(id(8, ToolCallId::from_bytes), session_id, "shell")
     });
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .split();
     let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
         panic!("expected a command")
     };
@@ -189,7 +209,9 @@ fn approve_for_workspace_sends_the_decision_and_surfaces_the_promotion() {
         ..fixtures::tool_call(id(8, ToolCallId::from_bytes), session_id, "shell")
     });
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+        .split();
     let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
         panic!("expected a command")
     };
@@ -290,7 +312,9 @@ fn slash_command_aliases_quit_and_open_sessions_without_submitting_prompts() {
 
     for command in ["/sessions", "/resume"] {
         app.composer.text = command.to_owned();
-        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let (_, requests) = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .split();
         assert!(requests.is_empty());
         assert!(matches!(app.overlay, Some(Overlay::Sessions { .. })));
         app.overlay = None;
@@ -299,9 +323,9 @@ fn slash_command_aliases_quit_and_open_sessions_without_submitting_prompts() {
     for command in ["/quit", "/exit"] {
         let mut app = App::new(TuiOptions::default());
         app.composer.text = command.to_owned();
-        let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(requests.is_empty());
-        assert!(app.quit);
+        let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(effects.requests().next().is_none());
+        assert!(effects.iter().any(|effect| *effect == Effect::Quit));
     }
 }
 
@@ -312,7 +336,9 @@ fn compact_slash_command_sends_compact_session_for_the_focused_idle_session() {
     let session_id = app.focused().unwrap();
     app.composer.text = "/compact".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
 
     let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
         panic!("expected a command")
@@ -375,7 +401,9 @@ fn warning_notices_expire_but_error_notices_stick_until_dismissed() {
         app.visible_status(),
         Some(("model request failed", NoticeLevel::Error))
     );
-    let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.visible_status(), None);
@@ -390,7 +418,9 @@ fn compact_refuses_while_the_focused_session_is_not_idle() {
     app.apply_snapshot(initial);
     app.composer.text = "/compact".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
 
     assert!(requests.is_empty());
     assert_eq!(
@@ -405,7 +435,9 @@ fn runtime_slash_invocations_are_submitted_as_prompts() {
     app.apply_snapshot(snapshot());
     app.composer.text = "/frobnicate the context".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
 
     assert_eq!(requests.len(), 1);
     let ClientRequest::Command(CommandRequest {
@@ -472,7 +504,9 @@ fn new_slash_command_creates_a_root_session_with_the_selected_model() {
     app.apply_snapshot(snapshot());
     app.composer.text = "/new".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
 
     assert!(matches!(
         &requests[0],
@@ -536,9 +570,9 @@ fn slash_autocomplete_filters_selects_and_executes_commands() {
         "/quit",
         "a command prefix should hide unrelated commands"
     );
-    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(app.composer.text.is_empty());
-    assert!(app.quit);
+    assert!(effects.iter().any(|effect| *effect == Effect::Quit));
 }
 
 #[test]
@@ -557,14 +591,18 @@ fn session_picker_searches_titles_and_focuses_the_match() {
     app.composer.text = "/sessions".to_owned();
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    let (changed, requests) = app.handle_terminal_event(Event::Paste("LOGIN".to_owned()));
+    let (changed, requests) = app
+        .handle_terminal_event(Event::Paste("LOGIN".to_owned()))
+        .split();
 
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.filtered_sessions(), [target]);
     assert_eq!(app.session_picker_selected(), Some(target));
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     assert!(matches!(
         &requests[0],
         ClientRequest::Snapshot(SnapshotRequest {
@@ -583,7 +621,9 @@ fn session_picker_keeps_open_when_search_has_no_matches() {
     app.handle_terminal_event(Event::Paste("missing".to_owned()));
 
     assert!(app.filtered_sessions().is_empty());
-    let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     assert!(!changed);
     assert!(requests.is_empty());
     assert!(matches!(app.overlay, Some(Overlay::Sessions { .. })));
@@ -597,20 +637,25 @@ fn session_picker_deletes_the_highlighted_session_after_a_confirm() {
     app.open_sessions();
 
     // The confirm gate: Ctrl-D asks, n keeps, y deletes.
-    let (changed, requests) =
-        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(
         app.session_picker_confirm(),
         Some(SessionConfirm::Delete(session_id))
     );
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+        .split();
     assert!(requests.is_empty());
     assert_eq!(app.session_picker_confirm(), None);
 
     app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .split();
     assert!(matches!(
         &requests[0],
         ClientRequest::Command(CommandRequest {
@@ -631,8 +676,9 @@ fn session_picker_refuses_to_delete_a_session_with_an_active_run() {
     app.apply_snapshot(initial);
     app.open_sessions();
 
-    let (changed, requests) =
-        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .split();
 
     assert!(changed);
     assert!(requests.is_empty());
@@ -650,13 +696,16 @@ fn session_picker_prunes_empty_sessions_after_a_confirm() {
     let workspace_id = app.workspace_id.unwrap();
     app.open_sessions();
 
-    let (changed, requests) =
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+        .split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.session_picker_confirm(), Some(SessionConfirm::Prune));
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .split();
     assert!(matches!(
         &requests[0],
         ClientRequest::Command(CommandRequest {
@@ -700,7 +749,7 @@ fn session_deleted_event_drops_state_and_refocuses_a_neighbor() {
         .insert(tool_call_id, "output tail".to_owned());
     app.open_sessions();
 
-    let changed = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+    let effects = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
         occurred_at_ms: 2,
         ..fixtures::envelope(
             2,
@@ -711,20 +760,19 @@ fn session_deleted_event_drops_state_and_refocuses_a_neighbor() {
         )
     }));
 
-    assert!(changed);
+    assert!(effects.redraws());
     assert!(!app.sessions.contains_key(&deleted));
     assert_eq!(app.focused(), Some(neighbor));
     assert_eq!(app.session_picker_selected(), Some(neighbor));
     // The refocus fetches the neighbor's transcript.
-    let requests = app.take_requests();
+    let requests = effects.into_requests();
     assert!(matches!(
-        &requests[0],
-        ClientRequest::Snapshot(SnapshotRequest {
+        requests.as_slice(),
+        [ClientRequest::Snapshot(SnapshotRequest {
             focused_session_id: Some(session_id),
             ..
-        }) if *session_id == neighbor
+        })] if *session_id == neighbor
     ));
-    assert!(app.take_requests().is_empty());
 }
 
 #[test]
@@ -735,7 +783,7 @@ fn session_deleted_event_clears_focus_when_no_session_remains() {
     app.apply_snapshot(initial);
     assert_eq!(app.focused(), Some(deleted));
 
-    app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+    let effects = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
         occurred_at_ms: 2,
         ..fixtures::envelope(
             2,
@@ -748,7 +796,7 @@ fn session_deleted_event_clears_focus_when_no_session_remains() {
 
     assert!(app.sessions.is_empty());
     assert_eq!(app.focused(), None);
-    assert!(app.take_requests().is_empty());
+    assert!(effects.requests().next().is_none());
 }
 
 #[test]
@@ -1122,7 +1170,9 @@ fn model_refresh_preserves_the_open_picker_selection_by_identity() {
         ],
         selected: Some(selection.clone()),
     });
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
 
     assert_eq!(app.model, selection);
     // A session is focused, so Enter applies the preserved selection to
@@ -1172,7 +1222,9 @@ fn model_picker_applies_to_the_focused_session_and_ctrl_n_creates() {
     app.apply_snapshot(snapshot());
     app.composer.text = "/models".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     assert!(requests.is_empty());
     assert!(matches!(app.overlay, Some(Overlay::Models(_))));
     app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
@@ -1181,7 +1233,9 @@ fn model_picker_applies_to_the_focused_session_and_ctrl_n_creates() {
     // Enter with a focused session repoints that session's model and
     // remembers it as the client default for later /new creates.
     let focused = app.focused().unwrap();
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     let ClientRequest::Command(request) = &requests[0] else {
         panic!("expected set-session-model command")
     };
@@ -1195,7 +1249,9 @@ fn model_picker_applies_to_the_focused_session_and_ctrl_n_creates() {
 
     // Ctrl-N creates a fresh session with the selected model instead.
     app.open_models();
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+        .split();
     let ClientRequest::Command(request) = &requests[0] else {
         panic!("expected create-session command")
     };
@@ -1237,7 +1293,9 @@ fn model_picker_enter_without_a_focused_session_creates_one() {
     assert!(app.focused().is_none());
     app.open_models();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
 
     let ClientRequest::Command(request) = &requests[0] else {
         panic!("expected create-session command")
@@ -1281,7 +1339,9 @@ fn model_picker_selection_becomes_the_default_for_new_sessions() {
     app.apply_snapshot(snapshot());
     app.open_models();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     assert!(matches!(
         &requests[0],
         ClientRequest::Command(CommandRequest {
@@ -1291,7 +1351,7 @@ fn model_picker_selection_becomes_the_default_for_new_sessions() {
     ));
     assert_eq!(app.model, switched);
 
-    let (_, requests) = app.execute(Command::NewRootSession);
+    let (_, requests) = app.execute(Command::NewRootSession).split();
     assert!(matches!(
         &requests[0],
         ClientRequest::Command(CommandRequest {
@@ -1308,7 +1368,9 @@ fn new_inherits_the_focused_session_model_when_no_default_is_loaded() {
     app.model = ModelSelection::default();
     app.composer.text = "/new".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
 
     assert!(matches!(
         &requests[0],
@@ -1327,7 +1389,7 @@ fn create_without_a_default_or_focused_session_still_requires_a_model() {
     let mut app = App::new(TuiOptions::default());
     app.apply_snapshot(initial);
 
-    let (_, requests) = app.execute(Command::NewRootSession);
+    let (_, requests) = app.execute(Command::NewRootSession).split();
 
     assert!(requests.is_empty());
     assert_eq!(
@@ -1342,7 +1404,9 @@ fn reset_preserves_an_in_flight_prompt_until_its_result() {
     let snapshot = snapshot();
     app.apply_snapshot(snapshot.clone());
     app.composer.text = "keep me".to_owned();
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     let ClientRequest::Command(request) = requests.into_iter().next().unwrap() else {
         panic!("expected command")
     };
@@ -1553,7 +1617,7 @@ fn stale_snapshot_cannot_change_the_selected_session() {
     app.apply_snapshot(initial.clone());
     app.focus_session(new_focus);
 
-    assert!(!app.apply_snapshot(initial));
+    assert!(!app.apply_snapshot(initial).redraws());
     assert_eq!(app.focused(), Some(new_focus));
     assert_ne!(app.focused(), Some(old_focus));
 }
@@ -1674,7 +1738,7 @@ fn ctrl_o_cycles_tool_detail_and_yields_to_overlays() {
     assert_eq!(app.tool_detail, ToolDetail::Collapsed);
     let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
 
-    let (changed, requests) = app.handle_key(ctrl_o);
+    let (changed, requests) = app.handle_key(ctrl_o).split();
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.tool_detail, ToolDetail::Expanded);
@@ -1693,19 +1757,23 @@ fn page_keys_scroll_the_transcript_by_one_visible_page() {
     let mut app = App::new(TuiOptions::default());
     app.update_transcript_viewport(100, 12, false);
 
-    let (changed, requests) = app.handle_terminal_event(Event::Key(KeyEvent::new(
-        KeyCode::PageUp,
-        KeyModifiers::NONE,
-    )));
+    let (changed, requests) = app
+        .handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .split();
 
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.transcript_scroll_offset(), 12);
 
-    let (changed, requests) = app.handle_terminal_event(Event::Key(KeyEvent::new(
-        KeyCode::PageDown,
-        KeyModifiers::NONE,
-    )));
+    let (changed, requests) = app
+        .handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )))
+        .split();
 
     assert!(changed);
     assert!(requests.is_empty());
@@ -1725,13 +1793,17 @@ fn mouse_wheel_scrolls_the_transcript_by_three_rows() {
             modifiers: KeyModifiers::NONE,
         })
     };
-    let (changed, requests) = app.handle_terminal_event(mouse(MouseEventKind::ScrollUp));
+    let (changed, requests) = app
+        .handle_terminal_event(mouse(MouseEventKind::ScrollUp))
+        .split();
 
     assert!(changed);
     assert!(requests.is_empty());
     assert_eq!(app.transcript_scroll_offset(), 3);
 
-    let (changed, requests) = app.handle_terminal_event(mouse(MouseEventKind::ScrollDown));
+    let (changed, requests) = app
+        .handle_terminal_event(mouse(MouseEventKind::ScrollDown))
+        .split();
 
     assert!(changed);
     assert!(requests.is_empty());
@@ -1784,15 +1856,15 @@ fn scrolling_clamps_at_the_oldest_row_and_the_live_tail() {
     let page_up = Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
     let page_down = Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
 
-    assert!(app.handle_terminal_event(page_up.clone()).0);
-    assert!(app.handle_terminal_event(page_up.clone()).0);
+    assert!(app.handle_terminal_event(page_up.clone()).split().0);
+    assert!(app.handle_terminal_event(page_up.clone()).split().0);
     assert_eq!(app.transcript_scroll_offset(), 15);
-    assert!(!app.handle_terminal_event(page_up).0);
+    assert!(!app.handle_terminal_event(page_up).split().0);
 
-    assert!(app.handle_terminal_event(page_down.clone()).0);
-    assert!(app.handle_terminal_event(page_down.clone()).0);
+    assert!(app.handle_terminal_event(page_down.clone()).split().0);
+    assert!(app.handle_terminal_event(page_down.clone()).split().0);
     assert_eq!(app.transcript_scroll_offset(), 0);
-    assert!(!app.handle_terminal_event(page_down).0);
+    assert!(!app.handle_terminal_event(page_down).split().0);
 }
 
 #[test]
@@ -1808,14 +1880,14 @@ fn transcript_scroll_controls_are_ignored_by_overlays() {
     });
     let page = Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
 
-    assert!(!app.handle_terminal_event(wheel.clone()).0);
-    assert!(!app.handle_terminal_event(page.clone()).0);
+    assert!(!app.handle_terminal_event(wheel.clone()).split().0);
+    assert!(!app.handle_terminal_event(page.clone()).split().0);
     assert_eq!(app.transcript_scroll_offset(), 0);
 
     app.overlay = None;
     app.overlay = Some(Overlay::sessions("", app.focused(), None));
-    assert!(!app.handle_terminal_event(wheel).0);
-    assert!(!app.handle_terminal_event(page).0);
+    assert!(!app.handle_terminal_event(wheel).split().0);
+    assert!(!app.handle_terminal_event(page).split().0);
     assert_eq!(app.transcript_scroll_offset(), 0);
 }
 
@@ -1853,7 +1925,7 @@ fn body_for(summary: &SessionSummary, output: &str) -> SessionSnapshot {
 fn creating_a_session_adopts_it_without_a_snapshot_round_trip() {
     let mut app = App::new(TuiOptions::default());
     app.apply_snapshot(snapshot());
-    let (_, requests) = app.execute(Command::NewRootSession);
+    let (_, requests) = app.execute(Command::NewRootSession).split();
     let [ClientRequest::Command(request)] = requests.as_slice() else {
         panic!("expected one create command, got {requests:?}");
     };
@@ -1863,7 +1935,7 @@ fn creating_a_session_adopts_it_without_a_snapshot_round_trip() {
 
     // The durable event arrives first (the SSE stream is usually ahead of
     // the HTTP receipt); focus moves and the body is already warm.
-    let changed = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+    let effects = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
         caused_by: Some(request.command_id),
         ..fixtures::envelope(
             2,
@@ -1873,13 +1945,16 @@ fn creating_a_session_adopts_it_without_a_snapshot_round_trip() {
             },
         )
     }));
-    assert!(changed);
+    assert!(effects.redraws());
     assert_eq!(app.focused(), Some(created));
     assert!(app.sessions[&created].is_warm());
-    assert!(app.take_requests().is_empty(), "no snapshot after create");
+    assert!(
+        effects.requests().next().is_none(),
+        "no snapshot after create"
+    );
 
     // The receipt confirms without changing anything or requesting more.
-    app.apply_client_update(ClientUpdate::CommandResult {
+    let effects = app.apply_client_update(ClientUpdate::CommandResult {
         command_id: request.command_id,
         result: Ok(qq_protocol::CommandReceipt {
             command_id: request.command_id,
@@ -1890,7 +1965,7 @@ fn creating_a_session_adopts_it_without_a_snapshot_round_trip() {
         }),
     });
     assert_eq!(app.focused(), Some(created));
-    assert!(app.take_requests().is_empty());
+    assert!(effects.requests().next().is_none());
     // The previously focused session keeps its body warm.
     let previous = snapshot().sessions[0].id;
     assert!(app.sessions[&previous].is_warm());
@@ -1911,13 +1986,13 @@ fn switching_to_a_warm_session_needs_no_request_and_a_cold_one_does() {
     assert!(app.sessions[&warm.id].is_warm());
     assert!(!app.sessions[&cold.id].is_warm());
 
-    let (changed, requests) = app.focus_session(warm.id);
+    let (changed, requests) = app.focus_session(warm.id).split();
     assert!(changed);
     assert!(requests.is_empty(), "warm switch must not request");
     assert_eq!(app.focused(), Some(warm.id));
     assert!(app.sessions[&first].is_warm(), "leaving does not evict");
 
-    let (_, requests) = app.focus_session(cold.id);
+    let (_, requests) = app.focus_session(cold.id).split();
     assert!(matches!(
         requests.as_slice(),
         [ClientRequest::Snapshot(SnapshotRequest {
@@ -2108,7 +2183,9 @@ fn running_app() -> (
 fn enter_during_a_run_queues_the_draft_and_it_submits_when_the_run_ends() {
     let (mut app, session_id, run_id, mut event) = running_app();
     app.composer.text = "follow up".to_owned();
-    let (changed, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (changed, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     assert!(changed);
     assert!(
         requests.is_empty(),
@@ -2141,14 +2218,15 @@ fn enter_during_a_run_queues_the_draft_and_it_submits_when_the_run_ends() {
     let mut summary = app.sessions[&session_id].summary.clone();
     summary.status = SessionStatus::Idle;
     summary.active_run_id = None;
-    app.apply_client_update(event(SessionEvent::RunFinished {
-        session: summary,
-        run_id,
-        outcome: RunOutcome::Completed,
-        usage: None,
-        context_tokens: None,
-    }));
-    let requests = app.take_requests();
+    let requests = app
+        .apply_client_update(event(SessionEvent::RunFinished {
+            session: summary,
+            run_id,
+            outcome: RunOutcome::Completed,
+            usage: None,
+            context_tokens: None,
+        }))
+        .into_requests();
     assert!(matches!(
         requests.as_slice(),
         [ClientRequest::Command(CommandRequest {
@@ -2163,17 +2241,17 @@ fn enter_during_a_run_queues_the_draft_and_it_submits_when_the_run_ends() {
 fn esc_twice_cancels_the_active_run_but_once_only_arms() {
     let (mut app, session_id, run_id, _) = running_app();
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-    let (changed, requests) = app.handle_key(esc);
+    let (changed, requests) = app.handle_key(esc).split();
     assert!(changed);
     assert!(requests.is_empty());
     assert!(app.status.as_deref().unwrap().contains("Esc again"));
 
     // Typing disarms.
     app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    let (_, requests) = app.handle_key(esc);
+    let (_, requests) = app.handle_key(esc).split();
     assert!(requests.is_empty(), "disarmed by intervening input");
 
-    let (_, requests) = app.handle_key(esc);
+    let (_, requests) = app.handle_key(esc).split();
     assert!(matches!(
         requests.as_slice(),
         [ClientRequest::Command(CommandRequest {
@@ -2184,11 +2262,11 @@ fn esc_twice_cancels_the_active_run_but_once_only_arms() {
     assert!(app.sessions[&session_id].summary.active_run_id.is_some());
 
     // Too slow: the arm expires.
-    let (_, _) = app.handle_key(esc);
+    let (_, _) = app.handle_key(esc).split();
     for _ in 0..=ESC_CANCEL_TICKS {
         app.advance_animation();
     }
-    let (_, requests) = app.handle_key(esc);
+    let (_, requests) = app.handle_key(esc).split();
     assert!(requests.is_empty());
 }
 
@@ -2196,7 +2274,7 @@ fn esc_twice_cancels_the_active_run_but_once_only_arms() {
 fn steer_falls_back_to_queueing_until_the_server_advertises_it() {
     let (mut app, session_id, _, _) = running_app();
     app.composer.text = "go left".to_owned();
-    let (_, requests) = app.execute(Command::SteerRun);
+    let (_, requests) = app.execute(Command::SteerRun).split();
     assert!(requests.is_empty());
     assert_eq!(
         app.queued_drafts(session_id).collect::<Vec<_>>(),
@@ -2218,7 +2296,7 @@ fn steer_falls_back_to_queueing_until_the_server_advertises_it() {
         max_pending_per_run: 4,
     }));
     app.composer.text = "stop".to_owned();
-    let (_, requests) = app.handle_key(alt('s'));
+    let (_, requests) = app.handle_key(alt('s')).split();
     assert!(requests.is_empty());
     assert_eq!(
         app.queued_drafts(session_id).collect::<Vec<_>>(),
@@ -2252,7 +2330,9 @@ fn enter_steers_the_active_run_when_the_server_advertises_it() {
     let (mut app, session_id, run_id, _) = steering_app();
     app.composer.text = "also check the tests".to_owned();
 
-    let (_, requests) = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     let [ClientRequest::Command(request)] = requests.as_slice() else {
         panic!("expected one steer command, got {requests:?}");
     };
@@ -2281,7 +2361,7 @@ fn alt_s_interrupts_and_steers_and_disarms_esc() {
     assert!(app.esc_armed_at.is_some());
     app.composer.text = "wrong file".to_owned();
 
-    let (_, requests) = app.handle_key(alt('s'));
+    let (_, requests) = app.handle_key(alt('s')).split();
     let [ClientRequest::Command(request)] = requests.as_slice() else {
         panic!("expected one steer command, got {requests:?}");
     };
@@ -2299,7 +2379,7 @@ fn alt_s_interrupts_and_steers_and_disarms_esc() {
 #[test]
 fn steer_with_an_empty_draft_or_no_run_sends_nothing() {
     let (mut app, _, _, _) = steering_app();
-    let (changed, requests) = app.execute(Command::InterruptRun);
+    let (changed, requests) = app.execute(Command::InterruptRun).split();
     assert!(!changed);
     assert!(requests.is_empty());
 
@@ -2311,14 +2391,16 @@ fn steer_with_an_empty_draft_or_no_run_sends_nothing() {
         max_pending_per_run: 4,
     }));
     idle.composer.text = "hello".to_owned();
-    let (_, requests) = idle.execute(Command::SteerRun);
+    let (_, requests) = idle.execute(Command::SteerRun).split();
     assert!(requests.is_empty());
     assert!(app.status.is_none());
     assert!(idle.status.as_deref().unwrap().contains("no active run"));
     assert_eq!(idle.composer.text, "hello");
 
     // Enter on an idle session still submits a new prompt.
-    let (_, requests) = idle.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (_, requests) = idle
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .split();
     let [ClientRequest::Command(request)] = requests.as_slice() else {
         panic!("expected one submit, got {requests:?}");
     };
@@ -2332,7 +2414,7 @@ fn steer_with_an_empty_draft_or_no_run_sends_nothing() {
 fn refused_or_late_steering_returns_the_draft_to_the_composer() {
     let (mut app, session_id, run_id, _) = steering_app();
     app.composer.text = "first".to_owned();
-    let (_, requests) = app.execute(Command::SteerRun);
+    let (_, requests) = app.execute(Command::SteerRun).split();
     let [ClientRequest::Command(request)] = requests.as_slice() else {
         panic!("expected one steer command");
     };
@@ -2349,7 +2431,7 @@ fn refused_or_late_steering_returns_the_draft_to_the_composer() {
 
     // The run finished before the steer landed: the receipt is a success
     // that applied nothing, so the text comes back with a warning.
-    let (_, requests) = app.execute(Command::SteerRun);
+    let (_, requests) = app.execute(Command::SteerRun).split();
     let [ClientRequest::Command(request)] = requests.as_slice() else {
         panic!("expected one steer command");
     };
@@ -2369,7 +2451,7 @@ fn refused_or_late_steering_returns_the_draft_to_the_composer() {
 
     // A steer that was recorded clears the pending row; the transcript
     // row arrives through `steering_queued` like any other message.
-    let (_, requests) = app.execute(Command::SteerRun);
+    let (_, requests) = app.execute(Command::SteerRun).split();
     let [ClientRequest::Command(request)] = requests.as_slice() else {
         panic!("expected one steer command");
     };
@@ -2411,7 +2493,7 @@ fn splitting_inherits_the_session_and_pane_commands_route_through_keys() {
     assert_eq!(app.panes.len(), 1);
 
     // Alt-\ splits beside; the new pane shows the same session, focused.
-    let (changed, requests) = app.handle_key(alt('\\'));
+    let (changed, requests) = app.handle_key(alt('\\')).split();
     assert!(changed);
     assert!(requests.is_empty(), "a split never fetches");
     assert_eq!(app.panes.len(), 2);
@@ -2429,7 +2511,7 @@ fn splitting_inherits_the_session_and_pane_commands_route_through_keys() {
     assert_eq!(app.panes.len(), 3);
     app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
     let before = app.panes.focused_id();
-    let (changed, _) = app.handle_key(alt('k'));
+    let (changed, _) = app.handle_key(alt('k')).split();
     assert!(changed);
     assert_ne!(app.panes.focused_id(), before);
     assert_eq!(app.focused(), Some(other));
@@ -2437,13 +2519,13 @@ fn splitting_inherits_the_session_and_pane_commands_route_through_keys() {
     // Alt-W closes; Alt-Z zooms.
     app.handle_key(alt('w'));
     assert_eq!(app.panes.len(), 2);
-    let (changed, _) = app.handle_key(alt('z'));
+    let (changed, _) = app.handle_key(alt('z')).split();
     assert!(changed && app.panes.is_zoomed());
     app.handle_key(alt('z'));
     assert!(!app.panes.is_zoomed());
     app.handle_key(alt('w'));
     assert_eq!(app.panes.len(), 1);
-    let (_, _) = app.handle_key(alt('w'));
+    let (_, _) = app.handle_key(alt('w')).split();
     assert_eq!(app.panes.len(), 1, "the last pane stays");
     assert!(app.status.as_deref().unwrap().contains("last pane"));
 }
@@ -2504,19 +2586,21 @@ fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus
         ..snapshot()
     });
     app.execute(Command::SplitBeside);
-    let (_, requests) = app.focus_session(cold.id);
+    let (_, requests) = app.focus_session(cold.id).split();
     assert_eq!(requests.len(), 1, "cold body is requested");
     // The user moves back to the first pane before the body arrives.
     app.execute(Command::FocusPaneLeft);
     app.panes.layout(crate::panes::Rect::new(0, 2, 160, 40));
-    let (moved, _) = app.execute(Command::FocusPaneLeft);
+    let (moved, _) = app.execute(Command::FocusPaneLeft).split();
     assert!(moved);
     assert_eq!(app.focused(), Some(first));
 
-    let installed = app.apply_snapshot(WorkspaceSnapshot {
-        focused: Some(body_for(&cold, "arrived")),
-        ..snapshot()
-    });
+    let installed = app
+        .apply_snapshot(WorkspaceSnapshot {
+            focused: Some(body_for(&cold, "arrived")),
+            ..snapshot()
+        })
+        .redraws();
     assert!(installed);
     assert!(app.sessions[&cold.id].is_warm());
     assert_eq!(
@@ -2532,10 +2616,13 @@ fn a_body_fetched_for_a_pane_that_lost_focus_still_installs_without_moving_focus
         focused: None,
         ..snapshot()
     });
-    assert!(!app.apply_snapshot(WorkspaceSnapshot {
-        focused: Some(body_for(&gone, "late")),
-        ..snapshot()
-    }));
+    assert!(
+        !app.apply_snapshot(WorkspaceSnapshot {
+            focused: Some(body_for(&gone, "late")),
+            ..snapshot()
+        })
+        .redraws()
+    );
 }
 
 #[test]
@@ -2545,7 +2632,7 @@ fn deleting_a_session_repoints_every_pane_showing_it() {
     app.execute(Command::SplitBelow);
     // Panes: [first] [first / first]; point the focused one at `other`.
     app.focus_session(other);
-    app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
+    let effects = app.apply_client_update(ClientUpdate::Event(SessionEventEnvelope {
         occurred_at_ms: 2,
         ..fixtures::envelope(2, first, SessionEvent::SessionDeleted { session_id: first })
     }));
@@ -2554,7 +2641,7 @@ fn deleting_a_session_repoints_every_pane_showing_it() {
     assert_eq!(shown.len(), 3);
     assert!(shown.iter().all(|id| *id == other));
     // The replacement is warm, so nothing is fetched.
-    assert!(app.take_requests().is_empty());
+    assert!(effects.requests().next().is_none());
 }
 
 #[test]
@@ -2587,11 +2674,13 @@ fn the_mouse_scrolls_the_pane_under_the_cursor_and_clicks_focus_it() {
         right.pane,
         "scrolling does not focus"
     );
-    let (changed, _) = app.handle_terminal_event(mouse(
-        MouseEventKind::Down(MouseButton::Left),
-        left.rect.x + 2,
-        5,
-    ));
+    let (changed, _) = app
+        .handle_terminal_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            left.rect.x + 2,
+            5,
+        ))
+        .split();
     assert!(changed);
     assert_eq!(app.panes.focused_id(), left.pane);
 }
@@ -2602,18 +2691,22 @@ fn resize_keys_move_the_divider_of_the_enclosing_split() {
     app.execute(Command::SplitBeside);
     let area = crate::panes::Rect::new(0, 2, 201, 40);
     let (before, _) = app.panes.layout(area);
-    let (changed, _) = app.handle_key(KeyEvent::new(
-        KeyCode::Char('H'),
-        KeyModifiers::ALT | KeyModifiers::SHIFT,
-    ));
+    let (changed, _) = app
+        .handle_key(KeyEvent::new(
+            KeyCode::Char('H'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ))
+        .split();
     assert!(changed);
     let (after, _) = app.panes.layout(area);
     assert!(after[0].rect.width < before[0].rect.width);
     // No row split encloses the focused pane, so Alt-Shift-K does nothing.
-    let (changed, _) = app.handle_key(KeyEvent::new(
-        KeyCode::Char('K'),
-        KeyModifiers::ALT | KeyModifiers::SHIFT,
-    ));
+    let (changed, _) = app
+        .handle_key(KeyEvent::new(
+            KeyCode::Char('K'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ))
+        .split();
     assert!(!changed);
 }
 
@@ -2692,24 +2785,28 @@ fn attention_is_requested_only_while_the_terminal_is_unfocused() {
         usage: None,
         context_tokens: None,
     };
+    let attention = |effects: Effects| {
+        effects.into_iter().find_map(|effect| match effect {
+            Effect::Attention(attention) => Some(attention),
+            _ => None,
+        })
+    };
     // Focused: nothing to report.
-    app.apply_client_update(event(finish(run_id)));
-    assert_eq!(app.take_attention(), None);
+    let effects = app.apply_client_update(event(finish(run_id)));
+    assert_eq!(attention(effects), None);
 
     // Unfocused: a finished run asks for attention with the title.
     app.handle_terminal_event(Event::FocusLost);
-    app.apply_client_update(event(finish(run_id)));
+    let effects = app.apply_client_update(event(finish(run_id)));
     assert_eq!(
-        app.take_attention(),
+        attention(effects),
         Some(Attention::RunFinished {
             session_title: "Deploy".to_owned()
         })
     );
-    assert_eq!(app.take_attention(), None, "taken once");
 
-    // An approval request while unfocused also asks; regaining focus
-    // clears anything not yet delivered.
-    app.apply_client_update(event(SessionEvent::ToolApprovalRequested {
+    // An approval request while unfocused also asks.
+    let effects = app.apply_client_update(event(SessionEvent::ToolApprovalRequested {
         tool_call: ToolCallSnapshot {
             run_id,
             call_ordinal: 0,
@@ -2725,11 +2822,13 @@ fn attention_is_requested_only_while_the_terminal_is_unfocused() {
         edit: None,
     }));
     assert!(matches!(
-        app.attention,
+        attention(effects),
         Some(Attention::ApprovalRequested { .. })
     ));
+    // Focused again: silent.
     app.handle_terminal_event(Event::FocusGained);
-    assert_eq!(app.take_attention(), None);
+    let effects = app.apply_client_update(event(finish(run_id)));
+    assert_eq!(attention(effects), None);
     assert_eq!(
         Attention::ApprovalRequested {
             session_title: "Deploy".to_owned()

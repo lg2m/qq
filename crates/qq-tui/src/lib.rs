@@ -7,6 +7,7 @@ mod app;
 pub mod bench_support;
 mod commands;
 mod composer;
+mod effect;
 #[cfg(any(test, feature = "bench-support"))]
 pub mod fixtures;
 mod input;
