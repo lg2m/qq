@@ -19,8 +19,8 @@ use qq_core::{
     SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
     WorkspaceGrantAuthority, WorkspaceGrantSeed,
     plan::{
-        AgentProfile, CompiledAgentPlan, CredentialReference, PlanCompileError, ProviderDescriptor,
-        SourceFingerprint,
+        AgentProfile, CompiledAgentPlan, CredentialReference, HostSnapshot, PlanCompileError,
+        ProviderDescriptor, SourceFingerprint,
     },
 };
 use qq_protocol::{
@@ -36,6 +36,7 @@ use qq_provider::{
 };
 use qq_server::{
     CommandFuture, ModelsFuture, ProfilesFuture, ServerHandler, ServerHandlerError, SnapshotFuture,
+    WorkspaceToolsFuture,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -616,7 +617,12 @@ impl RuntimeFactory {
                 .mcp
                 .registry_for_snapshot(&self.inner.credentials, epoch, &snapshot)?
         {
-            profile = profile.with_mcp(wired.registry, wired.servers);
+            // The catalog is snapshotted here, on the blocking compile
+            // thread, so the plan holds an immutable tool list and the cache
+            // can revalidate it against the manager's generation.
+            profile = profile
+                .with_host(HostSnapshot::capture_blocking(wired.registry))
+                .with_mcp_servers(wired.servers);
         }
         let plan = CompiledAgentPlan::compile_blocking(profile)?;
         let mut sources = Vec::with_capacity(snapshot.probed_paths().len() + 3);
@@ -1442,6 +1448,38 @@ impl RuntimeHandler {
     }
 }
 
+/// The capability document's workspace tool section, read off a compiled
+/// plan: nothing is fetched, so a warm plan answers from memory.
+fn workspace_tool_capabilities(plan: &CompiledAgentPlan) -> qq_protocol::WorkspaceToolCapabilities {
+    let catalog = plan.catalog();
+    let skills = plan.skills();
+    qq_protocol::WorkspaceToolCapabilities {
+        catalog_digest: catalog.digest(),
+        exposure: match catalog.exposure() {
+            qq_core::catalog::Exposure::Full => qq_protocol::ToolExposure::Full,
+            qq_core::catalog::Exposure::Progressive => qq_protocol::ToolExposure::Progressive,
+        },
+        hosts: catalog
+            .hosts()
+            .iter()
+            .map(|host| qq_protocol::ToolHostSummary {
+                name: host.name.clone(),
+                generation: host.generation,
+                tool_count: u32::try_from(host.tool_count).unwrap_or(u32::MAX),
+                ready: host.ready,
+                message: host.readiness_message.clone(),
+            })
+            .collect(),
+        excluded_tools: u32::try_from(catalog.excluded().len()).unwrap_or(u32::MAX),
+        skills: qq_protocol::SkillCapabilities {
+            digest: skills.digest(),
+            indexed: u32::try_from(skills.len()).unwrap_or(u32::MAX),
+            disclosed: u32::try_from(skills.disclosed_count()).unwrap_or(u32::MAX),
+            truncated: skills.truncated(),
+        },
+    }
+}
+
 impl ServerHandler for RuntimeHandler {
     fn command(&self, request: CommandRequest) -> CommandFuture {
         let runtime = self.durable.clone();
@@ -1495,6 +1533,30 @@ impl ServerHandler for RuntimeHandler {
                     }
                     _ => ServerHandlerError::Internal,
                 })
+        })
+    }
+
+    fn workspace_tools(&self, workspace_id: WorkspaceId) -> WorkspaceToolsFuture {
+        let runtime = self.durable.clone();
+        let factory = self.factory.clone();
+        Box::pin(async move {
+            let workspace = runtime
+                .workspace_path(workspace_id)
+                .await
+                .map_err(map_session_runtime_error)?;
+            tokio::task::spawn_blocking(move || {
+                let load = LoadRequest::from_process_env(&workspace, None)?;
+                let plan = factory.plan_for(&load)?;
+                Ok::<_, RuntimeBuildError>(workspace_tool_capabilities(&plan))
+            })
+            .await
+            .map_err(|_| ServerHandlerError::Internal)?
+            .map_err(|error| match error.failure_kind() {
+                RunFailureKind::Configuration | RunFailureKind::Policy => {
+                    ServerHandlerError::InvalidRequest(error.to_string())
+                }
+                _ => ServerHandlerError::Internal,
+            })
         })
     }
 
@@ -3998,7 +4060,7 @@ mod tests {
                 "descriptor leaked {forbidden}"
             );
         }
-        assert!(canonical.starts_with("qq-agent-plan-descriptor-v2\0{"));
+        assert!(canonical.starts_with("qq-agent-plan-descriptor-v3\0{"));
     }
 
     #[test]

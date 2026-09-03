@@ -565,6 +565,8 @@ fn test_prepared_audit_with_identity(
             system_prompt_hash: Some(qq_protocol::ContentHash::from_bytes([0; 32])),
             tool_schema_hash: Some(qq_protocol::ContentHash::from_bytes([0; 32])),
             selected_guidance: None,
+            catalog_digest: None,
+            exposure: None,
         }),
         context_shape: context_request_shape(resolved_model.as_ref()),
         resolved_model,

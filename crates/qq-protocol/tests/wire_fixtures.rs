@@ -1,6 +1,6 @@
-//! Golden wire encodings for protocol version 13.
+//! Golden wire encodings for protocol version 14.
 //!
-//! Each fixture under `tests/fixtures/v13/` is the exact JSON a conforming
+//! Each fixture under `tests/fixtures/v14/` is the exact JSON a conforming
 //! peer sends or receives. The test decodes every fixture into its Rust type,
 //! re-encodes it, and requires byte equality with the file, so a field rename,
 //! reorder, or default change fails here before any client notices. Set
@@ -19,8 +19,9 @@ use qq_protocol::{
     ResolvedModelVersion, RunActivity, RunFailure, RunFailureKind, RunId, RunLimits, RunOutcome,
     RunPlanIdentity, RunPromptIdentity, RunSnapshot, RunStatus, ServerCapabilities, ServerInfo,
     SessionCommand, SessionCommandKind, SessionEvent, SessionEventEnvelope, SessionId,
-    SessionStatus, SessionSummary, SteeringCapabilities, StoreId, TokenUsage, ToolCallId,
-    WorkspaceId,
+    SessionStatus, SessionSummary, SkillCapabilities, SteeringCapabilities, StoreId, TokenUsage,
+    ToolCallId, ToolCapabilities, ToolExposure, ToolHostSummary, WorkspaceId,
+    WorkspaceToolCapabilities,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -135,7 +136,7 @@ where
     T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
 {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v13")
+        .join("tests/fixtures/v14")
         .join(format!("{name}.json"));
     let encoded = serde_json::to_string_pretty(value).unwrap() + "\n";
     if std::env::var_os("QQ_UPDATE_FIXTURES").is_some() {
@@ -156,8 +157,8 @@ where
 }
 
 #[test]
-fn version_13_commands_receipts_events_and_capabilities_match_their_goldens() {
-    assert_eq!(PROTOCOL_VERSION, 13);
+fn version_14_commands_receipts_events_and_capabilities_match_their_goldens() {
+    assert_eq!(PROTOCOL_VERSION, 14);
     let session_id = SessionId::from_bytes([3; 16]);
     let run_id = RunId::from_bytes([4; 16]);
     let command = |byte: u8, command: SessionCommand| CommandRequest {
@@ -451,6 +452,8 @@ fn version_13_commands_receipts_events_and_capabilities_match_their_goldens() {
                 system_prompt_hash: Some(hash(2)),
                 tool_schema_hash: Some(hash(3)),
                 selected_guidance: None,
+                catalog_digest: Some(hash(9)),
+                exposure: Some(ToolExposure::Full),
             })),
             resolved_model: Some(Box::new(resolved_model())),
             plan: Some(Box::new(plan_identity())),
@@ -520,6 +523,34 @@ fn version_13_commands_receipts_events_and_capabilities_match_their_goldens() {
                     approval_mode: ApprovalMode::ReadOnly,
                 },
             ]),
+            tools: ToolCapabilities {
+                max_catalog_tools: 512,
+                max_tool_schema_bytes: 16_384,
+                max_catalog_schema_bytes: 1_048_576,
+                full_exposure_tools: 24,
+                full_exposure_schema_bytes: 32_768,
+                max_pinned_tools: 32,
+                max_indexed_skills: 64,
+                external_prefixes: vec!["mcp__".to_owned(), "ext__".to_owned()],
+            },
+            workspace_tools: Some(WorkspaceToolCapabilities {
+                catalog_digest: hash(0xcc),
+                exposure: ToolExposure::Progressive,
+                hosts: vec![ToolHostSummary {
+                    name: "mcp".to_owned(),
+                    generation: 3,
+                    tool_count: 40,
+                    ready: true,
+                    message: None,
+                }],
+                excluded_tools: 1,
+                skills: SkillCapabilities {
+                    digest: hash(0xdd),
+                    indexed: 2,
+                    disclosed: 1,
+                    truncated: false,
+                },
+            }),
         },
     );
     check(
@@ -536,7 +567,7 @@ fn version_13_commands_receipts_events_and_capabilities_match_their_goldens() {
 fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     let base = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/v13/command_submit_prompt.json"),
+            .join("tests/fixtures/v14/command_submit_prompt.json"),
     )
     .unwrap();
     let mut with_extra: serde_json::Value = serde_json::from_str(&base).unwrap();
@@ -556,7 +587,7 @@ fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     assert!(serde_json::from_value::<CommandRequest>(with_extra).is_err());
 
     let capabilities = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v13/capabilities.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v14/capabilities.json"),
     )
     .unwrap();
     let mut newer: serde_json::Value = serde_json::from_str(&capabilities).unwrap();
@@ -570,7 +601,7 @@ fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     // Events and snapshots stay strict: a server never sends what a client
     // cannot name, and both bump the version together.
     let started = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v13/event_run_started.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v14/event_run_started.json"),
     )
     .unwrap();
     let mut event: serde_json::Value = serde_json::from_str(&started).unwrap();

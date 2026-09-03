@@ -1,11 +1,13 @@
-//! Wires configuration-declared MCP servers into the core runtime seam.
+//! Wires configuration-declared MCP servers into the core tool-host seam.
 //!
 //! The composition root translates `ConfigSnapshot` MCP declarations into
 //! `qq-mcp` settings (resolving bearer secrets like every other credential)
-//! and adapts the resulting [`McpManager`] to `qq-core`'s [`McpRegistry`]
-//! trait. Registries are cached by declaration digest, so every runtime
-//! built from identical declarations shares one manager — and therefore one
-//! client connection per server — for the whole server process.
+//! and adapts the resulting [`McpManager`] to `qq-core`'s
+//! [`ExternalToolHost`] trait. Registries are cached by declaration digest,
+//! so every plan built from identical declarations shares one manager — and
+//! therefore one client connection per server — for the whole server
+//! process. Plans snapshot the manager's catalog at compile and revalidate
+//! against its generation.
 
 use std::{
     collections::VecDeque,
@@ -15,10 +17,11 @@ use std::{
 use qq_auth::CredentialStore;
 use qq_config::{ConfigSnapshot, McpServerConfig, McpTransport};
 use qq_core::{
-    McpCallFuture, McpRegistry, McpSpecsFuture,
+    ExternalToolHost, HostCallError, HostCallFuture, HostCatalog, HostReadiness,
+    HostShutdownFuture, HostTool, HostToolResult, ToolHints,
     plan::{CredentialReference, McpServerDescriptor, McpTransportKind},
 };
-use qq_mcp::{McpManager, McpServerSettings, McpTransportSettings};
+use qq_mcp::{McpCallFailure, McpManager, McpServerSettings, McpTransportSettings};
 use qq_protocol::CredentialEpoch;
 use qq_provider::SecretRef;
 use sha2::{Digest, Sha256};
@@ -26,31 +29,121 @@ use sha2::{Digest, Sha256};
 use crate::runtime::RuntimeBuildError;
 
 const MAX_CACHED_REGISTRIES: usize = 8;
+/// Bound on one catalog snapshot from a blocking compile thread: connect,
+/// list, and namespace every declared server.
+const CATALOG_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Adapts the shared [`McpManager`] to the `qq-core` registry seam.
+/// Adapts the shared [`McpManager`] to the `qq-core` tool-host seam.
 pub struct WiredMcpRegistry {
     manager: Arc<McpManager>,
 }
 
-impl McpRegistry for WiredMcpRegistry {
-    fn tool_specs(&self) -> McpSpecsFuture {
+impl ExternalToolHost for WiredMcpRegistry {
+    fn name(&self) -> &str {
+        "mcp"
+    }
+
+    fn catalog_blocking(&self) -> HostCatalog {
+        // Compiles run on blocking threads inside a Tokio process; the
+        // manager's connections live on the async runtime, so the fetch is
+        // driven from there and awaited here under a hard bound.
         let manager = Arc::clone(&self.manager);
-        Box::pin(async move { manager.tool_specs().await })
+        let fetch =
+            async move { tokio::time::timeout(CATALOG_SNAPSHOT_TIMEOUT, manager.catalog()).await };
+        let fetched = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(fetch),
+            Err(_) => {
+                return HostCatalog {
+                    generation: self.manager.generation(),
+                    tools: Vec::new(),
+                    readiness: HostReadiness::Unavailable {
+                        message: "no async runtime is available to reach MCP servers".to_owned(),
+                    },
+                };
+            }
+        };
+        match fetched {
+            Ok(catalog) => HostCatalog {
+                generation: catalog.generation,
+                tools: catalog
+                    .tools
+                    .into_iter()
+                    .map(|tool| HostTool {
+                        spec: tool.spec,
+                        hints: ToolHints {
+                            read_only: tool.hints.read_only,
+                            destructive: tool.hints.destructive,
+                            idempotent: tool.hints.idempotent,
+                            open_world: tool.hints.open_world,
+                        },
+                    })
+                    .collect(),
+                readiness: if catalog.unavailable.is_empty() {
+                    HostReadiness::Ready
+                } else {
+                    HostReadiness::Degraded {
+                        message: format!(
+                            "unavailable MCP servers: {}",
+                            catalog.unavailable.join(", ")
+                        ),
+                    }
+                },
+            },
+            Err(_) => HostCatalog {
+                generation: self.manager.generation(),
+                tools: Vec::new(),
+                readiness: HostReadiness::Unavailable {
+                    message: format!(
+                        "MCP catalog snapshot timed out after {} s",
+                        CATALOG_SNAPSHOT_TIMEOUT.as_secs()
+                    ),
+                },
+            },
+        }
+    }
+
+    fn catalog_is_current(&self, generation: u64) -> bool {
+        self.manager.catalog_is_current(generation)
     }
 
     fn config_grants(&self) -> Vec<String> {
         self.manager.config_grants()
     }
 
-    fn call(&self, name: String, arguments: String, cancelled: Arc<AtomicBool>) -> McpCallFuture {
+    fn call(&self, name: String, arguments: String, cancelled: Arc<AtomicBool>) -> HostCallFuture {
         let manager = Arc::clone(&self.manager);
         Box::pin(async move {
             let outcome = manager.call(&name, &arguments, cancelled).await;
-            qq_core::McpToolResult {
-                content: outcome.content,
-                is_error: outcome.is_error,
+            match outcome.failure {
+                None => Ok(HostToolResult {
+                    content: outcome.content,
+                    is_error: outcome.is_error,
+                }),
+                Some(McpCallFailure::Timeout) => Err(HostCallError::Timeout),
+                Some(McpCallFailure::Cancelled) => Err(HostCallError::Cancelled),
+                Some(McpCallFailure::Unavailable) => {
+                    Err(HostCallError::Unavailable(outcome.content))
+                }
+                Some(McpCallFailure::InvalidArguments) => {
+                    Err(HostCallError::Refused(outcome.content))
+                }
+                Some(McpCallFailure::UnknownTool) => Err(HostCallError::UnknownTool(name)),
+                Some(McpCallFailure::ShutDown) => Err(HostCallError::ShutDown),
             }
         })
+    }
+
+    fn readiness(&self) -> HostReadiness {
+        if self.manager.is_shut_down() {
+            HostReadiness::ShutDown
+        } else {
+            HostReadiness::Ready
+        }
+    }
+
+    fn shutdown(&self) -> HostShutdownFuture {
+        let manager = Arc::clone(&self.manager);
+        Box::pin(async move { manager.shutdown().await })
     }
 }
 

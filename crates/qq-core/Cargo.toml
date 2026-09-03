@@ -36,3 +36,7 @@ harness = false
 [[bench]]
 name = "plan_compile"
 harness = false
+
+[[bench]]
+name = "catalog_compile"
+harness = false

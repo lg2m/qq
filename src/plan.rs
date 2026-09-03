@@ -3,10 +3,11 @@
 //! Every durable run used to reload configuration, resolve credentials, and
 //! reopen the workspace. The cache keeps one live [`CompiledAgentPlan`]
 //! generation per (workspace, model selection, explicit config) key and
-//! revalidates it with a fixed list of `stat` calls: the paths the config
-//! loader probed, the credential index, and the workspace instruction files.
-//! Any observable change recompiles and atomically swaps in a new generation
-//! for later runs; runs already holding the old `Arc` keep it.
+//! revalidates it with a fixed list of `stat` calls — the paths the config
+//! loader probed, the credential index, the workspace instruction files, and
+//! the skill roots — plus one synchronous generation check per external tool
+//! host. Any observable change recompiles and atomically swaps in a new
+//! generation for later runs; runs already holding the old `Arc` keep it.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -169,7 +170,8 @@ impl PlanCache {
                     .generation
                     .sources
                     .iter()
-                    .all(SourceFingerprint::is_current);
+                    .all(SourceFingerprint::is_current)
+                    && slot.generation.plan.hosts_are_current();
                 if current {
                     let slot = state
                         .slots

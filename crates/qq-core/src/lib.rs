@@ -20,14 +20,15 @@ use qq_protocol::{
     RunFailureKind, RunLimits, RunPromptIdentity, TokenUsage, ToolCallId,
 };
 use qq_provider::{
-    ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role,
+    ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role, ToolSpec,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod approval;
+pub mod catalog;
+pub mod hosts;
 mod input;
-mod mcp;
 pub mod plan;
 mod runtime;
 mod sessions;
@@ -38,13 +39,16 @@ pub use runtime::TurnRetryPolicy;
 use runtime::{
     AGENT_PROMPT_VERSION, BUDGET_FINAL_RESPONSE_NOTICE, BudgetDecision, BudgetMeter, GateDecision,
     HistorySearcher, PendingToolCall, PreparedRequestWeight, PreparedStaticPrefix, RuntimeEvent,
-    RuntimeToolCall, SEARCH_HISTORY_TOOL, SPAWN_UNAVAILABLE_RESULT, SearchHistoryArgs,
-    SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, TurnBlock,
-    agent_system_prompt, attempts_message, is_transient_provider_failure, render_history_matches,
+    RuntimeToolCall, SPAWN_UNAVAILABLE_RESULT, SearchHistoryArgs, SpawnAgentFuture,
+    SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, TurnBlock, agent_system_prompt,
+    attempts_message, is_transient_provider_failure, render_history_matches,
     tool_schema_measurement,
 };
 
-pub use mcp::{MCP_TOOL_PREFIX, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult};
+pub use hosts::{
+    EMBEDDED_TOOL_PREFIX, ExternalToolHost, HostCallError, HostCallFuture, HostCatalog,
+    HostReadiness, HostShutdownFuture, HostTool, HostToolResult, MCP_TOOL_PREFIX, ToolHints,
+};
 pub use runtime::MAX_PENDING_STEERING;
 pub use sessions::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, MAX_CHILD_DEPTH,
@@ -54,6 +58,8 @@ pub use sessions::{
     SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
     WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
+pub use workspace::skills::{MAX_INDEXED_SKILLS, MAX_SKILL_DESCRIPTION_BYTES};
+pub use workspace::{SkillEntry, SkillIndex, SkillKind};
 
 pub type RunStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>;
 type RuntimeStream = Pin<Box<dyn Stream<Item = RuntimeEvent> + Send + 'static>>;
@@ -128,6 +134,99 @@ fn apply_steering(
         applied.push(message.message_id);
     }
     (!applied.is_empty()).then_some(applied)
+}
+
+/// Executes one `select_tools` call against the run's pin set. Returns the
+/// bounded tool result and whether any pin was added.
+fn select_tools(
+    catalog: &catalog::ToolCatalog,
+    pins: &mut catalog::PinSet,
+    arguments: &str,
+) -> (tools::ToolExecutionResult, bool) {
+    let arguments = match serde_json::from_str::<catalog::SelectToolsArgs>(arguments) {
+        Ok(arguments) if arguments.query.trim().is_empty() => {
+            return (
+                tools::bounded_result("query must not be empty".to_owned(), true),
+                false,
+            );
+        }
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return (
+                tools::bounded_result(format!("invalid arguments: {error}"), true),
+                false,
+            );
+        }
+    };
+    if catalog.exposure() != catalog::Exposure::Full && catalog.external_len() == 0 {
+        return (
+            tools::bounded_result("no external tools are available".to_owned(), true),
+            false,
+        );
+    }
+    let limit = arguments.limit.clamp(1, catalog::MAX_SELECT_MATCHES);
+    let matches = catalog.rank(&arguments.query, pins, limit);
+    let mut pinned = Vec::new();
+    let mut refused = Vec::new();
+    for entry in matches {
+        if pins.pin(entry.spec.name()) {
+            pinned.push(entry.spec.name().to_owned());
+        } else {
+            refused.push(entry.spec.name().to_owned());
+        }
+    }
+    let changed = !pinned.is_empty();
+    let result = catalog::SelectToolsResult {
+        pinned,
+        already_pinned: pins
+            .names()
+            .iter()
+            .filter(|name| {
+                let lower = arguments.query.to_ascii_lowercase();
+                name.to_ascii_lowercase().contains(lower.trim())
+            })
+            .cloned()
+            .collect(),
+        refused,
+        remaining_pin_slots: catalog::MAX_PINNED_TOOLS.saturating_sub(pins.len()),
+    };
+    let content = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned());
+    (tools::bounded_result(content, false), changed)
+}
+
+/// Re-pins every tool an earlier `select_tools` result in `messages` pinned,
+/// so a recovered run offers the schemas the model already selected. Only
+/// names the catalog still holds are pinned.
+fn recover_pins(messages: &[Message], catalog: &catalog::ToolCatalog, pins: &mut catalog::PinSet) {
+    let mut select_call_ids = std::collections::HashSet::new();
+    for message in messages {
+        for block in message.content() {
+            match block {
+                ContentBlock::ToolCall { id, name, .. } if name == catalog::SELECT_TOOLS_TOOL => {
+                    select_call_ids.insert(id.as_str());
+                }
+                ContentBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error: false,
+                } if select_call_ids.contains(call_id.as_str()) => {
+                    if let Ok(result) = serde_json::from_str::<catalog::SelectToolsResult>(content)
+                    {
+                        for name in result.pinned {
+                            if catalog.lookup(&name).is_some_and(|entry| {
+                                matches!(entry.host, catalog::ToolHost::External { .. })
+                            }) {
+                                pins.pin(&name);
+                            }
+                        }
+                    }
+                }
+                ContentBlock::Text { .. }
+                | ContentBlock::ToolCall { .. }
+                | ContentBlock::ToolResult { .. } => {}
+            }
+        }
+    }
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -264,7 +363,9 @@ pub struct Runtime {
     model: Arc<str>,
     max_output_tokens: u32,
     context_window: Option<u32>,
-    mcp: Option<Arc<dyn McpRegistry>>,
+    /// External tool hosts in contribution order. A compiled plan snapshots
+    /// their catalogs; direct runs snapshot them per run.
+    pub(crate) hosts: Arc<[Arc<dyn ExternalToolHost>]>,
     spawn_model_routes: Arc<[String]>,
     turn_retry: TurnRetryPolicy,
 }
@@ -297,7 +398,7 @@ impl Runtime {
             model,
             max_output_tokens,
             context_window: None,
-            mcp: None,
+            hosts: Arc::from([]),
             spawn_model_routes: Arc::from([]),
             turn_retry: TurnRetryPolicy::default(),
         })
@@ -346,13 +447,21 @@ impl Runtime {
         }
     }
 
-    /// Attaches a registry of configuration-declared MCP servers. Its cached
-    /// tool declarations join the built-ins for every run of this runtime,
-    /// and `mcp__`-named calls dispatch to it.
+    /// Attaches an external tool host. Its catalog is snapshotted when a plan
+    /// compiles from this runtime and its tools dispatch to it by name.
     #[must_use]
-    pub fn with_mcp_registry(mut self, registry: Arc<dyn McpRegistry>) -> Self {
-        self.mcp = Some(registry);
+    pub fn with_tool_host(mut self, host: Arc<dyn ExternalToolHost>) -> Self {
+        let mut hosts = self.hosts.to_vec();
+        hosts.push(host);
+        self.hosts = hosts.into();
         self
+    }
+
+    fn config_grants(&self) -> std::collections::HashSet<String> {
+        self.hosts
+            .iter()
+            .flat_map(|host| host.config_grants())
+            .collect()
     }
 
     /// Restricts model-visible sub-agent overrides to authenticated canonical
@@ -416,11 +525,7 @@ impl Runtime {
         // Configuration allowlists are the only grants a gate-less run has;
         // read-only mode still denies them inside `evaluate`.
         let grants = approval::SessionGrants {
-            tools: self
-                .mcp
-                .as_ref()
-                .map(|registry| registry.config_grants().into_iter().collect())
-                .unwrap_or_default(),
+            tools: self.config_grants(),
             shell_prefixes: Vec::new(),
         };
         self.run_loop(
@@ -537,12 +642,7 @@ impl plan::CompiledAgentPlan {
     /// run. Configuration allowlists are the only grants.
     pub fn run(self: &Arc<Self>, command: RunCommand) -> RunStream {
         let grants = approval::SessionGrants {
-            tools: self
-                .runtime
-                .mcp
-                .as_ref()
-                .map(|registry| registry.config_grants().into_iter().collect())
-                .unwrap_or_default(),
+            tools: self.runtime.config_grants(),
             shell_prefixes: Vec::new(),
         };
         public_run_stream(
@@ -576,7 +676,9 @@ impl plan::CompiledAgentPlan {
         let provider = Arc::clone(&plan.runtime.provider);
         let model = Arc::clone(&plan.runtime.model);
         let model_max_output_tokens = plan.runtime.max_output_tokens;
-        let mcp = plan.runtime.mcp.clone();
+        let catalog = Arc::clone(&plan.catalog);
+        let skills = Arc::clone(&plan.skills);
+        let hosts = Arc::clone(&plan.hosts);
         let turn_retry = plan.runtime.turn_retry;
         Box::pin(stream! {
             let RunCapabilities {
@@ -634,6 +736,7 @@ impl plan::CompiledAgentPlan {
                 None => None,
                 Some(request) => match workspace::prepare_guidance(
                     workspace.clone(),
+                    Arc::clone(&skills),
                     Arc::clone(&cancelled),
                     request,
                 )
@@ -656,42 +759,43 @@ impl plan::CompiledAgentPlan {
                     }
                 },
             };
-            // MCP declarations join the built-ins once per run: the cached
-            // specs are fetched here (connecting lazily on first use) so
-            // every turn of the run sees one stable tool list. The `mcp__`
-            // prefix keeps collisions with built-ins impossible, and specs
-            // that do not carry it are discarded to keep dispatch unambiguous.
-            let mut tool_specs = if allow_tools {
-                plan.built_in_specs().to_vec()
+            // The plan's catalog is the tool list: the static tools this run
+            // may use (the sub-agent tool only when it may spawn, recall only
+            // for durable session runs) plus every external tool under full
+            // exposure. Under progressive exposure the model pins external
+            // tools with `select_tools`; pins extend this base list.
+            let base_specs: Arc<[ToolSpec]> = if allow_tools {
+                catalog.base_specs(&catalog::StaticFilter {
+                    spawn_agent: spawner.is_some(),
+                    search_history: history.is_some(),
+                    load_skill: allow_guidance,
+                })
             } else {
-                Vec::new()
+                Arc::from([])
             };
-            // The sub-agent tool is declared only when this run may spawn:
-            // depth is one, so child runs (spawner-less) never see it.
-            if allow_tools && spawner.is_some() {
-                tool_specs.push(plan.spawn_agent_spec().clone());
+            let mut pins = catalog::PinSet::default();
+            // A recovered run re-pins what its earlier `select_tools` calls
+            // pinned, so the resumed request offers the same schemas.
+            if allow_tools && catalog.exposure() == catalog::Exposure::Progressive {
+                recover_pins(&messages, &catalog, &mut pins);
             }
-            // Full-transcript recall exists only for durable session runs.
-            if allow_tools && history.is_some() {
-                tool_specs.push(plan.search_history_spec().clone());
-            }
-            if allow_tools && let Some(registry) = &mcp {
-                for spec in registry.tool_specs().await {
-                    if spec.name().starts_with(MCP_TOOL_PREFIX)
-                        && spec.name().len() <= MAX_TOOL_NAME_BYTES
-                        && !tool_specs.iter().any(|existing| existing.name() == spec.name())
-                    {
-                        tool_specs.push(spec);
-                    }
-                }
-            }
+            let mut tool_specs: Arc<[ToolSpec]> = if pins.is_empty() {
+                Arc::clone(&base_specs)
+            } else {
+                catalog.specs_with_pins(&base_specs, &pins)
+            };
             let system: Arc<str> = Arc::from(agent_system_prompt(
                 workspace.path(),
-                &tool_specs,
+                &base_specs,
+                catalog.index_text().map(Arc::as_ref),
+                // Disclosure follows the guidance capability: restricted runs
+                // (compaction, model-authored child tasks) neither list nor
+                // load skills.
+                if allow_guidance { skills.disclosure_text() } else { None },
                 workspace_instructions,
                 selected_guidance.as_ref(),
             ));
-            let tool_schema = tool_schema_measurement(&tool_specs);
+            let mut tool_schema = tool_schema_measurement(&tool_specs);
             let system_prompt_hash = ContentHash::from_bytes(Sha256::digest(system.as_bytes()).into());
             let mut prompt_identity = Some(Arc::new(RunPromptIdentity {
                     version: AGENT_PROMPT_VERSION,
@@ -701,6 +805,11 @@ impl plan::CompiledAgentPlan {
                     selected_guidance: selected_guidance
                         .as_ref()
                         .map(|guidance| Box::new(guidance.identity())),
+                    catalog_digest: Some(catalog.digest()),
+                    exposure: Some(match catalog.exposure() {
+                        catalog::Exposure::Full => qq_protocol::ToolExposure::Full,
+                        catalog::Exposure::Progressive => qq_protocol::ToolExposure::Progressive,
+                    }),
                 }));
             // Only the transcript preceding the accepted prompt can be
             // replaced by a between-run compaction. Everything appended by
@@ -805,7 +914,7 @@ impl plan::CompiledAgentPlan {
                 );
                 let request = if request_has_tools {
                     request
-                        .with_tools(tool_specs.clone())
+                        .with_tools(Arc::clone(&tool_specs))
                         .with_system(Arc::clone(&request_system))
                 } else {
                     request.with_system(Arc::clone(&request_system))
@@ -1407,6 +1516,40 @@ impl plan::CompiledAgentPlan {
                     yield RuntimeEvent::ToolCallStarted { id: call.id };
                 }
 
+                // `select_tools` mutates run state (the pin set), so it
+                // executes here, before the concurrent dispatch below, in
+                // request order. It is read-only and instantaneous.
+                let mut pins_changed = false;
+                for (index, call) in calls.iter().enumerate() {
+                    if results[index].is_some() || call.argument_error.is_some() {
+                        continue;
+                    }
+                    if !matches!(
+                        catalog.lookup(&call.name).map(|entry| entry.host),
+                        Some(catalog::ToolHost::SelectTools)
+                    ) {
+                        continue;
+                    }
+                    let (result, changed) = select_tools(&catalog, &mut pins, &call.arguments);
+                    pins_changed |= changed;
+                    results[index] = Some(result.clone());
+                    yield RuntimeEvent::ToolCallFinished {
+                        id: call.id,
+                        result: result.content,
+                        is_error: result.is_error,
+                        file_state: None,
+                        display: None,
+                    };
+                }
+                if pins_changed {
+                    tool_specs = catalog.specs_with_pins(&base_specs, &pins);
+                    tool_schema = tool_schema_measurement(&tool_specs);
+                }
+                let approved = approved
+                    .into_iter()
+                    .filter(|call| results[usize::from(call.call_ordinal - 1)].is_none())
+                    .collect::<Vec<_>>();
+
                 let execute_one = |call: RuntimeToolCall,
                                    output: Option<
                     tokio::sync::mpsc::Sender<String>,
@@ -1414,13 +1557,21 @@ impl plan::CompiledAgentPlan {
                     let workspace = workspace.clone();
                     let file_state = Arc::clone(&file_state);
                     let cancelled = Arc::clone(&cancelled);
-                    let mcp = mcp.clone();
+                    let catalog = Arc::clone(&catalog);
+                    let skills = Arc::clone(&skills);
+                    let hosts = Arc::clone(&hosts);
                     let spawner = spawner.clone();
                     let history = history.clone();
+                    // Under progressive exposure only pinned externals were
+                    // offered; a call to one that was not is refused with the
+                    // way to make it available.
+                    let offered = catalog.exposure() == catalog::Exposure::Full
+                        || pins.names().contains(&call.name);
                     async move {
                         // `Some` when a sub-agent ran: its spend (or unknown
                         // spend) is charged to the parent's cost budget.
                         let mut child_cost: Option<Option<u64>> = None;
+                        let host = catalog.lookup(&call.name).map(|entry| entry.host);
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
                                 content: error,
@@ -1431,7 +1582,7 @@ impl plan::CompiledAgentPlan {
                             // run without a spawner rejects the call outright:
                             // the declaration is already absent there, but a
                             // model may still guess the name.
-                            None if call.name == tools::SPAWN_AGENT_TOOL => match &spawner {
+                            None if host == Some(catalog::ToolHost::SpawnAgent) => match &spawner {
                                 Some(spawner) => {
                                     match serde_json::from_str::<tools::SpawnAgentArgs>(
                                         &call.arguments,
@@ -1476,7 +1627,7 @@ impl plan::CompiledAgentPlan {
                             // Full-transcript recall dispatches to the session
                             // layer; the tool is declared only when a searcher
                             // exists, so a guessed call is simply unknown here.
-                            None if call.name == SEARCH_HISTORY_TOOL && history.is_some() => {
+                            None if host == Some(catalog::ToolHost::SearchHistory) && history.is_some() => {
                                 let history = history.expect("the history searcher was just checked");
                                 match serde_json::from_str::<SearchHistoryArgs>(&call.arguments) {
                                     Ok(arguments) if arguments.query.trim().is_empty() => {
@@ -1498,16 +1649,54 @@ impl plan::CompiledAgentPlan {
                                     ),
                                 }
                             }
-                            // MCP calls dispatch to the shared registry; the
-                            // outcome flows through the same bounded-result
-                            // truncation as built-in tools, so an MCP call is
-                            // indistinguishable from a built-in on the wire.
-                            None if call.name.starts_with(MCP_TOOL_PREFIX) && mcp.is_some() => {
-                                let outcome = mcp
-                                    .expect("the MCP registry was just checked")
+                            // The model asked for a disclosed skill body. Same
+                            // bounds as a `/name` invocation; failures are
+                            // tool errors, not run failures.
+                            None if host == Some(catalog::ToolHost::LoadSkill) => {
+                                match serde_json::from_str::<workspace::skills::LoadSkillArgs>(&call.arguments) {
+                                    Ok(arguments) => match workspace::load_disclosed_skill(
+                                        workspace,
+                                        skills,
+                                        cancelled,
+                                        arguments.name.trim().to_owned(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(guidance) => {
+                                            tools::bounded_result(guidance.render_for_tool(), false)
+                                        }
+                                        Err(error) => tools::bounded_result(error.to_string(), true),
+                                    },
+                                    Err(error) => tools::bounded_result(
+                                        format!("invalid arguments: {error}"),
+                                        true,
+                                    ),
+                                }
+                            }
+                            // External calls dispatch to their host by index;
+                            // the outcome flows through the same bounded-result
+                            // truncation as built-in tools, so an external call
+                            // is indistinguishable from a built-in on the wire.
+                            None if let Some(catalog::ToolHost::External { .. }) = host
+                                && !offered =>
+                            {
+                                tools::bounded_result(
+                                    format!(
+                                        "{} is not available in this run yet; call {} with keywords \
+                                         describing it first",
+                                        call.name, catalog::SELECT_TOOLS_TOOL
+                                    ),
+                                    true,
+                                )
+                            }
+                            None if let Some(catalog::ToolHost::External { host: index }) = host => {
+                                match hosts[index]
                                     .call(call.name.clone(), call.arguments.clone(), cancelled)
-                                    .await;
-                                tools::bounded_result(outcome.content, outcome.is_error)
+                                    .await
+                                {
+                                    Ok(outcome) => tools::bounded_result(outcome.content, outcome.is_error),
+                                    Err(error) => hosts::host_error_result(&error),
+                                }
                             }
                             None => {
                                 tools::execute(
@@ -4216,15 +4405,15 @@ mod tests {
         ));
     }
 
-    struct MockMcpRegistry {
+    pub(crate) struct MockMcpRegistry {
         specs: Vec<qq_provider::ToolSpec>,
         grants: Vec<String>,
         calls: Arc<Mutex<Vec<(String, String)>>>,
-        result: McpToolResult,
+        result: Result<HostToolResult, HostCallError>,
     }
 
     impl MockMcpRegistry {
-        fn returning(result: McpToolResult) -> Self {
+        fn returning(result: HostToolResult) -> Self {
             Self {
                 specs: vec![qq_provider::ToolSpec::new(
                     "mcp__srv__ping",
@@ -4233,15 +4422,34 @@ mod tests {
                 )],
                 grants: Vec::new(),
                 calls: Arc::new(Mutex::new(Vec::new())),
-                result,
+                result: Ok(result),
             }
         }
     }
 
-    impl McpRegistry for MockMcpRegistry {
-        fn tool_specs(&self) -> McpSpecsFuture {
-            let specs = self.specs.clone();
-            Box::pin(async move { specs })
+    impl ExternalToolHost for MockMcpRegistry {
+        fn name(&self) -> &str {
+            "mcp"
+        }
+
+        fn catalog_blocking(&self) -> HostCatalog {
+            HostCatalog {
+                generation: 1,
+                tools: self
+                    .specs
+                    .iter()
+                    .cloned()
+                    .map(|spec| HostTool {
+                        spec,
+                        hints: ToolHints::default(),
+                    })
+                    .collect(),
+                readiness: HostReadiness::Ready,
+            }
+        }
+
+        fn catalog_is_current(&self, generation: u64) -> bool {
+            generation == 1
         }
 
         fn config_grants(&self) -> Vec<String> {
@@ -4253,10 +4461,18 @@ mod tests {
             name: String,
             arguments: String,
             _cancelled: Arc<AtomicBool>,
-        ) -> McpCallFuture {
+        ) -> HostCallFuture {
             self.calls.lock().unwrap().push((name, arguments.clone()));
             let result = self.result.clone();
             Box::pin(async move { result })
+        }
+
+        fn readiness(&self) -> HostReadiness {
+            HostReadiness::Ready
+        }
+
+        fn shutdown(&self) -> HostShutdownFuture {
+            Box::pin(std::future::ready(()))
         }
     }
 
@@ -4301,7 +4517,7 @@ mod tests {
     async fn merges_mcp_declarations_and_dispatches_granted_calls_to_the_registry() {
         let directory = tempfile::tempdir().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = MockMcpRegistry::returning(McpToolResult {
+        let mut registry = MockMcpRegistry::returning(HostToolResult {
             content: "pong".to_owned(),
             is_error: false,
         });
@@ -4323,7 +4539,7 @@ mod tests {
             256,
         )
         .unwrap()
-        .with_mcp_registry(Arc::new(registry));
+        .with_tool_host(Arc::new(registry));
 
         let events = runtime
             .run_messages_in_workspace(vec![Message::user("ping")], directory.path().to_owned())
@@ -4349,7 +4565,7 @@ mod tests {
         assert_eq!(requests[0].tools().len(), 7);
         let system = requests[0].system().unwrap();
         assert!(system.contains("mcp__srv__ping"));
-        assert!(system.contains("MCP servers"));
+        assert!(system.contains("external tool hosts"));
         assert!(matches!(
             requests[1].messages()[2].content(),
             [ContentBlock::ToolResult {
@@ -4375,7 +4591,7 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let registry = MockMcpRegistry::returning(McpToolResult {
+        let registry = MockMcpRegistry::returning(HostToolResult {
             content: "the server exploded".to_owned(),
             is_error: true,
         });
@@ -4387,7 +4603,7 @@ mod tests {
             256,
         )
         .unwrap()
-        .with_mcp_registry(Arc::new(registry));
+        .with_tool_host(Arc::new(registry));
         let events = runtime
             .run_loop(
                 vec![Message::user("ping")],
@@ -4409,7 +4625,7 @@ mod tests {
         );
 
         let oversized = "x".repeat(tools::MAX_TOOL_RESULT_BYTES + 1024);
-        let registry = MockMcpRegistry::returning(McpToolResult {
+        let registry = MockMcpRegistry::returning(HostToolResult {
             content: oversized,
             is_error: false,
         });
@@ -4421,7 +4637,7 @@ mod tests {
             256,
         )
         .unwrap()
-        .with_mcp_registry(Arc::new(registry));
+        .with_tool_host(Arc::new(registry));
         let events = runtime
             .run_loop(
                 vec![Message::user("ping")],
@@ -4446,7 +4662,7 @@ mod tests {
     #[tokio::test]
     async fn ungranted_mcp_calls_are_denied_unattended_and_unknown_names_error() {
         let directory = tempfile::tempdir().unwrap();
-        let registry = MockMcpRegistry::returning(McpToolResult {
+        let registry = MockMcpRegistry::returning(HostToolResult {
             content: "pong".to_owned(),
             is_error: false,
         });
@@ -4458,7 +4674,7 @@ mod tests {
             256,
         )
         .unwrap()
-        .with_mcp_registry(Arc::new(registry));
+        .with_tool_host(Arc::new(registry));
         // No configuration grant covers the call: gate-less Ask mode denies
         // without executing, and the run still completes.
         let events = runtime
@@ -4626,7 +4842,7 @@ mod tests {
             !requests[0]
                 .tools()
                 .iter()
-                .any(|spec| spec.name() == SEARCH_HISTORY_TOOL)
+                .any(|spec| spec.name() == runtime::SEARCH_HISTORY_TOOL)
         );
     }
 
@@ -4757,13 +4973,14 @@ mod tests {
     fn agent_prompt_teaches_delegation_only_when_spawn_agent_is_declared() {
         let workspace = std::path::Path::new("/tmp/qq-prompt-test");
         let instructions = workspace::WorkspaceInstructions::empty();
-        let without = agent_system_prompt(workspace, &tools::specs(), &instructions, None);
+        let without =
+            agent_system_prompt(workspace, &tools::specs(), None, None, &instructions, None);
         assert!(!without.contains("spawn_agent"));
         assert!(!without.contains("Delegation:"));
 
         let mut specs = tools::specs();
         specs.push(tools::spawn_agent_spec(&[]));
-        let with = agent_system_prompt(workspace, &specs, &instructions, None);
+        let with = agent_system_prompt(workspace, &specs, None, None, &instructions, None);
         assert!(with.contains("spawn_agent"));
         assert!(with.contains("Delegation:"));
         assert!(with.contains("independent questions"));
@@ -4772,5 +4989,435 @@ mod tests {
         assert!(with.contains("configured worker model"));
         assert!(with.contains("persisted selected model"));
         assert!(with.contains("never guess, translate, or invent one"));
+    }
+
+    /// A host serving many tools so the catalog is disclosed progressively.
+    struct WideHost {
+        count: usize,
+        generation: Arc<std::sync::atomic::AtomicU64>,
+        calls: Arc<Mutex<Vec<String>>>,
+        failure: Option<HostCallError>,
+    }
+
+    impl WideHost {
+        fn new(count: usize) -> Self {
+            Self {
+                count,
+                generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                failure: None,
+            }
+        }
+    }
+
+    impl ExternalToolHost for WideHost {
+        fn name(&self) -> &str {
+            "wide"
+        }
+
+        fn catalog_blocking(&self) -> HostCatalog {
+            HostCatalog {
+                generation: self.generation.load(std::sync::atomic::Ordering::SeqCst),
+                tools: (0..self.count)
+                    .map(|i| HostTool {
+                        spec: qq_provider::ToolSpec::new(
+                            format!("ext__wide__tool{i:02}"),
+                            if i == 7 {
+                                "Deploy the service to production".to_owned()
+                            } else {
+                                format!("Widget helper number {i}")
+                            },
+                            serde_json::json!({"type": "object"}),
+                        ),
+                        hints: ToolHints::default(),
+                    })
+                    .collect(),
+                readiness: HostReadiness::Ready,
+            }
+        }
+
+        fn catalog_is_current(&self, generation: u64) -> bool {
+            self.generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+        }
+
+        fn config_grants(&self) -> Vec<String> {
+            (0..self.count)
+                .map(|i| format!("ext__wide__tool{i:02}"))
+                .collect()
+        }
+
+        fn call(
+            &self,
+            name: String,
+            _arguments: String,
+            _cancelled: Arc<AtomicBool>,
+        ) -> HostCallFuture {
+            self.calls.lock().unwrap().push(name.clone());
+            let failure = self.failure.clone();
+            Box::pin(async move {
+                match failure {
+                    Some(error) => Err(error),
+                    None => Ok(HostToolResult {
+                        content: format!("{name} ran"),
+                        is_error: false,
+                    }),
+                }
+            })
+        }
+
+        fn readiness(&self) -> HostReadiness {
+            HostReadiness::Ready
+        }
+
+        fn shutdown(&self) -> HostShutdownFuture {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// Scripts a sequence of turns, each a list of (tool name, arguments);
+    /// an empty list completes with text.
+    struct TurnScript {
+        turns: Vec<Vec<(&'static str, String)>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for TurnScript {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            drop(requests);
+            let Some(calls) = self.turns.get(turn).filter(|calls| !calls.is_empty()) else {
+                return Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]));
+            };
+            let mut events = Vec::new();
+            for (index, (name, arguments)) in calls.iter().enumerate() {
+                let id = format!("call_{turn}_{index}");
+                events.push(Ok(ProviderEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: (*name).to_owned(),
+                }));
+                events.push(Ok(ProviderEvent::ToolCallArgumentsDelta {
+                    id: id.clone(),
+                    json: arguments.clone(),
+                }));
+                events.push(Ok(ProviderEvent::ToolCallCompleted { id }));
+            }
+            events.push(Ok(ProviderEvent::Completed { usage: None }));
+            Box::pin(stream::iter(events))
+        }
+    }
+
+    fn tool_names(request: &ModelRequest) -> Vec<&str> {
+        request
+            .tools()
+            .iter()
+            .map(qq_provider::ToolSpec::name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn progressive_exposure_pins_selected_tools_for_the_rest_of_the_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let host = WideHost::new(40);
+        let calls = Arc::clone(&host.calls);
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![
+                    vec![("ext__wide__tool07", "{}".to_owned())],
+                    vec![
+                        (
+                            catalog::SELECT_TOOLS_TOOL,
+                            r#"{"query":"deploy service","limit":2}"#.to_owned(),
+                        ),
+                        // Selected earlier in the same turn, so already usable.
+                        ("ext__wide__tool07", "{}".to_owned()),
+                    ],
+                    vec![(
+                        catalog::SELECT_TOOLS_TOOL,
+                        r#"{"query":"widget helper","limit":8}"#.to_owned(),
+                    )],
+                    Vec::new(),
+                ],
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_tool_host(Arc::new(host));
+
+        let events = runtime
+            .run_in_workspace(RunCommand::new("deploy it"), directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(events.last(), Some(RunEvent::Completed)),
+            "{events:?}"
+        );
+
+        let requests = requests.lock().unwrap();
+        // Turn 1: static tools plus the selector, no external schema, and the
+        // index in the system prompt.
+        let first = tool_names(&requests[0]);
+        assert!(first.contains(&catalog::SELECT_TOOLS_TOOL));
+        assert!(!first.iter().any(|name| name.starts_with("ext__")));
+        let system = requests[0].system().unwrap();
+        assert!(system.contains("External tools (progressive)"));
+        assert!(system.contains("ext__wide__tool07 — Deploy the service"));
+        assert!(system.contains("host wide: 40 tools"));
+        // An unpinned external call never reaches the host: the tool error
+        // tells the model how to make it available.
+        let first_results = requests[1].messages().last().unwrap().content();
+        let unpinned = first_results.iter().find_map(|block| match block {
+            ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } if call_id == "call_0_0" => Some((content.clone(), *is_error)),
+            _ => None,
+        });
+        let (message, is_error) = unpinned.unwrap();
+        assert!(is_error && message.contains("select_tools"), "{message}");
+        assert_eq!(tool_names(&requests[1]), first, "nothing pinned yet");
+        // Turn 2 selects, then calls the selected tool in the same turn.
+        let second_results = requests[2].messages().last().unwrap().content();
+        let selection = second_results.iter().find_map(|block| match block {
+            ContentBlock::ToolResult {
+                call_id,
+                content,
+                is_error: false,
+            } if call_id == "call_1_0" => {
+                Some(serde_json::from_str::<serde_json::Value>(content).unwrap())
+            }
+            _ => None,
+        });
+        let selection = selection.unwrap();
+        assert_eq!(selection["pinned"][0], "ext__wide__tool07");
+        assert_eq!(calls.lock().unwrap().as_slice(), ["ext__wide__tool07"]);
+        // Turn 3 carries the pinned schema.
+        let third = tool_names(&requests[2]);
+        assert!(third.contains(&"ext__wide__tool07"));
+        assert_eq!(third.len(), first.len() + 1);
+        // Turn 3 pins eight more; turn 4 sees them all, in pin order, and
+        // nothing is duplicated.
+        let fourth = tool_names(&requests[3]);
+        assert_eq!(fourth.len(), first.len() + 9);
+        let mut deduped = fourth.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), fourth.len());
+    }
+
+    #[tokio::test]
+    async fn recovered_runs_re_pin_from_prior_select_tools_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![Vec::new()],
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_tool_host(Arc::new(WideHost::new(40)));
+        let prior = serde_json::to_string(&catalog::SelectToolsResult {
+            pinned: vec![
+                "ext__wide__tool03".to_owned(),
+                "ext__wide__tool99".to_owned(),
+                "read_file".to_owned(),
+            ],
+            already_pinned: Vec::new(),
+            refused: Vec::new(),
+            remaining_pin_slots: 30,
+        })
+        .unwrap();
+        let messages = vec![
+            Message::user("continue"),
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolCall {
+                    id: "c1".to_owned(),
+                    name: catalog::SELECT_TOOLS_TOOL.to_owned(),
+                    arguments: serde_json::json!({"query": "x"}),
+                }],
+            ),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                call_id: "c1".to_owned(),
+                content: prior,
+                is_error: false,
+            }]),
+            Message::user("go on"),
+        ];
+        let events = runtime
+            .run_messages_in_workspace(messages, directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        let requests = requests.lock().unwrap();
+        let names = tool_names(&requests[0]);
+        assert!(names.contains(&"ext__wide__tool03"), "{names:?}");
+        assert!(
+            !names.contains(&"ext__wide__tool99"),
+            "unknown names are not pinned"
+        );
+        assert_eq!(names.iter().filter(|n| **n == "read_file").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_failures_are_typed_tool_errors_and_small_catalogs_expose_fully() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut host = WideHost::new(3);
+        host.failure = Some(HostCallError::Timeout);
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![vec![("ext__wide__tool01", "{}".to_owned())], Vec::new()],
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap()
+        .with_tool_host(Arc::new(host));
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("go")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        let requests = requests.lock().unwrap();
+        let names = tool_names(&requests[0]);
+        assert!(names.contains(&"ext__wide__tool01"));
+        assert!(
+            !names.contains(&catalog::SELECT_TOOLS_TOOL),
+            "full exposure needs no selector"
+        );
+        assert!(!requests[0].system().unwrap().contains("progressive"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, is_error: true, .. }
+                if result == &HostCallError::Timeout.to_string()
+        )));
+    }
+
+    #[tokio::test]
+    async fn disclosed_skills_are_listed_and_loadable_only_for_guidance_capable_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        for (path, content) in [
+            (
+                ".qq/skills/deploy/SKILL.md",
+                "---\ndescription: How to deploy safely\n---\nRun the deploy checklist.\n",
+            ),
+            (".agents/skills/hidden/SKILL.md", "Compat only.\n"),
+        ] {
+            let path = directory.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![
+                    vec![
+                        ("load_skill", r#"{"name":"deploy"}"#.to_owned()),
+                        ("load_skill", r#"{"name":"hidden"}"#.to_owned()),
+                    ],
+                    Vec::new(),
+                ],
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run_in_workspace(RunCommand::new("deploy"), directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(events.last(), Some(RunEvent::Completed)),
+            "{events:?}"
+        );
+        {
+            let requests = requests.lock().unwrap();
+            let system = requests[0].system().unwrap();
+            assert!(system.contains("- deploy (skill): How to deploy safely"));
+            assert!(!system.contains("hidden"), "compat roots are not disclosed");
+            assert!(
+                !system.contains("Run the deploy checklist"),
+                "bodies load on demand"
+            );
+            assert!(tool_names(&requests[0]).contains(&"load_skill"));
+            let results = requests[1].messages().last().unwrap().content();
+            let loaded = results.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolResult { content, is_error: false, .. }
+                if content.contains("Run the deploy checklist") && content.contains("Selected skill `deploy`")
+        ));
+            assert!(loaded);
+            let hidden_refused = results.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { content, is_error: true, .. }
+                        if content.contains("unknown command or skill /hidden")
+                )
+            });
+            assert!(hidden_refused);
+        }
+
+        // A restricted run (no guidance) neither lists nor declares the loader.
+        let plan = plan::CompiledAgentPlan::compile_blocking(plan::AgentProfile::embedded(
+            &runtime,
+            std::fs::canonicalize(directory.path()).unwrap(),
+        ))
+        .unwrap();
+        let restricted_requests = Arc::new(Mutex::new(Vec::new()));
+        let restricted = Runtime::new(
+            TurnScript {
+                turns: vec![Vec::new()],
+                requests: Arc::clone(&restricted_requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let restricted_plan =
+            plan::CompiledAgentPlan::compile_blocking(plan::AgentProfile::embedded(
+                &restricted,
+                std::fs::canonicalize(directory.path()).unwrap(),
+            ))
+            .unwrap();
+        let events = restricted_plan
+            .execute(
+                vec![Message::user("summarize")],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(StaticPolicyGate {
+                    mode: ApprovalMode::Ask,
+                    grants: approval::SessionGrants::default(),
+                }),
+                Arc::new(workspace::FileState::default()),
+                RunCapabilities::restricted(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(RuntimeEvent::Completed)));
+        let restricted_requests = restricted_requests.lock().unwrap();
+        assert!(
+            !restricted_requests[0]
+                .system()
+                .unwrap()
+                .contains("Available skills")
+        );
+        assert!(!tool_names(&restricted_requests[0]).contains(&"load_skill"));
+        assert_eq!(plan.descriptor().skills.disclosed, 1);
+        assert_eq!(plan.descriptor().skills.indexed, 2);
     }
 }

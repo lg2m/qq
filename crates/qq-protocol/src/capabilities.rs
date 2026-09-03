@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentProfileId, ApprovalMode, BudgetLimitKind, InputPartKind, WorkspaceId,
-    sessions::SessionCommandKind,
+    AgentProfileId, ApprovalMode, BudgetLimitKind, ContentHash, InputPartKind, ToolExposure,
+    WorkspaceId, sessions::SessionCommandKind,
 };
 
 /// Schema version of [`ServerCapabilities`]. Bumped when the meaning of an
@@ -44,6 +44,60 @@ pub struct ServerCapabilities {
     /// Present only when the request named a workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profiles: Option<Vec<AgentProfileSummary>>,
+    /// Bounds every plan's tool catalog observes, and how large external
+    /// catalogs are disclosed.
+    pub tools: ToolCapabilities,
+    /// Present only when the request named a workspace: the external tool
+    /// hosts and skill index of that workspace's default plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_tools: Option<WorkspaceToolCapabilities>,
+}
+
+/// Catalog and exposure bounds. Clients learn from here that a run may see
+/// `select_tools` and `load_skill` rather than inferring it from tool names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCapabilities {
+    pub max_catalog_tools: u32,
+    pub max_tool_schema_bytes: u64,
+    pub max_catalog_schema_bytes: u64,
+    /// External catalogs at or under both thresholds are sent whole.
+    pub full_exposure_tools: u32,
+    pub full_exposure_schema_bytes: u64,
+    /// Most external tools one run may pin under progressive exposure.
+    pub max_pinned_tools: u32,
+    pub max_indexed_skills: u32,
+    /// Prefixes external tool names carry, by host kind.
+    pub external_prefixes: Vec<String>,
+}
+
+/// One workspace's external hosts and skills as its default plan sees them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceToolCapabilities {
+    pub catalog_digest: ContentHash,
+    pub exposure: ToolExposure,
+    pub hosts: Vec<ToolHostSummary>,
+    pub excluded_tools: u32,
+    pub skills: SkillCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolHostSummary {
+    pub name: String,
+    pub generation: u64,
+    pub tool_count: u32,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillCapabilities {
+    pub digest: ContentHash,
+    pub indexed: u32,
+    /// Documents the model may load itself through `load_skill`.
+    pub disclosed: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +147,7 @@ mod tests {
     fn capabilities_tolerate_unknown_response_fields_but_not_request_fields() {
         let json = r#"{
             "version": 1,
-            "protocol_version": 13,
+            "protocol_version": 14,
             "server_version": "0.1.0",
             "input_parts": ["text", "workspace_file", "hologram"],
             "commands": ["submit_prompt"],
@@ -107,6 +161,12 @@ mod tests {
             },
             "approvals": ["deny"],
             "approval_modes": ["auto"],
+            "tools": {
+                "max_catalog_tools": 512, "max_tool_schema_bytes": 16384,
+                "max_catalog_schema_bytes": 1048576, "full_exposure_tools": 24,
+                "full_exposure_schema_bytes": 32768, "max_pinned_tools": 32,
+                "max_indexed_skills": 64, "external_prefixes": ["mcp__"]
+            },
             "future_section": {"anything": 1}
         }"#;
         // Unknown enum values inside arrays are still rejected: a client that
@@ -114,8 +174,10 @@ mod tests {
         assert!(serde_json::from_str::<ServerCapabilities>(json).is_err());
         let known = json.replace(", \"hologram\"", "");
         let decoded: ServerCapabilities = serde_json::from_str(&known).unwrap();
-        assert_eq!(decoded.protocol_version, 13);
+        assert_eq!(decoded.protocol_version, 14);
         assert!(decoded.profiles.is_none());
+        assert!(decoded.workspace_tools.is_none());
+        assert_eq!(decoded.tools.max_pinned_tools, 32);
         assert!(decoded.steering.interrupt);
 
         assert!(serde_json::from_str::<CapabilitiesRequest>(r#"{"workspace":"x"}"#).is_err());

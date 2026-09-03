@@ -1,5 +1,5 @@
 use std::{
-    io::{ErrorKind, Read},
+    io::Read,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -168,55 +168,42 @@ pub(crate) fn parse_invocation(
     })
 }
 
+/// Resolves `/name` against the plan's compiled index and reads the body of
+/// the one document it names. The index decided which root wins at compile
+/// time; this reads, bounds, and hashes the content at invocation.
 pub(crate) fn load(
     workspace: &Workspace,
+    index: &super::skills::SkillIndex,
     request: GuidanceRequest,
     cancelled: &AtomicBool,
 ) -> Result<SelectedGuidance, GuidanceError> {
-    let native = [
-        Candidate::new(
-            GuidanceKind::Command,
-            format!(".qq/commands/{}.md", request.name),
-        ),
-        Candidate::new(
-            GuidanceKind::Skill,
-            format!(".qq/skills/{}/SKILL.md", request.name),
-        ),
-    ];
-    let compatibility = [
-        Candidate::new(
-            GuidanceKind::Skill,
-            format!(".agents/skills/{}/SKILL.md", request.name),
-        ),
-        Candidate::new(
-            GuidanceKind::Command,
-            format!(".claude/commands/{}.md", request.name),
-        ),
-        Candidate::new(
-            GuidanceKind::Skill,
-            format!(".claude/skills/{}/SKILL.md", request.name),
-        ),
-    ];
-
-    let mut matches = existing_candidates(workspace, &native)?;
-    if matches.is_empty() {
-        matches = existing_candidates(workspace, &compatibility)?;
-    }
-    let candidate = match matches.as_slice() {
-        [] => return Err(GuidanceError::Unknown { name: request.name }),
-        [candidate] => candidate,
-        _ => {
+    let entry = match index.resolve(&request.name) {
+        super::skills::SkillResolution::One(entry) => entry,
+        super::skills::SkillResolution::Unknown => {
+            return Err(GuidanceError::Unknown { name: request.name });
+        }
+        super::skills::SkillResolution::Ambiguous(entries) => {
             return Err(GuidanceError::Ambiguous {
                 name: request.name,
-                sources: matches
+                sources: entries
                     .iter()
-                    .map(|candidate| candidate.path.as_str())
+                    .map(|entry| entry.source.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
             });
         }
     };
+    load_entry(workspace, entry, cancelled)
+}
 
+/// Reads one indexed document's body with the guidance bounds.
+pub(crate) fn load_entry(
+    workspace: &Workspace,
+    entry: &super::skills::SkillEntry,
+    cancelled: &AtomicBool,
+) -> Result<SelectedGuidance, GuidanceError> {
+    let candidate = Candidate::new(entry.kind.into(), entry.source.clone());
+    let candidate = &candidate;
     if cancelled.load(Ordering::Acquire) {
         return Err(GuidanceError::Cancelled);
     }
@@ -274,14 +261,14 @@ pub(crate) fn load(
     let hash = Sha256::digest(content.as_bytes()).into();
     Ok(SelectedGuidance {
         kind: candidate.kind,
-        name: request.name,
+        name: entry.name.clone(),
         source: candidate.path.clone(),
         content,
         hash,
     })
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
         && name.as_bytes()[0].is_ascii_lowercase()
@@ -302,22 +289,12 @@ impl Candidate {
     }
 }
 
-fn existing_candidates<'a>(
-    workspace: &Workspace,
-    candidates: &'a [Candidate],
-) -> Result<Vec<&'a Candidate>, GuidanceError> {
-    let mut matches = Vec::new();
-    for candidate in candidates {
-        match workspace.root().symlink_metadata(&candidate.path) {
-            Ok(_) => matches.push(candidate),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(GuidanceError::Inspect {
-                    path: candidate.path.clone(),
-                    source,
-                });
-            }
-        }
+impl SelectedGuidance {
+    /// Renders a model-loaded document as a tool result: same framing as the
+    /// system-prompt form so the subordination notice travels with the body.
+    pub(crate) fn render_for_tool(&self) -> String {
+        let mut text = String::with_capacity(self.content.len() + 256);
+        self.append_to_prompt(&mut text);
+        text.trim_start().to_owned()
     }
-    Ok(matches)
 }

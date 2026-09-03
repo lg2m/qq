@@ -1084,6 +1084,16 @@ pub struct GuidanceIdentity {
     pub content_hash: ContentHash,
 }
 
+/// How a plan's external tools reach the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExposure {
+    /// Every external schema is in every request.
+    Full,
+    /// Requests carry an index; the model pins schemas with `select_tools`.
+    Progressive,
+}
+
 /// All-or-none identity of the system prefix prepared for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1093,11 +1103,18 @@ pub struct RunPromptIdentity {
     /// Absent only on rows written before protocol version 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_hash: Option<ContentHash>,
-    /// Absent only on rows written before protocol version 7.
+    /// Hash of the tool schemas in the run's first request. Absent only on
+    /// rows written before protocol version 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_schema_hash: Option<ContentHash>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_guidance: Option<Box<GuidanceIdentity>>,
+    /// Digest of the plan's complete tool catalog (every tool the run could
+    /// reach, exposed or not). Absent on rows written before protocol 14.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_digest: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<ToolExposure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2391,6 +2408,8 @@ mod tests {
                     version: None,
                     content_hash: "d".repeat(64).parse().unwrap(),
                 })),
+                catalog_digest: Some("e".repeat(64).parse().unwrap()),
+                exposure: Some(ToolExposure::Progressive),
             })),
             resolved_model: Some(Box::new(ResolvedModel {
                 version: ResolvedModelVersion::new(1).unwrap(),
@@ -2523,7 +2542,7 @@ mod tests {
         // `include_sessions`/`included` on snapshots. Version 13 replaced the
         // prompt string with input parts and added profiles, plan identity,
         // steering, correlation, and capabilities.
-        assert_eq!(crate::PROTOCOL_VERSION, 13);
+        assert_eq!(crate::PROTOCOL_VERSION, 14);
         let mut invalid = serde_json::to_value(&run).unwrap();
         invalid["resolved_model"]["future_control"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());

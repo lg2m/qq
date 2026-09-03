@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "protocol_version": 13,
+  "protocol_version": 14,
   "server_version": "0.1.0",
   "input_parts": [
     "text",
@@ -74,5 +74,36 @@
       "model": "anthropic/claude-x",
       "approval_mode": "read_only"
     }
-  ]
+  ],
+  "tools": {
+    "max_catalog_tools": 512,
+    "max_tool_schema_bytes": 16384,
+    "max_catalog_schema_bytes": 1048576,
+    "full_exposure_tools": 24,
+    "full_exposure_schema_bytes": 32768,
+    "max_pinned_tools": 32,
+    "max_indexed_skills": 64,
+    "external_prefixes": [
+      "mcp__",
+      "ext__"
+    ]
+  },
+  "workspace_tools": {
+    "catalog_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "exposure": "progressive",
+    "hosts": [
+      {
+        "name": "mcp",
+        "generation": 3,
+        "tool_count": 40,
+        "ready": true
+      }
+    ],
+    "excluded_tools": 1,
+    "skills": {
+      "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "indexed": 2,
+      "disclosed": 1
+    }
+  }
 }

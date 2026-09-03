@@ -35,8 +35,8 @@ use qq_protocol::{
     MAX_INPUT_FILE_PARTS, MAX_INPUT_PARTS, MAX_INPUT_TEXT_BYTES, MAX_MODEL_BYTES,
     MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES, ModelCatalogRequest,
     ModelDescriptor, PROTOCOL_VERSION, ServerCapabilities, ServerInfo, SessionCommand,
-    SessionCommandKind, SnapshotRequest, SteeringCapabilities, SubscribeRequest, WorkspaceId,
-    WorkspaceSnapshot, validate_input,
+    SessionCommandKind, SnapshotRequest, SteeringCapabilities, SubscribeRequest, ToolCapabilities,
+    WorkspaceId, WorkspaceSnapshot, WorkspaceToolCapabilities, validate_input,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -74,6 +74,11 @@ pub type ModelsFuture = Pin<
 pub type ProfilesFuture = Pin<
     Box<dyn Future<Output = Result<Vec<AgentProfileSummary>, ServerHandlerError>> + Send + 'static>,
 >;
+pub type WorkspaceToolsFuture = Pin<
+    Box<
+        dyn Future<Output = Result<WorkspaceToolCapabilities, ServerHandlerError>> + Send + 'static,
+    >,
+>;
 
 /// Root-supplied application seam for durable session requests.
 pub trait ServerHandler: Send + Sync + 'static {
@@ -93,6 +98,13 @@ pub trait ServerHandler: Send + Sync + 'static {
     /// capability document. Everything else in that document is owned by the
     /// transport and the protocol crate.
     fn profiles(&self, _workspace_id: WorkspaceId) -> ProfilesFuture {
+        Box::pin(async { Err(ServerHandlerError::Unavailable) })
+    }
+
+    /// The external tool hosts and skill index of a workspace's default plan,
+    /// for the capability document. The default returns nothing rather than
+    /// failing: a handler without plans still serves the static sections.
+    fn workspace_tools(&self, _workspace_id: WorkspaceId) -> WorkspaceToolsFuture {
         Box::pin(async { Err(ServerHandlerError::Unavailable) })
     }
 
@@ -790,14 +802,29 @@ async fn capabilities(
             Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
         }
     };
-    let profiles = match request.workspace_id {
-        None => None,
-        Some(workspace_id) => match state.handler.profiles(workspace_id).await {
-            Ok(profiles) => Some(profiles),
-            Err(error) => return handler_error_response(error),
-        },
+    let (profiles, workspace_tools) = match request.workspace_id {
+        None => (None, None),
+        Some(workspace_id) => {
+            let profiles = match state.handler.profiles(workspace_id).await {
+                Ok(profiles) => Some(profiles),
+                Err(error) => return handler_error_response(error),
+            };
+            // A workspace whose plan cannot compile still reports its
+            // profiles; the tool section is simply absent.
+            let tools = match state.handler.workspace_tools(workspace_id).await {
+                Ok(tools) => Some(tools),
+                Err(ServerHandlerError::Unavailable | ServerHandlerError::Internal) => None,
+                Err(ServerHandlerError::InvalidRequest(_)) => None,
+            };
+            (profiles, tools)
+        }
     };
-    Json(server_capabilities(&state.connection, profiles)).into_response()
+    Json(server_capabilities(
+        &state.connection,
+        profiles,
+        workspace_tools,
+    ))
+    .into_response()
 }
 
 /// The capability document this server build advertises. Every bound is the
@@ -806,6 +833,7 @@ async fn capabilities(
 fn server_capabilities(
     connection: &ServerConnection,
     profiles: Option<Vec<AgentProfileSummary>>,
+    workspace_tools: Option<WorkspaceToolCapabilities>,
 ) -> ServerCapabilities {
     ServerCapabilities {
         version: CAPABILITIES_VERSION,
@@ -845,6 +873,22 @@ fn server_capabilities(
             ApprovalMode::Full,
         ],
         profiles,
+        tools: ToolCapabilities {
+            max_catalog_tools: u32::try_from(qq_core::catalog::MAX_CATALOG_TOOLS)
+                .unwrap_or(u32::MAX),
+            max_tool_schema_bytes: qq_core::catalog::MAX_TOOL_SCHEMA_BYTES as u64,
+            max_catalog_schema_bytes: qq_core::catalog::MAX_CATALOG_SCHEMA_BYTES,
+            full_exposure_tools: u32::try_from(qq_core::catalog::FULL_EXPOSURE_TOOLS)
+                .unwrap_or(u32::MAX),
+            full_exposure_schema_bytes: qq_core::catalog::FULL_EXPOSURE_SCHEMA_BYTES,
+            max_pinned_tools: u32::try_from(qq_core::catalog::MAX_PINNED_TOOLS).unwrap_or(u32::MAX),
+            max_indexed_skills: u32::try_from(qq_core::MAX_INDEXED_SKILLS).unwrap_or(u32::MAX),
+            external_prefixes: vec![
+                qq_core::MCP_TOOL_PREFIX.to_owned(),
+                qq_core::EMBEDDED_TOOL_PREFIX.to_owned(),
+            ],
+        },
+        workspace_tools,
     }
 }
 
@@ -1541,7 +1585,8 @@ mod tests {
 
     use futures_util::stream as futures_stream;
     use qq_protocol::{
-        CommandOutcome, EventCursor, SessionEvent, SessionEventEnvelope, SessionId, StoreId,
+        CommandOutcome, ContentHash, EventCursor, SessionEvent, SessionEventEnvelope, SessionId,
+        StoreId,
     };
 
     use super::*;
@@ -1854,6 +1899,33 @@ mod tests {
                 }
             })
         }
+
+        fn workspace_tools(&self, workspace_id: WorkspaceId) -> WorkspaceToolsFuture {
+            Box::pin(async move {
+                if workspace_id == WorkspaceId::from_bytes([2; 16]) {
+                    Ok(WorkspaceToolCapabilities {
+                        catalog_digest: ContentHash::from_bytes([5; 32]),
+                        exposure: qq_protocol::ToolExposure::Progressive,
+                        hosts: vec![qq_protocol::ToolHostSummary {
+                            name: "mcp".to_owned(),
+                            generation: 3,
+                            tool_count: 40,
+                            ready: true,
+                            message: None,
+                        }],
+                        excluded_tools: 1,
+                        skills: qq_protocol::SkillCapabilities {
+                            digest: ContentHash::from_bytes([6; 32]),
+                            indexed: 2,
+                            disclosed: 1,
+                            truncated: false,
+                        },
+                    })
+                } else {
+                    Err(ServerHandlerError::Unavailable)
+                }
+            })
+        }
     }
 
     async fn post(
@@ -2063,6 +2135,12 @@ mod tests {
             qq_core::MAX_SPAWNED_CHILDREN_PER_RUN
         );
         assert!(capabilities.profiles.is_none());
+        assert!(capabilities.workspace_tools.is_none());
+        assert_eq!(
+            capabilities.tools.max_catalog_tools as usize,
+            qq_core::catalog::MAX_CATALOG_TOOLS
+        );
+        assert_eq!(capabilities.tools.external_prefixes, ["mcp__", "ext__"]);
         assert_eq!(body["approvals"][3], "deny");
 
         let (status, body) = post(
@@ -2078,6 +2156,10 @@ mod tests {
         let profiles = capabilities.profiles.unwrap();
         assert_eq!(profiles.len(), 1);
         assert!(profiles[0].id.is_default());
+        let tools = capabilities.workspace_tools.unwrap();
+        assert_eq!(tools.exposure, qq_protocol::ToolExposure::Progressive);
+        assert_eq!(tools.hosts[0].tool_count, 40);
+        assert_eq!(tools.skills.disclosed, 1);
 
         let (status, _) = post(
             &server,

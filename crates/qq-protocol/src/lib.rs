@@ -14,7 +14,8 @@ mod sessions;
 
 pub use capabilities::{
     AgentProfileSummary, CAPABILITIES_VERSION, CapabilitiesRequest, LimitCapabilities,
-    ServerCapabilities, SteeringCapabilities,
+    ServerCapabilities, SkillCapabilities, SteeringCapabilities, ToolCapabilities, ToolHostSummary,
+    WorkspaceToolCapabilities,
 };
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
 pub use input::{
@@ -45,10 +46,11 @@ pub use sessions::{
     RunSnapshot, RunStatus, SessionAccounting, SessionCommand, SessionCommandKind, SessionEvent,
     SessionEventEnvelope, SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview,
     SnapshotRequest, SpawnOrigin, SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay,
-    ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
+    ToolCallSnapshot, ToolCallState, ToolExposure, WorkspaceGrantOutcome, WorkspaceSnapshot,
+    WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Slash commands owned by interactive clients rather than the shared
 /// runtime. Keeping this vocabulary in the transport-neutral protocol avoids

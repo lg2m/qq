@@ -4,38 +4,44 @@ use qq_protocol::{ContentHash, PromptVersion};
 use qq_provider::ToolSpec;
 
 use crate::{
-    mcp::MCP_TOOL_PREFIX,
+    hosts::{EMBEDDED_TOOL_PREFIX, MCP_TOOL_PREFIX},
     tools::SPAWN_AGENT_TOOL,
     workspace::{SelectedGuidance, WorkspaceInstructions},
 };
 
-pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(8) {
+pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(9) {
     Some(version) => version,
     None => panic!("agent prompt version must be nonzero"),
 };
 
-/// Version 8 of the base agent prompt. The text is versioned in code, not
+/// Version 9 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
+///
+/// `tool_index` is the progressive-exposure index of external tools not yet
+/// callable; `skill_index` lists disclosed skills the model may load.
 pub(crate) fn agent_system_prompt(
     workspace: &Path,
     specs: &[ToolSpec],
+    tool_index: Option<&str>,
+    skill_index: Option<&str>,
     workspace_instructions: &WorkspaceInstructions,
     selected_guidance: Option<&SelectedGuidance>,
 ) -> String {
     let mut tool_names = String::new();
-    let mut has_mcp = false;
+    let mut has_external = tool_index.is_some();
     let mut has_spawn = false;
     for spec in specs {
         if !tool_names.is_empty() {
             tool_names.push_str(", ");
         }
         tool_names.push_str(spec.name());
-        has_mcp |= spec.name().starts_with(MCP_TOOL_PREFIX);
+        has_external |= spec.name().starts_with(MCP_TOOL_PREFIX)
+            || spec.name().starts_with(EMBEDDED_TOOL_PREFIX);
         has_spawn |= spec.name() == SPAWN_AGENT_TOOL;
     }
-    let mcp_note = if has_mcp {
-        " Tools named mcp__<server>__<tool> call external MCP servers, execute outside the \
-         workspace, and may require user approval."
+    let mcp_note = if has_external {
+        " Tools named mcp__<server>__<tool> or ext__<host>__<tool> call external tool hosts, \
+         execute outside the workspace, and may require user approval."
     } else {
         ""
     };
@@ -80,6 +86,14 @@ pub(crate) fn agent_system_prompt(
          - Prefer edit_file and write_file over shell for changing files.{spawn_section}",
         root = workspace.display(),
     );
+    if let Some(index) = tool_index {
+        prompt.push_str("\n\n");
+        prompt.push_str(index.trim_end());
+    }
+    if let Some(index) = skill_index {
+        prompt.push_str("\n\n");
+        prompt.push_str(index.trim_end());
+    }
     workspace_instructions.append_to_prompt(&mut prompt);
     if let Some(guidance) = selected_guidance {
         guidance.append_to_prompt(&mut prompt);

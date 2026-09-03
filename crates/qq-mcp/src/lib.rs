@@ -18,7 +18,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -107,15 +107,59 @@ pub enum McpTransportSettings {
 pub struct McpCallOutcome {
     pub content: String,
     pub is_error: bool,
+    /// Which failure class produced an `is_error` outcome that the server
+    /// did not itself report. `None` for successes and for server-reported
+    /// tool errors.
+    pub failure: Option<McpCallFailure>,
+}
+
+/// Why a call failed before or instead of the server answering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpCallFailure {
+    Timeout,
+    Cancelled,
+    Unavailable,
+    InvalidArguments,
+    UnknownTool,
+    ShutDown,
 }
 
 impl McpCallOutcome {
-    fn error(content: impl Into<String>) -> Self {
+    fn error(content: impl Into<String>, failure: McpCallFailure) -> Self {
         Self {
             content: content.into(),
             is_error: true,
+            failure: Some(failure),
         }
     }
+}
+
+/// Advisory annotations one server attached to a tool. Hints only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpToolHints {
+    pub read_only: bool,
+    pub destructive: bool,
+    pub idempotent: bool,
+    pub open_world: bool,
+}
+
+/// One namespaced declaration with its server's hints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpTool {
+    pub spec: ToolSpec,
+    pub hints: McpToolHints,
+}
+
+/// Every configured server's declarations at one instant. `generation`
+/// changes whenever any server's cached tool set changes (connect, loss,
+/// `list_changed`), so a holder can ask whether its snapshot is stale
+/// without refetching. `unavailable` names servers that contributed nothing
+/// because they could not be reached.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpCatalog {
+    pub generation: u64,
+    pub tools: Vec<McpTool>,
+    pub unavailable: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -152,15 +196,18 @@ pub fn valid_server_name(name: &str) -> bool {
 }
 
 /// Client handler shared by every connection: it records `list_changed`
-/// notifications so the next schema use refreshes the cache.
+/// notifications so the next schema use refreshes the cache, and advances
+/// the catalog generation so plans compiled from the old listing recompile.
 #[derive(Clone)]
 struct QqClientHandler {
     tools_dirty: Arc<AtomicBool>,
+    catalog_generation: Arc<AtomicU64>,
 }
 
 impl ClientHandler for QqClientHandler {
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         self.tools_dirty.store(true, Ordering::Release);
+        self.catalog_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     #[allow(clippy::field_reassign_with_default)]
@@ -185,6 +232,11 @@ struct ServerHandle {
     permits: Arc<Semaphore>,
     state: Mutex<ServerState>,
     tools_dirty: Arc<AtomicBool>,
+    /// Advances whenever the cached tool set changes or a `list_changed`
+    /// notification arrives. Read without the state lock by
+    /// [`McpManager::catalog_is_current`].
+    catalog_generation: Arc<AtomicU64>,
+    shut_down: AtomicBool,
     #[cfg(test)]
     connector: Option<TestConnector>,
 }
@@ -192,7 +244,7 @@ struct ServerHandle {
 #[derive(Default)]
 struct ServerState {
     client: Option<Arc<Client>>,
-    tools: Option<Arc<Vec<ToolSpec>>>,
+    tools: Option<Arc<Vec<McpTool>>>,
     last_failure: Option<Instant>,
 }
 
@@ -203,9 +255,15 @@ impl ServerHandle {
             settings,
             state: Mutex::new(ServerState::default()),
             tools_dirty: Arc::new(AtomicBool::new(false)),
+            catalog_generation: Arc::new(AtomicU64::new(0)),
+            shut_down: AtomicBool::new(false),
             #[cfg(test)]
             connector: None,
         }
+    }
+
+    fn bump_generation(&self) {
+        self.catalog_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Returns the shared client, connecting first when necessary. A recent
@@ -229,13 +287,16 @@ impl ServerHandle {
         }
         let handler = QqClientHandler {
             tools_dirty: Arc::clone(&self.tools_dirty),
+            catalog_generation: Arc::clone(&self.catalog_generation),
         };
         let connected = tokio::time::timeout(CONNECT_TIMEOUT, self.connect(handler)).await;
         match connected {
             Ok(Ok(client)) => {
                 let client = Arc::new(client);
                 state.client = Some(Arc::clone(&client));
-                state.tools = None;
+                if state.tools.take().is_some() {
+                    self.bump_generation();
+                }
                 state.last_failure = None;
                 Ok(client)
             }
@@ -316,49 +377,54 @@ impl ServerHandle {
             .is_some_and(|current| Arc::ptr_eq(current, client))
         {
             state.client = None;
-            state.tools = None;
+            if state.tools.take().is_some() {
+                self.bump_generation();
+            }
             state.last_failure = Some(Instant::now());
         }
     }
 
-    /// Cached namespaced tool specs, connecting and fetching on first use and
-    /// refetching after a `list_changed` notification. Failures yield an
-    /// empty list; the next use retries.
-    async fn tool_specs(&self) -> Vec<ToolSpec> {
+    /// Cached namespaced tools, connecting and fetching on first use and
+    /// refetching after a `list_changed` notification. `Err` names this
+    /// server as unavailable; the next use retries.
+    async fn tools(&self) -> Result<Arc<Vec<McpTool>>, ()> {
         let mut state = self.state.lock().await;
         if self.tools_dirty.swap(false, Ordering::AcqRel) {
             state.tools = None;
         }
         if let Some(tools) = &state.tools {
-            return tools.as_ref().clone();
+            return Ok(Arc::clone(tools));
         }
         let Ok(client) = self.client_locked(&mut state).await else {
-            return Vec::new();
+            return Err(());
         };
         match tokio::time::timeout(LIST_TOOLS_TIMEOUT, client.list_all_tools()).await {
             Ok(Ok(tools)) => {
-                let specs = Arc::new(self.namespaced_specs(tools));
-                state.tools = Some(Arc::clone(&specs));
-                specs.as_ref().clone()
+                let tools = Arc::new(self.namespaced_tools(tools));
+                state.tools = Some(Arc::clone(&tools));
+                self.bump_generation();
+                Ok(tools)
             }
             Ok(Err(_)) | Err(_) => {
                 state.client = None;
                 state.tools = None;
                 state.last_failure = Some(Instant::now());
-                Vec::new()
+                Err(())
             }
         }
     }
 
-    fn namespaced_specs(&self, tools: Vec<rmcp::model::Tool>) -> Vec<ToolSpec> {
-        let mut specs = Vec::<ToolSpec>::with_capacity(tools.len());
+    fn namespaced_tools(&self, tools: Vec<rmcp::model::Tool>) -> Vec<McpTool> {
+        let mut namespaced = Vec::<McpTool>::with_capacity(tools.len());
         for tool in tools {
             let name = format!("{MCP_TOOL_PREFIX}{}__{}", self.settings.name, tool.name);
             // Names the provider layer would reject, and duplicates within
             // one server, are skipped rather than failing the whole listing.
             if name.len() > MAX_NAMESPACED_NAME_BYTES
                 || tool.name.is_empty()
-                || specs.iter().any(|spec| spec.name() == name)
+                || namespaced
+                    .iter()
+                    .any(|existing| existing.spec.name() == name)
             {
                 continue;
             }
@@ -367,9 +433,21 @@ impl ServerHandle {
                 .as_deref()
                 .map_or_else(String::new, str::to_owned);
             let schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
-            specs.push(ToolSpec::new(name, description, schema));
+            let hints =
+                tool.annotations
+                    .as_ref()
+                    .map_or_else(McpToolHints::default, |annotations| McpToolHints {
+                        read_only: annotations.read_only_hint.unwrap_or(false),
+                        destructive: annotations.destructive_hint.unwrap_or(false),
+                        idempotent: annotations.idempotent_hint.unwrap_or(false),
+                        open_world: annotations.open_world_hint.unwrap_or(false),
+                    });
+            namespaced.push(McpTool {
+                spec: ToolSpec::new(name, description, schema),
+                hints,
+            });
         }
-        specs
+        namespaced
     }
 
     /// Executes one call under this server's concurrency bound and deadline.
@@ -379,9 +457,15 @@ impl ServerHandle {
         arguments: &str,
         cancelled: Arc<AtomicBool>,
     ) -> McpCallOutcome {
+        if self.shut_down.load(Ordering::Acquire) {
+            return McpCallOutcome::error(
+                "the MCP manager has been shut down",
+                McpCallFailure::ShutDown,
+            );
+        }
         let arguments = match parse_arguments(arguments) {
             Ok(arguments) => arguments,
-            Err(error) => return McpCallOutcome::error(error),
+            Err(error) => return McpCallOutcome::error(error, McpCallFailure::InvalidArguments),
         };
         let deadline = tokio::time::Instant::now() + self.settings.call_timeout;
         let mut cancel_poll = tokio::time::interval(CANCEL_POLL);
@@ -396,14 +480,20 @@ impl ServerHandle {
                 // shared client: rmcp requests are independent, so a timed
                 // out or cancelled call never wedges other users.
                 () = tokio::time::sleep_until(deadline) => {
-                    return McpCallOutcome::error(format!(
-                        "MCP call timed out after {} s",
-                        self.settings.call_timeout.as_secs()
-                    ));
+                    return McpCallOutcome::error(
+                        format!(
+                            "MCP call timed out after {} s",
+                            self.settings.call_timeout.as_secs()
+                        ),
+                        McpCallFailure::Timeout,
+                    );
                 }
                 _ = cancel_poll.tick() => {
                     if cancelled.load(Ordering::Acquire) {
-                        return McpCallOutcome::error("tool execution was cancelled");
+                        return McpCallOutcome::error(
+                            "tool execution was cancelled",
+                            McpCallFailure::Cancelled,
+                        );
                     }
                 }
             }
@@ -416,23 +506,37 @@ impl ServerHandle {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> McpCallOutcome {
         let Ok(_permit) = self.permits.acquire().await else {
-            return McpCallOutcome::error("MCP server executor is unavailable");
+            return McpCallOutcome::error(
+                "MCP server executor is unavailable",
+                McpCallFailure::Unavailable,
+            );
         };
+        if self.shut_down.load(Ordering::Acquire) {
+            return McpCallOutcome::error(
+                "the MCP manager has been shut down",
+                McpCallFailure::ShutDown,
+            );
+        }
         let client = match self.client().await {
             Ok(client) => client,
-            Err(error) => return McpCallOutcome::error(error),
+            Err(error) => return McpCallOutcome::error(error, McpCallFailure::Unavailable),
         };
         let mut params = CallToolRequestParams::new(tool.to_owned());
         params.arguments = arguments;
         match client.call_tool(params).await {
             Ok(result) => render_result(result),
             // A JSON-RPC error is the server answering; keep the connection.
-            Err(ServiceError::McpError(error)) => {
-                McpCallOutcome::error(format!("MCP server returned an error: {error}"))
-            }
+            Err(ServiceError::McpError(error)) => McpCallOutcome {
+                content: format!("MCP server returned an error: {error}"),
+                is_error: true,
+                failure: None,
+            },
             Err(error) => {
                 self.invalidate(&client).await;
-                McpCallOutcome::error(format!("MCP call failed: {error}"))
+                McpCallOutcome::error(
+                    format!("MCP call failed: {error}"),
+                    McpCallFailure::Unavailable,
+                )
             }
         }
     }
@@ -481,6 +585,7 @@ fn render_result(result: CallToolResult) -> McpCallOutcome {
     McpCallOutcome {
         content,
         is_error: result.is_error.unwrap_or(false),
+        failure: None,
     }
 }
 
@@ -543,7 +648,9 @@ impl McpManager {
             if handle.settings.eager {
                 let handle = Arc::clone(handle);
                 runtime.spawn(async move {
-                    let _ = handle.tool_specs().await;
+                    // The listing is cached on the handle; the eager path
+                    // only wants the connection warm.
+                    let _warm = handle.tools().await;
                 });
             }
         }
@@ -552,17 +659,76 @@ impl McpManager {
     /// Cached namespaced declarations for every configured server, connecting
     /// lazily on first use. Servers are queried in parallel and an
     /// unavailable server contributes nothing rather than failing the batch.
-    pub async fn tool_specs(&self) -> Vec<ToolSpec> {
+    pub async fn catalog(&self) -> McpCatalog {
         let fetches = self
             .servers
-            .values()
-            .map(|handle| handle.tool_specs())
+            .iter()
+            .map(|(name, handle)| async move { (name, handle.tools().await) })
             .collect::<Vec<_>>();
-        futures_util::future::join_all(fetches)
+        let results = futures_util::future::join_all(fetches).await;
+        let mut tools = Vec::new();
+        let mut unavailable = Vec::new();
+        for (name, result) in results {
+            match result {
+                Ok(listed) => tools.extend(listed.iter().cloned()),
+                Err(()) => unavailable.push(name.clone()),
+            }
+        }
+        McpCatalog {
+            // Read after the fetches: a listing that landed during them is
+            // reflected in both the tools and the generation.
+            generation: self.generation(),
+            tools,
+            unavailable,
+        }
+    }
+
+    /// The cached declarations for every server, flattened.
+    pub async fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.catalog()
             .await
+            .tools
             .into_iter()
-            .flatten()
+            .map(|tool| tool.spec)
             .collect()
+    }
+
+    /// The catalog generation right now. Cheap and synchronous: a sum of
+    /// per-server counters that advance on connect, loss, and
+    /// `list_changed`.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.servers
+            .values()
+            .map(|handle| handle.catalog_generation.load(Ordering::Acquire))
+            .fold(0_u64, u64::wrapping_add)
+    }
+
+    /// Whether a catalog taken under `generation` still describes every
+    /// server's cached tool set.
+    #[must_use]
+    pub fn catalog_is_current(&self, generation: u64) -> bool {
+        self.generation() == generation
+    }
+
+    /// Refuses new calls and drops every connection. In-flight calls settle
+    /// through their own deadlines; no call is retried.
+    pub async fn shutdown(&self) {
+        for handle in self.servers.values() {
+            handle.shut_down.store(true, Ordering::Release);
+            let mut state = handle.state.lock().await;
+            state.client = None;
+            if state.tools.take().is_some() {
+                handle.bump_generation();
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn is_shut_down(&self) -> bool {
+        self.servers
+            .values()
+            .any(|handle| handle.shut_down.load(Ordering::Acquire))
     }
 
     /// Exact namespaced tool names granted by configuration allowlists.
@@ -582,13 +748,22 @@ impl McpManager {
             .strip_prefix(MCP_TOOL_PREFIX)
             .and_then(|rest| rest.split_once("__"))
         else {
-            return McpCallOutcome::error(format!("unknown MCP tool {name:?}"));
+            return McpCallOutcome::error(
+                format!("unknown MCP tool {name:?}"),
+                McpCallFailure::UnknownTool,
+            );
         };
         let Some(handle) = self.servers.get(server) else {
-            return McpCallOutcome::error(format!("no MCP server named {server:?} is configured"));
+            return McpCallOutcome::error(
+                format!("no MCP server named {server:?} is configured"),
+                McpCallFailure::UnknownTool,
+            );
         };
         if tool.is_empty() {
-            return McpCallOutcome::error(format!("unknown MCP tool {name:?}"));
+            return McpCallOutcome::error(
+                format!("unknown MCP tool {name:?}"),
+                McpCallFailure::UnknownTool,
+            );
         }
         handle.call(tool, arguments, cancelled).await
     }

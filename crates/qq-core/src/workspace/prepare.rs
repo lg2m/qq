@@ -156,6 +156,7 @@ pub(crate) async fn prepare_workspace(
 /// before its first provider request, and only when the prompt named guidance.
 pub(crate) async fn prepare_guidance(
     workspace: Workspace,
+    index: Arc<super::skills::SkillIndex>,
     cancelled: Arc<AtomicBool>,
     request: GuidanceRequest,
 ) -> Result<SelectedGuidance, WorkspacePreparationError> {
@@ -168,7 +169,36 @@ pub(crate) async fn prepare_guidance(
         if cancelled.load(Ordering::Acquire) {
             return Err(WorkspacePreparationError::Cancelled);
         }
-        Ok(super::guidance::load(&workspace, request, &cancelled)?)
+        Ok(super::guidance::load(
+            &workspace, &index, request, &cancelled,
+        )?)
+    })
+    .await
+    .map_err(|source| WorkspacePreparationError::Stopped { source })?
+}
+
+/// Loads one disclosed document the model asked for by name through
+/// `load_skill`. Same bounds as an explicit invocation; the result is a tool
+/// error rather than a run failure when the name is unknown or undisclosed.
+pub(crate) async fn load_disclosed_skill(
+    workspace: Workspace,
+    index: Arc<super::skills::SkillIndex>,
+    cancelled: Arc<AtomicBool>,
+    name: String,
+) -> Result<SelectedGuidance, WorkspacePreparationError> {
+    let permit = blocking_permits()
+        .acquire_owned()
+        .await
+        .map_err(|source| WorkspacePreparationError::Unavailable { source })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(WorkspacePreparationError::Cancelled);
+        }
+        let Some(entry) = index.resolve_disclosed(&name) else {
+            return Err(GuidanceError::Unknown { name }.into());
+        };
+        Ok(super::guidance::load_entry(&workspace, entry, &cancelled)?)
     })
     .await
     .map_err(|source| WorkspacePreparationError::Stopped { source })?

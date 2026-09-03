@@ -3,6 +3,7 @@ mod file_state;
 mod guidance;
 mod instructions;
 mod prepare;
+pub mod skills;
 
 pub use access::WorkspacePathError;
 pub(crate) use access::{Workspace, blocking_permits};
@@ -16,4 +17,7 @@ pub(crate) use instructions::{
 };
 #[cfg(test)]
 pub(crate) use prepare::test_pause_after_workspace_open;
-pub(crate) use prepare::{WorkspacePreparationError, prepare_guidance, prepare_workspace};
+pub(crate) use prepare::{
+    WorkspacePreparationError, load_disclosed_skill, prepare_guidance, prepare_workspace,
+};
+pub use skills::{SkillEntry, SkillIndex, SkillKind};

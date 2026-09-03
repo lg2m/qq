@@ -10,7 +10,7 @@ use thiserror::Error;
 pub struct ModelRequest {
     model: Arc<str>,
     messages: Vec<Message>,
-    tools: Vec<ToolSpec>,
+    tools: Arc<[ToolSpec]>,
     system: Option<Arc<str>>,
     max_output_tokens: u32,
 }
@@ -21,16 +21,18 @@ impl ModelRequest {
         Self {
             model: model.into(),
             messages,
-            tools: Vec::new(),
+            tools: Arc::from([]),
             system: None,
             max_output_tokens,
         }
     }
 
-    /// Declares the tools the model may call during this request.
+    /// Declares the tools the model may call during this request. The list
+    /// is shared, not copied: a run declares the same catalog on every turn
+    /// and only the request carrying it is per-turn.
     #[must_use]
-    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
-        self.tools = tools;
+    pub fn with_tools(mut self, tools: impl Into<Arc<[ToolSpec]>>) -> Self {
+        self.tools = tools.into();
         self
     }
 

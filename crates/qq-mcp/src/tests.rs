@@ -363,10 +363,19 @@ async fn eager_servers_connect_at_construction() {
 async fn refreshes_the_tool_cache_on_list_changed_notifications() {
     let fixture = Fixture::new(&["echo"]);
     let manager = manager_with(vec![(settings("srv"), fixture.connector())]);
-    assert_eq!(manager.tool_specs().await.len(), 1);
+    let before = manager.catalog().await;
+    assert_eq!(before.tools.len(), 1);
+    assert!(before.unavailable.is_empty());
+    assert!(
+        manager.catalog_is_current(before.generation),
+        "a fresh catalog is current"
+    );
 
     fixture.server.tools.lock().unwrap().push(tool("extra"));
     fixture.notify_tool_list_changed().await;
+    // The notification alone advances the generation: a plan compiled from
+    // the old listing knows to recompile before anyone refetches.
+    poll_until(async || !manager.catalog_is_current(before.generation)).await;
     poll_until(async || {
         manager
             .tool_specs()
@@ -375,6 +384,9 @@ async fn refreshes_the_tool_cache_on_list_changed_notifications() {
             .any(|spec| spec.name() == "mcp__srv__extra")
     })
     .await;
+    let after = manager.catalog().await;
+    assert_ne!(after.generation, before.generation);
+    assert!(manager.catalog_is_current(after.generation));
     assert_eq!(fixture.connects(), 1, "a refresh must reuse the connection");
 }
 
@@ -391,6 +403,7 @@ async fn calls_succeed_fail_and_map_server_errors_without_reconnecting() {
         McpCallOutcome {
             content: "hello".to_owned(),
             is_error: false,
+            failure: None,
         }
     );
     assert_eq!(fixture.connects(), 1, "calls must connect lazily too");

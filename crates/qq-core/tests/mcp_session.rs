@@ -10,9 +10,10 @@ use std::{
 
 use futures_util::StreamExt;
 use qq_core::{
-    LoadedRuntime, McpCallFuture, McpRegistry, McpSpecsFuture, McpToolResult, Runtime,
-    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
-    SessionRuntime, SessionRuntimeOptions,
+    ExternalToolHost, HostCallFuture, HostCatalog, HostReadiness, HostShutdownFuture, HostTool,
+    HostToolResult, LoadedRuntime, Runtime, RuntimeLoadError, RuntimeLoadFuture,
+    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeOptions,
+    ToolHints,
 };
 use qq_protocol::{
     ApprovalDecision, ApprovalGrant, ApprovalMode, CapabilitySupport, CommandId, CommandOutcome,
@@ -28,29 +29,50 @@ struct PingRegistry {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
-impl McpRegistry for PingRegistry {
-    fn tool_specs(&self) -> McpSpecsFuture {
-        Box::pin(async {
-            vec![ToolSpec::new(
-                MCP_TOOL,
-                "Ping the fixture MCP server.",
-                serde_json::json!({"type": "object"}),
-            )]
-        })
+impl ExternalToolHost for PingRegistry {
+    fn name(&self) -> &str {
+        "mcp"
+    }
+
+    fn catalog_blocking(&self) -> HostCatalog {
+        HostCatalog {
+            generation: 1,
+            tools: vec![HostTool {
+                spec: ToolSpec::new(
+                    MCP_TOOL,
+                    "Ping the fixture MCP server.",
+                    serde_json::json!({"type": "object"}),
+                ),
+                hints: ToolHints::default(),
+            }],
+            readiness: HostReadiness::Ready,
+        }
+    }
+
+    fn catalog_is_current(&self, generation: u64) -> bool {
+        generation == 1
     }
 
     fn config_grants(&self) -> Vec<String> {
         Vec::new()
     }
 
-    fn call(&self, name: String, arguments: String, _cancelled: Arc<AtomicBool>) -> McpCallFuture {
+    fn call(&self, name: String, arguments: String, _cancelled: Arc<AtomicBool>) -> HostCallFuture {
         self.calls.lock().unwrap().push((name, arguments));
         Box::pin(async {
-            McpToolResult {
+            Ok(HostToolResult {
                 content: "pong".to_owned(),
                 is_error: false,
-            }
+            })
         })
+    }
+
+    fn readiness(&self) -> HostReadiness {
+        HostReadiness::Ready
+    }
+
+    fn shutdown(&self) -> HostShutdownFuture {
+        Box::pin(std::future::ready(()))
     }
 }
 
@@ -108,7 +130,7 @@ impl RuntimeLoader for McpLoader {
                 "test-model",
                 256,
             )
-            .map(|runtime| runtime.with_mcp_registry(registry))
+            .map(|runtime| runtime.with_tool_host(registry))
             .map_err(|error| RuntimeLoadError {
                 kind: RunFailureKind::Configuration,
                 message: error.to_string(),

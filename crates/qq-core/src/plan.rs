@@ -2,12 +2,13 @@
 //!
 //! A [`CompiledAgentPlan`] is everything about an agent's behavior that does
 //! not depend on the prompt: the compiled provider handle, the resolved model,
-//! the open workspace with its instructions, the static tool catalog, the
-//! sub-agent routes, and the retry policy. Compiling it does the filesystem
-//! and provider work once; the run loop then executes directly from shared
-//! immutable data. Its [`AgentPlanDescriptor`] is the secret-free account of
-//! that behavior whose canonical digest identifies the plan for caching,
-//! traces, and later protocol exposure.
+//! the open workspace with its instructions, the complete tool catalog (built-
+//! ins plus every external host's admitted declarations), the skill index, the
+//! sub-agent routes, and the retry policy. Compiling it does the filesystem,
+//! provider, and host-catalog work once; the run loop then executes directly
+//! from shared immutable data. Its [`AgentPlanDescriptor`] is the secret-free
+//! account of that behavior whose canonical digest identifies the plan for
+//! caching, traces, and the wire.
 
 mod descriptor;
 mod fingerprint;
@@ -22,21 +23,46 @@ use qq_protocol::{
     AgentPlanDigest, AgentProfileId, CredentialEpoch, InstructionHash, ResolvedModel,
     RunPlanIdentity,
 };
-use qq_provider::{Provider, ToolSpec};
+use qq_provider::Provider;
 use thiserror::Error;
 
 pub use descriptor::{
     AgentPlanDescriptor, CredentialReference, DESCRIPTOR_VERSION, McpServerDescriptor,
-    McpTransportKind, ProviderDescriptor, RetryPolicyDescriptor, ToolCatalogDescriptor,
+    McpTransportKind, ProviderDescriptor, RetryPolicyDescriptor, SkillIndexDescriptor,
+    ToolCatalogDescriptor,
 };
 pub use fingerprint::SourceFingerprint;
 
 use crate::{
-    McpRegistry, Runtime, RuntimeConfigError, TurnRetryPolicy,
-    runtime::{search_history_spec, tool_schema_measurement},
+    Runtime, RuntimeConfigError, TurnRetryPolicy,
+    catalog::{
+        EffectClass, HostContribution, StaticTool, ToolCatalog, ToolHost, select_tools_spec,
+    },
+    hosts::{ExternalToolHost, HostCatalog},
+    runtime::search_history_spec,
     tools,
-    workspace::{Workspace, WorkspaceInstructionError, WorkspaceInstructions},
+    workspace::{
+        SkillIndex, Workspace, WorkspaceInstructionError, WorkspaceInstructions,
+        skills::{SkillRoot, load_skill_spec},
+    },
 };
+
+/// One external host and the catalog snapshot it contributed to this
+/// compile. The snapshot is taken by the caller (outside the compile, where
+/// it may await); the compile only validates and orders it.
+pub struct HostSnapshot {
+    pub host: Arc<dyn ExternalToolHost>,
+    pub catalog: HostCatalog,
+}
+
+impl HostSnapshot {
+    /// Snapshots `host` now, blocking for at most the host's own bounds.
+    #[must_use]
+    pub fn capture_blocking(host: Arc<dyn ExternalToolHost>) -> Self {
+        let catalog = host.catalog_blocking();
+        Self { host, catalog }
+    }
+}
 
 /// Typed, application-neutral input to plan compilation. The embedding
 /// application translates its configuration into this shape; core never sees
@@ -46,7 +72,8 @@ pub struct AgentProfile {
     provider_descriptor: ProviderDescriptor,
     resolved_model: ResolvedModel,
     workspace: PathBuf,
-    mcp: Option<(Arc<dyn McpRegistry>, Vec<McpServerDescriptor>)>,
+    hosts: Vec<HostSnapshot>,
+    mcp_servers: Vec<McpServerDescriptor>,
     spawn_model_routes: Vec<String>,
     turn_retry: TurnRetryPolicy,
     adapter_build: String,
@@ -70,7 +97,8 @@ impl AgentProfile {
             provider_descriptor,
             resolved_model,
             workspace,
-            mcp: None,
+            hosts: Vec::new(),
+            mcp_servers: Vec::new(),
             spawn_model_routes: Vec::new(),
             turn_retry: TurnRetryPolicy::default(),
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
@@ -82,7 +110,8 @@ impl AgentProfile {
 
     /// A profile for an embedded runtime built without configuration: the
     /// descriptor records the provider as embedded and takes model identity
-    /// from the runtime. Used by direct `Runtime::run*` entry points and tests.
+    /// from the runtime. The runtime's hosts are snapshotted here, blocking.
+    /// Used by direct `Runtime::run*` entry points and tests.
     #[must_use]
     pub fn embedded(runtime: &Runtime, workspace: PathBuf) -> Self {
         Self {
@@ -90,7 +119,12 @@ impl AgentProfile {
             provider_descriptor: ProviderDescriptor::embedded(),
             resolved_model: runtime.embedded_resolved_model(),
             workspace,
-            mcp: runtime.mcp.clone().map(|registry| (registry, Vec::new())),
+            hosts: runtime
+                .hosts
+                .iter()
+                .map(|host| HostSnapshot::capture_blocking(Arc::clone(host)))
+                .collect(),
+            mcp_servers: Vec::new(),
             spawn_model_routes: runtime.spawn_model_routes.to_vec(),
             turn_retry: runtime.turn_retry,
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
@@ -100,16 +134,20 @@ impl AgentProfile {
         }
     }
 
-    /// Attaches configuration-declared MCP servers with their secret-free
-    /// descriptors. The registry's tool declarations still join each run when
-    /// it starts; only the declaration identity enters the plan digest.
+    /// Adds an external tool host with its already-captured catalog. Hosts
+    /// contribute in the order added; earlier hosts win catalog capacity.
     #[must_use]
-    pub fn with_mcp(
-        mut self,
-        registry: Arc<dyn McpRegistry>,
-        servers: Vec<McpServerDescriptor>,
-    ) -> Self {
-        self.mcp = Some((registry, servers));
+    pub fn with_host(mut self, snapshot: HostSnapshot) -> Self {
+        self.hosts.push(snapshot);
+        self
+    }
+
+    /// Records the secret-free descriptors of the configured MCP servers the
+    /// hosts realize. Declaration identity enters the digest independently of
+    /// the catalog the servers happen to serve.
+    #[must_use]
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServerDescriptor>) -> Self {
+        self.mcp_servers = servers;
         self
     }
 
@@ -190,18 +228,18 @@ pub struct CompiledAgentPlan {
     pub(crate) runtime: Runtime,
     pub(crate) workspace: Workspace,
     pub(crate) instructions: WorkspaceInstructions,
-    /// Built-in tools plus the `spawn_agent` and `search_history`
-    /// declarations, in declaration order. Runs select from this slice by
-    /// capability instead of rebuilding schemas.
-    pub(crate) static_tools: Arc<[ToolSpec]>,
-    spawn_agent_index: usize,
-    search_history_index: usize,
+    pub(crate) catalog: Arc<ToolCatalog>,
+    pub(crate) skills: Arc<SkillIndex>,
+    /// Host handles indexed as `ToolHost::External { host }` names them.
+    pub(crate) hosts: Arc<[Arc<dyn ExternalToolHost>]>,
     resolved_model: Arc<ResolvedModel>,
     descriptor: Arc<AgentPlanDescriptor>,
     descriptor_json: Arc<str>,
     digest: AgentPlanDigest,
     credential_epoch: CredentialEpoch,
-    instruction_sources: Vec<SourceFingerprint>,
+    /// Instruction files plus skill root directories: everything a cache
+    /// must `stat` to revalidate the workspace side of this plan.
+    sources: Vec<SourceFingerprint>,
     estimated_bytes: usize,
 }
 
@@ -213,22 +251,25 @@ impl fmt::Debug for CompiledAgentPlan {
             .field("credential_epoch", &self.credential_epoch)
             .field("route", &self.resolved_model.route)
             .field("workspace", &self.workspace.path())
+            .field("catalog", &self.catalog)
             .finish_non_exhaustive()
     }
 }
 
 impl CompiledAgentPlan {
     /// Compiles a profile. This opens the workspace, reads its instruction
-    /// file, builds every static tool declaration, and encodes the
-    /// descriptor. It performs blocking filesystem work and must run off the
-    /// async executor (`spawn_blocking` or a dedicated thread).
+    /// file, indexes its skill roots, builds the tool catalog from the static
+    /// declarations and the host snapshots, and encodes the descriptor. It
+    /// performs blocking filesystem work and must run off the async executor
+    /// (`spawn_blocking` or a dedicated thread).
     pub fn compile_blocking(profile: AgentProfile) -> Result<Arc<Self>, PlanCompileError> {
         let AgentProfile {
             provider,
             provider_descriptor,
             resolved_model,
             workspace,
-            mcp,
+            hosts,
+            mcp_servers,
             spawn_model_routes,
             turn_retry,
             adapter_build,
@@ -244,14 +285,22 @@ impl CompiledAgentPlan {
         .with_context_window(resolved_model.context_window)
         .with_turn_retry_policy(turn_retry)
         .with_spawn_model_routes(spawn_model_routes);
-        let (mcp_servers, config_grants) = match mcp {
-            Some((registry, servers)) => {
-                let grants = registry.config_grants();
-                runtime = runtime.with_mcp_registry(registry);
-                (servers, grants)
-            }
-            None => (Vec::new(), Vec::new()),
-        };
+        let mut config_grants = Vec::new();
+        let mut host_handles = Vec::with_capacity(hosts.len());
+        let mut contributions = Vec::with_capacity(hosts.len());
+        for snapshot in hosts {
+            config_grants.extend(snapshot.host.config_grants());
+            contributions.push(HostContribution {
+                name: snapshot.host.name().to_owned(),
+                catalog: snapshot.catalog,
+            });
+            host_handles.push(snapshot.host);
+        }
+        config_grants.sort();
+        config_grants.dedup();
+        let host_handles: Arc<[Arc<dyn ExternalToolHost>]> = host_handles.into();
+        runtime.hosts = Arc::clone(&host_handles);
+
         if !is_canonical_absolute(&workspace) {
             return Err(PlanCompileError::NonCanonicalWorkspace { path: workspace });
         }
@@ -261,15 +310,47 @@ impl CompiledAgentPlan {
                 source,
             })?;
         let cancelled = std::sync::atomic::AtomicBool::new(false);
-        let (instructions, instruction_sources) =
+        let (instructions, mut sources) =
             crate::workspace::load_instructions_with_sources(&opened, &cancelled)?;
+        let (skills, skill_sources) =
+            SkillIndex::compile_blocking(&opened, &SkillRoot::workspace_defaults());
+        sources.extend(skill_sources);
 
-        let mut static_tools = tools::specs();
-        let spawn_agent_index = static_tools.len();
-        static_tools.push(tools::spawn_agent_spec(&runtime.spawn_model_routes));
-        let search_history_index = static_tools.len();
-        static_tools.push(search_history_spec());
-        let static_schema = tool_schema_measurement(&static_tools);
+        let mut static_tools: Vec<StaticTool> = tools::specs()
+            .into_iter()
+            .map(|spec| StaticTool {
+                effect: match spec.name() {
+                    "edit_file" | "write_file" => EffectClass::Mutating,
+                    "shell" => EffectClass::Shell,
+                    _ => EffectClass::ReadOnly,
+                },
+                spec,
+                host: ToolHost::BuiltIn,
+            })
+            .collect();
+        static_tools.push(StaticTool {
+            spec: tools::spawn_agent_spec(&runtime.spawn_model_routes),
+            host: ToolHost::SpawnAgent,
+            effect: EffectClass::ReadOnly,
+        });
+        static_tools.push(StaticTool {
+            spec: search_history_spec(),
+            host: ToolHost::SearchHistory,
+            effect: EffectClass::ReadOnly,
+        });
+        static_tools.push(StaticTool {
+            spec: select_tools_spec(),
+            host: ToolHost::SelectTools,
+            effect: EffectClass::ReadOnly,
+        });
+        if skills.disclosed_count() > 0 {
+            static_tools.push(StaticTool {
+                spec: load_skill_spec(),
+                host: ToolHost::LoadSkill,
+                effect: EffectClass::ReadOnly,
+            });
+        }
+        let catalog = ToolCatalog::compile(static_tools, contributions);
 
         let descriptor = AgentPlanDescriptor {
             version: DESCRIPTOR_VERSION,
@@ -282,13 +363,19 @@ impl CompiledAgentPlan {
             instruction_hash: instructions.hash(),
             instruction_source: instructions.source_path().map(str::to_owned),
             tools: ToolCatalogDescriptor {
-                static_schema_hash: static_schema.hash,
-                names: static_tools
-                    .iter()
-                    .map(|spec| spec.name().to_owned())
-                    .collect(),
+                catalog_digest: catalog.digest(),
+                exposure: catalog.exposure(),
+                names: catalog.names().map(str::to_owned).collect(),
+                hosts: catalog.hosts().to_vec(),
+                excluded: catalog.excluded().to_vec(),
                 spawn_model_routes: runtime.spawn_model_routes.to_vec(),
                 config_grants,
+            },
+            skills: SkillIndexDescriptor {
+                digest: skills.digest(),
+                indexed: skills.len(),
+                disclosed: skills.disclosed_count(),
+                truncated: skills.truncated(),
             },
             mcp_servers,
             retry: RetryPolicyDescriptor::from(runtime.turn_retry),
@@ -306,21 +393,22 @@ impl CompiledAgentPlan {
         let estimated_bytes = descriptor_json.len()
             + descriptor.canonical_bytes()?.len()
             + instructions.content_len()
-            + usize::try_from(static_schema.bytes).unwrap_or(usize::MAX)
+            + catalog.estimated_bytes()
+            + skills.estimated_bytes()
             + std::mem::size_of::<Self>();
         Ok(Arc::new(Self {
             runtime,
             workspace: opened,
             instructions,
-            static_tools: static_tools.into(),
-            spawn_agent_index,
-            search_history_index,
+            catalog: Arc::new(catalog),
+            skills: Arc::new(skills),
+            hosts: host_handles,
             resolved_model: Arc::new(resolved_model),
             descriptor_json: Arc::from(descriptor_json),
             descriptor: Arc::new(descriptor),
             digest,
             credential_epoch,
-            instruction_sources,
+            sources,
             estimated_bytes,
         }))
     }
@@ -377,15 +465,36 @@ impl CompiledAgentPlan {
         self.instructions.hash()
     }
 
-    /// The instruction files this plan read or found absent, for callers that
-    /// revalidate a cached plan against the filesystem.
+    /// The instruction files and skill roots this plan read or found absent,
+    /// for callers that revalidate a cached plan against the filesystem.
     #[must_use]
     pub fn instruction_sources(&self) -> &[SourceFingerprint] {
-        &self.instruction_sources
+        &self.sources
+    }
+
+    /// Whether every external host still serves the catalog generation this
+    /// plan was compiled from. Cheap and synchronous.
+    #[must_use]
+    pub fn hosts_are_current(&self) -> bool {
+        self.catalog
+            .hosts()
+            .iter()
+            .zip(self.hosts.iter())
+            .all(|(summary, host)| host.catalog_is_current(summary.generation))
+    }
+
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<ToolCatalog> {
+        &self.catalog
+    }
+
+    #[must_use]
+    pub fn skills(&self) -> &Arc<SkillIndex> {
+        &self.skills
     }
 
     /// A conservative accounting of the heap this plan holds, for cache
-    /// admission. It excludes the provider transport and MCP connections,
+    /// admission. It excludes the provider transport and host connections,
     /// which are shared across generations.
     #[must_use]
     pub const fn estimated_bytes(&self) -> usize {
@@ -395,18 +504,6 @@ impl CompiledAgentPlan {
     #[must_use]
     pub const fn runtime(&self) -> &Runtime {
         &self.runtime
-    }
-
-    pub(crate) fn spawn_agent_spec(&self) -> &ToolSpec {
-        &self.static_tools[self.spawn_agent_index]
-    }
-
-    pub(crate) fn search_history_spec(&self) -> &ToolSpec {
-        &self.static_tools[self.search_history_index]
-    }
-
-    pub(crate) fn built_in_specs(&self) -> &[ToolSpec] {
-        &self.static_tools[..self.spawn_agent_index]
     }
 }
 
@@ -419,7 +516,6 @@ fn is_canonical_absolute(path: &Path) -> bool {
             )
         })
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -513,10 +609,29 @@ mod tests {
             instruction_hash: InstructionHash::from_bytes([1; 32]),
             instruction_source: Some("AGENTS.md".to_owned()),
             tools: ToolCatalogDescriptor {
-                static_schema_hash: qq_protocol::ContentHash::from_bytes([2; 32]),
+                catalog_digest: qq_protocol::ContentHash::from_bytes([2; 32]),
+                exposure: crate::catalog::Exposure::Full,
                 names: vec!["read_file".to_owned(), "spawn_agent".to_owned()],
+                hosts: vec![crate::catalog::HostSummary {
+                    name: "mcp".to_owned(),
+                    generation: 4,
+                    tool_count: 1,
+                    ready: true,
+                    readiness_message: None,
+                }],
+                excluded: vec![crate::catalog::ExcludedTool {
+                    name: "mcp__executor__huge".to_owned(),
+                    host: "mcp".to_owned(),
+                    reason: crate::catalog::ExclusionReason::SchemaTooLarge { bytes: 20_000 },
+                }],
                 spawn_model_routes: vec!["custom/worker".to_owned()],
                 config_grants: Vec::new(),
+            },
+            skills: SkillIndexDescriptor {
+                digest: qq_protocol::ContentHash::from_bytes([3; 32]),
+                indexed: 2,
+                disclosed: 1,
+                truncated: false,
             },
             mcp_servers: vec![McpServerDescriptor {
                 name: "executor".to_owned(),
@@ -541,7 +656,7 @@ mod tests {
         let bytes = descriptor.canonical_bytes().unwrap();
         assert!(
             bytes.starts_with(
-                b"qq-agent-plan-descriptor-v2\0{\"version\":2,\"profile\":\"review\","
+                b"qq-agent-plan-descriptor-v3\0{\"version\":3,\"profile\":\"review\","
             )
         );
         // The golden digest pins the canonical encoding. A change here means
@@ -549,10 +664,10 @@ mod tests {
         // from a different encoding.
         assert_eq!(
             descriptor.digest().unwrap().to_string(),
-            "bc19398a8c594852d138c594d5725b9812f0eb21869652177eb9d952f4a86267"
+            "d055839658146e7d0c7c4a79fe6afdcd23865454c7f70275869ab56cf25acfe1"
         );
         let round_trip: AgentPlanDescriptor =
-            serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v1\0".len()..]).unwrap();
+            serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v3\0".len()..]).unwrap();
         assert_eq!(round_trip, descriptor);
         assert_eq!(round_trip.digest().unwrap(), descriptor.digest().unwrap());
     }
@@ -630,11 +745,25 @@ mod tests {
                 Box::new(|d| d.instruction_source = None),
             ),
             (
-                "tools.static_schema_hash",
+                "tools.catalog_digest",
                 Box::new(|d| {
-                    d.tools.static_schema_hash = qq_protocol::ContentHash::from_bytes([9; 32]);
+                    d.tools.catalog_digest = qq_protocol::ContentHash::from_bytes([9; 32]);
                 }),
             ),
+            (
+                "tools.exposure",
+                Box::new(|d| d.tools.exposure = crate::catalog::Exposure::Progressive),
+            ),
+            (
+                "tools.hosts.generation",
+                Box::new(|d| d.tools.hosts[0].generation += 1),
+            ),
+            ("tools.excluded", Box::new(|d| d.tools.excluded.clear())),
+            (
+                "skills.digest",
+                Box::new(|d| d.skills.digest = qq_protocol::ContentHash::from_bytes([9; 32])),
+            ),
+            ("skills.disclosed", Box::new(|d| d.skills.disclosed = 0)),
             (
                 "tools.names",
                 Box::new(|d| d.tools.names.push("shell".to_owned())),
@@ -704,20 +833,31 @@ mod tests {
             descriptor.tools.spawn_model_routes,
             vec!["custom/worker".to_owned()]
         );
+        for name in [
+            "read_file",
+            "shell",
+            "spawn_agent",
+            "search_history",
+            "select_tools",
+        ] {
+            assert!(descriptor.tools.names.iter().any(|n| n == name), "{name}");
+        }
         assert!(
-            descriptor
-                .tools
-                .names
-                .ends_with(&["spawn_agent".to_owned(), "search_history".to_owned()])
+            !descriptor.tools.names.iter().any(|n| n == "load_skill"),
+            "no disclosed skills, no loader"
         );
+        assert_eq!(descriptor.tools.exposure, crate::catalog::Exposure::Full);
+        assert_eq!(descriptor.tools.catalog_digest, plan.catalog().digest());
+        assert_eq!(descriptor.skills.indexed, 0);
         assert_eq!(plan.credential_epoch(), CredentialEpoch::new(3));
         assert_eq!(plan.digest(), descriptor.digest().unwrap());
         assert_eq!(plan.resolved_model().route, "custom/test-model");
         assert!(plan.estimated_bytes() > "Answer tersely.\n".len());
 
-        // Both instruction candidates are fingerprinted, present or absent.
+        // Both instruction candidates and all five skill roots are
+        // fingerprinted, present or absent.
         let sources = plan.instruction_sources();
-        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.len(), 7);
         assert!(sources[0].path().ends_with("AGENTS.md") && sources[0].is_present());
         assert!(sources[1].path().ends_with("CLAUDE.md") && !sources[1].is_present());
 

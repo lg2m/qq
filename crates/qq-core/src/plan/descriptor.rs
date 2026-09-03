@@ -10,10 +10,10 @@ use crate::TurnRetryPolicy;
 /// Version of the descriptor's canonical encoding. Bump it whenever a field is
 /// added, removed, renamed, or its normalization changes, so historical digests
 /// are never compared against a different encoding.
-pub const DESCRIPTOR_VERSION: u16 = 2;
+pub const DESCRIPTOR_VERSION: u16 = 3;
 
 /// Domain separator prepended to the canonical bytes before hashing.
-const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v2\0";
+const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v3\0";
 
 /// Where a credential comes from, without its value. Two plans that read the
 /// same environment variable or stored credential name share a reference and
@@ -108,18 +108,38 @@ pub struct McpServerDescriptor {
     pub max_concurrent_calls: u32,
 }
 
-/// The static tool catalog every run of the plan starts from.
+/// The complete tool catalog every run of the plan selects from: built-ins,
+/// session tools, and every external host's admitted declarations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCatalogDescriptor {
-    /// Hash of the serialized static schemas (built-ins, `spawn_agent`,
-    /// `search_history`). MCP declarations join per run and are not included.
-    pub static_schema_hash: ContentHash,
+    /// Digest over every admitted entry (name, description, schema, effect)
+    /// and the exposure mode.
+    pub catalog_digest: ContentHash,
+    pub exposure: crate::catalog::Exposure,
     pub names: Vec<String>,
+    /// External hosts in contribution order with the catalog generation each
+    /// was snapshotted under.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<crate::catalog::HostSummary>,
+    /// Declarations left out and why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<crate::catalog::ExcludedTool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawn_model_routes: Vec<String>,
     /// Exact tool names the configuration pre-approves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_grants: Vec<String>,
+}
+
+/// The compiled skill/command index: what the model can be told about and
+/// what `/name` resolves to, without any document body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillIndexDescriptor {
+    pub digest: ContentHash,
+    pub indexed: usize,
+    pub disclosed: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +183,7 @@ pub struct AgentPlanDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_source: Option<String>,
     pub tools: ToolCatalogDescriptor,
+    pub skills: SkillIndexDescriptor,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerDescriptor>,
     pub retry: RetryPolicyDescriptor,

@@ -1,6 +1,8 @@
 use super::scheduler::schedule_runs;
 use super::*;
-use crate::plan::{AgentProfile, CompiledAgentPlan, PlanCompileError, ProviderDescriptor};
+use crate::plan::{
+    AgentProfile, CompiledAgentPlan, HostSnapshot, PlanCompileError, ProviderDescriptor,
+};
 
 pub type RuntimeLoadFuture =
     Pin<Box<dyn Future<Output = Result<LoadedRuntime, RuntimeLoadError>> + Send + 'static>>;
@@ -65,8 +67,8 @@ impl LoadedRuntime {
         .with_spawn_model_routes(runtime.spawn_model_routes.to_vec())
         .with_turn_retry_policy(runtime.turn_retry)
         .with_profile_id(profile_id);
-        if let Some(registry) = &runtime.mcp {
-            profile = profile.with_mcp(Arc::clone(registry), Vec::new());
+        for host in runtime.hosts.iter() {
+            profile = profile.with_host(HostSnapshot::capture_blocking(Arc::clone(host)));
         }
         Ok(Self {
             plan: CompiledAgentPlan::compile_blocking(profile)?,
