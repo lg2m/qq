@@ -35,7 +35,7 @@ impl ToolGate for SessionToolGate {
                 Ok(policy) => policy,
                 Err(error) => return approval_persistence_failure(error),
             };
-            let class = approval::classify(&call.name, &call.arguments);
+            let class = approval::classify(call.effect, &call.name, &call.arguments);
             match approval::evaluate(mode, &call.name, &class, &grants) {
                 approval::PolicyDecision::Execute => GateDecision::Execute,
                 approval::PolicyDecision::Deny => {

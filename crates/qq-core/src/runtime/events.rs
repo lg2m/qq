@@ -7,6 +7,7 @@ use qq_protocol::{
 use qq_provider::Message;
 use sha2::{Digest, Sha256};
 
+use crate::catalog::EffectClass;
 use crate::workspace::FileStateUpdate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,10 +181,15 @@ pub(crate) struct RuntimeToolCall {
     pub(crate) provider_call_id: String,
     pub(crate) name: String,
     pub(crate) arguments: String,
-    /// Set when the provider streamed arguments that were not valid JSON. The
-    /// call is never executed; this message is returned to the model as a
+    /// The catalog's effect for `name`, resolved once when the call is
+    /// admitted. Policy classifies from this, never from the name. A name
+    /// absent from the catalog is a tool error and never reaches the gate.
+    pub(crate) effect: EffectClass,
+    /// Set when the call cannot execute: the provider streamed arguments that
+    /// were not valid JSON, or the name is not in the catalog. The call never
+    /// reaches the gate; this message is returned to the model as a
     /// retryable tool error instead of failing the run.
-    pub(crate) argument_error: Option<String>,
+    pub(crate) rejection: Option<String>,
 }
 
 pub(crate) struct PendingToolCall {
@@ -191,7 +197,7 @@ pub(crate) struct PendingToolCall {
     pub(crate) name: String,
     pub(crate) arguments: String,
     pub(crate) parsed_arguments: Option<serde_json::Value>,
-    pub(crate) argument_error: Option<String>,
+    pub(crate) rejection: Option<String>,
     pub(crate) completed: bool,
 }
 

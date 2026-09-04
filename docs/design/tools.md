@@ -383,7 +383,10 @@ that an embedding application registers closures on, with a frozen registry,
 a concurrency permit, a per-call deadline, and argument (64 KiB) and result
 (1 MiB) bounds. Both pass the same conformance suite. Hosts never retry
 implicitly, and a host's effect hints are advisory: approval policy classifies
-every external call by name, exactly as before.
+every call from the catalog's effect class, and every external tool (MCP or
+embedded) is gated like a mutation — denied under read-only, held under ask and
+supervised, and trusted under auto and full. A `read_only` hint only filters
+the schema out of read-only requests; it never changes a decision.
 
 Host tools are compiled into the plan's `ToolCatalog` at plan compile time,
 not fetched per run. A tool is excluded, with a typed reason recorded in the

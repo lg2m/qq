@@ -11,8 +11,10 @@ mod write;
 pub(crate) use dispatch::{MAX_TOOL_RESULT_BYTES, test_executions_started};
 pub(crate) use dispatch::{ToolExecutionResult, bounded_result, execute};
 pub(crate) use specs::{
-    MAX_SPAWN_AGENT_SCHEMA_BYTES, SPAWN_AGENT_TOOL, SpawnAgentArgs, spawn_agent_spec, specs,
+    MAX_SPAWN_AGENT_SCHEMA_BYTES, SPAWN_AGENT_TOOL, SpawnAgentArgs, spawn_agent_spec, static_tools,
 };
+#[cfg(test)]
+pub(crate) use specs::{specs, test_tool_effect};
 
 #[cfg(test)]
 use crate::workspace::{FileState, Workspace, content_hash};

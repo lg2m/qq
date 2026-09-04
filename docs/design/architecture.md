@@ -404,7 +404,11 @@ registry, a concurrency permit, a per-call deadline, and argument (64 KiB) and
 result (1 MiB) bounds. Both pass the shared conformance suite in
 `qq-core::hosts::conformance`; the MCP adapter runs the availability subset
 over a real stdio transport. Hosts perform no implicit retry, and host hints
-never grant authority: approval policy still classifies calls by name.
+never grant authority: approval policy classifies every call from the effect
+class the catalog recorded for it (read-only, mutating, shell, or external),
+carried on the call from admission to the gate. Every external tool is gated
+like a mutation whatever its name or hints; a name the catalog does not hold is
+a tool error before any policy runs.
 
 Skills are compiled into a `SkillIndex` beside the catalog. Native `.qq/`
 roots and pack roots are *disclosed*: their names and front-matter

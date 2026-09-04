@@ -485,6 +485,53 @@ async fn cancellation_stops_a_call_without_wedging_the_shared_client() {
 }
 
 #[tokio::test]
+async fn a_slow_connect_never_holds_a_call_permit() {
+    // The permit bounds in-flight calls, not connection attempts: a caller
+    // parked in connect must leave the whole bound available to others.
+    let fixture = Fixture::new(&["echo"]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let inner = fixture.connector();
+    let connector: TestConnector = {
+        let gate = Arc::clone(&gate);
+        let entered = Arc::clone(&entered);
+        Arc::new(move |handler| {
+            let inner = Arc::clone(&inner);
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            Box::pin(async move {
+                entered.notify_one();
+                gate.notified().await;
+                inner(handler).await
+            })
+        })
+    };
+    let mut bounded = settings("srv");
+    bounded.max_concurrent_calls = 1;
+    let manager = Arc::new(manager_with(vec![(bounded, connector)]));
+    let handle = Arc::clone(manager.servers.get("srv").unwrap());
+
+    let call = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .call("mcp__srv__echo", r#"{"text":"late"}"#, not_cancelled())
+                .await
+        })
+    };
+    entered.notified().await;
+    assert_eq!(
+        handle.permits.available_permits(),
+        1,
+        "connecting must not consume the call bound"
+    );
+    gate.notify_one();
+    let outcome = call.await.unwrap();
+    assert_eq!(outcome.content, "late");
+    assert_eq!(handle.permits.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn one_server_is_bounded_while_distinct_servers_run_in_parallel() {
     // Per-server bound: with one permit, two concurrent slow calls must
     // never overlap inside the fixture.

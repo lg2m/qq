@@ -58,9 +58,11 @@ pub(crate) enum ToolHost {
     External { host: usize },
 }
 
-/// How a call to this tool relates to the workspace. External tools carry
-/// their host's hints for diagnosis, but policy classifies them by name
-/// (see `approval::classify`); hints never grant authority.
+/// How a call to this tool relates to the workspace. This is the single
+/// source policy classifies from (see `approval::classify`): a call carries
+/// its catalog effect from admission to the gate. External tools carry their
+/// host's hints for diagnosis and read-only schema filtering; hints never
+/// grant authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
@@ -988,14 +990,7 @@ pub mod bench_support {
     /// Compiles the default static tools plus `hosts` (name, tools).
     #[must_use]
     pub fn compile_default_catalog(hosts: Vec<(String, Vec<HostTool>)>) -> ToolCatalog {
-        let mut static_tools: Vec<StaticTool> = crate::tools::specs()
-            .into_iter()
-            .map(|spec| StaticTool {
-                spec,
-                host: ToolHost::BuiltIn,
-                effect: EffectClass::ReadOnly,
-            })
-            .collect();
+        let mut static_tools: Vec<StaticTool> = crate::tools::static_tools();
         static_tools.push(StaticTool {
             spec: select_tools_spec(),
             host: ToolHost::SelectTools,

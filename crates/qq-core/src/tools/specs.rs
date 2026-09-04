@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{list::MAX_DIRECTORY_ENTRIES, read::MAX_READ_LINES, shell::MAX_SHELL_TIMEOUT_SECS};
+use crate::catalog::{EffectClass, StaticTool, ToolHost};
 
 /// The sub-agent tool. Not a [`BuiltInTool`]: it is declared only for runs
 /// that may spawn (never for child sessions), and it dispatches to the
@@ -53,6 +54,20 @@ impl BuiltInTool {
             #[cfg(test)]
             "__test_shell" => Some(Self::TestShell),
             _ => None,
+        }
+    }
+
+    fn effect(self) -> EffectClass {
+        match self {
+            Self::ReadFile | Self::ListDir | Self::Search => EffectClass::ReadOnly,
+            Self::EditFile | Self::WriteFile => EffectClass::Mutating,
+            Self::Shell => EffectClass::Shell,
+            #[cfg(test)]
+            Self::TestDelay => EffectClass::ReadOnly,
+            #[cfg(test)]
+            Self::TestMutate => EffectClass::Mutating,
+            #[cfg(test)]
+            Self::TestShell => EffectClass::Shell,
         }
     }
 
@@ -288,4 +303,30 @@ pub(crate) fn specs() -> Vec<ToolSpec> {
                 .collect()
         })
         .clone()
+}
+
+/// The built-in tools as the catalog compiler receives them, each carrying
+/// the effect policy will classify it by.
+pub(crate) fn static_tools() -> Vec<StaticTool> {
+    specs()
+        .into_iter()
+        .zip(BuiltInTool::ALL)
+        .map(|(spec, tool)| StaticTool {
+            spec,
+            host: ToolHost::BuiltIn,
+            effect: tool.effect(),
+        })
+        .collect()
+}
+
+/// The effect of a test-only tool, which dispatch executes but the catalog
+/// never advertises.
+#[cfg(test)]
+pub(crate) fn test_tool_effect(name: &str) -> Option<EffectClass> {
+    match BuiltInTool::from_name(name)? {
+        tool @ (BuiltInTool::TestDelay | BuiltInTool::TestMutate | BuiltInTool::TestShell) => {
+            Some(tool.effect())
+        }
+        _ => None,
+    }
 }

@@ -179,17 +179,14 @@ fn note_audited_action(
     result: &tools::ToolExecutionResult,
 ) {
     triggers.tool_calls = triggers.tool_calls.saturating_add(1);
-    match approval::classify(&call.name, &call.arguments) {
+    match approval::classify(call.effect, &call.name, &call.arguments) {
         approval::ToolClass::Mutating if !result.is_error => triggers.mutated_files = true,
-        approval::ToolClass::Shell { .. } if !result.is_error => {
-            // Read-only shell (allowlisted VCS reads and the like) does not
-            // by itself make a run worth auditing; anything else does.
-            let read_only = approval::classify(&call.name, &call.arguments);
-            if let approval::ToolClass::Shell { command, .. } = read_only
-                && !approval::read_only_shell_command(&command)
-            {
-                triggers.non_read_shell = true;
-            }
+        // Read-only shell (allowlisted VCS reads and the like) does not by
+        // itself make a run worth auditing; anything else does.
+        approval::ToolClass::Shell { command, .. }
+            if !result.is_error && !approval::read_only_shell_command(&command) =>
+        {
+            triggers.non_read_shell = true;
         }
         _ => {}
     }
@@ -500,7 +497,7 @@ struct StaticPolicyGate {
 
 impl ToolGate for StaticPolicyGate {
     fn resolve(&self, call: &RuntimeToolCall) -> ToolGateFuture {
-        let class = approval::classify(&call.name, &call.arguments);
+        let class = approval::classify(call.effect, &call.name, &call.arguments);
         let decision = match approval::evaluate(self.mode, &call.name, &class, &self.grants) {
             approval::PolicyDecision::Execute => GateDecision::Execute,
             approval::PolicyDecision::Deny => GateDecision::Deny {
@@ -1427,7 +1424,7 @@ impl plan::CompiledAgentPlan {
                                 name,
                                 arguments: String::new(),
                                 parsed_arguments: None,
-                                argument_error: None,
+                                rejection: None,
                                 completed: false,
                             });
                             slice_tool_calls += 1;
@@ -1484,7 +1481,7 @@ impl plan::CompiledAgentPlan {
                             let parsed = match serde_json::from_str(arguments) {
                                 Ok(arguments) => arguments,
                                 Err(error) => {
-                                    call.argument_error = Some(format!(
+                                    call.rejection = Some(format!(
                                         "tool call arguments were not valid JSON: {error}"
                                     ));
                                     serde_json::Value::Object(serde_json::Map::new())
@@ -1628,6 +1625,21 @@ impl plan::CompiledAgentPlan {
                             break;
                         }
                     };
+                    // Effect is resolved once here from the catalog and
+                    // travels with the call; policy never re-derives it from
+                    // the name. A name the catalog does not hold is not
+                    // executable, so it settles as a tool error before any
+                    // gate sees it.
+                    let known = catalog.lookup(&pending.name).map(|entry| entry.effect);
+                    #[cfg(test)]
+                    let known = known.or_else(|| tools::test_tool_effect(&pending.name));
+                    let (effect, rejection) = match known {
+                        Some(effect) => (effect, pending.rejection),
+                        None => (
+                            catalog::EffectClass::ReadOnly,
+                            Some(format!("unknown tool {:?}", pending.name)),
+                        ),
+                    };
                     calls.push(RuntimeToolCall {
                         id,
                         turn_ordinal,
@@ -1636,7 +1648,8 @@ impl plan::CompiledAgentPlan {
                         provider_call_id: pending.provider_call_id,
                         name: pending.name,
                         arguments: pending.arguments,
-                        argument_error: pending.argument_error,
+                        effect,
+                        rejection,
                     });
                 }
                 if let Some(message) = id_generation_failed {
@@ -1869,7 +1882,7 @@ impl plan::CompiledAgentPlan {
                 let mut results = vec![None; calls.len()];
                 let mut turn_interrupted_in_tools = false;
                 for (index, call) in calls.iter().enumerate() {
-                    if call.argument_error.is_some() {
+                    if call.rejection.is_some() {
                         continue;
                     }
                     if turn_interrupted_in_tools {
@@ -1949,7 +1962,7 @@ impl plan::CompiledAgentPlan {
                 // request order. It is read-only and instantaneous.
                 let mut pins_changed = false;
                 for (index, call) in calls.iter().enumerate() {
-                    if results[index].is_some() || call.argument_error.is_some() {
+                    if results[index].is_some() || call.rejection.is_some() {
                         continue;
                     }
                     if !matches!(
@@ -2006,7 +2019,7 @@ impl plan::CompiledAgentPlan {
                         // spend) is charged to the parent's budgets.
                         let mut child_spend: Option<SpawnAgentSpend> = None;
                         let host = catalog.lookup(&call.name).map(|entry| entry.host);
-                        let result = match call.argument_error.clone() {
+                        let result = match call.rejection.clone() {
                             Some(error) => tools::ToolExecutionResult {
                                 content: error,
                                 is_error: true,
@@ -2174,12 +2187,13 @@ impl plan::CompiledAgentPlan {
                     }
                 };
                 // Read-only turns overlap under a small bound; a turn with any
-                // mutating or shell call runs entirely in request order so
-                // side effects never interleave and every read is
-                // deterministically ordered against the mutations.
+                // mutating, shell, or external call runs entirely in request
+                // order so side effects never interleave and every read is
+                // deterministically ordered against the mutations. Only a
+                // read child may overlap: a write child is a mutation.
                 let sequential = approved.iter().any(|call| {
                     !matches!(
-                        approval::classify(&call.name, &call.arguments),
+                        approval::classify(call.effect, &call.name, &call.arguments),
                         approval::ToolClass::ReadOnly
                     )
                 });
@@ -6233,6 +6247,10 @@ mod tests {
         generation: Arc<std::sync::atomic::AtomicU64>,
         calls: Arc<Mutex<Vec<String>>>,
         failure: Option<HostCallError>,
+        /// Advertised on every tool; must never change a policy decision.
+        read_only_hint: bool,
+        /// Whether the host declares configuration grants for its tools.
+        granted: bool,
     }
 
     impl WideHost {
@@ -6242,6 +6260,8 @@ mod tests {
                 generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 calls: Arc::new(Mutex::new(Vec::new())),
                 failure: None,
+                read_only_hint: false,
+                granted: true,
             }
         }
     }
@@ -6265,7 +6285,10 @@ mod tests {
                             },
                             serde_json::json!({"type": "object"}),
                         ),
-                        hints: ToolHints::default(),
+                        hints: ToolHints {
+                            read_only: self.read_only_hint,
+                            ..ToolHints::default()
+                        },
                     })
                     .collect(),
                 readiness: HostReadiness::Ready,
@@ -6277,6 +6300,9 @@ mod tests {
         }
 
         fn config_grants(&self) -> Vec<String> {
+            if !self.granted {
+                return Vec::new();
+            }
             (0..self.count)
                 .map(|i| format!("ext__wide__tool{i:02}"))
                 .collect()
@@ -6355,6 +6381,84 @@ mod tests {
             .iter()
             .map(qq_provider::ToolSpec::name)
             .collect()
+    }
+
+    /// Regression for the `ext__` approval bypass: embedded-host tools once
+    /// classified as `Unknown` and executed under every mode. Policy now
+    /// classifies from the catalog effect, so an external call is denied
+    /// under read-only and held under ask and supervised, and the host's
+    /// `read_only` hint never changes the decision.
+    #[tokio::test]
+    async fn external_host_tools_obey_every_approval_mode_regardless_of_hints() {
+        let directory = tempfile::tempdir().unwrap();
+        for read_only_hint in [false, true] {
+            for (mode, expected) in [
+                (ApprovalMode::ReadOnly, Some(approval::POLICY_DENIED_RESULT)),
+                (ApprovalMode::Ask, Some(approval::UNATTENDED_DENIED_RESULT)),
+                (
+                    ApprovalMode::Supervised,
+                    Some(approval::UNATTENDED_DENIED_RESULT),
+                ),
+                (ApprovalMode::Auto, None),
+                (ApprovalMode::Full, None),
+            ] {
+                let mut host = WideHost::new(2);
+                host.read_only_hint = read_only_hint;
+                host.granted = false;
+                let calls = Arc::clone(&host.calls);
+                let runtime = Runtime::new(
+                    TurnScript {
+                        turns: vec![vec![("ext__wide__tool01", "{}".to_owned())], Vec::new()],
+                        requests: Arc::new(Mutex::new(Vec::new())),
+                    },
+                    "gpt-test",
+                    256,
+                )
+                .unwrap()
+                .with_tool_host(Arc::new(host));
+                let events = runtime
+                    .run_loop(
+                        vec![Message::user("deploy")],
+                        directory.path().to_owned(),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(StaticPolicyGate {
+                            mode,
+                            grants: approval::SessionGrants::default(),
+                        }),
+                        Arc::new(workspace::FileState::default()),
+                    )
+                    .collect::<Vec<_>>()
+                    .await;
+                let context = format!("mode {mode:?}, read_only hint {read_only_hint}");
+                match expected {
+                    Some(message) => {
+                        assert!(
+                            events.iter().any(|event| matches!(
+                                event,
+                                RuntimeEvent::ToolCallDenied { message: denied, .. }
+                                    if denied == message
+                            )),
+                            "{context}: expected denial {message:?}, got {events:?}"
+                        );
+                        assert!(
+                            calls.lock().unwrap().is_empty(),
+                            "{context}: the host must never see a denied call"
+                        );
+                    }
+                    None => {
+                        assert_eq!(
+                            calls.lock().unwrap().as_slice(),
+                            ["ext__wide__tool01"],
+                            "{context}: the host must execute the call"
+                        );
+                    }
+                }
+                assert!(
+                    matches!(events.last(), Some(RuntimeEvent::Completed)),
+                    "{context}: {events:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

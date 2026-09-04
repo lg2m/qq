@@ -19,9 +19,11 @@ pub(crate) use events::{
     TurnBlock,
 };
 pub(crate) use gate::{GateDecision, ToolGate, ToolGateFuture};
+#[cfg(test)]
+pub(crate) use history::SEARCH_HISTORY_TOOL;
 pub(crate) use history::{
-    HistoryMatch, HistorySearchFuture, HistorySearcher, MAX_HISTORY_MATCHES, SEARCH_HISTORY_TOOL,
-    SearchHistoryArgs, excerpt_around, render_history_matches, search_history_spec,
+    HistoryMatch, HistorySearchFuture, HistorySearcher, MAX_HISTORY_MATCHES, SearchHistoryArgs,
+    excerpt_around, render_history_matches, search_history_spec,
 };
 pub(crate) use prompt::{
     AGENT_PROMPT_VERSION, PromptSections, agent_system_prompt, delegation_roster_text,

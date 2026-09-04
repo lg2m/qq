@@ -14351,8 +14351,9 @@ mod tests {
                 call_ordinal: 1,
                 provider_call_id: "provider-call".to_owned(),
                 name: "read_file".to_owned(),
+                effect: crate::catalog::EffectClass::ReadOnly,
                 arguments: r#"{"path":"note.txt"}"#.to_owned(),
-                argument_error: None,
+                rejection: None,
             };
             let message = Message::new(
                 Role::Assistant,
@@ -14572,8 +14573,9 @@ mod tests {
                 call_ordinal: 1,
                 provider_call_id: "provider-call".to_owned(),
                 name: "read_file".to_owned(),
+                effect: crate::catalog::EffectClass::ReadOnly,
                 arguments: r#"{"path":"note.txt"}"#.to_owned(),
-                argument_error: None,
+                rejection: None,
             };
             assert_eq!(
                 store
@@ -18273,8 +18275,9 @@ mod tests {
                 call_ordinal: 1,
                 provider_call_id: "call_0".to_owned(),
                 name: "read_file".to_owned(),
+                effect: crate::catalog::EffectClass::ReadOnly,
                 arguments: r#"{"path":"note.txt"}"#.to_owned(),
-                argument_error: None,
+                rejection: None,
             };
             store
                 .persist_model_turn(
@@ -18432,8 +18435,9 @@ mod tests {
                 call_ordinal: 1,
                 provider_call_id: "completed-call".to_owned(),
                 name: "read_file".to_owned(),
+                effect: crate::catalog::EffectClass::ReadOnly,
                 arguments: r#"{"path":"completed.txt"}"#.to_owned(),
-                argument_error: None,
+                rejection: None,
             },
             RuntimeToolCall {
                 id: started_call_id,
@@ -18441,8 +18445,9 @@ mod tests {
                 call_ordinal: 2,
                 provider_call_id: "started-call".to_owned(),
                 name: "read_file".to_owned(),
+                effect: crate::catalog::EffectClass::ReadOnly,
                 arguments: r#"{"path":"first.txt"}"#.to_owned(),
-                argument_error: None,
+                rejection: None,
             },
             RuntimeToolCall {
                 id: awaiting_call_id,
@@ -18450,8 +18455,9 @@ mod tests {
                 call_ordinal: 3,
                 provider_call_id: "awaiting-call".to_owned(),
                 name: "shell".to_owned(),
+                effect: crate::catalog::EffectClass::Shell,
                 arguments: r#"{"command":"true"}"#.to_owned(),
-                argument_error: None,
+                rejection: None,
             },
             RuntimeToolCall {
                 id: untouched_call_id,
@@ -18459,8 +18465,9 @@ mod tests {
                 call_ordinal: 4,
                 provider_call_id: "untouched-call".to_owned(),
                 name: "read_file".to_owned(),
+                effect: crate::catalog::EffectClass::ReadOnly,
                 arguments: r#"{"path":"second.txt"}"#.to_owned(),
-                argument_error: None,
+                rejection: None,
             },
         ];
         store
@@ -19702,8 +19709,9 @@ mod tests {
             call_ordinal: 1,
             provider_call_id: "call_0".to_owned(),
             name: "read_file".to_owned(),
+            effect: crate::catalog::EffectClass::ReadOnly,
             arguments: r#"{"path":"note.txt"}"#.to_owned(),
-            argument_error: None,
+            rejection: None,
         };
         store
             .persist_model_turn(
@@ -19859,8 +19867,9 @@ mod tests {
             call_ordinal: 1,
             provider_call_id: "provider-call".to_owned(),
             name: "edit_file".to_owned(),
+            effect: crate::catalog::EffectClass::Mutating,
             arguments: r#"{"path":"note.txt","old_string":"a","new_string":"b"}"#.to_owned(),
-            argument_error: None,
+            rejection: None,
         };
         store
             .persist_model_turn(
@@ -23364,11 +23373,13 @@ mod tests {
             active: Arc::new(AtomicUsize::new(0)),
             max_active: Arc::clone(&max_active),
         });
+        // Two distinct mutating names so two workspace grants are promoted.
+        // Both are catalog-known: an unknown name never reaches the gate.
         let mut harness = scripted_runs_harness_with_authority(
             ApprovalMode::Ask,
             vec![vec![
                 ("__test_mutate", "{}".to_owned()),
-                ("mcp__notes__write", "{}".to_owned()),
+                ("__test_shell", r#"{"command":"touch note"}"#.to_owned()),
             ]],
             Some(authority),
         )
@@ -23400,7 +23411,7 @@ mod tests {
             second.id,
             ApprovalDecision::ApproveForWorkspace {
                 grant: ApprovalGrant::Tool {
-                    name: "mcp__notes__write".to_owned(),
+                    name: "__test_shell".to_owned(),
                 },
             },
         )
@@ -23418,7 +23429,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), entries.recv())
                 .await
                 .unwrap(),
-            Some(ApprovalGrant::Tool { name }) if name == "mcp__notes__write"
+            Some(ApprovalGrant::Tool { name }) if name == "__test_shell"
         ));
         release.add_permits(1);
         collect_through_finished(&mut harness.events).await;
@@ -24783,8 +24794,9 @@ mod tests {
             call_ordinal: 1,
             provider_call_id: "call_0".to_owned(),
             name: "__test_mutate".to_owned(),
+            effect: crate::catalog::EffectClass::Mutating,
             arguments: "{}".to_owned(),
-            argument_error: None,
+            rejection: None,
         };
         store
             .persist_model_turn(

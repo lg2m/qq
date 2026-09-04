@@ -511,6 +511,20 @@ impl ServerHandle {
         tool: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> McpCallOutcome {
+        if self.shut_down.load(Ordering::Acquire) {
+            return McpCallOutcome::error(
+                "the MCP manager has been shut down",
+                McpCallFailure::ShutDown,
+            );
+        }
+        // Connect before taking a call permit. The permit bounds concurrent
+        // in-flight calls on one server; it must not be held across the
+        // state mutex, reconnect backoff, or the connect timeout, or a single
+        // slow connect would stall every caller behind it.
+        let client = match self.client().await {
+            Ok(client) => client,
+            Err(error) => return McpCallOutcome::error(error, McpCallFailure::Unavailable),
+        };
         let Ok(_permit) = self.permits.acquire().await else {
             return McpCallOutcome::error(
                 "MCP server executor is unavailable",
@@ -523,10 +537,6 @@ impl ServerHandle {
                 McpCallFailure::ShutDown,
             );
         }
-        let client = match self.client().await {
-            Ok(client) => client,
-            Err(error) => return McpCallOutcome::error(error, McpCallFailure::Unavailable),
-        };
         let mut params = CallToolRequestParams::new(tool.to_owned());
         params.arguments = arguments;
         match client.call_tool(params).await {

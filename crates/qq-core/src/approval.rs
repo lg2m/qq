@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use qq_protocol::{ApprovalMode, EditPreview, ToolCallDisplay};
 use serde::Deserialize;
 
+use crate::catalog::EffectClass;
+
 pub(crate) const POLICY_DENIED_RESULT: &str =
     "This session's approval mode is read-only; the tool call was denied without prompting.";
 pub(crate) const USER_DENIED_RESULT: &str = "The user denied this tool call.";
@@ -13,6 +15,9 @@ pub(crate) const REVIEWER_DENIED_RESULT: &str =
     "The approval reviewer denied this tool call for the supervised sub-agent:";
 
 /// How one requested tool call relates to the workspace and the outside world.
+/// Derived from the catalog's [`EffectClass`], refined by arguments only for
+/// the shell command and the `spawn_agent` authority. A name the catalog does
+/// not hold never reaches classification: dispatch rejects it first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolClass {
     ReadOnly,
@@ -21,10 +26,9 @@ pub(crate) enum ToolClass {
         command: String,
         cwd: Option<String>,
     },
-    Mcp,
-    /// Names no policy rule recognizes execute directly so the dispatcher can
-    /// return its precise unknown-tool error to the model.
-    Unknown,
+    /// An MCP or embedded-host tool. Host hints never grant authority, so
+    /// every external call is gated like a mutation.
+    External,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,9 +55,7 @@ impl SessionGrants {
                 .shell_prefixes
                 .iter()
                 .any(|prefix| shell_prefix_matches(prefix, command)),
-            ToolClass::ReadOnly | ToolClass::Mutating | ToolClass::Mcp | ToolClass::Unknown => {
-                false
-            }
+            ToolClass::ReadOnly | ToolClass::Mutating | ToolClass::External => false,
         }
     }
 }
@@ -156,26 +158,17 @@ fn dangerous_shell_segment(segment: &str) -> bool {
     }
 }
 
-pub(crate) fn classify(name: &str, arguments: &str) -> ToolClass {
-    match name {
-        "read_file" | "list_dir" | "search" | crate::runtime::SEARCH_HISTORY_TOOL => {
-            ToolClass::ReadOnly
-        }
-        // A read child carries no mutation authority and never needs a
-        // prompt. Asking for a write child is itself a mutating act under the
-        // parent's policy: `Ask` prompts for the delegation, `ReadOnly`
-        // denies it, `Auto` and `Full` proceed.
-        crate::tools::SPAWN_AGENT_TOOL => spawn_class(arguments),
-        "edit_file" | "write_file" => ToolClass::Mutating,
-        "shell" => shell_class(arguments),
-        #[cfg(test)]
-        "__test_delay" => ToolClass::ReadOnly,
-        #[cfg(test)]
-        "__test_mutate" => ToolClass::Mutating,
-        #[cfg(test)]
-        "__test_shell" => shell_class(arguments),
-        _ if name.starts_with("mcp__") => ToolClass::Mcp,
-        _ => ToolClass::Unknown,
+/// Classifies one call from the effect the catalog recorded for its name.
+/// Arguments are consulted only where the effect alone is not the whole
+/// story: the shell command (for grants and the dangerous-shape check) and
+/// the `spawn_agent` authority (a write child is a mutating act).
+pub(crate) fn classify(effect: EffectClass, name: &str, arguments: &str) -> ToolClass {
+    match effect {
+        EffectClass::ReadOnly if name == crate::tools::SPAWN_AGENT_TOOL => spawn_class(arguments),
+        EffectClass::ReadOnly => ToolClass::ReadOnly,
+        EffectClass::Mutating => ToolClass::Mutating,
+        EffectClass::Shell => shell_class(arguments),
+        EffectClass::External => ToolClass::External,
     }
 }
 
@@ -271,6 +264,10 @@ fn spawn_class(arguments: &str) -> ToolClass {
         #[serde(default)]
         authority: qq_protocol::ChildAuthority,
     }
+    // A read child carries no mutation authority and never needs a prompt.
+    // Asking for a write child is itself a mutating act under the parent's
+    // policy: `Ask` prompts for the delegation, `ReadOnly` denies it, `Auto`
+    // and `Full` proceed.
     match serde_json::from_str::<SpawnArguments>(arguments) {
         Ok(SpawnArguments {
             authority: qq_protocol::ChildAuthority::Write,
@@ -369,8 +366,8 @@ pub(crate) fn evaluate(
     grants: &SessionGrants,
 ) -> PolicyDecision {
     match class {
-        ToolClass::ReadOnly | ToolClass::Unknown => PolicyDecision::Execute,
-        ToolClass::Mutating | ToolClass::Shell { .. } | ToolClass::Mcp => match mode {
+        ToolClass::ReadOnly => PolicyDecision::Execute,
+        ToolClass::Mutating | ToolClass::Shell { .. } | ToolClass::External => match mode {
             ApprovalMode::ReadOnly => PolicyDecision::Deny,
             // Supervised holds everything, grants included: the whole point is
             // that a reviewer sees every action a write child takes.
@@ -383,7 +380,7 @@ pub(crate) fn evaluate(
                 }
             }
             ApprovalMode::Auto => match class {
-                // Auto trusts workspace-bounded edits and MCP tools, and
+                // Auto trusts workspace-bounded edits and external tools, and
                 // shell commands that carry no dangerous pattern. Only
                 // destructive or externally visible shell commands prompt.
                 ToolClass::Shell { command, .. } => {
@@ -432,10 +429,6 @@ mod tests {
                 evaluate(mode, "read_file", &ToolClass::ReadOnly, &grants(&[], &[])),
                 PolicyDecision::Execute
             );
-            assert_eq!(
-                evaluate(mode, "no_such_tool", &ToolClass::Unknown, &grants(&[], &[])),
-                PolicyDecision::Execute
-            );
         }
     }
 
@@ -445,7 +438,7 @@ mod tests {
             ("write_file", ToolClass::Mutating),
             ("shell", shell("cargo test")),
             ("shell", shell("rm -rf /")),
-            ("mcp__server__tool", ToolClass::Mcp),
+            ("mcp__server__tool", ToolClass::External),
         ] {
             assert_eq!(
                 evaluate(
@@ -474,7 +467,7 @@ mod tests {
         for (name, class) in [
             ("write_file", ToolClass::Mutating),
             ("shell", shell("cargo test")),
-            ("mcp__server__tool", ToolClass::Mcp),
+            ("mcp__server__tool", ToolClass::External),
         ] {
             assert_eq!(
                 evaluate(
@@ -494,7 +487,7 @@ mod tests {
         for (name, class) in [
             ("edit_file", ToolClass::Mutating),
             ("shell", shell("cargo test")),
-            ("mcp__server__tool", ToolClass::Mcp),
+            ("mcp__server__tool", ToolClass::External),
         ] {
             assert_eq!(
                 evaluate(ApprovalMode::Ask, name, &class, &grants(&[], &[])),
@@ -567,7 +560,7 @@ mod tests {
             evaluate(
                 ApprovalMode::Auto,
                 "mcp__server__tool",
-                &ToolClass::Mcp,
+                &ToolClass::External,
                 &grants(&[], &[]),
             ),
             PolicyDecision::Execute
@@ -580,7 +573,7 @@ mod tests {
             ToolClass::Mutating,
             shell("rm -rf /"),
             shell("sudo make install"),
-            ToolClass::Mcp,
+            ToolClass::External,
         ] {
             assert_eq!(
                 evaluate(ApprovalMode::Full, "shell", &class, &grants(&[], &[])),
@@ -741,28 +734,87 @@ mod tests {
     }
 
     #[test]
-    fn classification_reads_shell_arguments_and_namespaces() {
-        assert_eq!(classify("search", "{}"), ToolClass::ReadOnly);
-        assert_eq!(classify("spawn_agent", "{}"), ToolClass::ReadOnly);
+    fn classification_follows_the_catalog_effect_and_reads_refining_arguments() {
+        let read = EffectClass::ReadOnly;
+        assert_eq!(classify(read, "search", "{}"), ToolClass::ReadOnly);
+        assert_eq!(classify(read, "spawn_agent", "{}"), ToolClass::ReadOnly);
         assert_eq!(
-            classify("spawn_agent", r#"{"task":"t","authority":"read"}"#),
+            classify(read, "spawn_agent", r#"{"task":"t","authority":"read"}"#),
             ToolClass::ReadOnly
         );
         assert_eq!(
-            classify("spawn_agent", r#"{"task":"t","authority":"write"}"#),
+            classify(read, "spawn_agent", r#"{"task":"t","authority":"write"}"#),
             ToolClass::Mutating,
             "asking for a write child is a mutating act under the parent's policy"
         );
-        assert_eq!(classify("spawn_agent", "not json"), ToolClass::ReadOnly);
-        assert_eq!(classify("edit_file", "{}"), ToolClass::Mutating);
         assert_eq!(
-            classify("shell", r#"{"command":"cargo test","cwd":"crates"}"#),
+            classify(read, "spawn_agent", "not json"),
+            ToolClass::ReadOnly
+        );
+        assert_eq!(
+            classify(EffectClass::Mutating, "edit_file", "{}"),
+            ToolClass::Mutating
+        );
+        assert_eq!(
+            classify(
+                EffectClass::Shell,
+                "shell",
+                r#"{"command":"cargo test","cwd":"crates"}"#
+            ),
             ToolClass::Shell {
                 command: "cargo test".to_owned(),
                 cwd: Some("crates".to_owned()),
             }
         );
-        assert_eq!(classify("mcp__github__create_issue", "{}"), ToolClass::Mcp);
-        assert_eq!(classify("mystery", "{}"), ToolClass::Unknown);
+        // Every external tool is gated by its effect, whatever its prefix.
+        assert_eq!(
+            classify(EffectClass::External, "mcp__github__create_issue", "{}"),
+            ToolClass::External
+        );
+        assert_eq!(
+            classify(EffectClass::External, "ext__embedded__deploy", "{}"),
+            ToolClass::External
+        );
+        // The effect, not the name, decides: a read-only-named tool that the
+        // catalog recorded as mutating is mutating.
+        assert_eq!(
+            classify(EffectClass::Mutating, "read_file", "{}"),
+            ToolClass::Mutating
+        );
+    }
+
+    #[test]
+    fn external_tools_obey_every_approval_mode() {
+        let class = ToolClass::External;
+        let name = "ext__embedded__deploy";
+        assert_eq!(
+            evaluate(ApprovalMode::ReadOnly, name, &class, &grants(&[name], &[])),
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            evaluate(ApprovalMode::Ask, name, &class, &grants(&[], &[])),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            evaluate(ApprovalMode::Ask, name, &class, &grants(&[name], &[])),
+            PolicyDecision::Execute
+        );
+        assert_eq!(
+            evaluate(
+                ApprovalMode::Supervised,
+                name,
+                &class,
+                &grants(&[name], &[])
+            ),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            evaluate(ApprovalMode::Auto, name, &class, &grants(&[], &[])),
+            PolicyDecision::Execute
+        );
+        assert_eq!(
+            evaluate(ApprovalMode::Full, name, &class, &grants(&[], &[])),
+            PolicyDecision::Execute
+        );
     }
 }

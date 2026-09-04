@@ -501,18 +501,7 @@ impl CompiledAgentPlan {
             SkillIndex::compile_blocking(&opened, &pack_roots, &skill_roots);
         sources.extend(skill_sources);
 
-        let mut static_tools: Vec<StaticTool> = tools::specs()
-            .into_iter()
-            .map(|spec| StaticTool {
-                effect: match spec.name() {
-                    "edit_file" | "write_file" => EffectClass::Mutating,
-                    "shell" => EffectClass::Shell,
-                    _ => EffectClass::ReadOnly,
-                },
-                spec,
-                host: ToolHost::BuiltIn,
-            })
-            .collect();
+        let mut static_tools: Vec<StaticTool> = tools::static_tools();
         let spawn_spec = tools::spawn_agent_spec(&runtime.spawn_model_routes, &runtime.delegation);
         // Only roster-bearing declarations are bounded: the legacy flat route
         // enum may legitimately list every authenticated model.
