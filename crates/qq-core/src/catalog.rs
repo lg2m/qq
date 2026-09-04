@@ -470,7 +470,8 @@ impl ToolCatalog {
     /// plus every external tool under full exposure.
     pub(crate) fn base_specs(&self, include: &StaticFilter) -> Arc<[ToolSpec]> {
         let source = self.full_specs.as_ref().unwrap_or(&self.static_specs);
-        if include.spawn_agent && include.search_history && include.load_skill {
+        if include.spawn_agent && include.search_history && include.load_skill && !include.read_only
+        {
             return Arc::clone(source);
         }
         source
@@ -479,6 +480,20 @@ impl ToolCatalog {
                 let Some(entry) = self.lookup(spec.name()) else {
                     return true;
                 };
+                // A read-only run never receives a schema its policy would
+                // deny: the model cannot waste a turn on a call that is
+                // certain to be refused. Read-only externals stay because
+                // their hosts declared them non-mutating; policy still gates
+                // them by name at dispatch.
+                if include.read_only
+                    && match entry.effect {
+                        EffectClass::Mutating | EffectClass::Shell => true,
+                        EffectClass::External => !entry.hints.read_only,
+                        EffectClass::ReadOnly => false,
+                    }
+                {
+                    return false;
+                }
                 match entry.host {
                     ToolHost::SpawnAgent => include.spawn_agent,
                     ToolHost::SearchHistory => include.search_history,
@@ -546,6 +561,9 @@ pub(crate) struct StaticFilter {
     pub(crate) spawn_agent: bool,
     pub(crate) search_history: bool,
     pub(crate) load_skill: bool,
+    /// The run's policy denies every mutating, shell, and non-read external
+    /// call, so those schemas are withheld rather than offered and refused.
+    pub(crate) read_only: bool,
 }
 
 /// The external tools one run has pinned under progressive exposure.
@@ -727,6 +745,7 @@ mod tests {
             spawn_agent: true,
             search_history: true,
             load_skill: true,
+            read_only: false,
         });
         let names: Vec<&str> = base.iter().map(ToolSpec::name).collect();
         assert_eq!(names, ["read_file", "mcp__srv__ping"]);
@@ -814,6 +833,7 @@ mod tests {
             spawn_agent: true,
             search_history: true,
             load_skill: true,
+            read_only: false,
         });
         let names: Vec<&str> = base.iter().map(ToolSpec::name).collect();
         assert_eq!(names, ["read_file", SELECT_TOOLS_TOOL]);
@@ -884,18 +904,74 @@ mod tests {
             spawn_agent: false,
             search_history: true,
             load_skill: true,
+            read_only: false,
         });
         assert!(without.iter().all(|spec| spec.name() != "spawn_agent"));
         let with = catalog.base_specs(&StaticFilter {
             spawn_agent: true,
             search_history: true,
             load_skill: true,
+            read_only: false,
         });
         assert!(with.iter().any(|spec| spec.name() == "spawn_agent"));
         assert!(
             with.iter().all(|spec| spec.name() != SELECT_TOOLS_TOOL),
             "no externals, no selector"
         );
+    }
+
+    #[test]
+    fn read_only_runs_are_never_offered_schemas_their_policy_denies() {
+        let mut tools = statics();
+        tools.extend([
+            StaticTool {
+                spec: ToolSpec::new("edit_file", "", json!({"type": "object"})),
+                host: ToolHost::BuiltIn,
+                effect: EffectClass::Mutating,
+            },
+            StaticTool {
+                spec: ToolSpec::new("shell", "", json!({"type": "object"})),
+                host: ToolHost::BuiltIn,
+                effect: EffectClass::Shell,
+            },
+        ]);
+        let mut reader = external("mcp__srv__lookup", "Look it up");
+        reader.hints.read_only = true;
+        let catalog = ToolCatalog::compile(
+            tools,
+            vec![host(
+                "srv",
+                vec![reader, external("mcp__srv__deploy", "Deploy it")],
+            )],
+        );
+        let everything = catalog.base_specs(&StaticFilter {
+            spawn_agent: true,
+            search_history: true,
+            load_skill: true,
+            read_only: false,
+        });
+        let names: Vec<&str> = everything.iter().map(ToolSpec::name).collect();
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "edit_file",
+                "shell",
+                "mcp__srv__lookup",
+                "mcp__srv__deploy"
+            ]
+        );
+        let read_only = catalog.base_specs(&StaticFilter {
+            spawn_agent: true,
+            search_history: true,
+            load_skill: true,
+            read_only: true,
+        });
+        let names: Vec<&str> = read_only.iter().map(ToolSpec::name).collect();
+        // Mutating and shell built-ins go; externals stay only when their
+        // host declared them read-only. The digest is unchanged: filtering is
+        // per request, the compiled catalog is the same.
+        assert_eq!(names, ["read_file", "mcp__srv__lookup"]);
     }
 }
 

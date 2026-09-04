@@ -1106,30 +1106,46 @@ impl Store {
     /// spawn futures awaiting their child run.
     /// A settled run's outcome and estimated cost. The cost is `None` until
     /// the run settles and stays `None` when spend was unmeasurable.
+    /// A settled run's outcome with the spend it is accountable for. Usage
+    /// and cost are `None` when unknown, never zero.
     pub(super) async fn run_outcome(
         &self,
         run_id: RunId,
-    ) -> Result<Option<(RunOutcome, Option<u64>)>, SessionRuntimeError> {
+    ) -> Result<Option<(RunOutcome, SpawnAgentSpend)>, SessionRuntimeError> {
         self.call(Priority::Control, move |connection| {
-            let (outcome, cost) = connection
+            let (outcome, usage, cost) = connection
                 .query_row(
-                    "SELECT outcome_json, estimated_cost_usd_nanos FROM runs WHERE id = ?1",
+                    "SELECT outcome_json, usage_json, estimated_cost_usd_nanos FROM runs WHERE id = ?1",
                     [run_id.to_string()],
                     |row| {
                         Ok((
                             row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<u64>>(1)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<u64>>(2)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|_| SessionRuntimeError::Persistence)?
                 .ok_or(SessionRuntimeError::RunNotFound)?;
+            let usage = usage
+                .as_deref()
+                .map(serde_json::from_str::<TokenUsage>)
+                .transpose()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
             outcome
                 .as_deref()
                 .map(|encoded| {
                     serde_json::from_str(encoded)
-                        .map(|outcome| (outcome, cost))
+                        .map(|outcome| {
+                            (
+                                outcome,
+                                SpawnAgentSpend {
+                                    cost_usd_nanos: cost,
+                                    usage,
+                                },
+                            )
+                        })
                         .map_err(|_| SessionRuntimeError::Persistence)
                 })
                 .transpose()

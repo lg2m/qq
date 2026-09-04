@@ -36,8 +36,8 @@ use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     GateDecision, PreparedRequestWeight, PreparedStaticPrefix, RunCapabilities, Runtime,
-    RuntimeEvent, RuntimeToolCall, SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner, ToolGate,
-    ToolGateFuture, approval,
+    RuntimeEvent, RuntimeToolCall, SpawnAgentFuture, SpawnAgentOutcome, SpawnAgentSpend,
+    SpawnRequest, SubagentSpawner, ToolGate, ToolGateFuture, approval,
     runtime::{HistoryMatch, HistorySearchFuture, HistorySearcher, excerpt_around},
     workspace::{FileState, FileStateUpdate},
 };
@@ -331,6 +331,9 @@ struct ClaimedRun {
     /// Caller-imposed budgets persisted with the run row. Compaction runs and
     /// historical rows carry the empty set.
     limits: RunLimits,
+    /// The session's policy at claim time. Only shapes the offered tool
+    /// list; the gate re-reads the live mode for every held call.
+    approval_mode: ApprovalMode,
     /// Structured input of the prompt that created this run. Resolved (files
     /// read) when the run starts; empty for compaction and historical runs,
     /// whose message text is already final.
@@ -363,6 +366,7 @@ impl ClaimedRun {
             limits: RunLimits::default(),
             input: Vec::new(),
             profile: self.profile.clone(),
+            approval_mode: self.approval_mode,
         }
     }
 }
@@ -1602,6 +1606,20 @@ fn execute_command(
         }
         SessionCommand::SetApprovalMode { session_id, mode } => {
             let workspace_id = session_workspace(&transaction, session_id)?;
+            // A model-spawned child holds exactly the authority its parent
+            // granted at spawn time. A client may lower it further but never
+            // raise it: the parent's policy, not the client's, bounds what a
+            // child can do to the workspace.
+            let (owned, current): (bool, String) = transaction
+                .query_row(
+                    "SELECT owner_run_id IS NOT NULL, approval_mode FROM sessions WHERE id = ?1",
+                    [session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            if owned && approval_rank(mode) > approval_rank(parse_approval_mode(&current)?) {
+                return Err(SessionRuntimeError::ChildAuthorityEscalation);
+            }
             transaction
                 .execute(
                     "UPDATE sessions SET approval_mode = ?2, updated_at_ms = ?3 WHERE id = ?1",
@@ -2022,7 +2040,7 @@ fn reserve_next_run_recoverable(
                     (SELECT c.request_json FROM commands c WHERE c.id = r.command_id),
                     s.pending_context_overflow_basis_json,
                     s.context_tokens, s.context_occupancy_json, r.limits_json,
-                    r.input_json, s.profile
+                    r.input_json, s.profile, s.approval_mode
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
@@ -2057,6 +2075,7 @@ fn reserve_next_run_recoverable(
                     row.get::<_, Option<String>>(15)?,
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
+                    row.get::<_, String>(18)?,
                 ))
             },
         )
@@ -2081,6 +2100,7 @@ fn reserve_next_run_recoverable(
         limits_json,
         input_json,
         profile,
+        approval_mode,
     )) = row
     else {
         return Ok(None);
@@ -2088,6 +2108,7 @@ fn reserve_next_run_recoverable(
     let limits = parse_run_limits(limits_json.as_deref())?;
     let input = parse_input_parts(input_json.as_deref())?;
     let profile = parse_profile(profile.as_deref())?;
+    let approval_mode = parse_approval_mode(&approval_mode)?;
     let run_id: RunId = parse_id(&run)?;
     let session_id: SessionId = parse_id(&session)?;
     let command_id: CommandId = parse_id(&command)?;
@@ -2236,6 +2257,7 @@ fn reserve_next_run_recoverable(
         limits,
         input,
         profile,
+        approval_mode,
     }))
 }
 
@@ -2469,6 +2491,7 @@ fn start_auto_compaction(
             limits: RunLimits::default(),
             input: Vec::new(),
             profile: original.profile.clone(),
+            approval_mode: original.approval_mode,
         },
         started,
     )))
@@ -4706,6 +4729,7 @@ fn settle_panicked_execution(
                 limits: RunLimits::default(),
                 input: Vec::new(),
                 profile: original.profile.clone(),
+                approval_mode: original.approval_mode,
             };
             events.push(complete_run_in_transaction(
                 &transaction,
@@ -5062,6 +5086,7 @@ fn recover_interrupted_runs(
             limits: RunLimits::default(),
             input: Vec::new(),
             profile: AgentProfileId::default(),
+            approval_mode: ApprovalMode::default(),
         };
         let event =
             complete_run_in_transaction(&transaction, store_id, &claimed, RunOutcome::Interrupted)?;
@@ -5546,19 +5571,29 @@ fn load_session_accounting(
     connection: &Connection,
     session_id: SessionId,
 ) -> Result<SessionAccounting, SessionRuntimeError> {
+    // Inclusive totals are the bounded subtree, computed from run rows every
+    // time: never a sum of cached child inclusives, which could double count
+    // or go stale. The depth bound is the runtime's, so a store touched by a
+    // deeper future build still reads back the same tree this build runs.
     let mut statement = connection
         .prepare(
-            "SELECT r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos,
+            "WITH RECURSIVE subtree(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT child.id, subtree.depth + 1
+                 FROM sessions child JOIN subtree ON child.parent_id = subtree.id
+                 WHERE subtree.depth < ?2
+             )
+             SELECT r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos,
                     EXISTS(SELECT 1 FROM model_turns turn WHERE turn.run_id = r.id),
                     r.started_at_ms
              FROM runs r
-             JOIN sessions owner ON owner.id = r.session_id
-             WHERE owner.id = ?1 OR owner.parent_id = ?1
+             JOIN subtree ON subtree.id = r.session_id
              ORDER BY r.rowid",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let rows = statement
-        .query_map([session_id.to_string()], |row| {
+        .query_map(params![session_id.to_string(), MAX_CHILD_DEPTH], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -6941,6 +6976,17 @@ fn parse_approval_mode(value: &str) -> Result<ApprovalMode, SessionRuntimeError>
         "auto" => Ok(ApprovalMode::Auto),
         "full" => Ok(ApprovalMode::Full),
         _ => Err(SessionRuntimeError::Persistence),
+    }
+}
+
+/// Authority order of approval modes: a higher rank executes strictly more
+/// without a human than a lower one.
+const fn approval_rank(mode: ApprovalMode) -> u8 {
+    match mode {
+        ApprovalMode::ReadOnly => 0,
+        ApprovalMode::Ask => 1,
+        ApprovalMode::Auto => 2,
+        ApprovalMode::Full => 3,
     }
 }
 
@@ -13506,6 +13552,7 @@ mod tests {
             limits: RunLimits::default(),
             input: Vec::new(),
             profile: AgentProfileId::default(),
+            approval_mode: ApprovalMode::default(),
         };
         (
             directory,
@@ -25202,7 +25249,7 @@ mod tests {
             finished_outcome(&follow_up_events, follow_up),
             Some(RunOutcome::Completed)
         ));
-        let child_reqs = child_requests.lock().unwrap();
+        let child_reqs = child_requests.lock().unwrap().clone();
         assert!(
             !child_reqs[0]
                 .tools()
@@ -25210,6 +25257,20 @@ mod tests {
                 .any(|spec| spec.name() == "spawn_agent"),
             "child sessions must not have spawn_agent declared"
         );
+        // A read-only child is never offered the schemas its policy would
+        // deny; the denial below covers a model that guesses the name anyway.
+        let child_tools: Vec<&str> = child_reqs[0]
+            .tools()
+            .iter()
+            .map(qq_provider::ToolSpec::name)
+            .collect();
+        assert!(
+            !child_tools
+                .iter()
+                .any(|name| matches!(*name, "edit_file" | "write_file" | "shell")),
+            "read-only child was offered mutating schemas: {child_tools:?}"
+        );
+        assert!(child_tools.contains(&"read_file"));
         assert_eq!(
             child_reqs[0].messages(),
             [Message::user("/review Survey the widget inventory")]
@@ -25241,7 +25302,7 @@ mod tests {
             "child sessions remain depth-capped after a user follow-up"
         );
         drop(child_reqs);
-        let parent_reqs = parent_requests.lock().unwrap();
+        let parent_reqs = parent_requests.lock().unwrap().clone();
         assert!(
             parent_reqs[0]
                 .tools()
@@ -25257,6 +25318,60 @@ mod tests {
             finished_outcome(&observed, run_id),
             Some(RunOutcome::Completed)
         ));
+
+        // A client cannot raise the child above what its parent granted; the
+        // refusal is typed and leaves the row untouched. Lowering (a no-op
+        // here) and root sessions remain free to change.
+        let escalate = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SetApprovalMode {
+                    session_id: child_session.id,
+                    mode: ApprovalMode::Auto,
+                },
+            )
+            .await;
+        assert!(matches!(
+            escalate,
+            Err(SessionRuntimeError::ChildAuthorityEscalation)
+        ));
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest::new(
+                harness.workspace_id,
+                Some(child_session.id),
+                8,
+                8,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.focused.unwrap().summary.approval_mode,
+            ApprovalMode::ReadOnly
+        );
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SetApprovalMode {
+                    session_id: child_session.id,
+                    mode: ApprovalMode::ReadOnly,
+                },
+            )
+            .await
+            .expect("same authority is accepted");
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SetApprovalMode {
+                    session_id: harness.session_id,
+                    mode: ApprovalMode::Full,
+                },
+            )
+            .await
+            .expect("root sessions are unaffected");
     }
 
     #[tokio::test]
@@ -26662,18 +26777,22 @@ mod tests {
             limits: RunLimits::default(),
             input: Vec::new(),
             profile: AgentProfileId::default(),
+            approval_mode: ApprovalMode::default(),
         };
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),
             parent,
-            ToolCallId::from_bytes([0x5a; 16]),
             subagents::SpawnBudget {
                 slots: Arc::new(Semaphore::new(1)),
                 spawned: Arc::new(AtomicUsize::new(0)),
                 max_children: usize::from(MAX_SPAWNED_CHILDREN_PER_RUN),
             },
-            "research".to_owned(),
-            None,
+            SpawnRequest {
+                call_id: ToolCallId::from_bytes([0x5a; 16]),
+                task: "research".to_owned(),
+                model: None,
+                limits: RunLimits::default(),
+            },
         ));
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
             .await

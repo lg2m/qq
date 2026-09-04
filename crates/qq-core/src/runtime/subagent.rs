@@ -1,6 +1,38 @@
 use std::{future::Future, pin::Pin};
 
-use qq_protocol::ToolCallId;
+use qq_protocol::{RunLimits, TokenUsage, ToolCallId};
+
+/// The spend one spawned sub-agent reports back to its parent. Every field is
+/// `None` when unknown, never zero: the parent's meter turns an unknown into
+/// the matching `*_unknown` exhaustion rather than a silent pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpawnAgentSpend {
+    /// The child run's estimated cost, charged against the parent's cost
+    /// budget.
+    pub(crate) cost_usd_nanos: Option<u64>,
+    /// The child run's total token usage, charged against the parent's token
+    /// budgets exactly like the parent's own turns.
+    pub(crate) usage: Option<TokenUsage>,
+}
+
+impl SpawnAgentSpend {
+    /// A child that never ran spent nothing.
+    pub(crate) const NONE: Self = Self {
+        cost_usd_nanos: Some(0),
+        usage: Some(TokenUsage {
+            input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+        }),
+    };
+
+    /// A child whose spend could not be read.
+    pub(crate) const UNKNOWN: Self = Self {
+        cost_usd_nanos: None,
+        usage: None,
+    };
+}
 
 /// The outcome one spawned sub-agent call returns to its parent. The content
 /// flows through the same bounded-result truncation as built-in tools.
@@ -8,9 +40,20 @@ use qq_protocol::ToolCallId;
 pub(crate) struct SpawnAgentOutcome {
     pub(crate) content: String,
     pub(crate) is_error: bool,
-    /// The child run's estimated spend, charged against the parent's cost
-    /// budget. `None` means unknown, never zero.
-    pub(crate) cost_usd_nanos: Option<u64>,
+    pub(crate) spend: SpawnAgentSpend,
+}
+
+/// One `spawn_agent` call as the run loop hands it to the spawner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnRequest {
+    /// The parent's `spawn_agent` tool call; the child records it so clients
+    /// can place the child under the call that created it.
+    pub(crate) call_id: ToolCallId,
+    pub(crate) task: String,
+    pub(crate) model: Option<String>,
+    /// The parent's remaining budget at spawn time. The child is admitted
+    /// with these bounds, never with the parent's original caps.
+    pub(crate) limits: RunLimits,
 }
 
 pub(crate) type SpawnAgentFuture =
@@ -22,9 +65,7 @@ pub(crate) type SpawnAgentFuture =
 /// nor dispatchable there. Dropping the returned future must cancel the
 /// in-flight child work.
 pub(crate) trait SubagentSpawner: Send + Sync {
-    /// `call_id` is the parent's `spawn_agent` tool call; the child records it
-    /// so clients can place the child under the call that created it.
-    fn spawn(&self, call_id: ToolCallId, task: String, model: Option<String>) -> SpawnAgentFuture;
+    fn spawn(&self, request: SpawnRequest) -> SpawnAgentFuture;
 }
 
 /// The dispatcher's defensive answer when `spawn_agent` is called by a run

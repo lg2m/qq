@@ -119,13 +119,97 @@ impl BudgetMeter {
             .saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
     }
 
-    /// Charges sub-agent spend that the parent run is accountable for. An
-    /// unknown child cost makes the parent's cost unknown too.
-    pub(crate) fn charge_child(&mut self, cost_usd_nanos: Option<u64>) {
+    /// Charges sub-agent spend that the parent run is accountable for. Tokens
+    /// roll up under the parent's token bounds exactly like its own turns;
+    /// an unknown child cost or usage makes the parent's aggregate unknown.
+    pub(crate) fn charge_child(&mut self, usage: Option<TokenUsage>, cost_usd_nanos: Option<u64>) {
         self.cost_usd_nanos = match (self.cost_usd_nanos, cost_usd_nanos) {
             (Some(total), Some(cost)) => total.checked_add(cost),
             _ => None,
         };
+        match usage {
+            Some(usage) => {
+                let input = usage
+                    .input_tokens
+                    .saturating_add(usage.cache_read_input_tokens)
+                    .saturating_add(usage.cache_write_input_tokens);
+                self.tokens = self.tokens.map(|total| {
+                    total
+                        .saturating_add(input)
+                        .saturating_add(usage.output_tokens)
+                });
+                self.input_tokens = self.input_tokens.map(|total| total.saturating_add(input));
+                self.output_tokens = self
+                    .output_tokens
+                    .map(|total| total.saturating_add(usage.output_tokens));
+            }
+            None => {
+                self.tokens = None;
+                self.input_tokens = None;
+                self.output_tokens = None;
+            }
+        }
+    }
+
+    /// The budget a child spawned now may be given: every imposed cost,
+    /// wall-clock, and token bound reduced by what this run has already
+    /// spent. Turn, tool-call, byte, and child counts are per-run and are not
+    /// inherited. A bound whose remainder is zero, or whose spend is unknown,
+    /// refuses the child by naming that family: a parent that cannot afford
+    /// more work must not hand a fresh cap to a child.
+    pub(crate) fn remaining(&self, now: Instant) -> Result<RunLimits, BudgetLimitKind> {
+        let limits = &self.limits;
+        let max_duration_ms = match self.deadline() {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(now);
+                if left.is_zero() {
+                    return Err(BudgetLimitKind::Duration);
+                }
+                Some(u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1))
+            }
+            None => None,
+        };
+        let max_cost_usd_nanos = match limits.max_cost_usd_nanos {
+            Some(limit) => match self.cost_usd_nanos {
+                Some(spent) if spent < limit => Some(limit - spent),
+                Some(_) => return Err(BudgetLimitKind::Cost),
+                None => return Err(BudgetLimitKind::CostUnknown),
+            },
+            None => None,
+        };
+        let remaining_tokens =
+            |limit: Option<u64>, spent: Option<u64>, kind: BudgetLimitKind| match limit {
+                Some(limit) => match spent {
+                    Some(spent) if spent < limit => Ok(Some(limit - spent)),
+                    Some(_) => Err(kind),
+                    None => Err(BudgetLimitKind::TokensUnknown),
+                },
+                None => Ok(None),
+            };
+        Ok(RunLimits {
+            max_duration_ms,
+            max_model_turns: None,
+            max_tool_calls: None,
+            max_total_tokens: remaining_tokens(
+                limits.max_total_tokens,
+                self.tokens,
+                BudgetLimitKind::TotalTokens,
+            )?,
+            max_cost_usd_nanos,
+            max_input_tokens: remaining_tokens(
+                limits.max_input_tokens,
+                self.input_tokens,
+                BudgetLimitKind::InputTokens,
+            )?,
+            max_output_tokens: remaining_tokens(
+                limits.max_output_tokens,
+                self.output_tokens,
+                BudgetLimitKind::OutputTokens,
+            )?,
+            max_tool_output_bytes: None,
+            max_children: None,
+            max_concurrent_children: None,
+        })
     }
 
     /// Whether a limit has already been exceeded by observed work, checked
@@ -443,7 +527,7 @@ mod tests {
         assert!(!exhaustion.final_response);
 
         let mut child = BudgetMeter::new(limits, Some(pricing()), now);
-        child.charge_child(None);
+        child.charge_child(Some(usage(1, 1)), None);
         assert_eq!(
             child.exceeded(now),
             Some(BudgetLimitKind::CostUnknown),
@@ -467,6 +551,102 @@ mod tests {
         let mut priceless = BudgetMeter::new(limits, None, now);
         priceless.charge_turn(Some(usage(1, 1)));
         assert_eq!(priceless.exceeded(now), None);
+    }
+
+    #[test]
+    fn child_usage_rolls_up_into_every_parent_token_bound() {
+        let now = Instant::now();
+        let limits = RunLimits {
+            max_total_tokens: Some(100),
+            max_input_tokens: Some(70),
+            max_output_tokens: Some(40),
+            ..RunLimits::default()
+        };
+        let mut meter = BudgetMeter::new(limits, None, now);
+        meter.charge_turn(Some(usage(20, 10)));
+        meter.charge_child(Some(usage(45, 10)), Some(0));
+        assert_eq!(meter.exceeded(now), None);
+        meter.charge_child(Some(usage(10, 0)), Some(0));
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::InputTokens));
+
+        let mut meter = BudgetMeter::new(limits, None, now);
+        meter.charge_child(Some(usage(0, 41)), Some(0));
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::OutputTokens));
+
+        // A child whose usage was lost makes the parent's tokens unknown, so
+        // a token bound fails closed exactly like a usage-less parent turn.
+        let mut meter = BudgetMeter::new(limits, None, now);
+        meter.charge_child(None, Some(0));
+        assert_eq!(meter.exceeded(now), Some(BudgetLimitKind::TokensUnknown));
+        // Without any token bound, lost child usage is not an exhaustion.
+        let mut unbounded = BudgetMeter::new(RunLimits::default(), None, now);
+        unbounded.charge_child(None, None);
+        assert_eq!(unbounded.exceeded(now), None);
+    }
+
+    #[test]
+    fn remaining_budget_is_the_unspent_part_of_each_inherited_bound() {
+        let now = Instant::now();
+        let limits = RunLimits {
+            max_duration_ms: Some(10_000),
+            max_model_turns: Some(8),
+            max_tool_calls: Some(50),
+            max_total_tokens: Some(1_000),
+            max_cost_usd_nanos: Some(4_000_000),
+            max_input_tokens: Some(600),
+            max_output_tokens: Some(400),
+            max_tool_output_bytes: Some(9_999),
+            max_children: Some(4),
+            max_concurrent_children: Some(2),
+        };
+        // 0% spent: the child receives the full inherited caps and none of
+        // the per-run ones.
+        let fresh = BudgetMeter::new(limits, Some(pricing()), now);
+        let remaining = fresh.remaining(now).unwrap();
+        assert_eq!(remaining.max_duration_ms, Some(10_000));
+        assert_eq!(remaining.max_total_tokens, Some(1_000));
+        assert_eq!(remaining.max_input_tokens, Some(600));
+        assert_eq!(remaining.max_output_tokens, Some(400));
+        assert_eq!(remaining.max_cost_usd_nanos, Some(4_000_000));
+        assert_eq!(remaining.max_model_turns, None);
+        assert_eq!(remaining.max_tool_calls, None);
+        assert_eq!(remaining.max_tool_output_bytes, None);
+        assert_eq!(remaining.max_children, None);
+        assert_eq!(remaining.max_concurrent_children, None);
+
+        // 50% spent: each bound is the difference, wall clock included.
+        let mut half = BudgetMeter::new(limits, Some(pricing()), now);
+        half.charge_turn(Some(usage(300, 200)));
+        let later = now + Duration::from_millis(5_000);
+        let remaining = half.remaining(later).unwrap();
+        assert_eq!(remaining.max_duration_ms, Some(5_000));
+        assert_eq!(remaining.max_total_tokens, Some(500));
+        assert_eq!(remaining.max_input_tokens, Some(300));
+        assert_eq!(remaining.max_output_tokens, Some(200));
+        // pricing(): 1_000 nanos per input token, 2_000 per output token.
+        let spent = 300 * 1_000 + 200 * 2_000;
+        assert_eq!(remaining.max_cost_usd_nanos, Some(4_000_000 - spent));
+
+        // 100% spent (or over): the exhausted family refuses the child.
+        let mut spent = BudgetMeter::new(limits, Some(pricing()), now);
+        spent.charge_turn(Some(usage(600, 0)));
+        assert_eq!(spent.remaining(now), Err(BudgetLimitKind::InputTokens));
+        let mut timed_out = BudgetMeter::new(limits, Some(pricing()), now);
+        timed_out.charge_turn(Some(usage(1, 1)));
+        assert_eq!(
+            timed_out.remaining(now + Duration::from_millis(10_000)),
+            Err(BudgetLimitKind::Duration)
+        );
+        let mut unknown = BudgetMeter::new(limits, Some(pricing()), now);
+        unknown.charge_turn(None);
+        assert!(matches!(
+            unknown.remaining(now),
+            Err(BudgetLimitKind::CostUnknown | BudgetLimitKind::TokensUnknown)
+        ));
+
+        // No inherited bounds at all: the child is unbounded too.
+        let free = BudgetMeter::new(RunLimits::default(), None, now);
+        assert_eq!(free.remaining(now), Ok(RunLimits::default()));
     }
     #[test]
     fn split_token_and_tool_output_bounds_settle_with_their_own_kinds() {

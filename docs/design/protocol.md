@@ -579,8 +579,12 @@ spans provider retries, tool execution, and sub-agent work. When the turn or
 tool-call budget is nearly spent, the runtime reserves the last permitted turn
 as a tool-free final status response. `max_cost_usd_nanos` requires the
 resolved model to carry pricing; otherwise the run fails with a
-`configuration` failure before any provider work. Sub-agents inherit the
-parent's wall clock and cost cap, and their spend is charged to the parent.
+`configuration` failure before any provider work. Sub-agents receive the
+parent's *remaining* wall clock, cost, and token bounds at spawn time (never
+the original caps, and never the parent's per-run turn, tool-call, byte, or
+child counts); a family the parent has already spent refuses the spawn as a
+tool error naming it. Their settled usage and cost are charged to the parent's
+meter, so every `*_tokens` and cost bound covers the whole subtree.
 
 Outcome on accept:
 

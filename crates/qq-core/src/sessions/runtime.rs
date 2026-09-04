@@ -879,6 +879,8 @@ pub enum SessionRuntimeError {
     ApprovalNotPending,
     #[error("approval grant is empty or exceeds the session limit")]
     InvalidApprovalGrant,
+    #[error("a spawned child session cannot be raised above the authority its parent granted")]
+    ChildAuthorityEscalation,
     #[error("session follow-up queue is full")]
     QueueFull,
     #[error("session context exceeds the size limit")]

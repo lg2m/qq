@@ -579,8 +579,12 @@ spent the last permitted turn becomes a tool-free final status response; an
 elapsed wall clock or a provider turn that omits usage under a cost cap settles
 immediately. Every bound produces the typed `budget_exhausted` outcome, never a
 provider failure, so the TUI, server, and headless adapter observe one
-contract. Sub-agents inherit the parent's wall clock and cost cap and charge
-their settled (or unknown) spend back to the parent's meter.
+contract. Sub-agents are admitted with the parent's remaining wall clock, cost,
+and token bounds (`BudgetMeter::remaining`), never its original caps, and
+charge their settled (or unknown) usage and cost back to the parent's meter.
+A read-only session is not offered the mutating, shell, or non-read external
+schemas its policy would deny, and a spawned child's approval mode can be
+lowered but never raised by a client command.
 
 A run may cross multiple bounded internal execution slices. The strict
 256-tool-call ceiling is a runaway-loop backstop for one slice, not a

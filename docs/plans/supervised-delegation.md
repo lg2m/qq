@@ -1,7 +1,7 @@
 # Supervised Delegation, Continuation, And Audit
 
-Status: proposed 2026-09-03. D1 implemented 2026-09-03 (`feat/d1-output-continuation`);
-D2–D6 not started. This plan is a companion to
+Status: proposed 2026-09-03. D1 and D2 implemented 2026-09-03; D3–D6 not
+started. This plan is a companion to
 [`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md)
 and requires the amendments listed in [Amendments](#amendments-to-existing-plans)
 before D4 or D5 may land.
@@ -241,10 +241,12 @@ Owner: `qq-core`, `qq-protocol`. Prerequisite for any depth above one.
   `None` where the parent has none. A child cannot be admitted with a zero or
   negative remainder; the spawn settles as a tool error naming the exhausted
   family.
-- `SpawnAgentOutcome` carries `usage: Option<TokenUsage>` and turn/tool-call
-  counts; `BudgetMeter::charge_child` charges tokens, turns, and tool calls as
-  the protocol documentation already claims. Unknown usage marks the parent's
-  aggregate unknown exactly as cost does today.
+- `SpawnAgentOutcome` carries `SpawnAgentSpend { usage, cost }`;
+  `BudgetMeter::charge_child` charges tokens and cost as the protocol
+  documentation already claims. Unknown usage marks the parent's aggregate
+  unknown exactly as cost does today. Turn and tool-call counts are not rolled
+  up: those bounds are per run by definition (the child is given none), so the
+  parent's counters stay its own.
 - Child catalogs are filtered by authority at plan compile, not by denial at
   the gate: a `read` child's catalog excludes `edit_file`, `write_file`,
   `shell`, and non-read MCP tools. Static-tool exclusion is recorded in the
@@ -466,7 +468,7 @@ gate beyond T1 showing no pass-rate loss.
 | --- | --- | --- |
 | D6a compare command, arm stamping, reasoning tokens | none | lands first so every task is measurable |
 | D1 continuation | none | done; protocol 16, schema 22 |
-| D2 accounting and authority repair | none | prerequisite for D4 depth |
+| D2 accounting and authority repair | none | done |
 | D3 roster | D2 | descriptor 4, prompt bump |
 | D4a supervised write children at depth one | D2, D3, amendments | reviewer widening |
 | D4b configurable depth to three | D4a | per-depth pools, descendant cap |

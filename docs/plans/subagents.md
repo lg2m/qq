@@ -16,6 +16,12 @@ model list before any durable child state is created. Child creation is also
 crash-safe: one transaction persists the initialized read-only session, queued
 run, prompt, and parent-run ownership, and recovery cancels an unclaimed child
 whose owning parent is interrupted.
+Accounting repair (`supervised-delegation.md` D2, 2026-09-03) is implemented:
+children are admitted with the parent's remaining cost, wall-clock, and token
+bounds rather than its original caps; child usage rolls up into every parent
+token bound; read-only children are not offered mutating schemas; a spawned
+child's approval mode cannot be raised by a client; and inclusive accounting
+is the bounded subtree (recursive CTE to `MAX_CHILD_DEPTH`).
 
 Main-session context is premium real estate: every byte of gathered
 evidence is re-sent on every later turn, crowds out reasoning, and ages

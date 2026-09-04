@@ -719,6 +719,23 @@ impl BudgetLimitKind {
         Self::TokensUnknown,
         Self::ToolOutputBytes,
     ];
+
+    /// The wire name of this kind, for messages that name a budget family.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Duration => "duration",
+            Self::ModelTurns => "model_turns",
+            Self::ToolCalls => "tool_calls",
+            Self::TotalTokens => "total_tokens",
+            Self::Cost => "cost",
+            Self::CostUnknown => "cost_unknown",
+            Self::InputTokens => "input_tokens",
+            Self::OutputTokens => "output_tokens",
+            Self::TokensUnknown => "tokens_unknown",
+            Self::ToolOutputBytes => "tool_output_bytes",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

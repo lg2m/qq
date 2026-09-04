@@ -205,6 +205,14 @@ async fn prepare_execution(
             };
             RunCapabilities::user(spawner)
         };
+        // A read-only session (every model-spawned child today) never sees the
+        // schemas its policy denies; the catalog filter is part of the
+        // request, not a gate-time refusal.
+        let base = if claimed.approval_mode == ApprovalMode::ReadOnly {
+            base.read_only()
+        } else {
+            base
+        };
         let (sender, receiver) = crate::runtime::steering_channel();
         // Steering recorded between claim and start (the run was already
         // `running` for admission purposes) is queued into the channel now

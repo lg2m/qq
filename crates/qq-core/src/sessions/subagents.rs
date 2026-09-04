@@ -40,7 +40,7 @@ impl SessionSubagentSpawner {
 }
 
 impl SubagentSpawner for SessionSubagentSpawner {
-    fn spawn(&self, call_id: ToolCallId, task: String, model: Option<String>) -> SpawnAgentFuture {
+    fn spawn(&self, request: SpawnRequest) -> SpawnAgentFuture {
         let inner = Arc::clone(&self.inner);
         let parent = self.parent.clone();
         let slots = Arc::clone(&self.slots);
@@ -49,7 +49,7 @@ impl SubagentSpawner for SessionSubagentSpawner {
             spawned: Arc::clone(&self.spawned),
             max_children: self.max_children,
         };
-        Box::pin(async move { spawn_child_run(inner, parent, call_id, budget, task, model).await })
+        Box::pin(async move { spawn_child_run(inner, parent, budget, request).await })
     }
 }
 
@@ -61,19 +61,16 @@ pub(super) struct SpawnBudget {
 }
 
 /// A child that never ran spent nothing. Failed children report their real
-/// spend through `spawn_error_with_cost` so the parent budget still sees it.
+/// spend through `spawn_error_with_spend` so the parent budget still sees it.
 fn spawn_error(content: impl Into<String>) -> SpawnAgentOutcome {
-    spawn_error_with_cost(content, Some(0))
+    spawn_error_with_spend(content, SpawnAgentSpend::NONE)
 }
 
-fn spawn_error_with_cost(
-    content: impl Into<String>,
-    cost_usd_nanos: Option<u64>,
-) -> SpawnAgentOutcome {
+fn spawn_error_with_spend(content: impl Into<String>, spend: SpawnAgentSpend) -> SpawnAgentOutcome {
     SpawnAgentOutcome {
         content: content.into(),
         is_error: true,
-        cost_usd_nanos,
+        spend,
     }
 }
 
@@ -83,16 +80,20 @@ fn spawn_error_with_cost(
 pub(super) async fn spawn_child_run(
     inner: Arc<SessionRuntimeInner>,
     parent: ClaimedRun,
-    call_id: ToolCallId,
     budget: SpawnBudget,
-    task: String,
-    model: Option<String>,
+    request: SpawnRequest,
 ) -> SpawnAgentOutcome {
     let SpawnBudget {
         slots,
         spawned,
         max_children,
     } = budget;
+    let SpawnRequest {
+        call_id,
+        task,
+        model,
+        limits: child_limits,
+    } = request;
     // The budget counts attempts, so a failing spawn also consumes it. A
     // refused spawn is a tool error the model can act on, never a terminal
     // outcome: ending the parent because it asked for one child too many
@@ -168,20 +169,6 @@ pub(super) async fn spawn_child_run(
     if *inner.shutdown.borrow() || *inner.failed.borrow() {
         return spawn_error("the session runtime is shutting down");
     }
-    // A child inherits the parent's cost cap and wall clock so an unmetered or
-    // runaway child settles itself instead of stalling the parent's budget.
-    let child_limits = RunLimits {
-        max_duration_ms: parent.limits.max_duration_ms,
-        max_model_turns: None,
-        max_tool_calls: None,
-        max_total_tokens: None,
-        max_cost_usd_nanos: parent.limits.max_cost_usd_nanos,
-        max_input_tokens: None,
-        max_output_tokens: None,
-        max_tool_output_bytes: None,
-        max_children: None,
-        max_concurrent_children: None,
-    };
     let created = match inner
         .store
         .create_child_run(&parent, call_id, selection, task, child_limits)
@@ -214,56 +201,58 @@ pub(super) async fn spawn_child_run(
     // Parent cancellation reaches the child by drop: the cancelled parent's
     // tool loop is dropped wholesale, dropping this future mid-await, and the
     // guard then cancels the still-running child run.
-    let (outcome, cost) = loop {
+    let (outcome, spend) = loop {
         match inner.store.run_outcome(run_id).await {
             Ok(Some(settled)) => break settled,
             Ok(None) => {}
             Err(error) => {
                 guard.disarm();
-                return spawn_error_with_cost(
+                return spawn_error_with_spend(
                     format!("the sub-agent outcome could not be read: {error}"),
-                    None,
+                    SpawnAgentSpend::UNKNOWN,
                 );
             }
         }
         if wakeup.changed().await.is_err() {
             guard.disarm();
-            return spawn_error_with_cost(
+            return spawn_error_with_spend(
                 "the session runtime shut down while the sub-agent was running",
-                None,
+                SpawnAgentSpend::UNKNOWN,
             );
         }
     };
     guard.disarm();
     // Every settled child charges its real spend to the parent, whatever
-    // its outcome; the parent's cost budget must see failed work too.
+    // its outcome; the parent's budgets must see failed work too.
     match outcome {
         RunOutcome::Completed => match inner.store.run_final_text(run_id).await {
             Ok(text) if text.trim().is_empty() => {
-                spawn_error_with_cost("the sub-agent completed without producing any text", cost)
+                spawn_error_with_spend("the sub-agent completed without producing any text", spend)
             }
             Ok(text) => SpawnAgentOutcome {
                 content: text,
                 is_error: false,
-                cost_usd_nanos: cost,
+                spend,
             },
-            Err(error) => spawn_error_with_cost(
+            Err(error) => spawn_error_with_spend(
                 format!("the sub-agent answer could not be read: {error}"),
-                cost,
+                spend,
             ),
         },
-        RunOutcome::Cancelled => spawn_error_with_cost("the sub-agent run was cancelled", cost),
-        RunOutcome::Interrupted => spawn_error_with_cost("the sub-agent run was interrupted", cost),
-        RunOutcome::BudgetExhausted { exhaustion } => spawn_error_with_cost(
+        RunOutcome::Cancelled => spawn_error_with_spend("the sub-agent run was cancelled", spend),
+        RunOutcome::Interrupted => {
+            spawn_error_with_spend("the sub-agent run was interrupted", spend)
+        }
+        RunOutcome::BudgetExhausted { exhaustion } => spawn_error_with_spend(
             format!(
                 "the sub-agent run exhausted its budget: {}",
                 exhaustion.message
             ),
-            cost,
+            spend,
         ),
-        RunOutcome::Failed { failure } => spawn_error_with_cost(
+        RunOutcome::Failed { failure } => spawn_error_with_spend(
             format!("the sub-agent run failed: {}", failure.message),
-            cost,
+            spend,
         ),
     }
 }

@@ -23,5 +23,6 @@ pub(crate) use retry::{attempts_message, is_transient_provider_failure};
 pub use steering::MAX_PENDING_STEERING;
 pub(crate) use steering::{SteeringMessage, SteeringReceiver, SteeringSender, steering_channel};
 pub(crate) use subagent::{
-    SPAWN_UNAVAILABLE_RESULT, SpawnAgentFuture, SpawnAgentOutcome, SubagentSpawner,
+    SPAWN_UNAVAILABLE_RESULT, SpawnAgentFuture, SpawnAgentOutcome, SpawnAgentSpend, SpawnRequest,
+    SubagentSpawner,
 };

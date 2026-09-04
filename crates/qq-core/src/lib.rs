@@ -41,9 +41,9 @@ use runtime::{
     AGENT_PROMPT_VERSION, BUDGET_FINAL_RESPONSE_NOTICE, BudgetDecision, BudgetMeter, GateDecision,
     HistorySearcher, PendingToolCall, PreparedRequestWeight, PreparedStaticPrefix, RuntimeEvent,
     RuntimeToolCall, SPAWN_UNAVAILABLE_RESULT, SearchHistoryArgs, SpawnAgentFuture,
-    SpawnAgentOutcome, SubagentSpawner, ToolGate, ToolGateFuture, TurnBlock, agent_system_prompt,
-    attempts_message, is_transient_provider_failure, render_history_matches,
-    tool_schema_measurement,
+    SpawnAgentOutcome, SpawnAgentSpend, SpawnRequest, SubagentSpawner, ToolGate, ToolGateFuture,
+    TurnBlock, agent_system_prompt, attempts_message, is_transient_provider_failure,
+    render_history_matches, tool_schema_measurement,
 };
 
 pub use approval::shell_prefix_matches;
@@ -263,6 +263,10 @@ pub(crate) struct RunCapabilities {
     allow_guidance: bool,
     slash_is_literal: bool,
     allow_tools: bool,
+    /// The session's policy is `ReadOnly`: mutating, shell, and non-read
+    /// external schemas are withheld from the request instead of offered and
+    /// denied. Policy still evaluates every call; this only saves the tokens.
+    read_only: bool,
     max_output_tokens: Option<u32>,
     /// Caller-imposed budgets and the pricing that makes the cost bound
     /// measurable. Admission rejects a cost cap without pricing before this
@@ -283,6 +287,7 @@ impl RunCapabilities {
             allow_guidance: true,
             slash_is_literal: false,
             allow_tools: true,
+            read_only: false,
             max_output_tokens: None,
             limits: RunLimits::default(),
             pricing: None,
@@ -301,6 +306,12 @@ impl RunCapabilities {
 
     pub(crate) fn without_tools(mut self) -> Self {
         self.allow_tools = false;
+        self
+    }
+
+    /// Withholds schemas the `ReadOnly` policy would deny anyway.
+    pub(crate) fn read_only(mut self) -> Self {
+        self.read_only = true;
         self
     }
 
@@ -331,6 +342,7 @@ impl RunCapabilities {
             allow_guidance: false,
             slash_is_literal: false,
             allow_tools: true,
+            read_only: false,
             max_output_tokens: None,
             limits: RunLimits {
                 max_duration_ms: None,
@@ -736,6 +748,7 @@ impl plan::CompiledAgentPlan {
                 allow_guidance,
                 slash_is_literal,
                 allow_tools,
+                read_only,
                 max_output_tokens,
                 limits,
                 pricing,
@@ -872,6 +885,7 @@ impl plan::CompiledAgentPlan {
                     spawn_agent: spawner.is_some(),
                     search_history: history.is_some(),
                     load_skill: allow_guidance,
+                    read_only,
                 })
             } else {
                 Arc::from([])
@@ -1718,6 +1732,10 @@ impl plan::CompiledAgentPlan {
                     .into_iter()
                     .filter(|call| results[usize::from(call.call_ordinal - 1)].is_none())
                     .collect::<Vec<_>>();
+                // Children admitted this turn receive the parent's remaining
+                // budget as of now. A family the parent cannot afford refuses
+                // the spawn as a tool error naming it; the parent keeps working.
+                let child_limits = budget.remaining(tokio::time::Instant::now());
 
                 let execute_one = |call: RuntimeToolCall,
                                    output: Option<
@@ -1739,8 +1757,8 @@ impl plan::CompiledAgentPlan {
                         || pins.names().contains(&call.name);
                     async move {
                         // `Some` when a sub-agent ran: its spend (or unknown
-                        // spend) is charged to the parent's cost budget.
-                        let mut child_cost: Option<Option<u64>> = None;
+                        // spend) is charged to the parent's budgets.
+                        let mut child_spend: Option<SpawnAgentSpend> = None;
                         let host = catalog.lookup(&call.name).map(|entry| entry.host);
                         let result = match call.argument_error.clone() {
                             Some(error) => tools::ToolExecutionResult {
@@ -1775,14 +1793,30 @@ impl plan::CompiledAgentPlan {
                                             // authenticated served model list
                                             // at spawn time, before any
                                             // durable child state exists.
-                                            let outcome = spawner
-                                                .spawn(call.id, arguments.task, arguments.model)
-                                                .await;
-                                            child_cost = Some(outcome.cost_usd_nanos);
-                                            tools::bounded_result(
-                                                outcome.content,
-                                                outcome.is_error,
-                                            )
+                                            match child_limits {
+                                                Err(kind) => tools::bounded_result(
+                                                    format!(
+                                                        "this run cannot afford a sub-agent: its {} budget is spent; continue with what you have",
+                                                        kind.as_str()
+                                                    ),
+                                                    true,
+                                                ),
+                                                Ok(limits) => {
+                                                    let outcome = spawner
+                                                        .spawn(SpawnRequest {
+                                                            call_id: call.id,
+                                                            task: arguments.task,
+                                                            model: arguments.model,
+                                                            limits,
+                                                        })
+                                                        .await;
+                                                    child_spend = Some(outcome.spend);
+                                                    tools::bounded_result(
+                                                        outcome.content,
+                                                        outcome.is_error,
+                                                    )
+                                                }
+                                            }
                                         }
                                         Err(error) => tools::bounded_result(
                                             format!("invalid arguments: {error}"),
@@ -1881,7 +1915,7 @@ impl plan::CompiledAgentPlan {
                                 .await
                             }
                         };
-                        (call, result, child_cost)
+                        (call, result, child_spend)
                     }
                 };
                 // Read-only turns overlap under a small bound; a turn with any
@@ -1904,7 +1938,7 @@ impl plan::CompiledAgentPlan {
                         let (delta_sender, mut deltas) =
                             tokio::sync::mpsc::channel::<String>(SHELL_OUTPUT_QUEUE_CAPACITY);
                         let mut execution = Box::pin(execute_one(call, Some(delta_sender)));
-                        let (call, result, child_cost) = loop {
+                        let (call, result, child_spend) = loop {
                             let interrupt = interrupt_requested(&mut steering, handled_interrupt);
                             tokio::select! {
                                 biased;
@@ -1937,8 +1971,8 @@ impl plan::CompiledAgentPlan {
                         while let Ok(chunk) = deltas.try_recv() {
                             yield RuntimeEvent::ToolCallOutputDelta { id: call_id, chunk };
                         }
-                        if let Some(cost) = child_cost {
-                            budget.charge_child(cost);
+                        if let Some(spend) = child_spend {
+                            budget.charge_child(spend.usage, spend.cost_usd_nanos);
                         }
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                         let display = (!result.is_error)
@@ -1971,11 +2005,11 @@ impl plan::CompiledAgentPlan {
                             }
                             next = executions.next() => next,
                         };
-                        let Some((call, result, child_cost)) = next else {
+                        let Some((call, result, child_spend)) = next else {
                             break;
                         };
-                        if let Some(cost) = child_cost {
-                            budget.charge_child(cost);
+                        if let Some(spend) = child_spend {
+                            budget.charge_child(spend.usage, spend.cost_usd_nanos);
                         }
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                         yield RuntimeEvent::ToolCallFinished {
@@ -5283,16 +5317,26 @@ mod tests {
     struct StubSpawner {
         outcome: SpawnAgentOutcome,
         tasks: SpawnedTasks,
+        requests: Arc<Mutex<Vec<SpawnRequest>>>,
+    }
+
+    impl StubSpawner {
+        fn new(outcome: SpawnAgentOutcome, tasks: SpawnedTasks) -> Self {
+            Self {
+                outcome,
+                tasks,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl SubagentSpawner for StubSpawner {
-        fn spawn(
-            &self,
-            _call_id: ToolCallId,
-            task: String,
-            model: Option<String>,
-        ) -> SpawnAgentFuture {
-            self.tasks.lock().unwrap().push((task, model));
+        fn spawn(&self, request: SpawnRequest) -> SpawnAgentFuture {
+            self.tasks
+                .lock()
+                .unwrap()
+                .push((request.task.clone(), request.model.clone()));
+            self.requests.lock().unwrap().push(request);
             let outcome = self.outcome.clone();
             Box::pin(std::future::ready(outcome))
         }
@@ -5371,14 +5415,14 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let tasks = Arc::new(Mutex::new(Vec::new()));
-        let spawner = Arc::new(StubSpawner {
-            outcome: SpawnAgentOutcome {
+        let spawner = Arc::new(StubSpawner::new(
+            SpawnAgentOutcome {
                 content: "x".repeat(tools::MAX_TOOL_RESULT_BYTES + 1024),
                 is_error: false,
-                cost_usd_nanos: Some(0),
+                spend: SpawnAgentSpend::NONE,
             },
-            tasks: Arc::clone(&tasks),
-        });
+            Arc::clone(&tasks),
+        ));
         let runtime = Runtime::new(
             SpawnCallProvider {
                 turn: Mutex::new(0),
@@ -5444,14 +5488,14 @@ mod tests {
         for (requested, expected) in cases {
             let directory = tempfile::tempdir().unwrap();
             let tasks = Arc::new(Mutex::new(Vec::new()));
-            let spawner = Arc::new(StubSpawner {
-                outcome: SpawnAgentOutcome {
+            let spawner = Arc::new(StubSpawner::new(
+                SpawnAgentOutcome {
                     content: "child answer".to_owned(),
                     is_error: false,
-                    cost_usd_nanos: Some(0),
+                    spend: SpawnAgentSpend::NONE,
                 },
-                tasks: Arc::clone(&tasks),
-            });
+                Arc::clone(&tasks),
+            ));
             let runtime = Runtime::new(
                 SpawnCallProvider {
                     turn: Mutex::new(0),
@@ -5480,6 +5524,240 @@ mod tests {
                 &[("count the widgets".to_owned(), expected.map(str::to_owned))]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn children_receive_the_parents_remaining_budget_and_their_usage_rolls_up() {
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        // Turn one spawns a child and reports its own usage; the child then
+        // reports usage large enough to spend the parent's token cap.
+        struct MeteredSpawnProvider {
+            turn: Mutex<usize>,
+        }
+
+        impl Provider for MeteredSpawnProvider {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                let usage = Some(qq_provider::ProviderUsage {
+                    input_tokens: 100,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 50,
+                });
+                if current == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "call_0".to_owned(),
+                            name: "spawn_agent".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "call_0".to_owned(),
+                            json: r#"{"task":"count the widgets"}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "call_0".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "done".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage }),
+                    ]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let spawner = Arc::new(StubSpawner::new(
+            SpawnAgentOutcome {
+                content: "child answer".to_owned(),
+                is_error: false,
+                spend: SpawnAgentSpend {
+                    cost_usd_nanos: Some(0),
+                    usage: Some(TokenUsage {
+                        input_tokens: 700,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 200,
+                    }),
+                },
+            },
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let limits = RunLimits {
+            max_total_tokens: Some(1_000),
+            max_input_tokens: Some(1_000),
+            max_model_turns: Some(10),
+            ..RunLimits::default()
+        };
+        let runtime = Runtime::new(
+            MeteredSpawnProvider {
+                turn: Mutex::new(0),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let events = runtime
+            .run_loop_with_spawner(
+                vec![Message::user("go")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(workspace::FileState::default()),
+                RunCapabilities::user(Some(Arc::clone(&spawner) as Arc<dyn SubagentSpawner>))
+                    .with_limits(limits, None),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        // The child was admitted with what the parent had left after turn
+        // one (150 tokens spent of 1_000 total, 100 of 1_000 input) and none
+        // of the parent's per-run caps.
+        let requests = spawner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].limits.max_total_tokens, Some(850));
+        assert_eq!(requests[0].limits.max_input_tokens, Some(900));
+        assert_eq!(requests[0].limits.max_model_turns, None);
+        assert_eq!(requests[0].limits.max_duration_ms, None);
+        drop(requests);
+
+        // Parent 150 + child 900 = 1_050 > 1_000: the child's tokens exhaust
+        // the parent's total-token bound after the turn that ran it.
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::BudgetExhausted { exhaustion })
+                if exhaustion.limit == BudgetLimitKind::TotalTokens
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_spawn_the_parent_cannot_afford_is_refused_as_a_tool_error() {
+        struct AllowAllGate;
+
+        impl ToolGate for AllowAllGate {
+            fn resolve(&self, _call: &RuntimeToolCall) -> ToolGateFuture {
+                Box::pin(std::future::ready(GateDecision::Execute))
+            }
+        }
+
+        // Turn one spends the whole input-token cap and then asks to spawn.
+        struct ExhaustedSpawnProvider {
+            turn: Mutex<usize>,
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for ExhaustedSpawnProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                self.requests.lock().unwrap().push(request);
+                let mut turn = self.turn.lock().unwrap();
+                let current = *turn;
+                *turn += 1;
+                drop(turn);
+                if current == 0 {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "call_0".to_owned(),
+                            name: "spawn_agent".to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "call_0".to_owned(),
+                            json: r#"{"task":"count the widgets"}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "call_0".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed {
+                            usage: Some(qq_provider::ProviderUsage {
+                                input_tokens: 500,
+                                cache_read_input_tokens: 0,
+                                cache_write_input_tokens: 0,
+                                output_tokens: 10,
+                            }),
+                        }),
+                    ]))
+                } else {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "done".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let spawner = Arc::new(StubSpawner::new(
+            SpawnAgentOutcome {
+                content: "never runs".to_owned(),
+                is_error: false,
+                spend: SpawnAgentSpend::NONE,
+            },
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            ExhaustedSpawnProvider {
+                turn: Mutex::new(0),
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        // Input tokens are only observed after the turn, so the meter grants
+        // the reserved final response; the spawn inside that turn's tool
+        // loop must still be refused rather than handed a zero budget.
+        let limits = RunLimits {
+            max_input_tokens: Some(500),
+            ..RunLimits::default()
+        };
+        let events = runtime
+            .run_loop_with_spawner(
+                vec![Message::user("go")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AllowAllGate),
+                Arc::new(workspace::FileState::default()),
+                RunCapabilities::user(Some(Arc::clone(&spawner) as Arc<dyn SubagentSpawner>))
+                    .with_limits(limits, None),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(
+            spawner.requests.lock().unwrap().is_empty(),
+            "no child was admitted"
+        );
+        let refusal = events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::ToolCallFinished {
+                    result, is_error, ..
+                } => Some((result.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("the spawn call settles as a tool result");
+        assert!(refusal.1);
+        assert!(
+            refusal.0.contains("cannot afford a sub-agent") && refusal.0.contains("input_tokens"),
+            "{}",
+            refusal.0
+        );
     }
 
     #[test]
