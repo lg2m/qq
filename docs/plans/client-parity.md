@@ -1,6 +1,6 @@
 # Client Parity
 
-Status: Tier 1 complete 2026-09-03; Tier 2 next. Sequenced between Phase 4 and Phase 5 of
+Status: Tiers 1 and 2 complete 2026-09-03; Tier 3 not started. Sequenced between Phase 4 and Phase 5 of
 `speed-first-extensible-agent-harness.md`. Phase 5 (H10) stays gated on R6 and
 a platform threat model; Phase 6 needs an actual client; Phase 7 qualifies the
 TUI as a first-class path. None of them should start while the shipped clients
@@ -165,7 +165,24 @@ Reserved client slash commands: 16 → 19 (`/profile`, `/approval`, `/skills`).
 Workspace guidance can no longer take those names; `docs/design/tools.md` and
 the `design-skill-or-pack` skill reference the constant instead of a list.
 
-Not done in Tier 1: `qq run` steering and approve-for-session/workspace
-(T2.6). Python is absent on the development host, so
+Python is absent on the development host, so
 `benchmarks/harbor/tests/test_atif.py` was not run after the fixture
 regeneration; the Rust `harbor_atif_fixtures` test covers the shape.
+
+### Tier 2 — 2026-09-03
+
+| Item | Commit | Behavior | Evidence |
+| --- | --- | --- | --- |
+| T2.1 | `88f6ab7` | Approval card renders the server's `ShellCommandPreview` (command, then `(in cwd)`); the arguments re-parse is deleted; shell and edit previews share one per-call `ApprovalPreview` | `shell_approvals_show_the_server_preview_not_the_arguments` feeds a preview that differs from the arguments |
+| T2.2 | `4b8b81d` | Compaction notice ends with a 96-char excerpt of the model's summary; absent or blank summary adds nothing | `session_compacted_events_surface_the_shrink_in_the_status_line` (extended) |
+| T2.3 | `4b8b81d` | `/rollback` sends `RollbackCompaction` for the focused idle session; receipt distinguishes full restore from `N earlier retained`; server refusal surfaces as the failure notice; running session refused locally; reserved (20 entries) | `rollback_sends_for_an_idle_session_and_reports_the_receipt` |
+| T2.4 | `41ca6c9` | `ModelTurnCompleted` advances `RunStats.turns` and `live_cost_usd_nanos`; composer rule shows `turn N  $x.xx` during a run; completion line adds `N turns` when >1. Also fixed `rule_with` eating one guaranteed rule glyph | `the_composer_rule_carries_run_telemetry_*` (extended), `a_finished_run_ends_with_a_completion_line_*` (extended) |
+| T2.5 | `7657a8f` | Completion line names `as <profile> · plan <8 hex>` (or `plan <8 hex>` for default) from `RunStarted.plan`/snapshot, and `on <route>` when `ModelTurnCompleted.model` differs from the session's selection | `the_completion_line_names_the_plan_and_an_overridden_route` |
+| T2.6 | `9f9842e` | `qq run --allow-tool`/`--allow-shell` answer held calls with `ApproveForSession` grants (word-boundary prefix rule via now-public `qq_core::shell_prefix_matches`); `--steer-stdin` injects stdin lines as `SteerRun` at the next boundary, bounded buffer of 8, refusals are warnings | `shell_allowlist_grants_the_session_on_first_hold`, `tool_allowlist_approves_held_calls_under_auto`, `stdin_steering_lines_reach_the_next_model_turn`; live: `printf '…' \| qq run --steer-stdin` |
+
+Deliberately unchanged: `RunContextUpdated` stays a no-op because
+`SessionSummary.context_tokens` is authoritative for the meter and old
+persisted run-level events must not repopulate it. `--approve-for-workspace`
+was not added to `qq run`: promoting a grant into workspace configuration from
+an unattended run is a policy decision a human should make in the TUI, where
+`WorkspaceGrantPromoted` reports the outcome.
