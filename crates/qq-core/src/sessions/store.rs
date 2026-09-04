@@ -254,7 +254,8 @@ impl Drop for StoreInner {
 
 impl Store {
     pub(super) async fn open(path: PathBuf) -> Result<Self, SessionRuntimeError> {
-        let started = worker::start(path)?;
+        let feed = Arc::new(WorkspaceFeed::default());
+        let started = worker::start(path, Arc::clone(&feed))?;
         let store_id = started
             .ready
             .await
@@ -264,7 +265,7 @@ impl Store {
                 control: started.control,
                 output: started.output,
                 output_slots: Arc::new(Semaphore::new(OUTPUT_QUEUE_CAPACITY)),
-                feed: Arc::new(WorkspaceFeed::default()),
+                feed,
                 #[cfg(test)]
                 catch_up_reads: std::sync::atomic::AtomicU64::new(0),
                 shutdown: started.shutdown,
@@ -318,17 +319,19 @@ impl Store {
             ),
         };
         let (reply, response) = oneshot::channel();
-        let feed = Arc::clone(&self.inner.feed);
         let message = WorkerMessage::Run {
             job: Box::new(move |connection| {
                 let result = operation(connection);
-                // Persist, then publish, then acknowledge. A failed operation
-                // rolled back, so what it staged never reaches a subscriber.
-                let staged = feed::take_staged();
-                if result.is_ok() {
-                    feed.publish(staged);
+                // The worker settles this after the enclosing commit: the
+                // reply and the staged events wait for durability. A commit
+                // failure replaces the result so no caller is told a write
+                // landed when it did not.
+                worker::JobOutcome {
+                    ok: result.is_ok(),
+                    settle: Box::new(move |commit| {
+                        let _ = reply.send(commit.and(result));
+                    }),
                 }
-                let _ = reply.send(result);
             }),
             _output_permit: output_permit,
         };
@@ -1313,6 +1316,73 @@ impl Store {
     }
 }
 
+/// One store operation's unit of work.
+///
+/// Every mutating operation begins one of these and commits it. Alone, that
+/// is a real transaction. Inside the worker's output-lane group commit the
+/// connection already has a transaction open, and the unit is a savepoint:
+/// its `commit` releases the savepoint into the group, and the group's single
+/// `COMMIT` makes every unit durable at once. A failed unit rolls back its
+/// own savepoint and leaves its siblings intact. Operation code is identical
+/// in both modes.
+pub(super) enum Unit<'connection> {
+    Transaction(rusqlite::Transaction<'connection>),
+    Savepoint(rusqlite::Savepoint<'connection>),
+}
+
+impl<'connection> Unit<'connection> {
+    pub(super) fn commit(self) -> rusqlite::Result<()> {
+        match self {
+            Self::Transaction(transaction) => transaction.commit(),
+            Self::Savepoint(savepoint) => savepoint.commit(),
+        }
+    }
+}
+
+impl std::ops::Deref for Unit<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Transaction(transaction) => transaction,
+            Self::Savepoint(savepoint) => savepoint,
+        }
+    }
+}
+
+/// Begins the unit of work for one operation: a savepoint inside a group
+/// transaction, a deferred transaction otherwise.
+pub(super) fn begin_unit(connection: &mut Connection) -> Result<Unit<'_>, SessionRuntimeError> {
+    if connection.is_autocommit() {
+        connection
+            .transaction()
+            .map(Unit::Transaction)
+            .map_err(|_| SessionRuntimeError::Persistence)
+    } else {
+        rusqlite::Savepoint::new(connection)
+            .map(Unit::Savepoint)
+            .map_err(|_| SessionRuntimeError::Persistence)
+    }
+}
+
+/// `begin_unit` with `BEGIN IMMEDIATE` when it opens a real transaction, for
+/// operations that must take the write lock before reading. Inside a group
+/// the write lock is already held, so the savepoint form is identical.
+pub(super) fn begin_immediate_unit(
+    connection: &mut Connection,
+) -> Result<Unit<'_>, SessionRuntimeError> {
+    if connection.is_autocommit() {
+        connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map(Unit::Transaction)
+            .map_err(|_| SessionRuntimeError::Persistence)
+    } else {
+        rusqlite::Savepoint::new(connection)
+            .map(Unit::Savepoint)
+            .map_err(|_| SessionRuntimeError::Persistence)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -1322,11 +1392,268 @@ mod tests {
 
     use super::*;
 
+    /// A raw job with nothing to settle, for queue-shape tests.
+    fn raw_job(job: impl FnOnce(&mut Connection) + Send + 'static) -> worker::DatabaseJob {
+        Box::new(move |connection| {
+            job(connection);
+            worker::JobOutcome {
+                ok: true,
+                settle: Box::new(|_| {}),
+            }
+        })
+    }
+
     fn control_message(job: impl FnOnce(&mut Connection) + Send + 'static) -> WorkerMessage {
         WorkerMessage::Run {
-            job: Box::new(job),
+            job: raw_job(job),
             _output_permit: None,
         }
+    }
+
+    /// Holds the worker on a control job so output jobs pile up behind it and
+    /// are dequeued as one group when it releases.
+    async fn hold_worker(
+        store: &Store,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<Result<(), SessionRuntimeError>>,
+    ) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_store = store.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_store
+                .call(Priority::Control, move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv()
+                        .map_err(|_| SessionRuntimeError::Unavailable)
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        (release_tx, blocked)
+    }
+
+    fn scratch_rows(connection: &Connection) -> Vec<i64> {
+        let mut statement = connection
+            .prepare("SELECT n FROM scratch ORDER BY n")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// D2: output jobs queued together commit as one group; a job that fails
+    /// rolls back only its own savepoint, and its siblings stay durable.
+    #[tokio::test]
+    async fn grouped_output_jobs_commit_once_and_a_failing_job_rolls_back_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        store
+            .call(Priority::Control, |connection| {
+                connection
+                    .execute_batch("CREATE TABLE scratch(n INTEGER PRIMARY KEY)")
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        let (release, blocked) = hold_worker(&store).await;
+
+        let commits = Arc::new(AtomicUsize::new(0));
+        let mut jobs = Vec::new();
+        for n in 1_i64..=6 {
+            let store = store.clone();
+            let commits = Arc::clone(&commits);
+            jobs.push(tokio::spawn(async move {
+                store
+                    .call(Priority::Output, move |connection| {
+                        let unit = begin_unit(connection)?;
+                        // Inside a group every unit is a savepoint.
+                        assert!(matches!(unit, Unit::Savepoint(_)));
+                        unit.execute("INSERT INTO scratch(n) VALUES (?1)", [n])
+                            .map_err(|_| SessionRuntimeError::Persistence)?;
+                        if n == 4 {
+                            // Dropping the unit uncommitted rolls this
+                            // savepoint back; the group continues.
+                            return Err(SessionRuntimeError::OutputTooLarge);
+                        }
+                        unit.commit()
+                            .map_err(|_| SessionRuntimeError::Persistence)?;
+                        // Autocommit is still off: the group owns the commit.
+                        if !connection.is_autocommit() {
+                            commits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(n)
+                    })
+                    .await
+            }));
+        }
+        // Let every job enter the output queue before the worker is released.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        blocked.await.unwrap().unwrap();
+
+        let mut results = Vec::new();
+        for job in jobs {
+            results.push(job.await.unwrap());
+        }
+        assert_eq!(results[3], Err(SessionRuntimeError::OutputTooLarge));
+        for (index, result) in results.iter().enumerate() {
+            if index != 3 {
+                assert_eq!(*result, Ok(index as i64 + 1));
+            }
+        }
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            5,
+            "five units ran inside the group"
+        );
+        let rows = store
+            .call(Priority::Control, |connection| Ok(scratch_rows(connection)))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            [1, 2, 3, 5, 6],
+            "the failed job's row is gone, the rest are durable"
+        );
+    }
+
+    /// D2: when the group's outer commit fails, every job in it is told
+    /// `Persistence` and nothing it staged is published.
+    #[tokio::test]
+    async fn a_failed_group_commit_fails_every_job_and_publishes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let workspace_id = WorkspaceId::generate().unwrap();
+        // A deferred foreign key makes the outer COMMIT itself fail while
+        // every statement inside the group succeeds.
+        store
+            .call(Priority::Control, |connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                         CREATE TABLE child(
+                             parent_id INTEGER REFERENCES parent(id)
+                                 DEFERRABLE INITIALLY DEFERRED
+                         );",
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        let (release, blocked) = hold_worker(&store).await;
+        let mut live = store.feed(workspace_id).unwrap();
+
+        let mut jobs = Vec::new();
+        for n in 0..3_u64 {
+            let store = store.clone();
+            jobs.push(tokio::spawn(async move {
+                store
+                    .call(Priority::Output, move |connection| {
+                        let unit = begin_unit(connection)?;
+                        // Stage an event as `append_event` would, then make
+                        // the outer COMMIT impossible by ending the
+                        // transaction underneath the group.
+                        feed::stage(Arc::new(feed::PublishedEvent {
+                            envelope: SessionEventEnvelope {
+                                cursor: EventCursor {
+                                    store_id: StoreId::from_bytes([0; 16]),
+                                    workspace_id,
+                                    sequence: n + 1,
+                                },
+                                session_id: SessionId::from_bytes([1; 16]),
+                                run_id: None,
+                                caused_by: None,
+                                occurred_at_ms: 0,
+                                event: SessionEvent::SessionDeleted {
+                                    session_id: SessionId::from_bytes([1; 16]),
+                                },
+                            },
+                            json: Arc::from("{}"),
+                        }));
+                        if n == 2 {
+                            unit.execute("INSERT INTO child(parent_id) VALUES (999)", [])
+                                .map_err(|_| SessionRuntimeError::Persistence)?;
+                        }
+                        unit.commit()
+                            .map_err(|_| SessionRuntimeError::Persistence)?;
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        blocked.await.unwrap().unwrap();
+        for job in jobs {
+            assert_eq!(job.await.unwrap(), Err(SessionRuntimeError::Persistence));
+        }
+        assert!(
+            live.try_recv().is_err(),
+            "nothing from a failed group is published"
+        );
+    }
+
+    /// D2: a waiting control job bounds the group; it is admitted before the
+    /// next output job rather than behind the whole backlog.
+    #[tokio::test]
+    async fn a_waiting_control_job_is_admitted_between_output_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (release, blocked) = hold_worker(&store).await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut jobs = Vec::new();
+        for n in 0..(worker::OUTPUT_GROUP_LIMIT * 3) {
+            let store = store.clone();
+            let order = Arc::clone(&order);
+            jobs.push(tokio::spawn(async move {
+                store
+                    .call(Priority::Output, move |connection| {
+                        let unit = begin_unit(connection)?;
+                        unit.commit()
+                            .map_err(|_| SessionRuntimeError::Persistence)?;
+                        order.lock().unwrap().push(format!("output {n}"));
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let control_order = Arc::clone(&order);
+        let control = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .call(Priority::Control, move |_| {
+                        control_order.lock().unwrap().push("control".to_owned());
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.send(()).unwrap();
+        blocked.await.unwrap().unwrap();
+        for job in jobs {
+            job.await.unwrap().unwrap();
+        }
+        control.await.unwrap().unwrap();
+        let order = order.lock().unwrap();
+        let position = order.iter().position(|entry| entry == "control").unwrap();
+        assert!(
+            position <= worker::OUTPUT_GROUP_LIMIT,
+            "control ran at {position}, behind more than one group: {order:?}"
+        );
     }
 
     #[tokio::test]
@@ -1393,7 +1720,7 @@ mod tests {
                 .inner
                 .output
                 .try_send(WorkerMessage::Run {
-                    job: Box::new(|_| {}),
+                    job: raw_job(|_| {}),
                     _output_permit: Some(permit),
                 })
                 .unwrap();
@@ -1451,7 +1778,7 @@ mod tests {
             .inner
             .output
             .try_send(WorkerMessage::Run {
-                job: Box::new(move |_| {
+                job: raw_job(move |_| {
                     let _ = observed_tx.send(output_controls.load(Ordering::SeqCst));
                 }),
                 _output_permit: Some(permit),

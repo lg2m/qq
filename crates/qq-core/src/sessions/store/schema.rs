@@ -24,6 +24,8 @@ pub(in crate::sessions) fn open_database(
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|_| SessionRuntimeError::Persistence)?;
+    // Hot statements on the output lane are prepared once per connection.
+    connection.set_prepared_statement_cache_capacity(128);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

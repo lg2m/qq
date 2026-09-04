@@ -28,7 +28,7 @@ use qq_protocol::{
     WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary, validate_input,
 };
 use qq_provider::{ContentBlock, Message, Role};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -730,9 +730,7 @@ fn create_child_run(
     if task.len() > MAX_PROMPT_BYTES {
         return Err(SessionRuntimeError::PromptTooLarge);
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     ensure_workspace(&transaction, workspace_id)?;
     let parent_workspace = transaction
         .query_row(
@@ -957,9 +955,7 @@ fn execute_command(
         return Err(SessionRuntimeError::CommandLimitReached);
     }
 
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let mut grant_promotion_pending = false;
     let mut cascade_cancels = Vec::new();
@@ -2145,9 +2141,7 @@ fn reserve_next_run_recoverable(
     _store_id: StoreId,
     depth: u16,
 ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let row = transaction
         .query_row(
             "SELECT r.id, r.session_id, r.command_id, r.user_message_id, r.kind,
@@ -2421,9 +2415,7 @@ fn start_reserved_run(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let context_base_bytes = prepared_context_bytes(audit.weight)?;
     let now = now_ms();
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     // Plan identity and its descriptor are fixed in the same statement that
     // starts the run: a later configuration or credential refresh compiles a
     // new plan for later runs and never touches this row.
@@ -2517,9 +2509,7 @@ fn start_auto_compaction(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let context_base_bytes = prepared_context_bytes(audit.weight)?;
     let now = now_ms();
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let attempted = transaction
         .execute(
             "UPDATE runs SET context_compaction_attempted = 1
@@ -2639,9 +2629,7 @@ fn load_auto_compaction_messages(
     connection: &mut Connection,
     session_id: SessionId,
 ) -> Result<Vec<Message>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let mut messages = load_model_context(&transaction, session_id, u64::MAX)?;
     messages.push(Message::user(compaction_instruction(
         &transaction,
@@ -2657,9 +2645,7 @@ fn reload_reserved_messages(
     connection: &mut Connection,
     claimed: &ClaimedRun,
 ) -> Result<Option<(Vec<Message>, bool)>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let row = transaction
         .query_row(
             "SELECT r.status, r.cancel_requested, r.context_compaction_attempted,
@@ -2733,9 +2719,7 @@ fn begin_assistant_message(
     if text.is_empty() {
         return Err(SessionRuntimeError::Persistence);
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     reserve_context_capacity(&transaction, claimed.run_id, text.len())?;
     let now = now_ms();
     let ordinal: u64 = transaction
@@ -2813,16 +2797,14 @@ fn append_text(
     if text.is_empty() {
         return Err(SessionRuntimeError::Persistence);
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let streaming = transaction
-        .query_row(
-            "SELECT 1 FROM messages WHERE id = ?1 AND state = 'streaming'",
-            [message_id.to_string()],
-            |_| Ok(()),
-        )
-        .optional()
+        .prepare_cached("SELECT 1 FROM messages WHERE id = ?1 AND state = 'streaming'")
+        .and_then(|mut statement| {
+            statement
+                .query_row([message_id.to_string()], |_| Ok(()))
+                .optional()
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?;
     if streaming.is_none() {
         return Err(SessionRuntimeError::Unavailable);
@@ -2852,7 +2834,7 @@ fn append_text(
 }
 
 fn insert_message_chunk(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     message_id: MessageId,
     channel: TextChannel,
     text: &str,
@@ -2862,12 +2844,12 @@ fn insert_message_chunk(
         TextChannel::Refusal => "refusal",
     };
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO message_chunks(message_id, channel, chunk_ordinal, text)
              SELECT ?1, ?2, COALESCE(MAX(chunk_ordinal), 0) + 1, ?3
              FROM message_chunks WHERE message_id = ?1 AND channel = ?2",
-            params![message_id.to_string(), channel, text],
         )
+        .and_then(|mut statement| statement.execute(params![message_id.to_string(), channel, text]))
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(())
 }
@@ -2911,9 +2893,7 @@ fn persist_model_turn(
         .transpose()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let now = now_ms();
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let persisted_calls = if claimed.kind == RunKind::Prompt {
         calls.as_slice()
     } else {
@@ -3124,9 +3104,7 @@ fn start_tool_call(
     claimed: &ClaimedRun,
     tool_call_id: ToolCallId,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let updated = transaction
         .execute(
@@ -3168,9 +3146,7 @@ fn apply_steering_message(
     message_id: MessageId,
     turn_ordinal: u16,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let changed = transaction
         .execute(
             "UPDATE messages SET state = 'complete', turn_ordinal = ?3
@@ -3216,9 +3192,7 @@ fn record_run_interrupted(
     claimed: &ClaimedRun,
     turn_ordinal: u16,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let mut events = Vec::new();
     let mut statement = transaction
@@ -3288,9 +3262,7 @@ fn record_run_audit(
     claimed: &ClaimedRun,
     record: AuditRecord,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let audit_json =
         serde_json::to_string(&record).map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3335,9 +3307,7 @@ fn record_run_output_truncated(
     turn_ordinal: u16,
     continuation: u16,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let updated = transaction
         .execute(
@@ -3373,7 +3343,7 @@ fn record_run_output_truncated(
 /// Steering still queued when a run settles never reached the model: the
 /// rows move to `cancelled` and each is published as superseded.
 fn supersede_pending_steering(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     claimed: &ClaimedRun,
     now: u64,
@@ -3426,9 +3396,7 @@ fn append_run_activity(
     claimed: &ClaimedRun,
     activity: RunActivity,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let running = transaction
         .query_row(
             "SELECT 1 FROM runs WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
@@ -3467,9 +3435,7 @@ fn append_reasoning(
     claimed: &ClaimedRun,
     reasoning: ReasoningEvent,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let running = transaction
         .query_row(
             "SELECT 1 FROM runs WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
@@ -3524,9 +3490,7 @@ fn append_tool_call_output(
     tool_call_id: ToolCallId,
     chunk: String,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let running = transaction
         .query_row(
             "SELECT 1 FROM tool_calls WHERE id = ?1 AND run_id = ?2 AND state = 'running'",
@@ -3573,9 +3537,7 @@ fn finish_tool_call(
     file_state: Option<FileStateUpdate>,
     display: Option<ToolCallDisplay>,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let (provider_call_id, first_result_in_turn) = transaction
         .query_row(
             "SELECT current.provider_call_id,
@@ -3655,7 +3617,7 @@ fn finish_tool_call(
 /// when the per-session bound is exceeded; an evicted file simply needs a
 /// re-read before its next edit.
 fn record_session_file(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: SessionId,
     update: &FileStateUpdate,
     now: u64,
@@ -3690,7 +3652,7 @@ fn record_session_file(
 /// rather than failing creation: the config layer already validated
 /// well-formed grants, and a clamped seed only means more prompting.
 fn insert_seed_grants(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: SessionId,
     seed: &WorkspaceGrantSeed,
     now: u64,
@@ -3766,9 +3728,7 @@ fn deny_tool_call(
     tool_call_id: ToolCallId,
     message: &str,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let (provider_call_id, first_result_in_turn) = transaction
         .query_row(
             "SELECT current.provider_call_id,
@@ -3837,9 +3797,7 @@ fn request_tool_approval(
     shell: Option<ShellCommandPreview>,
     edit: Option<EditPreview>,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let updated = transaction
         .execute(
@@ -3885,9 +3843,7 @@ fn resolve_approval_by_reviewer(
     claimed: &ClaimedRun,
     tool_call_id: ToolCallId,
 ) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let updated = transaction
         .execute(
@@ -3938,9 +3894,7 @@ fn deny_approval_by_reviewer(
     tool_call_id: ToolCallId,
     message: &str,
 ) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let now = now_ms();
     let Some((state, resolution, provider_call_id, first_result_in_turn)) = transaction
         .query_row(
@@ -4074,9 +4028,7 @@ fn conclude_tool_approval(
     tool_call_id: ToolCallId,
     timed_out: bool,
 ) -> Result<ConcludedApproval, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let (state, resolution, result, provider_call_id, first_result_in_turn) = transaction
         .query_row(
             "SELECT current.state, current.approval_resolution, current.result,
@@ -4207,9 +4159,7 @@ fn settle_grant_promotion(
         },
         outcome => outcome,
     };
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_immediate_unit(connection)?;
     let pending: bool = transaction
         .query_row(
             "SELECT EXISTS(
@@ -4256,7 +4206,7 @@ fn settle_grant_promotion(
 }
 
 fn reserve_tool_result_capacity(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     run_id: RunId,
     provider_call_id: &str,
     result: &str,
@@ -4279,7 +4229,7 @@ fn reserve_tool_result_capacity(
 }
 
 fn reserve_context_capacity(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     run_id: RunId,
     additional: usize,
 ) -> Result<(), SessionRuntimeError> {
@@ -4289,13 +4239,15 @@ fn reserve_context_capacity(
     let additional = i64::try_from(additional).map_err(|_| SessionRuntimeError::OutputTooLarge)?;
     let maximum = i64::try_from(MAX_CONTEXT_BYTES).expect("context limit fits SQLite integer");
     let updated = transaction
-        .execute(
+        .prepare_cached(
             "UPDATE runs
              SET context_increment_bytes = context_increment_bytes + ?2
              WHERE id = ?1 AND status = 'running' AND context_base_bytes IS NOT NULL
                AND context_base_bytes + context_increment_bytes + ?2 <= ?3",
-            params![run_id.to_string(), additional, maximum],
         )
+        .and_then(|mut statement| {
+            statement.execute(params![run_id.to_string(), additional, maximum])
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?;
     if updated == 1 {
         return Ok(());
@@ -4318,7 +4270,7 @@ fn reserve_context_capacity(
 }
 
 fn append_parent_session_update(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     workspace_id: WorkspaceId,
     child_session_id: SessionId,
@@ -4352,9 +4304,7 @@ fn complete_run(
     outcome: RunOutcome,
     accounting: Option<RunAccounting>,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let mut events = Vec::new();
     supersede_pending_steering(&transaction, store_id, claimed, now_ms(), &mut events)?;
     events.push(finalize_run(
@@ -4391,9 +4341,7 @@ fn complete_compaction(
     summary: String,
     accounting: Option<RunAccounting>,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     // A cancel that raced the summarizer's completion wins: the run settles
     // cancelled and no marker is committed.
     let mut outcome = cancellation_wins(&transaction, claimed.run_id, RunOutcome::Completed)?;
@@ -4576,7 +4524,7 @@ fn complete_compaction(
 /// Settles a claimed run inside an open transaction: outcome, usage and cost
 /// accounting, message states, session status, and the `RunFinished` event.
 fn finalize_run(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     claimed: &ClaimedRun,
     outcome: RunOutcome,
@@ -4742,7 +4690,7 @@ fn run_context_tokens(
 }
 
 fn finish_queued_run(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     workspace_id: WorkspaceId,
     session_id: SessionId,
@@ -4761,7 +4709,7 @@ fn finish_queued_run(
 }
 
 fn finish_queued_run_with_outcome(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     workspace_id: WorkspaceId,
     session_id: SessionId,
@@ -4836,9 +4784,7 @@ fn finish_reserved_run(
     claimed: &ClaimedRun,
     outcome: RunOutcome,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let state = transaction
         .query_row(
             "SELECT status, outcome_json FROM runs WHERE id = ?1 AND session_id = ?2",
@@ -4892,9 +4838,7 @@ fn finish_prepared_run(
     let resolved_model = serde_json::to_string(audit.resolved_model.as_ref())
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let context_base_bytes = prepared_context_bytes(audit.weight)?;
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let state = transaction
         .query_row(
             "SELECT status, outcome_json FROM runs WHERE id = ?1 AND session_id = ?2",
@@ -4970,9 +4914,7 @@ fn settle_panicked_execution(
     original: &ClaimedRun,
     outcome: RunOutcome,
 ) -> Result<PanickedExecutionSettlement, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let session_state = transaction
         .query_row(
             "SELECT active_run_id, preparing_run_id FROM sessions WHERE id = ?1",
@@ -5179,7 +5121,7 @@ fn cancellation_signal_run_ids(
 /// are settled in this transaction, so either ordering between parent
 /// cancellation and atomic child creation has a durable outcome.
 fn cancel_owned_child_runs(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     owner_run_id: RunId,
     command_id: CommandId,
@@ -5282,7 +5224,7 @@ fn cancel_owned_child_runs(
 /// to: prompts still queued, a manual compaction, an ordinary prompt run, or
 /// a cancellation already underway.
 fn cascade_auto_compaction_cancel(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     workspace_id: WorkspaceId,
     session_id: SessionId,
@@ -5333,9 +5275,7 @@ fn recover_interrupted_runs(
     connection: &mut Connection,
     store_id: StoreId,
 ) -> Result<Vec<EventCursor>, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     // Reservation is process-local work backed by a queued run. A crash may
     // leave the pointer behind before RunStarted; clearing it makes that same
     // queued row eligible again. The per-prompt compaction-attempt marker is
@@ -5451,7 +5391,7 @@ fn recover_interrupted_runs(
 }
 
 fn complete_run_in_transaction(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     claimed: &ClaimedRun,
     outcome: RunOutcome,
@@ -5509,7 +5449,7 @@ fn complete_run_in_transaction(
 }
 
 fn interrupt_active_tool_calls(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     claimed: &ClaimedRun,
     outcome: &RunOutcome,
@@ -5574,7 +5514,7 @@ fn interrupt_active_tool_calls(
 }
 
 fn cancellation_wins(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     run_id: RunId,
     outcome: RunOutcome,
 ) -> Result<RunOutcome, SessionRuntimeError> {
@@ -5610,9 +5550,7 @@ fn load_snapshot(
     store_id: StoreId,
     request: SnapshotRequest,
 ) -> Result<WorkspaceSnapshot, SessionRuntimeError> {
-    let transaction = connection
-        .transaction()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let transaction = store::begin_unit(connection)?;
     let (path, sequence) = transaction
         .query_row(
             "SELECT path, next_sequence FROM workspaces WHERE id = ?1",
@@ -5695,7 +5633,7 @@ fn load_snapshot(
 }
 
 fn load_session_snapshot(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: SessionId,
     message_limit: u16,
 ) -> Result<SessionSnapshot, SessionRuntimeError> {
@@ -5841,17 +5779,19 @@ struct EventContext {
 }
 
 fn append_event(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     context: EventContext,
     event: SessionEvent,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
-    transaction
-        .execute(
-            "UPDATE workspaces SET next_sequence = next_sequence + 1 WHERE id = ?1",
-            [context.workspace_id.to_string()],
+    let sequence: u64 = transaction
+        .prepare_cached(
+            "UPDATE workspaces SET next_sequence = next_sequence + 1 WHERE id = ?1
+             RETURNING next_sequence",
         )
+        .and_then(|mut statement| {
+            statement.query_row([context.workspace_id.to_string()], |row| row.get(0))
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let sequence = workspace_sequence(transaction, context.workspace_id)?;
     let envelope = SessionEventEnvelope {
         cursor: EventCursor {
             store_id: context.store_id,
@@ -5869,10 +5809,16 @@ fn append_event(
         return Err(SessionRuntimeError::EventTooLarge);
     }
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO events(workspace_id, sequence, envelope_json) VALUES (?1, ?2, ?3)",
-            params![context.workspace_id.to_string(), sequence, encoded.as_str()],
         )
+        .and_then(|mut statement| {
+            statement.execute(params![
+                context.workspace_id.to_string(),
+                sequence,
+                encoded.as_str()
+            ])
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?;
     // The encoding is kept, not dropped: after commit the worker publishes
     // it to live subscribers and the server writes it to the wire as-is.
@@ -6337,7 +6283,7 @@ impl From<PersistedContentBlock> for ContentBlock {
 /// The stored rows are never modified — pruning and summarization are
 /// properties of assembly alone.
 fn load_model_context(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: SessionId,
     through_ordinal: u64,
 ) -> Result<Vec<Message>, SessionRuntimeError> {
@@ -6346,7 +6292,7 @@ fn load_model_context(
 }
 
 fn load_model_context_with_rewrite_status(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: SessionId,
     through_ordinal: u64,
 ) -> Result<(Vec<Message>, bool), SessionRuntimeError> {
@@ -6632,7 +6578,7 @@ fn context_bytes(messages: &[Message]) -> usize {
 /// calling run is excluded: its own `search_history` arguments would
 /// otherwise match every query.
 fn search_session_history(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: SessionId,
     calling_run: RunId,
     query: &str,
@@ -6760,7 +6706,7 @@ fn search_session_history(
 /// still streaming into the current turn's message, which has not joined a
 /// committed turn yet but will.
 fn assembled_context_bytes(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: SessionId,
 ) -> Result<usize, SessionRuntimeError> {
     let context = load_model_context(transaction, session_id, u64::MAX)?;
@@ -6827,7 +6773,7 @@ fn compaction_instruction(
 /// Replays one run's persisted model turns (assistant content and tool
 /// results) into `context`, in turn order.
 fn append_run_turns(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     run_id: RunId,
     context: &mut Vec<Message>,
 ) -> Result<(), SessionRuntimeError> {
@@ -7181,7 +7127,7 @@ fn validate_model_selection(model: &ModelSelection) -> Result<(), SessionRuntime
 /// `SessionDeleted` removes the child, and a following parent
 /// `SessionUpdated` refreshes the live inclusive projection when needed.
 fn delete_idle_session(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     store_id: StoreId,
     workspace_id: WorkspaceId,
     session_id: SessionId,

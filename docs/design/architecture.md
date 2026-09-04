@@ -584,6 +584,21 @@ This ordering makes persisted state authoritative and allows clients to resume
 an event stream without losing output. Each completed model turn also commits
 the run's cumulative usage and estimated cost.
 
+The store worker serves two bounded lanes. Control jobs (commands, claims,
+snapshots, catch-up reads) each run in their own transaction and reply as soon
+as it commits, so an acknowledgement never waits behind streamed output.
+Output jobs (text, reasoning, tool output, turn commits) are group-committed:
+when the worker dequeues one it opens a single transaction, runs that job and
+every output job already queued behind it (at most `OUTPUT_GROUP_LIMIT = 16`,
+and stopping early when a control job is waiting) each inside a savepoint,
+commits once, and only then publishes their events and replies to every
+caller. A failing job rolls back its own savepoint and its siblings are
+unaffected; a failing outer commit fails every job in the group with
+`Persistence` and publishes nothing. Eight concurrent streams therefore cost
+one fsync per service round instead of eight, at `synchronous=FULL`
+throughout. Operation code is identical in both modes: every mutation begins a
+`Unit` that is a transaction when alone and a savepoint inside a group.
+
 Caller budgets are core-owned. `submit_prompt.limits` carries a versioned
 `RunLimits` (wall clock, model turns, tool calls, total tokens, cost) that is
 validated at admission, persisted with the run row, and metered by the runtime
