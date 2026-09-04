@@ -67,7 +67,7 @@ impl SessionGrants {
 /// blessing of the whole chain. The check is deliberately quote-blind and
 /// conservative: a metacharacter inside a quoted argument also forces a
 /// prompt, which errs toward asking, never toward silent approval.
-pub(crate) fn shell_prefix_matches(prefix: &str, command: &str) -> bool {
+pub fn shell_prefix_matches(prefix: &str, command: &str) -> bool {
     let prefix = prefix.trim();
     if prefix.is_empty() {
         return false;

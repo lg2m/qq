@@ -46,6 +46,7 @@ use runtime::{
     tool_schema_measurement,
 };
 
+pub use approval::shell_prefix_matches;
 pub use context_source::{
     ContextBudget, ContextBundle, ContextCache, ContextFetchFuture, ContextItem, ContextRequest,
     ContextSource, ContextSourceError, FailPolicy, MAX_CONTEXT_SOURCES,

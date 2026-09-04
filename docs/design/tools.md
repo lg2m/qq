@@ -583,8 +583,10 @@ client responds with an idempotent `RespondToolApproval` command
 for the workspace, or deny). Denials are
 returned to the model as tool errors, not run failures, so the agent can take
 another path. Non-interactive automation chooses its policy up front via
-flags; a headless run with `ask` semantics and no attached client fails the
-approval after a bounded wait rather than hanging forever.
+flags (`--approval`, plus `--allow-tool` and `--allow-shell` allowlists that
+answer a held call with a session grant); a headless run with `ask` semantics
+and no attached client fails the approval after a bounded wait rather than
+hanging forever.
 
 Approval requests carry enough to decide without leaving the client: the
 resolved path and a diff preview for edits, the exact command and cwd for

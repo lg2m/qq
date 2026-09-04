@@ -102,6 +102,16 @@ command prefixes matched at word granularity. Nonzero exits and denials
 return to the model as tool errors, not run failures. See
 `docs/design/tools.md` for the full policy design.
 
+Headless runs answer approvals themselves: `qq run --approval read-only`
+denies every held call, `auto` denies only what the policy escalated (dangerous
+shell), and `full` approves everything. Between `auto` and `full`,
+`--allow-tool <name>` and `--allow-shell "<prefix>"` (both repeatable) approve
+a held call for the session with the same word-boundary prefix rule the
+interactive "approve for session" uses, so `--allow-shell "cargo test"` covers
+`cargo test -p qq-core` and never `cargo test | sh`. `--steer-stdin` reads one
+steering message per stdin line and injects each at the run's next model/tool
+boundary; without it stdin is left alone.
+
 ## MCP Servers
 
 MCP servers are declared in configuration and their tools join the same

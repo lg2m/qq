@@ -19,10 +19,11 @@ use std::{
 use futures_util::StreamExt;
 use qq_core::{SessionRuntime, SessionRuntimeError};
 use qq_protocol::{
-    ApprovalDecision, ApprovalMode, BudgetLimitKind, CommandId, CommandOutcome, CommandReceipt,
-    MessageId, MessageRole, ModelSelection, RunId, RunLimits, RunOutcome, RunPromptIdentity,
-    SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope, SessionId,
-    SnapshotRequest, SubscribeRequest, TokenUsage, ToolCallState, WorkspaceId,
+    ApprovalDecision, ApprovalGrant, ApprovalMode, BudgetLimitKind, CommandId, CommandOutcome,
+    CommandReceipt, InputPart, MessageId, MessageRole, ModelSelection, RunId, RunLimits,
+    RunOutcome, RunPromptIdentity, SessionAccounting, SessionCommand, SessionEvent,
+    SessionEventEnvelope, SessionId, ShellCommandPreview, SnapshotRequest, SubscribeRequest,
+    TokenUsage, ToolCallState, WorkspaceId,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -36,6 +37,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// request timeout with margin; without a verdict by then the deny proceeds
 /// so the run never stalls.
 const REVIEWER_DENY_GRACE: Duration = Duration::from_secs(20);
+/// Steering lines buffered between stdin and the run. Beyond this the reader
+/// waits; the runtime's own per-run pending bound refuses the rest anyway.
+pub const MAX_PENDING_STEER_LINES: usize = 8;
 
 /// Byte budget for one concise tool-activity line in text format.
 const MAX_ACTIVITY_BYTES: usize = 160;
@@ -58,6 +62,11 @@ pub struct HeadlessOptions {
     /// reviewer, `auto` holds an escalated call briefly so the reviewer can
     /// approve it, instead of denying the moment the request is published.
     pub reviewer_configured: bool,
+    /// Tools whose held calls are approved for the session on first request.
+    pub allow_tools: Vec<String>,
+    /// Shell prefixes (word-boundary, as the policy matches them) whose held
+    /// commands are approved for the session on first request.
+    pub allow_shell_prefixes: Vec<String>,
     pub timeout: Option<Duration>,
     pub max_turns: Option<u16>,
     pub max_cost_usd_nanos: Option<u64>,
@@ -339,10 +348,13 @@ impl RunEnd {
 
 /// Runs one headless task to a terminal status. Never panics the process on
 /// task problems: every path maps to a distinguishable exit status.
+/// `steering` delivers user lines to inject at the run's next boundary; `None`
+/// means the invocation has no steering source.
 pub async fn run(
     sessions: &SessionRuntime,
     options: HeadlessOptions,
     interrupt: impl Future<Output = ()>,
+    steering: Option<tokio::sync::mpsc::Receiver<String>>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> HeadlessStatus {
@@ -392,7 +404,7 @@ pub async fn run(
     }
 
     let end = match stream_run(
-        sessions, &options, &handle, &mut sink, interrupt, stdout, stderr,
+        sessions, &options, &handle, &mut sink, interrupt, steering, stdout, stderr,
     )
     .await
     {
@@ -534,12 +546,14 @@ async fn submit(
 /// interrupt through the ordinary idempotent cancellation command, and
 /// rendering output per the selected format. Time and budget bounds are
 /// enforced by the core runtime and arrive as typed run outcomes.
+#[allow(clippy::too_many_arguments)]
 async fn stream_run(
     sessions: &SessionRuntime,
     options: &HeadlessOptions,
     handle: &RunHandle,
     sink: &mut RecordSink,
     interrupt: impl Future<Output = ()>,
+    mut steering: Option<tokio::sync::mpsc::Receiver<String>>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<RunEnd, Failure> {
@@ -576,6 +590,35 @@ async fn stream_run(
                     if text {
                         let _ = writeln!(stderr, "[run] interrupt received; cancelling");
                     }
+                }
+            }
+            line = async { steering.as_mut().unwrap().recv().await }, if steering.is_some() => {
+                match line {
+                    Some(line) if !line.trim().is_empty() => {
+                        // Steering that arrives before the run starts or after it
+                        // ends is refused by the runtime; that is reported and
+                        // the run continues rather than failing the invocation.
+                        match send(
+                            sessions,
+                            SessionCommand::SteerRun {
+                                run_id: handle.run_id,
+                                input: vec![InputPart::text(line)],
+                                interrupt: false,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(_) if text => {
+                                let _ = writeln!(stderr, "[run] steering queued");
+                            }
+                            Ok(_) => {}
+                            Err(failure) => {
+                                let _ = writeln!(stderr, "warning: steering refused: {}", failure.message);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => steering = None,
                 }
             }
             () = tokio::time::sleep_until(shutdown_at.unwrap_or_else(Instant::now)),
@@ -643,18 +686,31 @@ async fn stream_run(
                             let _ = writeln!(stderr, "[tool] {} {verdict}", tool_call.name);
                         }
                     }
-                    SessionEvent::ToolApprovalRequested { tool_call, .. } => {
+                    SessionEvent::ToolApprovalRequested { tool_call, shell, .. } => {
                         // The headless invocation is the approval client.
-                        // Full approves everything unattended; auto denies
-                        // whatever the policy escalated (dangerous shell) so
-                        // the run never stalls waiting for a human — but
-                        // when a reviewer model is configured the deny is
+                        // An explicit allowlist answers first, as a session
+                        // grant so the same tool or prefix is not held again.
+                        // Otherwise full approves everything unattended; auto
+                        // denies whatever the policy escalated (dangerous
+                        // shell) so the run never stalls waiting for a human —
+                        // but when a reviewer model is configured the deny is
                         // deferred briefly, giving the reviewer its window.
                         // A late deny is harmless: resolution is idempotent,
                         // so a reviewer approval that landed first stands.
-                        let decision = match options.approval {
-                            HeadlessApproval::Full => Some(ApprovalDecision::ApproveOnce),
-                            HeadlessApproval::Auto if options.reviewer_configured => {
+                        let granted = allowlisted_grant(options, &tool_call.name, shell.as_ref());
+                        let decision = match (granted, options.approval) {
+                            (Some(grant), _) => {
+                                if text {
+                                    let _ = writeln!(
+                                        stderr,
+                                        "[tool] {} approved for the session by allowlist",
+                                        tool_call.name
+                                    );
+                                }
+                                Some(ApprovalDecision::ApproveForSession { grant })
+                            }
+                            (None, HeadlessApproval::Full) => Some(ApprovalDecision::ApproveOnce),
+                            (None, HeadlessApproval::Auto) if options.reviewer_configured => {
                                 if let Some(run_id) = envelope.run_id {
                                     let sessions = sessions.clone();
                                     let tool_call_id = tool_call.id;
@@ -673,8 +729,9 @@ async fn stream_run(
                                 }
                                 None
                             }
-                            HeadlessApproval::Auto => Some(ApprovalDecision::Deny),
-                            HeadlessApproval::ReadOnly => Some(ApprovalDecision::Deny),
+                            (None, HeadlessApproval::Auto | HeadlessApproval::ReadOnly) => {
+                                Some(ApprovalDecision::Deny)
+                            }
                         };
                         if let (Some(run_id), Some(decision)) = (envelope.run_id, decision) {
                             respond_approval(sessions, run_id, tool_call.id, decision, stderr)
@@ -869,6 +926,30 @@ async fn cancel_and_settle(sessions: &SessionRuntime, handle: &RunHandle) -> Res
 /// Answers one pending tool approval. Failures are reported but never fatal:
 /// an unanswerable approval resolves by the runtime's own deny-by-timeout,
 /// so the run still cannot stall forever.
+/// The session grant an allowlist entry earns a held call, if any. Shell
+/// prefixes match the server's own preview of the command with the policy's
+/// word-boundary rule, so `--allow-shell "cargo test"` covers
+/// `cargo test -p qq-core` and never `cargo test | sh`.
+fn allowlisted_grant(
+    options: &HeadlessOptions,
+    tool_name: &str,
+    shell: Option<&ShellCommandPreview>,
+) -> Option<ApprovalGrant> {
+    if options.allow_tools.iter().any(|name| name == tool_name) {
+        return Some(ApprovalGrant::Tool {
+            name: tool_name.to_owned(),
+        });
+    }
+    let command = shell.map(|preview| preview.command.as_str())?;
+    options
+        .allow_shell_prefixes
+        .iter()
+        .find(|prefix| qq_core::shell_prefix_matches(prefix, command))
+        .map(|prefix| ApprovalGrant::ShellPrefix {
+            prefix: prefix.clone(),
+        })
+}
+
 async fn respond_approval(
     sessions: &SessionRuntime,
     run_id: RunId,
@@ -1194,6 +1275,92 @@ mod tests {
         }
     }
 
+    /// Issues a dangerous shell command (held under `auto`) on each of two
+    /// turns, then answers. Distinct call ids so the second is a fresh
+    /// approval decision, not a replay.
+    struct DangerousShellProvider {
+        turn: Mutex<usize>,
+    }
+
+    impl Provider for DangerousShellProvider {
+        fn stream(&self, _request: ModelRequest) -> ProviderStream {
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            if current < 2 {
+                let id = format!("call_rm_{current}");
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::ToolCallStarted {
+                        id: id.clone(),
+                        name: "shell".to_owned(),
+                    }),
+                    Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: id.clone(),
+                        json: format!(r#"{{"command":"rm -r scratch{current}"}}"#),
+                    }),
+                    Ok(ProviderEvent::ToolCallCompleted { id }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+    }
+
+    /// Turn one requests a read, holding its completion until released, so a
+    /// steering line sent meanwhile lands at the boundary before turn two.
+    /// Turn two answers and records the request it saw.
+    struct SteerableProvider {
+        turn: Mutex<usize>,
+        release: Arc<tokio::sync::Notify>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for SteerableProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            let mut turn = self.turn.lock().unwrap();
+            let current = *turn;
+            *turn += 1;
+            drop(turn);
+            if current == 0 {
+                let release = Arc::clone(&self.release);
+                Box::pin(
+                    stream::once(async move {
+                        release.notified().await;
+                        Ok(ProviderEvent::ToolCallStarted {
+                            id: "call_read".to_owned(),
+                            name: "read_file".to_owned(),
+                        })
+                    })
+                    .chain(stream::iter([
+                        Ok(ProviderEvent::ToolCallArgumentsDelta {
+                            id: "call_read".to_owned(),
+                            json: r#"{"path":"note.txt"}"#.to_owned(),
+                        }),
+                        Ok(ProviderEvent::ToolCallCompleted {
+                            id: "call_read".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ])),
+                )
+            } else {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage: None }),
+                ]))
+            }
+        }
+    }
+
     /// Never produces an event; only cancellation can end its run.
     struct HangingProvider;
 
@@ -1454,6 +1621,8 @@ mod tests {
             pricing_provenance: Some("test fixture".to_owned()),
             approval: HeadlessApproval::ReadOnly,
             reviewer_configured: false,
+            allow_tools: Vec::new(),
+            allow_shell_prefixes: Vec::new(),
             timeout: None,
             max_turns: None,
             max_cost_usd_nanos: None,
@@ -1475,6 +1644,7 @@ mod tests {
                 &fixture.sessions,
                 options,
                 interrupt,
+                None,
                 &mut stdout,
                 &mut stderr,
             ),
@@ -1651,6 +1821,204 @@ mod tests {
         );
     }
 
+    /// `--allow-shell` answers a held command with a session grant: the first
+    /// request is approved for the session and the second identical prefix
+    /// is never held at all. A prefix that does not match is denied as
+    /// before, and the grant never extends over a control character.
+    #[tokio::test]
+    async fn shell_allowlist_grants_the_session_on_first_hold() {
+        let fixture = fixture(|| DangerousShellProvider {
+            turn: Mutex::new(0),
+        })
+        .await;
+        for name in ["scratch0", "scratch1"] {
+            std::fs::create_dir_all(fixture.workspace.join(name)).unwrap();
+        }
+        let mut options = options(&fixture.workspace);
+        options.approval = HeadlessApproval::Auto;
+        options.allow_shell_prefixes = vec!["rm -r".to_owned()];
+
+        let (status, stdout, stderr) = run_to_end(&fixture, options, std::future::pending()).await;
+
+        assert_eq!(status, HeadlessStatus::Completed, "{stderr}");
+        assert!(!fixture.workspace.join("scratch0").exists());
+        assert!(!fixture.workspace.join("scratch1").exists());
+        let records = parse_records(&stdout);
+        let approvals: Vec<_> = event_records(&records)
+            .into_iter()
+            .filter(|record| record["envelope"]["event"]["type"] == "tool_approval_requested")
+            .collect();
+        // The runtime asks about the first call only; the grant covers the
+        // second, which is never held.
+        assert_eq!(approvals.len(), 1, "one held call");
+        let resolved = event_records(&records)
+            .into_iter()
+            .filter(|record| record["envelope"]["event"]["type"] == "tool_approval_resolved")
+            .count();
+        assert_eq!(resolved, 1);
+        assert!(
+            finished_tool_calls(&records)
+                .iter()
+                .all(|call| call["state"] == "completed")
+        );
+
+        // A prefix that matches nothing leaves auto's deny in place.
+        let unmatched = self::fixture(|| DangerousShellProvider {
+            turn: Mutex::new(0),
+        })
+        .await;
+        let mut strict = self::options(&unmatched.workspace);
+        strict.approval = HeadlessApproval::Auto;
+        strict.allow_shell_prefixes = vec!["rm -rf".to_owned(), "cargo".to_owned()];
+        let (status, stdout, _) = run_to_end(&unmatched, strict, std::future::pending()).await;
+        assert_eq!(status, HeadlessStatus::Completed);
+        assert!(
+            finished_tool_calls(&parse_records(&stdout))
+                .iter()
+                .all(|call| call["state"] == "denied")
+        );
+    }
+
+    /// `--allow-tool` approves a held tool for the session under read-only
+    /// too: the allowlist is explicit authority, narrower than `full`.
+    #[tokio::test]
+    async fn tool_allowlist_approves_held_calls_under_auto() {
+        let fixture = fixture(|| DangerousShellProvider {
+            turn: Mutex::new(0),
+        })
+        .await;
+        for name in ["scratch0", "scratch1"] {
+            std::fs::create_dir_all(fixture.workspace.join(name)).unwrap();
+        }
+        let mut options = options(&fixture.workspace);
+        options.approval = HeadlessApproval::Auto;
+        options.allow_tools = vec!["shell".to_owned()];
+        let (status, stdout, _) = run_to_end(&fixture, options, std::future::pending()).await;
+        assert_eq!(status, HeadlessStatus::Completed);
+        assert!(
+            finished_tool_calls(&parse_records(&stdout))
+                .iter()
+                .all(|call| call["state"] == "completed")
+        );
+    }
+
+    /// A line on the steering channel is injected at the run's next boundary
+    /// and reaches the model on the following turn; a blank line is ignored;
+    /// closing the channel does not end the run.
+    #[tokio::test]
+    async fn stdin_steering_lines_reach_the_next_model_turn() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let fixture = {
+            let release = Arc::clone(&release);
+            let requests = Arc::clone(&requests);
+            fixture(move || SteerableProvider {
+                turn: Mutex::new(0),
+                release: Arc::clone(&release),
+                requests: Arc::clone(&requests),
+            })
+            .await
+        };
+        std::fs::write(fixture.workspace.join("note.txt"), "content\n").unwrap();
+        let options = options(&fixture.workspace);
+        let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_STEER_LINES);
+        let sessions = fixture.sessions.clone();
+        let workspace = fixture.workspace.display().to_string();
+        let session_requests = Arc::clone(&requests);
+        let driver = tokio::spawn(async move {
+            // Wait until the run is executing (turn one is held open by the
+            // provider), steer, wait for the steering to be durably queued,
+            // then release the turn so the boundary applies it.
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if session_requests.lock().unwrap().len() == 1 {
+                    break;
+                }
+            }
+            tx.send("   ".to_owned()).await.unwrap();
+            tx.send("also check the tests".to_owned()).await.unwrap();
+            let resolved = send(
+                &sessions,
+                SessionCommand::ResolveWorkspace { path: workspace },
+            )
+            .await
+            .unwrap();
+            let CommandOutcome::WorkspaceResolved { workspace_id } = resolved.outcome else {
+                panic!("unexpected receipt")
+            };
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let sessions_snapshot = sessions
+                    .snapshot(SnapshotRequest {
+                        workspace_id,
+                        focused_session_id: None,
+                        include_sessions: Vec::new(),
+                        session_limit: 1,
+                        message_limit: 8,
+                    })
+                    .await
+                    .unwrap();
+                let Some(session_id) = sessions_snapshot.sessions.first().map(|s| s.id) else {
+                    continue;
+                };
+                let snapshot = sessions
+                    .snapshot(SnapshotRequest {
+                        workspace_id,
+                        focused_session_id: Some(session_id),
+                        include_sessions: Vec::new(),
+                        session_limit: 1,
+                        message_limit: 8,
+                    })
+                    .await
+                    .unwrap();
+                let queued = snapshot
+                    .focused
+                    .as_ref()
+                    .is_some_and(|body| body.messages.iter().any(|message| message.steering));
+                if queued {
+                    break;
+                }
+            }
+            drop(tx);
+            release.notify_one();
+        });
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = tokio::time::timeout(
+            Duration::from_secs(30),
+            run(
+                &fixture.sessions,
+                options,
+                std::future::pending(),
+                Some(rx),
+                &mut stdout,
+                &mut stderr,
+            ),
+        )
+        .await
+        .expect("terminal status");
+        driver.await.unwrap();
+        assert_eq!(status, HeadlessStatus::Completed);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let records = parse_records(&stdout);
+        let steering_events: Vec<&str> = event_records(&records)
+            .into_iter()
+            .filter_map(|record| record["envelope"]["event"]["type"].as_str())
+            .filter(|kind| kind.starts_with("steering_"))
+            .collect();
+        assert_eq!(steering_events, ["steering_queued", "steering_applied"]);
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(
+            captured[1].messages().iter().any(|message| {
+                message.content().iter().any(|block| {
+                    matches!(block, qq_provider::ContentBlock::Text { text } if text.contains("also check the tests"))
+                })
+            }),
+            "turn two carries the steering text"
+        );
+    }
+
     #[tokio::test]
     async fn read_only_mode_denies_mutations_without_stalling() {
         let fixture = fixture(MutatingProvider::new).await;
@@ -1805,6 +2173,7 @@ mod tests {
                 &fixture.sessions,
                 options,
                 std::future::pending(),
+                None,
                 &mut stdout,
                 &mut stderr,
             ),
@@ -1829,6 +2198,7 @@ mod tests {
                 &fixture.sessions,
                 options,
                 std::future::pending(),
+                None,
                 &mut stdout,
                 &mut stderr,
             ),
@@ -1857,6 +2227,7 @@ mod tests {
                 &fixture.sessions,
                 options,
                 std::future::pending(),
+                None,
                 &mut stdout,
                 &mut stderr,
             ),
@@ -1880,6 +2251,7 @@ mod tests {
             &fixture.sessions,
             options,
             std::future::pending(),
+            None,
             &mut stdout,
             &mut stderr,
         )
@@ -1901,6 +2273,7 @@ mod tests {
                 &sessions,
                 options,
                 std::future::pending(),
+                None,
                 &mut stdout,
                 &mut stderr,
             )

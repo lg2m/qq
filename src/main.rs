@@ -105,15 +105,41 @@ async fn ask(prompt: String, overrides: &CliOverrides) -> Result<(), Box<dyn Err
 /// model failure, 2 invalid configuration, 3 timeout or budget exhaustion,
 /// 4 harness or persistence failure, 130 interrupted.
 async fn headless_run(args: cli::RunArgs, overrides: &CliOverrides) -> ExitCode {
+    let steer_stdin = args.steer_stdin;
     match prepare_headless(args, overrides).await {
         Ok((sessions, options)) => {
             let interrupt = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
+            // Steering lines come from stdin only when asked for, so a run
+            // launched from a script with an inherited stdin never blocks on
+            // it or swallows it.
+            let steering = if steer_stdin {
+                let (tx, rx) = tokio::sync::mpsc::channel(headless::MAX_PENDING_STEER_LINES);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt as _;
+                    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if tx.send(line).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Some(rx)
+            } else {
+                None
+            };
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
-            let status =
-                headless::run(&sessions, options, interrupt, &mut stdout, &mut stderr).await;
+            let status = headless::run(
+                &sessions,
+                options,
+                interrupt,
+                steering,
+                &mut stdout,
+                &mut stderr,
+            )
+            .await;
             drop(stdout);
             drop(stderr);
             match sessions.close().await {
@@ -242,6 +268,8 @@ async fn prepare_headless(
             cli::RunApproval::Full => headless::HeadlessApproval::Full,
         },
         reviewer_configured: snapshot.reviewer_model().is_some(),
+        allow_tools: args.allow_tools,
+        allow_shell_prefixes: args.allow_shell_prefixes,
         timeout: args.timeout_seconds.map(std::time::Duration::from_secs),
         max_turns: args.max_turns,
         max_cost_usd_nanos,

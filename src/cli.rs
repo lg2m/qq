@@ -93,6 +93,22 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
+    /// Approve every held call to this tool for the session (repeatable).
+    /// Under `--approval auto` this answers escalations the policy would
+    /// otherwise deny, without opening the whole run up as `full` does.
+    #[arg(long = "allow-tool", value_name = "NAME")]
+    pub allow_tools: Vec<String>,
+
+    /// Approve held shell commands starting with this word-boundary prefix
+    /// for the session (repeatable), e.g. `--allow-shell "cargo test"`.
+    #[arg(long = "allow-shell", value_name = "PREFIX")]
+    pub allow_shell_prefixes: Vec<String>,
+
+    /// Read steering messages from stdin, one per line, and inject each at
+    /// the run's next model/tool boundary. Without it stdin is not read.
+    #[arg(long)]
+    pub steer_stdin: bool,
+
     /// Cancel the run after N seconds and exit with the timeout status.
     #[arg(long, value_name = "N")]
     pub timeout_seconds: Option<u64>,
