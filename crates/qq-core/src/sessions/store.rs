@@ -454,6 +454,8 @@ impl Store {
             session_id: parent.session_id,
             run_id: parent.run_id,
             tool_call_id: Some(call_id),
+            depth: parent.depth,
+            root_run_id: parent.root_run_id,
         };
         self.call(Priority::Control, move |connection| {
             create_child_run(
@@ -533,19 +535,27 @@ impl Store {
         .await
     }
 
-    /// Reserves the next queued run from one of the two scheduling queues:
-    /// child-session runs when `children` is set, root-session runs
-    /// otherwise. The queues are separate because each draws from its own
-    /// permit pool.
+    /// Reserves the next queued run whose session sits at exactly `depth`
+    /// (0 = roots). The scheduler reserves per depth so each permit pool
+    /// stays independent.
+    pub(super) async fn reserve_next_run_at_depth(
+        &self,
+        depth: u16,
+    ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
+        let store_id = self.store_id;
+        self.call(Priority::Control, move |connection| {
+            reserve_next_run(connection, store_id, depth)
+        })
+        .await
+    }
+
+    /// Test convenience: roots, or depth-one children.
+    #[cfg(test)]
     pub(super) async fn reserve_next_run(
         &self,
         children: bool,
     ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
-        let store_id = self.store_id;
-        self.call(Priority::Control, move |connection| {
-            reserve_next_run(connection, store_id, children)
-        })
-        .await
+        self.reserve_next_run_at_depth(u16::from(children)).await
     }
 
     #[cfg(test)]

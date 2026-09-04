@@ -192,17 +192,26 @@ async fn prepare_execution(
                 },
             });
         }
-        let base = if !claimed.user_initiated {
-            RunCapabilities::restricted()
+        // A run may delegate while its depth is below the roster's effective
+        // maximum (itself capped at the runtime ceiling). Only depth-one
+        // children may hold write authority, so deeper spawners never offer
+        // it; grandchildren are read-only by construction.
+        let delegation = &loaded.plan.descriptor().delegation;
+        let effective_depth = delegation.max_depth.clamp(1, MAX_CHILD_DEPTH);
+        let spawner = if claimed.depth < effective_depth {
+            Some(Arc::new(
+                SessionSubagentSpawner::new(Arc::clone(inner), claimed.clone())
+                    .with_write_children(delegation.write_children && claimed.depth == 0),
+            ) as Arc<dyn SubagentSpawner>)
         } else {
-            let spawner = if claimed.child {
-                None
-            } else {
-                Some(Arc::new(
-                    SessionSubagentSpawner::new(Arc::clone(inner), claimed.clone())
-                        .with_write_children(loaded.plan.descriptor().delegation.write_children),
-                ) as Arc<dyn SubagentSpawner>)
-            };
+            None
+        };
+        let base = if !claimed.user_initiated {
+            match spawner {
+                Some(spawner) => RunCapabilities::restricted().with_spawner(spawner),
+                None => RunCapabilities::restricted(),
+            }
+        } else {
             RunCapabilities::user(spawner)
         };
         // A read-only session (every read child) never sees the schemas its

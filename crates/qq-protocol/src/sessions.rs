@@ -864,6 +864,15 @@ pub struct SpawnOrigin {
     /// Absent for children created before the spawning call was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<ToolCallId>,
+    /// Nesting depth of the spawned session (1 = a root's child). Defaults to
+    /// 1 on decode, which is what every session recorded before depth
+    /// existed was.
+    #[serde(default = "default_spawn_depth")]
+    pub depth: u16,
+}
+
+const fn default_spawn_depth() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2356,6 +2365,7 @@ mod tests {
             spawned_by: Some(SpawnOrigin {
                 run_id: id(8),
                 tool_call_id: Some(id(7)),
+                depth: 1,
             }),
             activity: Some(RunActivity::GeneratingResponse),
             ..decoded
@@ -2376,7 +2386,8 @@ mod tests {
             serde_json::from_value::<SpawnOrigin>(bare).unwrap(),
             SpawnOrigin {
                 run_id: id(8),
-                tool_call_id: None
+                tool_call_id: None,
+                depth: 1,
             }
         );
     }

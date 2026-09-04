@@ -39,14 +39,14 @@ pub(super) async fn schedule_runs(
         if *shutdown.borrow() || *inner.failed.borrow() {
             break;
         }
-        // Root runs and child (sub-agent) runs are claimed from separate
-        // queues against separate permit pools; see `child_permits` for why
-        // sharing one pool would deadlock parents awaiting their children.
-        for children in [false, true] {
-            let pool = if children {
-                &inner.child_permits
-            } else {
+        // Each depth is claimed from its own queue against its own permit
+        // pool; see `child_permits` for why sharing a pool between a depth
+        // and its parents would deadlock parents awaiting their children.
+        for depth in 0..=MAX_CHILD_DEPTH {
+            let pool = if depth == 0 {
                 &inner.permits
+            } else {
+                &inner.child_permits[usize::from(depth) - 1]
             };
             loop {
                 if *shutdown.borrow() || *inner.failed.borrow() {
@@ -56,7 +56,7 @@ pub(super) async fn schedule_runs(
                     Ok(permit) => permit,
                     Err(_) => break,
                 };
-                let claimed = match inner.store.reserve_next_run(children).await {
+                let claimed = match inner.store.reserve_next_run_at_depth(depth).await {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => break,
                     Err(_) => {

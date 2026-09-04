@@ -75,5 +75,5 @@ pub(crate) trait SubagentSpawner: Send + Sync {
 
 /// The dispatcher's defensive answer when `spawn_agent` is called by a run
 /// that has no spawner (a child session, or a run outside the session layer).
-pub(crate) const SPAWN_UNAVAILABLE_RESULT: &str =
-    "spawn_agent is not available in this session; sub-agents cannot spawn sub-agents.";
+pub(crate) const SPAWN_UNAVAILABLE_RESULT: &str = "spawn_agent is not available in this \
+     session: this run is at the deepest delegation level its configuration permits.";

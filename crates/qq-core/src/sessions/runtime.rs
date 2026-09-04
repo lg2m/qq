@@ -347,15 +347,16 @@ pub(super) struct SessionRuntimeInner {
     pub(super) grant_authority: Option<Arc<dyn WorkspaceGrantAuthority>>,
     pub(super) approval_reviewer: Option<Arc<dyn ApprovalReviewer>>,
     pub(super) permits: Arc<Semaphore>,
-    /// Run permits for child (sub-agent) sessions, deliberately a separate
-    /// pool from `permits`: a parent run holds its permit for its whole
-    /// lifetime, including while it awaits a spawned child. If children drew
-    /// from the same pool, `max_active_runs` parents all awaiting children
-    /// would leave no permit with which any child could ever start — a
-    /// deadlock. Children cannot spawn (depth is one), so no such wait cycle
-    /// exists against this pool. Sized like the root pool so global run
-    /// concurrency stays bounded at twice `max_active_runs`.
-    pub(super) child_permits: Arc<Semaphore>,
+    /// Run permits for child (sub-agent) sessions, one pool per depth
+    /// (`child_permits[d - 1]` serves depth `d`), each separate from
+    /// `permits`: a parent run holds its permit for its whole lifetime,
+    /// including while it awaits a spawned child. If a depth drew from its
+    /// parents' pool, `max_active_runs` parents all awaiting children would
+    /// leave no permit with which any child could ever start — a deadlock —
+    /// and the same holds between depth one and depth two. Each pool is
+    /// sized like the root pool, so global run concurrency stays bounded at
+    /// `(MAX_CHILD_DEPTH + 1) * max_active_runs`.
+    pub(super) child_permits: Vec<Arc<Semaphore>>,
     pub(super) max_active_runs: usize,
     pub(super) schedule: mpsc::Sender<()>,
     pub(super) cancellations: Mutex<HashMap<RunId, watch::Sender<bool>>>,
@@ -491,7 +492,9 @@ impl SessionRuntime {
             grant_authority: options.grant_authority,
             approval_reviewer: options.approval_reviewer,
             permits: Arc::new(Semaphore::new(options.max_active_runs)),
-            child_permits: Arc::new(Semaphore::new(options.max_active_runs)),
+            child_permits: (0..MAX_CHILD_DEPTH)
+                .map(|_| Arc::new(Semaphore::new(options.max_active_runs)))
+                .collect(),
             max_active_runs: options.max_active_runs,
             schedule,
             cancellations: Mutex::new(HashMap::new()),
@@ -751,7 +754,11 @@ impl SessionRuntime {
             let unfinished = self.inner.store.unfinished_run_ids().await?;
             let preparation_quiescent = self.inner.permits.available_permits()
                 == self.inner.max_active_runs
-                && self.inner.child_permits.available_permits() == self.inner.max_active_runs;
+                && self
+                    .inner
+                    .child_permits
+                    .iter()
+                    .all(|pool| pool.available_permits() == self.inner.max_active_runs);
             if unfinished.is_empty() && preparation_quiescent && *grant_promotion_stopped.borrow() {
                 // The promotion worker publishes `failed` before its stopped
                 // guard fires. Re-read after observing stopped so its failure
@@ -949,6 +956,10 @@ pub enum SessionRuntimeError {
     InvalidApprovalGrant,
     #[error("a spawned child session cannot be raised above the authority its parent granted")]
     ChildAuthorityEscalation,
+    #[error("sub-agent nesting would exceed the runtime depth ceiling")]
+    ChildDepthExceeded,
+    #[error("this run's delegation tree already holds the maximum number of sub-agents")]
+    DescendantLimitReached,
     #[error("session follow-up queue is full")]
     QueueFull,
     #[error("session context exceeds the size limit")]

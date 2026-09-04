@@ -193,6 +193,7 @@ pub fn capabilities(steering: SteeringCapabilities) -> ServerCapabilities {
             max_concurrent_children: 4,
             max_child_depth: 2,
             max_output_continuations: 3,
+            max_descendants: 24,
             max_correlation_entries: 8,
         },
         approvals: [

@@ -1836,6 +1836,8 @@ fn map_session_runtime_error(error: SessionRuntimeError) -> ServerHandlerError {
         | SessionRuntimeError::ApprovalNotPending
         | SessionRuntimeError::InvalidApprovalGrant
         | SessionRuntimeError::ChildAuthorityEscalation
+        | SessionRuntimeError::ChildDepthExceeded
+        | SessionRuntimeError::DescendantLimitReached
         | SessionRuntimeError::ContextTooLarge
         | SessionRuntimeError::EventTooLarge
         | SessionRuntimeError::InvalidModelSelection

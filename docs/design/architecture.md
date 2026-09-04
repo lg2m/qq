@@ -636,7 +636,16 @@ plan records the roster in its descriptor (version 4), renders it once into the
 Delegation section of the system prompt together with the spawning model's own
 route and context window, and compiles `spawn_agent` with a `role` argument
 plus an exact `model` override limited to roster routes (the declaration is
-bounded at 2 KiB). At dispatch `resolve_delegation_route` applies explicit
+bounded at 2 KiB). Depth follows the roster too: a run receives a spawner while
+its session `depth` is below the roster's `max_depth` (1 by default, 3 the
+runtime ceiling), so children may delegate when configured and the deepest
+level is refused at dispatch. Only depth-one children may hold write
+authority; grandchildren are read-only by construction. Every session records
+its `depth` and `root_run_id`; one root's tree is capped at
+`MAX_DESCENDANTS_PER_ROOT` (24) sessions, cancellation and recovery cascade
+over the whole subtree by a bounded recursive query, inclusive accounting sums
+the same subtree, and each depth claims runs from its own permit pool so
+parents awaiting children at any level cannot starve the level below. At dispatch `resolve_delegation_route` applies explicit
 model, then role, then the roster's default role; without a roster the legacy
 worker/parent fallback and full authenticated route list remain, and the
 session spawner still validates every resolved route against the authenticated

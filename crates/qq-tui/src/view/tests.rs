@@ -1936,6 +1936,7 @@ fn spawned_children_render_under_their_spawn_call_and_never_fold() {
                     spawned_by: Some(qq_protocol::SpawnOrigin {
                         run_id,
                         tool_call_id: Some(spawn_call.id),
+                        depth: 1,
                     }),
                     title: "survey callers".to_owned(),
                     status: SessionStatus::Running,

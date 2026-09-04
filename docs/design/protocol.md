@@ -328,9 +328,10 @@ Response `ServerCapabilities` (abridged; see
     "max_pending_prompts": 16,
     "max_children": 8,
     "max_concurrent_children": 3,
-    "max_child_depth": 1,
+    "max_child_depth": 3,
     "max_correlation_entries": 8,
-    "max_output_continuations": 3
+    "max_output_continuations": 3,
+    "max_descendants": 24
   },
   "approvals": ["approve_once", "approve_for_session", "approve_for_workspace", "deny"],
   "approval_modes": ["read_only", "ask", "auto", "full"],

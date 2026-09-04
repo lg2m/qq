@@ -50,6 +50,7 @@
     "max_concurrent_children": 3,
     "max_child_depth": 1,
     "max_correlation_entries": 8,
+    "max_descendants": 24,
     "max_output_continuations": 3
   },
   "approvals": [

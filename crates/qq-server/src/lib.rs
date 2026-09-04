@@ -873,6 +873,7 @@ fn server_capabilities(
             max_child_depth: qq_core::MAX_CHILD_DEPTH,
             max_correlation_entries: u16::try_from(MAX_CORRELATION_ENTRIES).unwrap_or(u16::MAX),
             max_output_continuations: qq_core::MAX_OUTPUT_CONTINUATIONS,
+            max_descendants: qq_core::MAX_DESCENDANTS_PER_ROOT,
         },
         approvals: vec![
             "approve_once".to_owned(),
@@ -2157,7 +2158,8 @@ mod tests {
             capabilities.limits.max_request_bytes,
             MAX_REQUEST_BYTES as u64
         );
-        assert_eq!(capabilities.limits.max_child_depth, 1);
+        assert_eq!(capabilities.limits.max_child_depth, 3);
+        assert_eq!(capabilities.limits.max_descendants, 24);
         assert_eq!(
             capabilities.limits.max_children,
             qq_core::MAX_SPAWNED_CHILDREN_PER_RUN

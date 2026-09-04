@@ -167,9 +167,13 @@ pub struct LimitCapabilities {
     pub max_children: u16,
     /// Hard ceiling on `RunLimits::max_concurrent_children`.
     pub max_concurrent_children: u16,
-    /// Deepest sub-agent nesting the runtime executes.
+    /// Deepest sub-agent nesting the runtime executes (the ceiling on a
+    /// roster's `max_depth`).
     pub max_child_depth: u16,
     pub max_correlation_entries: u16,
+    /// Most sessions one root run's delegation tree may hold.
+    #[serde(default)]
+    pub max_descendants: u16,
     /// Most times one run resumes a turn the provider cut at its output token
     /// limit before settling as `provider_output_truncated`.
     #[serde(default)]

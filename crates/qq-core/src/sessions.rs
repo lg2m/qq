@@ -117,12 +117,12 @@ pub const MAX_CONCURRENT_CHILDREN_PER_RUN: u16 = 3;
 /// Total children one parent run may spawn before further `spawn_agent`
 /// calls return a tool error. `RunLimits::max_children` may lower it per run.
 pub const MAX_SPAWNED_CHILDREN_PER_RUN: u16 = 8;
-/// Deepest sub-agent nesting this build executes: children never spawn.
-/// Advertised; `delegation.max_depth` may not exceed it.
-pub const MAX_CHILD_DEPTH: u16 = 1;
-/// The hard ceiling any future configuration may raise `MAX_CHILD_DEPTH` to.
-/// Advertised so clients can validate a roster's `max_depth` before sending.
-pub const MAX_CHILD_DEPTH_CEILING: u16 = 3;
+/// Deepest sub-agent nesting the runtime executes: the hard ceiling on
+/// `delegation.max_depth`. The effective depth of one tree is the roster's
+/// `max_depth` (default 1); runs at that depth receive no spawner.
+pub const MAX_CHILD_DEPTH: u16 = 3;
+/// Alias kept for capability documents: the ceiling clients validate against.
+pub const MAX_CHILD_DEPTH_CEILING: u16 = MAX_CHILD_DEPTH;
 /// Most routes a delegation roster may declare; the config layer enforces
 /// the same bound, this one is the runtime's and is advertised.
 pub const MAX_DELEGATION_ROSTER: u16 = 8;
@@ -318,9 +318,14 @@ struct ClaimedRun {
     command_id: CommandId,
     kind: RunKind,
     /// Whether the run belongs to a child (sub-agent) session. Guaranteed by
-    /// the claim query's parent filter; child runs may not spawn further
-    /// children.
+    /// the claim query's parent filter.
     child: bool,
+    /// Nesting depth of the run's session: 0 for a root, 1 for a child. A
+    /// run may spawn only while `depth < effective_max_depth`.
+    depth: u16,
+    /// The root run whose delegation tree this run belongs to; the run itself
+    /// for a root. Descendant caps and cascades key on it.
+    root_run_id: RunId,
     /// True only when this run's command is present in the durable command
     /// journal. Runtime- and model-created runs use generated command ids but
     /// intentionally have no command row.
@@ -376,6 +381,8 @@ impl ClaimedRun {
             input: Vec::new(),
             profile: self.profile.clone(),
             approval_mode: self.approval_mode,
+            depth: self.depth,
+            root_run_id: self.root_run_id,
         }
     }
 }
@@ -649,7 +656,16 @@ struct ChildRunParent {
     run_id: RunId,
     /// The `spawn_agent` call that requested the child, when known.
     tool_call_id: Option<ToolCallId>,
+    /// The parent's own depth; the child is one deeper.
+    depth: u16,
+    /// The root run of the tree the child joins.
+    root_run_id: RunId,
 }
+
+/// Most sessions one root run's delegation tree may hold across every depth.
+/// Bounds fan-out where per-run child caps alone would not (eight children
+/// each spawning eight).
+pub const MAX_DESCENDANTS_PER_ROOT: u16 = 24;
 
 fn create_child_run(
     connection: &mut Connection,
@@ -673,7 +689,13 @@ fn create_child_run(
         session_id: parent_session_id,
         run_id: parent_run_id,
         tool_call_id: spawned_by_tool_call_id,
+        depth: parent_depth,
+        root_run_id,
     } = parent;
+    let depth = parent_depth.saturating_add(1);
+    if depth > MAX_CHILD_DEPTH {
+        return Err(SessionRuntimeError::ChildDepthExceeded);
+    }
     validate_model_selection(&model)?;
     validate_run_limits(&limits)?;
     let limits_json = if limits.is_empty() {
@@ -717,6 +739,16 @@ fn create_child_run(
     if session_count >= MAX_SESSIONS_PER_WORKSPACE {
         return Err(SessionRuntimeError::SessionLimitReached);
     }
+    let descendants: u32 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE root_run_id = ?1",
+            [root_run_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if descendants >= u32::from(MAX_DESCENDANTS_PER_ROOT) {
+        return Err(SessionRuntimeError::DescendantLimitReached);
+    }
 
     let session_id = SessionId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
     let run_id = RunId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
@@ -733,8 +765,8 @@ fn create_child_run(
             "INSERT INTO sessions(
                 id, workspace_id, parent_id, owner_run_id, spawned_by_tool_call_id, title,
                 status, queued_prompts, model, max_output_tokens, organization, approval_mode,
-                created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?10, ?5, 'queued', 1, ?6, ?7, ?8, ?11, ?9, ?9)",
+                created_at_ms, updated_at_ms, depth, root_run_id
+             ) VALUES (?1, ?2, ?3, ?4, ?10, ?5, 'queued', 1, ?6, ?7, ?8, ?11, ?9, ?9, ?12, ?13)",
             params![
                 session_id.to_string(),
                 workspace_id.to_string(),
@@ -747,6 +779,8 @@ fn create_child_run(
                 now,
                 spawned_by_tool_call_id.map(|id| id.to_string()),
                 approval_mode_str(approval_mode),
+                depth,
+                root_run_id.to_string(),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -961,12 +995,23 @@ fn execute_command(
             if session_count >= MAX_SESSIONS_PER_WORKSPACE {
                 return Err(SessionRuntimeError::SessionLimitReached);
             }
+            // A publicly parented session sits one level below its parent and
+            // shares its parent's tree, so depth caps and cascades treat it
+            // like a spawned child even though no run owns it.
+            let mut depth = 0_u16;
+            let mut root_run_id: Option<String> = None;
             if let Some(parent_id) = parent_id {
-                let parent_workspace = transaction
+                let (parent_workspace, parent_depth, parent_root) = transaction
                     .query_row(
-                        "SELECT workspace_id FROM sessions WHERE id = ?1",
+                        "SELECT workspace_id, depth, root_run_id FROM sessions WHERE id = ?1",
                         [parent_id.to_string()],
-                        |row| row.get::<_, String>(0),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, u16>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
                     )
                     .optional()
                     .map_err(|_| SessionRuntimeError::Persistence)?
@@ -974,6 +1019,11 @@ fn execute_command(
                 if parse_id::<WorkspaceId>(&parent_workspace)? != workspace_id {
                     return Err(SessionRuntimeError::ParentWorkspaceMismatch);
                 }
+                depth = parent_depth.saturating_add(1);
+                if depth > MAX_CHILD_DEPTH {
+                    return Err(SessionRuntimeError::ChildDepthExceeded);
+                }
+                root_run_id = parent_root;
             }
             let session_id = SessionId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
             transaction
@@ -981,8 +1031,9 @@ fn execute_command(
                     "INSERT INTO sessions(
                         id, workspace_id, parent_id, title, status, model,
                         max_output_tokens, organization, approval_mode,
-                        created_at_ms, updated_at_ms, profile, correlation_json
-                     ) VALUES (?1, ?2, ?3, 'New session', 'idle', ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
+                        created_at_ms, updated_at_ms, profile, correlation_json, depth,
+                        root_run_id
+                     ) VALUES (?1, ?2, ?3, 'New session', 'idle', ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         session_id.to_string(),
                         workspace_id.to_string(),
@@ -994,6 +1045,8 @@ fn execute_command(
                         now,
                         (!profile.is_default()).then(|| profile.as_str().to_owned()),
                         correlation_json,
+                        depth,
+                        root_run_id,
                     ],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2023,7 +2076,7 @@ fn execute_command(
 fn reserve_next_run(
     connection: &mut Connection,
     store_id: StoreId,
-    children: bool,
+    depth: u16,
 ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
     // A preparation reservation is unpublished coordination: the prompt,
     // message, and queued run were already committed under FULL. In WAL mode,
@@ -2033,7 +2086,7 @@ fn reserve_next_run(
     connection
         .pragma_update(None, "synchronous", "NORMAL")
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let reserved = reserve_next_run_recoverable(connection, store_id, children);
+    let reserved = reserve_next_run_recoverable(connection, store_id, depth);
     let restored = connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(|_| SessionRuntimeError::Persistence);
@@ -2046,7 +2099,7 @@ fn reserve_next_run(
 fn reserve_next_run_recoverable(
     connection: &mut Connection,
     _store_id: StoreId,
-    children: bool,
+    depth: u16,
 ) -> Result<Option<ClaimedRun>, SessionRuntimeError> {
     let transaction = connection
         .transaction()
@@ -2059,13 +2112,13 @@ fn reserve_next_run_recoverable(
                     (SELECT c.request_json FROM commands c WHERE c.id = r.command_id),
                     s.pending_context_overflow_basis_json,
                     s.context_tokens, s.context_occupancy_json, r.limits_json,
-                    r.input_json, s.profile, s.approval_mode
+                    r.input_json, s.profile, s.approval_mode, s.depth, s.root_run_id
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
              WHERE r.status = 'queued' AND s.active_run_id IS NULL
                AND s.preparing_run_id IS NULL
-               AND (s.parent_id IS NOT NULL) = ?1
+               AND s.depth = ?1
              ORDER BY COALESCE((
                          SELECT MAX(previous.started_at_ms)
                          FROM runs previous
@@ -2073,7 +2126,7 @@ fn reserve_next_run_recoverable(
                      ), 0),
                       r.created_at_ms, r.rowid
              LIMIT 1",
-            [children],
+            [depth],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -2095,6 +2148,8 @@ fn reserve_next_run_recoverable(
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
                     row.get::<_, String>(18)?,
+                    row.get::<_, u16>(19)?,
+                    row.get::<_, Option<String>>(20)?,
                 ))
             },
         )
@@ -2120,6 +2175,8 @@ fn reserve_next_run_recoverable(
         input_json,
         profile,
         approval_mode,
+        depth,
+        root_run,
     )) = row
     else {
         return Ok(None);
@@ -2129,6 +2186,10 @@ fn reserve_next_run_recoverable(
     let profile = parse_profile(profile.as_deref())?;
     let approval_mode = parse_approval_mode(&approval_mode)?;
     let run_id: RunId = parse_id(&run)?;
+    let root_run_id = match root_run {
+        Some(root) => parse_id(&root)?,
+        None => run_id,
+    };
     let session_id: SessionId = parse_id(&session)?;
     let command_id: CommandId = parse_id(&command)?;
     let user_message_id = parse_id::<MessageId>(&user_message)?;
@@ -2264,7 +2325,7 @@ fn reserve_next_run_recoverable(
         run_id,
         command_id,
         kind,
-        child: children,
+        child: depth > 0,
         user_initiated,
         literal_slash,
         session_model: model.clone(),
@@ -2277,6 +2338,8 @@ fn reserve_next_run_recoverable(
         input,
         profile,
         approval_mode,
+        depth,
+        root_run_id,
     }))
 }
 
@@ -2511,6 +2574,8 @@ fn start_auto_compaction(
             input: Vec::new(),
             profile: original.profile.clone(),
             approval_mode: original.approval_mode,
+            depth: original.depth,
+            root_run_id: original.root_run_id,
         },
         started,
     )))
@@ -4888,6 +4953,8 @@ fn settle_panicked_execution(
                 input: Vec::new(),
                 profile: original.profile.clone(),
                 approval_mode: original.approval_mode,
+                depth: original.depth,
+                root_run_id: original.root_run_id,
             };
             events.push(complete_run_in_transaction(
                 &transaction,
@@ -4946,10 +5013,19 @@ fn owned_running_run_ids(
 ) -> Result<Vec<RunId>, SessionRuntimeError> {
     let mut statement = connection
         .prepare(
-            "SELECT r.id
-             FROM sessions child JOIN runs r ON r.session_id = child.id
-             WHERE child.owner_run_id = ?1
-               AND r.cancel_requested = 1
+            "WITH RECURSIVE owned(session_id, level) AS (
+                 SELECT id, 1 FROM sessions WHERE owner_run_id = ?1
+                 UNION ALL
+                 SELECT child.id, owned.level + 1
+                 FROM sessions child
+                 JOIN runs parent_run ON parent_run.id = child.owner_run_id
+                 JOIN owned ON owned.session_id = parent_run.session_id
+                 WHERE owned.level < ?2
+             )
+             SELECT r.id
+             FROM owned JOIN sessions child ON child.id = owned.session_id
+             JOIN runs r ON r.session_id = child.id
+             WHERE r.cancel_requested = 1
                AND (
                    r.status = 'running'
                    OR (r.status = 'queued' AND child.preparing_run_id = r.id)
@@ -4959,7 +5035,9 @@ fn owned_running_run_ids(
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     statement
-        .query_map([owner_run_id.to_string()], |row| row.get::<_, String>(0))
+        .query_map(params![owner_run_id.to_string(), MAX_CHILD_DEPTH], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?
         .map(|row| {
             let run = row.map_err(|_| SessionRuntimeError::Persistence)?;
@@ -5009,15 +5087,28 @@ fn cancel_owned_child_runs(
 ) -> Result<OwnedChildCancellations, SessionRuntimeError> {
     let mut statement = transaction
         .prepare(
-            "SELECT r.id, child.id, child.workspace_id, r.status,
+            // The whole subtree: sessions this run owns, sessions their runs
+            // own, and so on to the depth ceiling. Cancelling a parent must
+            // settle every descendant, not only the first generation.
+            "WITH RECURSIVE owned(session_id, level) AS (
+                 SELECT id, 1 FROM sessions WHERE owner_run_id = ?1
+                 UNION ALL
+                 SELECT child.id, owned.level + 1
+                 FROM sessions child
+                 JOIN runs parent_run ON parent_run.id = child.owner_run_id
+                 JOIN owned ON owned.session_id = parent_run.session_id
+                 WHERE owned.level < ?2
+             )
+             SELECT r.id, child.id, child.workspace_id, r.status,
                     COALESCE(child.preparing_run_id = r.id, 0)
-             FROM sessions child JOIN runs r ON r.session_id = child.id
-             WHERE child.owner_run_id = ?1 AND r.status IN ('queued', 'running')
-             ORDER BY r.created_at_ms, r.rowid",
+             FROM owned JOIN sessions child ON child.id = owned.session_id
+             JOIN runs r ON r.session_id = child.id
+             WHERE r.status IN ('queued', 'running')
+             ORDER BY owned.level, r.created_at_ms, r.rowid",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let owned = statement
-        .query_map([owner_run_id.to_string()], |row| {
+        .query_map(params![owner_run_id.to_string(), MAX_CHILD_DEPTH], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -5245,6 +5336,8 @@ fn recover_interrupted_runs(
             input: Vec::new(),
             profile: AgentProfileId::default(),
             approval_mode: ApprovalMode::default(),
+            depth: 0,
+            root_run_id: run_id,
         };
         let event =
             complete_run_in_transaction(&transaction, store_id, &claimed, RunOutcome::Interrupted)?;
@@ -5820,7 +5913,7 @@ fn load_session_summary(
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
                       ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1),
                      s.owner_run_id, s.spawned_by_tool_call_id, s.profile, s.correlation_json,
-                     s.approval_mode
+                     s.approval_mode, s.depth
               FROM sessions s WHERE s.id = ?1",
             [session_id.to_string()],
             |row| {
@@ -5840,6 +5933,7 @@ fn load_session_summary(
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, String>(14)?,
+                    row.get::<_, u16>(15)?,
                 ))
             },
         )
@@ -5863,6 +5957,7 @@ fn load_session_summary(
                 profile,
                 correlation,
                 approval_mode,
+                depth,
             )| {
                 let direct_cost = accounting.direct.estimated_cost_usd_nanos;
                 let active_run_id: Option<RunId> = active.as_deref().map(parse_id).transpose()?;
@@ -5874,6 +5969,7 @@ fn load_session_summary(
                     Some(owner_run) => Some(SpawnOrigin {
                         run_id: parse_id(&owner_run)?,
                         tool_call_id: spawned_by_call.as_deref().map(parse_id).transpose()?,
+                        depth,
                     }),
                     None => None,
                 };
@@ -7729,7 +7825,7 @@ mod tests {
     }
 
     #[test]
-    fn store_accounting_projects_direct_and_immediate_child_runs_after_restart_and_pruning() {
+    fn store_accounting_projects_direct_and_subtree_runs_after_restart_and_pruning() {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("sessions.sqlite3");
         let workspace_id = WorkspaceId::generate().unwrap();
@@ -7793,7 +7889,9 @@ mod tests {
                 estimated_cost_usd_nanos: Some(5),
             }
         );
-        assert_eq!(parent.inclusive.usage, Some(usage(26, 33)));
+        // Inclusive is the whole bounded subtree: parent, both children, and
+        // the grandchild under the first child.
+        assert_eq!(parent.inclusive.usage, Some(usage(49, 62)));
         assert_eq!(parent.inclusive.estimated_cost_usd_nanos, None);
 
         let first_child = load_session_accounting(&connection, first_child_id).unwrap();
@@ -7814,8 +7912,9 @@ mod tests {
             )
             .unwrap();
         let pruned = load_session_accounting(&connection, parent_id).unwrap();
-        assert_eq!(pruned.inclusive.usage, Some(usage(9, 14)));
-        assert_eq!(pruned.inclusive.estimated_cost_usd_nanos, Some(18));
+        // Parent 2/3 + first child 7/11 + grandchild 23/29; cost 5 + 13 + 31.
+        assert_eq!(pruned.inclusive.usage, Some(usage(32, 43)));
+        assert_eq!(pruned.inclusive.estimated_cost_usd_nanos, Some(49));
     }
 
     #[test]
@@ -11253,7 +11352,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(
             !connection
@@ -11380,7 +11479,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -11448,7 +11547,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let (display_json, result) = connection
             .query_row(
@@ -11507,7 +11606,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -11572,7 +11671,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -11660,7 +11759,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -11716,7 +11815,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -11760,7 +11859,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         for column in [
             "model_json",
@@ -11827,7 +11926,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -11901,7 +12000,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let command_id_not_null: bool = connection
             .query_row(
@@ -11940,7 +12039,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -12010,7 +12109,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -12102,7 +12201,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let preparing_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12225,7 +12324,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let occupancy_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12331,7 +12430,7 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                "22"
+                "23"
             );
         }
     }
@@ -12452,7 +12551,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         // A historical child keeps its parent run but has no recorded call:
         // the summary says so explicitly instead of inventing one.
@@ -12462,6 +12561,7 @@ mod tests {
             Some(SpawnOrigin {
                 run_id: owner_run,
                 tool_call_id: None,
+                depth: 1,
             })
         );
         let parent = load_session_summary(&connection, parent_id).unwrap();
@@ -12538,7 +12638,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let message = load_message(&connection, message_id).unwrap();
         assert!(!message.truncated);
@@ -12613,7 +12713,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
         let shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12695,7 +12795,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "22"
+            "23"
         );
     }
 
@@ -13729,6 +13829,8 @@ mod tests {
             input: Vec::new(),
             profile: AgentProfileId::default(),
             approval_mode: ApprovalMode::default(),
+            depth: 0,
+            root_run_id: run_id,
         };
         (
             directory,
@@ -22147,7 +22249,9 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(runtime.inner.permits.available_permits(), 1);
-        assert_eq!(runtime.inner.child_permits.available_permits(), 1);
+        for pool in &runtime.inner.child_permits {
+            assert_eq!(pool.available_permits(), 1);
+        }
         let preparing: Option<String> = runtime
             .inner
             .store
@@ -25383,6 +25487,7 @@ mod tests {
             Some(SpawnOrigin {
                 run_id,
                 tool_call_id: Some(spawn_call),
+                depth: 1,
             })
         );
         // A snapshot taken later reports the same origin from the persisted row.
@@ -25766,6 +25871,8 @@ mod tests {
                             session_id: create_parent.session_id,
                             run_id: create_parent.run_id,
                             tool_call_id: None,
+                            depth: 0,
+                            root_run_id: create_parent.run_id,
                         },
                         ModelSelection {
                             model: Some("test/child".to_owned()),
@@ -26982,6 +27089,8 @@ mod tests {
             input: Vec::new(),
             profile: AgentProfileId::default(),
             approval_mode: ApprovalMode::default(),
+            depth: 0,
+            root_run_id: parent_run,
         };
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),
@@ -27707,6 +27816,470 @@ mod tests {
         assert!(matches!(
             finished_outcome(&observed, second_run),
             Some(RunOutcome::Completed)
+        ));
+    }
+
+    /// `QueueLoader` whose plans permit nesting to `max_depth` and, when set,
+    /// write children.
+    struct DepthLoader {
+        inner: QueueLoader,
+        max_depth: u16,
+        write_children: bool,
+    }
+
+    impl RuntimeLoader for DepthLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = self.inner.next_provider(&request);
+            let spawn_model_routes = self
+                .inner
+                .routed
+                .iter()
+                .map(|(model, _)| (*model).to_owned())
+                .collect::<Vec<_>>();
+            let delegation = qq_protocol::DelegationRoster {
+                roster: Vec::new(),
+                default_role: qq_protocol::DelegationRole::Balanced,
+                max_depth: self.max_depth,
+                write_children: self.write_children,
+            };
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime
+                                .with_spawn_model_routes(spawn_model_routes)
+                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled())
+                                .with_delegation(delegation),
+                            &request.workspace,
+                            None,
+                        )
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    async fn depth_harness(
+        routed: Vec<(&'static str, Arc<dyn Provider>)>,
+        queue: Vec<Arc<dyn Provider>>,
+        max_depth: u16,
+        max_active_runs: usize,
+    ) -> SpawnHarness {
+        spawn_harness_with_loader(
+            Arc::new(DepthLoader {
+                inner: QueueLoader {
+                    routed,
+                    queue: StdMutex::new(queue),
+                },
+                max_depth,
+                write_children: false,
+            }),
+            max_active_runs,
+        )
+        .await
+    }
+
+    /// A child that itself delegates once (to `test/grandchild`) and then
+    /// answers "child done".
+    fn delegating_child() -> Arc<dyn Provider> {
+        Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"look deeper","model":"test/grandchild"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn depth_two_lets_children_spawn_read_only_grandchildren_that_cannot_spawn() {
+        let grandchild_requests = Arc::new(StdMutex::new(Vec::new()));
+        let grandchild: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&grandchild_requests),
+            // A grandchild guessing spawn_agent is refused at dispatch.
+            script: vec![("spawn_agent", r#"{"task":"deeper still"}"#.to_owned())],
+            turn: StdMutex::new(0),
+        });
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"survey","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = depth_harness(
+            vec![
+                ("test/child", delegating_child()),
+                ("test/grandchild", grandchild),
+            ],
+            vec![parent],
+            2,
+            8,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "go").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        let created = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session } if session.parent_id.is_some() => {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(created.len(), 2, "child and grandchild");
+        let child = created
+            .iter()
+            .find(|session| session.parent_id == Some(harness.session_id))
+            .unwrap();
+        let grandchild = created
+            .iter()
+            .find(|session| session.parent_id == Some(child.id))
+            .unwrap();
+        assert_eq!(child.spawned_by.as_ref().unwrap().depth, 1);
+        assert_eq!(grandchild.spawned_by.as_ref().unwrap().depth, 2);
+        assert_eq!(grandchild.approval_mode, ApprovalMode::ReadOnly);
+        // The grandchild sits at the effective depth: no spawner, and its
+        // guessed spawn call is refused at dispatch.
+        let requests = grandchild_requests.lock().unwrap().clone();
+        assert!(
+            !requests[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "spawn_agent")
+        );
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("deepest delegation level")
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+        // Inclusive accounting and the snapshot see the whole tree.
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest::new(
+                harness.workspace_id,
+                Some(harness.session_id),
+                8,
+                8,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.sessions.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn depth_one_keeps_children_from_spawning_and_the_ceiling_is_enforced() {
+        // Default max_depth = 1: the child has no spawner even though the
+        // grandchild route is configured.
+        let child_requests = Arc::new(StdMutex::new(Vec::new()));
+        let child: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&child_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"look deeper","model":"test/grandchild"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"survey","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = depth_harness(
+            vec![
+                ("test/child", child),
+                ("test/grandchild", Arc::new(StaticTextProvider)),
+            ],
+            vec![parent],
+            1,
+            8,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "go").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let children = observed
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, SessionEvent::SessionCreated { session } if session.parent_id.is_some())
+            })
+            .count();
+        assert_eq!(children, 1, "no grandchild at depth one");
+        let requests = child_requests.lock().unwrap().clone();
+        assert!(
+            !requests[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "spawn_agent")
+        );
+
+        // A publicly created session tree cannot exceed the runtime ceiling.
+        let mut parent_id = harness.session_id;
+        for _ in 0..MAX_CHILD_DEPTH {
+            let created =
+                create_session(&harness.runtime, harness.workspace_id, Some(parent_id)).await;
+            let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+                panic!("unexpected receipt")
+            };
+            parent_id = session_id;
+        }
+        let too_deep = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CreateSession {
+                    workspace_id: harness.workspace_id,
+                    parent_id: Some(parent_id),
+                    model: ModelSelection {
+                        model: Some("test/model".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    approval_mode: ApprovalMode::default(),
+                    profile: AgentProfileId::default(),
+                    correlation: Correlation::default(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            too_deep,
+            Err(SessionRuntimeError::ChildDepthExceeded)
+        ));
+    }
+
+    /// Spawns `spawns` children on a request without tool results, then
+    /// answers. Stateless, so one instance serves many concurrent runs.
+    struct StatelessFanOut {
+        spawns: usize,
+        route: &'static str,
+    }
+
+    impl Provider for StatelessFanOut {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let has_results = request.messages().iter().any(|message| {
+                message
+                    .content()
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            });
+            if has_results {
+                return Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "done".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage: None }),
+                ]));
+            }
+            let route = self.route;
+            let mut events = Vec::new();
+            for index in 0..self.spawns {
+                let id = format!("call_{index}");
+                events.push(Ok(qq_provider::ProviderEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: "spawn_agent".to_owned(),
+                }));
+                events.push(Ok(qq_provider::ProviderEvent::ToolCallArgumentsDelta {
+                    id: id.clone(),
+                    json: format!(r#"{{"task":"leaf {index}","model":"{route}"}}"#),
+                }));
+                events.push(Ok(qq_provider::ProviderEvent::ToolCallCompleted { id }));
+            }
+            events.push(Ok(qq_provider::ProviderEvent::Completed { usage: None }));
+            Box::pin(stream::iter(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tree_is_capped_at_the_descendant_limit() {
+        // Each child spawns as many grandchildren as the per-run cap allows;
+        // the tree still stops at MAX_DESCENDANTS_PER_ROOT sessions total.
+        let fan_out: Arc<dyn Provider> = Arc::new(StatelessFanOut {
+            spawns: usize::from(MAX_SPAWNED_CHILDREN_PER_RUN),
+            route: "test/leaf",
+        });
+        let parent: Arc<dyn Provider> = Arc::new(MultiSpawnProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            spawns: usize::from(MAX_SPAWNED_CHILDREN_PER_RUN),
+            arguments: |index| format!(r#"{{"task":"branch {index}","model":"test/branch"}}"#),
+            turn: StdMutex::new(0),
+        });
+        let mut harness = depth_harness(
+            vec![
+                ("test/branch", fan_out),
+                ("test/leaf", Arc::new(StaticTextProvider)),
+            ],
+            vec![parent],
+            2,
+            16,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "fan out").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let created = observed
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, SessionEvent::SessionCreated { session } if session.parent_id.is_some())
+            })
+            .count();
+        assert_eq!(
+            created,
+            usize::from(MAX_DESCENDANTS_PER_ROOT),
+            "8 branches + 16 leaves, then refused"
+        );
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_parents_at_every_depth_never_deadlock() {
+        // Two roots fill the root pool and each spawns a child that spawns a
+        // grandchild. Depth-one children fill their pool while awaiting
+        // grandchildren; grandchildren must still run from their own pool.
+        let spawn_child = || -> Arc<dyn Provider> {
+            Arc::new(ScriptedRunProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                script: vec![(
+                    "spawn_agent",
+                    r#"{"task":"survey","model":"test/child"}"#.to_owned(),
+                )],
+                turn: StdMutex::new(0),
+            })
+        };
+        let mut harness = depth_harness(
+            vec![
+                ("test/child", delegating_child()),
+                ("test/grandchild", Arc::new(StaticTextProvider)),
+            ],
+            vec![spawn_child(), spawn_child()],
+            2,
+            2,
+        )
+        .await;
+        let created = create_session(&harness.runtime, harness.workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id: second } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let first_run = submit_prompt_to(&harness.runtime, harness.session_id, "one").await;
+        let second_run = submit_prompt_to(&harness.runtime, second, "two").await;
+        let mut observed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while finished_outcome(&observed, first_run).is_none()
+                || finished_outcome(&observed, second_run).is_none()
+            {
+                observed.push(harness.events.next().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .expect("saturated parents at depth zero and one deadlocked");
+        assert!(matches!(
+            finished_outcome(&observed, first_run),
+            Some(RunOutcome::Completed)
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, second_run),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_root_settles_the_whole_subtree() {
+        let child_started = Arc::new(tokio::sync::Notify::new());
+        struct NotifyingHang {
+            started: Arc<tokio::sync::Notify>,
+        }
+        impl Provider for NotifyingHang {
+            fn stream(&self, _request: ModelRequest) -> ProviderStream {
+                self.started.notify_one();
+                Box::pin(stream::pending())
+            }
+        }
+        let grandchild: Arc<dyn Provider> = Arc::new(NotifyingHang {
+            started: Arc::clone(&child_started),
+        });
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"survey","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = depth_harness(
+            vec![
+                ("test/child", delegating_child()),
+                ("test/grandchild", grandchild),
+            ],
+            vec![parent],
+            2,
+            8,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), child_started.notified())
+            .await
+            .expect("the grandchild must start");
+        harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::CancelRun { run_id },
+            )
+            .await
+            .unwrap();
+        // Descendants settle in their own tasks; keep draining until both
+        // child runs have finished.
+        let mut observed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                observed.push(harness.events.next().await.unwrap().unwrap());
+                let child_finishes = observed
+                    .iter()
+                    .filter(|event| {
+                        matches!(&event.event, SessionEvent::RunFinished { session, .. } if session.parent_id.is_some())
+                    })
+                    .count();
+                if child_finishes >= 2 && finished_outcome(&observed, run_id).is_some() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("every descendant settles after the root is cancelled");
+        let finished = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::RunFinished {
+                    session, outcome, ..
+                } => Some((session.parent_id.is_some(), outcome.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finished
+                .iter()
+                .filter(|(is_child, outcome)| *is_child && *outcome == RunOutcome::Cancelled)
+                .count(),
+            2,
+            "child and grandchild both cancelled: {finished:?}"
+        );
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Cancelled)
         ));
     }
 

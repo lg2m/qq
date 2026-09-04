@@ -100,7 +100,7 @@ impl ToolGate for SessionToolGate {
                                 workspace: claimed.workspace.clone(),
                                 origin: if claimed.child {
                                     ReviewOrigin::Child {
-                                        depth: 1,
+                                        depth: claimed.depth,
                                         parent_run: claimed.run_id,
                                     }
                                 } else {

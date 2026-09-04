@@ -546,6 +546,7 @@ fn version_16_commands_receipts_events_and_capabilities_match_their_goldens() {
                 max_child_depth: 1,
                 max_correlation_entries: 8,
                 max_output_continuations: 3,
+                max_descendants: 24,
             },
             approvals: vec![
                 "approve_once".to_owned(),

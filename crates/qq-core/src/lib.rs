@@ -61,11 +61,11 @@ pub use runtime::MAX_PENDING_STEERING;
 pub use sessions::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, MAX_CHILD_DEPTH,
     MAX_CHILD_DEPTH_CEILING, MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_DELEGATION_ROSTER,
-    MAX_PENDING_PROMPTS, MAX_REPLAY_EVENTS, MAX_REVIEW_ARGUMENT_BYTES, MAX_REVIEW_BRIEF_BYTES,
-    MAX_REVIEW_RECENT_ACTIONS, MAX_SPAWNED_CHILDREN_PER_RUN, RecentAction, ReviewDecision,
-    ReviewFuture, ReviewOrigin, ReviewRequest, ReviewSpend, ReviewVerdict, RuntimeLoadError,
-    RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime,
-    SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
+    MAX_DESCENDANTS_PER_ROOT, MAX_PENDING_PROMPTS, MAX_REPLAY_EVENTS, MAX_REVIEW_ARGUMENT_BYTES,
+    MAX_REVIEW_BRIEF_BYTES, MAX_REVIEW_RECENT_ACTIONS, MAX_SPAWNED_CHILDREN_PER_RUN, RecentAction,
+    ReviewDecision, ReviewFuture, ReviewOrigin, ReviewRequest, ReviewSpend, ReviewVerdict,
+    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
+    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
     WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed, run_cost,
 };
 pub use workspace::skills::{MAX_INDEXED_SKILLS, MAX_SKILL_DESCRIPTION_BYTES};
@@ -376,6 +376,13 @@ impl RunCapabilities {
 
     pub(crate) fn with_steering(mut self, steering: runtime::SteeringReceiver) -> Self {
         self.steering = Some(steering);
+        self
+    }
+
+    /// Installs a spawner on a restricted run: a model-authored child task at a
+    /// depth the roster still permits to delegate.
+    pub(crate) fn with_spawner(mut self, spawner: Arc<dyn SubagentSpawner>) -> Self {
+        self.spawner = Some(spawner);
         self
     }
 

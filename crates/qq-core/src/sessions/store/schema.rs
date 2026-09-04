@@ -383,13 +383,26 @@ pub(in crate::sessions) fn open_database(
         }
         Some(
             "10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21"
-            | "22",
+            | "22" | "23",
         ) => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
+        Some(
+            "11" | "12"
+                | "13"
+                | "14"
+                | "15"
+                | "16"
+                | "17"
+                | "18"
+                | "19"
+                | "20"
+                | "21"
+                | "22"
+                | "23"
+        )
     ) {
         let transaction = connection
             .transaction()
@@ -407,7 +420,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
+        Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23")
     ) {
         let transaction = connection
             .transaction()
@@ -425,7 +438,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
+        Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23")
     ) {
         let transaction = connection
             .transaction()
@@ -443,7 +456,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
+        Some("14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23")
     ) {
         let transaction = connection
             .transaction()
@@ -462,7 +475,7 @@ pub(in crate::sessions) fn open_database(
     validate_model_turn_audit_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
+        Some("15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23")
     ) {
         let transaction = connection
             .transaction()
@@ -495,7 +508,7 @@ pub(in crate::sessions) fn open_database(
     validate_linear_streaming_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("16" | "17" | "18" | "19" | "20" | "21" | "22")
+        Some("16" | "17" | "18" | "19" | "20" | "21" | "22" | "23")
     ) {
         let transaction = connection
             .transaction()
@@ -516,7 +529,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("17" | "18" | "19" | "20" | "21" | "22")
+        Some("17" | "18" | "19" | "20" | "21" | "22" | "23")
     ) {
         let transaction = connection
             .transaction()
@@ -536,7 +549,7 @@ pub(in crate::sessions) fn open_database(
     validate_preparing_run_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("18" | "19" | "20" | "21" | "22")
+        Some("18" | "19" | "20" | "21" | "22" | "23")
     ) {
         let transaction = connection
             .transaction()
@@ -554,7 +567,10 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_context_occupancy_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("19" | "20" | "21" | "22")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("19" | "20" | "21" | "22" | "23")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -571,7 +587,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_run_limits_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("20" | "21" | "22")) {
+    if !matches!(schema_version.as_deref(), Some("20" | "21" | "22" | "23")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -586,7 +602,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if schema_version.as_deref() != Some("21") && schema_version.as_deref() != Some("22") {
+    if !matches!(schema_version.as_deref(), Some("21" | "22" | "23")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -601,7 +617,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if schema_version.as_deref() != Some("22") {
+    if !matches!(schema_version.as_deref(), Some("22" | "23")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -617,6 +633,22 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_output_truncation_schema(&connection)?;
+    if schema_version.as_deref() != Some("23") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_session_depth_columns(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '23' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_session_depth_schema(&connection)?;
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -1425,4 +1457,45 @@ pub(in crate::sessions) fn has_column(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(columns.iter().any(|candidate| candidate == column))
+}
+
+/// Records where a session sits in its delegation tree: `depth` (0 for a
+/// root, 1 for a child, ...) and `root_run_id`, the root run whose subtree it
+/// belongs to. Historical children are backfilled at depth 1 under their
+/// owner run, which is exactly what they were when depth was structurally
+/// one; deeper history does not exist.
+fn add_session_depth_columns(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "sessions", "depth")? {
+        connection
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    if !has_column(connection, "sessions", "root_run_id")? {
+        connection
+            .execute("ALTER TABLE sessions ADD COLUMN root_run_id TEXT", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    connection
+        .execute(
+            "UPDATE sessions SET depth = 1, root_run_id = owner_run_id
+             WHERE owner_run_id IS NOT NULL AND root_run_id IS NULL",
+            [],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(())
+}
+
+fn validate_session_depth_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    let depth = column_shape(connection, "sessions", "depth")?;
+    if depth != ("INTEGER".to_owned(), true, Some("0".to_owned()), 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let root = column_shape(connection, "sessions", "root_run_id")?;
+    if root != ("TEXT".to_owned(), false, None, 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    Ok(())
 }
