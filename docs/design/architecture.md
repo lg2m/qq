@@ -499,6 +499,26 @@ transcript and the requests the provider saw agree. Steering still queued
 when a run settles is superseded in the settlement transaction. A replayed
 `steer_run` returns its receipt without re-queuing.
 
+Output truncation is a turn boundary, not a failure. Every provider adapter
+maps its "stopped at the output token limit" stop reason (and Anthropic's
+`pause_turn`) to the neutral `ProviderEvent::Incomplete { usage, reason }`
+rather than an error; content-filter and refusal stops remain
+`ProviderError::ResponseIncomplete`. The loop treats `Incomplete` like an
+interrupt: streamed text stands, begun tool calls are discarded because their
+arguments are incomplete, and the partial turn is committed through the same
+`AssistantTurnCompleted` transaction with `truncated: true` on the turn row and
+its message, so it is charged and durable before anything continues. Up to
+`MAX_OUTPUT_CONTINUATIONS` (3) times per run the loop then publishes
+`run_output_truncated` (the counter rides the same transaction on
+`runs.output_continuations`), appends the fixed continuation notice as a user
+message to keep role alternation, and issues the next turn with tools
+available. Context assembly replays that notice after every truncated turn so
+the durable transcript matches the requests the provider saw. Past the cap the
+run settles as `provider_output_truncated`, naming the limit and turn count; a
+reserved budget final response that truncates settles as the budget exhaustion
+it already was and is never continued. Restart never resumes an in-flight
+continuation: the committed partial turns are what the next prompt sees.
+
 Run limits are core-owned. `BudgetMeter` charges turns, tool calls, tokens
 (total, input, output), tool-output bytes, and cost as the loop observes them
 and settles every accepted bound with exactly one `BudgetLimitKind`; lost usage

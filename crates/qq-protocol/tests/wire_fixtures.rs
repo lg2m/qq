@@ -1,6 +1,6 @@
-//! Golden wire encodings for protocol version 15.
+//! Golden wire encodings for protocol version 16.
 //!
-//! Each fixture under `tests/fixtures/v15/` is the exact JSON a conforming
+//! Each fixture under `tests/fixtures/v16/` is the exact JSON a conforming
 //! peer sends or receives. The test decodes every fixture into its Rust type,
 //! re-encodes it, and requires byte equality with the file, so a field rename,
 //! reorder, or default change fails here before any client notices. Set
@@ -111,6 +111,7 @@ fn message(byte: u8, steering: bool, state: MessageState) -> MessageSnapshot {
         role: MessageRole::User,
         state,
         steering,
+        truncated: false,
         output: if steering {
             "also check the tests".to_owned()
         } else {
@@ -137,7 +138,7 @@ where
     T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
 {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v15")
+        .join("tests/fixtures/v16")
         .join(format!("{name}.json"));
     let encoded = serde_json::to_string_pretty(value).unwrap() + "\n";
     if std::env::var_os("QQ_UPDATE_FIXTURES").is_some() {
@@ -158,8 +159,8 @@ where
 }
 
 #[test]
-fn version_15_commands_receipts_events_and_capabilities_match_their_goldens() {
-    assert_eq!(PROTOCOL_VERSION, 15);
+fn version_16_commands_receipts_events_and_capabilities_match_their_goldens() {
+    assert_eq!(PROTOCOL_VERSION, 16);
     let session_id = SessionId::from_bytes([3; 16]);
     let run_id = RunId::from_bytes([4; 16]);
     let command = |byte: u8, command: SessionCommand| CommandRequest {
@@ -441,6 +442,49 @@ fn version_15_commands_receipts_events_and_capabilities_match_their_goldens() {
         ),
     );
     check(
+        "event_run_output_truncated",
+        &envelope(
+            20,
+            SessionEvent::RunOutputTruncated {
+                run_id,
+                turn_ordinal: 2,
+                continuation: 1,
+            },
+        ),
+    );
+    check(
+        "event_run_finished_output_truncated",
+        &envelope(
+            21,
+            SessionEvent::RunFinished {
+                session: summary(),
+                run_id,
+                outcome: RunOutcome::Failed {
+                    failure: RunFailure {
+                        kind: RunFailureKind::ProviderOutputTruncated,
+                        message: "the provider stopped at its output token limit (16384 tokens) on 4 consecutive turns; the partial answer is in the transcript".to_owned(),
+                    },
+                },
+                usage: None,
+                context_tokens: None,
+            },
+        ),
+    );
+    check(
+        "event_assistant_message_started_truncated",
+        &envelope(
+            22,
+            SessionEvent::AssistantMessageStarted {
+                message: MessageSnapshot {
+                    role: MessageRole::Assistant,
+                    truncated: true,
+                    output: "The first part of a long answer".to_owned(),
+                    ..message(0x21, false, MessageState::Complete)
+                },
+            },
+        ),
+    );
+    check(
         "snapshot_run_with_plan_identity",
         &RunSnapshot {
             id: run_id,
@@ -500,6 +544,7 @@ fn version_15_commands_receipts_events_and_capabilities_match_their_goldens() {
                 max_concurrent_children: 3,
                 max_child_depth: 1,
                 max_correlation_entries: 8,
+                max_output_continuations: 3,
             },
             approvals: vec![
                 "approve_once".to_owned(),
@@ -597,7 +642,7 @@ fn version_15_commands_receipts_events_and_capabilities_match_their_goldens() {
 fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     let base = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/v15/command_submit_prompt.json"),
+            .join("tests/fixtures/v16/command_submit_prompt.json"),
     )
     .unwrap();
     let mut with_extra: serde_json::Value = serde_json::from_str(&base).unwrap();
@@ -617,7 +662,7 @@ fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     assert!(serde_json::from_value::<CommandRequest>(with_extra).is_err());
 
     let capabilities = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v15/capabilities.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v16/capabilities.json"),
     )
     .unwrap();
     let mut newer: serde_json::Value = serde_json::from_str(&capabilities).unwrap();
@@ -631,7 +676,7 @@ fn inbound_types_reject_unknown_fields_and_response_types_tolerate_them() {
     // Events and snapshots stay strict: a server never sends what a client
     // cannot name, and both bump the version together.
     let started = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v15/event_run_started.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v16/event_run_started.json"),
     )
     .unwrap();
     let mut event: serde_json::Value = serde_json::from_str(&started).unwrap();

@@ -1423,6 +1423,7 @@ async fn execute_started_run(
                 message,
                 usage,
                 calls,
+                truncated,
             })) => {
                 if internal {
                     // Usage, cost, and provider-turn identity persist like
@@ -1459,6 +1460,7 @@ async fn execute_started_run(
                                 usage,
                                 estimated_cost_usd_nanos: turn_cost,
                                 accounting: Some(accounting.snapshot()),
+                                truncated,
                             },
                         )
                         .await
@@ -1538,6 +1540,7 @@ async fn execute_started_run(
                             usage,
                             estimated_cost_usd_nanos: turn_cost,
                             accounting: Some(turn_accounting),
+                            truncated,
                         },
                     )
                     .await
@@ -1797,6 +1800,30 @@ async fn execute_started_run(
                             &inner,
                             &claimed,
                             persistence_failure("failed to persist the interrupted turn", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            RunInput::Event(Some(RuntimeEvent::OutputTruncated {
+                turn_ordinal,
+                continuation,
+            })) => {
+                if internal {
+                    continue;
+                }
+                match inner
+                    .store
+                    .record_output_truncated(&claimed, turn_ordinal, continuation)
+                    .await
+                {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist the truncated turn", &error),
                         )
                         .await;
                         return;
@@ -2295,4 +2322,8 @@ pub(super) struct ModelTurnCommit {
     pub(super) usage: Option<TokenUsage>,
     pub(super) estimated_cost_usd_nanos: Option<u64>,
     pub(super) accounting: Option<RunAccounting>,
+    /// The provider cut this turn at its output token limit. Persisted on the
+    /// turn row and the turn's message so context assembly can replay the
+    /// continuation notice and clients can mark the prefix.
+    pub(super) truncated: bool,
 }

@@ -867,6 +867,22 @@ impl Store {
         .await
     }
 
+    /// Records that the runtime is continuing past a turn the provider cut at
+    /// its output token limit. The counter and the event commit together.
+    pub(super) async fn record_output_truncated(
+        &self,
+        claimed: &ClaimedRun,
+        turn_ordinal: u16,
+        continuation: u16,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            record_run_output_truncated(connection, store_id, &claimed, turn_ordinal, continuation)
+        })
+        .await
+    }
+
     /// The steering messages of a run that are recorded but not yet applied,
     /// with their provider-visible text, in order. Used once when the run
     /// loop starts so steering that arrived between claim and start is not

@@ -859,6 +859,7 @@ fn server_capabilities(
             max_concurrent_children: qq_core::MAX_CONCURRENT_CHILDREN_PER_RUN,
             max_child_depth: qq_core::MAX_CHILD_DEPTH,
             max_correlation_entries: u16::try_from(MAX_CORRELATION_ENTRIES).unwrap_or(u16::MAX),
+            max_output_continuations: qq_core::MAX_OUTPUT_CONTINUATIONS,
         },
         approvals: vec![
             "approve_once".to_owned(),

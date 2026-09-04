@@ -50,7 +50,7 @@ pub use sessions::{
     ToolExposure, WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 /// Slash commands owned by interactive clients rather than the shared
 /// runtime. Keeping this vocabulary in the transport-neutral protocol avoids
@@ -168,6 +168,9 @@ pub enum RunFailureKind {
     ProviderApi,
     ProviderResponse,
     ProviderProtocol,
+    /// The provider stopped at its output token limit on every continuation
+    /// the runtime allowed. The partial turns are persisted in the transcript.
+    ProviderOutputTruncated,
 }
 
 /// Version information returned by the server health endpoint. Tolerates

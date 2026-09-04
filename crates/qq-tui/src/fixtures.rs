@@ -83,6 +83,7 @@ pub fn message(id: MessageId, session_id: SessionId, output: &str) -> MessageSna
         role: MessageRole::Assistant,
         state: MessageState::Complete,
         steering: false,
+        truncated: false,
         output: output.to_owned(),
         refusal: String::new(),
         created_at_ms: 1,
@@ -191,6 +192,7 @@ pub fn capabilities(steering: SteeringCapabilities) -> ServerCapabilities {
             max_children: 8,
             max_concurrent_children: 4,
             max_child_depth: 2,
+            max_output_continuations: 3,
             max_correlation_entries: 8,
         },
         approvals: [

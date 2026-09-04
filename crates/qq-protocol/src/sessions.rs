@@ -1175,6 +1175,11 @@ pub struct MessageSnapshot {
     /// then `complete`; `cancelled` when the run finished first.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub steering: bool,
+    /// The provider cut this assistant message at its output token limit.
+    /// The text is a valid prefix; the run either continued in the next turn
+    /// or settled as `provider_output_truncated`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     pub output: String,
     pub refusal: String,
     pub created_at_ms: u64,
@@ -1354,6 +1359,16 @@ pub enum SessionEvent {
     RunInterrupted {
         run_id: RunId,
         turn_ordinal: u16,
+    },
+    /// The provider stopped turn `turn_ordinal` at its output token limit.
+    /// The partial turn is committed (its text stands in the transcript) and
+    /// the run continues with turn `turn_ordinal + 1` asking the model to
+    /// resume. `continuation` counts continuations so far in this run
+    /// (1-based) against `LimitCapabilities::max_output_continuations`.
+    RunOutputTruncated {
+        run_id: RunId,
+        turn_ordinal: u16,
+        continuation: u16,
     },
     /// Replaceable liveness information for an active run. This describes
     /// harness/provider state, not assistant transcript content.
@@ -1920,6 +1935,7 @@ mod tests {
             role: MessageRole::Assistant,
             state: MessageState::Streaming,
             steering: false,
+            truncated: false,
             output: "checking".to_owned(),
             refusal: String::new(),
             created_at_ms: 11,
@@ -2595,8 +2611,10 @@ mod tests {
         // `include_sessions`/`included` on snapshots. Version 13 replaced the
         // prompt string with input parts and added profiles, plan identity,
         // steering, correlation, and capabilities.
-        // Version 15 added `approval_mode` on summaries.
-        assert_eq!(crate::PROTOCOL_VERSION, 15);
+        // Version 15 added `approval_mode` on summaries. Version 16 added
+        // output continuation: `run_output_truncated`, `MessageSnapshot.
+        // truncated`, and the `provider_output_truncated` failure kind.
+        assert_eq!(crate::PROTOCOL_VERSION, 16);
         let mut invalid = serde_json::to_value(&run).unwrap();
         invalid["resolved_model"]["future_control"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RunSnapshot>(invalid).is_err());

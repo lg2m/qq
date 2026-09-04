@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role, SharedRequestCredentialProvider, ToolSpec,
+    ContentBlock, IncompleteReason, ModelRequest, Provider, ProviderError, ProviderErrorKind,
+    ProviderEvent, ProviderStream, ProviderUsage, Role, SharedRequestCredentialProvider, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
@@ -204,6 +204,10 @@ impl Provider for OpenAi {
                     }
                     DecodedEvent::Completed(usage) => {
                         yield ProviderEvent::Completed { usage };
+                        return;
+                    }
+                    DecodedEvent::Incomplete { usage, reason } => {
+                        yield ProviderEvent::Incomplete { usage, reason };
                         return;
                     }
                     DecodedEvent::Ignored => {}
@@ -481,6 +485,7 @@ struct FailedResponse {
 #[derive(Deserialize)]
 struct IncompleteResponse {
     incomplete_details: Option<IncompleteDetails>,
+    usage: Option<ResponsesUsage>,
 }
 
 #[derive(Deserialize)]
@@ -537,6 +542,10 @@ enum DecodedEvent {
         item_id: String,
     },
     Completed(Option<ProviderUsage>),
+    Incomplete {
+        usage: Option<ProviderUsage>,
+        reason: IncompleteReason,
+    },
     Ignored,
 }
 
@@ -590,15 +599,22 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedEvent, Provi
             },
             |error| response_failed_from_api_error(error, redactions),
         )),
-        StreamingEvent::Incomplete { response } => Err(ProviderError::ResponseIncomplete(
-            response
+        StreamingEvent::Incomplete { response } => {
+            let reason = response
                 .incomplete_details
-                .and_then(|details| details.reason)
-                .map_or_else(
-                    || "unknown reason".to_owned(),
-                    |reason| sanitize_message(&reason, redactions),
-                ),
-        )),
+                .and_then(|details| details.reason);
+            if reason.as_deref() == Some("max_output_tokens") {
+                let usage = response.usage.map(provider_usage).transpose()?;
+                return Ok(DecodedEvent::Incomplete {
+                    usage,
+                    reason: IncompleteReason::OutputTokens,
+                });
+            }
+            Err(ProviderError::ResponseIncomplete(reason.map_or_else(
+                || "unknown reason".to_owned(),
+                |reason| sanitize_message(&reason, redactions),
+            )))
+        }
         StreamingEvent::Error {
             code,
             message,
@@ -1026,14 +1042,31 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        let incomplete = decode_event(
-            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        let truncated = decode_event(
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":64}}}"#,
+            &[],
+        )
+        .unwrap();
+        let filtered = decode_event(
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
             &[],
         )
         .unwrap_err();
 
         assert!(matches!(failed, ProviderError::ResponseFailed { .. }));
-        assert!(matches!(incomplete, ProviderError::ResponseIncomplete(_)));
+        assert!(matches!(
+            truncated,
+            DecodedEvent::Incomplete {
+                usage: Some(ProviderUsage {
+                    output_tokens: 64,
+                    ..
+                }),
+                reason: IncompleteReason::OutputTokens,
+            }
+        ));
+        assert!(
+            matches!(filtered, ProviderError::ResponseIncomplete(reason) if reason == "content_filter")
+        );
     }
 
     #[test]

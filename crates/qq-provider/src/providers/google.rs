@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role, ToolSpec,
+    ContentBlock, IncompleteReason, Message, ModelRequest, Provider, ProviderError,
+    ProviderErrorKind, ProviderEvent, ProviderStream, ProviderUsage, Role, ToolSpec,
     compiler::EndpointKind,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
@@ -207,6 +207,15 @@ impl Provider for GoogleGenerateContent {
                                 };
                             }
                             yield ProviderEvent::Completed { usage: usage.finish() };
+                            return;
+                        }
+                        DecodedEvent::Incomplete(reason) => {
+                            if reasoning_open {
+                                yield ProviderEvent::ReasoningCompleted {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                };
+                            }
+                            yield ProviderEvent::Incomplete { usage: usage.finish(), reason };
                             return;
                         }
                     }
@@ -537,6 +546,7 @@ enum DecodedEvent {
         arguments: String,
     },
     Completed,
+    Incomplete(IncompleteReason),
 }
 
 fn decode_event(
@@ -643,11 +653,7 @@ fn decode_event(
     if let Some(reason) = candidate.finish_reason {
         match reason.as_str() {
             "STOP" | "TOOL_CALL" | "TOOL_CALLS" => events.push(DecodedEvent::Completed),
-            "MAX_TOKENS" => {
-                return Err(ProviderError::ResponseIncomplete(
-                    "Google response reached its output token limit".to_owned(),
-                ));
-            }
+            "MAX_TOKENS" => events.push(DecodedEvent::Incomplete(IncompleteReason::OutputTokens)),
             "MALFORMED_FUNCTION_CALL"
             | "UNEXPECTED_TOOL_CALL"
             | "TOO_MANY_TOOL_CALLS"
@@ -1079,8 +1085,11 @@ mod tests {
             &mut 0,
             &[],
         )
-        .unwrap_err();
-        assert!(matches!(max_tokens, ProviderError::ResponseIncomplete(_)));
+        .unwrap();
+        assert!(matches!(
+            max_tokens.as_slice(),
+            [DecodedEvent::Incomplete(IncompleteReason::OutputTokens)]
+        ));
 
         let blocked = decode_event(
             r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#,

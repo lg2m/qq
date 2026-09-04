@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "protocol_version": 15,
+  "protocol_version": 16,
   "server_version": "0.1.0",
   "input_parts": [
     "text",
@@ -49,7 +49,8 @@
     "max_children": 8,
     "max_concurrent_children": 3,
     "max_child_depth": 1,
-    "max_correlation_entries": 8
+    "max_correlation_entries": 8,
+    "max_output_continuations": 3
   },
   "approvals": [
     "approve_once",

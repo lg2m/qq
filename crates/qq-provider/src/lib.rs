@@ -32,8 +32,8 @@ pub use compiler::{
 };
 pub use credentials::{SecretLiteral, SecretRef};
 pub use model::{
-    ContentBlock, Message, ModelRequest, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderUsage, Role, ToolSpec,
+    ContentBlock, IncompleteReason, Message, ModelRequest, ProviderError, ProviderErrorKind,
+    ProviderEvent, ProviderUsage, Role, ToolSpec,
 };
 pub use qq_reasoning::ReasoningKind;
 pub use request_auth::{

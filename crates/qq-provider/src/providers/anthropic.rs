@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role, ToolSpec,
+    ContentBlock, IncompleteReason, Message, ModelRequest, Provider, ProviderError,
+    ProviderErrorKind, ProviderEvent, ProviderStream, ProviderUsage, Role, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
@@ -181,6 +181,7 @@ impl Provider for AnthropicMessages {
                 "Anthropic-compatible stream sent arguments for an unknown tool call",
             );
             let mut reasoning_blocks = std::collections::HashSet::new();
+            let mut incomplete = None;
 
             while let Some(event) = sse.next_event().await? {
                 match decode_event(event, redactions.as_ref())? {
@@ -196,7 +197,10 @@ impl Provider for AnthropicMessages {
                             usage.set(start)?;
                         }
                     }
-                    DecodedEvent::MessageDelta { refusal, output_tokens } => {
+                    DecodedEvent::MessageDelta { refusal, output_tokens, incomplete: reason } => {
+                        if let Some(reason) = reason {
+                            incomplete = Some(reason);
+                        }
                         if let Some(text) = refusal {
                             output_bytes.add(text.len())?;
                             yield ProviderEvent::RefusalDelta { text };
@@ -260,7 +264,11 @@ impl Provider for AnthropicMessages {
                         }
                     }
                     DecodedEvent::Completed => {
-                        yield ProviderEvent::Completed { usage: usage.finish() };
+                        let usage = usage.finish();
+                        match incomplete {
+                            Some(reason) => yield ProviderEvent::Incomplete { usage, reason },
+                            None => yield ProviderEvent::Completed { usage },
+                        }
                         return;
                     }
                     DecodedEvent::Ignored => {}
@@ -585,6 +593,9 @@ enum DecodedEvent {
     MessageDelta {
         refusal: Option<String>,
         output_tokens: Option<u64>,
+        /// A recoverable stop reason; the stream still runs to
+        /// `message_stop` so the terminal event carries final usage.
+        incomplete: Option<IncompleteReason>,
     },
     ThinkingStarted {
         index: u64,
@@ -685,19 +696,25 @@ fn decode_event(event: SseEvent, redactions: &[String]) -> Result<DecodedEvent, 
                 }
             })))
         }
-        StreamingEvent::MessageDelta { delta, usage } => Ok(DecodedEvent::MessageDelta {
-            refusal: decode_message_delta(delta, redactions)?,
-            output_tokens: usage.map(|usage| usage.output_tokens),
-        }),
+        StreamingEvent::MessageDelta { delta, usage } => {
+            let (refusal, incomplete) = decode_message_delta(delta, redactions)?;
+            Ok(DecodedEvent::MessageDelta {
+                refusal,
+                output_tokens: usage.map(|usage| usage.output_tokens),
+                incomplete,
+            })
+        }
         StreamingEvent::MessageStop => Ok(DecodedEvent::Completed),
         StreamingEvent::Error { error } => Err(wire_api_error(error, redactions)),
     }
 }
 
+/// Decodes a `message_delta` stop into the refusal text (if the model
+/// refused) and the recoverable incomplete reason (if it stopped short).
 fn decode_message_delta(
     delta: MessageDelta,
     redactions: &[String],
-) -> Result<Option<String>, ProviderError> {
+) -> Result<(Option<String>, Option<IncompleteReason>), ProviderError> {
     let details_are_refusal = delta
         .stop_details
         .as_ref()
@@ -712,21 +729,17 @@ fn decode_message_delta(
                 || "Anthropic declined the request".to_owned(),
                 |explanation| sanitize_message(&explanation, redactions),
             );
-        return Ok(Some(explanation));
+        return Ok((Some(explanation), None));
     }
 
     match delta.stop_reason.as_deref() {
-        None | Some("end_turn" | "stop_sequence" | "tool_use") => Ok(None),
-        Some("max_tokens") => Err(ProviderError::ResponseIncomplete(
-            "Anthropic response reached the maximum output token limit".to_owned(),
-        )),
+        None | Some("end_turn" | "stop_sequence" | "tool_use") => Ok((None, None)),
+        Some("max_tokens") => Ok((None, Some(IncompleteReason::OutputTokens))),
+        Some("pause_turn") => Ok((None, Some(IncompleteReason::Paused))),
         Some("model_context_window_exceeded") => Err(ProviderError::ResponseFailed {
             kind: ProviderErrorKind::ContextExceeded,
             message: "Anthropic request exceeded the model context window".to_owned(),
         }),
-        Some("pause_turn") => Err(ProviderError::ResponseIncomplete(
-            "Anthropic paused the response before completion".to_owned(),
-        )),
         Some(_) => Err(ProviderError::Protocol(
             "Anthropic response used an unsupported stop reason".to_owned(),
         )),
@@ -1020,6 +1033,7 @@ mod tests {
             DecodedEvent::MessageDelta {
                 refusal: None,
                 output_tokens: Some(9),
+                incomplete: None,
             }
         );
 
@@ -1099,6 +1113,7 @@ mod tests {
             DecodedEvent::MessageDelta {
                 refusal: Some(text),
                 output_tokens: None,
+                incomplete: None,
             } if text == "request declined"
         ));
         assert_eq!(
@@ -1114,12 +1129,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_and_unsupported_stop_reasons() {
+    fn classifies_incomplete_and_unsupported_stop_reasons() {
         let max_tokens = decode_data(
             "message_delta",
-            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":64}}"#,
         )
-        .unwrap_err();
+        .unwrap();
+        let paused = decode_data(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"pause_turn"}}"#,
+        )
+        .unwrap();
         let unknown = decode_data(
             "message_delta",
             r#"{"type":"message_delta","delta":{"stop_reason":"mystery"}}"#,
@@ -1131,13 +1151,29 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(max_tokens, ProviderError::ResponseIncomplete(_)));
+        assert_eq!(
+            max_tokens,
+            DecodedEvent::MessageDelta {
+                refusal: None,
+                output_tokens: Some(64),
+                incomplete: Some(IncompleteReason::OutputTokens),
+            }
+        );
+        assert_eq!(
+            paused,
+            DecodedEvent::MessageDelta {
+                refusal: None,
+                output_tokens: None,
+                incomplete: Some(IncompleteReason::Paused),
+            }
+        );
         assert!(matches!(unknown, ProviderError::Protocol(_)));
         assert_eq!(
             tool_use,
             DecodedEvent::MessageDelta {
                 refusal: None,
                 output_tokens: None,
+                incomplete: None,
             }
         );
     }

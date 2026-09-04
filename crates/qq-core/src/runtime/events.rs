@@ -90,6 +90,9 @@ pub(crate) enum RuntimeEvent {
         /// and its calls in one transaction; a crash must never leave a
         /// persisted ToolCall block without its tool_calls rows.
         calls: Vec<RuntimeToolCall>,
+        /// The provider stopped this turn at its output token limit. The
+        /// message is a valid prefix; `calls` is always empty.
+        truncated: bool,
     },
     ToolCallStarted {
         id: ToolCallId,
@@ -129,6 +132,13 @@ pub(crate) enum RuntimeEvent {
     /// the store marks every call of the turn still open as interrupted.
     Interrupted {
         turn_ordinal: u16,
+    },
+    /// The provider cut turn `turn_ordinal` at its output token limit. Emitted
+    /// after the partial turn is committed via `AssistantTurnCompleted`; the
+    /// loop then continues with the next turn. `continuation` is 1-based.
+    OutputTruncated {
+        turn_ordinal: u16,
+        continuation: u16,
     },
     Completed,
     Failed {

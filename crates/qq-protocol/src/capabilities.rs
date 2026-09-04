@@ -166,6 +166,10 @@ pub struct LimitCapabilities {
     /// Deepest sub-agent nesting the runtime executes.
     pub max_child_depth: u16,
     pub max_correlation_entries: u16,
+    /// Most times one run resumes a turn the provider cut at its output token
+    /// limit before settling as `provider_output_truncated`.
+    #[serde(default)]
+    pub max_output_continuations: u16,
 }
 
 /// A configured profile a session may select.

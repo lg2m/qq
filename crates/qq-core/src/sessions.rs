@@ -2727,6 +2727,7 @@ fn persist_model_turn(
         usage,
         estimated_cost_usd_nanos,
         accounting,
+        truncated,
     } = turn;
     if message.role() != Role::Assistant {
         return Err(SessionRuntimeError::Persistence);
@@ -2782,9 +2783,13 @@ fn persist_model_turn(
     if let Some(message_id) = turn_message {
         let updated = transaction
             .execute(
-                "UPDATE messages SET state = 'complete'
+                "UPDATE messages SET state = 'complete', truncated = ?3
                  WHERE id = ?1 AND run_id = ?2 AND state = 'streaming'",
-                params![message_id.to_string(), claimed.run_id.to_string()],
+                params![
+                    message_id.to_string(),
+                    claimed.run_id.to_string(),
+                    truncated
+                ],
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
         if updated != 1 {
@@ -2795,8 +2800,8 @@ fn persist_model_turn(
         .execute(
             "INSERT INTO model_turns(
                  run_id, turn_ordinal, assistant_content_json, model_json,
-                 usage_json, estimated_cost_usd_nanos, completed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 usage_json, estimated_cost_usd_nanos, completed_at_ms, truncated
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 claimed.run_id.to_string(),
                 turn_ordinal,
@@ -2805,6 +2810,7 @@ fn persist_model_turn(
                 usage_json,
                 turn_cost,
                 now,
+                truncated,
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3110,6 +3116,52 @@ fn record_run_interrupted(
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(events)
+}
+
+/// Persists the continuation counter and publishes `run_output_truncated`
+/// in one transaction. The truncated turn itself was committed by the
+/// preceding `persist_model_turn`; the counter is the run's authoritative
+/// record of how many continuations it spent.
+fn record_run_output_truncated(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    turn_ordinal: u16,
+    continuation: u16,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let updated = transaction
+        .execute(
+            "UPDATE runs SET output_continuations = ?2 WHERE id = ?1 AND status = 'running'",
+            params![claimed.run_id.to_string(), continuation],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if updated != 1 {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::RunOutputTruncated {
+            run_id: claimed.run_id,
+            turn_ordinal,
+            continuation,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
 }
 
 /// Steering still queued when a run settles never reached the model: the
@@ -5703,27 +5755,29 @@ fn load_message(
     connection: &Connection,
     message_id: MessageId,
 ) -> Result<MessageSnapshot, SessionRuntimeError> {
-    let (session, run, turn_ordinal, role, state, output, refusal, created, steering) = connection
-        .query_row(
-            "SELECT session_id, run_id, turn_ordinal, role, state, output, refusal, created_at_ms,
-                    steering
-             FROM messages WHERE id = ?1",
-            [message_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, u16>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, u64>(7)?,
-                    row.get::<_, bool>(8)?,
-                ))
-            },
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let (session, run, turn_ordinal, role, state, output, refusal, created, steering, truncated) =
+        connection
+            .query_row(
+                "SELECT session_id, run_id, turn_ordinal, role, state, output, refusal,
+                        created_at_ms, steering, truncated
+                 FROM messages WHERE id = ?1",
+                [message_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u16>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, u64>(7)?,
+                        row.get::<_, bool>(8)?,
+                        row.get::<_, bool>(9)?,
+                    ))
+                },
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
     let (output, refusal) = load_message_text(connection, message_id, output, refusal)?;
     Ok(MessageSnapshot {
         id: message_id,
@@ -5733,6 +5787,7 @@ fn load_message(
         role: parse_message_role(&role)?,
         state: parse_message_state(&state)?,
         steering,
+        truncated,
         output,
         refusal,
         created_at_ms: created,
@@ -6353,13 +6408,17 @@ fn append_run_turns(
 ) -> Result<(), SessionRuntimeError> {
     let mut statement = transaction
         .prepare(
-            "SELECT turn_ordinal, assistant_content_json FROM model_turns
+            "SELECT turn_ordinal, assistant_content_json, truncated FROM model_turns
              WHERE run_id = ?1 ORDER BY turn_ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let turns = statement
         .query_map([run_id.to_string()], |row| {
-            Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, u16>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })
         .map_err(|_| SessionRuntimeError::Persistence)?
         .collect::<Result<Vec<_>, _>>()
@@ -6383,7 +6442,7 @@ fn append_run_turns(
         .collect::<Result<std::collections::VecDeque<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     drop(statement);
-    for (turn_ordinal, content_json) in turns {
+    for (turn_ordinal, content_json, truncated) in turns {
         while steering
             .front()
             .is_some_and(|(applied_before, _)| *applied_before <= turn_ordinal)
@@ -6442,6 +6501,12 @@ fn append_run_turns(
         context.push(Message::new(Role::Assistant, content));
         if !results.is_empty() {
             context.push(Message::tool_results(results));
+        }
+        // A truncated turn was followed in the live run by the continuation
+        // notice; replaying it keeps the assembled context identical to the
+        // request the model actually saw (and preserves role alternation).
+        if truncated {
+            context.push(Message::user(crate::OUTPUT_TRUNCATED_CONTINUE_NOTICE));
         }
     }
     // Steering applied for a turn that never committed (the run settled
@@ -10966,7 +11031,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(
             !connection
@@ -11093,7 +11158,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -11161,7 +11226,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let (display_json, result) = connection
             .query_row(
@@ -11220,7 +11285,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -11285,7 +11350,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -11373,7 +11438,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -11429,7 +11494,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -11473,7 +11538,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         for column in [
             "model_json",
@@ -11540,7 +11605,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -11614,7 +11679,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let command_id_not_null: bool = connection
             .query_row(
@@ -11653,7 +11718,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -11723,7 +11788,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -11815,7 +11880,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let preparing_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -11938,7 +12003,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let occupancy_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12044,7 +12109,7 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                "21"
+                "22"
             );
         }
     }
@@ -12165,7 +12230,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         // A historical child keeps its parent run but has no recorded call:
         // the summary says so explicitly instead of inventing one.
@@ -12180,6 +12245,99 @@ mod tests {
         let parent = load_session_summary(&connection, parent_id).unwrap();
         assert_eq!(parent.spawned_by, None);
         assert_eq!(parent.activity, None);
+    }
+
+    #[test]
+    fn version_twenty_two_migration_adds_truncation_state_as_never_truncated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let run_id = RunId::generate().unwrap();
+        let message_id = MessageId::generate().unwrap();
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/v21-truncation')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'Old', 'idle', 1, 1)",
+                params![session_id.to_string(), workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(
+                     id, session_id, command_id, user_message_id, assistant_message_id,
+                     status, created_at_ms
+                 ) VALUES (?1, ?2, 'cmd', 'u', 'a', 'completed', 1)",
+                params![run_id.to_string(), session_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(id, session_id, run_id, ordinal, turn_ordinal, role, state,
+                                      output, created_at_ms)
+                 VALUES (?1, ?2, ?3, 1, 1, 'assistant', 'complete', 'legacy', 1)",
+                params![
+                    message_id.to_string(),
+                    session_id.to_string(),
+                    run_id.to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_turns(run_id, turn_ordinal, assistant_content_json)
+                 VALUES (?1, 1, '[{\"type\":\"text\",\"text\":\"legacy\"}]')",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        for statement in [
+            "UPDATE metadata SET value = '21' WHERE key = 'schema_version'",
+            "ALTER TABLE messages DROP COLUMN truncated",
+            "ALTER TABLE model_turns DROP COLUMN truncated",
+            "ALTER TABLE runs DROP COLUMN output_continuations",
+        ] {
+            connection.execute(statement, []).unwrap();
+        }
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "22"
+        );
+        let message = load_message(&connection, message_id).unwrap();
+        assert!(!message.truncated);
+        assert_eq!(message.output, "legacy");
+        let (truncated, continuations): (bool, u16) = connection
+            .query_row(
+                "SELECT t.truncated, r.output_continuations
+                 FROM model_turns t JOIN runs r ON r.id = t.run_id WHERE r.id = ?1",
+                [run_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(continuations, 0);
+        // Historical context replays without a continuation notice.
+        let mut connection = connection;
+        let transaction = connection.transaction().unwrap();
+        let mut context = Vec::new();
+        append_run_turns(&transaction, run_id, &mut context).unwrap();
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].role(), Role::Assistant);
     }
 
     #[test]
@@ -12233,7 +12391,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
         let shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12315,7 +12473,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "21"
+            "22"
         );
     }
 
@@ -13630,6 +13788,7 @@ mod tests {
                     usage: Some(usage(100, 1)),
                     estimated_cost_usd_nanos: None,
                     accounting: None,
+                    truncated: false,
                 },
             )
             .await
@@ -13817,6 +13976,7 @@ mod tests {
                         usage: None,
                         estimated_cost_usd_nanos: None,
                         accounting: None,
+                        truncated: false,
                     },
                 )
                 .await;
@@ -13996,6 +14156,7 @@ mod tests {
                             usage: None,
                             estimated_cost_usd_nanos: None,
                             accounting: None,
+                            truncated: false,
                         },
                     )
                     .await
@@ -17686,6 +17847,7 @@ mod tests {
                         usage: None,
                         estimated_cost_usd_nanos: None,
                         accounting: None,
+                        truncated: false,
                     },
                 )
                 .await
@@ -17875,6 +18037,7 @@ mod tests {
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
+                    truncated: false,
                 },
             )
             .await
@@ -18180,6 +18343,221 @@ mod tests {
             messages[2].content(),
             [ContentBlock::Text { text }] if text == "continue after cancellation"
         ));
+    }
+
+    /// Truncates the first turn of every run at the output limit, then
+    /// completes on the second turn.
+    struct TruncatingLoader {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl RuntimeLoader for TruncatingLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                Runtime::new(TruncatingProvider { requests }, "test-model", 256)
+                    .map(|runtime| loaded_runtime(runtime, &request.workspace, None))
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct TruncatingProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for TruncatingProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            drop(requests);
+            let usage = Some(qq_provider::ProviderUsage {
+                input_tokens: 4,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 2,
+            });
+            // Even-numbered requests (the first of each run) truncate.
+            if turn.is_multiple_of(2) {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: "first half".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Incomplete {
+                        usage,
+                        reason: qq_provider::IncompleteReason::OutputTokens,
+                    }),
+                ]))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: " second half".to_owned(),
+                    }),
+                    Ok(qq_provider::ProviderEvent::Completed { usage }),
+                ]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_turns_persist_publish_and_replay_the_continuation_notice() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3")),
+            Arc::new(TruncatingLoader {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, cursor) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: cursor,
+            })
+            .unwrap();
+        let submit = |prompt: &str| {
+            let input = vec![InputPart::text(prompt.to_owned())];
+            let runtime = &runtime;
+            async move {
+                let receipt = runtime
+                    .command(
+                        CommandId::generate().unwrap(),
+                        SessionCommand::SubmitPrompt {
+                            session_id,
+                            input,
+                            limits: qq_protocol::RunLimits::default(),
+                            correlation: Correlation::default(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let CommandOutcome::PromptQueued { run_id, .. } = receipt.outcome else {
+                    panic!("unexpected receipt")
+                };
+                run_id
+            }
+        };
+
+        let run_id = submit("write a long answer").await;
+        let observed = collect_through_finished(&mut events).await;
+
+        // Persisted before published: the truncation event names the partial
+        // turn and the continuation count, and the run completes.
+        let truncated = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::RunOutputTruncated {
+                    run_id: observed_run,
+                    turn_ordinal,
+                    continuation,
+                } if *observed_run == run_id => Some((*turn_ordinal, *continuation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(truncated, vec![(1, 1)]);
+        let turns = observed
+            .iter()
+            .filter(|event| matches!(event.event, SessionEvent::ModelTurnCompleted { .. }))
+            .count();
+        assert_eq!(turns, 2, "both the partial and the resumed turn commit");
+        let finished = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { outcome, usage, .. } => Some((outcome.clone(), *usage)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(finished.0, RunOutcome::Completed);
+        assert_eq!(
+            finished.1.map(|usage| usage.output_tokens),
+            Some(4),
+            "the truncated turn's usage is charged"
+        );
+
+        // The transcript shows both halves as separate turns; the first is
+        // flagged so clients can join them.
+        let snapshot = runtime
+            .snapshot(SnapshotRequest::new(workspace_id, Some(session_id), 8, 32))
+            .await
+            .unwrap();
+        let focused = snapshot.focused.unwrap();
+        let assistant = focused
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .map(|message| {
+                (
+                    message.turn_ordinal,
+                    message.truncated,
+                    message.output.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assistant,
+            vec![(1, true, "first half"), (2, false, " second half")]
+        );
+        let run = focused.runs.iter().find(|run| run.id == run_id).unwrap();
+        assert_eq!(run.status, RunStatus::Completed);
+
+        // The counter is durable on the run row.
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let continuations: u16 = store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .query_row(
+                        "SELECT output_continuations FROM runs WHERE id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)
+            })
+            .await
+            .unwrap();
+        assert_eq!(continuations, 1);
+
+        // The next run's assembled context replays the partial turn, the
+        // continuation notice, and the resumed turn, exactly as the live
+        // request saw them.
+        let _ = submit("and now summarize").await;
+        let _ = collect_through_finished(&mut events).await;
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4);
+        let replayed = requests[2]
+            .messages()
+            .iter()
+            .map(|message| {
+                let text = match message.content().first() {
+                    Some(ContentBlock::Text { text }) => text.as_str(),
+                    _ => "",
+                };
+                (message.role(), text)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replayed,
+            vec![
+                (Role::User, "write a long answer"),
+                (Role::Assistant, "first half"),
+                (Role::User, crate::OUTPUT_TRUNCATED_CONTINUE_NOTICE),
+                (Role::Assistant, " second half"),
+                (Role::User, "and now summarize"),
+            ]
+        );
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -18540,6 +18918,7 @@ mod tests {
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
+                    truncated: false,
                 },
             )
             .await
@@ -18901,6 +19280,7 @@ mod tests {
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
+                    truncated: false,
                 },
             )
             .await
@@ -19052,6 +19432,7 @@ mod tests {
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
+                    truncated: false,
                 },
             )
             .await
@@ -19204,6 +19585,7 @@ mod tests {
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
+                    truncated: false,
                 },
             )
             .await
@@ -23969,6 +24351,7 @@ mod tests {
                     usage: None,
                     estimated_cost_usd_nanos: None,
                     accounting: None,
+                    truncated: false,
                 },
             )
             .await

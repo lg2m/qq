@@ -38,7 +38,11 @@ pub use tui::{
     TuiSourceReport,
 };
 
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
+/// Default per-turn output cap. Clamped to the model's advertised output
+/// limit at runtime, so a smaller model never receives an unrepresentable
+/// request. Raised from 4,096 because coding answers routinely exceed it
+/// and each truncation costs a continuation turn.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MCP_CALL_TIMEOUT_SECONDS: u64 = 60;
 pub const MAX_MCP_CALL_TIMEOUT_SECONDS: u64 = 600;

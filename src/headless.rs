@@ -576,6 +576,7 @@ async fn stream_run(
     // streaming; earlier turns are progress, not the answer.
     let mut answer = String::new();
     let mut answer_message: Option<MessageId> = None;
+    let mut answer_truncated = false;
     let text = options.format == HeadlessFormat::Text;
 
     loop {
@@ -652,9 +653,24 @@ async fn stream_run(
                 match &envelope.event {
                     SessionEvent::AssistantMessageStarted { message } if ours => {
                         if message.role == MessageRole::Assistant {
+                            // A message that follows a truncated one is the
+                            // same answer resumed: keep the prefix.
+                            if !answer_truncated {
+                                answer.clear();
+                            }
+                            answer_truncated = false;
                             answer_message = Some(message.id);
-                            answer.clear();
                             answer.push_str(&message.output);
+                        }
+                    }
+                    SessionEvent::RunOutputTruncated { continuation, .. } if ours => {
+                        answer_truncated = true;
+                        if text {
+                            let _ = writeln!(
+                                stderr,
+                                "\n[run] output truncated; continuing ({continuation}/{})",
+                                qq_core::MAX_OUTPUT_CONTINUATIONS
+                            );
                         }
                     }
                     SessionEvent::TextAppended { message_id, text: chunk, .. } if ours => {

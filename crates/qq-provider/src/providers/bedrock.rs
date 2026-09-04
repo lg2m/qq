@@ -35,8 +35,8 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 
 use crate::{
-    ContentBlock, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role,
+    ContentBlock, IncompleteReason, ModelRequest, Provider, ProviderError, ProviderErrorKind,
+    ProviderEvent, ProviderStream, ProviderUsage, Role,
     aws::{AwsConfigLoadError, load_aws_config, validate_configuration},
     bedrock_auth::BedrockAuth,
     limits::{ByteCounter, StreamLimits},
@@ -127,6 +127,7 @@ impl Provider for Bedrock {
                 "Amazon Bedrock output exceeded the configured size limit",
             );
             let mut message_stopped = false;
+            let mut incomplete = None;
             // Maps streamed content-block indexes to tool-call ids so argument
             // deltas and block stops can be attributed after the start event.
             let mut tool_calls = ToolCallTracker::default();
@@ -175,6 +176,15 @@ impl Provider for Bedrock {
                         }
                         message_stopped = true;
                     }
+                    DecodedEvent::MessageIncomplete(reason) => {
+                        if message_stopped {
+                            Err(ProviderError::Protocol(
+                                "Amazon Bedrock returned more than one messageStop".to_owned(),
+                            ))?;
+                        }
+                        message_stopped = true;
+                        incomplete = Some(reason);
+                    }
                     DecodedEvent::ToolCallStarted { index, id, name } => {
                         if message_stopped {
                             Err(ProviderError::Protocol(
@@ -210,7 +220,12 @@ impl Provider for Bedrock {
                                 "Amazon Bedrock returned metadata before messageStop".to_owned(),
                             ))?;
                         }
-                        yield ProviderEvent::Completed { usage: Some(usage) };
+                        match incomplete {
+                            Some(reason) => {
+                                yield ProviderEvent::Incomplete { usage: Some(usage), reason };
+                            }
+                            None => yield ProviderEvent::Completed { usage: Some(usage) },
+                        }
                         return;
                     }
                     DecodedEvent::Ignored => {}
@@ -403,6 +418,9 @@ enum DecodedEvent {
     OutputText(String),
     Refusal(String),
     MessageStopped,
+    /// `messageStop` with a recoverable stop reason; the terminal usage
+    /// still follows in `metadata`.
+    MessageIncomplete(IncompleteReason),
     Usage(ProviderUsage),
     ToolCallStarted {
         index: i32,
@@ -533,8 +551,8 @@ fn decode_stop_reason(reason: &StopReason) -> Result<DecodedEvent, ProviderError
         StopReason::GuardrailIntervened => Ok(DecodedEvent::Refusal(
             "Amazon Bedrock guardrail intervened".to_owned(),
         )),
-        StopReason::MaxTokens => Err(ProviderError::ResponseIncomplete(
-            "Amazon Bedrock reached the maximum output token limit".to_owned(),
+        StopReason::MaxTokens => Ok(DecodedEvent::MessageIncomplete(
+            IncompleteReason::OutputTokens,
         )),
         StopReason::ModelContextWindowExceeded => Err(ProviderError::ResponseFailed {
             kind: ProviderErrorKind::ContextExceeded,
@@ -1084,10 +1102,10 @@ mod tests {
             ));
         }
 
-        assert!(matches!(
-            decode_stop_reason(&StopReason::MaxTokens),
-            Err(ProviderError::ResponseIncomplete(_))
-        ));
+        assert_eq!(
+            decode_stop_reason(&StopReason::MaxTokens).unwrap(),
+            DecodedEvent::MessageIncomplete(IncompleteReason::OutputTokens)
+        );
         assert!(matches!(
             decode_stop_reason(&StopReason::ModelContextWindowExceeded),
             Err(ProviderError::ResponseFailed {

@@ -381,13 +381,15 @@ pub(in crate::sessions) fn open_database(
                 .commit()
                 .map_err(|_| SessionRuntimeError::Persistence)?;
         }
-        Some("10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21") => {
-        }
+        Some(
+            "10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21"
+            | "22",
+        ) => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
+        Some("11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
     ) {
         let transaction = connection
             .transaction()
@@ -405,7 +407,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
+        Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
     ) {
         let transaction = connection
             .transaction()
@@ -423,7 +425,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
+        Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
     ) {
         let transaction = connection
             .transaction()
@@ -441,7 +443,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
+        Some("14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
     ) {
         let transaction = connection
             .transaction()
@@ -460,7 +462,7 @@ pub(in crate::sessions) fn open_database(
     validate_model_turn_audit_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("15" | "16" | "17" | "18" | "19" | "20" | "21")
+        Some("15" | "16" | "17" | "18" | "19" | "20" | "21" | "22")
     ) {
         let transaction = connection
             .transaction()
@@ -493,7 +495,7 @@ pub(in crate::sessions) fn open_database(
     validate_linear_streaming_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("16" | "17" | "18" | "19" | "20" | "21")
+        Some("16" | "17" | "18" | "19" | "20" | "21" | "22")
     ) {
         let transaction = connection
             .transaction()
@@ -514,7 +516,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("17" | "18" | "19" | "20" | "21")
+        Some("17" | "18" | "19" | "20" | "21" | "22")
     ) {
         let transaction = connection
             .transaction()
@@ -532,7 +534,10 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_preparing_run_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("18" | "19" | "20" | "21")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("18" | "19" | "20" | "21" | "22")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -549,7 +554,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_context_occupancy_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("19" | "20" | "21")) {
+    if !matches!(schema_version.as_deref(), Some("19" | "20" | "21" | "22")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -566,7 +571,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_run_limits_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("20" | "21")) {
+    if !matches!(schema_version.as_deref(), Some("20" | "21" | "22")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -581,7 +586,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if schema_version.as_deref() != Some("21") {
+    if schema_version.as_deref() != Some("21") && schema_version.as_deref() != Some("22") {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -596,6 +601,22 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
+    if schema_version.as_deref() != Some("22") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_output_truncation_columns(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '22' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_output_truncation_schema(&connection)?;
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -1314,6 +1335,39 @@ fn add_contract_columns(connection: &Connection) -> Result<(), SessionRuntimeErr
                     [],
                 )
                 .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+    }
+    Ok(())
+}
+
+/// Records output truncation state. Historical rows read back as never
+/// truncated and zero continuations, which is what they were.
+fn add_output_truncation_columns(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    for (table, column) in OUTPUT_TRUNCATION_COLUMNS {
+        if !has_column(connection, table, column)? {
+            connection
+                .execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                    [],
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+        }
+    }
+    Ok(())
+}
+
+const OUTPUT_TRUNCATION_COLUMNS: [(&str, &str); 3] = [
+    ("messages", "truncated"),
+    ("model_turns", "truncated"),
+    ("runs", "output_continuations"),
+];
+
+fn validate_output_truncation_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    for (table, column) in OUTPUT_TRUNCATION_COLUMNS {
+        if column_shape(connection, table, column)?
+            != ("INTEGER".to_owned(), true, Some("0".to_owned()), 0)
+        {
+            return Err(SessionRuntimeError::Persistence);
         }
     }
     Ok(())

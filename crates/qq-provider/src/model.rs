@@ -213,15 +213,66 @@ pub enum Role {
 /// Events common to provider streaming implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
-    OutputTextDelta { text: String },
-    RefusalDelta { text: String },
-    ReasoningStarted { kind: ReasoningKind },
-    ReasoningDelta { kind: ReasoningKind, text: String },
-    ReasoningCompleted { kind: ReasoningKind },
-    ToolCallStarted { id: String, name: String },
-    ToolCallArgumentsDelta { id: String, json: String },
-    ToolCallCompleted { id: String },
-    Completed { usage: Option<ProviderUsage> },
+    OutputTextDelta {
+        text: String,
+    },
+    RefusalDelta {
+        text: String,
+    },
+    ReasoningStarted {
+        kind: ReasoningKind,
+    },
+    ReasoningDelta {
+        kind: ReasoningKind,
+        text: String,
+    },
+    ReasoningCompleted {
+        kind: ReasoningKind,
+    },
+    ToolCallStarted {
+        id: String,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        id: String,
+        json: String,
+    },
+    ToolCallCompleted {
+        id: String,
+    },
+    Completed {
+        usage: Option<ProviderUsage>,
+    },
+    /// The provider stopped generating before the model finished its turn
+    /// for a reason the caller can recover from by asking it to continue.
+    /// Text streamed so far is valid; tool calls still open when this arrives
+    /// carry incomplete arguments and must not be executed. Terminal like
+    /// `Completed`. Stops the caller cannot recover from (content filters,
+    /// refusals) remain `ProviderError::ResponseIncomplete`.
+    Incomplete {
+        usage: Option<ProviderUsage>,
+        reason: IncompleteReason,
+    },
+}
+
+/// Why a provider stopped a response short of the model finishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompleteReason {
+    /// The response reached the request's output token limit.
+    OutputTokens,
+    /// The provider paused a long-running turn (Anthropic `pause_turn`) and
+    /// expects the caller to resend to resume.
+    Paused,
+}
+
+impl IncompleteReason {
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::OutputTokens => "the response reached its output token limit",
+            Self::Paused => "the provider paused the response before completion",
+        }
+    }
 }
 
 /// Provider-neutral token counts for one completed model response.

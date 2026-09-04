@@ -46,7 +46,7 @@ Related documents:
 ## Protocol Version
 
 ```text
-PROTOCOL_VERSION = 15
+PROTOCOL_VERSION = 16
 ```
 
 The counter restarted at 1 on 2026-07-28, before any release; earlier
@@ -105,8 +105,15 @@ added `SessionSummary.approval_mode` so every client renders the policy a
 session holds tool calls against, and `set_approval_mode` now publishes
 `session_updated` with the new summary. The field defaults to `auto` on decode
 so events persisted by earlier builds still replay; a version-14 client rejects
-the field on every summary-bearing snapshot and event. Golden fixtures
-moved to `crates/qq-protocol/tests/fixtures/v15/`.
+the field on every summary-bearing snapshot and event. Version 16 added bounded
+output continuation: when a provider stops a turn at its output token limit the
+runtime commits the partial turn, publishes `run_output_truncated` (turn ordinal
+and 1-based continuation count), and resumes on the next turn, up to
+`LimitCapabilities.max_output_continuations` times before settling with the
+new `provider_output_truncated` failure kind. `MessageSnapshot.truncated` marks
+the assistant message the provider cut. Older clients reject the new event tag
+and failure kind. Golden fixtures moved to
+`crates/qq-protocol/tests/fixtures/v16/`.
 
 Clients and servers must agree on this value.
 
@@ -279,7 +286,7 @@ Response `ServerInfo`:
 
 ```json
 {
-  "protocol_version": 15,
+  "protocol_version": 16,
   "version": "0.1.0",
   "pid": 12345
 }
@@ -304,7 +311,7 @@ Response `ServerCapabilities` (abridged; see
 ```json
 {
   "version": 1,
-  "protocol_version": 15,
+  "protocol_version": 16,
   "server_version": "0.1.0",
   "input_parts": ["text", "workspace_file"],
   "commands": ["resolve_workspace", "create_session", "submit_prompt", "steer_run", "..."],
@@ -322,7 +329,8 @@ Response `ServerCapabilities` (abridged; see
     "max_children": 8,
     "max_concurrent_children": 3,
     "max_child_depth": 1,
-    "max_correlation_entries": 8
+    "max_correlation_entries": 8,
+    "max_output_continuations": 3
   },
   "approvals": ["approve_once", "approve_for_session", "approve_for_workspace", "deny"],
   "approval_modes": ["read_only", "ask", "auto", "full"],
@@ -1154,6 +1162,7 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `steering_applied` | `run_id`, `message_id`, `turn_ordinal` | Steering entered model context for that turn |
 | `steering_superseded` | `run_id`, `message_id` | Run finished before the steering applied |
 | `run_interrupted` | `run_id`, `turn_ordinal` | An interrupting steer aborted the turn in flight |
+| `run_output_truncated` | `run_id`, `turn_ordinal`, `continuation` | The provider cut the turn at its output token limit; the partial turn is committed and the run resumes on the next turn |
 | `assistant_message_started` | `message` | A model turn's message begins streaming |
 | `text_appended` | `message_id`, `channel`, `text` | Output or refusal delta |
 | `model_turn_completed` | `run_id`, `turn_ordinal`, `model`, optional `usage`, optional `estimated_cost_usd_nanos` | A provider inference and its accounting committed |
@@ -1525,11 +1534,20 @@ provider_api
 provider_response
 provider_protocol
 context_source
+provider_output_truncated
 ```
 
 `context_source` settles a run whose fail-closed `ContextSource` did not
 deliver before any provider work; the record on `prompt_identity` names the
 source and outcome.
+
+`provider_output_truncated` settles a run whose provider stopped at its output
+token limit on more consecutive turns than the runtime continues
+(`max_output_continuations`, currently 3). Each truncated turn is committed as
+a `truncated` assistant message and is charged to the run; the failure message
+names the cap and the turn count so the reason is never a generic "response
+was incomplete". Content-filter and refusal stops remain `provider_response`
+and are never continued.
 
 ### Token usage
 

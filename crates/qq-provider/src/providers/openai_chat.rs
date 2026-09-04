@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ContentBlock, Message, ModelRequest, Provider, ProviderError, ProviderErrorKind, ProviderEvent,
-    ProviderStream, ProviderUsage, Role, ToolSpec,
+    ContentBlock, IncompleteReason, Message, ModelRequest, Provider, ProviderError,
+    ProviderErrorKind, ProviderEvent, ProviderStream, ProviderUsage, Role, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
     exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
     http::{
@@ -144,13 +144,21 @@ impl Provider for OpenAiChatCompletions {
                 "OpenAI-compatible stream sent arguments for an unknown tool call",
             );
 
+            // A `length` finish reason arrives before the usage chunk and
+            // `[DONE]`; remember it so the terminal event still carries usage.
+            let mut incomplete = None;
+
             while let Some(event) = sse.next_event().await? {
                 let data = event.data.trim();
                 if data.is_empty() {
                     continue;
                 }
                 if data == "[DONE]" {
-                    yield ProviderEvent::Completed { usage: usage.finish() };
+                    let usage = usage.finish();
+                    match incomplete {
+                        Some(reason) => yield ProviderEvent::Incomplete { usage, reason },
+                        None => yield ProviderEvent::Completed { usage },
+                    }
                     return;
                 }
 
@@ -181,6 +189,9 @@ impl Provider for OpenAiChatCompletions {
                             for id in tool_calls.drain() {
                                 yield ProviderEvent::ToolCallCompleted { id };
                             }
+                        }
+                        DecodedDelta::Incomplete(reason) => {
+                            incomplete = Some(reason);
                         }
                         DecodedDelta::TerminalError(error) => Err(error)?,
                     }
@@ -495,6 +506,9 @@ enum DecodedDelta {
         json: String,
     },
     ToolCallsFinished,
+    /// The choice stopped short for a recoverable reason; the stream still
+    /// runs to `[DONE]` so trailing usage is captured.
+    Incomplete(IncompleteReason),
     TerminalError(ProviderError),
 }
 
@@ -554,9 +568,10 @@ fn decode_event(data: &str, redactions: &[String]) -> Result<DecodedChunk, Provi
                     deltas.push(DecodedDelta::ToolCallsFinished);
                     continue;
                 }
-                "length" => ProviderError::ResponseIncomplete(
-                    "OpenAI-compatible response reached its output token limit".to_owned(),
-                ),
+                "length" => {
+                    deltas.push(DecodedDelta::Incomplete(IncompleteReason::OutputTokens));
+                    continue;
+                }
                 "content_filter" => ProviderError::ResponseIncomplete(
                     "OpenAI-compatible response was stopped by a content filter".to_owned(),
                 ),
@@ -887,7 +902,7 @@ mod tests {
 
         assert!(matches!(
             length,
-            DecodedDelta::TerminalError(ProviderError::ResponseIncomplete(_))
+            DecodedDelta::Incomplete(IncompleteReason::OutputTokens)
         ));
         assert!(matches!(
             function_call,

@@ -100,6 +100,16 @@ const INTERRUPT_CONTINUE_NOTICE: &str = "[QQ runtime notice; not a user instruct
 turn was interrupted by the user. Continue from where it stopped.";
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
+/// Most times one run resumes a turn the provider cut at its output token
+/// limit. The cap keeps a model that re-emits the same prefix from spending
+/// the whole budget; the typed failure names it.
+pub const MAX_OUTPUT_CONTINUATIONS: u16 = 3;
+/// Sent after a truncated turn is committed so the model resumes rather than
+/// restarts. Assistant/user alternation is preserved because the partial
+/// assistant message precedes it.
+pub(crate) const OUTPUT_TRUNCATED_CONTINUE_NOTICE: &str = "[QQ runtime notice; not a user instruction]\nThe \
+previous response was cut off at the output token limit. Continue exactly from where it \
+stopped; do not repeat what was already written.";
 
 enum StreamStep<T> {
     Interrupted,
@@ -920,6 +930,7 @@ impl plan::CompiledAgentPlan {
             let mut compatible_request: Option<(Arc<str>, bool, u64, u64)> = None;
 
             let mut slice_tool_calls = 0_usize;
+            let mut output_continuations = 0_u16;
             let mut model_text_bytes = 0_usize;
             let mut continuing_slice = false;
             for turn_ordinal in 1..=u16::MAX {
@@ -1005,7 +1016,7 @@ impl plan::CompiledAgentPlan {
                 // failing the run — but only while nothing user-visible has
                 // streamed, so a retry can never duplicate output.
                 let mut attempt = 1_u32;
-                let (blocks, pending_calls, terminal_usage, interrupted_turn) = 'turn: loop {
+                let (blocks, pending_calls, terminal_usage, interrupted_turn, truncated_turn) = 'turn: loop {
                 let request = ModelRequest::new(
                     Arc::clone(&model),
                     messages.clone(),
@@ -1032,6 +1043,7 @@ impl plan::CompiledAgentPlan {
                 let mut open_reasoning = None;
                 let mut turn_streamed = false;
                 let mut interrupted_turn = false;
+                let mut truncated_turn = false;
                 let deadline = budget.deadline();
 
                 loop {
@@ -1321,6 +1333,23 @@ impl plan::CompiledAgentPlan {
                             completed = true;
                             break;
                         }
+                        Ok(ProviderEvent::Incomplete { usage, reason: _ }) => {
+                            // The turn is a valid prefix but the model was
+                            // not done. Text stands; any tool call it had
+                            // begun carries incomplete arguments and is
+                            // dropped, so nothing from this turn executes.
+                            // Continuation (or the typed failure) is decided
+                            // after the partial turn is committed.
+                            if open_reasoning.is_some() {
+                                yield RuntimeEvent::ReasoningCompleted {
+                                    kind: open_reasoning.take().expect("checked"),
+                                };
+                            }
+                            terminal_usage = usage.map(provider_usage);
+                            truncated_turn = true;
+                            completed = true;
+                            break;
+                        }
                         Err(error) => {
                             if is_transient_provider_failure(error.kind())
                                 && !turn_streamed
@@ -1359,16 +1388,19 @@ impl plan::CompiledAgentPlan {
                     return;
                 }
 
-                if interrupted_turn {
-                    handled_interrupt = steering
-                        .as_ref()
-                        .map_or(handled_interrupt, |steering| *steering.interrupts.borrow());
+                if interrupted_turn || truncated_turn {
+                    if interrupted_turn {
+                        handled_interrupt = steering
+                            .as_ref()
+                            .map_or(handled_interrupt, |steering| *steering.interrupts.borrow());
+                    }
                     // Only fully streamed calls could be executed; an interrupt
-                    // executes none, so the partial turn carries text alone.
+                    // or truncation executes none, so the partial turn carries
+                    // text alone.
                     blocks.retain(|block| matches!(block, TurnBlock::Text(_)));
                     pending_calls.clear();
                 }
-                break 'turn (blocks, pending_calls, terminal_usage, interrupted_turn);
+                break 'turn (blocks, pending_calls, terminal_usage, interrupted_turn, truncated_turn);
                 };
 
                 compatible_request = terminal_usage.map(|usage| {
@@ -1437,9 +1469,47 @@ impl plan::CompiledAgentPlan {
                     message: assistant.clone(),
                     usage: terminal_usage,
                     calls: calls.clone(),
+                    truncated: truncated_turn,
                 };
                 budget.charge_turn(terminal_usage);
                 budget.charge_tool_calls(calls.len());
+
+                if truncated_turn {
+                    // A reserved final response that ran out of room cannot be
+                    // continued: the budget already settles the run below.
+                    // Otherwise resume, bounded, or settle with the reason.
+                    if !budget_final_turn {
+                        if output_continuations >= MAX_OUTPUT_CONTINUATIONS {
+                            yield RuntimeEvent::Failed {
+                                kind: RunFailureKind::ProviderOutputTruncated,
+                                message: format!(
+                                    "the provider stopped at its output token limit ({max_output_tokens} tokens) on \
+                                     {} consecutive turns; the partial answer is in the transcript",
+                                    u32::from(MAX_OUTPUT_CONTINUATIONS) + 1
+                                ),
+                            };
+                            return;
+                        }
+                        output_continuations += 1;
+                        yield RuntimeEvent::OutputTruncated {
+                            turn_ordinal,
+                            continuation: output_continuations,
+                        };
+                        if assistant.has_content() {
+                            irreducible_message_bytes = irreducible_message_bytes
+                                .saturating_add(measure_message(&assistant));
+                            messages.push(assistant);
+                        }
+                        if messages.last().is_some_and(|message| message.role() == Role::Assistant) {
+                            messages.push(Message::user(OUTPUT_TRUNCATED_CONTINUE_NOTICE));
+                            irreducible_message_bytes = irreducible_message_bytes
+                                .saturating_add(measure_message(messages.last().expect("just pushed")));
+                        }
+                        continue;
+                    }
+                } else {
+                    output_continuations = 0;
+                }
 
                 if interrupted_turn {
                     yield RuntimeEvent::Interrupted { turn_ordinal };
@@ -2042,7 +2112,10 @@ fn public_run_stream(mut events: RuntimeStream, context_window: Option<u32>) -> 
                 | RuntimeEvent::ToolCallFinished { .. }
                 // Direct runs have no steering channel, so these never fire.
                 | RuntimeEvent::SteeringApplied { .. }
-                | RuntimeEvent::Interrupted { .. } => {}
+                | RuntimeEvent::Interrupted { .. }
+                // Continuation is transparent to the direct stream: the text
+                // keeps flowing and the typed failure names exhaustion.
+                | RuntimeEvent::OutputTruncated { .. } => {}
                 RuntimeEvent::Completed => {
                     yield RunEvent::Completed;
                     return;
@@ -3871,6 +3944,345 @@ mod tests {
             events.last(),
             Some(RunEvent::Failed {
                 kind: RunFailureKind::ProviderProtocol,
+                ..
+            })
+        ));
+    }
+
+    /// Truncates the first `truncations` turns at the output limit (each with
+    /// its own text prefix and, on the first, a half-streamed tool call), then
+    /// completes with a final chunk. Records every request for inspection.
+    struct TruncatingProvider {
+        truncations: usize,
+        /// Cut a tool call mid-arguments on the first truncated turn.
+        cut_tool_call: bool,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for TruncatingProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            drop(requests);
+            let usage = Some(qq_provider::ProviderUsage {
+                input_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 7,
+            });
+            if turn < self.truncations {
+                let mut events = vec![Ok(ProviderEvent::OutputTextDelta {
+                    text: format!("part{turn} "),
+                })];
+                if turn == 0 && self.cut_tool_call {
+                    // A tool call cut mid-arguments must never execute.
+                    events.push(Ok(ProviderEvent::ToolCallStarted {
+                        id: "cut".to_owned(),
+                        name: "read_file".to_owned(),
+                    }));
+                    events.push(Ok(ProviderEvent::ToolCallArgumentsDelta {
+                        id: "cut".to_owned(),
+                        json: r#"{"path":"AGEN"#.to_owned(),
+                    }));
+                }
+                events.push(Ok(ProviderEvent::Incomplete {
+                    usage,
+                    reason: qq_provider::IncompleteReason::OutputTokens,
+                }));
+                Box::pin(stream::iter(events))
+            } else {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "end".to_owned(),
+                    }),
+                    Ok(ProviderEvent::Completed { usage }),
+                ]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_turns_are_committed_and_continued_within_the_cap() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            TruncatingProvider {
+                truncations: 2,
+                cut_tool_call: true,
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let events = runtime
+            .run_messages_in_workspace(
+                vec![Message::user("write a long answer")],
+                directory.path().to_owned(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        // Three provider turns, each committed; the two truncated ones flagged
+        // and carrying no calls.
+        let turns = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::AssistantTurnCompleted {
+                    turn_ordinal,
+                    calls,
+                    truncated,
+                    ..
+                } => Some((*turn_ordinal, calls.len(), *truncated)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(turns, vec![(1, 0, true), (2, 0, true), (3, 0, false)]);
+        let continuations = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::OutputTruncated {
+                    turn_ordinal,
+                    continuation,
+                } => Some((*turn_ordinal, *continuation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(continuations, vec![(1, 1), (2, 2)]);
+        assert_eq!(events.last(), Some(&RuntimeEvent::Completed));
+        // The half-streamed tool call never reached the tool loop.
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallStarted { .. } | RuntimeEvent::ToolCallDenied { .. }
+        )));
+
+        // The final request carries both partial turns with the continuation
+        // notice after each, so the model resumes rather than restarts, and
+        // alternation holds.
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let transcript = requests[2]
+            .messages()
+            .iter()
+            .map(|message| {
+                let text = match message.content().first() {
+                    Some(ContentBlock::Text { text }) => text.as_str(),
+                    _ => "",
+                };
+                (message.role(), text)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transcript,
+            vec![
+                (Role::User, "write a long answer"),
+                (Role::Assistant, "part0 "),
+                (Role::User, OUTPUT_TRUNCATED_CONTINUE_NOTICE),
+                (Role::Assistant, "part1 "),
+                (Role::User, OUTPUT_TRUNCATED_CONTINUE_NOTICE),
+            ]
+        );
+        // Tools stay available on continuation turns.
+        assert!(!requests[2].tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncation_past_the_cap_settles_with_a_typed_failure() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            TruncatingProvider {
+                truncations: usize::MAX,
+                cut_tool_call: false,
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let events = runtime
+            .run_messages_in_workspace(
+                vec![Message::user("write a long answer")],
+                directory.path().to_owned(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let expected_turns = usize::from(MAX_OUTPUT_CONTINUATIONS) + 1;
+        assert_eq!(requests.lock().unwrap().len(), expected_turns);
+        let committed = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::AssistantTurnCompleted {
+                        truncated: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(committed, expected_turns, "every partial turn is durable");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::OutputTruncated { .. }))
+                .count(),
+            usize::from(MAX_OUTPUT_CONTINUATIONS)
+        );
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::Failed {
+                kind: RunFailureKind::ProviderOutputTruncated,
+                message,
+            }) if message.contains("256 tokens") && message.contains("4 consecutive turns")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_budget_final_turn_settles_as_exhausted_not_continued() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            TruncatingProvider {
+                truncations: usize::MAX,
+                cut_tool_call: false,
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        // One model turn: the first request is already the reserved final
+        // response, so its truncation must not spend a second turn.
+        // (A tool call on that turn is already a budget failure; this case
+        // covers plain text running out of room.)
+        let limits = RunLimits {
+            max_model_turns: Some(1),
+            ..RunLimits::default()
+        };
+        let events = runtime
+            .run_loop_with_spawner(
+                vec![Message::user("write a long answer")],
+                directory.path().to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(StaticPolicyGate {
+                    mode: ApprovalMode::Ask,
+                    grants: approval::SessionGrants::default(),
+                }),
+                Arc::new(workspace::FileState::default()),
+                RunCapabilities::user(None).with_limits(limits, None),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AssistantTurnCompleted {
+                truncated: true,
+                ..
+            }
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::OutputTruncated { .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::BudgetExhausted { exhaustion })
+                if exhaustion.limit == BudgetLimitKind::ModelTurns
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_paused_turn_with_no_text_resumes_from_the_original_prompt() {
+        struct PausingProvider {
+            requests: Arc<Mutex<Vec<ModelRequest>>>,
+        }
+
+        impl Provider for PausingProvider {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let mut requests = self.requests.lock().unwrap();
+                let turn = requests.len();
+                requests.push(request);
+                drop(requests);
+                if turn == 0 {
+                    Box::pin(stream::iter([Ok(ProviderEvent::Incomplete {
+                        usage: None,
+                        reason: qq_provider::IncompleteReason::Paused,
+                    })]))
+                } else {
+                    Box::pin(stream::iter([
+                        Ok(ProviderEvent::OutputTextDelta {
+                            text: "done".to_owned(),
+                        }),
+                        Ok(ProviderEvent::Completed { usage: None }),
+                    ]))
+                }
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            PausingProvider {
+                requests: Arc::clone(&requests),
+            },
+            "gpt-test",
+            256,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let events = runtime
+            .run_messages_in_workspace(vec![Message::user("go")], directory.path().to_owned())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events.last(), Some(&RuntimeEvent::Completed));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::OutputTruncated {
+                continuation: 1,
+                ..
+            }
+        )));
+        // A paused turn with no text commits no assistant message, so there
+        // is nothing to append a notice after: the resume request repeats
+        // the original prompt alone and alternation holds.
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].messages().len(), 1);
+        assert_eq!(requests[1].messages()[0].role(), Role::User);
+    }
+
+    #[tokio::test]
+    async fn content_filter_stops_still_fail_as_provider_response() {
+        struct FilteredProvider;
+
+        impl Provider for FilteredProvider {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                Box::pin(stream::iter([
+                    Ok(ProviderEvent::OutputTextDelta {
+                        text: "partial".to_owned(),
+                    }),
+                    Err(ProviderError::ResponseIncomplete(
+                        "content_filter".to_owned(),
+                    )),
+                ]))
+            }
+        }
+
+        let runtime = Runtime::new(FilteredProvider, "gpt-test", 256).unwrap();
+        let events = runtime
+            .run(RunCommand::new("hello"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Failed {
+                kind: RunFailureKind::ProviderResponse,
                 ..
             })
         ));

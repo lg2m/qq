@@ -270,6 +270,43 @@ impl App {
             // The interrupted turn's tool calls arrive as ordinary finished
             // events; nothing else changes on screen.
             SessionEvent::RunInterrupted { .. } => {}
+            // The truncated turn's message was already completed with its
+            // `truncated` flag by the turn commit; the next turn's message
+            // continues the same answer. Surface the continuation so the
+            // user knows why the answer paused.
+            SessionEvent::RunOutputTruncated {
+                run_id,
+                turn_ordinal,
+                continuation,
+            } => {
+                if let Some(messages) = self
+                    .sessions
+                    .get_mut(&envelope.session_id)
+                    .and_then(|session| session.messages.as_mut())
+                    && let Some(message) = messages.iter_mut().rev().find(|message| {
+                        message.run_id == *run_id
+                            && message.turn_ordinal == *turn_ordinal
+                            && message.role == qq_protocol::MessageRole::Assistant
+                    })
+                {
+                    message.truncated = true;
+                }
+                let cap = self
+                    .capabilities
+                    .as_ref()
+                    .map(|capabilities| capabilities.limits.max_output_continuations)
+                    .filter(|cap| *cap > 0);
+                effects.push(Effect::Notice {
+                    session: Some(envelope.session_id),
+                    level: NoticeLevel::Info,
+                    text: match cap {
+                        Some(cap) => {
+                            format!("output limit reached; continuing ({continuation}/{cap})")
+                        }
+                        None => format!("output limit reached; continuing ({continuation})"),
+                    },
+                });
+            }
             // The follow-through of an approve-for-workspace decision. A
             // failure is informational: the session grant already stands.
             SessionEvent::WorkspaceGrantPromoted { outcome, .. } => {

@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use qq_provider::{
-    EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, Message, ModelRequest, Provider,
-    ProviderCompiler, ProviderError, ProviderErrorKind, ProviderRecipe,
-    test_support::LoopbackServer,
+    EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, IncompleteReason, Message,
+    ModelRequest, Provider, ProviderCompiler, ProviderError, ProviderErrorKind, ProviderEvent,
+    ProviderRecipe, test_support::LoopbackServer,
 };
 
 /// Compiles an HTTP recipe against a loopback base URL, exactly as runtime
@@ -93,4 +93,51 @@ pub async fn assert_output_limit_ends_the_stream(protocol: HttpProtocol, sse_bod
 /// A single output-text payload one byte past the 64 KiB output floor.
 pub fn oversized_text() -> String {
     "a".repeat(64 * 1_024 + 1)
+}
+
+/// Streams a response the provider cut at its output token limit and asserts
+/// the partial text arrives followed by a terminal `Incomplete` event carrying
+/// the reason and any reported usage, never an error.
+pub async fn assert_output_truncation_is_typed(
+    protocol: HttpProtocol,
+    sse_body: String,
+    expected_output_tokens: Option<u64>,
+) {
+    let server = LoopbackServer::sse(sse_body);
+    let provider = compile_http(
+        server.base_url.clone(),
+        protocol,
+        HttpAuth::ApiKey("interface-test-secret".into()),
+    );
+
+    let events = provider
+        .stream(ModelRequest::new(
+            "test-model",
+            vec![Message::user("hello")],
+            64,
+        ))
+        .collect::<Vec<_>>()
+        .await;
+
+    let text = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(ProviderEvent::OutputTextDelta { text }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        text, "partial",
+        "{protocol:?} must keep the streamed prefix"
+    );
+    let Some(Ok(ProviderEvent::Incomplete { usage, reason })) = events.last() else {
+        panic!("{protocol:?} must end a truncated stream with Incomplete: {events:?}");
+    };
+    assert_eq!(*reason, IncompleteReason::OutputTokens);
+    assert_eq!(
+        usage.map(|usage| usage.output_tokens),
+        expected_output_tokens,
+        "{protocol:?} must carry the reported usage on the terminal event"
+    );
+    server.capture();
 }
