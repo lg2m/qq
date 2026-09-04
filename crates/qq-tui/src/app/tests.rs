@@ -943,6 +943,7 @@ fn context_usage_uses_last_turn_tokens_live_updates_and_the_model_limit() {
             cache_read_input_tokens: 2_000,
             cache_write_input_tokens: 500,
             output_tokens: 1_000,
+            reasoning_tokens: None,
         }),
         context_tokens: Some(9_000),
         estimated_cost_usd_nanos: Some(1),
@@ -989,6 +990,7 @@ fn context_usage_uses_last_turn_tokens_live_updates_and_the_model_limit() {
                     cache_read_input_tokens: 3_000,
                     cache_write_input_tokens: 1_000,
                     output_tokens: 2_000,
+                    reasoning_tokens: None,
                 }),
                 context_tokens: Some(18_000),
             },
@@ -1094,6 +1096,7 @@ fn legacy_cumulative_usage_is_not_presented_as_context_occupancy() {
             cache_read_input_tokens: 12_000,
             cache_write_input_tokens: 2_400,
             output_tokens: 4_000,
+            reasoning_tokens: None,
         }),
         estimated_cost_usd_nanos: Some(1),
         ..fixtures::run(id(7, RunId::from_bytes), session_id, RunStatus::Completed)
@@ -1158,6 +1161,7 @@ fn compaction_run_usage_does_not_become_session_context() {
                     cache_read_input_tokens: 6_000,
                     cache_write_input_tokens: 0,
                     output_tokens: 2_000,
+                    reasoning_tokens: None,
                 }),
                 // This is the compaction request's pre-summary input, not
                 // the session occupancy after the summary replaced it.

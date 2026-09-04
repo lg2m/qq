@@ -72,6 +72,10 @@ pub struct HeadlessOptions {
     pub max_cost_usd_nanos: Option<u64>,
     pub format: HeadlessFormat,
     pub trace: Option<PathBuf>,
+    /// An evaluation arm label (`QQ_EVAL_ARM`) stamped on the trial record so
+    /// paired comparisons can tell configurations apart without inferring
+    /// them from prompt or schema hashes. Never affects behavior.
+    pub arm: Option<String>,
 }
 
 /// Unattended approval policies. Interactive `ask` approval is unrepresentable
@@ -175,6 +179,8 @@ enum TrialRecord<'a> {
         max_turns: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_cost_usd_nanos: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arm: Option<&'a str>,
         workspace_id: String,
         session_id: String,
         run_id: String,
@@ -391,6 +397,7 @@ pub async fn run(
         timeout_seconds: options.timeout.map(|timeout| timeout.as_secs()),
         max_turns: options.max_turns,
         max_cost_usd_nanos: options.max_cost_usd_nanos,
+        arm: options.arm.as_deref(),
         workspace_id: handle.workspace_id.to_string(),
         session_id: handle.session_id.to_string(),
         run_id: handle.run_id.to_string(),
@@ -1176,6 +1183,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                         cache_write_input_tokens: 0,
                         output_tokens: 5,
+                        reasoning_tokens: None,
                     }),
                 }),
             ]))
@@ -1432,6 +1440,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                         cache_write_input_tokens: 0,
                         output_tokens: 1,
+                        reasoning_tokens: None,
                     }),
                 }),
             ]))
@@ -1475,6 +1484,7 @@ mod tests {
                             cache_read_input_tokens: 0,
                             cache_write_input_tokens: 0,
                             output_tokens: 1,
+                            reasoning_tokens: None,
                         }),
                     }),
                 ]))
@@ -1489,6 +1499,7 @@ mod tests {
                             cache_read_input_tokens: 0,
                             cache_write_input_tokens: 0,
                             output_tokens: 1,
+                            reasoning_tokens: None,
                         }),
                     }),
                 ]))
@@ -1644,6 +1655,7 @@ mod tests {
             max_cost_usd_nanos: None,
             format: HeadlessFormat::Jsonl,
             trace: None,
+            arm: None,
         }
     }
 
@@ -2063,13 +2075,20 @@ mod tests {
     #[tokio::test]
     async fn jsonl_records_have_monotonic_cursors_and_exactly_one_terminal_outcome() {
         let fixture = fixture(|| TextProvider).await;
-        let options = options(&fixture.workspace);
+        let options = HeadlessOptions {
+            arm: Some("A1".to_owned()),
+            ..options(&fixture.workspace)
+        };
 
         let (status, stdout, _stderr) = run_to_end(&fixture, options, std::future::pending()).await;
 
         assert_eq!(status, HeadlessStatus::Completed);
         let records = parse_records(&stdout);
         assert_eq!(records[0]["type"], "trial", "metadata must lead the trial");
+        assert_eq!(
+            records[0]["arm"], "A1",
+            "the arm label rides the trial record"
+        );
         assert_eq!(records[0]["model"]["model"], "test/model");
         assert_eq!(records[0]["profile"], "default");
         assert_eq!(records[0]["approval"], "read-only");
@@ -2546,12 +2565,14 @@ mod tests {
             cache_read_input_tokens: 2,
             cache_write_input_tokens: 1,
             output_tokens: 3,
+            reasoning_tokens: None,
         };
         let inclusive = TokenUsage {
             input_tokens: 30,
             cache_read_input_tokens: 5,
             cache_write_input_tokens: 4,
             output_tokens: 9,
+            reasoning_tokens: None,
         };
         let accounting = SessionAccounting {
             direct: AccountingTotal {

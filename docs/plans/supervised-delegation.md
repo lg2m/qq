@@ -1,7 +1,7 @@
 # Supervised Delegation, Continuation, And Audit
 
-Status: proposed 2026-09-03. D1 and D2 implemented 2026-09-03; D3–D6 not
-started. This plan is a companion to
+Status: proposed 2026-09-03. D1, D2, and D6a implemented 2026-09-03; D3, D4,
+D5, and D6b not started. This plan is a companion to
 [`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md)
 and requires the amendments listed in [Amendments](#amendments-to-existing-plans)
 before D4 or D5 may land.
@@ -466,7 +466,7 @@ gate beyond T1 showing no pass-rate loss.
 
 | Task | Depends on | Notes |
 | --- | --- | --- |
-| D6a compare command, arm stamping, reasoning tokens | none | lands first so every task is measurable |
+| D6a compare command, arm stamping, reasoning tokens | none | done |
 | D1 continuation | none | done; protocol 16, schema 22 |
 | D2 accounting and authority repair | none | done |
 | D3 roster | D2 | descriptor 4, prompt bump |

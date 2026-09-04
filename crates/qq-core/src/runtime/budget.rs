@@ -412,6 +412,7 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
             output_tokens: output,
+            reasoning_tokens: None,
         }
     }
 

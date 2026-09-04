@@ -7,7 +7,7 @@ use std::{
 
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -30,6 +30,10 @@ enum EvalCommand {
     Report(ReportArgs),
     /// Record one trajectory-grounded primary failure category.
     Classify(ClassifyArgs),
+    /// Compare two compatible jobs task by task: paired pass outcomes with a
+    /// McNemar exact test, a bootstrap interval on the dollars-per-pass ratio,
+    /// and the scorecard delta.
+    Compare(CompareArgs),
 }
 
 #[derive(Debug, Args)]
@@ -70,6 +74,11 @@ struct RunArgs {
     /// Stable operator-supplied machine or runner class recorded in the manifest.
     #[arg(long)]
     machine_class: Option<String>,
+    /// Evaluation arm label stamped on every trial (`QQ_EVAL_ARM`), so paired
+    /// comparisons can name the configuration under test. The configuration
+    /// itself is expressed through `QQ_*` environment passthrough.
+    #[arg(long)]
+    arm: Option<String>,
     /// Include one task name or glob. May be repeated.
     #[arg(short = 'i', long = "include-task-name")]
     include_task_names: Vec<String>,
@@ -89,6 +98,25 @@ struct ReportArgs {
     /// Harbor job directory containing trial subdirectories.
     job: PathBuf,
     /// Optional JSON output path. The report is always printed to stdout.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CompareArgs {
+    /// The reference job (arm A).
+    #[arg(long)]
+    baseline: PathBuf,
+    /// The job under test (arm B).
+    #[arg(long)]
+    candidate: PathBuf,
+    /// Bootstrap resamples for the dollars-per-pass ratio interval.
+    #[arg(long, default_value_t = 2_000, value_parser = clap::value_parser!(u32).range(100..))]
+    resamples: u32,
+    /// Seed for the deterministic bootstrap.
+    #[arg(long, default_value_t = 20_260_903)]
+    seed: u64,
+    /// Optional JSON output path. The comparison is always printed to stdout.
     #[arg(long)]
     output: Option<PathBuf>,
 }
@@ -172,6 +200,19 @@ fn run_blocking(args: EvalArgs) -> Result<(), EvalError> {
             Ok(())
         }
         EvalCommand::Classify(args) => classify(args),
+        EvalCommand::Compare(args) => {
+            let comparison = compare_jobs(&args)?;
+            let rendered =
+                serde_json::to_string_pretty(&comparison).map_err(|source| EvalError::Json {
+                    path: "evaluation comparison".to_owned(),
+                    source,
+                })?;
+            println!("{rendered}");
+            if let Some(path) = args.output {
+                write_file(&path, format!("{rendered}\n").as_bytes())?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -270,10 +311,21 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         machine_class: args.machine_class,
         program: args.harbor.display().to_string(),
         arguments,
-        environment: BTreeMap::from([
-            ("HARBOR_TELEMETRY".to_owned(), "off".to_owned()),
-            ("PYTHONPATH".to_owned(), adapter.display().to_string()),
-        ]),
+        environment: {
+            let mut environment = BTreeMap::from([
+                ("HARBOR_TELEMETRY".to_owned(), "off".to_owned()),
+                ("PYTHONPATH".to_owned(), adapter.display().to_string()),
+            ]);
+            if let Some(arm) = args
+                .arm
+                .as_deref()
+                .map(str::trim)
+                .filter(|arm| !arm.is_empty())
+            {
+                environment.insert("QQ_EVAL_ARM".to_owned(), arm.to_owned());
+            }
+            environment
+        },
     };
     if args.dry_run {
         println!(
@@ -463,6 +515,10 @@ struct BaselineIdentity {
     system_prompt_hash: String,
     tool_schema_hash: String,
     selected_guidance: Option<Value>,
+    /// Operator-declared arm label; the only identity field two compared
+    /// jobs are expected to differ in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    arm: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -479,6 +535,25 @@ struct TrialSummary {
     passed: bool,
     harness_failure: bool,
     identity_observed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncached_tokens: Option<u64>,
+    /// Reasoning tokens the provider broke out of `output_tokens`; read from
+    /// the durable QQ trace outcome, since Harbor carries no such field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wall_seconds: Option<f64>,
+    /// Sub-agent sessions the trial's run spawned, counted from durable
+    /// `session_created` events with a parent.
+    child_count: u64,
+    /// Turns the provider cut at its output limit and the runtime continued.
+    output_continuations: u64,
+    /// The run settled as `provider_output_truncated`.
+    output_truncated_failure: bool,
     trajectory: Option<String>,
     classification: Option<FailureClassification>,
 }
@@ -658,6 +733,11 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
         let harness_failure = result.exception_info.is_some();
         harness_failures += u64::from(harness_failure);
         let trace_path = trial_dir.join("agent/qq-trace.jsonl");
+        let trace_metrics = if trace_path.is_file() {
+            read_trace_metrics(&trace_path)?
+        } else {
+            TraceMetrics::default()
+        };
         let identity = if trace_path.is_file() {
             let identity = read_identity(&trace_path)?;
             if identity.qq_source_revision != manifest.qq_source_revision {
@@ -707,8 +787,9 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
             }
             _ => uncached_token_sum = None,
         }
+        let trial_wall_seconds = wall_seconds(&result);
         if passed {
-            match wall_seconds(&result) {
+            match trial_wall_seconds {
                 Some(duration) => durations.push(duration),
                 None => all_pass_durations_known = false,
             }
@@ -763,6 +844,16 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
             passed,
             harness_failure,
             identity_observed: identity.is_some(),
+            cost_usd: totals
+                .cost_usd
+                .filter(|cost| cost.is_finite() && *cost >= 0.0),
+            total_tokens: totals.total_tokens,
+            uncached_tokens: totals.uncached_tokens,
+            reasoning_tokens: trace_metrics.reasoning_tokens,
+            wall_seconds: trial_wall_seconds,
+            child_count: trace_metrics.child_count,
+            output_continuations: trace_metrics.output_continuations,
+            output_truncated_failure: trace_metrics.output_truncated_failure,
             trajectory,
             classification,
         });
@@ -801,6 +892,476 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
         failure_counts,
         trials,
     })
+}
+
+/// The result of comparing two compatible jobs task by task.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct EvalComparison {
+    baseline_arm: Option<String>,
+    candidate_arm: Option<String>,
+    /// Identity fields that legitimately differ between arms and were not
+    /// required to match, with both values, so a reader can see exactly what
+    /// changed besides the label.
+    tolerated_differences: BTreeMap<&'static str, (Value, Value)>,
+    pairs: u64,
+    /// Both arms passed.
+    both_passed: u64,
+    /// Neither arm passed.
+    both_failed: u64,
+    /// Baseline passed, candidate did not.
+    baseline_only: u64,
+    /// Candidate passed, baseline did not.
+    candidate_only: u64,
+    /// Two-sided exact McNemar p-value on the discordant pairs; `None` when
+    /// there are none.
+    mcnemar_p_value: Option<f64>,
+    baseline: Scorecard,
+    candidate: Scorecard,
+    delta: ScorecardDelta,
+    /// Candidate dollars-per-pass divided by baseline dollars-per-pass, with a
+    /// percentile bootstrap interval over task pairs. Below 1.0 favors the
+    /// candidate. `None` when either arm has no priced pass.
+    cost_per_pass_ratio: Option<f64>,
+    cost_per_pass_ratio_ci95_low: Option<f64>,
+    cost_per_pass_ratio_ci95_high: Option<f64>,
+    bootstrap_resamples: u32,
+    bootstrap_seed: u64,
+}
+
+/// One arm's headline numbers, copied from its report so the comparison is
+/// self-contained.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct Scorecard {
+    attempts: u64,
+    passes: u64,
+    pass_rate: f64,
+    pass_rate_ci95_low: f64,
+    pass_rate_ci95_high: f64,
+    cost_usd_per_attempt: Option<f64>,
+    cost_usd_per_pass: Option<f64>,
+    total_tokens_per_pass: Option<f64>,
+    uncached_tokens_per_pass: Option<f64>,
+    reasoning_tokens_per_attempt: Option<f64>,
+    median_wall_seconds: Option<f64>,
+    harness_failure_rate: f64,
+    children_per_attempt: f64,
+    output_continuations_per_attempt: f64,
+    output_truncated_failures: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ScorecardDelta {
+    pass_rate: f64,
+    cost_usd_per_pass: Option<f64>,
+    total_tokens_per_pass: Option<f64>,
+    median_wall_seconds: Option<f64>,
+    harness_failure_rate: f64,
+}
+
+impl Scorecard {
+    fn from_report(report: &EvalReport) -> Self {
+        let attempts = report.attempts as f64;
+        let reasoning = report
+            .trials
+            .iter()
+            .map(|trial| trial.reasoning_tokens)
+            .try_fold(0_u64, |total, tokens| {
+                tokens.and_then(|tokens| total.checked_add(tokens))
+            });
+        Self {
+            attempts: report.attempts,
+            passes: report.passes,
+            pass_rate: report.pass_rate,
+            pass_rate_ci95_low: report.pass_rate_ci95_low,
+            pass_rate_ci95_high: report.pass_rate_ci95_high,
+            cost_usd_per_attempt: report.cost_usd_per_attempt,
+            cost_usd_per_pass: report.cost_usd_per_pass,
+            total_tokens_per_pass: report.total_tokens_per_pass,
+            uncached_tokens_per_pass: report.uncached_tokens_per_pass,
+            reasoning_tokens_per_attempt: reasoning.map(|total| total as f64 / attempts),
+            median_wall_seconds: report.median_wall_seconds,
+            harness_failure_rate: report.harness_failure_rate,
+            children_per_attempt: report
+                .trials
+                .iter()
+                .map(|trial| trial.child_count)
+                .sum::<u64>() as f64
+                / attempts,
+            output_continuations_per_attempt: report
+                .trials
+                .iter()
+                .map(|trial| trial.output_continuations)
+                .sum::<u64>() as f64
+                / attempts,
+            output_truncated_failures: report
+                .trials
+                .iter()
+                .filter(|trial| trial.output_truncated_failure)
+                .count() as u64,
+        }
+    }
+}
+
+/// One task attempt present in both arms.
+struct TrialPair<'a> {
+    baseline: &'a TrialSummary,
+    candidate: &'a TrialSummary,
+}
+
+fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
+    let baseline = report_job(&args.baseline)?;
+    let candidate = report_job(&args.candidate)?;
+    let (Some(baseline_identity), Some(candidate_identity)) =
+        (&baseline.identity, &candidate.identity)
+    else {
+        return Err(EvalError::Invalid(
+            "both jobs must carry a fixed QQ identity (at least one trial with a durable trace)"
+                .to_owned(),
+        ));
+    };
+
+    // Everything that shapes the task or the model must match; everything an
+    // arm is allowed to change is reported rather than rejected.
+    let required: [(&str, Value, Value); 13] = [
+        (
+            "model",
+            json!(baseline_identity.model),
+            json!(candidate_identity.model),
+        ),
+        (
+            "organization",
+            json!(baseline_identity.organization),
+            json!(candidate_identity.organization),
+        ),
+        (
+            "max_output_tokens",
+            json!(baseline_identity.max_output_tokens),
+            json!(candidate_identity.max_output_tokens),
+        ),
+        (
+            "context_window",
+            json!(baseline_identity.context_window),
+            json!(candidate_identity.context_window),
+        ),
+        (
+            "approval",
+            json!(baseline_identity.approval),
+            json!(candidate_identity.approval),
+        ),
+        (
+            "timeout_seconds",
+            json!(baseline_identity.timeout_seconds),
+            json!(candidate_identity.timeout_seconds),
+        ),
+        (
+            "max_turns",
+            json!(baseline_identity.max_turns),
+            json!(candidate_identity.max_turns),
+        ),
+        (
+            "max_cost_usd_nanos",
+            json!(baseline_identity.max_cost_usd_nanos),
+            json!(candidate_identity.max_cost_usd_nanos),
+        ),
+        (
+            "protocol_version",
+            json!(baseline_identity.protocol_version),
+            json!(candidate_identity.protocol_version),
+        ),
+        (
+            "prompt_version",
+            json!(baseline_identity.prompt_version),
+            json!(candidate_identity.prompt_version),
+        ),
+        (
+            "instruction_hash",
+            json!(baseline_identity.instruction_hash),
+            json!(candidate_identity.instruction_hash),
+        ),
+        (
+            "workspace_identity",
+            json!(baseline_identity.workspace_identity),
+            json!(candidate_identity.workspace_identity),
+        ),
+        (
+            "machine_class",
+            json!(baseline.machine_class),
+            json!(candidate.machine_class),
+        ),
+    ];
+    for (label, left, right) in &required {
+        if left != right {
+            return Err(EvalError::Invalid(format!(
+                "jobs are not comparable: {label} differs ({left} vs {right})"
+            )));
+        }
+    }
+    if baseline.harbor_config_hash != candidate.harbor_config_hash {
+        return Err(EvalError::Invalid(
+            "jobs are not comparable: Harbor configurations differ".to_owned(),
+        ));
+    }
+    let mut tolerated = BTreeMap::new();
+    for (label, left, right) in [
+        (
+            "arm",
+            json!(baseline_identity.arm),
+            json!(candidate_identity.arm),
+        ),
+        (
+            "qq_version",
+            json!(baseline_identity.qq_version),
+            json!(candidate_identity.qq_version),
+        ),
+        (
+            "qq_source_revision",
+            json!(baseline_identity.qq_source_revision),
+            json!(candidate_identity.qq_source_revision),
+        ),
+        (
+            "system_prompt_hash",
+            json!(baseline_identity.system_prompt_hash),
+            json!(candidate_identity.system_prompt_hash),
+        ),
+        (
+            "tool_schema_hash",
+            json!(baseline_identity.tool_schema_hash),
+            json!(candidate_identity.tool_schema_hash),
+        ),
+        (
+            "selected_guidance",
+            json!(baseline_identity.selected_guidance),
+            json!(candidate_identity.selected_guidance),
+        ),
+    ] {
+        if left != right {
+            tolerated.insert(label, (left, right));
+        }
+    }
+    if baseline_identity.arm.is_some() && baseline_identity.arm == candidate_identity.arm {
+        return Err(EvalError::Invalid(format!(
+            "both jobs carry the same arm label {:?}; label each arm distinctly",
+            baseline_identity.arm
+        )));
+    }
+
+    // Pair attempts task by task. Within a task, attempts pair in trial-name
+    // order, which is the seed order Harbor assigns.
+    let mut by_task: BTreeMap<&str, (Vec<&TrialSummary>, Vec<&TrialSummary>)> = BTreeMap::new();
+    for trial in &baseline.trials {
+        by_task.entry(&trial.task_name).or_default().0.push(trial);
+    }
+    for trial in &candidate.trials {
+        by_task.entry(&trial.task_name).or_default().1.push(trial);
+    }
+    let mut pairs = Vec::new();
+    for (task, (mut left, mut right)) in by_task {
+        if left.len() != right.len() {
+            return Err(EvalError::Invalid(format!(
+                "task {task} has {} baseline attempts but {} candidate attempts; arms must run the same task set and attempt count",
+                left.len(),
+                right.len()
+            )));
+        }
+        left.sort_by(|a, b| a.trial_name.cmp(&b.trial_name));
+        right.sort_by(|a, b| a.trial_name.cmp(&b.trial_name));
+        for (baseline, candidate) in left.into_iter().zip(right) {
+            if baseline.task_checksum != candidate.task_checksum {
+                return Err(EvalError::Invalid(format!(
+                    "task {task} has different checksums across arms; the task changed"
+                )));
+            }
+            pairs.push(TrialPair {
+                baseline,
+                candidate,
+            });
+        }
+    }
+
+    let mut both_passed = 0_u64;
+    let mut both_failed = 0_u64;
+    let mut baseline_only = 0_u64;
+    let mut candidate_only = 0_u64;
+    for pair in &pairs {
+        match (pair.baseline.passed, pair.candidate.passed) {
+            (true, true) => both_passed += 1,
+            (false, false) => both_failed += 1,
+            (true, false) => baseline_only += 1,
+            (false, true) => candidate_only += 1,
+        }
+    }
+    let mcnemar_p_value = mcnemar_exact(baseline_only, candidate_only);
+
+    let ratio = cost_per_pass_ratio(pairs.iter().map(|pair| (pair.baseline, pair.candidate)));
+    let (ci_low, ci_high) = match ratio {
+        Some(_) => bootstrap_ratio_interval(&pairs, args.resamples, args.seed),
+        None => (None, None),
+    };
+
+    let baseline_card = Scorecard::from_report(&baseline);
+    let candidate_card = Scorecard::from_report(&candidate);
+    let delta = ScorecardDelta {
+        pass_rate: candidate_card.pass_rate - baseline_card.pass_rate,
+        cost_usd_per_pass: difference(
+            candidate_card.cost_usd_per_pass,
+            baseline_card.cost_usd_per_pass,
+        ),
+        total_tokens_per_pass: difference(
+            candidate_card.total_tokens_per_pass,
+            baseline_card.total_tokens_per_pass,
+        ),
+        median_wall_seconds: difference(
+            candidate_card.median_wall_seconds,
+            baseline_card.median_wall_seconds,
+        ),
+        harness_failure_rate: candidate_card.harness_failure_rate
+            - baseline_card.harness_failure_rate,
+    };
+    Ok(EvalComparison {
+        baseline_arm: baseline_identity.arm.clone(),
+        candidate_arm: candidate_identity.arm.clone(),
+        tolerated_differences: tolerated,
+        pairs: pairs.len() as u64,
+        both_passed,
+        both_failed,
+        baseline_only,
+        candidate_only,
+        mcnemar_p_value,
+        baseline: baseline_card,
+        candidate: candidate_card,
+        delta,
+        cost_per_pass_ratio: ratio,
+        cost_per_pass_ratio_ci95_low: ci_low,
+        cost_per_pass_ratio_ci95_high: ci_high,
+        bootstrap_resamples: args.resamples,
+        bootstrap_seed: args.seed,
+    })
+}
+
+fn difference(candidate: Option<f64>, baseline: Option<f64>) -> Option<f64> {
+    Some(candidate? - baseline?)
+}
+
+/// Candidate dollars-per-pass over baseline dollars-per-pass across the given
+/// pairs. `None` when either side has no pass, or any trial on a side lacks a
+/// cost: an unpriced trial makes that side's total unknown, never zero.
+fn cost_per_pass_ratio<'a>(
+    pairs: impl Iterator<Item = (&'a TrialSummary, &'a TrialSummary)>,
+) -> Option<f64> {
+    let mut baseline_cost = Some(0.0_f64);
+    let mut baseline_passes = 0_u64;
+    let mut candidate_cost = Some(0.0_f64);
+    let mut candidate_passes = 0_u64;
+    for (baseline, candidate) in pairs {
+        baseline_cost = match (baseline_cost, baseline.cost_usd) {
+            (Some(total), Some(cost)) => Some(total + cost),
+            _ => None,
+        };
+        candidate_cost = match (candidate_cost, candidate.cost_usd) {
+            (Some(total), Some(cost)) => Some(total + cost),
+            _ => None,
+        };
+        baseline_passes += u64::from(baseline.passed);
+        candidate_passes += u64::from(candidate.passed);
+    }
+    if baseline_passes == 0 || candidate_passes == 0 {
+        return None;
+    }
+    let baseline_per_pass = baseline_cost? / baseline_passes as f64;
+    let candidate_per_pass = candidate_cost? / candidate_passes as f64;
+    if baseline_per_pass <= 0.0 {
+        return None;
+    }
+    Some(candidate_per_pass / baseline_per_pass)
+}
+
+/// Percentile bootstrap over task pairs: resampling pairs (not sides) keeps
+/// the pairing, so task difficulty cancels the way it does in the estimate.
+/// Resamples where either side has no pass are dropped; if fewer than half
+/// survive the interval is reported as unknown rather than misleadingly tight.
+fn bootstrap_ratio_interval(
+    pairs: &[TrialPair<'_>],
+    resamples: u32,
+    seed: u64,
+) -> (Option<f64>, Option<f64>) {
+    if pairs.is_empty() {
+        return (None, None);
+    }
+    let mut rng = SplitMix64::new(seed);
+    let mut ratios = Vec::with_capacity(resamples as usize);
+    for _ in 0..resamples {
+        let sample = (0..pairs.len()).map(|_| {
+            let pair = &pairs[rng.below(pairs.len())];
+            (pair.baseline, pair.candidate)
+        });
+        if let Some(ratio) = cost_per_pass_ratio(sample) {
+            ratios.push(ratio);
+        }
+    }
+    if ratios.len() * 2 < resamples as usize {
+        return (None, None);
+    }
+    ratios.sort_by(f64::total_cmp);
+    let low = ratios[((ratios.len() as f64) * 0.025).floor() as usize];
+    let high = ratios[(((ratios.len() as f64) * 0.975).ceil() as usize).saturating_sub(1)];
+    (Some(low), Some(high))
+}
+
+/// Two-sided exact McNemar test: under no difference, each discordant pair is
+/// equally likely to favor either arm, so the count favoring the candidate is
+/// Binomial(discordant, 1/2). Returns `None` with no discordant pairs.
+fn mcnemar_exact(baseline_only: u64, candidate_only: u64) -> Option<f64> {
+    let n = baseline_only + candidate_only;
+    if n == 0 {
+        return None;
+    }
+    let k = baseline_only.min(candidate_only);
+    // Sum the lower tail in log space to stay finite for large n, then
+    // double for two sides (capped at 1).
+    let log_half_n = -(n as f64) * std::f64::consts::LN_2;
+    let mut tail = 0.0_f64;
+    for i in 0..=k {
+        tail += (log_binomial(n, i) + log_half_n).exp();
+    }
+    Some((2.0 * tail).min(1.0))
+}
+
+fn log_binomial(n: u64, k: u64) -> f64 {
+    ln_factorial(n) - ln_factorial(k) - ln_factorial(n - k)
+}
+
+fn ln_factorial(n: u64) -> f64 {
+    (1..=n).map(|i| (i as f64).ln()).sum()
+}
+
+/// A tiny deterministic generator (SplitMix64) so bootstrap intervals are
+/// reproducible from the recorded seed without a dependency.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `0..bound` by rejection, so no modulo bias.
+    fn below(&mut self, bound: usize) -> usize {
+        let bound = bound as u64;
+        let zone = u64::MAX - (u64::MAX % bound);
+        loop {
+            let value = self.next();
+            if value < zone {
+                return (value % bound) as usize;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1030,7 +1591,76 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
         system_prompt_hash: required_hash_value(prompt, "system_prompt_hash", trace)?,
         tool_schema_hash: required_hash_value(prompt, "tool_schema_hash", trace)?,
         selected_guidance: prompt.get("selected_guidance").cloned(),
+        arm: trial
+            .get("arm")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|arm| !arm.is_empty())
+            .map(str::to_owned),
     })
+}
+
+/// Per-trial facts only the durable QQ trace carries: Harbor's result has no
+/// notion of reasoning tokens, sub-agents, or continuation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TraceMetrics {
+    reasoning_tokens: Option<u64>,
+    child_count: u64,
+    output_continuations: u64,
+    output_truncated_failure: bool,
+}
+
+fn read_trace_metrics(trace: &Path) -> Result<TraceMetrics, EvalError> {
+    let records = read_jsonl(trace)?;
+    let mut metrics = TraceMetrics::default();
+    for record in &records {
+        match record.get("type").and_then(Value::as_str) {
+            Some("event") => {
+                let Some(event) = record
+                    .get("envelope")
+                    .and_then(|envelope| envelope.get("event"))
+                else {
+                    continue;
+                };
+                match event.get("type").and_then(Value::as_str) {
+                    Some("session_created")
+                        if event
+                            .get("session")
+                            .and_then(|session| session.get("parent_id"))
+                            .is_some_and(|parent| !parent.is_null()) =>
+                    {
+                        metrics.child_count += 1;
+                    }
+                    Some("run_output_truncated") => metrics.output_continuations += 1,
+                    _ => {}
+                }
+            }
+            Some("outcome") => {
+                metrics.reasoning_tokens = record
+                    .get("usage")
+                    .and_then(|usage| usage.get("reasoning_tokens"))
+                    .and_then(Value::as_u64);
+            }
+            _ => {}
+        }
+    }
+    // The typed failure is on Harbor's side too, but the trace outcome is
+    // what QQ wrote; a `run_finished` event carries the failure kind.
+    metrics.output_truncated_failure = records.iter().any(|record| {
+        record
+            .get("envelope")
+            .and_then(|envelope| envelope.get("event"))
+            .is_some_and(|event| {
+                event.get("type").and_then(Value::as_str) == Some("run_finished")
+                    && event
+                        .get("outcome")
+                        .and_then(|outcome| outcome.get("failure"))
+                        .and_then(|failure| failure.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("provider_output_truncated")
+            })
+    });
+    Ok(metrics)
 }
 
 fn optional_u64(record: &Value, key: &str, path: &Path) -> Result<Option<u64>, EvalError> {
@@ -2006,6 +2636,324 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    /// Extra per-trial facts for comparison fixtures.
+    struct ArmTrial<'a> {
+        task: &'a str,
+        attempt: u8,
+        passed: bool,
+        cost: Option<f64>,
+        reasoning_tokens: Option<u64>,
+        children: u64,
+        continuations: u64,
+        truncated_failure: bool,
+    }
+
+    fn write_arm_job(
+        root: &Path,
+        arm: Option<&str>,
+        tool_schema_hash: char,
+        trials: &[ArmTrial<'_>],
+    ) {
+        write_job_scaffold(root);
+        for trial in trials {
+            let name = format!("{}__{}", trial.task, trial.attempt);
+            let trial_dir = root.join(&name);
+            fs::create_dir_all(trial_dir.join("agent")).unwrap();
+            let config = json!({
+                "trial_name": name,
+                "task": {"path": format!("/tasks/{}", trial.task)},
+                "agent": {"name": "qq", "model": "test/fixed"}
+            });
+            write_json(&trial_dir.join("config.json"), &config);
+            write_json(
+                &trial_dir.join("lock.json"),
+                &json!({"task":{"path":format!("/tasks/{}", trial.task)}}),
+            );
+            let reward = if trial.passed { 1.0 } else { 0.0 };
+            write_json(
+                &trial_dir.join("result.json"),
+                &json!({
+                    "id": format!("{name}-id"),
+                    "task_name": trial.task,
+                    "trial_name": name,
+                    "trial_uri": format!("file:///jobs/{name}"),
+                    "task_id": {"path": format!("/tasks/{}", trial.task)},
+                    "source": "fixture@1",
+                    "task_checksum": format!("checksum-{}", trial.task),
+                    "config": config,
+                    "agent_info": {"name":"qq","version":"0.1.0"},
+                    "agent_result": {
+                        "n_input_tokens": 10, "n_cache_tokens": 0, "n_output_tokens": 5,
+                        "cost_usd": trial.cost
+                    },
+                    "verifier_result": {"rewards":{"reward":reward}},
+                    "exception_info": null,
+                    "started_at": "2026-08-04T00:00:00Z",
+                    "finished_at": "2026-08-04T00:00:10Z"
+                }),
+            );
+            let mut lines = vec![json!({
+                "type": "trial",
+                "qq_version": "0.1.0",
+                "qq_source_revision": "abc123",
+                "protocol_version": 16,
+                "model": {"model": "test/fixed", "max_output_tokens": 4096},
+                "context_window": 128000,
+                "pricing_provenance": "fixture",
+                "approval": "auto",
+                "workspace_identity": "e".repeat(64),
+                "arm": arm,
+            })];
+            for child in 0..trial.children {
+                lines.push(json!({
+                    "type": "event",
+                    "envelope": {"event": {
+                        "type": "session_created",
+                        "session": {"id": format!("child-{child}"), "parent_id": "parent"}
+                    }}
+                }));
+            }
+            for _ in 0..trial.continuations {
+                lines.push(json!({
+                    "type": "event",
+                    "envelope": {"event": {"type": "run_output_truncated"}}
+                }));
+            }
+            if trial.truncated_failure {
+                lines.push(json!({
+                    "type": "event",
+                    "envelope": {"event": {
+                        "type": "run_finished",
+                        "outcome": {"type": "failed", "failure": {"kind": "provider_output_truncated"}}
+                    }}
+                }));
+            }
+            let mut usage = json!({
+                "input_tokens": 10, "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0, "output_tokens": 5
+            });
+            if let Some(reasoning) = trial.reasoning_tokens {
+                usage["reasoning_tokens"] = json!(reasoning);
+            }
+            lines.push(json!({
+                "type": "outcome",
+                "status": if trial.passed { "completed" } else { "task_failed" },
+                "exit_code": if trial.passed { 0 } else { 1 },
+                "usage": usage,
+                "prompt_identity": {
+                    "version": 7,
+                    "instruction_hash": "a".repeat(64),
+                    "system_prompt_hash": "b".repeat(64),
+                    "tool_schema_hash": tool_schema_hash.to_string().repeat(64)
+                }
+            }));
+            let trace = lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(trial_dir.join("agent/qq-trace.jsonl"), format!("{trace}\n")).unwrap();
+            if trial.passed {
+                write_json(
+                    &trial_dir.join("agent/trajectory.json"),
+                    &json!({"schema_version":"ATIF-v1.7","steps":[{"step_id":1}]}),
+                );
+            } else {
+                classify_trial(root, &name, "verification_omitted", "trajectory", "1");
+                write_json(
+                    &trial_dir.join("agent/trajectory.json"),
+                    &json!({"steps":[{"step_id":1}]}),
+                );
+            }
+        }
+    }
+
+    fn trial<'a>(task: &'a str, attempt: u8, passed: bool, cost: f64) -> ArmTrial<'a> {
+        ArmTrial {
+            task,
+            attempt,
+            passed,
+            cost: Some(cost),
+            reasoning_tokens: None,
+            children: 0,
+            continuations: 0,
+            truncated_failure: false,
+        }
+    }
+
+    fn compare_args(baseline: &Path, candidate: &Path) -> CompareArgs {
+        CompareArgs {
+            baseline: baseline.to_owned(),
+            candidate: candidate.to_owned(),
+            resamples: 400,
+            seed: 7,
+            output: None,
+        }
+    }
+
+    #[test]
+    fn compare_pairs_attempts_by_task_and_reports_discordance_cost_and_trace_metrics() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = root.path().join("a0");
+        let candidate = root.path().join("a2");
+        write_arm_job(
+            &baseline,
+            Some("A0"),
+            'c',
+            &[
+                trial("alpha", 1, true, 0.40),
+                trial("beta", 1, true, 0.40),
+                trial("gamma", 1, false, 0.40),
+                trial("delta", 1, false, 0.40),
+            ],
+        );
+        write_arm_job(
+            &candidate,
+            Some("A2"),
+            'd',
+            &[
+                ArmTrial {
+                    reasoning_tokens: Some(30),
+                    children: 2,
+                    continuations: 1,
+                    ..trial("alpha", 1, true, 0.10)
+                },
+                trial("beta", 1, false, 0.10),
+                ArmTrial {
+                    reasoning_tokens: Some(10),
+                    children: 1,
+                    ..trial("gamma", 1, true, 0.10)
+                },
+                ArmTrial {
+                    truncated_failure: true,
+                    ..trial("delta", 1, true, 0.10)
+                },
+            ],
+        );
+
+        let comparison = compare_jobs(&compare_args(&baseline, &candidate)).unwrap();
+        assert_eq!(comparison.baseline_arm.as_deref(), Some("A0"));
+        assert_eq!(comparison.candidate_arm.as_deref(), Some("A2"));
+        assert_eq!(comparison.pairs, 4);
+        assert_eq!(comparison.both_passed, 1);
+        assert_eq!(comparison.both_failed, 0);
+        assert_eq!(comparison.baseline_only, 1);
+        assert_eq!(comparison.candidate_only, 2);
+        // Three discordant pairs, one favoring baseline: exact two-sided
+        // binomial p = 2 * P(X <= 1 | n = 3, 1/2) = 2 * 4/8 = 1.0.
+        assert_eq!(comparison.mcnemar_p_value, Some(1.0));
+        // A schema hash that differs between arms is tolerated and reported,
+        // never silently accepted or fatally rejected.
+        assert!(
+            comparison
+                .tolerated_differences
+                .contains_key("tool_schema_hash")
+        );
+        assert!(comparison.tolerated_differences.contains_key("arm"));
+        assert!(
+            !comparison
+                .tolerated_differences
+                .contains_key("qq_source_revision")
+        );
+        // Baseline: 1.60 / 2 passes = 0.80 per pass. Candidate: 0.40 / 3 = 0.1333.
+        let ratio = comparison.cost_per_pass_ratio.unwrap();
+        assert!((ratio - (0.40 / 3.0) / 0.80).abs() < 1e-9, "{ratio}");
+        assert!(comparison.cost_per_pass_ratio_ci95_low.unwrap() <= ratio);
+        assert!(comparison.cost_per_pass_ratio_ci95_high.unwrap() >= ratio);
+        assert_eq!(comparison.candidate.children_per_attempt, 0.75);
+        assert_eq!(comparison.candidate.output_continuations_per_attempt, 0.25);
+        assert_eq!(comparison.candidate.output_truncated_failures, 1);
+        assert_eq!(comparison.baseline.output_truncated_failures, 0);
+        // Reasoning tokens are unknown for the arm as a whole when any trial
+        // omits them; the baseline reported none.
+        assert_eq!(comparison.candidate.reasoning_tokens_per_attempt, None);
+        assert_eq!(comparison.baseline.reasoning_tokens_per_attempt, None);
+        assert!((comparison.delta.pass_rate - 0.25).abs() < 1e-9);
+
+        // The same seed reproduces the same interval.
+        let again = compare_jobs(&compare_args(&baseline, &candidate)).unwrap();
+        assert_eq!(
+            again.cost_per_pass_ratio_ci95_low,
+            comparison.cost_per_pass_ratio_ci95_low
+        );
+        assert_eq!(
+            again.cost_per_pass_ratio_ci95_high,
+            comparison.cost_per_pass_ratio_ci95_high
+        );
+    }
+
+    #[test]
+    fn compare_refuses_incompatible_jobs_and_mismatched_task_sets() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = root.path().join("base");
+        write_arm_job(&baseline, Some("A0"), 'c', &[trial("alpha", 1, true, 0.1)]);
+
+        // Same arm label on both sides is a labeling mistake.
+        let same_label = root.path().join("same");
+        write_arm_job(
+            &same_label,
+            Some("A0"),
+            'c',
+            &[trial("alpha", 1, true, 0.1)],
+        );
+        let error = compare_jobs(&compare_args(&baseline, &same_label)).unwrap_err();
+        assert!(error.to_string().contains("same arm label"), "{error}");
+
+        // A different task set cannot be paired.
+        let other_tasks = root.path().join("other");
+        write_arm_job(
+            &other_tasks,
+            Some("A1"),
+            'c',
+            &[trial("beta", 1, true, 0.1)],
+        );
+        let error = compare_jobs(&compare_args(&baseline, &other_tasks)).unwrap_err();
+        assert!(error.to_string().contains("baseline attempts"), "{error}");
+
+        // A different model is not a comparison at all.
+        let other_model = root.path().join("model");
+        write_arm_job(
+            &other_model,
+            Some("A1"),
+            'c',
+            &[trial("alpha", 1, true, 0.1)],
+        );
+        let trace_path = other_model.join("alpha__1/agent/qq-trace.jsonl");
+        let trace = fs::read_to_string(&trace_path)
+            .unwrap()
+            .replace("test/fixed", "test/other");
+        fs::write(&trace_path, trace).unwrap();
+        let error = compare_jobs(&compare_args(&baseline, &other_model)).unwrap_err();
+        assert!(error.to_string().contains("model differs"), "{error}");
+    }
+
+    #[test]
+    fn mcnemar_exact_matches_hand_computed_binomial_tails() {
+        assert_eq!(mcnemar_exact(0, 0), None);
+        // One discordant pair: p = 2 * 0.5 = 1.
+        assert_eq!(mcnemar_exact(1, 0), Some(1.0));
+        // 0 vs 6: p = 2 * (1/64) = 0.03125.
+        assert!((mcnemar_exact(0, 6).unwrap() - 0.03125).abs() < 1e-12);
+        // 2 vs 8: lower tail P(X <= 2 | 10) = (1 + 10 + 45) / 1024.
+        assert!((mcnemar_exact(2, 8).unwrap() - 2.0 * 56.0 / 1024.0).abs() < 1e-12);
+        // Symmetric.
+        assert_eq!(mcnemar_exact(3, 9), mcnemar_exact(9, 3));
+        // Large n stays finite and small.
+        let p = mcnemar_exact(10, 90).unwrap();
+        assert!(p > 0.0 && p < 1e-12, "{p}");
+    }
+
+    #[test]
+    fn split_mix_below_is_deterministic_and_in_range() {
+        let mut a = SplitMix64::new(42);
+        let mut b = SplitMix64::new(42);
+        for _ in 0..1_000 {
+            let x = a.below(7);
+            assert_eq!(x, b.below(7));
+            assert!(x < 7);
+        }
     }
 
     #[test]

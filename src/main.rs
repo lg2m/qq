@@ -278,6 +278,10 @@ async fn prepare_headless(
             cli::RunFormat::Jsonl => headless::HeadlessFormat::Jsonl,
         },
         trace: args.trace,
+        arm: std::env::var("QQ_EVAL_ARM")
+            .ok()
+            .map(|arm| arm.trim().to_owned())
+            .filter(|arm| !arm.is_empty()),
     };
     Ok((handler.sessions().clone(), options))
 }

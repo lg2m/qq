@@ -439,6 +439,7 @@ mod tests {
                     cache_read_input_tokens: 5,
                     cache_write_input_tokens: 0,
                     output_tokens: 9,
+                    reasoning_tokens: None,
                 },
             ),
             (
@@ -453,6 +454,7 @@ mod tests {
                     cache_read_input_tokens: 5,
                     cache_write_input_tokens: 0,
                     output_tokens: 9,
+                    reasoning_tokens: None,
                 },
             ),
             (
@@ -468,6 +470,7 @@ mod tests {
                     cache_read_input_tokens: 5,
                     cache_write_input_tokens: 3,
                     output_tokens: 9,
+                    reasoning_tokens: None,
                 },
             ),
         ];

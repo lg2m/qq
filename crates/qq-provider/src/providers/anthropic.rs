@@ -693,6 +693,9 @@ fn decode_event(event: SseEvent, redactions: &[String]) -> Result<DecodedEvent, 
                     cache_read_input_tokens: usage.cache_read_input_tokens,
                     cache_write_input_tokens: usage.cache_creation_input_tokens,
                     output_tokens: usage.output_tokens,
+                    // Anthropic bills thinking inside output_tokens and does
+                    // not break it out.
+                    reasoning_tokens: None,
                 }
             })))
         }
@@ -1026,6 +1029,7 @@ mod tests {
                 cache_read_input_tokens: 4,
                 cache_write_input_tokens: 3,
                 output_tokens: 1,
+                reasoning_tokens: None,
             }))
         );
         assert_eq!(
@@ -1288,6 +1292,7 @@ mod tests {
                     cache_read_input_tokens: 4,
                     cache_write_input_tokens: 3,
                     output_tokens: 9,
+                    reasoning_tokens: None,
                 }),
             }
         );

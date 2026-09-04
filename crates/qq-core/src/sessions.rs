@@ -7115,6 +7115,7 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
             output_tokens,
+            reasoning_tokens: None,
         }
     }
 
@@ -7359,6 +7360,7 @@ mod tests {
                                         cache_read_input_tokens: 0,
                                         cache_write_input_tokens: 0,
                                         output_tokens: 1,
+                                        reasoning_tokens: None,
                                     }),
                                 }),
                             ]))
@@ -7884,6 +7886,7 @@ mod tests {
                             cache_read_input_tokens: 2,
                             cache_write_input_tokens: 1,
                             output_tokens: 5,
+                            reasoning_tokens: None,
                         }),
                     }),
                 ]));
@@ -7904,6 +7907,7 @@ mod tests {
                         cache_read_input_tokens: 2,
                         cache_write_input_tokens: 1,
                         output_tokens: 5,
+                        reasoning_tokens: None,
                     }),
                 }),
             ]))
@@ -8255,6 +8259,7 @@ mod tests {
                             cache_read_input_tokens: 0,
                             cache_write_input_tokens: 0,
                             output_tokens: 2,
+                            reasoning_tokens: None,
                         }),
                     }),
                 ]))
@@ -8269,6 +8274,7 @@ mod tests {
                             cache_read_input_tokens: 0,
                             cache_write_input_tokens: 0,
                             output_tokens: 1,
+                            reasoning_tokens: None,
                         }),
                     }),
                 ]))
@@ -8345,6 +8351,7 @@ mod tests {
                             cache_read_input_tokens: 1,
                             cache_write_input_tokens: 2,
                             output_tokens: 5,
+                            reasoning_tokens: None,
                         }),
                     })]));
                 }
@@ -8395,6 +8402,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                         cache_write_input_tokens: 0,
                         output_tokens: 1,
+                        reasoning_tokens: None,
                     }),
             }));
             Box::pin(stream::iter(events))
@@ -10321,6 +10329,7 @@ mod tests {
                                 cache_read_input_tokens: 0,
                                 cache_write_input_tokens: 0,
                                 output_tokens: 1,
+                                reasoning_tokens: None,
                             }),
                         }),
                     ]))
@@ -10446,6 +10455,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_write_input_tokens: 0,
                     output_tokens: 1,
+                    reasoning_tokens: None,
                 }),
             };
             Box::pin(async move {
@@ -14544,6 +14554,7 @@ mod tests {
                     cache_read_input_tokens: 2,
                     cache_write_input_tokens: 1,
                     output_tokens: 3,
+                    reasoning_tokens: None,
                 },
                 &pricing,
             ),
@@ -14880,6 +14891,7 @@ mod tests {
                 cache_read_input_tokens: 2,
                 cache_write_input_tokens: 1,
                 output_tokens: 5,
+                reasoning_tokens: None,
             })
         );
         assert!(observed.iter().any(|event| matches!(
@@ -17022,6 +17034,7 @@ mod tests {
                     cache_read_input_tokens: 2,
                     cache_write_input_tokens: 1,
                     output_tokens: 5,
+                    ..
                 }),
                 context_tokens: Some(13),
                 ..
@@ -17055,6 +17068,7 @@ mod tests {
                     cache_read_input_tokens: 2,
                     cache_write_input_tokens: 1,
                     output_tokens: 5,
+                    ..
                 }),
                 estimated_cost_usd_nanos: Some(20_500),
                 ..
@@ -17084,6 +17098,7 @@ mod tests {
                 cache_read_input_tokens: 2,
                 cache_write_input_tokens: 1,
                 output_tokens: 5,
+                reasoning_tokens: None,
             })
         );
         assert_eq!(focused.runs[0].context_tokens, Some(13));
@@ -17111,6 +17126,7 @@ mod tests {
                 cache_read_input_tokens: 2,
                 cache_write_input_tokens: 1,
                 output_tokens: 5,
+                reasoning_tokens: None,
             }
         );
         assert_eq!(cost, 20_500);
@@ -17178,6 +17194,7 @@ mod tests {
                         cache_read_input_tokens: 12_000,
                         cache_write_input_tokens: 2_400,
                         output_tokens: 1,
+                        reasoning_tokens: None,
                     }),
                     None,
                 ]),
@@ -17401,6 +17418,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_write_input_tokens: 0,
                 output_tokens: 3,
+                reasoning_tokens: None,
             })
         );
         assert_eq!(focused.runs[0].context_tokens, Some(6));
@@ -17766,6 +17784,7 @@ mod tests {
             cache_read_input_tokens: 1,
             cache_write_input_tokens: 2,
             output_tokens: 21,
+            reasoning_tokens: None,
         };
         let snapshot = runtime
             .snapshot(SnapshotRequest {
@@ -18427,6 +18446,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_write_input_tokens: 0,
                 output_tokens: 2,
+                reasoning_tokens: None,
             });
             // Even-numbered requests (the first of each run) truncate.
             if turn.is_multiple_of(2) {
@@ -24736,6 +24756,7 @@ mod tests {
                             cache_read_input_tokens: 0,
                             cache_write_input_tokens: 0,
                             output_tokens: 3,
+                            reasoning_tokens: None,
                         }),
                     }),
                 ]))
@@ -24750,6 +24771,7 @@ mod tests {
                             cache_read_input_tokens: 0,
                             cache_write_input_tokens: 0,
                             output_tokens: 7,
+                            reasoning_tokens: None,
                         }),
                     }),
                 ]))
@@ -24771,6 +24793,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                         cache_write_input_tokens: 0,
                         output_tokens: 13,
+                        reasoning_tokens: None,
                     },
                 }),
                 Some("test/child-second") => Arc::new(AccountingTextProvider {
@@ -24779,6 +24802,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                         cache_write_input_tokens: 0,
                         output_tokens: 19,
+                        reasoning_tokens: None,
                     },
                 }),
                 other => panic!("unexpected accounting test model: {other:?}"),
@@ -27061,6 +27085,7 @@ mod tests {
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_write_input_tokens: usage.cache_write_input_tokens,
             output_tokens: usage.output_tokens,
+            reasoning_tokens: None,
         }
     }
 

@@ -114,3 +114,47 @@ passing tasks, harness-failure rate, per-trial identities, and failure-category
 counts. A Harbor setup failure with no QQ trace remains an explicit harness
 failure rather than making the whole report unreadable. No category is inferred
 from final answer text.
+
+Each per-trial row also carries its own cost, total and uncached tokens, wall
+time, reasoning tokens when the provider broke them out, the number of
+sub-agents the run spawned, how many turns the provider cut at its output limit
+and the runtime continued, and whether the run settled as
+`provider_output_truncated`. These come from the durable QQ trace, which is the
+only place they exist.
+
+## Compare Two Arms
+
+A paired comparison answers "did this configuration change help?" with the
+same model on the same tasks. Run each arm as its own job with a distinct label
+and express the configuration through `QQ_*` environment passthrough, which the
+adapter forwards into the task container:
+
+```sh
+cargo xtask eval run --arm A0 --job-name deleg-a0 ... 
+QQ_CONFIG_CONTENT="$(cat benchmarks/arms/delegation.ron)" \
+  cargo xtask eval run --arm A2 --job-name deleg-a2 ...
+
+cargo xtask eval compare \
+  --baseline target/qq-eval/jobs/deleg-a0 \
+  --candidate target/qq-eval/jobs/deleg-a2 \
+  --output target/qq-eval/deleg-a0-vs-a2.json
+```
+
+`--arm` sets `QQ_EVAL_ARM`, which `qq run` stamps on the trial record; it never
+changes behavior. `compare` refuses jobs that differ in model route,
+organization, output-token limit, context window, approval policy, run limits,
+prompt version, instruction hash, workspace identity, machine class, or Harbor
+configuration, and jobs whose arms carry the same label. It tolerates — and
+lists under `tolerated_differences` — the arm label, QQ version and revision,
+system-prompt and tool-schema hashes, and selected guidance, since those are
+exactly what an arm changes. Attempts pair task by task in trial-name order;
+a task with different attempt counts or checksums across arms is an error.
+
+The comparison reports the discordant-pair table (`both_passed`,
+`both_failed`, `baseline_only`, `candidate_only`) with a two-sided exact
+McNemar p-value, both arms' scorecards and their delta, and the candidate's
+dollars-per-pass as a ratio of the baseline's with a percentile bootstrap
+interval over task pairs (deterministic from `--seed`; `--resamples` defaults
+to 2000). A ratio below 1.0 favors the candidate. The R7 promotion gate in
+`docs/plans/terminal-bench-readiness.md` reads: ratio interval entirely below
+0.80 with no meaningful pass-rate loss.

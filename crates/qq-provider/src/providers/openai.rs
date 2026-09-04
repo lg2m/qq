@@ -503,12 +503,19 @@ struct ResponsesUsage {
     input_tokens: u64,
     output_tokens: u64,
     input_tokens_details: Option<ResponsesInputTokenDetails>,
+    output_tokens_details: Option<ResponsesOutputTokenDetails>,
 }
 
 #[derive(Deserialize)]
 struct ResponsesInputTokenDetails {
     #[serde(default)]
     cached_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct ResponsesOutputTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -677,6 +684,9 @@ fn provider_usage(usage: ResponsesUsage) -> Result<ProviderUsage, ProviderError>
         cache_read_input_tokens: cached,
         cache_write_input_tokens: 0,
         output_tokens: usage.output_tokens,
+        reasoning_tokens: usage
+            .output_tokens_details
+            .and_then(|details| details.reasoning_tokens),
     })
 }
 
@@ -952,7 +962,7 @@ mod tests {
         )
         .unwrap();
         let completed = decode_event(
-            r#"{"type":"response.completed","response":{"usage":{"input_tokens":17,"input_tokens_details":{"cached_tokens":5},"output_tokens":9}}}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":17,"input_tokens_details":{"cached_tokens":5},"output_tokens":9,"output_tokens_details":{"reasoning_tokens":4}}}}"#,
             &[],
         )
         .unwrap();
@@ -966,6 +976,7 @@ mod tests {
                 cache_read_input_tokens: 5,
                 cache_write_input_tokens: 0,
                 output_tokens: 9,
+                reasoning_tokens: Some(4),
             }))
         );
     }
@@ -1142,6 +1153,7 @@ mod tests {
                     cache_read_input_tokens: 5,
                     cache_write_input_tokens: 0,
                     output_tokens: 9,
+                    reasoning_tokens: None,
                 }),
             }
         );

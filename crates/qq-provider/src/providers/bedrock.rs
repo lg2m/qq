@@ -596,6 +596,7 @@ fn provider_usage(usage: &TokenUsage) -> Result<ProviderUsage, ProviderError> {
         cache_read_input_tokens,
         cache_write_input_tokens,
         output_tokens,
+        reasoning_tokens: None,
     })
 }
 
@@ -1078,6 +1079,7 @@ mod tests {
                 cache_read_input_tokens: 4,
                 cache_write_input_tokens: 3,
                 output_tokens: 9,
+                reasoning_tokens: None,
             })
         );
 

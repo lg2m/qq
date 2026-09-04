@@ -2242,6 +2242,7 @@ const fn provider_usage(usage: qq_provider::ProviderUsage) -> TokenUsage {
         cache_read_input_tokens: usage.cache_read_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
         output_tokens: usage.output_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
     }
 }
 
@@ -2315,6 +2316,7 @@ mod tests {
                         cache_read_input_tokens: 3,
                         cache_write_input_tokens: 2,
                         output_tokens: 5,
+                        reasoning_tokens: None,
                     }),
                 }),
             ]))
@@ -3174,6 +3176,7 @@ mod tests {
                         cache_read_input_tokens: 3,
                         cache_write_input_tokens: 2,
                         output_tokens: 5,
+                        reasoning_tokens: None,
                     }
                 },
                 RunEvent::Completed,
@@ -4004,6 +4007,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_write_input_tokens: 0,
                 output_tokens: 7,
+                reasoning_tokens: None,
             });
             if turn < self.truncations {
                 let mut events = vec![Ok(ProviderEvent::OutputTextDelta {
@@ -4643,6 +4647,7 @@ mod tests {
                             cache_read_input_tokens: 1,
                             cache_write_input_tokens: 2,
                             output_tokens: 5,
+                            reasoning_tokens: None,
                         }),
                     })]));
                 }
@@ -4689,6 +4694,7 @@ mod tests {
                     cache_read_input_tokens: 1,
                     cache_write_input_tokens: 2,
                     output_tokens: 5,
+                    ..
                 }
             }
         )));
@@ -5553,6 +5559,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_write_input_tokens: 0,
                     output_tokens: 50,
+                    reasoning_tokens: None,
                 });
                 if current == 0 {
                     Box::pin(stream::iter([
@@ -5592,6 +5599,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                         cache_write_input_tokens: 0,
                         output_tokens: 200,
+                        reasoning_tokens: None,
                     }),
                 },
             },
@@ -5686,6 +5694,7 @@ mod tests {
                                 cache_read_input_tokens: 0,
                                 cache_write_input_tokens: 0,
                                 output_tokens: 10,
+                                reasoning_tokens: None,
                             }),
                         }),
                     ]))

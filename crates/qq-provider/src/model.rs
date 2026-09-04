@@ -284,6 +284,9 @@ pub struct ProviderUsage {
     pub cache_write_input_tokens: u64,
     /// All generated tokens, including hidden reasoning tokens when reported.
     pub output_tokens: u64,
+    /// The reasoning-token portion of `output_tokens` when the provider
+    /// reports it separately.
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Error)]

@@ -2331,6 +2331,7 @@ fn a_finished_run_ends_with_a_completion_line_and_a_running_one_does_not() {
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
             output_tokens: 300,
+            reasoning_tokens: None,
         }),
         context_tokens: None,
     }));

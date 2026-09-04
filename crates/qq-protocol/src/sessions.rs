@@ -84,7 +84,14 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_write_input_tokens: u64,
+    /// Every generated token, including hidden reasoning tokens when the
+    /// provider reports them. Billing and budgets use this total.
     pub output_tokens: u64,
+    /// The reasoning-token portion of `output_tokens` when the provider
+    /// reports it separately; `None` when it does not. Observational: it is
+    /// never added to `output_tokens` again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Usage and estimated cost derived from the durable runs owned by a session.
@@ -1600,6 +1607,7 @@ mod tests {
                 cache_read_input_tokens: 3,
                 cache_write_input_tokens: 1,
                 output_tokens: 4,
+                reasoning_tokens: None,
             }),
             estimated_cost_usd_nanos: Some(99),
         };
@@ -2266,6 +2274,7 @@ mod tests {
                         cache_read_input_tokens: 2,
                         cache_write_input_tokens: 3,
                         output_tokens: 4,
+                        reasoning_tokens: None,
                     }),
                     estimated_cost_usd_nanos: Some(7),
                 },
@@ -2275,6 +2284,7 @@ mod tests {
                         cache_read_input_tokens: 12,
                         cache_write_input_tokens: 13,
                         output_tokens: 14,
+                        reasoning_tokens: None,
                     }),
                     estimated_cost_usd_nanos: Some(17),
                 },
@@ -2457,6 +2467,7 @@ mod tests {
                 cache_read_input_tokens: 4,
                 cache_write_input_tokens: 2,
                 output_tokens: 9,
+                reasoning_tokens: None,
             }),
             context_tokens: Some(16),
         };
@@ -2531,6 +2542,7 @@ mod tests {
                 cache_read_input_tokens: 4,
                 cache_write_input_tokens: 2,
                 output_tokens: 9,
+                reasoning_tokens: None,
             }),
             context_tokens: Some(16),
             estimated_cost_usd_nanos: Some(1),

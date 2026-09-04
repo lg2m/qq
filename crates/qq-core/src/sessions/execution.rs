@@ -2262,6 +2262,12 @@ pub(super) fn add_usage(left: TokenUsage, right: TokenUsage) -> Option<TokenUsag
             .cache_write_input_tokens
             .checked_add(right.cache_write_input_tokens)?,
         output_tokens: left.output_tokens.checked_add(right.output_tokens)?,
+        // A known reasoning total stays known only while every turn reports
+        // one; a single turn without it makes the sum unknown, never a lie.
+        reasoning_tokens: match (left.reasoning_tokens, right.reasoning_tokens) {
+            (Some(left), Some(right)) => Some(left.checked_add(right)?),
+            _ => None,
+        },
     })
 }
 

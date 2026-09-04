@@ -705,6 +705,7 @@ fn provider_usage(usage: UsageMetadata) -> Result<ProviderUsage, ProviderError> 
         cache_read_input_tokens: usage.cached_content_token_count,
         cache_write_input_tokens: 0,
         output_tokens,
+        reasoning_tokens: Some(usage.thoughts_token_count),
     })
 }
 
@@ -787,6 +788,7 @@ mod tests {
                         cache_read_input_tokens: 6,
                         cache_write_input_tokens: 0,
                         output_tokens: 10,
+                        ..
                     }),
                 }),
             ] if first == "Hel" && second == "lo"
@@ -1130,6 +1132,7 @@ mod tests {
                     cache_read_input_tokens: 6,
                     cache_write_input_tokens: 0,
                     output_tokens: 10,
+                    reasoning_tokens: Some(3),
                 }),
                 DecodedEvent::Completed,
             ]

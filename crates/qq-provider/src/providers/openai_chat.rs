@@ -441,12 +441,19 @@ struct ChatUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
     prompt_tokens_details: Option<ChatPromptTokenDetails>,
+    completion_tokens_details: Option<ChatCompletionTokenDetails>,
 }
 
 #[derive(Deserialize)]
 struct ChatPromptTokenDetails {
     #[serde(default)]
     cached_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -602,6 +609,9 @@ fn provider_usage(usage: ChatUsage) -> Result<ProviderUsage, ProviderError> {
         cache_read_input_tokens: cached,
         cache_write_input_tokens: 0,
         output_tokens: usage.completion_tokens,
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .and_then(|details| details.reasoning_tokens),
     })
 }
 
@@ -914,7 +924,7 @@ mod tests {
     #[test]
     fn decodes_usage_and_rejects_cached_prompt_underflow() {
         let usage = decode_event(
-            r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":6}}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":6},"completion_tokens_details":{"reasoning_tokens":2}}}"#,
             &[],
         )
         .unwrap()
@@ -926,6 +936,7 @@ mod tests {
                 cache_read_input_tokens: 6,
                 cache_write_input_tokens: 0,
                 output_tokens: 7,
+                reasoning_tokens: Some(2),
             })
         );
 
@@ -1003,6 +1014,7 @@ mod tests {
                     cache_read_input_tokens: 6,
                     cache_write_input_tokens: 0,
                     output_tokens: 7,
+                    reasoning_tokens: None,
                 }),
             }
         );

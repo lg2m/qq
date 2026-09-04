@@ -716,6 +716,7 @@ def _trajectory_extra(
                     "timeout_seconds": trial.get("timeout_seconds"),
                     "max_turns": trial.get("max_turns"),
                     "max_cost_usd_nanos": trial.get("max_cost_usd_nanos"),
+                    "arm": trial.get("arm"),
                     "workspace_id": trial.get("workspace_id"),
                     "session_id": trial.get("session_id"),
                     "run_id": trial.get("run_id"),

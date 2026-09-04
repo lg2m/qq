@@ -436,6 +436,7 @@ fn version_16_commands_receipts_events_and_capabilities_match_their_goldens() {
                     cache_read_input_tokens: 0,
                     cache_write_input_tokens: 0,
                     output_tokens: 4,
+                    reasoning_tokens: None,
                 }),
                 context_tokens: Some(10),
             },

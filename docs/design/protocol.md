@@ -1560,9 +1560,18 @@ and are never continued.
   "input_tokens": 1000,
   "cache_read_input_tokens": 200,
   "cache_write_input_tokens": 0,
-  "output_tokens": 250
+  "output_tokens": 250,
+  "reasoning_tokens": 90
 }
 ```
+
+`output_tokens` is every generated token and is what budgets and billing use.
+`reasoning_tokens` is the part of that total the provider reported as hidden
+reasoning (OpenAI `reasoning_tokens`, Google `thoughtsTokenCount`); it is
+omitted when the provider does not break it out (Anthropic, Bedrock) and is
+never added to `output_tokens` again. Aggregates keep it only while every
+summed turn reported one. Added in protocol 16 as an optional field; older
+encodings decode unchanged.
 
 Usage may appear on `run_finished`. Estimated costs on summaries are integer
 US-dollar nanos (`1e-9 USD`) when pricing data is available.
