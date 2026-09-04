@@ -755,10 +755,13 @@ cancellation, duplicate work, context exchange, and conflicting changes.
 
 Initial concurrency should therefore be bounded and session-aware. Multiple
 independent sessions may run concurrently, but two writing agents must not
-modify the same checkout concurrently. When editing subagents are introduced,
-each receives an isolated Git worktree or sandbox and returns a patch for
-central review and integration. Read-only research agents may be parallelized
-earlier.
+modify the same checkout concurrently. When *parallel* editing subagents are
+introduced, each receives an isolated Git worktree or sandbox and returns a
+patch for central review and integration. A single serialized `Supervised`
+write child shares its parent's checkout: the parent is blocked while it runs,
+sibling writers serialize on a per-run permit, and every mutating call it makes
+is adjudicated before it executes. Read-only research agents may be
+parallelized earlier.
 
 Do not build an agent swarm, distributed scheduler, or worktree coordinator in
 the initial version.

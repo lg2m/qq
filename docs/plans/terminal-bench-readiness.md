@@ -587,7 +587,10 @@ Record, but initially do not automatically interfere with:
 
 Only add a model-visible recovery notice or forced final-verification state if
 trajectory analysis shows a repeated generic failure and a paired experiment
-demonstrates improvement.
+demonstrates improvement. Amended 2026-09-03 by `supervised-delegation.md` D5:
+a heuristic-triggered, fail-open audit of the root answer may ship with
+`audit.mode = heuristic` as the default provided the B1 arm runs before the
+next published baseline and the default becomes `off` if it loses.
 
 ### Tests And Evaluation
 
@@ -1098,7 +1101,9 @@ Complete the pending work in `docs/plans/subagents.md`:
   child session display.
 - Include child trajectories in headless and ATIF output.
 - Record child queue wait and concurrency.
-- Keep depth one and current read-only semantics.
+- Depth is configurable up to a ceiling of three, default one until the A3
+  arm in `supervised-delegation.md` wins; write authority is limited to
+  serialized `Supervised` depth-one children (amended 2026-09-03).
 
 Evaluate delegation by task shape:
 
@@ -1119,8 +1124,9 @@ Add provider-aware scheduling only after telemetry shows pressure:
 - Retry-attempt visibility.
 - Cancellation of queued child work.
 
-Do not add editing sub-agents, automatic swarms, or worktree orchestration in
-this plan.
+Do not add automatic swarms or worktree orchestration in this plan. Editing
+sub-agents are permitted only as one serialized `Supervised` child per run
+(`supervised-delegation.md` D4, amended 2026-09-03).
 
 ## Phase 8: Warm-Path Runtime And Request Efficiency
 

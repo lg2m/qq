@@ -478,10 +478,17 @@ Each session has an approval mode:
 
 - `read-only` — only read-only built-ins and allowlisted read-only MCP tools
   execute; everything else is denied without prompting.
-- `ask` (interactive default) — workspace-contained edits, writes, shell, and
-  non-allowlisted MCP calls each request approval.
-- `auto` — workspace-contained edits and writes execute without prompting;
-  shell commands matching the allowlist execute; everything else still asks.
+- `ask` — workspace-contained edits, writes, shell, and non-allowlisted MCP
+  calls each request approval.
+- `auto` (default) — workspace-contained edits, writes, and MCP calls execute
+  without prompting; shell commands matching the allowlist or carrying no
+  dangerous pattern execute; destructive or externally visible shell commands
+  ask (or are adjudicated by the configured reviewer model).
+- `supervised` — every mutating, shell, and MCP call is held and adjudicated
+  by the reviewer model regardless of grants; a reviewer denial is final and a
+  reviewer escalation reaches the human. Only spawned write children run here;
+  a client cannot select it directly.
+- `full` — everything executes without prompting.
 
 The allowlist is deliberately simple: exact commands or command prefixes
 (`cargo test`, `git status`), plus per-tool grants for MCP. No pattern DSL

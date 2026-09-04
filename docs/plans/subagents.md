@@ -98,8 +98,11 @@ are size-bounded.
 
 ## What This Is Not
 
-- Not multi-agent editing: children do not mutate. Parallel mutation
-  needs the run-snapshot/undo layer and conflict semantics first.
+- Not parallel multi-agent editing: parallel mutation needs the
+  run-snapshot/undo layer and conflict semantics first. One serialized
+  `Supervised` write child per run, with every held action adjudicated by the
+  reviewer model, is specified by `supervised-delegation.md` D4 (amended
+  2026-09-03); that plan also owns recursion depth and the roster.
 - Not a persistent worker pool: children are one-shot and disposable.
 - Not automatic: the model chooses when to spawn, guided by the
   formula in its instructions; users see every spawn as a tool call.
@@ -407,5 +410,6 @@ rejection is observable only as a tool error in the parent transcript.
 5. **Complete:** Phase C spawn-time authenticated-model validation — one
    choke point for every resolution source, the `UnknownModel` error
    variant, and no durable state on rejection.
-6. **Later:** mutating children with explicit approval semantics; parallel
-   fan-out helpers.
+6. **Moved:** mutating children, recursion depth, and the delegation roster
+   are specified and tracked in `supervised-delegation.md` (D2–D4). Parallel
+   fan-out helpers remain later work.

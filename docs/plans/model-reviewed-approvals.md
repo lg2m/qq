@@ -76,3 +76,21 @@ denies the auto-approval (the human path remains open).
 
 Each step lands independently; the feature activates only when
 `reviewer_model` is configured.
+
+## Amendment 2026-09-03 (supervised children)
+
+`supervised-delegation.md` D4 widens this seam for `Supervised` write children:
+
+- `ReviewRequest` gains the bounded call arguments (16 KiB), the child's task
+  brief (8 KiB), the spawn origin (root or child with depth and parent run),
+  the last 16 tool names with paths, and the session's grants; the reviewer
+  prompt gains a second criterion, that the action be plausibly necessary for
+  the stated task.
+- `Deny` is honored for `Supervised` sessions (persisted as `DeniedByReviewer`,
+  returned to the child as a tool error). Root `Auto` sessions keep today's
+  escalate-on-deny so shipped behavior does not change.
+- The verdict carries usage and cost and is charged to the reviewed run's
+  `BudgetMeter`, so reviewer spend rolls up to the root.
+- `REVIEWER_MAX_OUTPUT_TOKENS` rises to 1,024 for the wider request; the
+  compiled provider handle is cached by credential epoch instead of reloading
+  configuration per call.

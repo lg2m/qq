@@ -495,7 +495,7 @@ existing workspace row when the path was seen before.
 | `workspace_id` | yes | From `resolve_workspace` |
 | `parent_id` | no | Optional parent session |
 | `model` | yes | `ModelSelection`; fields inside may be omitted |
-| `approval_mode` | no | Defaults to `ask` |
+| `approval_mode` | no | Defaults to `auto` |
 | `profile` | no | `AgentProfileId`; defaults to `default`. Lowercase letters, digits, hyphens; ≤ 64 bytes |
 | `correlation` | no | Opaque string map, ≤ 8 entries, keys ≤ 64 B, values ≤ 256 B, ≤ 2 KiB total |
 

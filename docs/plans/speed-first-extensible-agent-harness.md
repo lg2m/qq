@@ -157,8 +157,10 @@ This plan does not authorize:
 - messaging, cron, voice, browser automation, or product-specific memory in
   `qq-core`;
 - a distributed scheduler, hosted control plane, or general multi-tenant IAM;
-- editing sub-agents before snapshots, isolation, and conflict semantics are
-  implemented;
+- parallel or unsupervised editing sub-agents before snapshots, isolation, and
+  conflict semantics are implemented. One serialized `Supervised` write child
+  per run, every held action adjudicated, is permitted by
+  `supervised-delegation.md` (amended 2026-09-03);
 - WebSocket, gRPC, GraphQL, or a binary wire protocol without measurement or a
   feature that HTTP/SSE cannot express;
 - unbounded queues, tasks, listeners, retries, output, or concurrency; or
