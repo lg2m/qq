@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use qq_protocol::{DelegationRole, DelegationRoster};
 use qq_provider::ToolSpec;
 use serde::Deserialize;
 use serde_json::json;
@@ -154,10 +155,17 @@ impl BuiltInTool {
     }
 }
 
+/// Byte bound on the `spawn_agent` declaration (name, description, schema).
+/// The roster is bounded upstream; this catches a description that grows
+/// past what every turn should pay for.
+pub(crate) const MAX_SPAWN_AGENT_SCHEMA_BYTES: usize = 2 * 1024;
+
 /// The declaration for [`SPAWN_AGENT_TOOL`]. Kept out of [`specs`] because it
 /// joins the tool list only when the run may spawn: child sessions and
-/// session-less runs never see it.
-pub(crate) fn spawn_agent_spec(model_routes: &[String]) -> ToolSpec {
+/// session-less runs never see it. With a roster, `role` is the model's
+/// primary selector and the exact `model` override is limited to roster
+/// routes; without one, `model` spans every authenticated route as before.
+pub(crate) fn spawn_agent_spec(model_routes: &[String], delegation: &DelegationRoster) -> ToolSpec {
     let mut properties = serde_json::Map::from_iter([(
         "task".to_owned(),
         json!({
@@ -166,18 +174,62 @@ pub(crate) fn spawn_agent_spec(model_routes: &[String]) -> ToolSpec {
             "description": "A complete, self-contained brief for the sub-agent."
         }),
     )]);
-    if !model_routes.is_empty() {
+    let has_roster = !delegation.roster.is_empty();
+    if has_roster {
+        let roles: Vec<&str> = {
+            let mut roles: Vec<DelegationRole> =
+                delegation.roster.iter().map(|entry| entry.role).collect();
+            roles.sort();
+            roles.dedup();
+            roles.into_iter().map(DelegationRole::as_str).collect()
+        };
+        properties.insert(
+            "role".to_owned(),
+            json!({
+                "type": "string",
+                "enum": roles,
+                "description": format!(
+                    "Which roster role should run this task. Omit to use the default ({}). \
+                     Pick fast for lookups and breadth, balanced for ordinary work, strong for \
+                     hard reasoning; the system prompt lists each role's route and relative cost.",
+                    delegation.default_role.as_str()
+                )
+            }),
+        );
+    }
+    let override_routes: Vec<&str> = if has_roster {
+        delegation
+            .roster
+            .iter()
+            .map(|entry| entry.route.as_str())
+            .collect()
+    } else {
+        model_routes.iter().map(String::as_str).collect()
+    };
+    if !override_routes.is_empty() {
         properties.insert(
             "model".to_owned(),
             json!({
                 "type": "string",
-                "enum": model_routes,
-                "description": "Exact authenticated provider/model override. Omit by default to use QQ's configured worker model or this session's selected model. Set only when the user explicitly requests one of these exact routes; never guess or translate providers."
+                "enum": override_routes,
+                "description": if has_roster {
+                    "Exact roster route override. Omit by default and choose by role instead. Set only when the user explicitly requests one of these exact routes; never guess or translate providers."
+                } else {
+                    "Exact authenticated provider/model override. Omit by default to use QQ's configured worker model or this session's selected model. Set only when the user explicitly requests one of these exact routes; never guess or translate providers."
+                }
             }),
         );
     }
-    ToolSpec::new(
-        SPAWN_AGENT_TOOL,
+    let description = if has_roster {
+        "Delegate one self-contained task to a read-only sub-agent in this workspace and receive \
+         only its final answer. Worth it when the raw evidence would dwarf the distilled answer \
+         and you will not need that evidence verbatim later; several independent questions can be \
+         delegated in parallel. Single reads, searches, and quick lookups are cheaper inline. The \
+         task brief must carry everything the sub-agent needs: it starts with no other context. \
+         Choose the sub-agent by role (see Delegation in the system prompt for each role's route \
+         and relative cost); omit role for the default. Set model only when the user explicitly \
+         requests an exact roster route; never guess, translate, or invent a route."
+    } else {
         "Delegate one self-contained task to a read-only sub-agent in this workspace and receive \
          only its final answer. Worth it when the raw evidence would dwarf the distilled answer \
          and you will not need that evidence verbatim later; several independent questions can be \
@@ -185,7 +237,11 @@ pub(crate) fn spawn_agent_spec(model_routes: &[String]) -> ToolSpec {
          task brief must carry everything the sub-agent needs: it starts with no other context. \
          Omit model by default so QQ uses its configured worker model or the current session's \
          selected model. Set model only when the user explicitly requests an exact provider/model \
-         route listed by this tool; never guess, translate, or invent a route.",
+         route listed by this tool; never guess, translate, or invent a route."
+    };
+    ToolSpec::new(
+        SPAWN_AGENT_TOOL,
+        description,
         serde_json::Value::Object(serde_json::Map::from_iter([
             ("type".to_owned(), json!("object")),
             (
@@ -204,6 +260,8 @@ pub(crate) struct SpawnAgentArgs {
     pub(crate) task: String,
     #[serde(default)]
     pub(crate) model: Option<String>,
+    #[serde(default)]
+    pub(crate) role: Option<DelegationRole>,
 }
 
 pub(crate) fn specs() -> Vec<ToolSpec> {

@@ -626,6 +626,23 @@ durable ownership link for in-process children. Once a child completes, only
 its final committed model turn's text or refusal is returned to the parent;
 earlier turns remain visible in the child's authoritative transcript.
 
+Which model a child runs is decided at one choke point from the delegation
+roster. The root translates the configured `delegation` section (or, as sugar,
+a legacy `worker_model`) into the secret-free `qq_protocol::DelegationRoster`
+on the `AgentProfile`: at most eight routes, each with an operator-declared
+role (`fast`, `balanced`, `strong`), an optional note, catalog context window
+and output limit, and its blended price relative to the spawning model. The
+plan records the roster in its descriptor (version 4), renders it once into the
+Delegation section of the system prompt together with the spawning model's own
+route and context window, and compiles `spawn_agent` with a `role` argument
+plus an exact `model` override limited to roster routes (the declaration is
+bounded at 2 KiB). At dispatch `resolve_delegation_route` applies explicit
+model, then role, then the roster's default role; without a roster the legacy
+worker/parent fallback and full authenticated route list remain, and the
+session spawner still validates every resolved route against the authenticated
+served model list before any durable child state exists. Roles are declared,
+never inferred: QQ ranks nothing.
+
 Compaction is a property of that projection, not an edit to the transcript: a
 validated summary row and cutoff marker commit atomically with the internal
 summarization run, three compactions are retained per session for

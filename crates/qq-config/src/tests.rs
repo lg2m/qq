@@ -250,6 +250,152 @@ fn worker_model_layers_clears_and_tracks_provenance_independently() {
 }
 
 #[test]
+fn delegation_roster_layers_validates_and_falls_back_to_worker_model_sugar() {
+    let tree = TempTree::new();
+
+    // No section and no worker: the empty roster with defaults.
+    let bare = tree.loader().load(&tree.request()).unwrap();
+    assert!(bare.delegation().roster().is_empty());
+    assert_eq!(bare.delegation().default_role(), DelegationRole::Balanced);
+    assert_eq!(bare.delegation().max_depth(), 1);
+    assert!(!bare.delegation().write_children());
+    assert!(bare.provenance().delegation().is_none());
+
+    // A legacy worker_model is the one-entry balanced roster.
+    let sugar = tree
+        .loader()
+        .load(
+            &tree
+                .request()
+                .with_explicit_content(r#"(version: 1, worker_model: "openai/worker")"#),
+        )
+        .unwrap();
+    let roster = sugar.delegation().roster();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0].route().as_str(), "openai/worker");
+    assert_eq!(roster[0].role(), DelegationRole::Balanced);
+    assert_eq!(
+        sugar
+            .delegation()
+            .route_for_role(DelegationRole::Balanced)
+            .map(ModelRoute::as_str),
+        Some("openai/worker")
+    );
+
+    // A declared section wins over the sugar and tracks provenance.
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, worker_model: "openai/ignored", delegation: (
+            roster: [
+                (route: "openai/fast", role: fast, note: "  lookups  "),
+                (route: "anthropic/balanced", role: balanced),
+                (route: "anthropic/strong", role: strong),
+            ],
+            default_role: strong,
+            max_depth: 2,
+            write_children: true,
+        ))"#,
+    );
+    let declared = tree.loader().load(&tree.request()).unwrap();
+    let roster = declared.delegation().roster();
+    assert_eq!(roster.len(), 3);
+    assert_eq!(roster[0].route().as_str(), "openai/fast");
+    assert_eq!(roster[0].note(), Some("lookups"), "notes are trimmed");
+    assert_eq!(roster[1].note(), None);
+    assert_eq!(declared.delegation().default_role(), DelegationRole::Strong);
+    assert_eq!(declared.delegation().max_depth(), 2);
+    assert!(declared.delegation().write_children());
+    assert_eq!(
+        declared.provenance().delegation().unwrap().kind(),
+        SourceKind::Global
+    );
+    assert_eq!(
+        declared.worker_model().map(ModelRoute::as_str),
+        Some("openai/ignored"),
+        "worker_model stays a separately reported value"
+    );
+
+    // Clearing the section from a later layer restores the sugar.
+    let cleared = tree
+        .loader()
+        .load(
+            &tree
+                .request()
+                .with_explicit_content(r#"(version: 1, delegation: Clear)"#),
+        )
+        .unwrap();
+    assert_eq!(cleared.delegation().roster().len(), 1);
+    assert_eq!(
+        cleared.delegation().roster()[0].route().as_str(),
+        "openai/ignored"
+    );
+    assert_eq!(
+        cleared.provenance().delegation().unwrap().kind(),
+        SourceKind::Inline
+    );
+
+    // Every route is validated exactly like `model`, and the section's own
+    // bounds are enforced.
+    let load = |content: &str| {
+        tree.loader()
+            .load(&tree.request().with_explicit_content(content))
+            .expect_err(content)
+    };
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "nope", role: fast)]))"#),
+        ConfigError::InvalidModelRoute(_)
+    ));
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "unknown/x", role: fast)]))"#),
+        ConfigError::UnknownProvider(provider) if provider == "unknown"
+    ));
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: fast), (route: "openai/a", role: strong)]))"#),
+        ConfigError::InvalidDelegation(message) if message.contains("more than once")
+    ));
+    assert!(matches!(
+        load(
+            r#"(version: 1, delegation: (roster: [
+                (route: "openai/a1", role: fast), (route: "openai/a2", role: fast),
+                (route: "openai/a3", role: fast), (route: "openai/a4", role: fast),
+                (route: "openai/a5", role: fast), (route: "openai/a6", role: fast),
+                (route: "openai/a7", role: fast), (route: "openai/a8", role: fast),
+                (route: "openai/a9", role: fast)]))"#
+        ),
+        ConfigError::InvalidDelegation(message) if message.contains("at most 8")
+    ));
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: fast)], default_role: strong))"#),
+        ConfigError::InvalidDelegation(message) if message.contains("default_role")
+    ));
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: fast)], max_depth: 4))"#),
+        ConfigError::InvalidDelegation(message) if message.contains("max_depth")
+    ));
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: fast)], max_depth: 0))"#),
+        ConfigError::InvalidDelegation(message) if message.contains("max_depth")
+    ));
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: warp)]))"#),
+        ConfigError::Parse { .. }
+    ));
+
+    // Policy applies to roster routes.
+    tree.write(
+        "managed/managed.ron",
+        r#"(version: 1, policy: (allowed_providers: ["openai"]))"#,
+    );
+    assert!(matches!(
+        load(r#"(version: 1, delegation: (roster: [(route: "anthropic/x", role: fast)]))"#),
+        ConfigError::PolicyViolation {
+            rule: "allowed_providers",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn worker_model_uses_primary_model_route_validation_and_policy() {
     let tree = TempTree::new();
 

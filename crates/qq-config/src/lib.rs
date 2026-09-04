@@ -1223,6 +1223,7 @@ pub enum ConfigKey {
     Model,
     WorkerModel,
     ReviewerModel,
+    Delegation,
     MaxOutputTokens,
     Providers,
     Provider(String),
@@ -1273,6 +1274,7 @@ pub struct ConfigProvenance {
     model: Option<SourceIdentity>,
     worker_model: Option<SourceIdentity>,
     reviewer_model: Option<SourceIdentity>,
+    delegation: Option<SourceIdentity>,
     max_output_tokens: Option<SourceIdentity>,
     providers: BTreeMap<String, SourceIdentity>,
     profiles: BTreeMap<String, SourceIdentity>,
@@ -1312,6 +1314,11 @@ impl ConfigProvenance {
     #[must_use]
     pub const fn reviewer_model(&self) -> Option<&SourceIdentity> {
         self.reviewer_model.as_ref()
+    }
+
+    #[must_use]
+    pub const fn delegation(&self) -> Option<&SourceIdentity> {
+        self.delegation.as_ref()
     }
 
     #[must_use]
@@ -1381,6 +1388,7 @@ pub struct ConfigSnapshot {
     model: ModelRoute,
     worker_model: Option<ModelRoute>,
     reviewer_model: Option<ModelRoute>,
+    delegation: DelegationConfig,
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
@@ -1396,6 +1404,118 @@ pub struct ConfigSnapshot {
 /// Longest agent profile name in bytes. Mirrors the protocol's identifier
 /// bound so a configured name is always representable on the wire.
 pub const MAX_PROFILE_NAME_BYTES: usize = 64;
+
+/// Most routes a delegation roster may declare. Bounds the `spawn_agent`
+/// schema and the prompt line that advertises the roster.
+pub const MAX_DELEGATION_ROSTER: usize = 8;
+/// Deepest sub-agent nesting a configuration may request. The runtime's own
+/// ceiling is the same; a larger value is a configuration error.
+pub const MAX_DELEGATION_DEPTH: u16 = 3;
+/// Longest operator note on a roster entry, in bytes.
+pub const MAX_DELEGATION_NOTE_BYTES: usize = 120;
+
+/// The operator's declared role for one delegation route: what kind of task
+/// it suits, not a quality tier QQ inferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationRole {
+    /// Cheap and quick: lookups, breadth, mechanical summaries.
+    Fast,
+    /// The everyday worker.
+    Balanced,
+    /// Hard reasoning; expected to cost the most.
+    Strong,
+}
+
+impl DelegationRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Strong => "strong",
+        }
+    }
+}
+
+/// One route an agent may delegate to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationEntry {
+    route: ModelRoute,
+    role: DelegationRole,
+    note: Option<String>,
+}
+
+impl DelegationEntry {
+    #[must_use]
+    pub const fn route(&self) -> &ModelRoute {
+        &self.route
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> DelegationRole {
+        self.role
+    }
+
+    #[must_use]
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+}
+
+/// The validated delegation settings: an ordered roster of routes the agent
+/// may spawn, the role chosen when it names none, and the recursion and
+/// authority bounds. An absent `delegation` section yields the empty roster
+/// (or, as sugar, the legacy `worker_model` as a single `balanced` entry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationConfig {
+    roster: Vec<DelegationEntry>,
+    default_role: DelegationRole,
+    max_depth: u16,
+    write_children: bool,
+}
+
+impl DelegationConfig {
+    #[must_use]
+    pub fn roster(&self) -> &[DelegationEntry] {
+        &self.roster
+    }
+
+    #[must_use]
+    pub const fn default_role(&self) -> DelegationRole {
+        self.default_role
+    }
+
+    #[must_use]
+    pub const fn max_depth(&self) -> u16 {
+        self.max_depth
+    }
+
+    #[must_use]
+    pub const fn write_children(&self) -> bool {
+        self.write_children
+    }
+
+    /// The first roster entry declaring `role`, in roster order.
+    #[must_use]
+    pub fn route_for_role(&self, role: DelegationRole) -> Option<&ModelRoute> {
+        self.roster
+            .iter()
+            .find(|entry| entry.role == role)
+            .map(|entry| &entry.route)
+    }
+}
+
+impl Default for DelegationConfig {
+    fn default() -> Self {
+        Self {
+            roster: Vec::new(),
+            default_role: DelegationRole::Balanced,
+            max_depth: 1,
+            write_children: false,
+        }
+    }
+}
 
 /// Per-session approval policy a profile may preselect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1541,6 +1661,12 @@ impl ConfigSnapshot {
     #[must_use]
     pub const fn reviewer_model(&self) -> Option<&ModelRoute> {
         self.reviewer_model.as_ref()
+    }
+
+    /// The validated delegation roster and bounds.
+    #[must_use]
+    pub const fn delegation(&self) -> &DelegationConfig {
+        &self.delegation
     }
 
     #[must_use]
@@ -1728,6 +1854,8 @@ pub enum ConfigError {
     PackMissing { id: String, path: PathBuf },
     #[error("model route selects an unknown or disabled provider: {0}")]
     UnknownProvider(String),
+    #[error("delegation roster is invalid: {0}")]
+    InvalidDelegation(String),
     #[error("managed policy {rule} was violated: {message}")]
     PolicyViolation { rule: &'static str, message: String },
     #[error("TUI settings are invalid: {message}")]

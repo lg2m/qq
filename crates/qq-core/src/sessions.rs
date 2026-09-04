@@ -114,9 +114,15 @@ pub const MAX_CONCURRENT_CHILDREN_PER_RUN: u16 = 3;
 /// Total children one parent run may spawn before further `spawn_agent`
 /// calls return a tool error. `RunLimits::max_children` may lower it per run.
 pub const MAX_SPAWNED_CHILDREN_PER_RUN: u16 = 8;
-/// Deepest sub-agent nesting: children never spawn. Advertised, not
-/// configurable.
+/// Deepest sub-agent nesting this build executes: children never spawn.
+/// Advertised; `delegation.max_depth` may not exceed it.
 pub const MAX_CHILD_DEPTH: u16 = 1;
+/// The hard ceiling any future configuration may raise `MAX_CHILD_DEPTH` to.
+/// Advertised so clients can validate a roster's `max_depth` before sending.
+pub const MAX_CHILD_DEPTH_CEILING: u16 = 3;
+/// Most routes a delegation roster may declare; the config layer enforces
+/// the same bound, this one is the runtime's and is advertised.
+pub const MAX_DELEGATION_ROSTER: u16 = 8;
 const INTERRUPTED_TOOL_RESULT: &str =
     "Tool execution was interrupted before a durable result was recorded.";
 const RUNTIME_NOTICE_PREAMBLE: &str = "[QQ runtime notice; not a user instruction]";

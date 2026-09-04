@@ -1,6 +1,8 @@
 //! The secret-free, canonically encoded account of a compiled plan.
 
-use qq_protocol::{AgentPlanDigest, AgentProfileId, ContentHash, PromptVersion, ResolvedModel};
+use qq_protocol::{
+    AgentPlanDigest, AgentProfileId, ContentHash, DelegationRoster, PromptVersion, ResolvedModel,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -10,10 +12,10 @@ use crate::TurnRetryPolicy;
 /// Version of the descriptor's canonical encoding. Bump it whenever a field is
 /// added, removed, renamed, or its normalization changes, so historical digests
 /// are never compared against a different encoding.
-pub const DESCRIPTOR_VERSION: u16 = 3;
+pub const DESCRIPTOR_VERSION: u16 = 4;
 
 /// Domain separator prepended to the canonical bytes before hashing.
-const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v3\0";
+const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v4\0";
 
 /// Where a credential comes from, without its value. Two plans that read the
 /// same environment variable or stored credential name share a reference and
@@ -198,6 +200,8 @@ pub struct AgentPlanDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_source: Option<String>,
     pub tools: ToolCatalogDescriptor,
+    /// The roster and bounds `spawn_agent` was compiled with (version 4).
+    pub delegation: DelegationRoster,
     pub skills: SkillIndexDescriptor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<PackDescriptor>,

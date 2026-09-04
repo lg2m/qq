@@ -53,6 +53,10 @@ pub struct ServerCapabilities {
     pub workspace_tools: Option<WorkspaceToolCapabilities>,
     /// How committed events are delivered to observers.
     pub events: EventCapabilities,
+    /// Present only when the request named a workspace: that workspace's
+    /// delegation roster and the runtime's delegation ceilings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationCapabilities>,
 }
 
 /// Delivery contract for post-commit observers.
@@ -189,6 +193,107 @@ pub struct AgentProfileSummary {
 pub struct PackSummary {
     pub id: String,
     pub version: String,
+}
+
+/// The operator-declared role of one delegation route. Roles are declared,
+/// never inferred from price or benchmarks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationRole {
+    Fast,
+    Balanced,
+    Strong,
+}
+
+impl DelegationRole {
+    pub const ALL: [Self; 3] = [Self::Fast, Self::Balanced, Self::Strong];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Strong => "strong",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fast" => Some(Self::Fast),
+            "balanced" => Some(Self::Balanced),
+            "strong" => Some(Self::Strong),
+            _ => None,
+        }
+    }
+}
+
+/// One route an agent may delegate to, with the facts the agent needs to
+/// choose it. Secret-free: routes and catalog metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRosterEntry {
+    /// Canonical `provider/model` route.
+    pub route: String,
+    pub role: DelegationRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// This route's blended per-token price relative to the spawning model's,
+    /// in thousandths (1000 = the same price). `None` when either price is
+    /// unknown. Observational guidance for the model; never used for budgets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_cost_permille: Option<u32>,
+}
+
+/// The delegation roster and bounds a plan compiled with. Empty roster means
+/// `spawn_agent` resolves through the legacy worker/parent fallback only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRoster {
+    pub roster: Vec<DelegationRosterEntry>,
+    pub default_role: DelegationRole,
+    /// Deepest nesting this configuration permits (1 = children only).
+    pub max_depth: u16,
+    /// Whether children may be spawned with write authority.
+    pub write_children: bool,
+}
+
+impl DelegationRoster {
+    #[must_use]
+    pub fn route_for_role(&self, role: DelegationRole) -> Option<&str> {
+        self.roster
+            .iter()
+            .find(|entry| entry.role == role)
+            .map(|entry| entry.route.as_str())
+    }
+
+    #[must_use]
+    pub fn contains_route(&self, route: &str) -> bool {
+        self.roster.iter().any(|entry| entry.route == route)
+    }
+}
+
+impl Default for DelegationRoster {
+    fn default() -> Self {
+        Self {
+            roster: Vec::new(),
+            default_role: DelegationRole::Balanced,
+            max_depth: 1,
+            write_children: false,
+        }
+    }
+}
+
+/// Server-advertised delegation settings for a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationCapabilities {
+    #[serde(flatten)]
+    pub roster: DelegationRoster,
+    /// Hard ceilings the runtime enforces regardless of configuration.
+    pub max_roster_entries: u16,
+    pub max_depth_ceiling: u16,
 }
 
 #[cfg(test)]

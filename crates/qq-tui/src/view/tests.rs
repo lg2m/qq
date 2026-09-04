@@ -3126,7 +3126,7 @@ fn the_completion_line_names_the_plan_and_an_overridden_route() {
         run_id,
         plan: Some(Box::new(qq_protocol::RunPlanIdentity {
             profile: qq_protocol::AgentProfileId::new("reviewer").unwrap(),
-            descriptor_version: 3,
+            descriptor_version: 4,
             digest: qq_protocol::AgentPlanDigest::from_hash(qq_protocol::ContentHash::from_bytes(
                 [0xab; 32],
             )),

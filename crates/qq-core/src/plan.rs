@@ -20,8 +20,8 @@ use std::{
 };
 
 use qq_protocol::{
-    AgentPlanDigest, AgentProfileId, ContentHash, CredentialEpoch, InstructionHash, ResolvedModel,
-    RunPlanIdentity,
+    AgentPlanDigest, AgentProfileId, ContentHash, CredentialEpoch, DelegationRoster,
+    InstructionHash, ResolvedModel, RunPlanIdentity,
 };
 use qq_provider::Provider;
 use sha2::Digest as _;
@@ -111,6 +111,7 @@ pub struct AgentProfile {
     hosts: Vec<HostSnapshot>,
     mcp_servers: Vec<McpServerDescriptor>,
     spawn_model_routes: Vec<String>,
+    delegation: DelegationRoster,
     turn_retry: TurnRetryPolicy,
     adapter_build: String,
     provenance: Vec<String>,
@@ -139,6 +140,7 @@ impl AgentProfile {
             hosts: Vec::new(),
             mcp_servers: Vec::new(),
             spawn_model_routes: Vec::new(),
+            delegation: DelegationRoster::default(),
             turn_retry: TurnRetryPolicy::default(),
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
@@ -168,6 +170,7 @@ impl AgentProfile {
                 .collect(),
             mcp_servers: Vec::new(),
             spawn_model_routes: runtime.spawn_model_routes.to_vec(),
+            delegation: runtime.delegation.as_ref().clone(),
             turn_retry: runtime.turn_retry,
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
@@ -228,6 +231,15 @@ impl AgentProfile {
     #[must_use]
     pub fn with_spawn_model_routes(mut self, routes: Vec<String>) -> Self {
         self.spawn_model_routes = routes;
+        self
+    }
+
+    /// The delegation roster the agent may spawn from, with its bounds. When
+    /// the roster is non-empty it also restricts `spawn_agent`'s exact model
+    /// override to roster routes.
+    #[must_use]
+    pub fn with_delegation(mut self, delegation: DelegationRoster) -> Self {
+        self.delegation = delegation;
         self
     }
 
@@ -305,6 +317,11 @@ pub enum PlanCompileError {
     },
     #[error("descriptor could not be encoded canonically: {message}")]
     Encode { message: String },
+    #[error(
+        "the spawn_agent declaration is {bytes} bytes, above its {limit}-byte bound; shorten \
+         roster notes or the roster"
+    )]
+    SpawnSchemaTooLarge { bytes: usize, limit: usize },
 }
 
 /// The immutable live plan one or more runs execute from. It is never
@@ -320,6 +337,9 @@ pub struct CompiledAgentPlan {
     pub(crate) pack_roots: Arc<[Workspace]>,
     /// Pack persona text appended after workspace instructions, if any.
     pub(crate) persona: Option<Arc<Persona>>,
+    /// The rendered roster block for the Delegation prompt section, when a
+    /// roster is configured. Built once here; the run loop concatenates it.
+    pub(crate) roster_text: Option<Arc<str>>,
     /// Host handles indexed as `ToolHost::External { host }` names them.
     pub(crate) hosts: Arc<[Arc<dyn ExternalToolHost>]>,
     resolved_model: Arc<ResolvedModel>,
@@ -361,6 +381,7 @@ impl CompiledAgentPlan {
             hosts,
             mcp_servers,
             spawn_model_routes,
+            delegation,
             turn_retry,
             adapter_build,
             provenance,
@@ -377,7 +398,8 @@ impl CompiledAgentPlan {
         )?
         .with_context_window(resolved_model.context_window)
         .with_turn_retry_policy(turn_retry)
-        .with_spawn_model_routes(spawn_model_routes);
+        .with_spawn_model_routes(spawn_model_routes)
+        .with_delegation(delegation);
         for source in context_sources {
             runtime = runtime.with_context_source(source);
         }
@@ -479,8 +501,22 @@ impl CompiledAgentPlan {
                 host: ToolHost::BuiltIn,
             })
             .collect();
+        let spawn_spec = tools::spawn_agent_spec(&runtime.spawn_model_routes, &runtime.delegation);
+        // Only roster-bearing declarations are bounded: the legacy flat route
+        // enum may legitimately list every authenticated model.
+        if !runtime.delegation.roster.is_empty() {
+            let bytes = spawn_spec.name().len()
+                + spawn_spec.description().len()
+                + spawn_spec.input_schema().to_string().len();
+            if bytes > tools::MAX_SPAWN_AGENT_SCHEMA_BYTES {
+                return Err(PlanCompileError::SpawnSchemaTooLarge {
+                    bytes,
+                    limit: tools::MAX_SPAWN_AGENT_SCHEMA_BYTES,
+                });
+            }
+        }
         static_tools.push(StaticTool {
-            spec: tools::spawn_agent_spec(&runtime.spawn_model_routes),
+            spec: spawn_spec,
             host: ToolHost::SpawnAgent,
             effect: EffectClass::ReadOnly,
         });
@@ -539,6 +575,7 @@ impl CompiledAgentPlan {
                 spawn_model_routes: runtime.spawn_model_routes.to_vec(),
                 config_grants,
             },
+            delegation: runtime.delegation.as_ref().clone(),
             skills: SkillIndexDescriptor {
                 digest: skills.digest(),
                 indexed: skills.len(),
@@ -566,6 +603,12 @@ impl CompiledAgentPlan {
             + catalog.estimated_bytes()
             + skills.estimated_bytes()
             + std::mem::size_of::<Self>();
+        let roster_text = crate::runtime::delegation_roster_text(
+            &resolved_model.route,
+            resolved_model.context_window,
+            &runtime.delegation,
+        )
+        .map(Arc::from);
         Ok(Arc::new(Self {
             runtime,
             workspace: opened,
@@ -574,6 +617,7 @@ impl CompiledAgentPlan {
             skills: Arc::new(skills),
             pack_roots: pack_roots.into(),
             persona,
+            roster_text,
             hosts: host_handles,
             resolved_model: Arc::new(resolved_model),
             descriptor_json: Arc::from(descriptor_json),
@@ -877,6 +921,19 @@ mod tests {
                 spawn_model_routes: vec!["custom/worker".to_owned()],
                 config_grants: Vec::new(),
             },
+            delegation: DelegationRoster {
+                roster: vec![qq_protocol::DelegationRosterEntry {
+                    route: "custom/worker".to_owned(),
+                    role: qq_protocol::DelegationRole::Balanced,
+                    note: Some("everyday".to_owned()),
+                    context_window: Some(200_000),
+                    max_output_tokens: Some(8_192),
+                    relative_cost_permille: Some(400),
+                }],
+                default_role: qq_protocol::DelegationRole::Balanced,
+                max_depth: 1,
+                write_children: false,
+            },
             skills: SkillIndexDescriptor {
                 digest: qq_protocol::ContentHash::from_bytes([3; 32]),
                 indexed: 2,
@@ -914,7 +971,7 @@ mod tests {
         let bytes = descriptor.canonical_bytes().unwrap();
         assert!(
             bytes.starts_with(
-                b"qq-agent-plan-descriptor-v3\0{\"version\":3,\"profile\":\"review\","
+                b"qq-agent-plan-descriptor-v4\0{\"version\":4,\"profile\":\"review\","
             )
         );
         // The golden digest pins the canonical encoding. A change here means
@@ -922,10 +979,10 @@ mod tests {
         // from a different encoding.
         assert_eq!(
             descriptor.digest().unwrap().to_string(),
-            "bad1908d3cc53cce15a11867c5fc9bd88e63bfad1f6ebc5eabd04c28bf8ae761"
+            "cfdaf34cfe55e788736bc9bd94db2a0afb5b592fb159d875cf638bdd5373293b"
         );
         let round_trip: AgentPlanDescriptor =
-            serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v3\0".len()..]).unwrap();
+            serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v4\0".len()..]).unwrap();
         assert_eq!(round_trip, descriptor);
         assert_eq!(round_trip.digest().unwrap(), descriptor.digest().unwrap());
     }
@@ -1022,6 +1079,30 @@ mod tests {
                 Box::new(|d| d.skills.digest = qq_protocol::ContentHash::from_bytes([9; 32])),
             ),
             ("skills.disclosed", Box::new(|d| d.skills.disclosed = 0)),
+            (
+                "delegation.roster",
+                Box::new(|d| d.delegation.roster.clear()),
+            ),
+            (
+                "delegation.role",
+                Box::new(|d| d.delegation.roster[0].role = qq_protocol::DelegationRole::Fast),
+            ),
+            (
+                "delegation.relative_cost",
+                Box::new(|d| d.delegation.roster[0].relative_cost_permille = None),
+            ),
+            (
+                "delegation.default_role",
+                Box::new(|d| d.delegation.default_role = qq_protocol::DelegationRole::Strong),
+            ),
+            (
+                "delegation.max_depth",
+                Box::new(|d| d.delegation.max_depth = 2),
+            ),
+            (
+                "delegation.write_children",
+                Box::new(|d| d.delegation.write_children = true),
+            ),
             ("pack", Box::new(|d| d.pack = None)),
             (
                 "pack.version",

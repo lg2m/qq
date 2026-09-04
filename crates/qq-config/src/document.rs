@@ -15,11 +15,13 @@ use sha2::{Digest, Sha256};
 use super::{
     AgentProfileConfig, AwsAuth, BedrockAuth, ConfigError, ConfigKey, ConfigProvenance,
     ConfigSnapshot, Connection, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MCP_CALL_TIMEOUT_SECONDS,
-    DEFAULT_MCP_MAX_CONCURRENT_CALLS, EffectivePolicy, HttpAccess, HttpCredential, InputModality,
-    MAX_MCP_CALL_TIMEOUT_SECONDS, MAX_MCP_MAX_CONCURRENT_CALLS, MAX_PROFILE_NAME_BYTES,
-    McpServerConfig, McpTransport, ModelMetadata, ModelPricing, ModelRoute, PolicyGrants,
-    ProfileApprovalMode, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind,
-    RuntimeOverrides, SecretRef, SourceIdentity, SourceKind, SourceReport, WorkspaceGrant,
+    DEFAULT_MCP_MAX_CONCURRENT_CALLS, DelegationConfig, DelegationEntry, DelegationRole,
+    EffectivePolicy, HttpAccess, HttpCredential, InputModality, MAX_DELEGATION_DEPTH,
+    MAX_DELEGATION_NOTE_BYTES, MAX_DELEGATION_ROSTER, MAX_MCP_CALL_TIMEOUT_SECONDS,
+    MAX_MCP_MAX_CONCURRENT_CALLS, MAX_PROFILE_NAME_BYTES, McpServerConfig, McpTransport,
+    ModelMetadata, ModelPricing, ModelRoute, PolicyGrants, ProfileApprovalMode, ProviderAccess,
+    ProviderApi, ProviderConfig, ProviderKind, RuntimeOverrides, SecretRef, SourceIdentity,
+    SourceKind, SourceReport, WorkspaceGrant,
 };
 
 pub(super) fn deserialize_unique_btree_map<'de, D, K, V>(
@@ -490,6 +492,10 @@ pub(super) struct Document {
     worker_model: StringField,
     #[serde(default, skip_serializing_if = "StringField::is_missing")]
     reviewer_model: StringField,
+    /// Delegation roster and bounds. Replaces the whole section when set;
+    /// `Clear` drops what an earlier layer declared.
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    delegation: Field<DelegationPatch>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     max_output_tokens: Field<u32>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
@@ -505,6 +511,26 @@ pub(super) struct Document {
     packs: Field<UniqueMap<String, PackPatch>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy: Option<PolicyPatch>,
+}
+
+/// The `delegation` section as declared. Validated against providers, policy,
+/// and the runtime bounds when layers are merged.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DelegationPatch {
+    roster: Vec<DelegationEntryPatch>,
+    default_role: Option<DelegationRole>,
+    max_depth: Option<u16>,
+    write_children: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegationEntryPatch {
+    route: String,
+    role: DelegationRole,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +636,7 @@ impl Document {
             || self.model.is_present()
             || self.worker_model.is_present()
             || self.reviewer_model.is_present()
+            || self.delegation.is_present()
             || self.providers.is_present()
             || self.mcp.is_present()
             || self.packs.is_present()
@@ -646,6 +673,8 @@ impl Document {
             #[serde(skip_serializing_if = "Option::is_none")]
             reviewer_model: Option<&'a StringField>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            delegation: Option<&'a Field<DelegationPatch>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             providers: Option<&'a Field<UniqueMap<String, ProviderEntryPatch>>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             mcp: Option<&'a Field<UniqueMap<String, McpServerPatch>>>,
@@ -667,6 +696,7 @@ impl Document {
                 .reviewer_model
                 .is_present()
                 .then_some(&self.reviewer_model),
+            delegation: present(&self.delegation),
             providers: present(&self.providers),
             mcp: present(&self.mcp),
             packs: present(&self.packs),
@@ -705,6 +735,9 @@ impl Document {
         }
         if self.reviewer_model.is_present() {
             touched.push(ConfigKey::ReviewerModel);
+        }
+        if self.delegation.is_present() {
+            touched.push(ConfigKey::Delegation);
         }
         if self.max_output_tokens.is_present() {
             touched.push(ConfigKey::MaxOutputTokens);
@@ -1094,6 +1127,7 @@ pub(super) struct MergeState {
     model: Option<String>,
     worker_model: Option<String>,
     reviewer_model: Option<String>,
+    delegation: Option<DelegationPatch>,
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
@@ -1165,6 +1199,7 @@ impl MergeState {
                 model: None,
                 worker_model: None,
                 reviewer_model: None,
+                delegation: None,
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 providers,
                 mcp: BTreeMap::new(),
@@ -1212,6 +1247,17 @@ impl MergeState {
         }
         if apply_optional_string(&document.reviewer_model, &mut self.reviewer_model) {
             self.provenance.reviewer_model = Some(source.clone());
+        }
+        match &document.delegation {
+            Field::Missing => {}
+            Field::Set(patch) => {
+                self.delegation = Some(patch.clone());
+                self.provenance.delegation = Some(source.clone());
+            }
+            Field::Clear => {
+                self.delegation = None;
+                self.provenance.delegation = Some(source.clone());
+            }
         }
         self.apply_providers(&document.providers, source);
         self.apply_mcp(&document.mcp);
@@ -1649,6 +1695,90 @@ impl MergeState {
             }
             enforce_policy(&self.policy, route, self.max_output_tokens, &self.providers)?;
         }
+        // The roster is validated route by route exactly like `model`. Without
+        // a declared section, a legacy `worker_model` is the one-entry
+        // balanced roster so existing configurations keep delegating.
+        let delegation = match self.delegation.take() {
+            Some(patch) => {
+                if patch.roster.len() > MAX_DELEGATION_ROSTER {
+                    return Err(ConfigError::InvalidDelegation(format!(
+                        "at most {MAX_DELEGATION_ROSTER} roster entries are allowed, found {}",
+                        patch.roster.len()
+                    )));
+                }
+                let mut roster = Vec::with_capacity(patch.roster.len());
+                for entry in patch.roster {
+                    let route = ModelRoute::parse(entry.route)?;
+                    if roster
+                        .iter()
+                        .any(|existing: &DelegationEntry| existing.route == route)
+                    {
+                        return Err(ConfigError::InvalidDelegation(format!(
+                            "route {} is listed more than once",
+                            route.as_str()
+                        )));
+                    }
+                    if !self.providers.contains_key(route.provider()) {
+                        return Err(ConfigError::UnknownProvider(route.provider().to_owned()));
+                    }
+                    enforce_policy(
+                        &self.policy,
+                        &route,
+                        self.max_output_tokens,
+                        &self.providers,
+                    )?;
+                    let note = entry
+                        .note
+                        .map(|note| note.trim().to_owned())
+                        .filter(|note| !note.is_empty());
+                    if note
+                        .as_ref()
+                        .is_some_and(|note| note.len() > MAX_DELEGATION_NOTE_BYTES)
+                    {
+                        return Err(ConfigError::InvalidDelegation(format!(
+                            "note for {} exceeds {MAX_DELEGATION_NOTE_BYTES} bytes",
+                            route.as_str()
+                        )));
+                    }
+                    roster.push(DelegationEntry {
+                        route,
+                        role: entry.role,
+                        note,
+                    });
+                }
+                let max_depth = patch.max_depth.unwrap_or(1);
+                if max_depth == 0 || max_depth > MAX_DELEGATION_DEPTH {
+                    return Err(ConfigError::InvalidDelegation(format!(
+                        "max_depth must be between 1 and {MAX_DELEGATION_DEPTH}, found {max_depth}"
+                    )));
+                }
+                let default_role = patch.default_role.unwrap_or(DelegationRole::Balanced);
+                if !roster.is_empty() && !roster.iter().any(|entry| entry.role == default_role) {
+                    return Err(ConfigError::InvalidDelegation(format!(
+                        "default_role {} has no roster entry",
+                        default_role.as_str()
+                    )));
+                }
+                DelegationConfig {
+                    roster,
+                    default_role,
+                    max_depth,
+                    write_children: patch.write_children.unwrap_or(false),
+                }
+            }
+            None => DelegationConfig {
+                roster: worker_model
+                    .clone()
+                    .map(|route| DelegationEntry {
+                        route,
+                        role: DelegationRole::Balanced,
+                        note: None,
+                    })
+                    .into_iter()
+                    .collect(),
+                ..DelegationConfig::default()
+            },
+        };
         // Profiles are validated like the top-level selection: a well-formed
         // name, a parseable route on a configured provider, and a policy-
         // permitted cap. `default` names the implicit profile and cannot be
@@ -1703,6 +1833,7 @@ impl MergeState {
             model,
             worker_model,
             reviewer_model,
+            delegation,
             max_output_tokens: self.max_output_tokens,
             providers: self.providers,
             mcp: self.mcp,

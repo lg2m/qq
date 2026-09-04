@@ -362,6 +362,17 @@ Response `ServerCapabilities` (abridged; see
   "events": {
     "post_commit": true, "replay_page": 128, "max_subscriptions": 64,
     "max_event_bytes": 1048576, "retention_bounded": false
+  },
+  "delegation": {
+    "roster": [
+      { "route": "openai/gpt-5-mini", "role": "fast", "note": "lookups, breadth",
+        "context_window": 400000, "max_output_tokens": 16384,
+        "relative_cost_permille": 150 },
+      { "route": "openai/gpt-5.6", "role": "balanced", "context_window": 400000,
+        "relative_cost_permille": 1000 }
+    ],
+    "default_role": "balanced", "max_depth": 1, "write_children": false,
+    "max_roster_entries": 8, "max_depth_ceiling": 3
   }
 }
 ```
@@ -391,6 +402,19 @@ durable commit, a subscriber is served `replay_page` events per page from its
 cursor, at most `max_subscriptions` SSE subscriptions are accepted (503 beyond),
 and `retention_bounded: false` means a cursor from any point in the store's
 history replays.
+
+`delegation` (additive; present only for a named workspace) is the roster the
+workspace's configuration declares for `spawn_agent`: each entry's canonical
+route, its operator-declared `role` (`fast`, `balanced`, or `strong`; roles are
+never inferred), optional note, catalog context window and output limit, and
+`relative_cost_permille` — the route's blended per-token price relative to the
+workspace's default model in thousandths (1000 = same price; absent when
+either price is unknown). `default_role` is what the model gets when it names
+no role; `max_depth` and `write_children` are the configured recursion and
+authority bounds; `max_roster_entries` and `max_depth_ceiling` are the
+runtime's hard ceilings. An empty roster means the legacy `worker_model`/parent
+fallback. The same roster is recorded in the run's plan descriptor (descriptor
+version 4), so a roster change recompiles the plan.
 
 ### Command envelope
 

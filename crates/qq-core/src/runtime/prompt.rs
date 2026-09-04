@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use qq_protocol::{ContentHash, PromptVersion};
+use qq_protocol::{ContentHash, DelegationRoster, PromptVersion};
 use qq_provider::ToolSpec;
 
 use crate::{
@@ -9,25 +9,43 @@ use crate::{
     workspace::{SelectedGuidance, WorkspaceInstructions},
 };
 
-pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(9) {
+pub(crate) const AGENT_PROMPT_VERSION: PromptVersion = match PromptVersion::new(10) {
     Some(version) => version,
     None => panic!("agent prompt version must be nonzero"),
 };
 
-/// Version 9 of the base agent prompt. The text is versioned in code, not
+/// Version 10 of the base agent prompt. The text is versioned in code, not
 /// configuration: bump this note and review the diff whenever it changes.
 ///
 /// `tool_index` is the progressive-exposure index of external tools not yet
-/// callable; `skill_index` lists disclosed skills the model may load.
+/// callable; `roster_text` is the compiled delegation roster block (routes,
+/// roles, relative cost) when one is configured; `skill_index` lists
+/// disclosed skills the model may load.
+/// Compiled prompt sections a run appends to the base prompt: none of them
+/// is authored per turn.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PromptSections<'a> {
+    /// Progressive-exposure index of external tools not yet callable.
+    pub(crate) tool_index: Option<&'a str>,
+    /// The rendered delegation roster (see `delegation_roster_text`).
+    pub(crate) roster: Option<&'a str>,
+    /// Disclosed skills the model may load.
+    pub(crate) skill_index: Option<&'a str>,
+}
+
 pub(crate) fn agent_system_prompt(
     workspace: &Path,
     specs: &[ToolSpec],
-    tool_index: Option<&str>,
-    skill_index: Option<&str>,
+    sections: PromptSections<'_>,
     workspace_instructions: &WorkspaceInstructions,
     persona: Option<&crate::plan::Persona>,
     selected_guidance: Option<&SelectedGuidance>,
 ) -> String {
+    let PromptSections {
+        tool_index,
+        roster: roster_text,
+        skill_index,
+    } = sections;
     let mut tool_names = String::new();
     let mut has_external = tool_index.is_some();
     let mut has_spawn = false;
@@ -46,14 +64,30 @@ pub(crate) fn agent_system_prompt(
     } else {
         ""
     };
-    let spawn_section = if has_spawn {
-        "\n\nDelegation:\n\
-         - spawn_agent runs a one-shot read-only sub-agent in this workspace from a \
-         self-contained task brief and returns only its final answer.\n\
-         - Omit spawn_agent's model argument by default. QQ then uses the configured worker \
+    // With a roster the model chooses by role and the roster line (built once
+    // at plan compile) names each role's route and relative cost; without one
+    // the legacy worker/parent fallback text applies.
+    let model_guidance = match (has_spawn, roster_text) {
+        (true, Some(roster)) => format!(
+            "- Choose the sub-agent by spawn_agent's role argument; omit it for the default role. \
+             Set model only when the user explicitly requests an exact roster route; never \
+             guess, translate, or invent one.\n{roster}\n"
+        ),
+        (true, None) => {
+            "- Omit spawn_agent's model argument by default. QQ then uses the configured worker \
          model or this session's persisted selected model, including its authenticated provider. \
          Set model only when the user explicitly requests an exact provider/model route; never \
-         guess, translate, or invent one.\n\
+         guess, translate, or invent one.\n"
+                .to_owned()
+        }
+        (false, _) => String::new(),
+    };
+    let spawn_section = if has_spawn {
+        format!(
+            "\n\nDelegation:\n\
+         - spawn_agent runs a one-shot read-only sub-agent in this workspace from a \
+         self-contained task brief and returns only its final answer.\n\
+{model_guidance}\
          - Delegate when all three hold: the raw evidence would dwarf the distilled answer, \
          you will not need that evidence verbatim later, and the task needs no mid-flight \
          steering.\n\
@@ -61,8 +95,9 @@ pub(crate) fn agent_system_prompt(
          worth a sub-agent.\n\
          - Exception: several independent questions are worth delegating even when each is \
          small, because sub-agents run concurrently."
+        )
     } else {
-        ""
+        String::new()
     };
     let mut prompt = format!(
         "You are QQ, a coding agent operating in the workspace rooted at {root}.\n\
@@ -136,5 +171,74 @@ pub(crate) fn tool_schema_measurement(specs: &[ToolSpec]) -> ToolSchemaMeasureme
     ToolSchemaMeasurement {
         hash: ContentHash::from_bytes(digest.finalize().into()),
         bytes: measured_bytes,
+    }
+}
+
+/// Renders the delegation roster for the system prompt: the spawning model's
+/// own identity first (so it can judge relative cost), then every roster
+/// entry with its role, route, context window, relative cost, and note.
+/// Built once at plan compile; the run loop only concatenates it.
+pub(crate) fn delegation_roster_text(
+    current_route: &str,
+    current_context_window: Option<u32>,
+    roster: &DelegationRoster,
+) -> Option<String> {
+    if roster.roster.is_empty() {
+        return None;
+    }
+    let mut text = String::with_capacity(256);
+    text.push_str("         - You are running as ");
+    text.push_str(current_route);
+    if let Some(window) = current_context_window {
+        text.push_str(" (");
+        push_tokens(&mut text, window);
+        text.push_str(" context)");
+    }
+    text.push_str(". Roster (default role: ");
+    text.push_str(roster.default_role.as_str());
+    text.push_str("):\n");
+    for entry in &roster.roster {
+        text.push_str("           - ");
+        text.push_str(entry.role.as_str());
+        text.push_str(": ");
+        text.push_str(&entry.route);
+        let mut details: Vec<String> = Vec::with_capacity(3);
+        if let Some(window) = entry.context_window {
+            let mut rendered = String::new();
+            push_tokens(&mut rendered, window);
+            rendered.push_str(" context");
+            details.push(rendered);
+        }
+        match entry.relative_cost_permille {
+            Some(1000) => details.push("same cost as you".to_owned()),
+            Some(permille) if permille < 1000 => {
+                details.push(format!("~{}% of your cost", permille.div_ceil(10)));
+            }
+            Some(permille) => {
+                details.push(format!("~{:.1}x your cost", f64::from(permille) / 1000.0));
+            }
+            None => {}
+        }
+        if let Some(note) = &entry.note {
+            details.push(note.clone());
+        }
+        if !details.is_empty() {
+            text.push_str(" — ");
+            text.push_str(&details.join("; "));
+        }
+        text.push('\n');
+    }
+    text.truncate(text.trim_end().len());
+    Some(text)
+}
+
+fn push_tokens(text: &mut String, tokens: u32) {
+    use std::fmt::Write as _;
+    if tokens >= 1_000_000 && tokens.is_multiple_of(100_000) {
+        let _ = write!(text, "{}M", f64::from(tokens) / 1_000_000.0);
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+        let _ = write!(text, "{}k", tokens / 1_000);
+    } else {
+        let _ = write!(text, "{tokens}");
     }
 }

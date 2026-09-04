@@ -10,7 +10,9 @@ mod write;
 #[cfg(test)]
 pub(crate) use dispatch::{MAX_TOOL_RESULT_BYTES, test_executions_started};
 pub(crate) use dispatch::{ToolExecutionResult, bounded_result, execute};
-pub(crate) use specs::{SPAWN_AGENT_TOOL, SpawnAgentArgs, spawn_agent_spec, specs};
+pub(crate) use specs::{
+    MAX_SPAWN_AGENT_SCHEMA_BYTES, SPAWN_AGENT_TOOL, SpawnAgentArgs, spawn_agent_spec, specs,
+};
 
 #[cfg(test)]
 use crate::workspace::{FileState, Workspace, content_hash};
@@ -352,7 +354,7 @@ mod tests {
             "anthropic/claude-test".to_owned(),
             "openai-codex/gpt-test".to_owned(),
         ];
-        let spec = spawn_agent_spec(&routes);
+        let spec = spawn_agent_spec(&routes, &qq_protocol::DelegationRoster::default());
         assert!(spec.description().contains("Omit model by default"));
         assert!(
             spec.description()
@@ -370,11 +372,70 @@ mod tests {
         assert!(model.contains("never guess or translate providers"));
     }
 
+    fn roster() -> qq_protocol::DelegationRoster {
+        qq_protocol::DelegationRoster {
+            roster: vec![
+                qq_protocol::DelegationRosterEntry {
+                    route: "openai/fast".to_owned(),
+                    role: qq_protocol::DelegationRole::Fast,
+                    note: Some("lookups".to_owned()),
+                    context_window: Some(400_000),
+                    max_output_tokens: None,
+                    relative_cost_permille: Some(150),
+                },
+                qq_protocol::DelegationRosterEntry {
+                    route: "anthropic/strong".to_owned(),
+                    role: qq_protocol::DelegationRole::Strong,
+                    note: None,
+                    context_window: None,
+                    max_output_tokens: None,
+                    relative_cost_permille: Some(2_500),
+                },
+            ],
+            default_role: qq_protocol::DelegationRole::Fast,
+            max_depth: 1,
+            write_children: false,
+        }
+    }
+
+    #[test]
+    fn spawn_agent_with_a_roster_selects_by_role_and_limits_overrides_to_roster_routes() {
+        // The flat authenticated list is ignored once a roster exists: the
+        // model may only name roster routes exactly.
+        let every_route = ["openai/fast".to_owned(), "openai/other".to_owned()];
+        let spec = spawn_agent_spec(&every_route, &roster());
+        let schema = spec.input_schema();
+        assert_eq!(schema["required"], json!(["task"]));
+        assert_eq!(
+            schema["properties"]["role"]["enum"],
+            json!(["fast", "strong"])
+        );
+        assert!(
+            schema["properties"]["role"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("default (fast)")
+        );
+        assert_eq!(
+            schema["properties"]["model"]["enum"],
+            json!(["openai/fast", "anthropic/strong"])
+        );
+        assert!(spec.description().contains("Choose the sub-agent by role"));
+        let bytes = spec.name().len() + spec.description().len() + schema.to_string().len();
+        assert!(bytes <= MAX_SPAWN_AGENT_SCHEMA_BYTES, "{bytes}");
+
+        let parsed: SpawnAgentArgs =
+            serde_json::from_str(r#"{"task":"t","role":"strong"}"#).unwrap();
+        assert_eq!(parsed.role, Some(qq_protocol::DelegationRole::Strong));
+        assert!(serde_json::from_str::<SpawnAgentArgs>(r#"{"task":"t","role":"warp"}"#).is_err());
+    }
+
     #[test]
     fn spawn_agent_hides_model_override_without_authenticated_routes() {
-        let spec = spawn_agent_spec(&[]);
+        let spec = spawn_agent_spec(&[], &qq_protocol::DelegationRoster::default());
         let schema = spec.input_schema();
         assert!(schema["properties"].get("model").is_none());
+        assert!(schema["properties"].get("role").is_none());
         assert_eq!(schema["required"], json!(["task"]));
     }
 

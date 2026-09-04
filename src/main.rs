@@ -543,6 +543,7 @@ fn config_command(
                     "organization" => snapshot.provenance().organization(),
                     "model" => snapshot.provenance().model(),
                     "worker_model" => snapshot.provenance().worker_model(),
+                    "delegation" => snapshot.provenance().delegation(),
                     "max_output_tokens" => snapshot.provenance().max_output_tokens(),
                     _ => field
                         .strip_prefix("pack.")
@@ -603,11 +604,33 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
     );
     println!("model: {}", snapshot.model().as_str());
     println!(
-        "worker_model: {}",
+        "worker_model: {}{}",
         snapshot
             .worker_model()
-            .map_or("<none>", config::ModelRoute::as_str)
+            .map_or("<none>", config::ModelRoute::as_str),
+        if snapshot.worker_model().is_some() {
+            " (deprecated; declare a delegation roster instead)"
+        } else {
+            ""
+        }
     );
+    let delegation = snapshot.delegation();
+    println!(
+        "delegation: default_role={} max_depth={} write_children={}",
+        delegation.default_role().as_str(),
+        delegation.max_depth(),
+        delegation.write_children()
+    );
+    for entry in delegation.roster() {
+        println!(
+            "  - {} ({}){}",
+            entry.route().as_str(),
+            entry.role().as_str(),
+            entry
+                .note()
+                .map_or(String::new(), |note| format!(": {note}"))
+        );
+    }
     println!("max_output_tokens: {}", snapshot.max_output_tokens());
     println!("providers:");
     for (name, provider) in snapshot.providers() {

@@ -228,6 +228,7 @@ pub fn capabilities(steering: SteeringCapabilities) -> ServerCapabilities {
             max_event_bytes: 1 << 20,
             retention_bounded: false,
         },
+        delegation: None,
     }
 }
 

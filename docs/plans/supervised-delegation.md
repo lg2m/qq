@@ -1,6 +1,6 @@
 # Supervised Delegation, Continuation, And Audit
 
-Status: proposed 2026-09-03. D1, D2, and D6a implemented 2026-09-03; D3, D4,
+Status: proposed 2026-09-03. D1, D2, D3, and D6a implemented 2026-09-03; D4,
 D5, and D6b not started. This plan is a companion to
 [`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md)
 and requires the amendments listed in [Amendments](#amendments-to-existing-plans)
@@ -291,17 +291,20 @@ delegation: (
   config type crosses into core.
 - The descriptor records the roster (`DESCRIPTOR_VERSION` 4); a roster change
   recompiles the plan.
-- `spawn_agent` gains `role: "fast" | "balanced" | "strong"` and
+- `spawn_agent` gains `role: "fast" | "balanced" | "strong"` (D3) and
   `authority: "read" | "write"` (D4). The `model` exact-override enum is
-  restricted to roster routes. The schema description is bounded to 2 KiB.
+  restricted to roster routes. The whole declaration is bounded to 2 KiB at
+  plan compile (`PlanCompileError::SpawnSchemaTooLarge`) when a roster exists.
 - The prompt's Delegation block receives a dynamic roster line (passed like
   `tool_index`, prompt version bump) stating the current model and context
   window, then each roster entry with role, relative cost, and note. When no
   roster is configured the block is unchanged from today.
 - `ServerCapabilities.delegation` advertises the roster, roles, `max_depth`,
   `write_children`, and bounds. Additive; capabilities version unchanged.
-- `resolve_worker_model` becomes `resolve_delegation_route(role | model)` and
-  remains the single validation choke point.
+- `resolve_delegation_route(roster, model, role)` in the run loop is the
+  single resolution choke point (model > role > default role); the loader's
+  `resolve_worker_model` remains the legacy fallback when no roster exists and
+  `validate_spawn_model` remains the authentication check for every route.
 
 Tests: roster validation (unknown provider, unauthenticated route, ninth
 entry, duplicate route); role resolution precedence (explicit model > role >
@@ -469,7 +472,7 @@ gate beyond T1 showing no pass-rate loss.
 | D6a compare command, arm stamping, reasoning tokens | none | done |
 | D1 continuation | none | done; protocol 16, schema 22 |
 | D2 accounting and authority repair | none | done |
-| D3 roster | D2 | descriptor 4, prompt bump |
+| D3 roster | D2 | done; descriptor 4, prompt 10 |
 | D4a supervised write children at depth one | D2, D3, amendments | reviewer widening |
 | D4b configurable depth to three | D4a | per-depth pools, descendant cap |
 | D5 audit | D4a (audit child reuses supervised machinery) | amendment |

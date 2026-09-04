@@ -35,8 +35,8 @@ use qq_provider::{
     ProviderCompiler, ProviderError, ProviderRecipe, SecretRef,
 };
 use qq_server::{
-    CommandFuture, ModelsFuture, ProfilesFuture, ServerHandler, ServerHandlerError, SnapshotFuture,
-    WorkspaceToolsFuture,
+    CommandFuture, DelegationFuture, ModelsFuture, ProfilesFuture, ServerHandler,
+    ServerHandlerError, SnapshotFuture, WorkspaceToolsFuture,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -257,6 +257,17 @@ impl RuntimeFactory {
             });
         }
         Ok(profiles)
+    }
+
+    /// The delegation roster a workspace's configuration declares, translated
+    /// into the secret-free protocol shape the plan compiles with and the
+    /// capability document advertises. Blocking: loads configuration.
+    pub fn delegation_for(
+        &self,
+        workspace: &str,
+    ) -> Result<qq_protocol::DelegationRoster, RuntimeBuildError> {
+        let snapshot = self.snapshot_for_selection(workspace, &ModelSelection::default())?;
+        Ok(delegation_roster(&snapshot, snapshot.model()))
     }
 
     pub fn models_for(
@@ -653,9 +664,11 @@ impl RuntimeFactory {
             .iter()
             .map(|report| report.source().label().to_owned())
             .collect();
+        let delegation = delegation_roster(&snapshot, snapshot.model());
         let mut profile =
             AgentProfile::new(provider, descriptor, resolved_model, workspace.to_owned())
                 .with_spawn_model_routes(spawn_model_routes)
+                .with_delegation(delegation)
                 .with_provenance(provenance)
                 .with_credential_epoch(epoch)
                 .with_profile_id(profile_id.clone());
@@ -1602,6 +1615,26 @@ impl ServerHandler for RuntimeHandler {
         })
     }
 
+    fn delegation(&self, workspace_id: WorkspaceId) -> DelegationFuture {
+        let runtime = self.durable.clone();
+        let factory = self.factory.clone();
+        Box::pin(async move {
+            let workspace = runtime
+                .workspace_path(workspace_id)
+                .await
+                .map_err(map_session_runtime_error)?;
+            tokio::task::spawn_blocking(move || factory.delegation_for(&workspace))
+                .await
+                .map_err(|_| ServerHandlerError::Internal)?
+                .map_err(|error| match error.failure_kind() {
+                    RunFailureKind::Configuration | RunFailureKind::Policy => {
+                        ServerHandlerError::InvalidRequest(error.to_string())
+                    }
+                    _ => ServerHandlerError::Internal,
+                })
+        })
+    }
+
     fn workspace_tools(&self, workspace_id: WorkspaceId) -> WorkspaceToolsFuture {
         let runtime = self.durable.clone();
         let factory = self.factory.clone();
@@ -1686,6 +1719,70 @@ pub enum RuntimeHandlerError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Sessions(#[from] SessionRuntimeError),
+}
+
+/// Translates the configured roster into the protocol shape, decorating each
+/// entry with catalog metadata and its blended price relative to the spawning
+/// model (`current`). Relative cost is observational guidance for the model;
+/// `None` when either side has no pricing.
+fn delegation_roster(
+    snapshot: &ConfigSnapshot,
+    current: &qq_config::ModelRoute,
+) -> qq_protocol::DelegationRoster {
+    let metadata = |route: &qq_config::ModelRoute| {
+        snapshot
+            .providers()
+            .get(route.provider())
+            .and_then(|provider| provider.models().get(route.model()))
+    };
+    // A blended per-token price: three input tokens per output token is a
+    // rough coding-agent mix and only needs to rank routes, not bill them.
+    let blended = |pricing: &qq_config::ModelPricing| -> u128 {
+        u128::from(pricing.input_usd_nanos_per_token) * 3
+            + u128::from(pricing.output_usd_nanos_per_token)
+    };
+    let current_price = metadata(current)
+        .and_then(qq_config::ModelMetadata::pricing)
+        .map(blended)
+        .filter(|price| *price > 0);
+    let config = snapshot.delegation();
+    qq_protocol::DelegationRoster {
+        roster: config
+            .roster()
+            .iter()
+            .map(|entry| {
+                let metadata = metadata(entry.route());
+                qq_protocol::DelegationRosterEntry {
+                    route: entry.route().as_str().to_owned(),
+                    role: delegation_role(entry.role()),
+                    note: entry.note().map(str::to_owned),
+                    context_window: metadata.and_then(qq_config::ModelMetadata::context_window),
+                    max_output_tokens: metadata
+                        .and_then(qq_config::ModelMetadata::max_output_tokens),
+                    relative_cost_permille: match (
+                        current_price,
+                        metadata
+                            .and_then(qq_config::ModelMetadata::pricing)
+                            .map(blended),
+                    ) {
+                        (Some(current), Some(entry)) => u32::try_from(entry * 1000 / current).ok(),
+                        _ => None,
+                    },
+                }
+            })
+            .collect(),
+        default_role: delegation_role(config.default_role()),
+        max_depth: config.max_depth(),
+        write_children: config.write_children(),
+    }
+}
+
+const fn delegation_role(role: qq_config::DelegationRole) -> qq_protocol::DelegationRole {
+    match role {
+        qq_config::DelegationRole::Fast => qq_protocol::DelegationRole::Fast,
+        qq_config::DelegationRole::Balanced => qq_protocol::DelegationRole::Balanced,
+        qq_config::DelegationRole::Strong => qq_protocol::DelegationRole::Strong,
+    }
 }
 
 fn protocol_model_pricing(pricing: qq_config::ModelPricing) -> qq_protocol::ModelPricing {
@@ -3117,6 +3214,108 @@ mod tests {
         assert_eq!(bedrock.credential_profile.as_deref(), Some("aws-work"));
         assert!(bedrock.prompt_cache.cache_read_usage);
         assert!(bedrock.prompt_cache.cache_write_usage);
+    }
+
+    #[test]
+    fn delegation_roster_carries_catalog_metadata_and_relative_cost() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let snapshot = factory
+            .load(&fixture.request(
+                r#"(
+                    version: 1,
+                    model: "custom/main",
+                    delegation: (
+                        roster: [
+                            (route: "custom/fast", role: fast, note: "lookups"),
+                            (route: "custom/main", role: balanced),
+                            (route: "custom/unpriced", role: strong),
+                        ],
+                        default_role: fast,
+                        max_depth: 2,
+                    ),
+                    providers: {
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: OpenAiResponses,
+                                auth: NoAuth,
+                            ),
+                            models: {
+                                "main": (
+                                    name: "Main",
+                                    context_window: 200000,
+                                    max_output_tokens: 8192,
+                                    pricing: (
+                                        input_usd_nanos_per_token: 100,
+                                        output_usd_nanos_per_token: 200,
+                                        provenance: "fixture",
+                                    ),
+                                ),
+                                "fast": (
+                                    name: "Fast",
+                                    context_window: 400000,
+                                    pricing: (
+                                        input_usd_nanos_per_token: 10,
+                                        output_usd_nanos_per_token: 20,
+                                        provenance: "fixture",
+                                    ),
+                                ),
+                                "unpriced": (name: "Unpriced"),
+                            },
+                        ),
+                    },
+                )"#,
+            ))
+            .unwrap();
+        let roster = delegation_roster(&snapshot, snapshot.model());
+        assert_eq!(roster.default_role, qq_protocol::DelegationRole::Fast);
+        assert_eq!(roster.max_depth, 2);
+        assert!(!roster.write_children);
+        assert_eq!(roster.roster.len(), 3);
+        let fast = &roster.roster[0];
+        assert_eq!(fast.route, "custom/fast");
+        assert_eq!(fast.role, qq_protocol::DelegationRole::Fast);
+        assert_eq!(fast.note.as_deref(), Some("lookups"));
+        assert_eq!(fast.context_window, Some(400_000));
+        assert_eq!(fast.max_output_tokens, None);
+        // Blended 3:1 price: fast (10*3+20)=50 vs main (100*3+200)=500.
+        assert_eq!(fast.relative_cost_permille, Some(100));
+        let main = &roster.roster[1];
+        assert_eq!(main.relative_cost_permille, Some(1000));
+        assert_eq!(main.max_output_tokens, Some(8_192));
+        let unpriced = &roster.roster[2];
+        assert_eq!(unpriced.relative_cost_permille, None);
+        assert_eq!(unpriced.context_window, None);
+
+        // The compiled plan records the roster in its descriptor and the
+        // spawn_agent schema offers roles.
+        let plan = factory
+            .plan_for(&fixture.request(
+                r#"(
+                    version: 1,
+                    model: "custom/main",
+                    delegation: (roster: [(route: "custom/fast", role: fast)], default_role: fast),
+                    providers: {
+                        "custom": Custom(
+                            connection: (
+                                base_url: "http://127.0.0.1:1/v1",
+                                api: OpenAiResponses,
+                                auth: NoAuth,
+                            ),
+                            models: {"main": (name: "Main"), "fast": (name: "Fast")},
+                        ),
+                    },
+                )"#,
+            ))
+            .unwrap();
+        assert_eq!(plan.descriptor().version, 4);
+        assert_eq!(plan.descriptor().delegation.roster.len(), 1);
+        assert_eq!(plan.descriptor().delegation.roster[0].route, "custom/fast");
+        assert_eq!(
+            plan.descriptor().delegation.default_role,
+            qq_protocol::DelegationRole::Fast
+        );
     }
 
     #[test]
@@ -4674,7 +4873,7 @@ mod tests {
                 "descriptor leaked {forbidden}"
             );
         }
-        assert!(canonical.starts_with("qq-agent-plan-descriptor-v3\0{"));
+        assert!(canonical.starts_with("qq-agent-plan-descriptor-v4\0{"));
     }
 
     #[test]

@@ -627,6 +627,33 @@ fn version_16_commands_receipts_events_and_capabilities_match_their_goldens() {
                 max_event_bytes: 1_048_576,
                 retention_bounded: false,
             },
+            delegation: Some(qq_protocol::DelegationCapabilities {
+                roster: qq_protocol::DelegationRoster {
+                    roster: vec![
+                        qq_protocol::DelegationRosterEntry {
+                            route: "openai/gpt-5-mini".to_owned(),
+                            role: qq_protocol::DelegationRole::Fast,
+                            note: Some("lookups, breadth".to_owned()),
+                            context_window: Some(400_000),
+                            max_output_tokens: Some(16_384),
+                            relative_cost_permille: Some(150),
+                        },
+                        qq_protocol::DelegationRosterEntry {
+                            route: "openai/gpt-5.6".to_owned(),
+                            role: qq_protocol::DelegationRole::Balanced,
+                            note: None,
+                            context_window: Some(400_000),
+                            max_output_tokens: None,
+                            relative_cost_permille: Some(1000),
+                        },
+                    ],
+                    default_role: qq_protocol::DelegationRole::Balanced,
+                    max_depth: 1,
+                    write_children: false,
+                },
+                max_roster_entries: 8,
+                max_depth_ceiling: 3,
+            }),
         },
     );
     check(

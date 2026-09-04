@@ -13,9 +13,10 @@ mod plan;
 mod sessions;
 
 pub use capabilities::{
-    AgentProfileSummary, CAPABILITIES_VERSION, CapabilitiesRequest, EventCapabilities,
-    LimitCapabilities, PackSummary, ServerCapabilities, SkillCapabilities, SkillSummary,
-    SteeringCapabilities, ToolCapabilities, ToolHostSummary, WorkspaceToolCapabilities,
+    AgentProfileSummary, CAPABILITIES_VERSION, CapabilitiesRequest, DelegationCapabilities,
+    DelegationRole, DelegationRoster, DelegationRosterEntry, EventCapabilities, LimitCapabilities,
+    PackSummary, ServerCapabilities, SkillCapabilities, SkillSummary, SteeringCapabilities,
+    ToolCapabilities, ToolHostSummary, WorkspaceToolCapabilities,
 };
 pub use ids::{CommandId, IdError, MessageId, RunId, SessionId, StoreId, ToolCallId, WorkspaceId};
 pub use input::{

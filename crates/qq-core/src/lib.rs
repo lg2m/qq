@@ -16,8 +16,8 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream as futures_stream};
 use qq_protocol::{
-    ApprovalMode, BudgetLimitKind, ContentHash, ModelPricing, RunActivity, RunCommand, RunEvent,
-    RunFailureKind, RunLimits, RunPromptIdentity, TokenUsage, ToolCallId,
+    ApprovalMode, BudgetLimitKind, ContentHash, DelegationRoster, ModelPricing, RunActivity,
+    RunCommand, RunEvent, RunFailureKind, RunLimits, RunPromptIdentity, TokenUsage, ToolCallId,
 };
 use qq_provider::{
     ContentBlock, Message, ModelRequest, Provider, ProviderErrorKind, ProviderEvent, Role, ToolSpec,
@@ -60,11 +60,12 @@ pub use hosts::{
 pub use runtime::MAX_PENDING_STEERING;
 pub use sessions::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, MAX_CHILD_DEPTH,
-    MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_PENDING_PROMPTS, MAX_REPLAY_EVENTS,
-    MAX_SPAWNED_CHILDREN_PER_RUN, ReviewFuture, ReviewRequest, ReviewVerdict, RuntimeLoadError,
-    RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime,
-    SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
-    WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    MAX_CHILD_DEPTH_CEILING, MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_DELEGATION_ROSTER,
+    MAX_PENDING_PROMPTS, MAX_REPLAY_EVENTS, MAX_SPAWNED_CHILDREN_PER_RUN, ReviewFuture,
+    ReviewRequest, ReviewVerdict, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
+    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
+    SpawnModelValidationFuture, WorkerRuntimeLoadFuture, WorkspaceGrantAuthority,
+    WorkspaceGrantSeed,
 };
 pub use workspace::skills::{MAX_INDEXED_SKILLS, MAX_SKILL_DESCRIPTION_BYTES};
 pub use workspace::{SkillEntry, SkillIndex, SkillKind};
@@ -156,6 +157,47 @@ fn apply_steering(
 
 /// Executes one `select_tools` call against the run's pin set. Returns the
 /// bounded tool result and whether any pin was added.
+/// Resolves a `spawn_agent` call's model choice against the roster. Precedence:
+/// an explicit `model` (which must be a roster route when a roster exists),
+/// then the requested `role`, then the roster's default role. `None` means
+/// "no roster and no override": the session layer falls back to the legacy
+/// worker model or the parent's selection. Errors are tool results the model
+/// can act on.
+fn resolve_delegation_route(
+    delegation: &DelegationRoster,
+    model: Option<String>,
+    role: Option<qq_protocol::DelegationRole>,
+) -> Result<Option<String>, String> {
+    if delegation.roster.is_empty() {
+        if role.is_some() {
+            return Err(
+                "no delegation roster is configured, so role cannot be used; omit role \
+                        (and model) to use the configured worker model"
+                    .to_owned(),
+            );
+        }
+        return Ok(model);
+    }
+    if let Some(model) = model {
+        if !delegation.contains_route(&model) {
+            return Err(format!(
+                "model {model:?} is not on the delegation roster; choose a role instead or use \
+                 one of the listed routes"
+            ));
+        }
+        return Ok(Some(model));
+    }
+    let role = role.unwrap_or(delegation.default_role);
+    match delegation.route_for_role(role) {
+        Some(route) => Ok(Some(route.to_owned())),
+        None => Err(format!(
+            "no roster entry declares the {} role; choose one of the roles listed in the \
+             system prompt",
+            role.as_str()
+        )),
+    }
+}
+
 fn select_tools(
     catalog: &catalog::ToolCatalog,
     pins: &mut catalog::PinSet,
@@ -400,6 +442,8 @@ pub struct Runtime {
     pub(crate) context_sources: Arc<[context_source::RegisteredSource]>,
     pub(crate) context_cache: Arc<ContextCache>,
     spawn_model_routes: Arc<[String]>,
+    /// The roster and bounds `spawn_agent` advertises and resolves through.
+    pub(crate) delegation: Arc<DelegationRoster>,
     turn_retry: TurnRetryPolicy,
 }
 
@@ -435,6 +479,7 @@ impl Runtime {
             context_sources: Arc::from([]),
             context_cache: Arc::new(ContextCache::default()),
             spawn_model_routes: Arc::from([]),
+            delegation: Arc::new(DelegationRoster::default()),
             turn_retry: TurnRetryPolicy::default(),
         })
     }
@@ -530,6 +575,13 @@ impl Runtime {
         routes.dedup();
         routes.retain(|route| !route.trim().is_empty());
         self.spawn_model_routes = routes.into();
+        self
+    }
+
+    /// Installs the delegation roster the run loop advertises to the model.
+    #[must_use]
+    pub fn with_delegation(mut self, delegation: DelegationRoster) -> Self {
+        self.delegation = Arc::new(delegation);
         self
     }
 
@@ -735,6 +787,7 @@ impl plan::CompiledAgentPlan {
         let model_max_output_tokens = plan.runtime.max_output_tokens;
         let catalog = Arc::clone(&plan.catalog);
         let skills = Arc::clone(&plan.skills);
+        let roster_text = plan.roster_text.clone();
         let pack_roots = Arc::clone(&plan.pack_roots);
         let persona = plan.persona.clone();
         let hosts = Arc::clone(&plan.hosts);
@@ -742,6 +795,7 @@ impl plan::CompiledAgentPlan {
         let context_cache = Arc::clone(&plan.runtime.context_cache);
         let profile_name = plan.descriptor().profile.as_str().to_owned();
         let turn_retry = plan.runtime.turn_retry;
+        let delegation = Arc::clone(&plan.runtime.delegation);
         Box::pin(stream! {
             let RunCapabilities {
                 spawner,
@@ -905,11 +959,14 @@ impl plan::CompiledAgentPlan {
                 let mut system = agent_system_prompt(
                     workspace.path(),
                     &base_specs,
-                    catalog.index_text().map(Arc::as_ref),
-                    // Disclosure follows the guidance capability: restricted
-                    // runs (compaction, model-authored child tasks) neither
-                    // list nor load skills.
-                    if allow_guidance { skills.disclosure_text() } else { None },
+                    runtime::PromptSections {
+                        tool_index: catalog.index_text().map(Arc::as_ref),
+                        roster: roster_text.as_deref(),
+                        // Disclosure follows the guidance capability: restricted
+                        // runs (compaction, model-authored child tasks) neither
+                        // list nor load skills.
+                        skill_index: if allow_guidance { skills.disclosure_text() } else { None },
+                    },
                     workspace_instructions,
                     persona.as_deref(),
                     selected_guidance.as_ref(),
@@ -1750,6 +1807,7 @@ impl plan::CompiledAgentPlan {
                     let hosts = Arc::clone(&hosts);
                     let spawner = spawner.clone();
                     let history = history.clone();
+                    let delegation = Arc::clone(&delegation);
                     // Under progressive exposure only pinned externals were
                     // offered; a call to one that was not is refused with the
                     // way to make it available.
@@ -1786,27 +1844,34 @@ impl plan::CompiledAgentPlan {
                                                 let model = model.trim().to_owned();
                                                 (!model.is_empty()).then_some(model)
                                             });
-                                            // The advertised route list is
-                                            // schema guidance only; the
-                                            // session spawner validates every
-                                            // resolved route against the
-                                            // authenticated served model list
-                                            // at spawn time, before any
-                                            // durable child state exists.
-                                            match child_limits {
-                                                Err(kind) => tools::bounded_result(
+                                            // Role and roster resolve here, the one
+                                            // choke point: an exact model must be a
+                                            // roster route when a roster exists, and
+                                            // a role maps to the first roster route
+                                            // declaring it. The session spawner then
+                                            // validates the resolved route against
+                                            // the authenticated served model list
+                                            // before any durable child state exists.
+                                            let resolution = resolve_delegation_route(
+                                                &delegation,
+                                                arguments.model,
+                                                arguments.role,
+                                            );
+                                            match (child_limits, resolution) {
+                                                (_, Err(message)) => tools::bounded_result(message, true),
+                                                (Err(kind), Ok(_)) => tools::bounded_result(
                                                     format!(
                                                         "this run cannot afford a sub-agent: its {} budget is spent; continue with what you have",
                                                         kind.as_str()
                                                     ),
                                                     true,
                                                 ),
-                                                Ok(limits) => {
+                                                (Ok(limits), Ok(model)) => {
                                                     let outcome = spawner
                                                         .spawn(SpawnRequest {
                                                             call_id: call.id,
                                                             task: arguments.task,
-                                                            model: arguments.model,
+                                                            model,
                                                             limits,
                                                         })
                                                         .await;
@@ -5776,8 +5841,7 @@ mod tests {
         let without = agent_system_prompt(
             workspace,
             &tools::specs(),
-            None,
-            None,
+            runtime::PromptSections::default(),
             &instructions,
             None,
             None,
@@ -5786,8 +5850,15 @@ mod tests {
         assert!(!without.contains("Delegation:"));
 
         let mut specs = tools::specs();
-        specs.push(tools::spawn_agent_spec(&[]));
-        let with = agent_system_prompt(workspace, &specs, None, None, &instructions, None, None);
+        specs.push(tools::spawn_agent_spec(&[], &DelegationRoster::default()));
+        let with = agent_system_prompt(
+            workspace,
+            &specs,
+            runtime::PromptSections::default(),
+            &instructions,
+            None,
+            None,
+        );
         assert!(with.contains("spawn_agent"));
         assert!(with.contains("Delegation:"));
         assert!(with.contains("independent questions"));
@@ -5796,6 +5867,153 @@ mod tests {
         assert!(with.contains("configured worker model"));
         assert!(with.contains("persisted selected model"));
         assert!(with.contains("never guess, translate, or invent one"));
+    }
+
+    #[test]
+    fn delegation_route_resolution_prefers_model_then_role_then_default() {
+        use qq_protocol::{DelegationRole, DelegationRoster, DelegationRosterEntry};
+        let entry = |route: &str, role| DelegationRosterEntry {
+            route: route.to_owned(),
+            role,
+            note: None,
+            context_window: None,
+            max_output_tokens: None,
+            relative_cost_permille: None,
+        };
+        let roster = DelegationRoster {
+            roster: vec![
+                entry("openai/fast", DelegationRole::Fast),
+                entry("anthropic/balanced", DelegationRole::Balanced),
+                entry("anthropic/balanced-2", DelegationRole::Balanced),
+            ],
+            default_role: DelegationRole::Balanced,
+            max_depth: 1,
+            write_children: false,
+        };
+
+        // Exact model wins and must be a roster route.
+        assert_eq!(
+            resolve_delegation_route(
+                &roster,
+                Some("openai/fast".to_owned()),
+                Some(DelegationRole::Balanced)
+            ),
+            Ok(Some("openai/fast".to_owned()))
+        );
+        assert!(
+            resolve_delegation_route(&roster, Some("openai/other".to_owned()), None)
+                .unwrap_err()
+                .contains("not on the delegation roster")
+        );
+        // Role maps to the first entry declaring it.
+        assert_eq!(
+            resolve_delegation_route(&roster, None, Some(DelegationRole::Balanced)),
+            Ok(Some("anthropic/balanced".to_owned()))
+        );
+        // Default role when neither is given.
+        assert_eq!(
+            resolve_delegation_route(&roster, None, None),
+            Ok(Some("anthropic/balanced".to_owned()))
+        );
+        // A role nobody declares is a tool error naming it.
+        assert!(
+            resolve_delegation_route(&roster, None, Some(DelegationRole::Strong))
+                .unwrap_err()
+                .contains("strong role")
+        );
+
+        // Without a roster the legacy path is untouched: any model passes
+        // through for spawn-time validation, and role is refused.
+        let none = DelegationRoster::default();
+        assert_eq!(
+            resolve_delegation_route(&none, Some("x/y".to_owned()), None),
+            Ok(Some("x/y".to_owned()))
+        );
+        assert_eq!(resolve_delegation_route(&none, None, None), Ok(None));
+        assert!(
+            resolve_delegation_route(&none, None, Some(DelegationRole::Fast))
+                .unwrap_err()
+                .contains("no delegation roster")
+        );
+    }
+
+    #[test]
+    fn roster_prompt_names_the_current_model_and_each_route_with_relative_cost() {
+        use qq_protocol::{DelegationRole, DelegationRoster, DelegationRosterEntry};
+        let roster = DelegationRoster {
+            roster: vec![
+                DelegationRosterEntry {
+                    route: "openai/fast".to_owned(),
+                    role: DelegationRole::Fast,
+                    note: Some("lookups, breadth".to_owned()),
+                    context_window: Some(400_000),
+                    max_output_tokens: None,
+                    relative_cost_permille: Some(150),
+                },
+                DelegationRosterEntry {
+                    route: "anthropic/same".to_owned(),
+                    role: DelegationRole::Balanced,
+                    note: None,
+                    context_window: Some(200_000),
+                    max_output_tokens: None,
+                    relative_cost_permille: Some(1000),
+                },
+                DelegationRosterEntry {
+                    route: "anthropic/strong".to_owned(),
+                    role: DelegationRole::Strong,
+                    note: None,
+                    context_window: None,
+                    max_output_tokens: None,
+                    relative_cost_permille: Some(2_500),
+                },
+                DelegationRosterEntry {
+                    route: "custom/unpriced".to_owned(),
+                    role: DelegationRole::Strong,
+                    note: None,
+                    context_window: Some(1_500),
+                    max_output_tokens: None,
+                    relative_cost_permille: None,
+                },
+            ],
+            default_role: DelegationRole::Balanced,
+            max_depth: 1,
+            write_children: false,
+        };
+        let text =
+            runtime::delegation_roster_text("anthropic/current", Some(1_000_000), &roster).unwrap();
+        assert_eq!(
+            text,
+            "         - You are running as anthropic/current (1M context). Roster (default role: balanced):\n\
+             \x20          - fast: openai/fast — 400k context; ~15% of your cost; lookups, breadth\n\
+             \x20          - balanced: anthropic/same — 200k context; same cost as you\n\
+             \x20          - strong: anthropic/strong — ~2.5x your cost\n\
+             \x20          - strong: custom/unpriced — 1500 context"
+        );
+        assert!(runtime::delegation_roster_text("x", None, &DelegationRoster::default()).is_none());
+
+        // The prompt embeds it and switches to role-based guidance; the
+        // legacy worker-model sentence goes away.
+        let workspace = std::path::Path::new("/tmp/qq-prompt-test");
+        let instructions = workspace::WorkspaceInstructions::empty();
+        let mut specs = tools::specs();
+        specs.push(tools::spawn_agent_spec(&[], &roster));
+        let prompt = agent_system_prompt(
+            workspace,
+            &specs,
+            runtime::PromptSections {
+                roster: Some(&text),
+                ..runtime::PromptSections::default()
+            },
+            &instructions,
+            None,
+            None,
+        );
+        assert!(prompt.contains("Delegation:"));
+        assert!(prompt.contains("Choose the sub-agent by spawn_agent's role argument"));
+        assert!(prompt.contains("You are running as anthropic/current"));
+        assert!(prompt.contains("- fast: openai/fast"));
+        assert!(!prompt.contains("configured worker model"));
+        assert!(prompt.contains("independent questions"));
     }
 
     /// A host serving many tools so the catalog is disclosed progressively.

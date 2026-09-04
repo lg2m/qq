@@ -30,13 +30,14 @@ use futures_util::StreamExt;
 use qq_core::SessionEventStream;
 use qq_protocol::{
     AgentProfileSummary, ApprovalMode, BudgetLimitKind, CAPABILITIES_VERSION, CapabilitiesRequest,
-    CommandReceipt, CommandRequest, EventCapabilities, InputPartKind, LimitCapabilities,
-    LocalConnectionError, LocalServerConnection, MAX_CORRELATION_ENTRIES, MAX_EVENT_BYTES,
-    MAX_INPUT_FILE_BYTES, MAX_INPUT_FILE_PARTS, MAX_INPUT_PARTS, MAX_INPUT_TEXT_BYTES,
-    MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES, MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES,
-    ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION, ServerCapabilities, ServerInfo,
-    SessionCommand, SessionCommandKind, SnapshotRequest, SteeringCapabilities, SubscribeRequest,
-    ToolCapabilities, WorkspaceId, WorkspaceSnapshot, WorkspaceToolCapabilities, validate_input,
+    CommandReceipt, CommandRequest, DelegationCapabilities, DelegationRoster, EventCapabilities,
+    InputPartKind, LimitCapabilities, LocalConnectionError, LocalServerConnection,
+    MAX_CORRELATION_ENTRIES, MAX_EVENT_BYTES, MAX_INPUT_FILE_BYTES, MAX_INPUT_FILE_PARTS,
+    MAX_INPUT_PARTS, MAX_INPUT_TEXT_BYTES, MAX_MODEL_BYTES, MAX_ORGANIZATION_BYTES,
+    MAX_REQUEST_BYTES, MAX_WORKSPACE_BYTES, ModelCatalogRequest, ModelDescriptor, PROTOCOL_VERSION,
+    ServerCapabilities, ServerInfo, SessionCommand, SessionCommandKind, SnapshotRequest,
+    SteeringCapabilities, SubscribeRequest, ToolCapabilities, WorkspaceId, WorkspaceSnapshot,
+    WorkspaceToolCapabilities, validate_input,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -79,6 +80,8 @@ pub type WorkspaceToolsFuture = Pin<
         dyn Future<Output = Result<WorkspaceToolCapabilities, ServerHandlerError>> + Send + 'static,
     >,
 >;
+pub type DelegationFuture =
+    Pin<Box<dyn Future<Output = Result<DelegationRoster, ServerHandlerError>> + Send + 'static>>;
 
 /// Root-supplied application seam for durable session requests.
 pub trait ServerHandler: Send + Sync + 'static {
@@ -105,6 +108,12 @@ pub trait ServerHandler: Send + Sync + 'static {
     /// for the capability document. The default returns nothing rather than
     /// failing: a handler without plans still serves the static sections.
     fn workspace_tools(&self, _workspace_id: WorkspaceId) -> WorkspaceToolsFuture {
+        Box::pin(async { Err(ServerHandlerError::Unavailable) })
+    }
+
+    /// The delegation roster and bounds a workspace's configuration declares,
+    /// for the capability document.
+    fn delegation(&self, _workspace_id: WorkspaceId) -> DelegationFuture {
         Box::pin(async { Err(ServerHandlerError::Unavailable) })
     }
 
@@ -802,8 +811,8 @@ async fn capabilities(
             Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid request"),
         }
     };
-    let (profiles, workspace_tools) = match request.workspace_id {
-        None => (None, None),
+    let (profiles, workspace_tools, delegation) = match request.workspace_id {
+        None => (None, None, None),
         Some(workspace_id) => {
             let profiles = match state.handler.profiles(workspace_id).await {
                 Ok(profiles) => Some(profiles),
@@ -816,13 +825,16 @@ async fn capabilities(
                 Err(ServerHandlerError::Unavailable | ServerHandlerError::Internal) => None,
                 Err(ServerHandlerError::InvalidRequest(_)) => None,
             };
-            (profiles, tools)
+            // Delegation follows the same rule: absent when it cannot load.
+            let delegation = state.handler.delegation(workspace_id).await.ok();
+            (profiles, tools, delegation)
         }
     };
     Json(server_capabilities(
         &state.connection,
         profiles,
         workspace_tools,
+        delegation,
     ))
     .into_response()
 }
@@ -834,6 +846,7 @@ fn server_capabilities(
     connection: &ServerConnection,
     profiles: Option<Vec<AgentProfileSummary>>,
     workspace_tools: Option<WorkspaceToolCapabilities>,
+    delegation: Option<DelegationRoster>,
 ) -> ServerCapabilities {
     ServerCapabilities {
         version: CAPABILITIES_VERSION,
@@ -897,6 +910,11 @@ fn server_capabilities(
             max_event_bytes: MAX_EVENT_BYTES as u64,
             retention_bounded: false,
         },
+        delegation: delegation.map(|roster| DelegationCapabilities {
+            roster,
+            max_roster_entries: qq_core::MAX_DELEGATION_ROSTER,
+            max_depth_ceiling: qq_core::MAX_CHILD_DEPTH_CEILING,
+        }),
     }
 }
 
