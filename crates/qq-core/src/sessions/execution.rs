@@ -193,11 +193,12 @@ async fn prepare_execution(
             });
         }
         // A run may delegate while its depth is below the roster's effective
-        // maximum (itself capped at the runtime ceiling). Only depth-one
-        // children may hold write authority, so deeper spawners never offer
-        // it; grandchildren are read-only by construction.
+        // maximum (itself capped at the runtime ceiling; zero disables
+        // delegation for the whole tree). Only depth-one children may hold
+        // write authority, so deeper spawners never offer it; grandchildren
+        // are read-only by construction.
         let delegation = &loaded.plan.descriptor().delegation;
-        let effective_depth = delegation.max_depth.clamp(1, MAX_CHILD_DEPTH);
+        let effective_depth = delegation.max_depth.min(MAX_CHILD_DEPTH);
         let spawner = if claimed.depth < effective_depth {
             Some(Arc::new(
                 SessionSubagentSpawner::new(Arc::clone(inner), claimed.clone())

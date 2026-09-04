@@ -1,0 +1,6 @@
+// A0: the root never delegates. Control arm for every delegation comparison.
+(
+    version: 1,
+    delegation: (roster: [], max_depth: 0),
+    audit: (mode: off),
+)

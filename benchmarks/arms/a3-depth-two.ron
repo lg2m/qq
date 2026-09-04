@@ -1,0 +1,15 @@
+// A3: A2 plus one more level of nesting. Children may delegate to
+// grandchildren; grandchildren are read-only and cannot spawn.
+(
+    version: 1,
+    delegation: (
+        roster: [
+            (route: "PROVIDER/FAST", role: fast, note: "lookups, breadth"),
+            (route: "PROVIDER/PRIMARY", role: balanced),
+        ],
+        default_role: fast,
+        max_depth: 2,
+        write_children: false,
+    ),
+    audit: (mode: off),
+)

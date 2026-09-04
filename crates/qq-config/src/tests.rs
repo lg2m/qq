@@ -372,10 +372,14 @@ fn delegation_roster_layers_validates_and_falls_back_to_worker_model_sugar() {
         load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: fast)], max_depth: 4))"#),
         ConfigError::InvalidDelegation(message) if message.contains("max_depth")
     ));
-    assert!(matches!(
-        load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: fast)], max_depth: 0))"#),
-        ConfigError::InvalidDelegation(message) if message.contains("max_depth")
-    ));
+    // Zero is the "never delegate" control arm, not an error.
+    let disabled = tree
+        .loader()
+        .load(&tree.request().with_explicit_content(
+            r#"(version: 1, delegation: (roster: [(route: "openai/a", role: fast)], default_role: fast, max_depth: 0))"#,
+        ))
+        .unwrap();
+    assert_eq!(disabled.delegation().max_depth(), 0);
     assert!(matches!(
         load(r#"(version: 1, delegation: (roster: [(route: "openai/a", role: warp)]))"#),
         ConfigError::Parse { .. }
@@ -440,6 +444,53 @@ fn audit_settings_default_to_heuristic_and_validate_revisions() {
     assert!(
         matches!(error, ConfigError::InvalidAudit(message) if message.contains("max_revisions"))
     );
+}
+
+#[test]
+fn every_experiment_arm_overlay_parses_and_validates() {
+    let arms = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/arms");
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, model: "openai/test-model")"#,
+    );
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&arms).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("ron") {
+            continue;
+        }
+        seen += 1;
+        // Placeholders become routes on the configured test providers.
+        let content = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("PROVIDER/PRIMARY", "openai/test-model")
+            .replace("PROVIDER/FAST", "openai/fast")
+            .replace("PROVIDER/STRONG", "anthropic/strong")
+            .replace("PROVIDER/REVIEWER", "anthropic/reviewer");
+        let snapshot = tree
+            .loader()
+            .load(&tree.request().with_explicit_content(&content))
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let name = path.file_stem().unwrap().to_str().unwrap();
+        match name {
+            "a0-no-delegation" => {
+                assert_eq!(snapshot.delegation().max_depth(), 0);
+                assert_eq!(snapshot.audit().mode(), AuditMode::Off);
+            }
+            "a3-depth-two" => assert_eq!(snapshot.delegation().max_depth(), 2),
+            "b1-audit-heuristic" => {
+                assert_eq!(snapshot.audit().mode(), AuditMode::Heuristic);
+                assert_eq!(snapshot.delegation().max_depth(), 0);
+            }
+            "c1-write-children" => {
+                assert!(snapshot.delegation().write_children());
+                assert!(snapshot.reviewer_model().is_some());
+            }
+            _ => assert_eq!(snapshot.audit().mode(), AuditMode::Off),
+        }
+    }
+    assert_eq!(seen, 6, "six arm overlays are documented");
 }
 
 #[test]

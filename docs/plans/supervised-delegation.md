@@ -1,7 +1,8 @@
 # Supervised Delegation, Continuation, And Audit
 
-Status: proposed 2026-09-03. D1–D5 and D6a implemented 2026-09-03; D6b (paid
-paired runs) not started. This plan is a companion to
+Status: proposed 2026-09-03. D1–D5 and D6a implemented 2026-09-03; the D6b
+arm overlays and runbook are in `benchmarks/arms/`; the paid paired runs and
+the default decisions they feed have not been made. This plan is a companion to
 [`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md)
 and requires the amendments listed in [Amendments](#amendments-to-existing-plans)
 before D4 or D5 may land.
@@ -429,41 +430,66 @@ is read-only and cannot spawn; cancellation during audit settles both runs.
 
 ### D6 — Paired Evaluation
 
-Owner: `xtask`, `benchmarks/harbor`, `qq-protocol`.
+Owner: `xtask`, `benchmarks/harbor`, `benchmarks/arms`, `qq-protocol`.
 
-- `cargo xtask eval compare --baseline JOB --candidate JOB` computes
-  per-task paired pass outcomes, McNemar on discordant pairs, a bootstrap CI
-  on the dollars-per-pass ratio, and the full scorecard delta. It requires
-  identical model route, task set, seeds, timeout, and machine class and
-  tolerates a differing `arm` field.
-- `QQ_EVAL_ARM` stamps `BaselineIdentity.arm`; arms are expressed through
-  `QQ_*` configuration passthrough (roster, `max_depth`, `write_children`,
-  `audit.mode`, `spawn_agent` exposure).
-- `TokenUsage.reasoning_tokens` is added (additive) so reasoning-heavy arms
-  are costed truthfully.
-- The report surfaces per-trial child count, subtree cost, reviewer cost,
-  audit cost and verdict, continuation count, and truncation failures.
-- Deterministic pre-checks with scripted providers assert every arm's events,
-  accounting, and ATIF conversion before any paid run.
+D6a (done) built the instrument; D6b is the paid measurement and the default
+decisions it feeds. Nothing in D6b is code: the remaining work is operator
+time, credentials, and spend on a host with Python and Harbor 0.20.0.
 
-Arms on a stratified 30–40 task subset, three seeds, identical model and
-limits:
+Instrument (D6a, done):
 
-| Arm | Change | Question |
-| --- | --- | --- |
-| A0 | no `spawn_agent` | baseline |
-| A1 | read children, same model | does orchestration alone help |
-| A2 | read children, `Fast` worker | does cheap breadth lower $/pass |
-| A3 | A2 plus `max_depth = 2` | does recursion add anything |
-| B1 | A0 plus `audit: Heuristic` | does audit raise pass rate; at what cost |
-| C1 | A2 plus `write_children` | do supervised writers finish more tasks |
-| T1 | A0 with D1 on versus off, long-output tasks | continuation effect |
+- `cargo xtask eval compare --baseline JOB --candidate JOB`: per-task paired
+  pass outcomes, an exact two-sided McNemar on discordant pairs, a seeded
+  percentile bootstrap on the dollars-per-pass ratio, and the scorecard delta.
+  Refuses jobs that differ in model route, organization, output limit, context
+  window, approval, run limits, prompt version, instruction hash, workspace
+  identity, machine class, or Harbor configuration, and arms sharing a label;
+  tolerates and lists the arm label, QQ version and revision, system-prompt
+  and tool-schema hashes, and guidance.
+- `eval run --arm LABEL` stamps `QQ_EVAL_ARM` on every trial record; arm
+  configuration travels as `QQ_CONFIG_CONTENT` through the Harbor adapter.
+- `TokenUsage.reasoning_tokens` costs reasoning-heavy arms truthfully.
+- Per-trial rows carry cost, tokens, wall time, reasoning tokens, child count,
+  continuation count, and the truncated-failure flag.
+- `delegation.max_depth: 0` is the A0 control: the root itself is never
+  offered `spawn_agent`.
+- `benchmarks/arms/*.ron` are the six arm overlays, validated by a
+  configuration test; `benchmarks/arms/README.md` is the runbook.
 
-Gates: delegation defaults per task class follow R7 (≥20% lower $/pass, no
-meaningful pass loss). Audit stays default `Heuristic` only if pass rate rises
-meaningfully or $/pass falls; otherwise default `Off`. Depth above one stays
-opt-in unless A3 beats A2. Continuation is a correctness fix and needs no
-gate beyond T1 showing no pass-rate loss.
+D6b runbook (not started; requires spend):
+
+1. Choose the task subset: 30–40 Terminal-Bench 2 tasks stratified by shape
+   (breadth-heavy research, depth-heavy implementation, long-output), plus a
+   long-output subset for T1. Record the exact `--include-task-name` list in
+   `benchmarks/arms/README.md` so every arm uses it verbatim.
+2. Fill the `PROVIDER/...` placeholders in each overlay with authenticated
+   routes; the primary route must equal `--model` on every arm.
+3. Run the deterministic pre-checks listed in the runbook (scripted-provider
+   tests for every arm's events, accounting, and ATIF conversion). They cost
+   nothing and must pass before the first paid trial.
+4. Run A0, A1, A2, A3, B1, and C1 with `--n-attempts 3` (the three seeds),
+   identical `--timeout-seconds`, `--max-turns`, `--max-cost-usd`, and
+   `--machine-class`, one job per arm. Classify every non-passing trial.
+5. Run T1 as two jobs on the long-output subset: the commit before `e074f89`
+   and `main`, both arm A0. `compare` tolerates the revision difference.
+6. Compare each arm against A0 (and A3 against A2) and record the JSON
+   outputs under `benchmarks/arms/results/`.
+7. Apply the gates below by editing defaults and this plan's status, then
+   record the receipts in `terminal-bench-readiness.md` R7.
+
+Gates: delegation defaults per task class follow R7 — the candidate's
+`cost_per_pass_ratio_ci95_high` below 0.80 with no meaningful pass-rate loss
+(`delta.pass_rate` not below zero beyond `mcnemar_p_value` noise). Audit stays
+the configured default `heuristic` only if B1 raises pass rate meaningfully or
+lowers dollars per pass; otherwise `AuditConfig::default()` flips to `off` and
+the readiness guardrail amendment is retired. Depth above one stays opt-in
+unless A3 beats A2 on the same gate. Continuation is a correctness fix and
+needs no gate beyond T1 showing no pass-rate loss.
+
+Not measured yet, and honestly uncertain: whether any delegation arm beats A0
+at all. Published results favor breadth-shaped work at several times the
+token cost and penalize depth-shaped work; the stratified subset exists so the
+answer can differ per task class rather than average to nothing.
 
 ## Sequence
 
@@ -476,7 +502,7 @@ gate beyond T1 showing no pass-rate loss.
 | D4a supervised write children at depth one | D2, D3, amendments | done |
 | D4b configurable depth to three | D4a | done; schema 23 |
 | D5 audit | D4a (audit child reuses supervised machinery) | done; schema 24 |
-| D6b paired runs and gate decisions | all | flips defaults |
+| D6b paired runs and gate decisions | all | not started: needs spend; runbook in `benchmarks/arms/README.md` |
 
 D1, D2, and D6a are independent and may proceed in parallel worktrees.
 

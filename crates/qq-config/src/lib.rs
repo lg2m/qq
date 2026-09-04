@@ -1417,7 +1417,8 @@ pub const MAX_PROFILE_NAME_BYTES: usize = 64;
 /// schema and the prompt line that advertises the roster.
 pub const MAX_DELEGATION_ROSTER: usize = 8;
 /// Deepest sub-agent nesting a configuration may request. The runtime's own
-/// ceiling is the same; a larger value is a configuration error.
+/// ceiling is the same; a larger value is a configuration error. Zero
+/// disables delegation: no run is offered `spawn_agent`.
 pub const MAX_DELEGATION_DEPTH: u16 = 3;
 /// Longest operator note on a roster entry, in bytes.
 pub const MAX_DELEGATION_NOTE_BYTES: usize = 120;

@@ -1777,10 +1777,14 @@ impl MergeState {
                         note,
                     });
                 }
+                // `max_depth: 0` disables delegation entirely: no run receives
+                // `spawn_agent`. It is the control arm of every delegation
+                // experiment, so it is a real setting rather than a roster-less
+                // workaround.
                 let max_depth = patch.max_depth.unwrap_or(1);
-                if max_depth == 0 || max_depth > MAX_DELEGATION_DEPTH {
+                if max_depth > MAX_DELEGATION_DEPTH {
                     return Err(ConfigError::InvalidDelegation(format!(
-                        "max_depth must be between 1 and {MAX_DELEGATION_DEPTH}, found {max_depth}"
+                        "max_depth must be at most {MAX_DELEGATION_DEPTH}, found {max_depth}"
                     )));
                 }
                 let default_role = patch.default_role.unwrap_or(DelegationRole::Balanced);

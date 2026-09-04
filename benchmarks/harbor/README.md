@@ -141,7 +141,8 @@ cargo xtask eval compare \
 ```
 
 `--arm` sets `QQ_EVAL_ARM`, which `qq run` stamps on the trial record; it never
-changes behavior. `compare` refuses jobs that differ in model route,
+changes behavior. Ready-made overlays for the delegation experiment live in
+`benchmarks/arms/` with their own runbook. `compare` refuses jobs that differ in model route,
 organization, output-token limit, context window, approval policy, run limits,
 prompt version, instruction hash, workspace identity, machine class, or Harbor
 configuration, and jobs whose arms carry the same label. It tolerates — and

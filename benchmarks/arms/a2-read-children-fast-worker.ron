@@ -1,0 +1,14 @@
+// A2: read-only children on a cheap, fast worker. The R7 economics question.
+(
+    version: 1,
+    delegation: (
+        roster: [
+            (route: "PROVIDER/FAST", role: fast, note: "lookups, breadth"),
+            (route: "PROVIDER/PRIMARY", role: balanced),
+        ],
+        default_role: fast,
+        max_depth: 1,
+        write_children: false,
+    ),
+    audit: (mode: off),
+)

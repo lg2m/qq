@@ -1,0 +1,12 @@
+// B1: A0 plus the heuristic final-answer audit. The auditor runs at the
+// strong role; declare a route for it or the audit falls back to the root's
+// own model. Compared against A0.
+(
+    version: 1,
+    delegation: (
+        roster: [(route: "PROVIDER/STRONG", role: strong, note: "auditor")],
+        default_role: strong,
+        max_depth: 0,
+    ),
+    audit: (mode: heuristic, max_revisions: 1, role: strong),
+)

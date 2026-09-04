@@ -28232,6 +28232,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_depth_zero_disables_delegation_for_the_root_itself() {
+        // The A0 control arm: the root is never offered spawn_agent, and a
+        // guessed call is refused at dispatch without creating a child.
+        let root_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&root_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"survey","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = depth_harness(
+            vec![("test/child", Arc::new(StaticTextProvider))],
+            vec![parent],
+            0,
+            8,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "go").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        assert!(!observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::SessionCreated { session } if session.parent_id.is_some()
+        )));
+        let requests = root_requests.lock().unwrap().clone();
+        assert!(
+            !requests[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "spawn_agent")
+        );
+        assert!(matches!(
+            requests[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("deepest delegation level")
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
     async fn a_tree_is_capped_at_the_descendant_limit() {
         // Each child spawns as many grandchildren as the per-run cap allows;
         // the tree still stops at MAX_DESCENDANTS_PER_ROOT sessions total.

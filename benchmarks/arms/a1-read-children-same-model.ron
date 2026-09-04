@@ -1,0 +1,13 @@
+// A1: read-only children on the same model as the root. Isolates the effect
+// of orchestration from the effect of a cheaper worker.
+// PROVIDER/PRIMARY must equal the --model route passed to `eval run`.
+(
+    version: 1,
+    delegation: (
+        roster: [(route: "PROVIDER/PRIMARY", role: balanced)],
+        default_role: balanced,
+        max_depth: 1,
+        write_children: false,
+    ),
+    audit: (mode: off),
+)
