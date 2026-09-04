@@ -89,6 +89,7 @@ fn spawn_error_with_spend(content: impl Into<String>, spend: SpawnAgentSpend) ->
         content: content.into(),
         is_error: true,
         spend,
+        session_id: None,
     }
 }
 
@@ -114,6 +115,7 @@ pub(super) async fn spawn_child_run(
         model,
         authority,
         limits: child_limits,
+        purpose,
     } = request;
     // Authority attenuates strictly: a read child is ReadOnly; a write child
     // is Supervised and needs both the roster's permission and a reviewer to
@@ -225,7 +227,17 @@ pub(super) async fn spawn_child_run(
     }
     let created = match inner
         .store
-        .create_child_run(&parent, call_id, selection, task, child_limits, child_mode)
+        .create_child_run(
+            &parent,
+            call_id,
+            ChildAdmission {
+                model: selection,
+                task,
+                limits: child_limits,
+                approval_mode: child_mode,
+                purpose,
+            },
+        )
         .await
     {
         Ok(created) => created,
@@ -236,7 +248,7 @@ pub(super) async fn spawn_child_run(
         }
     };
     let CreatedChildRun {
-        session_id: _session_id,
+        session_id: child_session_id,
         run_id,
         committed_through,
     } = created;
@@ -277,8 +289,9 @@ pub(super) async fn spawn_child_run(
     };
     guard.disarm();
     // Every settled child charges its real spend to the parent, whatever
-    // its outcome; the parent's budgets must see failed work too.
-    match outcome {
+    // its outcome; the parent's budgets must see failed work too. Every
+    // settled child also names its session so callers can point at it.
+    let mut settled = match outcome {
         RunOutcome::Completed => match inner.store.run_final_text(run_id).await {
             Ok(text) if text.trim().is_empty() => {
                 spawn_error_with_spend("the sub-agent completed without producing any text", spend)
@@ -287,6 +300,7 @@ pub(super) async fn spawn_child_run(
                 content: text,
                 is_error: false,
                 spend,
+                session_id: None,
             },
             Err(error) => spawn_error_with_spend(
                 format!("the sub-agent answer could not be read: {error}"),
@@ -308,7 +322,9 @@ pub(super) async fn spawn_child_run(
             format!("the sub-agent run failed: {}", failure.message),
             spend,
         ),
-    }
+    };
+    settled.session_id = Some(child_session_id);
+    settled
 }
 
 /// Cancels a still-running child run when the spawn future awaiting it is
@@ -408,3 +424,146 @@ impl HistorySearcher for SessionHistorySearcher {
 }
 
 const HISTORY_SEARCH_RETRIES: usize = 64;
+
+/// Audits a root run's candidate answer by spawning a read-only child marked
+/// `purpose: audit` at the configured roster role. The child inherits every
+/// bound of an ordinary child (remaining budget, depth, accounting,
+/// cancellation) and its final text is parsed as the verdict. Any failure is
+/// `Unavailable`: the audit never fails the audited run.
+pub(super) struct SessionAuditHook {
+    inner: Arc<SessionRuntimeInner>,
+    parent: ClaimedRun,
+    delegation: qq_protocol::DelegationRoster,
+    /// Audits are one at a time per run and never count against the
+    /// parent's ordinary child slots.
+    slots: Arc<Semaphore>,
+}
+
+impl SessionAuditHook {
+    pub(super) fn new(
+        inner: Arc<SessionRuntimeInner>,
+        parent: ClaimedRun,
+        delegation: qq_protocol::DelegationRoster,
+    ) -> Self {
+        Self {
+            inner,
+            parent,
+            delegation,
+            slots: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
+/// The fixed brief an audit child receives. The auditor verifies claims with
+/// its own read-only tools rather than trusting the run's account.
+const AUDIT_BRIEF_HEADER: &str = "You are auditing another agent's final answer to a user \
+request in this workspace. You have read-only tools. Verify the answer's factual claims \
+against the actual workspace state: open the files it says it changed, run the read-only \
+checks it says it ran, and confirm the request was addressed. Do not redo the task. Reply \
+with exactly one JSON object on one line and nothing else: \
+{\"verdict\":\"pass\"} when the claims hold, or \
+{\"verdict\":\"revise\",\"findings\":[\"...\"]} listing each concrete, verifiable problem \
+(at most 8, one sentence each). Escalate nothing; if you cannot verify, say so as a finding.";
+
+impl crate::runtime::AuditHook for SessionAuditHook {
+    fn audit(&self, request: crate::runtime::AuditRequest) -> crate::runtime::AuditFuture {
+        let inner = Arc::clone(&self.inner);
+        let parent = self.parent.clone();
+        let slots = Arc::clone(&self.slots);
+        let model = self
+            .delegation
+            .route_for_role(request.role)
+            .map(str::to_owned);
+        Box::pin(async move {
+            let mut brief = String::with_capacity(4 * 1024);
+            brief.push_str(AUDIT_BRIEF_HEADER);
+            brief.push_str("\n\nUser request:\n");
+            brief.push_str(&request.prompt);
+            brief.push_str("\n\nThe agent's final answer");
+            if request.revision > 0 {
+                brief.push_str(&format!(" (revision {})", request.revision));
+            }
+            brief.push_str(":\n");
+            brief.push_str(&request.answer);
+            if !request.actions.is_empty() {
+                brief.push_str("\n\nTool calls the agent made, in order:\n");
+                for action in &request.actions {
+                    brief.push_str("- ");
+                    brief.push_str(&action.tool);
+                    if let Some(target) = &action.target {
+                        brief.push(' ');
+                        brief.push_str(target);
+                    }
+                    if action.is_error {
+                        brief.push_str(" (error)");
+                    }
+                    brief.push('\n');
+                }
+            }
+            // The audit child is admitted with the parent's remaining budget
+            // like any child; the parent's meter already accounts for this
+            // spend when the verdict returns.
+            let limits = RunLimits::default();
+            let outcome = spawn_child_run(
+                inner,
+                parent,
+                SpawnBudget {
+                    slots,
+                    write_slot: Arc::new(Semaphore::new(1)),
+                    write_children: false,
+                    spawned: Arc::new(AtomicUsize::new(0)),
+                    max_children: 1,
+                },
+                SpawnRequest {
+                    call_id: ToolCallId::from_bytes([0xAD; 16]),
+                    task: brief,
+                    model,
+                    authority: ChildAuthority::Read,
+                    limits,
+                    purpose: SessionPurpose::Audit,
+                },
+            )
+            .await;
+            let mut verdict = crate::runtime::AuditVerdict {
+                outcome: AuditOutcome::Unavailable,
+                findings: Vec::new(),
+                usage: outcome.spend.usage,
+                cost_usd_nanos: outcome.spend.cost_usd_nanos,
+                audit_session: outcome.session_id,
+            };
+            if outcome.is_error {
+                return verdict;
+            }
+            #[derive(serde::Deserialize)]
+            struct Reply {
+                verdict: String,
+                #[serde(default)]
+                findings: Vec<String>,
+            }
+            let Ok(reply) = serde_json::from_str::<Reply>(outcome.content.trim()) else {
+                return verdict;
+            };
+            match reply.verdict.as_str() {
+                "pass" => verdict.outcome = AuditOutcome::Pass,
+                "revise" => {
+                    verdict.outcome = AuditOutcome::Revised;
+                    verdict.findings = reply
+                        .findings
+                        .into_iter()
+                        .map(|finding| {
+                            truncate_utf8(finding, crate::runtime::MAX_AUDIT_FINDING_BYTES)
+                        })
+                        .filter(|finding| !finding.trim().is_empty())
+                        .take(crate::runtime::MAX_AUDIT_FINDINGS)
+                        .collect();
+                    if verdict.findings.is_empty() {
+                        // A revise with nothing to fix is not actionable.
+                        verdict.outcome = AuditOutcome::Pass;
+                    }
+                }
+                _ => {}
+            }
+            verdict
+        })
+    }
+}

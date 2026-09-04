@@ -199,6 +199,8 @@ enum TrialRecord<'a> {
         estimated_cost_usd_nanos: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt_identity: Option<&'a RunPromptIdentity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audit: Option<&'a qq_protocol::AuditRecord>,
     },
 }
 
@@ -335,6 +337,8 @@ struct RunEnd {
     usage: Option<TokenUsage>,
     estimated_cost_usd_nanos: Option<u64>,
     prompt_identity: Option<Box<RunPromptIdentity>>,
+    /// How the final answer was audited, when it was.
+    audit: Option<Box<qq_protocol::AuditRecord>>,
     /// Accumulated text of the last assistant message: the final answer.
     answer: String,
 }
@@ -347,6 +351,7 @@ impl RunEnd {
             usage: None,
             estimated_cost_usd_nanos: None,
             prompt_identity: None,
+            audit: None,
             answer: String::new(),
         }
     }
@@ -435,6 +440,7 @@ pub async fn run(
         usage: end.usage,
         estimated_cost_usd_nanos: end.estimated_cost_usd_nanos,
         prompt_identity: end.prompt_identity.as_deref(),
+        audit: end.audit.as_deref(),
     };
     if let Err(error) = sink.record(stdout, &outcome).and_then(|()| sink.finish()) {
         let _ = writeln!(stderr, "error: could not write the outcome record: {error}");
@@ -787,13 +793,15 @@ async fn stream_run(
                         {
                             let _ = writeln!(stderr, "[run] {}", status.as_str());
                         }
-                        let prompt_identity = run_prompt_identity(sessions, handle).await?;
+                        let (prompt_identity, audit) =
+                            run_prompt_identity(sessions, handle).await?;
                         return Ok(RunEnd {
                             status,
                             message,
                             usage,
                             estimated_cost_usd_nanos: cost,
                             prompt_identity,
+                            audit,
                             answer,
                         });
                     }
@@ -837,7 +845,13 @@ fn workspace_identity(workspace: &Path) -> String {
 async fn run_prompt_identity(
     sessions: &SessionRuntime,
     handle: &RunHandle,
-) -> Result<Option<Box<RunPromptIdentity>>, Failure> {
+) -> Result<
+    (
+        Option<Box<RunPromptIdentity>>,
+        Option<Box<qq_protocol::AuditRecord>>,
+    ),
+    Failure,
+> {
     let snapshot = sessions
         .snapshot(SnapshotRequest {
             workspace_id: handle.workspace_id,
@@ -854,7 +868,7 @@ async fn run_prompt_identity(
     snapshot
         .focused
         .and_then(|session| session.runs.into_iter().find(|run| run.id == handle.run_id))
-        .map(|run| run.prompt_identity)
+        .map(|run| (run.prompt_identity, run.audit))
         .ok_or_else(|| Failure::harness("the terminal run is missing from its session snapshot"))
 }
 

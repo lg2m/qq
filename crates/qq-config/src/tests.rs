@@ -396,6 +396,53 @@ fn delegation_roster_layers_validates_and_falls_back_to_worker_model_sugar() {
 }
 
 #[test]
+fn audit_settings_default_to_heuristic_and_validate_revisions() {
+    let tree = TempTree::new();
+    let bare = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(bare.audit().mode(), AuditMode::Heuristic);
+    assert_eq!(bare.audit().max_revisions(), 1);
+    assert_eq!(bare.audit().role(), DelegationRole::Strong);
+    assert!(bare.provenance().audit().is_none());
+
+    let declared = tree
+        .loader()
+        .load(&tree.request().with_explicit_content(
+            r#"(version: 1, audit: (mode: always, max_revisions: 2, role: fast))"#,
+        ))
+        .unwrap();
+    assert_eq!(declared.audit().mode(), AuditMode::Always);
+    assert_eq!(declared.audit().max_revisions(), 2);
+    assert_eq!(declared.audit().role(), DelegationRole::Fast);
+    assert_eq!(
+        declared.provenance().audit().unwrap().kind(),
+        SourceKind::Inline
+    );
+
+    let off = tree
+        .loader()
+        .load(
+            &tree
+                .request()
+                .with_explicit_content(r#"(version: 1, audit: (mode: off))"#),
+        )
+        .unwrap();
+    assert_eq!(off.audit().mode(), AuditMode::Off);
+    assert_eq!(off.audit().max_revisions(), 1, "other fields keep defaults");
+
+    let error = tree
+        .loader()
+        .load(
+            &tree
+                .request()
+                .with_explicit_content(r#"(version: 1, audit: (max_revisions: 3))"#),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, ConfigError::InvalidAudit(message) if message.contains("max_revisions"))
+    );
+}
+
+#[test]
 fn worker_model_uses_primary_model_route_validation_and_policy() {
     let tree = TempTree::new();
 

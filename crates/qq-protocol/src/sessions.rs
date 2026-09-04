@@ -886,6 +886,9 @@ pub struct SessionSummary {
     /// for summaries produced by older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<SpawnOrigin>,
+    /// Why the session exists; `task` unless it is an audit child.
+    #[serde(default, skip_serializing_if = "SessionPurpose::is_task")]
+    pub purpose: SessionPurpose,
     pub title: String,
     pub status: SessionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -968,6 +971,68 @@ pub struct RunSnapshot {
     /// runs submitted without limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Box<RunLimits>>,
+    /// How the final answer was audited, when the run was audited at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<Box<AuditRecord>>,
+}
+
+/// How the root run's final answer was audited before it was presented as
+/// complete. Advisory: the audit can send the run back for one revision but
+/// never fails it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRecord {
+    pub outcome: AuditOutcome,
+    /// The auditor's findings, bounded; empty on `pass` or `unavailable`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<String>,
+    /// How many revision cycles the audit sent the run through (0 or 1 with
+    /// the default `max_revisions`).
+    #[serde(default)]
+    pub revisions: u16,
+    /// The audit child run's usage and cost, charged to the audited run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd_nanos: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    /// The auditor verified the answer's claims.
+    Pass,
+    /// The auditor found problems; the run revised its answer (once) and the
+    /// revision stands unaudited.
+    Revised,
+    /// The auditor could not answer (failed, timed out, unparseable) and the
+    /// answer stands as given. Fail-open, recorded rather than hidden.
+    Unavailable,
+}
+
+/// Why a session exists, when it is not an ordinary user or delegated task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPurpose {
+    #[default]
+    Task,
+    /// A read-only child spawned to audit its parent's final answer.
+    Audit,
+}
+
+impl SessionPurpose {
+    #[must_use]
+    pub const fn is_task(&self) -> bool {
+        matches!(self, Self::Task)
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Audit => "audit",
+        }
+    }
 }
 
 /// Version of the provider-neutral system prompt prepared for a run.
@@ -1428,6 +1493,19 @@ pub enum SessionEvent {
         run_id: RunId,
         turn_ordinal: u16,
         continuation: u16,
+    },
+    /// The run's candidate final answer is being audited by a read-only
+    /// child before it is presented as complete. `audit_session_id` is that
+    /// child; its transcript is the audit.
+    RunAuditStarted {
+        run_id: RunId,
+        audit_session_id: SessionId,
+    },
+    /// The audit settled and its record is durable on the run. On `revised`
+    /// the run continues with the findings; otherwise it completes.
+    RunAuditCompleted {
+        run_id: RunId,
+        audit: AuditRecord,
     },
     /// Replaceable liveness information for an active run. This describes
     /// harness/provider state, not assistant transcript content.
@@ -2140,6 +2218,7 @@ mod tests {
             session: SessionSummary {
                 activity: None,
                 spawned_by: None,
+                purpose: SessionPurpose::Task,
                 id: session_id,
                 workspace_id: id(2),
                 parent_id: None,
@@ -2197,6 +2276,7 @@ mod tests {
             session: SessionSummary {
                 activity: None,
                 spawned_by: None,
+                purpose: SessionPurpose::Task,
                 id: session_id,
                 workspace_id: id(2),
                 parent_id: None,
@@ -2253,6 +2333,7 @@ mod tests {
             session: SessionSummary {
                 activity: None,
                 spawned_by: None,
+                purpose: SessionPurpose::Task,
                 id: session_id,
                 workspace_id,
                 parent_id: None,
@@ -2480,6 +2561,7 @@ mod tests {
             session: SessionSummary {
                 activity: None,
                 spawned_by: None,
+                purpose: SessionPurpose::Task,
                 id: id(3),
                 workspace_id: id(2),
                 parent_id: None,
@@ -2587,6 +2669,7 @@ mod tests {
                 max_model_turns: Some(12),
                 ..RunLimits::default()
             })),
+            audit: None,
         };
         let encoded = serde_json::to_value(&run).unwrap();
         assert_eq!(encoded["context_tokens"], 16);
@@ -2640,6 +2723,7 @@ mod tests {
             prompt_identity: None,
             resolved_model: None,
             limits: None,
+            audit: None,
             ..run.clone()
         };
         let encoded = serde_json::to_value(&bare).unwrap();
@@ -2893,6 +2977,7 @@ mod tests {
             "session": serde_json::to_value(SessionSummary {
                 activity: None,
                 spawned_by: None,
+                purpose: SessionPurpose::Task,
                 id: id(3),
                 workspace_id: id(2),
                 parent_id: None,

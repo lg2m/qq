@@ -53,6 +53,7 @@ fn summary() -> SessionSummary {
         workspace_id: WorkspaceId::from_bytes([2; 16]),
         parent_id: None,
         spawned_by: None,
+        purpose: qq_protocol::SessionPurpose::Task,
         title: "Fix the login redirect".to_owned(),
         status: SessionStatus::Running,
         active_run_id: Some(RunId::from_bytes([4; 16])),
@@ -361,6 +362,7 @@ fn version_16_commands_receipts_events_and_capabilities_match_their_goldens() {
                         max_model_turns: Some(40),
                         ..RunLimits::default()
                     })),
+                    audit: None,
                 }),
                 queue_position: 1,
             },
@@ -472,6 +474,38 @@ fn version_16_commands_receipts_events_and_capabilities_match_their_goldens() {
         ),
     );
     check(
+        "event_run_audit_started",
+        &envelope(
+            23,
+            SessionEvent::RunAuditStarted {
+                run_id,
+                audit_session_id: SessionId::from_bytes([0x33; 16]),
+            },
+        ),
+    );
+    check(
+        "event_run_audit_completed",
+        &envelope(
+            24,
+            SessionEvent::RunAuditCompleted {
+                run_id,
+                audit: qq_protocol::AuditRecord {
+                    outcome: qq_protocol::AuditOutcome::Revised,
+                    findings: vec!["src/auth.rs still redirects to /login".to_owned()],
+                    revisions: 0,
+                    usage: Some(TokenUsage {
+                        input_tokens: 900,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 40,
+                        reasoning_tokens: None,
+                    }),
+                    estimated_cost_usd_nanos: Some(1_200),
+                },
+            },
+        ),
+    );
+    check(
         "event_assistant_message_started_truncated",
         &envelope(
             22,
@@ -509,6 +543,7 @@ fn version_16_commands_receipts_events_and_capabilities_match_their_goldens() {
             context_tokens: Some(1200),
             estimated_cost_usd_nanos: Some(42),
             limits: None,
+            audit: None,
         },
     );
 

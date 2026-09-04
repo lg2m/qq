@@ -119,6 +119,18 @@ pub(crate) enum RuntimeEvent {
         /// a successful edit). Never enters model context.
         display: Option<ToolCallDisplay>,
     },
+    /// The final-answer auditor settled. Emitted before `Completed` (when the
+    /// answer stands) or before the revision turn (when it does not); the
+    /// store persists the record and charges the audit's spend to the run.
+    Audited {
+        outcome: qq_protocol::AuditOutcome,
+        findings: Vec<String>,
+        /// Revisions already spent before this audit (0 for the first).
+        revisions: u16,
+        usage: Option<TokenUsage>,
+        cost_usd_nanos: Option<u64>,
+        audit_session: Option<qq_protocol::SessionId>,
+    },
     /// The approval reviewer answered for one of this run's held calls; its
     /// provider spend is the run's to account for. Emitted before the call
     /// executes or settles as denied.

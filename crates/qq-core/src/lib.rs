@@ -57,7 +57,11 @@ pub use hosts::{
     HostCatalog, HostReadiness, HostShutdownFuture, HostTool, HostToolResult, MCP_TOOL_PREFIX,
     ToolHints,
 };
-pub use runtime::MAX_PENDING_STEERING;
+pub use runtime::{
+    AUDIT_TOOL_CALL_THRESHOLD, AuditMode, AuditPolicy, AuditRequest, AuditVerdict, AuditedAction,
+    MAX_AUDIT_ACTION_BYTES, MAX_AUDIT_ANSWER_BYTES, MAX_AUDIT_FINDING_BYTES, MAX_AUDIT_FINDINGS,
+    MAX_PENDING_STEERING,
+};
 pub use sessions::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, MAX_CHILD_DEPTH,
     MAX_CHILD_DEPTH_CEILING, MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_DELEGATION_ROSTER,
@@ -164,6 +168,70 @@ fn apply_steering(
 /// "no roster and no override": the session layer falls back to the legacy
 /// worker model or the parent's selection. Errors are tool results the model
 /// can act on.
+/// Records one finished tool call for the audit trigger and, when a hook will
+/// read it, the auditor's action summary. Bounded: the summary keeps names
+/// and targets only and stops growing at `MAX_AUDIT_ACTION_BYTES`.
+fn note_audited_action(
+    triggers: &mut runtime::AuditTriggers,
+    actions: &mut Vec<runtime::AuditedAction>,
+    keep_actions: bool,
+    call: &RuntimeToolCall,
+    result: &tools::ToolExecutionResult,
+) {
+    triggers.tool_calls = triggers.tool_calls.saturating_add(1);
+    match approval::classify(&call.name, &call.arguments) {
+        approval::ToolClass::Mutating if !result.is_error => triggers.mutated_files = true,
+        approval::ToolClass::Shell { .. } if !result.is_error => {
+            // Read-only shell (allowlisted VCS reads and the like) does not
+            // by itself make a run worth auditing; anything else does.
+            let read_only = approval::classify(&call.name, &call.arguments);
+            if let approval::ToolClass::Shell { command, .. } = read_only
+                && !approval::read_only_shell_command(&command)
+            {
+                triggers.non_read_shell = true;
+            }
+        }
+        _ => {}
+    }
+    if call.name == tools::SPAWN_AGENT_TOOL && !result.is_error {
+        triggers.spawned_children = true;
+    }
+    if !keep_actions {
+        return;
+    }
+    let target = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()
+        .and_then(|arguments| {
+            arguments
+                .get("path")
+                .or_else(|| arguments.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .map(|target| bounded_text(target, 200))
+        });
+    let bytes: usize = actions
+        .iter()
+        .map(|action| action.tool.len() + action.target.as_ref().map_or(0, String::len) + 8)
+        .sum();
+    if bytes < runtime::MAX_AUDIT_ACTION_BYTES {
+        actions.push(runtime::AuditedAction {
+            tool: call.name.clone(),
+            target,
+            is_error: result.is_error,
+        });
+    }
+}
+
+fn bounded_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &text[..end])
+}
+
 fn resolve_delegation_route(
     delegation: &DelegationRoster,
     model: Option<String>,
@@ -321,6 +389,9 @@ pub(crate) struct RunCapabilities {
     history: Option<Arc<dyn HistorySearcher>>,
     /// Steering input from the session layer. Direct runs have none.
     steering: Option<runtime::SteeringReceiver>,
+    /// Audits the candidate final answer of a root run. Session roots install
+    /// one; children, internal runs, and direct runs have none.
+    audit_hook: Option<Arc<dyn runtime::AuditHook>>,
 }
 
 impl RunCapabilities {
@@ -336,6 +407,7 @@ impl RunCapabilities {
             pricing: None,
             history: None,
             steering: None,
+            audit_hook: None,
         }
     }
 
@@ -379,6 +451,11 @@ impl RunCapabilities {
         self
     }
 
+    pub(crate) fn with_audit_hook(mut self, hook: Arc<dyn runtime::AuditHook>) -> Self {
+        self.audit_hook = Some(hook);
+        self
+    }
+
     /// Installs a spawner on a restricted run: a model-authored child task at a
     /// depth the roster still permits to delegate.
     pub(crate) fn with_spawner(mut self, spawner: Arc<dyn SubagentSpawner>) -> Self {
@@ -409,6 +486,7 @@ impl RunCapabilities {
             pricing: None,
             history: None,
             steering: None,
+            audit_hook: None,
         }
     }
 }
@@ -452,6 +530,8 @@ pub struct Runtime {
     spawn_model_routes: Arc<[String]>,
     /// The roster and bounds `spawn_agent` advertises and resolves through.
     pub(crate) delegation: Arc<DelegationRoster>,
+    /// When a root run's final answer is audited before completion.
+    pub(crate) audit: runtime::AuditPolicy,
     turn_retry: TurnRetryPolicy,
 }
 
@@ -488,6 +568,7 @@ impl Runtime {
             context_cache: Arc::new(ContextCache::default()),
             spawn_model_routes: Arc::from([]),
             delegation: Arc::new(DelegationRoster::default()),
+            audit: runtime::AuditPolicy::default(),
             turn_retry: TurnRetryPolicy::default(),
         })
     }
@@ -590,6 +671,13 @@ impl Runtime {
     #[must_use]
     pub fn with_delegation(mut self, delegation: DelegationRoster) -> Self {
         self.delegation = Arc::new(delegation);
+        self
+    }
+
+    /// Sets when a root run's final answer is audited before completion.
+    #[must_use]
+    pub const fn with_audit(mut self, audit: runtime::AuditPolicy) -> Self {
+        self.audit = audit;
         self
     }
 
@@ -816,6 +904,7 @@ impl plan::CompiledAgentPlan {
                 pricing,
                 history,
                 steering,
+                audit_hook,
             } = capabilities;
             let mut steering = steering;
             let mut handled_interrupt = steering
@@ -1010,6 +1099,22 @@ impl plan::CompiledAgentPlan {
 
             let mut slice_tool_calls = 0_usize;
             let mut output_continuations = 0_u16;
+            // What this run did, for the heuristic audit trigger and the
+            // auditor's action summary. Only roots with a hook keep actions.
+            let mut audit_triggers = runtime::AuditTriggers::default();
+            let mut audit_actions: Vec<runtime::AuditedAction> = Vec::new();
+            let mut audit_revisions = 0_u16;
+            let audit_prompt = messages
+                .iter()
+                .rev()
+                .find(|message| message.role() == Role::User)
+                .and_then(|message| {
+                    message.content().iter().find_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default();
             let mut model_text_bytes = 0_usize;
             let mut continuing_slice = false;
             for turn_ordinal in 1..=u16::MAX {
@@ -1690,6 +1795,65 @@ impl plan::CompiledAgentPlan {
                         }
                         continue;
                     }
+                    // The candidate final answer. A root run whose work meets
+                    // the audit trigger hands it to a read-only auditor before
+                    // completing; a revise verdict continues the loop once
+                    // with the findings, then the revision stands. Budget final
+                    // turns settle above and are never audited.
+                    // The first answer is always audited; a revision is audited
+                    // only while another revision could follow, so the answer
+                    // at the cap stands as given.
+                    if let Some(hook) = &audit_hook
+                        && (audit_revisions == 0
+                            || audit_revisions < plan.runtime.audit.max_revisions)
+                        && audit_triggers.fires(plan.runtime.audit.mode)
+                        && budget.remaining(tokio::time::Instant::now()).is_ok()
+                    {
+                        let answer = assistant
+                            .content()
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let verdict = hook
+                            .audit(runtime::AuditRequest {
+                                prompt: audit_prompt.clone(),
+                                answer: bounded_text(&answer, runtime::MAX_AUDIT_ANSWER_BYTES),
+                                actions: audit_actions.clone(),
+                                role: plan.runtime.audit.role,
+                                revision: audit_revisions,
+                            })
+                            .await;
+                        budget.charge_child(verdict.usage, verdict.cost_usd_nanos);
+                        let revise = verdict.outcome == qq_protocol::AuditOutcome::Revised
+                            && audit_revisions < plan.runtime.audit.max_revisions;
+                        yield RuntimeEvent::Audited {
+                            outcome: verdict.outcome,
+                            findings: verdict.findings.clone(),
+                            revisions: audit_revisions,
+                            usage: verdict.usage,
+                            cost_usd_nanos: verdict.cost_usd_nanos,
+                            audit_session: verdict.audit_session,
+                        };
+                        if revise {
+                            audit_revisions += 1;
+                            irreducible_message_bytes = irreducible_message_bytes
+                                .saturating_add(measure_message(&assistant));
+                            messages.push(assistant);
+                            let mut notice = String::from(runtime::AUDIT_REVISION_NOTICE);
+                            for finding in &verdict.findings {
+                                notice.push_str("\n- ");
+                                notice.push_str(finding);
+                            }
+                            messages.push(Message::user(notice));
+                            irreducible_message_bytes = irreducible_message_bytes
+                                .saturating_add(measure_message(messages.last().expect("just pushed")));
+                            continue;
+                        }
+                    }
                     yield RuntimeEvent::Completed;
                     return;
                 }
@@ -1898,6 +2062,7 @@ impl plan::CompiledAgentPlan {
                                                             model,
                                                             authority: arguments.authority,
                                                             limits,
+                                                            purpose: qq_protocol::SessionPurpose::Task,
                                                         })
                                                         .await;
                                                     child_spend = Some(outcome.spend);
@@ -2064,6 +2229,13 @@ impl plan::CompiledAgentPlan {
                         if let Some(spend) = child_spend {
                             budget.charge_child(spend.usage, spend.cost_usd_nanos);
                         }
+                        note_audited_action(
+                            &mut audit_triggers,
+                            &mut audit_actions,
+                            audit_hook.is_some(),
+                            &call,
+                            &result,
+                        );
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                         let display = (!result.is_error)
                             .then(|| approval::edit_result_display(&call.name, &call.arguments))
@@ -2101,6 +2273,13 @@ impl plan::CompiledAgentPlan {
                         if let Some(spend) = child_spend {
                             budget.charge_child(spend.usage, spend.cost_usd_nanos);
                         }
+                        note_audited_action(
+                            &mut audit_triggers,
+                            &mut audit_actions,
+                            audit_hook.is_some(),
+                            &call,
+                            &result,
+                        );
                         results[usize::from(call.call_ordinal - 1)] = Some(result.clone());
                         yield RuntimeEvent::ToolCallFinished {
                             id: call.id,
@@ -2237,8 +2416,9 @@ fn public_run_stream(mut events: RuntimeStream, context_window: Option<u32>) -> 
                 // Direct runs have no steering channel, so these never fire.
                 | RuntimeEvent::SteeringApplied { .. }
                 | RuntimeEvent::Interrupted { .. }
-                // Direct runs have no reviewer either.
+                // Direct runs have no reviewer or auditor either.
                 | RuntimeEvent::ReviewCharged { .. }
+                | RuntimeEvent::Audited { .. }
                 // Continuation is transparent to the direct stream: the text
                 // keeps flowing and the typed failure names exhaustion.
                 | RuntimeEvent::OutputTruncated { .. } => {}
@@ -5518,6 +5698,7 @@ mod tests {
                 content: "x".repeat(tools::MAX_TOOL_RESULT_BYTES + 1024),
                 is_error: false,
                 spend: SpawnAgentSpend::NONE,
+                session_id: None,
             },
             Arc::clone(&tasks),
         ));
@@ -5591,6 +5772,7 @@ mod tests {
                     content: "child answer".to_owned(),
                     is_error: false,
                     spend: SpawnAgentSpend::NONE,
+                    session_id: None,
                 },
                 Arc::clone(&tasks),
             ));
@@ -5694,6 +5876,7 @@ mod tests {
                         reasoning_tokens: None,
                     }),
                 },
+                session_id: None,
             },
             Arc::new(Mutex::new(Vec::new())),
         ));
@@ -5807,6 +5990,7 @@ mod tests {
                 content: "never runs".to_owned(),
                 is_error: false,
                 spend: SpawnAgentSpend::NONE,
+                session_id: None,
             },
             Arc::new(Mutex::new(Vec::new())),
         ));

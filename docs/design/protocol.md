@@ -111,8 +111,13 @@ runtime commits the partial turn, publishes `run_output_truncated` (turn ordinal
 and 1-based continuation count), and resumes on the next turn, up to
 `LimitCapabilities.max_output_continuations` times before settling with the
 new `provider_output_truncated` failure kind. `MessageSnapshot.truncated` marks
-the assistant message the provider cut. Older clients reject the new event tag
-and failure kind. Golden fixtures moved to
+the assistant message the provider cut. Version 16 also carries the delegation
+and audit work: `SessionSummary.approval_mode` gained `supervised`,
+`SessionSummary.purpose` (`task`|`audit`) and `SpawnOrigin.depth` were added,
+`RunSnapshot.audit` records how a run's final answer was audited, and the
+`run_audit_started` and `run_audit_completed` events were added (see
+[Final-answer audit](#final-answer-audit)). Older clients reject the new event
+tags and failure kind. Golden fixtures moved to
 `crates/qq-protocol/tests/fixtures/v16/`.
 
 Clients and servers must agree on this value.
@@ -1204,6 +1209,8 @@ Every streamed payload is a `SessionEventEnvelope`:
 | `steering_superseded` | `run_id`, `message_id` | Run finished before the steering applied |
 | `run_interrupted` | `run_id`, `turn_ordinal` | An interrupting steer aborted the turn in flight |
 | `run_output_truncated` | `run_id`, `turn_ordinal`, `continuation` | The provider cut the turn at its output token limit; the partial turn is committed and the run resumes on the next turn |
+| `run_audit_started` | `run_id`, `audit_session_id` | A read-only audit child is checking the run's candidate final answer |
+| `run_audit_completed` | `run_id`, `audit` | The audit settled (`pass`, `revised`, or `unavailable`); on `revised` the run continues once with the findings |
 | `assistant_message_started` | `message` | A model turn's message begins streaming |
 | `text_appended` | `message_id`, `channel`, `text` | Output or refusal delta |
 | `model_turn_completed` | `run_id`, `turn_ordinal`, `model`, optional `usage`, optional `estimated_cost_usd_nanos` | A provider inference and its accounting committed |
@@ -1726,3 +1733,36 @@ The current protocol does not define:
 - Partial event patch frames (events are whole JSON objects)
 
 Those features require an explicit protocol revision.
+
+## Final-answer audit
+
+When the configured `audit` section enables it (`mode: heuristic` by default:
+the run mutated a file, ran a non-read shell command, made twelve or more tool
+calls, or spawned a child; `always`; or `off`), a root run's candidate final
+answer is handed to a read-only child session (`purpose: "audit"`) at the
+roster's configured role before the run completes. The child receives the user
+prompt, the answer, and a bounded list of the run's tool calls, verifies the
+answer's claims against the workspace with its own tools, and replies with one
+JSON verdict. `run_audit_started` names the audit session on the parent run
+atomically with its creation; `run_audit_completed` carries the durable
+`AuditRecord`:
+
+```json
+{
+  "outcome": "revised",
+  "findings": ["src/auth.rs still redirects to /login"],
+  "revisions": 0,
+  "usage": { "input_tokens": 900, "cache_read_input_tokens": 0,
+             "cache_write_input_tokens": 0, "output_tokens": 40 },
+  "estimated_cost_usd_nanos": 1200
+}
+```
+
+`pass` completes the run. `revised` sends the run back once (bounded by
+`max_revisions`, at most 2) with the findings as a runtime notice; the revised
+answer stands unaudited when the cap is reached. `unavailable` (the auditor
+failed, was refused, or answered prose) is fail-open: the answer completes and
+the record says so. The audit child's usage and cost are charged to the audited
+run; the latest record is on `RunSnapshot.audit`. Child runs, internal runs,
+budget-final turns, and runs whose remaining budget cannot fund an auditor are
+never audited.

@@ -645,7 +645,23 @@ its `depth` and `root_run_id`; one root's tree is capped at
 `MAX_DESCENDANTS_PER_ROOT` (24) sessions, cancellation and recovery cascade
 over the whole subtree by a bounded recursive query, inclusive accounting sums
 the same subtree, and each depth claims runs from its own permit pool so
-parents awaiting children at any level cannot starve the level below. At dispatch `resolve_delegation_route` applies explicit
+parents awaiting children at any level cannot starve the level below.
+
+A root run's candidate final answer may be audited before it completes. The
+plan carries an `AuditPolicy` (`off`, `heuristic`, or `always`; `heuristic` is
+the configured default and fires on a mutation, a non-read shell command,
+twelve tool calls, or a spawned child). At the completion boundary the loop
+consults an `AuditHook`; the session layer implements it by spawning a
+read-only child with `purpose: audit` at the roster's audit role, whose brief
+is the user prompt, the answer, and a bounded action list, never the
+transcript. The child verifies the claims against the workspace with its own
+tools and answers one JSON verdict. `pass` completes the run; `revise` pushes
+the answer plus the findings as a runtime notice and continues once (bounded by
+`max_revisions`); an auditor that fails, is refused, or answers prose is
+`unavailable` and the answer stands. The record is durable on the run
+(`runs.audit_json`, published as `run_audit_completed`) before the run settles,
+and the child's spend is charged to the audited run. Children, internal runs,
+budget-final turns, and runs that cannot fund an auditor are never audited. At dispatch `resolve_delegation_route` applies explicit
 model, then role, then the roster's default role; without a roster the legacy
 worker/parent fallback and full authenticated route list remain, and the
 session spawner still validates every resolved route against the authenticated

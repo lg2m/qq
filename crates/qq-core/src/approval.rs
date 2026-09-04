@@ -299,6 +299,67 @@ fn shell_class(arguments: &str) -> ToolClass {
     }
 }
 
+/// Whether a shell command is interrogative: a version-control or filesystem
+/// read whose worst outcome is output. Used only by the audit heuristic to
+/// decide whether a run did anything worth checking; it grants nothing.
+pub(crate) fn read_only_shell_command(command: &str) -> bool {
+    const READ_ONLY: &[&str] = &[
+        "git blame",
+        "git diff",
+        "git log",
+        "git show",
+        "git status",
+        "git branch",
+        "git rev-parse",
+        "jj diff",
+        "jj log",
+        "jj op log",
+        "jj show",
+        "jj status",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "find",
+        "grep",
+        "rg",
+        "fd",
+        "tree",
+        "pwd",
+        "echo",
+        "which",
+        "file",
+        "stat",
+        "du",
+        "df",
+        "cargo metadata",
+        "cargo tree",
+        "cargo --version",
+        "rustc --version",
+    ];
+    let command = command.trim();
+    if command.is_empty() {
+        return true;
+    }
+    // Every pipeline segment must be read-only; redirections write.
+    if command.contains('>') {
+        return false;
+    }
+    command
+        .split(['|', ';', '&'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .all(|segment| {
+            READ_ONLY.iter().any(|prefix| {
+                segment == *prefix
+                    || segment
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with(' '))
+            })
+        })
+}
+
 /// Decides whether one classified tool call executes, waits for approval, or
 /// is denied outright under the session's approval mode and recorded grants.
 pub(crate) fn evaluate(

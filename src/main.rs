@@ -544,6 +544,7 @@ fn config_command(
                     "model" => snapshot.provenance().model(),
                     "worker_model" => snapshot.provenance().worker_model(),
                     "delegation" => snapshot.provenance().delegation(),
+                    "audit" => snapshot.provenance().audit(),
                     "max_output_tokens" => snapshot.provenance().max_output_tokens(),
                     _ => field
                         .strip_prefix("pack.")
@@ -631,6 +632,12 @@ fn print_snapshot(snapshot: &config::ConfigSnapshot) {
                 .map_or(String::new(), |note| format!(": {note}"))
         );
     }
+    println!(
+        "audit: mode={} max_revisions={} role={}",
+        snapshot.audit().mode().as_str(),
+        snapshot.audit().max_revisions(),
+        snapshot.audit().role().as_str()
+    );
     println!("max_output_tokens: {}", snapshot.max_output_tokens());
     println!("providers:");
     for (name, provider) in snapshot.providers() {

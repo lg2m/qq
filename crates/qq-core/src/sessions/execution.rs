@@ -2,7 +2,7 @@ use super::*;
 use super::{
     approvals::SessionToolGate,
     runtime::SessionRuntimeInner,
-    subagents::{SessionHistorySearcher, SessionSubagentSpawner},
+    subagents::{SessionAuditHook, SessionHistorySearcher, SessionSubagentSpawner},
 };
 
 /// Denies every tool call. Compaction runs summarize existing context; a
@@ -254,13 +254,26 @@ async fn prepare_execution(
                 return Err(internal_failure("steering registry is poisoned"));
             }
         }
-        base.with_limits(claimed.limits, loaded.resolved_model().pricing.clone())
+        let base = base
+            .with_limits(claimed.limits, loaded.resolved_model().pricing.clone())
             .with_history(Arc::new(SessionHistorySearcher::new(
                 Arc::clone(inner),
                 claimed.session_id,
                 claimed.run_id,
             )))
-            .with_steering(receiver)
+            .with_steering(receiver);
+        // Only user-initiated roots are audited: children answer to their
+        // parent, internal runs to the runtime, and an audit child auditing
+        // itself would recurse.
+        if claimed.depth == 0 && claimed.user_initiated && claimed.purpose == SessionPurpose::Task {
+            base.with_audit_hook(Arc::new(SessionAuditHook::new(
+                Arc::clone(inner),
+                claimed.clone(),
+                loaded.plan.descriptor().delegation.clone(),
+            )))
+        } else {
+            base
+        }
     }
     .with_literal_slash(claimed.literal_slash);
     // The claimed workspace is the plan's workspace: the loader compiled the
@@ -1585,6 +1598,37 @@ async fn execute_started_run(
             // Approval transitions (including denials) are persisted and
             // published by the tool gate before this event is emitted.
             RunInput::Event(Some(RuntimeEvent::ToolCallDenied { .. })) => {}
+            // The audit record is durable on the run before the run settles
+            // or revises; its spend joins the run's accounting.
+            RunInput::Event(Some(RuntimeEvent::Audited {
+                outcome,
+                findings,
+                revisions,
+                usage,
+                cost_usd_nanos,
+                audit_session: _,
+            })) => {
+                accounting.record_review(usage, cost_usd_nanos);
+                let record = AuditRecord {
+                    outcome,
+                    findings,
+                    revisions,
+                    usage,
+                    estimated_cost_usd_nanos: cost_usd_nanos,
+                };
+                match inner.store.record_audit(&claimed, record).await {
+                    Ok(event) => inner.notify(event.cursor),
+                    Err(error) => {
+                        finish_run(
+                            &inner,
+                            &claimed,
+                            persistence_failure("failed to persist the audit record", &error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             // Reviewer spend joins the run's accounting; the next persisted
             // turn or the run's settlement carries the updated totals.
             RunInput::Event(Some(RuntimeEvent::ReviewCharged {

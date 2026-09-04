@@ -55,6 +55,7 @@ pub fn session_summary(id: SessionId) -> SessionSummary {
         workspace_id: WORKSPACE,
         parent_id: None,
         spawned_by: None,
+        purpose: qq_protocol::SessionPurpose::Task,
         title: "Session".to_owned(),
         status: SessionStatus::Idle,
         active_run_id: None,
@@ -124,6 +125,7 @@ pub fn run(id: RunId, session_id: SessionId, status: RunStatus) -> RunSnapshot {
         context_tokens: None,
         estimated_cost_usd_nanos: None,
         limits: None,
+        audit: None,
     }
 }
 

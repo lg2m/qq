@@ -17,15 +17,15 @@ use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use qq_protocol::{
     AccountingTotal, AgentProfileId, ApprovalDecision, ApprovalGrant, ApprovalMode,
-    ApprovalResolution, CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, ContentHash,
-    Correlation, EditPreview, EventCursor, InputPart, MessageId, MessageRole, MessageSnapshot,
-    MessageState, ModelPricing, ModelSelection, ReasoningEvent, ResolvedModel, RunActivity,
-    RunFailure, RunFailureKind, RunId, RunLimits, RunOutcome, RunPlanIdentity, RunPromptIdentity,
-    RunSnapshot, RunStatus, SessionAccounting, SessionCommand, SessionEvent, SessionEventEnvelope,
-    SessionId, SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview,
-    SnapshotRequest, SpawnOrigin, StoreId, SubscribeRequest, TextChannel, TokenUsage,
-    ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState, WorkspaceGrantOutcome,
-    WorkspaceId, WorkspaceSnapshot, WorkspaceSummary, validate_input,
+    ApprovalResolution, AuditOutcome, AuditRecord, CapabilitySupport, CommandId, CommandOutcome,
+    CommandReceipt, ContentHash, Correlation, EditPreview, EventCursor, InputPart, MessageId,
+    MessageRole, MessageSnapshot, MessageState, ModelPricing, ModelSelection, ReasoningEvent,
+    ResolvedModel, RunActivity, RunFailure, RunFailureKind, RunId, RunLimits, RunOutcome,
+    RunPlanIdentity, RunPromptIdentity, RunSnapshot, RunStatus, SessionAccounting, SessionCommand,
+    SessionEvent, SessionEventEnvelope, SessionId, SessionPurpose, SessionSnapshot, SessionStatus,
+    SessionSummary, ShellCommandPreview, SnapshotRequest, SpawnOrigin, StoreId, SubscribeRequest,
+    TextChannel, TokenUsage, ToolCallDisplay, ToolCallId, ToolCallSnapshot, ToolCallState,
+    WorkspaceGrantOutcome, WorkspaceId, WorkspaceSnapshot, WorkspaceSummary, validate_input,
 };
 use qq_provider::{ContentBlock, Message, Role};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -326,6 +326,8 @@ struct ClaimedRun {
     /// The root run whose delegation tree this run belongs to; the run itself
     /// for a root. Descendant caps and cascades key on it.
     root_run_id: RunId,
+    /// Why the run's session exists; audit children are never audited.
+    purpose: SessionPurpose,
     /// True only when this run's command is present in the durable command
     /// journal. Runtime- and model-created runs use generated command ids but
     /// intentionally have no command row.
@@ -383,6 +385,7 @@ impl ClaimedRun {
             approval_mode: self.approval_mode,
             depth: self.depth,
             root_run_id: self.root_run_id,
+            purpose: self.purpose,
         }
     }
 }
@@ -662,6 +665,16 @@ struct ChildRunParent {
     root_run_id: RunId,
 }
 
+/// What a new child is admitted with: its model, task, remaining budget, and
+/// the authority and purpose its parent granted.
+pub(super) struct ChildAdmission {
+    pub(super) model: ModelSelection,
+    pub(super) task: String,
+    pub(super) limits: RunLimits,
+    pub(super) approval_mode: ApprovalMode,
+    pub(super) purpose: SessionPurpose,
+}
+
 /// Most sessions one root run's delegation tree may hold across every depth.
 /// Bounds fan-out where per-run child caps alone would not (eight children
 /// each spawning eight).
@@ -671,11 +684,15 @@ fn create_child_run(
     connection: &mut Connection,
     store_id: StoreId,
     parent: ChildRunParent,
-    model: ModelSelection,
-    task: String,
-    limits: RunLimits,
-    approval_mode: ApprovalMode,
+    admission: ChildAdmission,
 ) -> Result<CreatedChildRun, SessionRuntimeError> {
+    let ChildAdmission {
+        model,
+        task,
+        limits,
+        approval_mode,
+        purpose,
+    } = admission;
     // Children never hold more than Supervised authority; the spawner decides
     // between ReadOnly and Supervised and nothing else may reach here.
     if !matches!(
@@ -765,8 +782,8 @@ fn create_child_run(
             "INSERT INTO sessions(
                 id, workspace_id, parent_id, owner_run_id, spawned_by_tool_call_id, title,
                 status, queued_prompts, model, max_output_tokens, organization, approval_mode,
-                created_at_ms, updated_at_ms, depth, root_run_id
-             ) VALUES (?1, ?2, ?3, ?4, ?10, ?5, 'queued', 1, ?6, ?7, ?8, ?11, ?9, ?9, ?12, ?13)",
+                created_at_ms, updated_at_ms, depth, root_run_id, purpose
+             ) VALUES (?1, ?2, ?3, ?4, ?10, ?5, 'queued', 1, ?6, ?7, ?8, ?11, ?9, ?9, ?12, ?13, ?14)",
             params![
                 session_id.to_string(),
                 workspace_id.to_string(),
@@ -781,6 +798,7 @@ fn create_child_run(
                 approval_mode_str(approval_mode),
                 depth,
                 root_run_id.to_string(),
+                purpose.as_str(),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -850,6 +868,29 @@ fn create_child_run(
             queue_position: 1,
         },
     )?;
+    // An audit child announces itself on the parent run too, atomically with
+    // its creation, so a client watching the parent learns which session is
+    // the audit before any of its events arrive.
+    let committed_through = if purpose == SessionPurpose::Audit {
+        append_event(
+            &transaction,
+            EventContext {
+                store_id,
+                workspace_id,
+                session_id: parent_session_id,
+                run_id: Some(parent_run_id),
+                caused_by: Some(command_id),
+                occurred_at_ms: now,
+            },
+            SessionEvent::RunAuditStarted {
+                run_id: parent_run_id,
+                audit_session_id: session_id,
+            },
+        )?
+        .cursor
+    } else {
+        queued.cursor
+    };
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -857,7 +898,7 @@ fn create_child_run(
     Ok(CreatedChildRun {
         session_id,
         run_id,
-        committed_through: queued.cursor,
+        committed_through,
     })
 }
 
@@ -2112,7 +2153,8 @@ fn reserve_next_run_recoverable(
                     (SELECT c.request_json FROM commands c WHERE c.id = r.command_id),
                     s.pending_context_overflow_basis_json,
                     s.context_tokens, s.context_occupancy_json, r.limits_json,
-                    r.input_json, s.profile, s.approval_mode, s.depth, s.root_run_id
+                    r.input_json, s.profile, s.approval_mode, s.depth, s.root_run_id,
+                    s.purpose
              FROM runs r
              JOIN sessions s ON s.id = r.session_id
              JOIN workspaces w ON w.id = s.workspace_id
@@ -2150,6 +2192,7 @@ fn reserve_next_run_recoverable(
                     row.get::<_, String>(18)?,
                     row.get::<_, u16>(19)?,
                     row.get::<_, Option<String>>(20)?,
+                    row.get::<_, String>(21)?,
                 ))
             },
         )
@@ -2177,9 +2220,15 @@ fn reserve_next_run_recoverable(
         approval_mode,
         depth,
         root_run,
+        purpose,
     )) = row
     else {
         return Ok(None);
+    };
+    let purpose = match purpose.as_str() {
+        "task" => SessionPurpose::Task,
+        "audit" => SessionPurpose::Audit,
+        _ => return Err(SessionRuntimeError::Persistence),
     };
     let limits = parse_run_limits(limits_json.as_deref())?;
     let input = parse_input_parts(input_json.as_deref())?;
@@ -2340,6 +2389,7 @@ fn reserve_next_run_recoverable(
         approval_mode,
         depth,
         root_run_id,
+        purpose,
     }))
 }
 
@@ -2576,6 +2626,7 @@ fn start_auto_compaction(
             approval_mode: original.approval_mode,
             depth: original.depth,
             root_run_id: original.root_run_id,
+            purpose: original.purpose,
         },
         started,
     )))
@@ -3223,6 +3274,51 @@ fn record_run_interrupted(
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(events)
+}
+
+/// Persists the audit record on the run row and publishes
+/// `run_audit_completed` in one transaction. A later revision's audit
+/// replaces the record; the latest is what `RunSnapshot.audit` shows.
+fn record_run_audit(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    record: AuditRecord,
+) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let audit_json =
+        serde_json::to_string(&record).map_err(|_| SessionRuntimeError::Persistence)?;
+    let updated = transaction
+        .execute(
+            "UPDATE runs SET audit_json = ?2 WHERE id = ?1 AND status = 'running'",
+            params![claimed.run_id.to_string(), audit_json],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if updated != 1 {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::RunAuditCompleted {
+            run_id: claimed.run_id,
+            audit: record,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(event)
 }
 
 /// Persists the continuation counter and publishes `run_output_truncated`
@@ -4955,6 +5051,7 @@ fn settle_panicked_execution(
                 approval_mode: original.approval_mode,
                 depth: original.depth,
                 root_run_id: original.root_run_id,
+                purpose: original.purpose,
             };
             events.push(complete_run_in_transaction(
                 &transaction,
@@ -5338,6 +5435,7 @@ fn recover_interrupted_runs(
             approval_mode: ApprovalMode::default(),
             depth: 0,
             root_run_id: run_id,
+            purpose: SessionPurpose::Task,
         };
         let event =
             complete_run_in_transaction(&transaction, store_id, &claimed, RunOutcome::Interrupted)?;
@@ -5913,7 +6011,7 @@ fn load_session_summary(
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
                       ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1),
                      s.owner_run_id, s.spawned_by_tool_call_id, s.profile, s.correlation_json,
-                     s.approval_mode, s.depth
+                     s.approval_mode, s.depth, s.purpose
               FROM sessions s WHERE s.id = ?1",
             [session_id.to_string()],
             |row| {
@@ -5934,6 +6032,7 @@ fn load_session_summary(
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, String>(14)?,
                     row.get::<_, u16>(15)?,
+                    row.get::<_, String>(16)?,
                 ))
             },
         )
@@ -5958,6 +6057,7 @@ fn load_session_summary(
                 correlation,
                 approval_mode,
                 depth,
+                purpose,
             )| {
                 let direct_cost = accounting.direct.estimated_cost_usd_nanos;
                 let active_run_id: Option<RunId> = active.as_deref().map(parse_id).transpose()?;
@@ -5978,6 +6078,11 @@ fn load_session_summary(
                     workspace_id: parse_id(&workspace)?,
                     parent_id: parent.as_deref().map(parse_id).transpose()?,
                     spawned_by,
+                    purpose: match purpose.as_str() {
+                        "task" => SessionPurpose::Task,
+                        "audit" => SessionPurpose::Audit,
+                        _ => return Err(SessionRuntimeError::Persistence),
+                    },
                     title,
                     status: parse_session_status(&status)?,
                     active_run_id,
@@ -6876,7 +6981,8 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
         .query_row(
             "SELECT session_id, status, outcome_json, prompt_identity_json,
                     resolved_model_json, usage_json, context_tokens,
-                    estimated_cost_usd_nanos, limits_json, plan_identity_json, correlation_json
+                    estimated_cost_usd_nanos, limits_json, plan_identity_json, correlation_json,
+                    audit_json
              FROM runs WHERE id = ?1",
             [run_id.to_string()],
             |row| {
@@ -6892,6 +6998,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
@@ -6909,6 +7016,7 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                 limits,
                 plan_identity,
                 correlation,
+                audit,
             )| {
                 Ok(RunSnapshot {
                     id: run_id,
@@ -6949,6 +7057,12 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
                         let limits = parse_run_limits(limits.as_deref())?;
                         (!limits.is_empty()).then(|| Box::new(limits))
                     },
+                    audit: audit
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRuntimeError::Persistence)?
+                        .map(Box::new),
                 })
             },
         )
@@ -11352,7 +11466,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(
             !connection
@@ -11479,7 +11593,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -11547,7 +11661,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         let (display_json, result) = connection
             .query_row(
@@ -11606,7 +11720,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -11671,7 +11785,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -11759,7 +11873,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -11815,7 +11929,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -11859,7 +11973,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         for column in [
             "model_json",
@@ -11926,7 +12040,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -12000,7 +12114,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         let command_id_not_null: bool = connection
             .query_row(
@@ -12039,7 +12153,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -12109,7 +12223,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -12201,7 +12315,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         let preparing_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12324,7 +12438,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         let occupancy_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12430,7 +12544,7 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                "23"
+                "24"
             );
         }
     }
@@ -12551,7 +12665,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         // A historical child keeps its parent run but has no recorded call:
         // the summary says so explicitly instead of inventing one.
@@ -12638,7 +12752,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         let message = load_message(&connection, message_id).unwrap();
         assert!(!message.truncated);
@@ -12713,7 +12827,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
         let shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12795,7 +12909,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "23"
+            "24"
         );
     }
 
@@ -13831,6 +13945,7 @@ mod tests {
             approval_mode: ApprovalMode::default(),
             depth: 0,
             root_run_id: run_id,
+            purpose: SessionPurpose::Task,
         };
         (
             directory,
@@ -25874,14 +25989,17 @@ mod tests {
                             depth: 0,
                             root_run_id: create_parent.run_id,
                         },
-                        ModelSelection {
-                            model: Some("test/child".to_owned()),
-                            max_output_tokens: Some(256),
-                            organization: None,
+                        ChildAdmission {
+                            model: ModelSelection {
+                                model: Some("test/child".to_owned()),
+                                max_output_tokens: Some(256),
+                                organization: None,
+                            },
+                            task: "queued child task".to_owned(),
+                            limits: RunLimits::default(),
+                            approval_mode: ApprovalMode::ReadOnly,
+                            purpose: SessionPurpose::Task,
                         },
-                        "queued child task".to_owned(),
-                        RunLimits::default(),
-                        ApprovalMode::ReadOnly,
                     );
                     let _ = created_tx.send(result.as_ref().ok().map(|created| {
                         (
@@ -25943,14 +26061,17 @@ mod tests {
             .create_child_run(
                 &cancelling_parent,
                 ToolCallId::from_bytes([0x5a; 16]),
-                ModelSelection {
-                    model: Some("test/child".to_owned()),
-                    max_output_tokens: Some(256),
-                    organization: None,
+                ChildAdmission {
+                    model: ModelSelection {
+                        model: Some("test/child".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    task: "too late".to_owned(),
+                    limits: RunLimits::default(),
+                    approval_mode: ApprovalMode::ReadOnly,
+                    purpose: SessionPurpose::Task,
                 },
-                "too late".to_owned(),
-                RunLimits::default(),
-                ApprovalMode::ReadOnly,
             )
             .await;
         assert!(matches!(rejected, Err(SessionRuntimeError::RunNotFound)));
@@ -25972,14 +26093,17 @@ mod tests {
             .create_child_run(
                 &parent,
                 ToolCallId::from_bytes([0x5a; 16]),
-                ModelSelection {
-                    model: Some("test/child".to_owned()),
-                    max_output_tokens: Some(256),
-                    organization: None,
+                ChildAdmission {
+                    model: ModelSelection {
+                        model: Some("test/child".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    task: "running child task".to_owned(),
+                    limits: RunLimits::default(),
+                    approval_mode: ApprovalMode::ReadOnly,
+                    purpose: SessionPurpose::Task,
                 },
-                "running child task".to_owned(),
-                RunLimits::default(),
-                ApprovalMode::ReadOnly,
             )
             .await
             .unwrap();
@@ -26018,14 +26142,17 @@ mod tests {
             .create_child_run(
                 &parent,
                 ToolCallId::from_bytes([0x5a; 16]),
-                ModelSelection {
-                    model: Some("test/child".to_owned()),
-                    max_output_tokens: Some(256),
-                    organization: None,
+                ChildAdmission {
+                    model: ModelSelection {
+                        model: Some("test/child".to_owned()),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                    task: "queued child task".to_owned(),
+                    limits: RunLimits::default(),
+                    approval_mode: ApprovalMode::ReadOnly,
+                    purpose: SessionPurpose::Task,
                 },
-                "queued child task".to_owned(),
-                RunLimits::default(),
-                ApprovalMode::ReadOnly,
             )
             .await
             .unwrap();
@@ -27091,6 +27218,7 @@ mod tests {
             approval_mode: ApprovalMode::default(),
             depth: 0,
             root_run_id: parent_run,
+            purpose: SessionPurpose::Task,
         };
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),
@@ -27108,6 +27236,7 @@ mod tests {
                 model: None,
                 authority: qq_protocol::ChildAuthority::Read,
                 limits: RunLimits::default(),
+                purpose: SessionPurpose::Task,
             },
         ));
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
@@ -28280,6 +28409,432 @@ mod tests {
         assert!(matches!(
             finished_outcome(&observed, run_id),
             Some(RunOutcome::Cancelled)
+        ));
+    }
+
+    /// `QueueLoader` whose plans audit under the given mode; the roster names
+    /// `test/auditor` as the strong role so the audit child is routable.
+    struct AuditLoader {
+        inner: QueueLoader,
+        mode: crate::runtime::AuditMode,
+        max_revisions: u16,
+    }
+
+    impl RuntimeLoader for AuditLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = self.inner.next_provider(&request);
+            let mode = self.mode;
+            let max_revisions = self.max_revisions;
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime
+                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled())
+                                .with_delegation(qq_protocol::DelegationRoster {
+                                    roster: vec![qq_protocol::DelegationRosterEntry {
+                                        route: "test/auditor".to_owned(),
+                                        role: qq_protocol::DelegationRole::Strong,
+                                        note: None,
+                                        context_window: None,
+                                        max_output_tokens: None,
+                                        relative_cost_permille: None,
+                                    }],
+                                    default_role: qq_protocol::DelegationRole::Strong,
+                                    max_depth: 1,
+                                    write_children: false,
+                                })
+                                .with_audit(crate::runtime::AuditPolicy {
+                                    mode,
+                                    max_revisions,
+                                    role: qq_protocol::DelegationRole::Strong,
+                                }),
+                            &request.workspace,
+                            None,
+                        )
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    /// Answers with a fixed JSON verdict, recording every request.
+    struct VerdictProvider {
+        reply: &'static str,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl Provider for VerdictProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(stream::iter([
+                Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                    text: self.reply.to_owned(),
+                }),
+                Ok(qq_provider::ProviderEvent::Completed {
+                    usage: Some(qq_provider::ProviderUsage {
+                        input_tokens: 50,
+                        cache_read_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 5,
+                        reasoning_tokens: None,
+                    }),
+                }),
+            ]))
+        }
+    }
+
+    async fn audit_harness(
+        parent: Arc<dyn Provider>,
+        auditor: Arc<dyn Provider>,
+        mode: crate::runtime::AuditMode,
+        max_revisions: u16,
+    ) -> SpawnHarness {
+        spawn_harness_with_loader(
+            Arc::new(AuditLoader {
+                inner: QueueLoader {
+                    routed: vec![("test/auditor", auditor)],
+                    queue: StdMutex::new(vec![parent]),
+                },
+                mode,
+                max_revisions,
+            }),
+            8,
+        )
+        .await
+    }
+
+    fn audit_events(
+        observed: &[SessionEventEnvelope],
+        run_id: RunId,
+    ) -> (Option<SessionId>, Vec<AuditRecord>) {
+        let started = observed.iter().find_map(|event| match &event.event {
+            SessionEvent::RunAuditStarted {
+                run_id: audited,
+                audit_session_id,
+            } if *audited == run_id => Some(*audit_session_id),
+            _ => None,
+        });
+        let completed = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::RunAuditCompleted {
+                    run_id: audited,
+                    audit,
+                } if *audited == run_id => Some(audit.clone()),
+                _ => None,
+            })
+            .collect();
+        (started, completed)
+    }
+
+    #[tokio::test]
+    async fn a_mutating_run_is_audited_by_a_read_only_child_and_passes() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "write_file",
+                r#"{"path":"out.txt","content":"hello"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let auditor_requests = Arc::new(StdMutex::new(Vec::new()));
+        let auditor: Arc<dyn Provider> = Arc::new(VerdictProvider {
+            reply: r#"{"verdict":"pass"}"#,
+            requests: Arc::clone(&auditor_requests),
+        });
+        let mut harness =
+            audit_harness(parent, auditor, crate::runtime::AuditMode::Heuristic, 1).await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "write hello").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        let (started, completed) = audit_events(&observed, run_id);
+        let audit_session = started.expect("the audit child announces itself on the parent");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].outcome, AuditOutcome::Pass);
+        assert!(completed[0].findings.is_empty());
+        assert_eq!(completed[0].revisions, 0);
+        assert_eq!(completed[0].usage.map(|usage| usage.input_tokens), Some(50));
+        // The audit child is a read-only session with purpose audit, at the
+        // strong role's route, and its brief carries the prompt, answer, and
+        // actions but not the transcript.
+        let child = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session } if session.id == audit_session => {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(child.purpose, SessionPurpose::Audit);
+        assert_eq!(child.approval_mode, ApprovalMode::ReadOnly);
+        assert_eq!(child.model.as_deref(), Some("test/auditor"));
+        let brief = auditor_requests.lock().unwrap().clone();
+        let text = request_texts(&brief[0]).join("\n");
+        assert!(text.contains("User request:\nwrite hello"));
+        assert!(text.contains("final answer"));
+        assert!(text.contains("- write_file out.txt"));
+        assert!(
+            !brief[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "write_file")
+        );
+        // The parent completed with the audit ordered before RunFinished,
+        // and the snapshot carries the record.
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+        let completed_at = observed
+            .iter()
+            .position(|event| matches!(&event.event, SessionEvent::RunAuditCompleted { run_id: r, .. } if *r == run_id))
+            .unwrap();
+        let finished_at = observed
+            .iter()
+            .position(|event| matches!(&event.event, SessionEvent::RunFinished { run_id: r, .. } if *r == run_id))
+            .unwrap();
+        assert!(completed_at < finished_at);
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest::new(
+                harness.workspace_id,
+                Some(harness.session_id),
+                8,
+                8,
+            ))
+            .await
+            .unwrap();
+        let run = snapshot
+            .focused
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .unwrap();
+        assert_eq!(
+            run.audit.as_deref().map(|audit| audit.outcome),
+            Some(AuditOutcome::Pass)
+        );
+        // The audit child's own run carries its usage; the scripted parent
+        // reports none, so the parent's total is unknown rather than partial.
+        let child_run = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { session, usage, .. } if session.id == audit_session => {
+                    Some(*usage)
+                }
+                _ => None,
+            })
+            .flatten()
+            .expect("the audit child reports usage");
+        assert_eq!(child_run.input_tokens, 50);
+        assert_eq!(run.usage, None);
+        // The parent's own model saw no audit notice.
+        let parent_reqs = parent_requests.lock().unwrap().clone();
+        assert_eq!(parent_reqs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_revise_verdict_sends_the_run_back_once_and_the_revision_stands() {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "write_file",
+                r#"{"path":"out.txt","content":"hello"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let auditor: Arc<dyn Provider> = Arc::new(VerdictProvider {
+            reply: r#"{"verdict":"revise","findings":["out.txt lacks a trailing newline","the answer claims tests ran"]}"#,
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut harness =
+            audit_harness(parent, auditor, crate::runtime::AuditMode::Heuristic, 1).await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "write hello").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        let (_, completed) = audit_events(&observed, run_id);
+        // One audit, one revision; the revised answer is not re-audited when
+        // the cap is reached.
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].outcome, AuditOutcome::Revised);
+        assert_eq!(completed[0].findings.len(), 2);
+        let parent_reqs = parent_requests.lock().unwrap().clone();
+        assert_eq!(parent_reqs.len(), 3, "tool turn, answer, revision");
+        let revision_request = request_texts(&parent_reqs[2]).join("\n");
+        assert!(revision_request.contains("independent read-only audit"));
+        assert!(revision_request.contains("- out.txt lacks a trailing newline"));
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+        // The transcript shows two assistant answers.
+        let turns = observed
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, SessionEvent::ModelTurnCompleted { run_id: r, .. } if *r == run_id)
+            })
+            .count();
+        assert_eq!(turns, 3);
+    }
+
+    #[tokio::test]
+    async fn audit_triggers_and_suppressions_follow_the_heuristic() {
+        // A read-only run under Heuristic is not audited ...
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![("read_file", r#"{"path":"AGENTS.md"}"#.to_owned())],
+            turn: StdMutex::new(0),
+        });
+        let auditor_requests = Arc::new(StdMutex::new(Vec::new()));
+        let auditor: Arc<dyn Provider> = Arc::new(VerdictProvider {
+            reply: r#"{"verdict":"pass"}"#,
+            requests: Arc::clone(&auditor_requests),
+        });
+        let mut harness = audit_harness(
+            parent,
+            Arc::clone(&auditor),
+            crate::runtime::AuditMode::Heuristic,
+            1,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "read").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        assert!(audit_events(&observed, run_id).0.is_none());
+        assert!(auditor_requests.lock().unwrap().is_empty());
+
+        // ... but under Always it is; and Off never audits even a mutation.
+        for (mode, mutate, expect_audit) in [
+            (crate::runtime::AuditMode::Always, false, true),
+            (crate::runtime::AuditMode::Off, true, false),
+            (crate::runtime::AuditMode::Heuristic, true, true),
+        ] {
+            let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                script: if mutate {
+                    vec![(
+                        "write_file",
+                        r#"{"path":"out.txt","content":"x"}"#.to_owned(),
+                    )]
+                } else {
+                    vec![("read_file", r#"{"path":"AGENTS.md"}"#.to_owned())]
+                },
+                turn: StdMutex::new(0),
+            });
+            let auditor: Arc<dyn Provider> = Arc::new(VerdictProvider {
+                reply: r#"{"verdict":"pass"}"#,
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            });
+            let mut harness = audit_harness(parent, auditor, mode, 1).await;
+            let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "go").await;
+            let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+            assert_eq!(
+                audit_events(&observed, run_id).0.is_some(),
+                expect_audit,
+                "{mode:?} mutate={mutate}"
+            );
+        }
+
+        // A child run is never audited, even when it mutates under Always.
+        let child: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![("read_file", r#"{"path":"AGENTS.md"}"#.to_owned())],
+            turn: StdMutex::new(0),
+        });
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"look","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let auditor: Arc<dyn Provider> = Arc::new(VerdictProvider {
+            reply: r#"{"verdict":"pass"}"#,
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut harness = spawn_harness_with_loader(
+            Arc::new(AuditLoader {
+                inner: QueueLoader {
+                    routed: vec![("test/auditor", auditor), ("test/child", child)],
+                    queue: StdMutex::new(vec![parent]),
+                },
+                mode: crate::runtime::AuditMode::Always,
+                max_revisions: 1,
+            }),
+            8,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let audits = observed
+            .iter()
+            .filter(|event| matches!(&event.event, SessionEvent::RunAuditStarted { .. }))
+            .count();
+        assert_eq!(
+            audits, 1,
+            "only the root is audited, and spawning triggers it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_auditor_fails_open_and_is_recorded() {
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "write_file",
+                r#"{"path":"out.txt","content":"hello"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        // The auditor answers prose, not a verdict.
+        let auditor: Arc<dyn Provider> = Arc::new(VerdictProvider {
+            reply: "Looks fine to me!",
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut harness =
+            audit_harness(parent, auditor, crate::runtime::AuditMode::Always, 1).await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "write").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let (_, completed) = audit_events(&observed, run_id);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].outcome, AuditOutcome::Unavailable);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+
+        // A failing audit child is also fail-open.
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            script: vec![(
+                "write_file",
+                r#"{"path":"out.txt","content":"hello"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let mut harness = audit_harness(
+            parent,
+            Arc::new(RefusalProvider),
+            crate::runtime::AuditMode::Always,
+            1,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "write").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let (_, completed) = audit_events(&observed, run_id);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].outcome, AuditOutcome::Unavailable);
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
         ));
     }
 

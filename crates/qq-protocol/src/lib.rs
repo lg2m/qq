@@ -37,18 +37,19 @@ pub use plan::{
 pub use qq_reasoning::{ReasoningEvent, ReasoningKind};
 pub use sessions::{
     AccountingTotal, ApprovalDecision, ApprovalGrant, ApprovalMode, ApprovalResolution,
-    BudgetExhaustion, BudgetLimitKind, CapabilitySupport, ChildAuthority, CommandOutcome,
-    CommandReceipt, CommandRequest, ContentHash, ContentHashError, ContextSourceOutcome,
-    ContextSourceRecord, CursorError, EditPreview, EventCursor, GenerationCapabilities,
-    GuidanceIdentity, GuidanceKind, InstructionHash, InstructionHashError, MAX_INCLUDED_SESSIONS,
-    MessageRole, MessageSnapshot, MessageState, ModelCatalogRequest, ModelDescriptor, ModelPricing,
-    ModelPricingTier, ModelSelection, PromptCacheCapabilities, PromptVersion,
-    ProviderRequestShapeIdentity, ProviderRequestShapeVersion, ResolvedModel, ResolvedModelVersion,
-    RunActivity, RunFailure, RunLimits, RunOutcome, RunPromptIdentity, RunSnapshot, RunStatus,
-    SessionAccounting, SessionCommand, SessionCommandKind, SessionEvent, SessionEventEnvelope,
-    SessionSnapshot, SessionStatus, SessionSummary, ShellCommandPreview, SnapshotRequest,
-    SpawnOrigin, SubscribeRequest, TextChannel, TokenUsage, ToolCallDisplay, ToolCallSnapshot,
-    ToolCallState, ToolExposure, WorkspaceGrantOutcome, WorkspaceSnapshot, WorkspaceSummary,
+    AuditOutcome, AuditRecord, BudgetExhaustion, BudgetLimitKind, CapabilitySupport,
+    ChildAuthority, CommandOutcome, CommandReceipt, CommandRequest, ContentHash, ContentHashError,
+    ContextSourceOutcome, ContextSourceRecord, CursorError, EditPreview, EventCursor,
+    GenerationCapabilities, GuidanceIdentity, GuidanceKind, InstructionHash, InstructionHashError,
+    MAX_INCLUDED_SESSIONS, MessageRole, MessageSnapshot, MessageState, ModelCatalogRequest,
+    ModelDescriptor, ModelPricing, ModelPricingTier, ModelSelection, PromptCacheCapabilities,
+    PromptVersion, ProviderRequestShapeIdentity, ProviderRequestShapeVersion, ResolvedModel,
+    ResolvedModelVersion, RunActivity, RunFailure, RunLimits, RunOutcome, RunPromptIdentity,
+    RunSnapshot, RunStatus, SessionAccounting, SessionCommand, SessionCommandKind, SessionEvent,
+    SessionEventEnvelope, SessionPurpose, SessionSnapshot, SessionStatus, SessionSummary,
+    ShellCommandPreview, SnapshotRequest, SpawnOrigin, SubscribeRequest, TextChannel, TokenUsage,
+    ToolCallDisplay, ToolCallSnapshot, ToolCallState, ToolExposure, WorkspaceGrantOutcome,
+    WorkspaceSnapshot, WorkspaceSummary,
 };
 
 pub const PROTOCOL_VERSION: u16 = 16;

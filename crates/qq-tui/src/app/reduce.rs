@@ -270,6 +270,28 @@ impl App {
             // The interrupted turn's tool calls arrive as ordinary finished
             // events; nothing else changes on screen.
             SessionEvent::RunInterrupted { .. } => {}
+            // An audit child announces itself on the parent; its own session
+            // arrives through ordinary events. Its verdict is a notice on the
+            // audited session.
+            SessionEvent::RunAuditStarted { .. } => {}
+            SessionEvent::RunAuditCompleted { audit, .. } => {
+                let text = match audit.outcome {
+                    qq_protocol::AuditOutcome::Pass => "audit passed".to_owned(),
+                    qq_protocol::AuditOutcome::Revised => format!(
+                        "audit asked for a revision ({} finding{})",
+                        audit.findings.len(),
+                        if audit.findings.len() == 1 { "" } else { "s" }
+                    ),
+                    qq_protocol::AuditOutcome::Unavailable => {
+                        "audit unavailable; answer stands".to_owned()
+                    }
+                };
+                effects.push(Effect::Notice {
+                    session: Some(envelope.session_id),
+                    level: NoticeLevel::Info,
+                    text,
+                });
+            }
             // The truncated turn's message was already completed with its
             // `truncated` flag by the turn commit; the next turn's message
             // continues the same answer. Surface the continuation so the

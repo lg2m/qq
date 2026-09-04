@@ -1224,6 +1224,7 @@ pub enum ConfigKey {
     WorkerModel,
     ReviewerModel,
     Delegation,
+    Audit,
     MaxOutputTokens,
     Providers,
     Provider(String),
@@ -1275,6 +1276,7 @@ pub struct ConfigProvenance {
     worker_model: Option<SourceIdentity>,
     reviewer_model: Option<SourceIdentity>,
     delegation: Option<SourceIdentity>,
+    audit: Option<SourceIdentity>,
     max_output_tokens: Option<SourceIdentity>,
     providers: BTreeMap<String, SourceIdentity>,
     profiles: BTreeMap<String, SourceIdentity>,
@@ -1319,6 +1321,11 @@ impl ConfigProvenance {
     #[must_use]
     pub const fn delegation(&self) -> Option<&SourceIdentity> {
         self.delegation.as_ref()
+    }
+
+    #[must_use]
+    pub const fn audit(&self) -> Option<&SourceIdentity> {
+        self.audit.as_ref()
     }
 
     #[must_use]
@@ -1389,6 +1396,7 @@ pub struct ConfigSnapshot {
     worker_model: Option<ModelRoute>,
     reviewer_model: Option<ModelRoute>,
     delegation: DelegationConfig,
+    audit: AuditConfig,
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
@@ -1513,6 +1521,69 @@ impl Default for DelegationConfig {
             default_role: DelegationRole::Balanced,
             max_depth: 1,
             write_children: false,
+        }
+    }
+}
+/// When the root run's final answer is audited by a read-only child before
+/// it is presented as complete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditMode {
+    Off,
+    /// Audit when the run mutated files, ran a non-read shell command, made
+    /// at least twelve tool calls, or spawned a child.
+    #[default]
+    Heuristic,
+    Always,
+}
+
+impl AuditMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Heuristic => "heuristic",
+            Self::Always => "always",
+        }
+    }
+}
+
+/// Most revision cycles an audit may send a run through.
+pub const MAX_AUDIT_REVISIONS: u16 = 2;
+
+/// The validated final-answer audit settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditConfig {
+    mode: AuditMode,
+    max_revisions: u16,
+    role: DelegationRole,
+}
+
+impl AuditConfig {
+    #[must_use]
+    pub const fn mode(&self) -> AuditMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn max_revisions(&self) -> u16 {
+        self.max_revisions
+    }
+
+    /// The roster role the auditor runs as; falls back to the spawning model
+    /// when the roster declares no such role.
+    #[must_use]
+    pub const fn role(&self) -> DelegationRole {
+        self.role
+    }
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuditMode::Heuristic,
+            max_revisions: 1,
+            role: DelegationRole::Strong,
         }
     }
 }
@@ -1667,6 +1738,12 @@ impl ConfigSnapshot {
     #[must_use]
     pub const fn delegation(&self) -> &DelegationConfig {
         &self.delegation
+    }
+
+    /// The validated final-answer audit settings.
+    #[must_use]
+    pub const fn audit(&self) -> &AuditConfig {
+        &self.audit
     }
 
     #[must_use]
@@ -1856,6 +1933,8 @@ pub enum ConfigError {
     UnknownProvider(String),
     #[error("delegation roster is invalid: {0}")]
     InvalidDelegation(String),
+    #[error("audit settings are invalid: {0}")]
+    InvalidAudit(String),
     #[error("managed policy {rule} was violated: {message}")]
     PolicyViolation { rule: &'static str, message: String },
     #[error("TUI settings are invalid: {message}")]

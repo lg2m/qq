@@ -202,6 +202,8 @@ pub struct AgentPlanDescriptor {
     pub tools: ToolCatalogDescriptor,
     /// The roster and bounds `spawn_agent` was compiled with (version 4).
     pub delegation: DelegationRoster,
+    /// When the root run's final answer is audited (version 4).
+    pub audit: AuditDescriptor,
     pub skills: SkillIndexDescriptor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<PackDescriptor>,
@@ -230,5 +232,37 @@ impl AgentPlanDescriptor {
         Ok(AgentPlanDigest::from_hash(ContentHash::from_bytes(
             Sha256::digest(&bytes).into(),
         )))
+    }
+}
+
+/// The audit policy a plan compiled with. Mirrors `runtime::AuditPolicy` in
+/// the canonical encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditDescriptor {
+    pub mode: AuditModeDescriptor,
+    pub max_revisions: u16,
+    pub role: qq_protocol::DelegationRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditModeDescriptor {
+    Off,
+    Heuristic,
+    Always,
+}
+
+impl From<crate::runtime::AuditPolicy> for AuditDescriptor {
+    fn from(policy: crate::runtime::AuditPolicy) -> Self {
+        Self {
+            mode: match policy.mode {
+                crate::runtime::AuditMode::Off => AuditModeDescriptor::Off,
+                crate::runtime::AuditMode::Heuristic => AuditModeDescriptor::Heuristic,
+                crate::runtime::AuditMode::Always => AuditModeDescriptor::Always,
+            },
+            max_revisions: policy.max_revisions,
+            role: policy.role,
+        }
     }
 }

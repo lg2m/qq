@@ -443,10 +443,7 @@ impl Store {
         &self,
         parent: &ClaimedRun,
         call_id: ToolCallId,
-        model: ModelSelection,
-        task: String,
-        limits: RunLimits,
-        approval_mode: ApprovalMode,
+        admission: ChildAdmission,
     ) -> Result<CreatedChildRun, SessionRuntimeError> {
         let store_id = self.store_id;
         let parent = ChildRunParent {
@@ -458,15 +455,7 @@ impl Store {
             root_run_id: parent.root_run_id,
         };
         self.call(Priority::Control, move |connection| {
-            create_child_run(
-                connection,
-                store_id,
-                parent,
-                model,
-                task,
-                limits,
-                approval_mode,
-            )
+            create_child_run(connection, store_id, parent, admission)
         })
         .await
     }
@@ -1086,6 +1075,20 @@ impl Store {
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
             resolve_approval_by_reviewer(connection, store_id, &claimed, tool_call_id)
+        })
+        .await
+    }
+
+    /// Persists the final-answer audit record on the run and publishes it.
+    pub(super) async fn record_audit(
+        &self,
+        claimed: &ClaimedRun,
+        record: AuditRecord,
+    ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            record_run_audit(connection, store_id, &claimed, record)
         })
         .await
     }

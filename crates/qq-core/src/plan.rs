@@ -28,9 +28,9 @@ use sha2::Digest as _;
 use thiserror::Error;
 
 pub use descriptor::{
-    AgentPlanDescriptor, CredentialReference, DESCRIPTOR_VERSION, McpServerDescriptor,
-    McpTransportKind, PackDescriptor, ProviderDescriptor, RetryPolicyDescriptor,
-    SkillIndexDescriptor, ToolCatalogDescriptor,
+    AgentPlanDescriptor, AuditDescriptor, AuditModeDescriptor, CredentialReference,
+    DESCRIPTOR_VERSION, McpServerDescriptor, McpTransportKind, PackDescriptor, ProviderDescriptor,
+    RetryPolicyDescriptor, SkillIndexDescriptor, ToolCatalogDescriptor,
 };
 pub use fingerprint::SourceFingerprint;
 
@@ -40,7 +40,7 @@ use crate::{
         EffectClass, HostContribution, StaticTool, ToolCatalog, ToolHost, select_tools_spec,
     },
     hosts::{ExternalToolHost, HostCatalog},
-    runtime::search_history_spec,
+    runtime::{AuditPolicy, search_history_spec},
     tools,
     workspace::{
         SkillIndex, Workspace, WorkspaceInstructionError, WorkspaceInstructions,
@@ -112,6 +112,7 @@ pub struct AgentProfile {
     mcp_servers: Vec<McpServerDescriptor>,
     spawn_model_routes: Vec<String>,
     delegation: DelegationRoster,
+    audit: AuditPolicy,
     turn_retry: TurnRetryPolicy,
     adapter_build: String,
     provenance: Vec<String>,
@@ -141,6 +142,7 @@ impl AgentProfile {
             mcp_servers: Vec::new(),
             spawn_model_routes: Vec::new(),
             delegation: DelegationRoster::default(),
+            audit: AuditPolicy::default(),
             turn_retry: TurnRetryPolicy::default(),
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
@@ -171,6 +173,7 @@ impl AgentProfile {
             mcp_servers: Vec::new(),
             spawn_model_routes: runtime.spawn_model_routes.to_vec(),
             delegation: runtime.delegation.as_ref().clone(),
+            audit: runtime.audit,
             turn_retry: runtime.turn_retry,
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
@@ -240,6 +243,13 @@ impl AgentProfile {
     #[must_use]
     pub fn with_delegation(mut self, delegation: DelegationRoster) -> Self {
         self.delegation = delegation;
+        self
+    }
+
+    /// When a root run's final answer is audited before completion.
+    #[must_use]
+    pub const fn with_audit(mut self, audit: AuditPolicy) -> Self {
+        self.audit = audit;
         self
     }
 
@@ -382,6 +392,7 @@ impl CompiledAgentPlan {
             mcp_servers,
             spawn_model_routes,
             delegation,
+            audit,
             turn_retry,
             adapter_build,
             provenance,
@@ -399,7 +410,8 @@ impl CompiledAgentPlan {
         .with_context_window(resolved_model.context_window)
         .with_turn_retry_policy(turn_retry)
         .with_spawn_model_routes(spawn_model_routes)
-        .with_delegation(delegation);
+        .with_delegation(delegation)
+        .with_audit(audit);
         for source in context_sources {
             runtime = runtime.with_context_source(source);
         }
@@ -576,6 +588,7 @@ impl CompiledAgentPlan {
                 config_grants,
             },
             delegation: runtime.delegation.as_ref().clone(),
+            audit: AuditDescriptor::from(runtime.audit),
             skills: SkillIndexDescriptor {
                 digest: skills.digest(),
                 indexed: skills.len(),
@@ -934,6 +947,11 @@ mod tests {
                 max_depth: 1,
                 write_children: false,
             },
+            audit: AuditDescriptor {
+                mode: AuditModeDescriptor::Heuristic,
+                max_revisions: 1,
+                role: qq_protocol::DelegationRole::Strong,
+            },
             skills: SkillIndexDescriptor {
                 digest: qq_protocol::ContentHash::from_bytes([3; 32]),
                 indexed: 2,
@@ -979,7 +997,7 @@ mod tests {
         // from a different encoding.
         assert_eq!(
             descriptor.digest().unwrap().to_string(),
-            "cfdaf34cfe55e788736bc9bd94db2a0afb5b592fb159d875cf638bdd5373293b"
+            "7e5b9a76b69f15490e80467122f2733e733e72b3bd7bf9169040ff1baac64201"
         );
         let round_trip: AgentPlanDescriptor =
             serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v4\0".len()..]).unwrap();

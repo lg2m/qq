@@ -13,15 +13,15 @@ use serde::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    AgentProfileConfig, AwsAuth, BedrockAuth, ConfigError, ConfigKey, ConfigProvenance,
-    ConfigSnapshot, Connection, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MCP_CALL_TIMEOUT_SECONDS,
-    DEFAULT_MCP_MAX_CONCURRENT_CALLS, DelegationConfig, DelegationEntry, DelegationRole,
-    EffectivePolicy, HttpAccess, HttpCredential, InputModality, MAX_DELEGATION_DEPTH,
-    MAX_DELEGATION_NOTE_BYTES, MAX_DELEGATION_ROSTER, MAX_MCP_CALL_TIMEOUT_SECONDS,
-    MAX_MCP_MAX_CONCURRENT_CALLS, MAX_PROFILE_NAME_BYTES, McpServerConfig, McpTransport,
-    ModelMetadata, ModelPricing, ModelRoute, PolicyGrants, ProfileApprovalMode, ProviderAccess,
-    ProviderApi, ProviderConfig, ProviderKind, RuntimeOverrides, SecretRef, SourceIdentity,
-    SourceKind, SourceReport, WorkspaceGrant,
+    AgentProfileConfig, AuditConfig, AuditMode, AwsAuth, BedrockAuth, ConfigError, ConfigKey,
+    ConfigProvenance, ConfigSnapshot, Connection, DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_MCP_CALL_TIMEOUT_SECONDS, DEFAULT_MCP_MAX_CONCURRENT_CALLS, DelegationConfig,
+    DelegationEntry, DelegationRole, EffectivePolicy, HttpAccess, HttpCredential, InputModality,
+    MAX_AUDIT_REVISIONS, MAX_DELEGATION_DEPTH, MAX_DELEGATION_NOTE_BYTES, MAX_DELEGATION_ROSTER,
+    MAX_MCP_CALL_TIMEOUT_SECONDS, MAX_MCP_MAX_CONCURRENT_CALLS, MAX_PROFILE_NAME_BYTES,
+    McpServerConfig, McpTransport, ModelMetadata, ModelPricing, ModelRoute, PolicyGrants,
+    ProfileApprovalMode, ProviderAccess, ProviderApi, ProviderConfig, ProviderKind,
+    RuntimeOverrides, SecretRef, SourceIdentity, SourceKind, SourceReport, WorkspaceGrant,
 };
 
 pub(super) fn deserialize_unique_btree_map<'de, D, K, V>(
@@ -496,6 +496,9 @@ pub(super) struct Document {
     /// `Clear` drops what an earlier layer declared.
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     delegation: Field<DelegationPatch>,
+    /// Final-answer audit settings. Replaces the whole section when set.
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    audit: Field<AuditPatch>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     max_output_tokens: Field<u32>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
@@ -522,6 +525,14 @@ struct DelegationPatch {
     default_role: Option<DelegationRole>,
     max_depth: Option<u16>,
     write_children: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AuditPatch {
+    mode: Option<AuditMode>,
+    max_revisions: Option<u16>,
+    role: Option<DelegationRole>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +648,7 @@ impl Document {
             || self.worker_model.is_present()
             || self.reviewer_model.is_present()
             || self.delegation.is_present()
+            || self.audit.is_present()
             || self.providers.is_present()
             || self.mcp.is_present()
             || self.packs.is_present()
@@ -675,6 +687,8 @@ impl Document {
             #[serde(skip_serializing_if = "Option::is_none")]
             delegation: Option<&'a Field<DelegationPatch>>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            audit: Option<&'a Field<AuditPatch>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             providers: Option<&'a Field<UniqueMap<String, ProviderEntryPatch>>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             mcp: Option<&'a Field<UniqueMap<String, McpServerPatch>>>,
@@ -697,6 +711,7 @@ impl Document {
                 .is_present()
                 .then_some(&self.reviewer_model),
             delegation: present(&self.delegation),
+            audit: present(&self.audit),
             providers: present(&self.providers),
             mcp: present(&self.mcp),
             packs: present(&self.packs),
@@ -738,6 +753,9 @@ impl Document {
         }
         if self.delegation.is_present() {
             touched.push(ConfigKey::Delegation);
+        }
+        if self.audit.is_present() {
+            touched.push(ConfigKey::Audit);
         }
         if self.max_output_tokens.is_present() {
             touched.push(ConfigKey::MaxOutputTokens);
@@ -1128,6 +1146,7 @@ pub(super) struct MergeState {
     worker_model: Option<String>,
     reviewer_model: Option<String>,
     delegation: Option<DelegationPatch>,
+    audit: Option<AuditPatch>,
     max_output_tokens: u32,
     providers: BTreeMap<String, ProviderConfig>,
     mcp: BTreeMap<String, McpServerConfig>,
@@ -1200,6 +1219,7 @@ impl MergeState {
                 worker_model: None,
                 reviewer_model: None,
                 delegation: None,
+                audit: None,
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
                 providers,
                 mcp: BTreeMap::new(),
@@ -1257,6 +1277,17 @@ impl MergeState {
             Field::Clear => {
                 self.delegation = None;
                 self.provenance.delegation = Some(source.clone());
+            }
+        }
+        match &document.audit {
+            Field::Missing => {}
+            Field::Set(patch) => {
+                self.audit = Some(patch.clone());
+                self.provenance.audit = Some(source.clone());
+            }
+            Field::Clear => {
+                self.audit = None;
+                self.provenance.audit = Some(source.clone());
             }
         }
         self.apply_providers(&document.providers, source);
@@ -1827,6 +1858,22 @@ impl MergeState {
                 }
             }
         }
+        let audit = match self.audit.take() {
+            Some(patch) => {
+                let max_revisions = patch.max_revisions.unwrap_or(1);
+                if max_revisions > MAX_AUDIT_REVISIONS {
+                    return Err(ConfigError::InvalidAudit(format!(
+                        "max_revisions must be at most {MAX_AUDIT_REVISIONS}, found {max_revisions}"
+                    )));
+                }
+                AuditConfig {
+                    mode: patch.mode.unwrap_or_default(),
+                    max_revisions,
+                    role: patch.role.unwrap_or(DelegationRole::Strong),
+                }
+            }
+            None => AuditConfig::default(),
+        };
         let grants = resolve_policy_grants(&self.policy, &self.mcp);
         Ok(ConfigSnapshot {
             organization: self.organization,
@@ -1834,6 +1881,7 @@ impl MergeState {
             worker_model,
             reviewer_model,
             delegation,
+            audit,
             max_output_tokens: self.max_output_tokens,
             providers: self.providers,
             mcp: self.mcp,

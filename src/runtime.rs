@@ -665,10 +665,12 @@ impl RuntimeFactory {
             .map(|report| report.source().label().to_owned())
             .collect();
         let delegation = delegation_roster(&snapshot, snapshot.model());
+        let audit = audit_policy(snapshot.audit());
         let mut profile =
             AgentProfile::new(provider, descriptor, resolved_model, workspace.to_owned())
                 .with_spawn_model_routes(spawn_model_routes)
                 .with_delegation(delegation)
+                .with_audit(audit)
                 .with_provenance(provenance)
                 .with_credential_epoch(epoch)
                 .with_profile_id(profile_id.clone());
@@ -1923,6 +1925,19 @@ fn delegation_roster(
         default_role: delegation_role(config.default_role()),
         max_depth: config.max_depth(),
         write_children: config.write_children(),
+    }
+}
+
+/// Translates the configured audit section into the runtime policy.
+const fn audit_policy(audit: &qq_config::AuditConfig) -> qq_core::AuditPolicy {
+    qq_core::AuditPolicy {
+        mode: match audit.mode() {
+            qq_config::AuditMode::Off => qq_core::AuditMode::Off,
+            qq_config::AuditMode::Heuristic => qq_core::AuditMode::Heuristic,
+            qq_config::AuditMode::Always => qq_core::AuditMode::Always,
+        },
+        max_revisions: audit.max_revisions(),
+        role: delegation_role(audit.role()),
     }
 }
 
