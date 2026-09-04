@@ -7,6 +7,7 @@
 use crate::{
     Provider, ProviderError, ProviderStream,
     compiler::{EndpointKind, HttpAuth, HttpProtocol},
+    http::AttemptPolicy,
     providers::{
         anthropic::{AnthropicAuth, AnthropicMessages},
         google::{GoogleAuth, GoogleGenerateContent},
@@ -80,6 +81,12 @@ impl CompiledHttpProvider {
 
     #[must_use]
     pub(crate) fn without_retries(self) -> Self {
+        self.with_attempt_policy(AttemptPolicy::disabled())
+    }
+
+    /// Replaces the single retry owner for every send this provider makes.
+    #[must_use]
+    pub(crate) fn with_attempt_policy(self, policy: AttemptPolicy) -> Self {
         let mut provider = self;
         let exchange = match &mut provider {
             Self::OpenAiResponses(provider) => &mut provider.exchange,
@@ -87,7 +94,7 @@ impl CompiledHttpProvider {
             Self::AnthropicMessages(provider) => &mut provider.exchange,
             Self::GoogleGenerateContent(provider) => &mut provider.exchange,
         };
-        exchange.disable_retries();
+        exchange.set_attempt_policy(policy);
         provider
     }
 }

@@ -16,32 +16,45 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ERROR_BODY_BYTES_LIMIT: usize = 16 * 1_024;
-const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
-const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
-const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
-const DEFAULT_RETRY_TOTAL_BUDGET: Duration = Duration::from_secs(15);
+const DEFAULT_ATTEMPTS: u32 = 4;
+const DEFAULT_BASE_DELAY: Duration = Duration::from_millis(500);
+const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(8);
+const DEFAULT_TOTAL_BUDGET: Duration = Duration::from_secs(30);
 
-/// Pre-stream retry settings for [`HttpExchange`].
+/// The single retry owner for one compiled provider.
+///
+/// Every send a logical request may cost — a rejected or failed HTTP exchange
+/// before any body arrives, or an SSE stream that ends or fails before it has
+/// yielded one semantic event — draws from the same attempt count and time
+/// budget. Once a stream has yielded an event the request is never resent:
+/// a retry could duplicate output the caller has already seen. Nothing above
+/// the provider retries a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RetryPolicy {
+pub struct AttemptPolicy {
     max_attempts: u32,
     base_delay: Duration,
     max_delay: Duration,
     total_budget: Duration,
 }
 
-impl RetryPolicy {
-    pub(crate) const fn default_policy() -> Self {
+impl Default for AttemptPolicy {
+    /// Four attempts with 500 ms → 8 s full-jitter exponential backoff inside
+    /// a 30 s budget: enough to ride out an overload blip without holding a
+    /// turn open for minutes.
+    fn default() -> Self {
         Self {
-            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
-            base_delay: DEFAULT_RETRY_BASE_DELAY,
-            max_delay: DEFAULT_RETRY_MAX_DELAY,
-            total_budget: DEFAULT_RETRY_TOTAL_BUDGET,
+            max_attempts: DEFAULT_ATTEMPTS,
+            base_delay: DEFAULT_BASE_DELAY,
+            max_delay: DEFAULT_MAX_DELAY,
+            total_budget: DEFAULT_TOTAL_BUDGET,
         }
     }
+}
 
+impl AttemptPolicy {
     /// Single attempt, no sleeps. For live canaries and single-shot tests.
-    pub(crate) const fn disabled() -> Self {
+    #[must_use]
+    pub const fn disabled() -> Self {
         Self {
             max_attempts: 1,
             base_delay: Duration::ZERO,
@@ -50,23 +63,40 @@ impl RetryPolicy {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn max_attempts(self) -> u32 {
+    /// Bounded attempts with the given backoff. `max_attempts` is clamped to
+    /// at least one; the cap is clamped to at least the base.
+    #[must_use]
+    pub fn new(
+        max_attempts: u32,
+        base_delay: Duration,
+        max_delay: Duration,
+        total_budget: Duration,
+    ) -> Self {
+        Self {
+            max_attempts: max_attempts.max(1),
+            base_delay,
+            max_delay: max_delay.max(base_delay),
+            total_budget,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_attempts(self) -> u32 {
         self.max_attempts
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn base_delay(self) -> Duration {
+    #[must_use]
+    pub const fn base_delay(self) -> Duration {
         self.base_delay
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn max_delay(self) -> Duration {
+    #[must_use]
+    pub const fn max_delay(self) -> Duration {
         self.max_delay
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn total_budget(self) -> Duration {
+    #[must_use]
+    pub const fn total_budget(self) -> Duration {
         self.total_budget
     }
 
@@ -106,6 +136,100 @@ impl RetryPolicy {
     }
 }
 
+/// The attempts one logical request has spent, shared between the HTTP
+/// exchange (pre-body retries) and the stream driver (pre-first-event
+/// restarts) so their sum never exceeds the policy.
+#[derive(Debug)]
+pub(crate) struct AttemptLedger {
+    policy: AttemptPolicy,
+    started: Instant,
+    attempts: u32,
+}
+
+impl AttemptLedger {
+    pub(crate) fn new(policy: AttemptPolicy) -> Self {
+        Self {
+            policy,
+            started: Instant::now(),
+            attempts: 0,
+        }
+    }
+
+    /// Records one send about to happen and returns its ordinal (1-based).
+    pub(crate) fn begin_attempt(&mut self) -> u32 {
+        self.attempts = self.attempts.saturating_add(1);
+        self.attempts
+    }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// The delay to sleep before another attempt, or `None` when the policy
+    /// has no attempt or time left. `retry_after` comes from the provider.
+    pub(crate) fn next_delay(&self, retry_after: Option<Duration>) -> Option<Duration> {
+        if !self.policy.has_remaining_attempt(self.attempts) {
+            return None;
+        }
+        let retry_index = self.attempts.saturating_sub(1);
+        let delay = full_jitter(
+            self.policy.delay_before_retry(retry_index, retry_after),
+            random_u32(),
+        );
+        self.policy
+            .can_afford(self.started.elapsed(), delay)
+            .then_some(delay)
+    }
+}
+
+/// The attempt ledger shared between the exchange and the stream restart
+/// loop. Both touch it only between polls of one stream, so the lock is
+/// never contended and never held across an await.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedLedger(Arc<std::sync::Mutex<AttemptLedger>>);
+
+impl SharedLedger {
+    pub(crate) fn new(policy: AttemptPolicy) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(AttemptLedger::new(policy))))
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, AttemptLedger> {
+        // A poisoned lock means a panic already unwound through this task's
+        // stream; the count it holds is still the right one to report.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Appends the attempt count to a failure the policy gave up on, so the
+/// outcome a caller records shows how many sends the turn cost.
+pub(crate) fn note_attempts(error: ProviderError, attempts: u32) -> ProviderError {
+    if attempts <= 1 {
+        return error;
+    }
+    let suffix = format!(" (gave up after {attempts} attempts with backoff)");
+    match error {
+        ProviderError::Configuration(message) => ProviderError::Configuration(message + &suffix),
+        ProviderError::CredentialsUnavailable(message) => {
+            ProviderError::CredentialsUnavailable(message + &suffix)
+        }
+        ProviderError::Transport(message) => ProviderError::Transport(message + &suffix),
+        ProviderError::Api { status, message } => ProviderError::Api {
+            status,
+            message: message + &suffix,
+        },
+        ProviderError::ResponseFailed { kind, message } => ProviderError::ResponseFailed {
+            kind,
+            message: message + &suffix,
+        },
+        ProviderError::ResponseIncomplete(message) => {
+            ProviderError::ResponseIncomplete(message + &suffix)
+        }
+        ProviderError::Protocol(message) => ProviderError::Protocol(message + &suffix),
+    }
+}
+
 /// Pre-stream statuses that may be retried by [`HttpExchange`].
 pub(crate) fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
@@ -139,10 +263,23 @@ pub(crate) fn full_jitter(delay: Duration, random: u32) -> Duration {
 
 fn random_u32() -> u32 {
     getrandom::u32().unwrap_or_else(|_| {
-        // Fall back to a non-crypto mix of the monotonic clock if the OS RNG is
-        // unavailable. Retry jitter only needs to break synchronized stampedes.
-        let nanos = std::time::Instant::now().elapsed().as_nanos() as u64;
-        (nanos ^ (nanos >> 32)) as u32
+        // Fall back to a process-wide xorshift seeded from the wall clock if
+        // the OS RNG is unavailable. Retry jitter only needs to break
+        // synchronized stampedes, and successive draws must differ.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static STATE: AtomicU64 = AtomicU64::new(0);
+        let mut state = STATE.load(Ordering::Relaxed);
+        if state == 0 {
+            state = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x9E37_79B9_7F4A_7C15, |since| since.as_nanos() as u64)
+                | 1;
+        }
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        STATE.store(state, Ordering::Relaxed);
+        (state >> 32) as u32
     })
 }
 
@@ -242,7 +379,7 @@ pub(crate) struct HttpExchange {
     client: reqwest::Client,
     authorizer: RequestAuthorizer,
     redactions: Arc<[String]>,
-    retry: RetryPolicy,
+    attempts: AttemptPolicy,
 }
 
 pub(crate) struct ExchangeMessages {
@@ -265,6 +402,8 @@ pub(crate) struct HttpRejection {
     status: StatusCode,
     body: Vec<u8>,
     redactions: Arc<[String]>,
+    /// Sends spent before this rejection was final, for the failure message.
+    attempts: u32,
 }
 
 impl HttpExchange {
@@ -277,18 +416,36 @@ impl HttpExchange {
             client,
             authorizer,
             redactions,
-            retry: RetryPolicy::default_policy(),
+            attempts: AttemptPolicy::default(),
         }
     }
 
+    pub(crate) fn set_attempt_policy(&mut self, attempts: AttemptPolicy) {
+        self.attempts = attempts;
+    }
+
     #[cfg(test)]
-    pub(crate) fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
-        self.retry = retry;
+    #[must_use]
+    pub(crate) fn with_attempt_policy(mut self, attempts: AttemptPolicy) -> Self {
+        self.attempts = attempts;
         self
     }
 
-    pub(crate) fn disable_retries(&mut self) {
-        self.retry = RetryPolicy::disabled();
+    /// `execute` under a fresh ledger for this exchange's policy.
+    #[cfg(test)]
+    pub(crate) async fn execute_fresh(
+        &self,
+        request: reqwest::Request,
+        wire_limit: usize,
+        messages: ExchangeMessages,
+    ) -> Result<ExchangeOutcome, ProviderError> {
+        self.execute(request, wire_limit, messages, &self.ledger())
+            .await
+    }
+
+    /// A fresh ledger for one logical request under this exchange's policy.
+    pub(crate) fn ledger(&self) -> SharedLedger {
+        SharedLedger::new(self.attempts)
     }
 
     pub(crate) fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
@@ -299,26 +456,27 @@ impl HttpExchange {
         &self.redactions
     }
 
+    /// Sends `request`, retrying pre-body failures (transport errors and
+    /// retryable statuses) against `ledger`. The ledger outlives this call
+    /// so a stream restart after a success here draws from the same count.
     pub(crate) async fn execute(
         &self,
         request: reqwest::Request,
         wire_limit: usize,
         messages: ExchangeMessages,
+        ledger: &SharedLedger,
     ) -> Result<ExchangeOutcome, ProviderError> {
-        let started = Instant::now();
         let mut request = request;
-        let mut attempt = 0u32;
 
         loop {
-            attempt += 1;
+            let attempts = ledger.lock().begin_attempt();
             // Clone before consuming the request so a later attempt can resend.
             // Streaming bodies that cannot be cloned stay single-shot.
-            let next_request = if self.retry.has_remaining_attempt(attempt) {
+            let next_request = if self.attempts.has_remaining_attempt(attempts) {
                 request.try_clone()
             } else {
                 None
             };
-            let can_retry_after = next_request.is_some();
 
             let mut redactions = self.redactions.as_ref().to_vec();
             redactions.extend(self.authorizer.authorize(&mut request).await?);
@@ -329,13 +487,12 @@ impl HttpExchange {
                 Ok(response) => response,
                 Err(error) => {
                     let transport = transport_error(error, redactions.as_ref());
-                    let Some(delay) =
-                        self.maybe_retry_delay(can_retry_after, attempt, None, started.elapsed())
+                    let Some((next, delay)) = next_request.zip(ledger.lock().next_delay(None))
                     else {
-                        return Err(transport);
+                        return Err(note_attempts(transport, ledger.lock().attempts()));
                     };
                     tokio::time::sleep(delay).await;
-                    request = next_request.expect("can_retry_after requires a cloned request");
+                    request = next;
                     continue;
                 }
             };
@@ -373,42 +530,21 @@ impl HttpExchange {
                 status,
                 body,
                 redactions,
+                attempts: ledger.lock().attempts(),
             };
 
             if !is_retryable_status(status) {
                 return Ok(ExchangeOutcome::Rejected(rejection));
             }
 
-            let Some(delay) =
-                self.maybe_retry_delay(can_retry_after, attempt, retry_after, started.elapsed())
+            let Some((next, delay)) = next_request.zip(ledger.lock().next_delay(retry_after))
             else {
                 return Ok(ExchangeOutcome::Rejected(rejection));
             };
 
             tokio::time::sleep(delay).await;
-            request = next_request.expect("can_retry_after requires a cloned request");
+            request = next;
         }
-    }
-
-    fn maybe_retry_delay(
-        &self,
-        can_retry_after: bool,
-        completed_attempts: u32,
-        retry_after: Option<Duration>,
-        elapsed: Duration,
-    ) -> Option<Duration> {
-        if !can_retry_after || !self.retry.has_remaining_attempt(completed_attempts) {
-            return None;
-        }
-        let retry_index = completed_attempts.saturating_sub(1);
-        let delay = full_jitter(
-            self.retry.delay_before_retry(retry_index, retry_after),
-            random_u32(),
-        );
-        if !self.retry.can_afford(elapsed, delay) {
-            return None;
-        }
-        Some(delay)
     }
 }
 
@@ -439,6 +575,10 @@ impl HttpRejection {
 
     pub(crate) fn redactions(&self) -> &[String] {
         &self.redactions
+    }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
     }
 }
 
@@ -590,20 +730,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_retry_policy_matches_documented_constants() {
-        let policy = RetryPolicy::default_policy();
-        assert_eq!(policy.max_attempts(), 3);
-        assert_eq!(policy.base_delay(), Duration::from_millis(250));
-        assert_eq!(policy.max_delay(), Duration::from_secs(4));
-        assert_eq!(policy.total_budget(), Duration::from_secs(15));
+    fn default_attempt_policy_matches_documented_constants() {
+        let policy = AttemptPolicy::default();
+        assert_eq!(policy.max_attempts(), 4);
+        assert_eq!(policy.base_delay(), Duration::from_millis(500));
+        assert_eq!(policy.max_delay(), Duration::from_secs(8));
+        assert_eq!(policy.total_budget(), Duration::from_secs(30));
         assert!(policy.has_remaining_attempt(0));
-        assert!(policy.has_remaining_attempt(2));
-        assert!(!policy.has_remaining_attempt(3));
+        assert!(policy.has_remaining_attempt(3));
+        assert!(!policy.has_remaining_attempt(4));
     }
 
     #[test]
-    fn disabled_retry_policy_allows_one_attempt() {
-        let policy = RetryPolicy::disabled();
+    fn disabled_attempt_policy_allows_one_attempt() {
+        let policy = AttemptPolicy::disabled();
         assert_eq!(policy.max_attempts(), 1);
         assert!(policy.has_remaining_attempt(0));
         assert!(!policy.has_remaining_attempt(1));
@@ -664,22 +804,22 @@ mod tests {
 
     #[test]
     fn exponential_delays_double_then_cap_at_max_delay() {
-        let policy = RetryPolicy::default_policy();
-        assert_eq!(policy.exponential_delay(0), Duration::from_millis(250));
-        assert_eq!(policy.exponential_delay(1), Duration::from_millis(500));
-        assert_eq!(policy.exponential_delay(2), Duration::from_secs(1));
-        assert_eq!(policy.exponential_delay(3), Duration::from_secs(2));
-        assert_eq!(policy.exponential_delay(4), Duration::from_secs(4));
-        assert_eq!(policy.exponential_delay(5), Duration::from_secs(4));
-        assert_eq!(policy.exponential_delay(31), Duration::from_secs(4));
+        let policy = AttemptPolicy::default();
+        assert_eq!(policy.exponential_delay(0), Duration::from_millis(500));
+        assert_eq!(policy.exponential_delay(1), Duration::from_secs(1));
+        assert_eq!(policy.exponential_delay(2), Duration::from_secs(2));
+        assert_eq!(policy.exponential_delay(3), Duration::from_secs(4));
+        assert_eq!(policy.exponential_delay(4), Duration::from_secs(8));
+        assert_eq!(policy.exponential_delay(5), Duration::from_secs(8));
+        assert_eq!(policy.exponential_delay(31), Duration::from_secs(8));
     }
 
     #[test]
     fn delay_before_retry_honors_retry_after_then_caps() {
-        let policy = RetryPolicy::default_policy();
+        let policy = AttemptPolicy::default();
         assert_eq!(
             policy.delay_before_retry(0, None),
-            Duration::from_millis(250)
+            Duration::from_millis(500)
         );
         assert_eq!(
             policy.delay_before_retry(0, Some(Duration::from_secs(2))),
@@ -687,25 +827,25 @@ mod tests {
         );
         assert_eq!(
             policy.delay_before_retry(0, Some(Duration::from_millis(100))),
-            Duration::from_millis(250)
+            Duration::from_millis(500)
         );
         assert_eq!(
             policy.delay_before_retry(0, Some(Duration::from_secs(30))),
-            Duration::from_secs(4)
+            Duration::from_secs(8)
         );
     }
 
     #[test]
     fn budget_helper_rejects_unaffordable_sleeps() {
-        let policy = RetryPolicy::default_policy();
-        assert!(policy.can_afford(Duration::ZERO, Duration::from_secs(15)));
+        let policy = AttemptPolicy::default();
+        assert!(policy.can_afford(Duration::ZERO, Duration::from_secs(30)));
         assert!(!policy.can_afford(
             Duration::ZERO,
-            Duration::from_secs(15) + Duration::from_nanos(1)
+            Duration::from_secs(30) + Duration::from_nanos(1)
         ));
-        assert!(policy.can_afford(Duration::from_secs(14), Duration::from_secs(1)));
+        assert!(policy.can_afford(Duration::from_secs(29), Duration::from_secs(1)));
         assert!(!policy.can_afford(
-            Duration::from_secs(14),
+            Duration::from_secs(29),
             Duration::from_secs(1) + Duration::from_nanos(1)
         ));
         assert!(!policy.can_afford(Duration::from_secs(10), Duration::MAX));
@@ -724,11 +864,11 @@ mod tests {
     }
 
     #[test]
-    fn exchange_defaults_to_retry_policy_and_accepts_override() {
+    fn exchange_defaults_to_attempt_policy_and_accepts_override() {
         let exchange = default_exchange(RequestAuthorizer::default(), Vec::new());
-        assert_eq!(exchange.retry, RetryPolicy::default_policy());
-        let disabled = exchange.with_retry_policy(RetryPolicy::disabled());
-        assert_eq!(disabled.retry, RetryPolicy::disabled());
+        assert_eq!(exchange.attempts, AttemptPolicy::default());
+        let disabled = exchange.with_attempt_policy(AttemptPolicy::disabled());
+        assert_eq!(disabled.attempts, AttemptPolicy::disabled());
     }
 
     const WIRE_OVERFLOW: &str = "test wire size overflowed";
@@ -750,27 +890,27 @@ mod tests {
     fn exchange_with_retry(
         authorizer: RequestAuthorizer,
         redactions: Vec<String>,
-        retry: RetryPolicy,
+        retry: AttemptPolicy,
     ) -> HttpExchange {
         HttpExchange::new(
             build_direct_client().unwrap(),
             authorizer,
             Arc::from(redactions),
         )
-        .with_retry_policy(retry)
+        .with_attempt_policy(retry)
     }
 
-    fn fast_retry_policy() -> RetryPolicy {
-        RetryPolicy {
-            max_attempts: 3,
-            base_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(1),
-            total_budget: Duration::from_secs(1),
-        }
+    fn fast_retry_policy() -> AttemptPolicy {
+        AttemptPolicy::new(
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
     }
 
     fn default_exchange(authorizer: RequestAuthorizer, redactions: Vec<String>) -> HttpExchange {
-        exchange_with_retry(authorizer, redactions, RetryPolicy::default_policy())
+        exchange_with_retry(authorizer, redactions, AttemptPolicy::default())
     }
 
     #[tokio::test]
@@ -794,7 +934,7 @@ mod tests {
                 String::new(),
             ],
         )
-        .execute(request, body.len(), messages())
+        .execute_fresh(request, body.len(), messages())
         .await
         .unwrap();
         let ExchangeOutcome::Success(response) = outcome else {
@@ -835,9 +975,9 @@ mod tests {
         let outcome = exchange_with_retry(
             RequestAuthorizer::default(),
             Vec::new(),
-            RetryPolicy::disabled(),
+            AttemptPolicy::disabled(),
         )
-        .execute(request, usize::MAX, messages())
+        .execute_fresh(request, usize::MAX, messages())
         .await
         .unwrap();
         let ExchangeOutcome::Rejected(rejection) = outcome else {
@@ -858,7 +998,7 @@ mod tests {
         );
         let request = build_direct_client().unwrap().get(url).build().unwrap();
         let ExchangeOutcome::Success(response) = exchange(RequestAuthorizer::default(), Vec::new())
-            .execute(request, exact_body.len(), messages())
+            .execute_fresh(request, exact_body.len(), messages())
             .await
             .unwrap()
         else {
@@ -875,7 +1015,7 @@ mod tests {
         );
         let request = build_direct_client().unwrap().get(url).build().unwrap();
         let ExchangeOutcome::Success(response) = exchange(RequestAuthorizer::default(), Vec::new())
-            .execute(request, 4, messages())
+            .execute_fresh(request, 4, messages())
             .await
             .unwrap()
         else {
@@ -901,7 +1041,7 @@ mod tests {
             authorizer,
             vec!["short".to_owned(), secret.to_owned(), "short".to_owned()],
         )
-        .execute(request, usize::MAX, messages())
+        .execute_fresh(request, usize::MAX, messages())
         .await
         .unwrap();
         let ExchangeOutcome::Rejected(rejection) = outcome else {
@@ -929,7 +1069,7 @@ mod tests {
             .unwrap();
 
         let ExchangeOutcome::Success(response) = exchange(authorizer, Vec::new())
-            .execute(request, usize::MAX, messages())
+            .execute_fresh(request, usize::MAX, messages())
             .await
             .unwrap()
         else {
@@ -1074,7 +1214,7 @@ mod tests {
         let request = build_direct_client().unwrap().get(&url).build().unwrap();
 
         let outcome = exchange(RequestAuthorizer::default(), Vec::new())
-            .execute(request, body.len(), messages())
+            .execute_fresh(request, body.len(), messages())
             .await
             .unwrap();
         let ExchangeOutcome::Success(response) = outcome else {
@@ -1100,7 +1240,7 @@ mod tests {
         let request = build_direct_client().unwrap().get(&url).build().unwrap();
 
         let outcome = exchange(RequestAuthorizer::default(), Vec::new())
-            .execute(request, usize::MAX, messages())
+            .execute_fresh(request, usize::MAX, messages())
             .await
             .unwrap();
         let ExchangeOutcome::Rejected(rejection) = outcome else {
@@ -1123,9 +1263,9 @@ mod tests {
         let outcome = exchange_with_retry(
             RequestAuthorizer::default(),
             Vec::new(),
-            RetryPolicy::disabled(),
+            AttemptPolicy::disabled(),
         )
-        .execute(request, usize::MAX, messages())
+        .execute_fresh(request, usize::MAX, messages())
         .await
         .unwrap();
         let ExchangeOutcome::Rejected(rejection) = outcome else {
@@ -1153,7 +1293,7 @@ mod tests {
         let request = build_direct_client().unwrap().get(&url).build().unwrap();
 
         let outcome = exchange(RequestAuthorizer::default(), Vec::new())
-            .execute(request, usize::MAX, messages())
+            .execute_fresh(request, usize::MAX, messages())
             .await
             .unwrap();
         let ExchangeOutcome::Rejected(rejection) = outcome else {
@@ -1183,14 +1323,14 @@ mod tests {
 
         // Cap Retry-After via max_delay so the test stays fast while still
         // exercising the header parse + delay selection path.
-        let policy = RetryPolicy {
-            max_attempts: 3,
-            base_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(5),
-            total_budget: Duration::from_secs(1),
-        };
+        let policy = AttemptPolicy::new(
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+        );
         let outcome = exchange_with_retry(RequestAuthorizer::default(), Vec::new(), policy)
-            .execute(request, body.len(), messages())
+            .execute_fresh(request, body.len(), messages())
             .await
             .unwrap();
         let ExchangeOutcome::Success(_) = outcome else {
@@ -1215,7 +1355,7 @@ mod tests {
         let request = build_direct_client().unwrap().get(&url).build().unwrap();
 
         let outcome = exchange(RequestAuthorizer::default(), Vec::new())
-            .execute(request, body.len(), messages())
+            .execute_fresh(request, body.len(), messages())
             .await
             .unwrap();
         let ExchangeOutcome::Success(response) = outcome else {
@@ -1259,7 +1399,7 @@ mod tests {
         let request = build_direct_client().unwrap().get(&url).build().unwrap();
 
         let outcome = exchange(authorizer, Vec::new())
-            .execute(request, body.len(), messages())
+            .execute_fresh(request, body.len(), messages())
             .await
             .unwrap();
         let ExchangeOutcome::Success(response) = outcome else {

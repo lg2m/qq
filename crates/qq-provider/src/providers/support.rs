@@ -10,7 +10,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    ProviderError, ProviderErrorKind, ProviderUsage, http::HttpRejection,
+    ProviderError, ProviderErrorKind, ProviderUsage,
+    http::{HttpRejection, note_attempts},
     sanitize::sanitize_message,
 };
 
@@ -48,7 +49,7 @@ pub(crate) fn api_error<E: DeserializeOwned>(
         };
     }
 
-    ProviderError::Api { status, message }
+    note_attempts(ProviderError::Api { status, message }, rejection.attempts())
 }
 
 /// Message-text detection of context-window overflow for providers that

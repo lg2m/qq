@@ -82,15 +82,21 @@ shared driver into a shallow generic-provider abstraction. Shared behavior must
 continue to pass the deletion test: it replaces implementation in at least two
 adapters.
 
-Before a successful response is handed to an adapter, `HttpExchange` may retry
-transient pre-stream failures under a fixed internal policy (default three
-attempts, exponential backoff with full jitter, a total delay budget, and
-`Retry-After` delta-seconds when present). Retryable outcomes are transport
-errors and HTTP `408` / `429` / `500` / `502` / `503` / `504`. Auth and other
-client errors are not retried, and nothing is retried after success headers are
-observed. Operational probes use `ProviderCompiler::compile_for_canary`, which
-disables direct HTTP and Mantle adapter retries through the facade. Bedrock's AWS
-SDK client already has SDK retries disabled.
+The provider is the single retry owner. Each compiled HTTP provider carries one
+public `AttemptPolicy` (default four attempts, 500 ms base, 8 s cap, 30 s
+budget, full jitter, `Retry-After` delta-seconds honored) set through
+`ProviderCompiler::with_attempt_policy`. Every send a logical request costs
+draws from one shared ledger: a transport error or retryable status (`408` /
+`429` / `500` / `502` / `503` / `504`) before the body, and an SSE body that
+fails or ends before it has decoded a single event. Once one `ProviderEvent`
+has been yielded the request is never resent, so a retry can never duplicate
+output; a body that ends after events is the adapter's protocol error. Auth
+and other client errors are never retried. When the policy is exhausted the
+final error message records the attempts spent. Nothing above the provider —
+not the core run loop, not the session layer — retries a turn. Operational
+probes use `ProviderCompiler::compile_for_canary`, which disables direct HTTP
+and Mantle adapter retries through the facade. Bedrock's AWS SDK client already
+has SDK retries disabled.
 
 Header consolidation follows the same boundary. `http.rs` defines universal
 request-controlled names and parses names and values, marks sensitive values,

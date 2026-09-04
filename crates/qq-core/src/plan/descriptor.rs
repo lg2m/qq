@@ -7,15 +7,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::PlanCompileError;
-use crate::TurnRetryPolicy;
 
 /// Version of the descriptor's canonical encoding. Bump it whenever a field is
 /// added, removed, renamed, or its normalization changes, so historical digests
 /// are never compared against a different encoding.
-pub const DESCRIPTOR_VERSION: u16 = 4;
+pub const DESCRIPTOR_VERSION: u16 = 5;
 
 /// Domain separator prepended to the canonical bytes before hashing.
-const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v4\0";
+const DIGEST_DOMAIN: &[u8] = b"qq-agent-plan-descriptor-v5\0";
 
 /// Where a credential comes from, without its value. Two plans that read the
 /// same environment variable or stored credential name share a reference and
@@ -159,23 +158,6 @@ pub struct SkillIndexDescriptor {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetryPolicyDescriptor {
-    pub max_attempts: u32,
-    pub base_delay_ms: u64,
-    pub max_delay_ms: u64,
-}
-
-impl From<TurnRetryPolicy> for RetryPolicyDescriptor {
-    fn from(policy: TurnRetryPolicy) -> Self {
-        Self {
-            max_attempts: policy.max_attempts(),
-            base_delay_ms: u64::try_from(policy.base_delay().as_millis()).unwrap_or(u64::MAX),
-            max_delay_ms: u64::try_from(policy.max_delay().as_millis()).unwrap_or(u64::MAX),
-        }
-    }
-}
-
 /// Everything behavior-affecting about a compiled plan, and nothing secret.
 ///
 /// Field order is the canonical order: the digest hashes the compact JSON
@@ -209,7 +191,6 @@ pub struct AgentPlanDescriptor {
     pub pack: Option<PackDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerDescriptor>,
-    pub retry: RetryPolicyDescriptor,
     /// Labels of the configuration sources that produced the plan, in
     /// application order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

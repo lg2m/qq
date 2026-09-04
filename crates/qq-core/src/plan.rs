@@ -4,7 +4,7 @@
 //! not depend on the prompt: the compiled provider handle, the resolved model,
 //! the open workspace with its instructions, the complete tool catalog (built-
 //! ins plus every external host's admitted declarations), the skill index, the
-//! sub-agent routes, and the retry policy. Compiling it does the filesystem,
+//! and the sub-agent routes. Compiling it does the filesystem,
 //! provider, and host-catalog work once; the run loop then executes directly
 //! from shared immutable data. Its [`AgentPlanDescriptor`] is the secret-free
 //! account of that behavior whose canonical digest identifies the plan for
@@ -30,12 +30,12 @@ use thiserror::Error;
 pub use descriptor::{
     AgentPlanDescriptor, AuditDescriptor, AuditModeDescriptor, CredentialReference,
     DESCRIPTOR_VERSION, McpServerDescriptor, McpTransportKind, PackDescriptor, ProviderDescriptor,
-    RetryPolicyDescriptor, SkillIndexDescriptor, ToolCatalogDescriptor,
+    SkillIndexDescriptor, ToolCatalogDescriptor,
 };
 pub use fingerprint::SourceFingerprint;
 
 use crate::{
-    ContextCache, ContextSource, Runtime, RuntimeConfigError, TurnRetryPolicy,
+    ContextCache, ContextSource, Runtime, RuntimeConfigError,
     catalog::{
         EffectClass, HostContribution, StaticTool, ToolCatalog, ToolHost, select_tools_spec,
     },
@@ -113,7 +113,6 @@ pub struct AgentProfile {
     spawn_model_routes: Vec<String>,
     delegation: DelegationRoster,
     audit: AuditPolicy,
-    turn_retry: TurnRetryPolicy,
     adapter_build: String,
     provenance: Vec<String>,
     credential_epoch: CredentialEpoch,
@@ -143,7 +142,6 @@ impl AgentProfile {
             spawn_model_routes: Vec::new(),
             delegation: DelegationRoster::default(),
             audit: AuditPolicy::default(),
-            turn_retry: TurnRetryPolicy::default(),
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
             credential_epoch: CredentialEpoch::NONE,
@@ -174,7 +172,6 @@ impl AgentProfile {
             spawn_model_routes: runtime.spawn_model_routes.to_vec(),
             delegation: runtime.delegation.as_ref().clone(),
             audit: runtime.audit,
-            turn_retry: runtime.turn_retry,
             adapter_build: qq_provider::BUILD_IDENTITY.to_owned(),
             provenance: Vec::new(),
             credential_epoch: CredentialEpoch::NONE,
@@ -250,12 +247,6 @@ impl AgentProfile {
     #[must_use]
     pub const fn with_audit(mut self, audit: AuditPolicy) -> Self {
         self.audit = audit;
-        self
-    }
-
-    #[must_use]
-    pub fn with_turn_retry_policy(mut self, policy: TurnRetryPolicy) -> Self {
-        self.turn_retry = policy;
         self
     }
 
@@ -393,7 +384,6 @@ impl CompiledAgentPlan {
             spawn_model_routes,
             delegation,
             audit,
-            turn_retry,
             adapter_build,
             provenance,
             credential_epoch,
@@ -408,7 +398,6 @@ impl CompiledAgentPlan {
             resolved_model.max_output_tokens,
         )?
         .with_context_window(resolved_model.context_window)
-        .with_turn_retry_policy(turn_retry)
         .with_spawn_model_routes(spawn_model_routes)
         .with_delegation(delegation)
         .with_audit(audit);
@@ -586,7 +575,6 @@ impl CompiledAgentPlan {
             },
             pack: pack_descriptor,
             mcp_servers,
-            retry: RetryPolicyDescriptor::from(runtime.turn_retry),
             provenance,
         };
         let digest = descriptor.digest()?;
@@ -967,7 +955,6 @@ mod tests {
                 call_timeout_seconds: 60,
                 max_concurrent_calls: 4,
             }],
-            retry: RetryPolicyDescriptor::from(TurnRetryPolicy::default()),
             provenance: vec!["compiled defaults".to_owned()],
         }
     }
@@ -978,7 +965,7 @@ mod tests {
         let bytes = descriptor.canonical_bytes().unwrap();
         assert!(
             bytes.starts_with(
-                b"qq-agent-plan-descriptor-v4\0{\"version\":4,\"profile\":\"review\","
+                b"qq-agent-plan-descriptor-v5\0{\"version\":5,\"profile\":\"review\","
             )
         );
         // The golden digest pins the canonical encoding. A change here means
@@ -986,10 +973,10 @@ mod tests {
         // from a different encoding.
         assert_eq!(
             descriptor.digest().unwrap().to_string(),
-            "7e5b9a76b69f15490e80467122f2733e733e72b3bd7bf9169040ff1baac64201"
+            "724ffeb55a54288aebdf946424f81deb4a6e87f07c04b722b850b5e847dd0ca7"
         );
         let round_trip: AgentPlanDescriptor =
-            serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v4\0".len()..]).unwrap();
+            serde_json::from_slice(&bytes[b"qq-agent-plan-descriptor-v5\0".len()..]).unwrap();
         assert_eq!(round_trip, descriptor);
         assert_eq!(round_trip.digest().unwrap(), descriptor.digest().unwrap());
     }
@@ -1153,10 +1140,6 @@ mod tests {
                 Box::new(|d| {
                     d.mcp_servers[0].credential = CredentialReference::Stored("tok".to_owned());
                 }),
-            ),
-            (
-                "retry.max_attempts",
-                Box::new(|d| d.retry.max_attempts += 1),
             ),
             (
                 "provenance",

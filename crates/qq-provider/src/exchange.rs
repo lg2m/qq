@@ -14,10 +14,10 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap};
 use serde::Serialize;
 
 use crate::{
-    ProviderError,
+    ProviderError, ProviderErrorKind, ProviderStream,
     http::{
-        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, is_event_stream_headers,
-        transport_error,
+        ExchangeMessages, ExchangeOutcome, HttpExchange, HttpRejection, SharedLedger,
+        is_event_stream_headers, note_attempts, transport_error,
     },
     sse::{SseDecoder, SseEvent},
 };
@@ -83,6 +83,7 @@ pub(crate) struct SseExchangeStream {
     chunks: futures_core::stream::BoxStream<'static, Result<bytes::Bytes, ProviderError>>,
     decoder: SseDecoder,
     pending: VecDeque<SseEvent>,
+    decoded_any: bool,
 }
 
 impl SseExchangeStream {
@@ -95,6 +96,7 @@ impl SseExchangeStream {
     pub(crate) async fn next_event(&mut self) -> Result<Option<SseEvent>, ProviderError> {
         loop {
             if let Some(event) = self.pending.pop_front() {
+                self.decoded_any = true;
                 return Ok(Some(event));
             }
             match self.chunks.next().await {
@@ -103,17 +105,31 @@ impl SseExchangeStream {
             }
         }
     }
+
+    /// The error for a body that ended before the protocol's terminal event.
+    /// A body that carried no event at all is a dropped connection
+    /// (`Transport`, retryable under the attempt policy); one that ended
+    /// mid-conversation is the provider's protocol violation.
+    pub(crate) fn ended_early(&self, message: &str) -> ProviderError {
+        if self.decoded_any {
+            ProviderError::Protocol(message.to_owned())
+        } else {
+            ProviderError::Transport(format!("{message} (no events were received)"))
+        }
+    }
 }
 
-/// Executes one SSE request and prepares its decoded event stream.
+/// Executes one SSE request and prepares its decoded event stream. Pre-body
+/// retries draw from `ledger`; the caller keeps it so a restart after the
+/// body has begun draws from the same count.
 pub(crate) async fn sse_exchange(
     exchange: &HttpExchange,
-    endpoint: reqwest::Url,
-    headers: HeaderMap,
+    (endpoint, headers): (reqwest::Url, HeaderMap),
     body: &impl Serialize,
     decoder: SseDecoder,
     wire_limit: usize,
     spec: SseExchangeSpec,
+    ledger: &SharedLedger,
 ) -> Result<SseExchangeStream, SseExchangeError> {
     let request = exchange
         .request(reqwest::Method::POST, endpoint)
@@ -122,7 +138,10 @@ pub(crate) async fn sse_exchange(
         .json(body)
         .build()
         .map_err(|error| transport_error(error, exchange.static_redactions()))?;
-    let response = match exchange.execute(request, wire_limit, spec.messages).await? {
+    let response = match exchange
+        .execute(request, wire_limit, spec.messages, ledger)
+        .await?
+    {
         ExchangeOutcome::Success(response) => response,
         ExchangeOutcome::Rejected(rejection) => return Err(SseExchangeError::Rejected(rejection)),
     };
@@ -136,6 +155,78 @@ pub(crate) async fn sse_exchange(
         chunks: response.into_body(),
         decoder,
         pending: VecDeque::new(),
+        decoded_any: false,
+    })
+}
+
+/// A provider failure the policy may spend another attempt on: the request
+/// never reached the model, or the model never answered. Rejections,
+/// authentication, and protocol violations are the caller's to see.
+pub(crate) const fn is_transient(kind: ProviderErrorKind) -> bool {
+    matches!(
+        kind,
+        ProviderErrorKind::Unavailable
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Transport
+    )
+}
+
+/// Wraps an adapter's stream factory in the provider's restart loop.
+///
+/// `attempt` builds one full attempt: request, exchange, decode, fold. The
+/// wrapper polls it and, while the attempt has yielded no semantic event,
+/// treats a transient error or an end-of-stream as a failed send and restarts
+/// under `ledger`. Once one event has been yielded the attempt is committed:
+/// its errors and its end pass through unchanged, because a resend could
+/// duplicate output the caller already observed. The final error records the
+/// attempts spent.
+pub(crate) fn with_restart<F>(exchange: &HttpExchange, attempt: F) -> ProviderStream
+where
+    F: Fn(SharedLedger) -> ProviderStream + Send + Sync + 'static,
+{
+    let ledger = exchange.ledger();
+    Box::pin(async_stream::stream! {
+        loop {
+            let mut inner = attempt(ledger.clone());
+            let mut yielded = false;
+            let delay = loop {
+                match inner.next().await {
+                    Some(Ok(event)) => {
+                        yielded = true;
+                        yield Ok(event);
+                    }
+                    Some(Err(error)) if !yielded && is_transient(error.kind()) => {
+                        let (next_delay, attempts) = {
+                            let ledger = ledger.lock();
+                            (ledger.next_delay(None), ledger.attempts())
+                        };
+                        match next_delay {
+                            Some(delay) => break delay,
+                            None => {
+                                yield Err(note_attempts(error, attempts));
+                                return;
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let attempts = ledger.lock().attempts();
+                        yield Err(if yielded {
+                            error
+                        } else {
+                            note_attempts(error, attempts)
+                        });
+                        return;
+                    }
+                    // A body that ends without any event is a dropped
+                    // connection: the adapter's `ended_early` already turned
+                    // it into a transient error above. A body that ends
+                    // after events is the adapter's own terminal event.
+                    None => return,
+                }
+            };
+            drop(inner);
+            tokio::time::sleep(delay).await;
+        }
     })
 }
 
@@ -145,7 +236,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        http::build_direct_client, request_auth::RequestAuthorizer, sse::Utf8ErrorMessage,
+        http::{AttemptPolicy, build_direct_client},
+        request_auth::RequestAuthorizer,
+        sse::Utf8ErrorMessage,
         test_support::LoopbackServer,
     };
 
@@ -177,7 +270,7 @@ mod tests {
             RequestAuthorizer::default(),
             Arc::from(redactions),
         )
-        .with_retry_policy(crate::http::RetryPolicy::disabled())
+        .with_attempt_policy(crate::http::AttemptPolicy::disabled())
     }
 
     async fn drive(
@@ -185,14 +278,16 @@ mod tests {
         content_type_gate: ContentTypeGate,
     ) -> Result<SseExchangeStream, SseExchangeError> {
         let endpoint = reqwest::Url::parse(&format!("{}/v1/test", server.base_url)).unwrap();
+        let exchange = exchange(vec!["loopback-secret".to_owned()]);
+        let ledger = exchange.ledger();
         sse_exchange(
-            &exchange(vec!["loopback-secret".to_owned()]),
-            endpoint,
-            HeaderMap::new(),
+            &exchange,
+            (endpoint, HeaderMap::new()),
             &json!({"model": "test-model"}),
             decoder(),
             1_024 * 1_024,
             spec(content_type_gate),
+            &ledger,
         )
         .await
     }
@@ -268,5 +363,189 @@ mod tests {
             ProviderError::Protocol(message)
                 if message == "test provider returned a non-SSE response"
         ));
+    }
+
+    /// A scripted stream factory: each call consumes the next script entry.
+    fn scripted(
+        policy: AttemptPolicy,
+        scripts: Vec<Vec<Result<crate::ProviderEvent, ProviderError>>>,
+    ) -> (ProviderStream, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let exchange = exchange(Vec::new()).with_attempt_policy(policy);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scripts = Arc::new(std::sync::Mutex::new(scripts.into_iter()));
+        let observed = Arc::clone(&calls);
+        let stream = with_restart(&exchange, move |ledger| {
+            // Every factory call is one send against the shared ledger, the
+            // way `sse_exchange` records it.
+            ledger.lock().begin_attempt();
+            calls.fetch_add(1, Ordering::SeqCst);
+            let script = scripts
+                .lock()
+                .unwrap()
+                .next()
+                .expect("the script must cover every attempt");
+            Box::pin(futures_util::stream::iter(script))
+        });
+        (stream, observed)
+    }
+
+    fn fast(attempts: u32) -> AttemptPolicy {
+        AttemptPolicy::new(
+            attempts,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(5),
+        )
+    }
+
+    fn text(text: &str) -> Result<crate::ProviderEvent, ProviderError> {
+        Ok(crate::ProviderEvent::OutputTextDelta {
+            text: text.to_owned(),
+        })
+    }
+
+    #[tokio::test]
+    async fn restarts_a_stream_that_fails_before_its_first_event() {
+        let (stream, calls) = scripted(
+            fast(4),
+            vec![
+                vec![Err(ProviderError::Transport("dropped".to_owned()))],
+                vec![Err(ProviderError::Api {
+                    status: 503,
+                    message: "overloaded".to_owned(),
+                })],
+                vec![
+                    text("a"),
+                    text("b"),
+                    Ok(crate::ProviderEvent::Completed { usage: None }),
+                ],
+            ],
+        );
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(events.iter().all(Result::is_ok));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_ends_before_any_event_costs_one_attempt() {
+        // The adapter reports an empty body through `ended_early`, which is
+        // transport-class before the first event and protocol-class after.
+        let empty = SseExchangeStream {
+            redactions: Arc::from(Vec::<String>::new()),
+            chunks: Box::pin(futures_util::stream::empty()),
+            decoder: decoder(),
+            pending: VecDeque::new(),
+            decoded_any: false,
+        };
+        let before = empty.ended_early("stream ended before done");
+        assert_eq!(before.kind(), ProviderErrorKind::Transport);
+        let mut after = empty;
+        after.decoded_any = true;
+        assert_eq!(
+            after.ended_early("stream ended before done").kind(),
+            ProviderErrorKind::Protocol
+        );
+
+        let (stream, calls) = scripted(
+            fast(4),
+            vec![
+                vec![Err(before)],
+                vec![
+                    text("late"),
+                    Ok(crate::ProviderEvent::Completed { usage: None }),
+                ],
+            ],
+        );
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn never_restarts_after_an_event_has_been_yielded() {
+        // Duplicating "a" would be visible to the caller, so the transient
+        // error after it passes straight through and nothing is resent.
+        let (stream, calls) = scripted(
+            fast(4),
+            vec![vec![
+                text("a"),
+                Err(ProviderError::Transport("cut mid-stream".to_owned())),
+            ]],
+        );
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_ok());
+        let error = events[1].as_ref().unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::Transport);
+        assert_eq!(error.to_string(), "provider request failed: cut mid-stream");
+    }
+
+    #[tokio::test]
+    async fn attempts_never_exceed_the_policy_and_the_failure_records_them() {
+        let (stream, calls) = scripted(
+            fast(3),
+            vec![
+                vec![Err(ProviderError::Transport("one".to_owned()))],
+                vec![Err(ProviderError::Transport("two".to_owned()))],
+                vec![Err(ProviderError::Transport("three".to_owned()))],
+                vec![text("never reached")],
+            ],
+        );
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(events.len(), 1);
+        let error = events[0].as_ref().unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::Transport);
+        assert!(
+            error
+                .to_string()
+                .ends_with("three (gave up after 3 attempts with backoff)"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_transient_failures_are_never_retried() {
+        for error in [
+            ProviderError::Api {
+                status: 401,
+                message: "denied".to_owned(),
+            },
+            ProviderError::Protocol("garbage".to_owned()),
+            ProviderError::Configuration("bad".to_owned()),
+        ] {
+            let kind = error.kind();
+            let (stream, calls) = scripted(fast(4), vec![vec![Err(error)], vec![text("no")]]);
+            let events: Vec<_> = stream.collect().await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{kind:?}"
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].as_ref().unwrap_err().kind(), kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_policy_makes_exactly_one_attempt() {
+        let (stream, calls) = scripted(
+            AttemptPolicy::disabled(),
+            vec![
+                vec![Err(ProviderError::Transport("once".to_owned()))],
+                vec![text("no")],
+            ],
+        );
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].as_ref().unwrap_err().to_string(),
+            "provider request failed: once",
+            "a single attempt carries no attempt suffix"
+        );
     }
 }

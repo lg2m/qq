@@ -1872,6 +1872,10 @@ enum ProviderMode {
         name: &'static str,
         arguments: &'static str,
     },
+    /// Every stream fails before its first event. The runtime above the
+    /// provider must not resend, so the attempts-per-turn ratio it produces
+    /// is the retry amplification above the single provider retry owner.
+    Faulting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2076,6 +2080,12 @@ impl Provider for BenchmarkProvider {
                 })
             }
             ProviderMode::Hanging => Box::pin(stream::pending()),
+            ProviderMode::Faulting => Box::pin(stream::once(async {
+                Err(ProviderError::Api {
+                    status: 503,
+                    message: "benchmark provider overloaded".to_owned(),
+                })
+            })),
             ProviderMode::Tool { name, arguments } => {
                 let has_result = request
                     .messages()
@@ -2428,6 +2438,11 @@ async fn run_workloads(
         cancellation_workloads(samples, warmups).await?;
     metrics.extend(cancellation_metrics);
     checks.extend(cancellation_checks);
+
+    let (amplification_metrics, amplification_checks) =
+        retry_amplification_workloads(samples).await?;
+    metrics.extend(amplification_metrics);
+    checks.extend(amplification_checks);
 
     let (stream_metrics, stream_checks) = long_stream_workloads(samples).await?;
     metrics.extend(stream_metrics);
@@ -3559,6 +3574,72 @@ async fn cancellation_workloads(
     }
     .await;
     finish_runtime_fixture(&fixture, "shut down cancellation runtime", operation).await
+}
+
+/// Retry amplification above the provider: with a provider that fails every
+/// stream before its first event, the number of provider entries per failed
+/// run is the number of sends the runtime issued for one logical turn. The
+/// provider is the single retry owner, so the expected value is exactly one
+/// and the gate is below 1.05.
+async fn retry_amplification_workloads(
+    samples: u16,
+) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
+    let runs = samples.clamp(5, 20);
+    let mut fixture = RuntimeFixture::open(ProviderMode::Faulting).await?;
+    let operation = async {
+        let mut entries_per_run = Vec::with_capacity(usize::from(runs));
+        for _ in 0..runs {
+            let (session_id, cursor) = fixture.create_session(ApprovalMode::ReadOnly).await?;
+            let mut events = fixture.subscribe(cursor)?;
+            let queued = session_command(
+                "submit faulting prompt",
+                &fixture.runtime,
+                generate_id("faulting prompt command")?,
+                SessionCommand::SubmitPrompt {
+                    session_id,
+                    input: vec![qq_protocol::InputPart::text("fail please".to_owned())],
+                    limits: qq_protocol::RunLimits::default(),
+                    correlation: qq_protocol::Correlation::default(),
+                },
+            )
+            .await?;
+            let run_id = prompt_run_id(&queued)?;
+            let (outcome, _, _) = wait_for_run(&mut events, run_id).await?;
+            if !matches!(outcome, RunOutcome::Failed { .. }) {
+                return Err(PerfError::Fixture(
+                    "faulting run did not settle as failed".to_owned(),
+                ));
+            }
+            // The run has settled, so every provider entry it caused is
+            // already in the channel.
+            let mut entries = 0_u64;
+            while let Ok(mark) = fixture.marks.try_recv() {
+                if mark.kind == ProviderMarkKind::Entered {
+                    entries += 1;
+                }
+            }
+            entries_per_run.push(entries);
+        }
+        let total: u64 = entries_per_run.iter().sum();
+        let ratio_milli = total.saturating_mul(1_000) / u64::from(runs);
+        Ok((
+            vec![MetricResult::scalar(
+                "provider_retry_amplification_milli",
+                "ratio_milli",
+                "provider stream entries per logical turn when every stream fails before its first event; the provider owns retry so the runtime must add none",
+                ratio_milli,
+            )?],
+            vec![CorrectnessCheck {
+                name: "retry_amplification_bounded".to_owned(),
+                passed: ratio_milli < 1_050,
+                detail: format!(
+                    "{total} provider entries across {runs} failed runs ({ratio_milli} milli); gate is below 1050"
+                ),
+            }],
+        ))
+    }
+    .await;
+    finish_runtime_fixture(&fixture, "shut down amplification runtime", operation).await
 }
 
 async fn long_stream_workloads(
@@ -4820,6 +4901,17 @@ async fn measure_load_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixture's amplification counter must observe exactly one provider
+    /// entry per failed run: the provider owns retry, the runtime adds none.
+    #[tokio::test]
+    async fn retry_amplification_fixture_observes_one_send_per_turn() {
+        let (metrics, checks) = retry_amplification_workloads(5).await.unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "provider_retry_amplification_milli");
+        assert_eq!(metrics[0].summary.p95, 1_000, "{:?}", metrics[0].summary);
+        assert!(checks[0].passed, "{}", checks[0].detail);
+    }
 
     #[test]
     fn statistics_use_nearest_rank_percentiles_and_report_p99_at_one_hundred_samples() {

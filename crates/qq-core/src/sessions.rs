@@ -15480,10 +15480,6 @@ mod tests {
                 Runtime::new(provider, "test-model", max_output_tokens)
                     .map(|runtime| runtime.with_context_window(context_window))
                     .map(|runtime| {
-                        // Failure-path tests assert on the first error; turn
-                        // retry is covered in lib.rs.
-                        let runtime =
-                            runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled());
                         let mut resolved = test_resolved_model(
                             "test/model",
                             runtime.model.to_string(),
@@ -24936,11 +24932,7 @@ mod tests {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| {
                         loaded_runtime(
-                            runtime
-                                .with_spawn_model_routes(spawn_model_routes)
-                                // Failure-path tests assert on the first
-                                // error; turn retry is covered in lib.rs.
-                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
+                            runtime.with_spawn_model_routes(spawn_model_routes),
                             &request.workspace,
                             None,
                         )
@@ -24987,11 +24979,7 @@ mod tests {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| {
                         loaded_runtime(
-                            runtime
-                                .with_spawn_model_routes(spawn_model_routes)
-                                // Failure-path tests assert on the first
-                                // error; turn retry is covered in lib.rs.
-                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
+                            runtime.with_spawn_model_routes(spawn_model_routes),
                             &request.workspace,
                             None,
                         )
@@ -25077,13 +25065,7 @@ mod tests {
             };
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
-                    .map(|runtime| {
-                        loaded_runtime(
-                            runtime.with_turn_retry_policy(crate::TurnRetryPolicy::disabled()),
-                            &request.workspace,
-                            None,
-                        )
-                    })
+                    .map(|runtime| loaded_runtime(runtime, &request.workspace, None))
                     .map_err(|error| RuntimeLoadError {
                         kind: RunFailureKind::Configuration,
                         message: error.to_string(),
@@ -27294,14 +27276,12 @@ mod tests {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| {
                         loaded_runtime(
-                            runtime
-                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled())
-                                .with_delegation(qq_protocol::DelegationRoster {
-                                    roster: Vec::new(),
-                                    default_role: qq_protocol::DelegationRole::Balanced,
-                                    max_depth: 1,
-                                    write_children: true,
-                                }),
+                            runtime.with_delegation(qq_protocol::DelegationRoster {
+                                roster: Vec::new(),
+                                default_role: qq_protocol::DelegationRole::Balanced,
+                                max_depth: 1,
+                                write_children: true,
+                            }),
                             &request.workspace,
                             None,
                         )
@@ -27989,7 +27969,6 @@ mod tests {
                         loaded_runtime(
                             runtime
                                 .with_spawn_model_routes(spawn_model_routes)
-                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled())
                                 .with_delegation(delegation),
                             &request.workspace,
                             None,
@@ -28486,7 +28465,6 @@ mod tests {
                     .map(|runtime| {
                         loaded_runtime(
                             runtime
-                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled())
                                 .with_delegation(qq_protocol::DelegationRoster {
                                     roster: vec![qq_protocol::DelegationRosterEntry {
                                         route: "test/auditor".to_owned(),

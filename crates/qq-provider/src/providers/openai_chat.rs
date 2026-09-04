@@ -11,7 +11,7 @@ use crate::{
     ContentBlock, IncompleteReason, Message, ModelRequest, Provider, ProviderError,
     ProviderErrorKind, ProviderEvent, ProviderStream, ProviderUsage, Role, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
-    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange, with_restart},
     http::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
     },
@@ -55,6 +55,17 @@ pub(crate) struct OpenAiChatCompletions {
     headers: HeaderMap,
 }
 
+#[cfg(test)]
+impl OpenAiChatCompletions {
+    /// One attempt per request, so a scripted single-response server is
+    /// observed exactly once.
+    fn single_shot(mut self) -> Self {
+        self.exchange
+            .set_attempt_policy(crate::http::AttemptPolicy::disabled());
+        self
+    }
+}
+
 impl OpenAiChatCompletions {
     /// Creates a client for OpenAI's standard Chat Completions endpoint.
     #[cfg(test)]
@@ -87,6 +98,7 @@ impl OpenAiChatCompletions {
             static_headers,
             RequestAuthorizer::default(),
         )
+        .map(Self::single_shot)
     }
 
     pub(crate) fn with_client_and_authorizer(
@@ -112,95 +124,99 @@ impl Provider for OpenAiChatCompletions {
         let endpoint = self.endpoint.clone();
         let headers = self.headers.clone();
 
-        Box::pin(try_stream! {
-            let limits = StreamLimits::new(request.max_output_tokens());
-            let body = ChatCompletionsRequest::from(&request);
-            let mut sse = sse_exchange(
-                &exchange,
-                endpoint,
-                headers,
-                &body,
-                sse_decoder(limits.event),
-                limits.wire,
-                SSE_SPEC,
-            )
-            .await
-            .map_err(|error| error.into_provider_error(api_error))?;
+        with_restart(&self.exchange, move |ledger| {
+            let exchange = exchange.clone();
+            let endpoint = endpoint.clone();
+            let headers = headers.clone();
+            let request = request.clone();
+            Box::pin(try_stream! {
+                let limits = StreamLimits::new(request.max_output_tokens());
+                let body = ChatCompletionsRequest::from(&request);
+                let mut sse = sse_exchange(
+                    &exchange,
+                    (endpoint, headers),
+                    &body,
+                    sse_decoder(limits.event),
+                    limits.wire,
+                    SSE_SPEC,
+                    &ledger,
+                )
+                .await
+                .map_err(|error| error.into_provider_error(api_error))?;
 
-            let redactions = Arc::clone(sse.redactions());
-            let mut output_bytes = ByteCounter::new(
-                limits.output,
-                "OpenAI-compatible output size overflowed",
-                "OpenAI-compatible output exceeded the configured size limit",
-            );
-            let mut usage = UsageOnce::new(
-                "OpenAI-compatible stream reported usage more than once",
-            );
-            // Maps streamed tool-call array indexes to call ids so argument
-            // fragments and the finish reason can be attributed after the
-            // first fragment.
-            let mut tool_calls = ToolCallLedger::new(
-                "OpenAI-compatible stream reused a tool-call index",
-                "OpenAI-compatible stream sent arguments for an unknown tool call",
-            );
+                let redactions = Arc::clone(sse.redactions());
+                let mut output_bytes = ByteCounter::new(
+                    limits.output,
+                    "OpenAI-compatible output size overflowed",
+                    "OpenAI-compatible output exceeded the configured size limit",
+                );
+                let mut usage = UsageOnce::new(
+                    "OpenAI-compatible stream reported usage more than once",
+                );
+                // Maps streamed tool-call array indexes to call ids so argument
+                // fragments and the finish reason can be attributed after the
+                // first fragment.
+                let mut tool_calls = ToolCallLedger::new(
+                    "OpenAI-compatible stream reused a tool-call index",
+                    "OpenAI-compatible stream sent arguments for an unknown tool call",
+                );
 
-            // A `length` finish reason arrives before the usage chunk and
-            // `[DONE]`; remember it so the terminal event still carries usage.
-            let mut incomplete = None;
+                // A `length` finish reason arrives before the usage chunk and
+                // `[DONE]`; remember it so the terminal event still carries usage.
+                let mut incomplete = None;
 
-            while let Some(event) = sse.next_event().await? {
-                let data = event.data.trim();
-                if data.is_empty() {
-                    continue;
-                }
-                if data == "[DONE]" {
-                    let usage = usage.finish();
-                    match incomplete {
-                        Some(reason) => yield ProviderEvent::Incomplete { usage, reason },
-                        None => yield ProviderEvent::Completed { usage },
+                while let Some(event) = sse.next_event().await? {
+                    let data = event.data.trim();
+                    if data.is_empty() {
+                        continue;
                     }
-                    return;
-                }
+                    if data == "[DONE]" {
+                        let usage = usage.finish();
+                        match incomplete {
+                            Some(reason) => yield ProviderEvent::Incomplete { usage, reason },
+                            None => yield ProviderEvent::Completed { usage },
+                        }
+                        return;
+                    }
 
-                let decoded = decode_event(data, redactions.as_ref())?;
-                if let Some(chunk_usage) = decoded.usage {
-                    usage.set(chunk_usage)?;
-                }
-                for delta in decoded.deltas {
-                    match delta {
-                        DecodedDelta::OutputText(text) => {
-                            output_bytes.add(text.len())?;
-                            yield ProviderEvent::OutputTextDelta { text };
-                        }
-                        DecodedDelta::Refusal(text) => {
-                            output_bytes.add(text.len())?;
-                            yield ProviderEvent::RefusalDelta { text };
-                        }
-                        DecodedDelta::ToolCallStarted { index, id, name } => {
-                            tool_calls.insert(index, id.clone())?;
-                            yield ProviderEvent::ToolCallStarted { id, name };
-                        }
-                        DecodedDelta::ToolCallArguments { index, json } => {
-                            let id = tool_calls.get(&index)?.to_owned();
-                            output_bytes.add(json.len())?;
-                            yield ProviderEvent::ToolCallArgumentsDelta { id, json };
-                        }
-                        DecodedDelta::ToolCallsFinished => {
-                            for id in tool_calls.drain() {
-                                yield ProviderEvent::ToolCallCompleted { id };
+                    let decoded = decode_event(data, redactions.as_ref())?;
+                    if let Some(chunk_usage) = decoded.usage {
+                        usage.set(chunk_usage)?;
+                    }
+                    for delta in decoded.deltas {
+                        match delta {
+                            DecodedDelta::OutputText(text) => {
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::OutputTextDelta { text };
                             }
+                            DecodedDelta::Refusal(text) => {
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::RefusalDelta { text };
+                            }
+                            DecodedDelta::ToolCallStarted { index, id, name } => {
+                                tool_calls.insert(index, id.clone())?;
+                                yield ProviderEvent::ToolCallStarted { id, name };
+                            }
+                            DecodedDelta::ToolCallArguments { index, json } => {
+                                let id = tool_calls.get(&index)?.to_owned();
+                                output_bytes.add(json.len())?;
+                                yield ProviderEvent::ToolCallArgumentsDelta { id, json };
+                            }
+                            DecodedDelta::ToolCallsFinished => {
+                                for id in tool_calls.drain() {
+                                    yield ProviderEvent::ToolCallCompleted { id };
+                                }
+                            }
+                            DecodedDelta::Incomplete(reason) => {
+                                incomplete = Some(reason);
+                            }
+                            DecodedDelta::TerminalError(error) => Err(error)?,
                         }
-                        DecodedDelta::Incomplete(reason) => {
-                            incomplete = Some(reason);
-                        }
-                        DecodedDelta::TerminalError(error) => Err(error)?,
                     }
                 }
-            }
 
-            Err(ProviderError::Protocol(
-                "OpenAI-compatible stream ended before [DONE]".to_owned(),
-            ))?;
+                Err(sse.ended_early("OpenAI-compatible stream ended before [DONE]"))?;
+            })
         })
     }
 }

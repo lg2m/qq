@@ -112,6 +112,7 @@ source control.
 | State/replay | snapshot, runtime cursor replay, authenticated HTTP/SSE reconnect replay | Public runtime and `qq-client` APIs through a known terminal cursor |
 | Tools | `read_file` and one-shot `shell` two-turn runs | Durable prompt through tool dispatch and final completion |
 | Cancellation | cancel call through committed terminal event | Hanging deterministic provider, bounded by the runtime timeout |
+| Retry amplification | provider stream entries per logical turn (`provider_retry_amplification_milli`) | Every fake-provider stream fails before its first event; the provider is the single retry owner, so the runtime must add no sends (gate below 1.05) |
 | Stream scaling | 64 KiB, 512 KiB, 1 MiB and 1 MiB/512 KiB ratio | 1 KiB fake-provider deltas through durable completion |
 | Long reasoning | completion, durable payload transactions, temporary RSS | One MiB of provider-exposed reasoning with exact lifecycle order and replay digest |
 | Long shell | completion, live-output transactions, temporary RSS | One MiB workspace file through bounded shell streaming, terminal result, and exact replay digest |

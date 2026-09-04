@@ -30,6 +30,7 @@
     { "metric": "read_tool_run_ns", "max_regression_percent": 15 },
     { "metric": "one_shot_shell_run_ns", "max_regression_percent": 15 },
     { "metric": "cancellation_to_finished_ns", "max_regression_percent": 10, "maximum_p95": 100000000 },
+    { "metric": "provider_retry_amplification_milli", "max_regression_percent": 0, "maximum_p95": 1050 },
     { "metric": "long_stream_65536_bytes_ns", "max_regression_percent": 15 },
     { "metric": "long_stream_524288_bytes_ns", "max_regression_percent": 15 },
     { "metric": "long_stream_1048576_bytes_ns", "max_regression_percent": 15 },

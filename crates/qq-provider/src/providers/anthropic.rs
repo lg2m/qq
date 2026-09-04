@@ -11,7 +11,7 @@ use crate::{
     ContentBlock, IncompleteReason, Message, ModelRequest, Provider, ProviderError,
     ProviderErrorKind, ProviderEvent, ProviderStream, ProviderUsage, Role, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
-    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange, with_restart},
     http::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
     },
@@ -54,6 +54,17 @@ pub(crate) struct AnthropicMessages {
     pub(crate) exchange: HttpExchange,
     endpoint: reqwest::Url,
     headers: HeaderMap,
+}
+
+#[cfg(test)]
+impl AnthropicMessages {
+    /// One attempt per request, so a scripted single-response server is
+    /// observed exactly once.
+    fn single_shot(mut self) -> Self {
+        self.exchange
+            .set_attempt_policy(crate::http::AttemptPolicy::disabled());
+        self
+    }
 }
 
 impl AnthropicMessages {
@@ -107,6 +118,7 @@ impl AnthropicMessages {
             RequestAuthorizer::default(),
             anthropic_version,
         )
+        .map(Self::single_shot)
     }
 
     pub(crate) fn with_client_and_authorizer(
@@ -150,134 +162,138 @@ impl Provider for AnthropicMessages {
         let endpoint = self.endpoint.clone();
         let headers = self.headers.clone();
 
-        Box::pin(try_stream! {
-            let limits = StreamLimits::new(request.max_output_tokens());
-            let body = MessagesRequest::from(&request);
-            let mut sse = sse_exchange(
-                &exchange,
-                endpoint,
-                headers,
-                &body,
-                sse_decoder(limits.event),
-                limits.wire,
-                SSE_SPEC,
-            )
-            .await
-            .map_err(|error| error.into_provider_error(api_error))?;
+        with_restart(&self.exchange, move |ledger| {
+            let exchange = exchange.clone();
+            let endpoint = endpoint.clone();
+            let headers = headers.clone();
+            let request = request.clone();
+            Box::pin(try_stream! {
+                let limits = StreamLimits::new(request.max_output_tokens());
+                let body = MessagesRequest::from(&request);
+                let mut sse = sse_exchange(
+                    &exchange,
+                    (endpoint, headers),
+                    &body,
+                    sse_decoder(limits.event),
+                    limits.wire,
+                    SSE_SPEC,
+                    &ledger,
+                )
+                .await
+                .map_err(|error| error.into_provider_error(api_error))?;
 
-            let redactions = Arc::clone(sse.redactions());
-            let mut output_bytes = ByteCounter::new(
-                limits.output,
-                "Anthropic-compatible output size overflowed",
-                "Anthropic-compatible output exceeded the configured size limit",
-            );
-            let mut usage = UsageOnce::new(
-                "Anthropic-compatible stream reported starting usage more than once",
-            );
-            // Maps streamed content-block indexes to tool-call ids so argument
-            // deltas and block stops can be attributed after the start event.
-            let mut tool_calls = ToolCallLedger::new(
-                "Anthropic-compatible stream reused a tool content-block index",
-                "Anthropic-compatible stream sent arguments for an unknown tool call",
-            );
-            let mut reasoning_blocks = std::collections::HashSet::new();
-            let mut incomplete = None;
+                let redactions = Arc::clone(sse.redactions());
+                let mut output_bytes = ByteCounter::new(
+                    limits.output,
+                    "Anthropic-compatible output size overflowed",
+                    "Anthropic-compatible output exceeded the configured size limit",
+                );
+                let mut usage = UsageOnce::new(
+                    "Anthropic-compatible stream reported starting usage more than once",
+                );
+                // Maps streamed content-block indexes to tool-call ids so argument
+                // deltas and block stops can be attributed after the start event.
+                let mut tool_calls = ToolCallLedger::new(
+                    "Anthropic-compatible stream reused a tool content-block index",
+                    "Anthropic-compatible stream sent arguments for an unknown tool call",
+                );
+                let mut reasoning_blocks = std::collections::HashSet::new();
+                let mut incomplete = None;
 
-            while let Some(event) = sse.next_event().await? {
-                match decode_event(event, redactions.as_ref())? {
-                    DecodedEvent::OutputText(text) => {
-                        if text.is_empty() {
-                            continue;
-                        }
-                        output_bytes.add(text.len())?;
-                        yield ProviderEvent::OutputTextDelta { text };
-                    }
-                    DecodedEvent::MessageStart(start) => {
-                        if let Some(start) = start {
-                            usage.set(start)?;
-                        }
-                    }
-                    DecodedEvent::MessageDelta { refusal, output_tokens, incomplete: reason } => {
-                        if let Some(reason) = reason {
-                            incomplete = Some(reason);
-                        }
-                        if let Some(text) = refusal {
+                while let Some(event) = sse.next_event().await? {
+                    match decode_event(event, redactions.as_ref())? {
+                        DecodedEvent::OutputText(text) => {
+                            if text.is_empty() {
+                                continue;
+                            }
                             output_bytes.add(text.len())?;
-                            yield ProviderEvent::RefusalDelta { text };
+                            yield ProviderEvent::OutputTextDelta { text };
                         }
-                        if let Some(output_tokens) = output_tokens {
-                            let current = usage.stored_mut().ok_or_else(|| {
-                                ProviderError::Protocol(
-                                    "Anthropic-compatible stream reported output usage before starting usage".to_owned(),
-                                )
-                            })?;
-                            if output_tokens < current.output_tokens {
+                        DecodedEvent::MessageStart(start) => {
+                            if let Some(start) = start {
+                                usage.set(start)?;
+                            }
+                        }
+                        DecodedEvent::MessageDelta { refusal, output_tokens, incomplete: reason } => {
+                            if let Some(reason) = reason {
+                                incomplete = Some(reason);
+                            }
+                            if let Some(text) = refusal {
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::RefusalDelta { text };
+                            }
+                            if let Some(output_tokens) = output_tokens {
+                                let current = usage.stored_mut().ok_or_else(|| {
+                                    ProviderError::Protocol(
+                                        "Anthropic-compatible stream reported output usage before starting usage".to_owned(),
+                                    )
+                                })?;
+                                if output_tokens < current.output_tokens {
+                                    Err(ProviderError::Protocol(
+                                        "Anthropic-compatible cumulative output usage decreased".to_owned(),
+                                    ))?;
+                                }
+                                current.output_tokens = output_tokens;
+                            }
+                        }
+                        DecodedEvent::ToolCallStarted { index, id, name } => {
+                            tool_calls.insert(index, id.clone())?;
+                            yield ProviderEvent::ToolCallStarted { id, name };
+                        }
+                        DecodedEvent::ToolCallArguments { index, json } => {
+                            let id = tool_calls.get(&index)?.to_owned();
+                            output_bytes.add(json.len())?;
+                            yield ProviderEvent::ToolCallArgumentsDelta { id, json };
+                        }
+                        DecodedEvent::ThinkingStarted { index } => {
+                            if !reasoning_blocks.insert(index) {
                                 Err(ProviderError::Protocol(
-                                    "Anthropic-compatible cumulative output usage decreased".to_owned(),
+                                    "Anthropic-compatible stream reused a thinking content-block index"
+                                        .to_owned(),
                                 ))?;
                             }
-                            current.output_tokens = output_tokens;
-                        }
-                    }
-                    DecodedEvent::ToolCallStarted { index, id, name } => {
-                        tool_calls.insert(index, id.clone())?;
-                        yield ProviderEvent::ToolCallStarted { id, name };
-                    }
-                    DecodedEvent::ToolCallArguments { index, json } => {
-                        let id = tool_calls.get(&index)?.to_owned();
-                        output_bytes.add(json.len())?;
-                        yield ProviderEvent::ToolCallArgumentsDelta { id, json };
-                    }
-                    DecodedEvent::ThinkingStarted { index } => {
-                        if !reasoning_blocks.insert(index) {
-                            Err(ProviderError::Protocol(
-                                "Anthropic-compatible stream reused a thinking content-block index"
-                                    .to_owned(),
-                            ))?;
-                        }
-                        yield ProviderEvent::ReasoningStarted {
-                            kind: crate::ReasoningKind::ExposedThinking,
-                        };
-                    }
-                    DecodedEvent::ThinkingDelta { index, text } => {
-                        if !reasoning_blocks.contains(&index) {
-                            Err(ProviderError::Protocol(
-                                "Anthropic-compatible stream sent thinking for an unknown block"
-                                    .to_owned(),
-                            ))?;
-                        }
-                        if !text.is_empty() {
-                            output_bytes.add(text.len())?;
-                            yield ProviderEvent::ReasoningDelta {
-                                kind: crate::ReasoningKind::ExposedThinking,
-                                text,
-                            };
-                        }
-                    }
-                    DecodedEvent::BlockStopped { index } => {
-                        if reasoning_blocks.remove(&index) {
-                            yield ProviderEvent::ReasoningCompleted {
+                            yield ProviderEvent::ReasoningStarted {
                                 kind: crate::ReasoningKind::ExposedThinking,
                             };
-                        } else if let Some(id) = tool_calls.remove(&index) {
-                            yield ProviderEvent::ToolCallCompleted { id };
                         }
-                    }
-                    DecodedEvent::Completed => {
-                        let usage = usage.finish();
-                        match incomplete {
-                            Some(reason) => yield ProviderEvent::Incomplete { usage, reason },
-                            None => yield ProviderEvent::Completed { usage },
+                        DecodedEvent::ThinkingDelta { index, text } => {
+                            if !reasoning_blocks.contains(&index) {
+                                Err(ProviderError::Protocol(
+                                    "Anthropic-compatible stream sent thinking for an unknown block"
+                                        .to_owned(),
+                                ))?;
+                            }
+                            if !text.is_empty() {
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::ReasoningDelta {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                    text,
+                                };
+                            }
                         }
-                        return;
+                        DecodedEvent::BlockStopped { index } => {
+                            if reasoning_blocks.remove(&index) {
+                                yield ProviderEvent::ReasoningCompleted {
+                                    kind: crate::ReasoningKind::ExposedThinking,
+                                };
+                            } else if let Some(id) = tool_calls.remove(&index) {
+                                yield ProviderEvent::ToolCallCompleted { id };
+                            }
+                        }
+                        DecodedEvent::Completed => {
+                            let usage = usage.finish();
+                            match incomplete {
+                                Some(reason) => yield ProviderEvent::Incomplete { usage, reason },
+                                None => yield ProviderEvent::Completed { usage },
+                            }
+                            return;
+                        }
+                        DecodedEvent::Ignored => {}
                     }
-                    DecodedEvent::Ignored => {}
                 }
-            }
 
-            Err(ProviderError::Protocol(
-                "Anthropic-compatible stream ended before message_stop".to_owned(),
-            ))?;
+                Err(sse.ended_early("Anthropic-compatible stream ended before message_stop"))?;
+            })
         })
     }
 }
@@ -1612,5 +1628,87 @@ mod tests {
 
     fn test_request() -> ModelRequest {
         ModelRequest::new("claude-test", vec![Message::user("ping")], 128)
+    }
+
+    /// The provider is the single retry owner: a 503 before the body and an
+    /// empty body before the first event each cost one attempt under the same
+    /// policy, and the eventual stream is delivered once with no duplicates.
+    #[tokio::test]
+    async fn the_attempt_policy_covers_rejections_and_empty_bodies_alike() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let stream_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let responses = [
+            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbusy".to_owned(),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n".to_owned(),
+            format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{stream_body}",
+                stream_body.len()
+            ),
+        ];
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let mut request = Vec::new();
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    if read == 0 || request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let mut provider = AnthropicMessages::with_endpoint(
+            &endpoint,
+            AnthropicAuth::Bearer("secret".into()),
+            [],
+            true,
+        )
+        .unwrap();
+        provider
+            .exchange
+            .set_attempt_policy(crate::http::AttemptPolicy::new(
+                4,
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_secs(5),
+            ));
+
+        let events: Vec<_> = provider.stream(test_request()).collect().await;
+        server.join().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "one send per attempt");
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ProviderEvent::OutputTextDelta { text }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["pong"], "no duplicated output: {events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Ok(ProviderEvent::Completed { .. }))
+        ));
     }
 }

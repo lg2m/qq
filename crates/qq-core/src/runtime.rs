@@ -4,7 +4,6 @@ mod events;
 mod gate;
 mod history;
 mod prompt;
-mod retry;
 mod steering;
 mod subagent;
 
@@ -29,8 +28,6 @@ pub(crate) use prompt::{
     AGENT_PROMPT_VERSION, PromptSections, agent_system_prompt, delegation_roster_text,
     tool_schema_measurement,
 };
-pub use retry::TurnRetryPolicy;
-pub(crate) use retry::{attempts_message, is_transient_provider_failure};
 pub use steering::MAX_PENDING_STEERING;
 pub(crate) use steering::{SteeringMessage, SteeringReceiver, SteeringSender, steering_channel};
 pub(crate) use subagent::{

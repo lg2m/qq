@@ -31,6 +31,7 @@ pub use compiler::{
     EndpointSpec, HttpAuth, HttpProtocol, HttpProviderRecipe, ProviderCompiler, ProviderRecipe,
 };
 pub use credentials::{SecretLiteral, SecretRef};
+pub use http::AttemptPolicy;
 pub use model::{
     ContentBlock, IncompleteReason, Message, ModelRequest, ProviderError, ProviderErrorKind,
     ProviderEvent, ProviderUsage, Role, ToolSpec,

@@ -67,7 +67,6 @@ impl LoadedRuntime {
         .with_spawn_model_routes(runtime.spawn_model_routes.to_vec())
         .with_delegation(runtime.delegation.as_ref().clone())
         .with_audit(runtime.audit)
-        .with_turn_retry_policy(runtime.turn_retry)
         .with_profile_id(profile_id);
         for host in runtime.hosts.iter() {
             profile = profile.with_host(HostSnapshot::capture_blocking(Arc::clone(host)));

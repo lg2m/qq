@@ -12,7 +12,7 @@ use crate::{
     ProviderErrorKind, ProviderEvent, ProviderStream, ProviderUsage, Role, ToolSpec,
     compiler::EndpointKind,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
-    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange, with_restart},
     http::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
     },
@@ -51,6 +51,17 @@ pub(crate) struct GoogleGenerateContent {
     endpoint: reqwest::Url,
     endpoint_kind: EndpointKind,
     headers: HeaderMap,
+}
+
+#[cfg(test)]
+impl GoogleGenerateContent {
+    /// One attempt per request, so a scripted single-response server is
+    /// observed exactly once.
+    fn single_shot(mut self) -> Self {
+        self.exchange
+            .set_attempt_policy(crate::http::AttemptPolicy::disabled());
+        self
+    }
 }
 
 impl GoogleGenerateContent {
@@ -115,116 +126,122 @@ impl GoogleGenerateContent {
 impl Provider for GoogleGenerateContent {
     fn stream(&self, request: ModelRequest) -> ProviderStream {
         let exchange = self.exchange.clone();
-        let endpoint = self.request_endpoint(request.model());
+        let endpoint = self.request_endpoint(request.model()).map_err(Arc::new);
         let headers = self.headers.clone();
 
-        Box::pin(try_stream! {
-            let endpoint = endpoint?;
-            let max_output_tokens = i32::try_from(request.max_output_tokens()).map_err(|_| {
-                ProviderError::Configuration(
-                    "Google max output tokens must not exceed 2147483647".to_owned(),
+        with_restart(&self.exchange, move |ledger| {
+            let exchange = exchange.clone();
+            let endpoint = endpoint.clone();
+            let headers = headers.clone();
+            let request = request.clone();
+            Box::pin(try_stream! {
+                let endpoint = endpoint.map_err(|error| ProviderError::Configuration(error.to_string()))?;
+                let max_output_tokens = i32::try_from(request.max_output_tokens()).map_err(|_| {
+                    ProviderError::Configuration(
+                        "Google max output tokens must not exceed 2147483647".to_owned(),
+                    )
+                })?;
+                let limits = StreamLimits::new(request.max_output_tokens());
+                let body = GenerateContentRequest::new(&request, max_output_tokens)?;
+                let mut sse = sse_exchange(
+                    &exchange,
+                    (endpoint, headers),
+                    &body,
+                    sse_decoder(limits.event),
+                    limits.wire,
+                    SSE_SPEC,
+                    &ledger,
                 )
-            })?;
-            let limits = StreamLimits::new(request.max_output_tokens());
-            let body = GenerateContentRequest::new(&request, max_output_tokens)?;
-            let mut sse = sse_exchange(
-                &exchange,
-                endpoint,
-                headers,
-                &body,
-                sse_decoder(limits.event),
-                limits.wire,
-                SSE_SPEC,
-            )
-            .await
-            .map_err(|error| error.into_provider_error(api_error))?;
+                .await
+                .map_err(|error| error.into_provider_error(api_error))?;
 
-            let redactions = Arc::clone(sse.redactions());
-            let mut output_bytes = ByteCounter::new(
-                limits.output,
-                "Google GenerateContent output size overflowed",
-                "Google GenerateContent output exceeded the configured size limit",
-            );
-            let mut usage = UsageOnce::new(
-                "Google GenerateContent stream reported usage more than once",
-            );
-            let mut reasoning_open = false;
-            // Gemini assigns no tool-call ids; a per-stream ordinal keeps the
-            // synthesized ids deterministic.
-            let mut tool_call_ordinal = 0_u64;
+                let redactions = Arc::clone(sse.redactions());
+                let mut output_bytes = ByteCounter::new(
+                    limits.output,
+                    "Google GenerateContent output size overflowed",
+                    "Google GenerateContent output exceeded the configured size limit",
+                );
+                let mut usage = UsageOnce::new(
+                    "Google GenerateContent stream reported usage more than once",
+                );
+                let mut reasoning_open = false;
+                // Gemini assigns no tool-call ids; a per-stream ordinal keeps the
+                // synthesized ids deterministic.
+                let mut tool_call_ordinal = 0_u64;
 
-            while let Some(frame) = sse.next_event().await? {
-                for event in decode_event(&frame.data, &mut tool_call_ordinal, redactions.as_ref())? {
-                    match event {
-                        DecodedEvent::OutputText(text) => {
-                            if reasoning_open {
-                                yield ProviderEvent::ReasoningCompleted {
-                                    kind: crate::ReasoningKind::ExposedThinking,
-                                };
-                                reasoning_open = false;
+                while let Some(frame) = sse.next_event().await? {
+                    for event in decode_event(&frame.data, &mut tool_call_ordinal, redactions.as_ref())? {
+                        match event {
+                            DecodedEvent::OutputText(text) => {
+                                if reasoning_open {
+                                    yield ProviderEvent::ReasoningCompleted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                    reasoning_open = false;
+                                }
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::OutputTextDelta { text };
                             }
-                            output_bytes.add(text.len())?;
-                            yield ProviderEvent::OutputTextDelta { text };
-                        }
-                        DecodedEvent::Reasoning(text) => {
-                            if !reasoning_open {
-                                yield ProviderEvent::ReasoningStarted {
+                            DecodedEvent::Reasoning(text) => {
+                                if !reasoning_open {
+                                    yield ProviderEvent::ReasoningStarted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                    reasoning_open = true;
+                                }
+                                output_bytes.add(text.len())?;
+                                yield ProviderEvent::ReasoningDelta {
                                     kind: crate::ReasoningKind::ExposedThinking,
-                                };
-                                reasoning_open = true;
-                            }
-                            output_bytes.add(text.len())?;
-                            yield ProviderEvent::ReasoningDelta {
-                                kind: crate::ReasoningKind::ExposedThinking,
-                                text,
-                            };
-                        }
-                        DecodedEvent::Usage(event_usage) => {
-                            usage.set(event_usage)?;
-                        }
-                        DecodedEvent::ToolCall { id, name, arguments } => {
-                            if reasoning_open {
-                                yield ProviderEvent::ReasoningCompleted {
-                                    kind: crate::ReasoningKind::ExposedThinking,
-                                };
-                                reasoning_open = false;
-                            }
-                            output_bytes.add(arguments.len())?;
-                            yield ProviderEvent::ToolCallStarted {
-                                id: id.clone(),
-                                name,
-                            };
-                            yield ProviderEvent::ToolCallArgumentsDelta {
-                                id: id.clone(),
-                                json: arguments,
-                            };
-                            yield ProviderEvent::ToolCallCompleted { id };
-                        }
-                        DecodedEvent::Completed => {
-                            if reasoning_open {
-                                yield ProviderEvent::ReasoningCompleted {
-                                    kind: crate::ReasoningKind::ExposedThinking,
+                                    text,
                                 };
                             }
-                            yield ProviderEvent::Completed { usage: usage.finish() };
-                            return;
-                        }
-                        DecodedEvent::Incomplete(reason) => {
-                            if reasoning_open {
-                                yield ProviderEvent::ReasoningCompleted {
-                                    kind: crate::ReasoningKind::ExposedThinking,
-                                };
+                            DecodedEvent::Usage(event_usage) => {
+                                usage.set(event_usage)?;
                             }
-                            yield ProviderEvent::Incomplete { usage: usage.finish(), reason };
-                            return;
+                            DecodedEvent::ToolCall { id, name, arguments } => {
+                                if reasoning_open {
+                                    yield ProviderEvent::ReasoningCompleted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                    reasoning_open = false;
+                                }
+                                output_bytes.add(arguments.len())?;
+                                yield ProviderEvent::ToolCallStarted {
+                                    id: id.clone(),
+                                    name,
+                                };
+                                yield ProviderEvent::ToolCallArgumentsDelta {
+                                    id: id.clone(),
+                                    json: arguments,
+                                };
+                                yield ProviderEvent::ToolCallCompleted { id };
+                            }
+                            DecodedEvent::Completed => {
+                                if reasoning_open {
+                                    yield ProviderEvent::ReasoningCompleted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                }
+                                yield ProviderEvent::Completed { usage: usage.finish() };
+                                return;
+                            }
+                            DecodedEvent::Incomplete(reason) => {
+                                if reasoning_open {
+                                    yield ProviderEvent::ReasoningCompleted {
+                                        kind: crate::ReasoningKind::ExposedThinking,
+                                    };
+                                }
+                                yield ProviderEvent::Incomplete { usage: usage.finish(), reason };
+                                return;
+                            }
                         }
                     }
                 }
-            }
 
-            Err(ProviderError::Protocol(
-                "Google GenerateContent stream ended before a terminal finish reason".to_owned(),
-            ))?;
+                Err(sse.ended_early(
+                    "Google GenerateContent stream ended before a terminal finish reason",
+                ))?;
+            })
         })
     }
 }
@@ -766,6 +783,7 @@ mod tests {
             GoogleAuth::XGoogApiKey("google-test-secret".into()),
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
 
         let events = provider
@@ -841,6 +859,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
         let request = ModelRequest::new(
             "gemini-test",
@@ -936,6 +955,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
 
         let events = provider
@@ -994,6 +1014,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
         let events = provider
             .stream(ModelRequest::new(
@@ -1050,6 +1071,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
         let request = ModelRequest::new(
             "gemini-test",
@@ -1187,6 +1209,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
         assert!(provider.request_endpoint("../secret").is_err());
         assert!(provider.request_endpoint("model?key=secret").is_err());
@@ -1198,6 +1221,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
         assert_eq!(
             exact.request_endpoint("../not-used").unwrap().as_str(),
@@ -1232,6 +1256,7 @@ mod tests {
             GoogleAuth::XGoogApiKey(secret.into()),
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap();
 
         let error = provider
@@ -1263,6 +1288,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap()
         .stream(ModelRequest::new(
             "gemini-test",
@@ -1289,6 +1315,7 @@ mod tests {
             GoogleAuth::NoAuth,
             [],
         )
+        .map(GoogleGenerateContent::single_shot)
         .unwrap()
         .stream(ModelRequest::new(
             "gemini-test",

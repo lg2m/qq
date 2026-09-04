@@ -11,7 +11,7 @@ use crate::{
     ContentBlock, IncompleteReason, ModelRequest, Provider, ProviderError, ProviderErrorKind,
     ProviderEvent, ProviderStream, ProviderUsage, Role, SharedRequestCredentialProvider, ToolSpec,
     credentials::{SecretLiteral, sensitive_bearer_value, sensitive_header_value},
-    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange},
+    exchange::{ContentTypeGate, SseExchangeSpec, sse_exchange, with_restart},
     http::{
         ExchangeMessages, HttpExchange, HttpRejection, SafeHeaders, is_request_controlled_header,
     },
@@ -64,6 +64,17 @@ pub(crate) struct OpenAi {
     request_kind: ResponsesRequestKind,
 }
 
+#[cfg(test)]
+impl OpenAi {
+    /// One attempt per request, so a scripted single-response server is
+    /// observed exactly once.
+    fn single_shot(mut self) -> Self {
+        self.exchange
+            .set_attempt_policy(crate::http::AttemptPolicy::disabled());
+        self
+    }
+}
+
 impl OpenAi {
     /// Creates a client for OpenAI's standard Responses endpoint.
     #[cfg(test)]
@@ -95,6 +106,7 @@ impl OpenAi {
             ResponsesConstructionAuth::Static(auth),
             static_headers,
         )
+        .map(Self::single_shot)
     }
 
     pub(crate) fn with_client_and_auth(
@@ -145,78 +157,82 @@ impl Provider for OpenAi {
         let endpoint = self.endpoint.clone();
         let headers = self.headers.clone();
         let request_kind = self.request_kind;
-        Box::pin(try_stream! {
-            let limits = StreamLimits::new(request.max_output_tokens());
-            let body = ResponsesRequest::new(&request, request_kind);
-            let mut sse = sse_exchange(
-                &exchange,
-                endpoint,
-                headers,
-                &body,
-                sse_decoder(limits.event),
-                limits.wire,
-                sse_spec(request_kind),
-            )
-            .await
-            .map_err(|error| error.into_provider_error(api_error))?;
+        with_restart(&self.exchange, move |ledger| {
+            let exchange = exchange.clone();
+            let endpoint = endpoint.clone();
+            let headers = headers.clone();
+            let request = request.clone();
+            Box::pin(try_stream! {
+                let limits = StreamLimits::new(request.max_output_tokens());
+                let body = ResponsesRequest::new(&request, request_kind);
+                let mut sse = sse_exchange(
+                    &exchange,
+                    (endpoint, headers),
+                    &body,
+                    sse_decoder(limits.event),
+                    limits.wire,
+                    sse_spec(request_kind),
+                    &ledger,
+                )
+                .await
+                .map_err(|error| error.into_provider_error(api_error))?;
 
-            let redactions = Arc::clone(sse.redactions());
-            let mut output_bytes = ByteCounter::new(
-                limits.output,
-                "OpenAI output size overflowed",
-                "OpenAI output exceeded the configured size limit",
-            );
-            // Maps streamed function-call item ids to call ids so argument
-            // deltas and item completions can be attributed after the added
-            // event; the call id is what round-trips into function_call_output.
-            let mut tool_calls = ToolCallLedger::new(
-                "OpenAI-compatible stream reused a function-call item id",
-                "OpenAI-compatible stream sent arguments for an unknown function call",
-            );
-            while let Some(event) = sse.next_event().await? {
-                let data = event.data;
-                if data == "[DONE]" || data.trim().is_empty() {
-                    continue;
-                }
+                let redactions = Arc::clone(sse.redactions());
+                let mut output_bytes = ByteCounter::new(
+                    limits.output,
+                    "OpenAI output size overflowed",
+                    "OpenAI output exceeded the configured size limit",
+                );
+                // Maps streamed function-call item ids to call ids so argument
+                // deltas and item completions can be attributed after the added
+                // event; the call id is what round-trips into function_call_output.
+                let mut tool_calls = ToolCallLedger::new(
+                    "OpenAI-compatible stream reused a function-call item id",
+                    "OpenAI-compatible stream sent arguments for an unknown function call",
+                );
+                while let Some(event) = sse.next_event().await? {
+                    let data = event.data;
+                    if data == "[DONE]" || data.trim().is_empty() {
+                        continue;
+                    }
 
-                match decode_event(&data, redactions.as_ref())? {
-                    DecodedEvent::OutputTextDelta(text) => {
-                        output_bytes.add(text.len())?;
-                        yield ProviderEvent::OutputTextDelta { text };
-                    }
-                    DecodedEvent::RefusalDelta(text) => {
-                        output_bytes.add(text.len())?;
-                        yield ProviderEvent::RefusalDelta { text };
-                    }
-                    DecodedEvent::ToolCallStarted { item_id, call_id, name } => {
-                        tool_calls.insert(item_id, call_id.clone())?;
-                        yield ProviderEvent::ToolCallStarted { id: call_id, name };
-                    }
-                    DecodedEvent::ToolCallArguments { item_id, json } => {
-                        let id = tool_calls.get(&item_id)?.to_owned();
-                        output_bytes.add(json.len())?;
-                        yield ProviderEvent::ToolCallArgumentsDelta { id, json };
-                    }
-                    DecodedEvent::ToolCallDone { item_id } => {
-                        if let Some(call_id) = tool_calls.remove(&item_id) {
-                            yield ProviderEvent::ToolCallCompleted { id: call_id };
+                    match decode_event(&data, redactions.as_ref())? {
+                        DecodedEvent::OutputTextDelta(text) => {
+                            output_bytes.add(text.len())?;
+                            yield ProviderEvent::OutputTextDelta { text };
                         }
+                        DecodedEvent::RefusalDelta(text) => {
+                            output_bytes.add(text.len())?;
+                            yield ProviderEvent::RefusalDelta { text };
+                        }
+                        DecodedEvent::ToolCallStarted { item_id, call_id, name } => {
+                            tool_calls.insert(item_id, call_id.clone())?;
+                            yield ProviderEvent::ToolCallStarted { id: call_id, name };
+                        }
+                        DecodedEvent::ToolCallArguments { item_id, json } => {
+                            let id = tool_calls.get(&item_id)?.to_owned();
+                            output_bytes.add(json.len())?;
+                            yield ProviderEvent::ToolCallArgumentsDelta { id, json };
+                        }
+                        DecodedEvent::ToolCallDone { item_id } => {
+                            if let Some(call_id) = tool_calls.remove(&item_id) {
+                                yield ProviderEvent::ToolCallCompleted { id: call_id };
+                            }
+                        }
+                        DecodedEvent::Completed(usage) => {
+                            yield ProviderEvent::Completed { usage };
+                            return;
+                        }
+                        DecodedEvent::Incomplete { usage, reason } => {
+                            yield ProviderEvent::Incomplete { usage, reason };
+                            return;
+                        }
+                        DecodedEvent::Ignored => {}
                     }
-                    DecodedEvent::Completed(usage) => {
-                        yield ProviderEvent::Completed { usage };
-                        return;
-                    }
-                    DecodedEvent::Incomplete { usage, reason } => {
-                        yield ProviderEvent::Incomplete { usage, reason };
-                        return;
-                    }
-                    DecodedEvent::Ignored => {}
                 }
-            }
 
-            Err(ProviderError::Protocol(
-                "OpenAI stream ended before response.completed".to_owned(),
-            ))?;
+                Err(sse.ended_early("OpenAI stream ended before response.completed"))?;
+            })
         })
     }
 }

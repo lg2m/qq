@@ -36,14 +36,12 @@ mod sessions;
 mod tools;
 mod workspace;
 
-pub use runtime::TurnRetryPolicy;
 use runtime::{
     AGENT_PROMPT_VERSION, BUDGET_FINAL_RESPONSE_NOTICE, BudgetDecision, BudgetMeter, GateDecision,
     HistorySearcher, PendingToolCall, PreparedRequestWeight, PreparedStaticPrefix, RuntimeEvent,
     RuntimeToolCall, SPAWN_UNAVAILABLE_RESULT, SearchHistoryArgs, SpawnAgentFuture,
     SpawnAgentOutcome, SpawnAgentSpend, SpawnRequest, SubagentSpawner, ToolGate, ToolGateFuture,
-    TurnBlock, agent_system_prompt, attempts_message, is_transient_provider_failure,
-    render_history_matches, tool_schema_measurement,
+    TurnBlock, agent_system_prompt, render_history_matches, tool_schema_measurement,
 };
 
 pub use approval::shell_prefix_matches;
@@ -529,7 +527,6 @@ pub struct Runtime {
     pub(crate) delegation: Arc<DelegationRoster>,
     /// When a root run's final answer is audited before completion.
     pub(crate) audit: runtime::AuditPolicy,
-    turn_retry: TurnRetryPolicy,
 }
 
 impl Runtime {
@@ -566,15 +563,7 @@ impl Runtime {
             spawn_model_routes: Arc::from([]),
             delegation: Arc::new(DelegationRoster::default()),
             audit: runtime::AuditPolicy::default(),
-            turn_retry: TurnRetryPolicy::default(),
         })
-    }
-
-    /// Overrides the transient-failure retry policy applied to model turns.
-    #[must_use]
-    pub fn with_turn_retry_policy(mut self, policy: TurnRetryPolicy) -> Self {
-        self.turn_retry = policy;
-        self
     }
 
     /// Supplies the effective model context window for provider-neutral
@@ -887,7 +876,6 @@ impl plan::CompiledAgentPlan {
         let context_sources = Arc::clone(&plan.runtime.context_sources);
         let context_cache = Arc::clone(&plan.runtime.context_cache);
         let profile_name = plan.descriptor().profile.as_str().to_owned();
-        let turn_retry = plan.runtime.turn_retry;
         let delegation = Arc::clone(&plan.runtime.delegation);
         Box::pin(stream! {
             let RunCapabilities {
@@ -1192,12 +1180,9 @@ impl plan::CompiledAgentPlan {
                         compatible_input_tokens,
                     },
                 };
-                // Transient provider failures (overload, rate limits, dropped
-                // connections) re-issue this turn with backoff instead of
-                // failing the run — but only while nothing user-visible has
-                // streamed, so a retry can never duplicate output.
-                let mut attempt = 1_u32;
-                let (blocks, pending_calls, terminal_usage, interrupted_turn, truncated_turn) = 'turn: loop {
+                // The provider owns every retry: it resends only while nothing
+                // has streamed, so this loop sees each logical turn once and
+                // can never duplicate output.
                 let request = ModelRequest::new(
                     Arc::clone(&model),
                     messages.clone(),
@@ -1211,9 +1196,7 @@ impl plan::CompiledAgentPlan {
                     request.with_system(Arc::clone(&request_system))
                 };
                 let mut activity = RunActivity::WaitingForProvider;
-                if attempt == 1 {
-                    yield RuntimeEvent::ActivityChanged { activity };
-                }
+                yield RuntimeEvent::ActivityChanged { activity };
                 let mut provider_events = provider.stream(request);
                 let mut pending_calls = Vec::<PendingToolCall>::new();
                 let mut calls_by_provider_id = HashMap::<String, usize>::new();
@@ -1222,7 +1205,6 @@ impl plan::CompiledAgentPlan {
                 let mut completed = false;
                 let mut reasoning_bytes = 0_usize;
                 let mut open_reasoning = None;
-                let mut turn_streamed = false;
                 let mut interrupted_turn = false;
                 let mut truncated_turn = false;
                 let deadline = budget.deadline();
@@ -1286,7 +1268,6 @@ impl plan::CompiledAgentPlan {
                                 return;
                             }
                             open_reasoning = Some(kind);
-                            turn_streamed = true;
                             if activity != RunActivity::Reasoning {
                                 activity = RunActivity::Reasoning;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -1325,7 +1306,6 @@ impl plan::CompiledAgentPlan {
                             yield RuntimeEvent::ReasoningCompleted { kind };
                         }
                         Ok(ProviderEvent::OutputTextDelta { text }) => {
-                            turn_streamed = true;
                             if activity != RunActivity::GeneratingResponse {
                                 activity = RunActivity::GeneratingResponse;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -1342,7 +1322,6 @@ impl plan::CompiledAgentPlan {
                             yield RuntimeEvent::OutputTextDelta { text };
                         }
                         Ok(ProviderEvent::RefusalDelta { text }) => {
-                            turn_streamed = true;
                             if activity != RunActivity::GeneratingResponse {
                                 activity = RunActivity::GeneratingResponse;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -1384,7 +1363,6 @@ impl plan::CompiledAgentPlan {
                                 };
                                 return;
                             }
-                            turn_streamed = true;
                             if activity != RunActivity::PreparingToolCall {
                                 activity = RunActivity::PreparingToolCall;
                                 yield RuntimeEvent::ActivityChanged { activity };
@@ -1532,18 +1510,9 @@ impl plan::CompiledAgentPlan {
                             break;
                         }
                         Err(error) => {
-                            if is_transient_provider_failure(error.kind())
-                                && !turn_streamed
-                                && attempt < turn_retry.max_attempts()
-                            {
-                                let delay = turn_retry.delay(attempt);
-                                attempt += 1;
-                                tokio::time::sleep(delay).await;
-                                continue 'turn;
-                            }
                             yield RuntimeEvent::Failed {
                                 kind: run_failure_kind(error.kind()),
-                                message: attempts_message(error.to_string(), attempt),
+                                message: error.to_string(),
                             };
                             return;
                         }
@@ -1551,20 +1520,12 @@ impl plan::CompiledAgentPlan {
                 }
 
                 if !completed {
-                    // A stream that ends without a terminal event is the same
-                    // transient class as a dropped connection.
-                    if !turn_streamed && attempt < turn_retry.max_attempts() {
-                        let delay = turn_retry.delay(attempt);
-                        attempt += 1;
-                        tokio::time::sleep(delay).await;
-                        continue 'turn;
-                    }
+                    // The provider restarts a stream that ends before its
+                    // first event; one that ends after events is its
+                    // protocol violation, and nothing above it may resend.
                     yield RuntimeEvent::Failed {
                         kind: RunFailureKind::ProviderProtocol,
-                        message: attempts_message(
-                            "provider stream ended without a terminal event".to_owned(),
-                            attempt,
-                        ),
+                        message: "provider stream ended without a terminal event".to_owned(),
                     };
                     return;
                 }
@@ -1581,8 +1542,6 @@ impl plan::CompiledAgentPlan {
                     blocks.retain(|block| matches!(block, TurnBlock::Text(_)));
                     pending_calls.clear();
                 }
-                break 'turn (blocks, pending_calls, terminal_usage, interrupted_turn, truncated_turn);
-                };
 
                 compatible_request = terminal_usage.map(|usage| {
                     (
@@ -5027,152 +4986,79 @@ mod tests {
         }
     }
 
-    /// Fails the first `failed_attempts` streams (with an error, or an empty
-    /// stream when `failure` returns `None`), then streams text to completion.
-    struct RecoveringProvider {
+    /// Counts stream calls and fails every one of them the scripted way.
+    struct FailingProvider {
         calls: Arc<std::sync::atomic::AtomicU32>,
-        failed_attempts: u32,
         failure: fn() -> Option<ProviderError>,
     }
 
-    impl Provider for RecoveringProvider {
+    impl Provider for FailingProvider {
         fn stream(&self, _: ModelRequest) -> ProviderStream {
-            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if call < self.failed_attempts {
-                return match (self.failure)() {
-                    Some(error) => Box::pin(stream::once(async move { Err(error) })),
-                    None => Box::pin(stream::iter(Vec::new())),
-                };
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match (self.failure)() {
+                Some(error) => Box::pin(stream::once(async move { Err(error) })),
+                None => Box::pin(stream::iter(Vec::new())),
             }
-            Box::pin(stream::iter([
-                Ok(ProviderEvent::OutputTextDelta {
-                    text: "recovered".to_owned(),
-                }),
-                Ok(ProviderEvent::Completed { usage: None }),
-            ]))
         }
     }
 
+    /// The provider is the single retry owner. Whatever the failure — a
+    /// transient error before any output, a stream that ends without a
+    /// terminal event, or a failure after output has streamed — the run loop
+    /// issues exactly one request per logical turn and reports the provider's
+    /// error as-is. Amplification is therefore exactly 1.0 above the provider.
     #[tokio::test(start_paused = true)]
-    async fn retries_transient_provider_failures_and_completes() {
-        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let runtime = Runtime::new(
-            RecoveringProvider {
-                calls: Arc::clone(&calls),
-                failed_attempts: 2,
-                failure: || Some(overloaded()),
-            },
-            "gpt-test",
-            256,
-        )
-        .unwrap();
-
-        let events = runtime
-            .run(RunCommand::new("hello"))
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, RunEvent::Failed { .. })),
-            "transient failures must not fail the run: {events:?}"
-        );
-        assert!(events.contains(&RunEvent::OutputTextDelta {
-            text: "recovered".to_owned()
-        }));
-        assert_eq!(events.last(), Some(&RunEvent::Completed));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retries_a_stream_that_ends_without_a_terminal_event() {
-        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let runtime = Runtime::new(
-            RecoveringProvider {
-                calls: Arc::clone(&calls),
-                failed_attempts: 1,
-                failure: || None,
-            },
-            "gpt-test",
-            256,
-        )
-        .unwrap();
-
-        let events = runtime
-            .run(RunCommand::new("hello"))
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(events.last(), Some(&RunEvent::Completed));
-    }
-
-    #[tokio::test]
-    async fn does_not_retry_non_transient_provider_failures() {
-        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let runtime = Runtime::new(
-            RecoveringProvider {
-                calls: Arc::clone(&calls),
-                failed_attempts: u32::MAX,
-                failure: || {
-                    Some(ProviderError::Api {
-                        status: 401,
-                        message: "invalid key".to_owned(),
-                    })
+    async fn the_run_loop_never_resends_a_turn() {
+        type Case = (fn() -> Option<ProviderError>, RunFailureKind, &'static str);
+        let cases: [Case; 3] = [
+            (
+                || Some(overloaded()),
+                RunFailureKind::ProviderUnavailable,
+                "provider overloaded",
+            ),
+            (
+                || Some(ProviderError::Transport("offline".to_owned())),
+                RunFailureKind::ProviderTransport,
+                "offline",
+            ),
+            (
+                || None,
+                RunFailureKind::ProviderProtocol,
+                "ended without a terminal event",
+            ),
+        ];
+        for (failure, kind, needle) in cases {
+            let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let runtime = Runtime::new(
+                FailingProvider {
+                    calls: Arc::clone(&calls),
+                    failure,
                 },
-            },
-            "gpt-test",
-            256,
-        )
-        .unwrap();
+                "gpt-test",
+                256,
+            )
+            .unwrap();
+            let events = runtime
+                .run(RunCommand::new("hello"))
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{kind:?}: core must issue one request per turn"
+            );
+            assert!(
+                matches!(
+                    events.last(),
+                    Some(RunEvent::Failed { kind: got, message })
+                        if *got == kind && message.contains(needle)
+                ),
+                "{kind:?}: {events:?}"
+            );
+        }
 
-        let events = runtime
-            .run(RunCommand::new("hello"))
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(matches!(
-            events.last(),
-            Some(RunEvent::Failed {
-                kind: RunFailureKind::ProviderAuthentication,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn gives_up_after_exhausting_transient_retry_attempts() {
-        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let runtime = Runtime::new(
-            RecoveringProvider {
-                calls: Arc::clone(&calls),
-                failed_attempts: u32::MAX,
-                failure: || Some(overloaded()),
-            },
-            "gpt-test",
-            256,
-        )
-        .unwrap();
-
-        let events = runtime
-            .run(RunCommand::new("hello"))
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 8);
-        assert!(matches!(
-            events.last(),
-            Some(RunEvent::Failed {
-                kind: RunFailureKind::ProviderUnavailable,
-                message,
-            }) if message.contains("8 attempts")
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn does_not_retry_after_visible_output_has_streamed() {
+        // After visible output, a failure ends the run with the partial turn
+        // intact and still no resend.
         struct MidStreamFailureProvider {
             calls: Arc<std::sync::atomic::AtomicU32>,
         }
@@ -5198,43 +5084,14 @@ mod tests {
             256,
         )
         .unwrap();
-
         let events = runtime
             .run(RunCommand::new("hello"))
             .collect::<Vec<_>>()
             .await;
-
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(matches!(
-            events.last(),
-            Some(RunEvent::Failed {
-                kind: RunFailureKind::ProviderUnavailable,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn disabled_retry_policy_fails_on_the_first_transient_error() {
-        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let runtime = Runtime::new(
-            RecoveringProvider {
-                calls: Arc::clone(&calls),
-                failed_attempts: u32::MAX,
-                failure: || Some(overloaded()),
-            },
-            "gpt-test",
-            256,
-        )
-        .unwrap()
-        .with_turn_retry_policy(TurnRetryPolicy::disabled());
-
-        let events = runtime
-            .run(RunCommand::new("hello"))
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(events.contains(&RunEvent::OutputTextDelta {
+            text: "partial".to_owned()
+        }));
         assert!(matches!(
             events.last(),
             Some(RunEvent::Failed {

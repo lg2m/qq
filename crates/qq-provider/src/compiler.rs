@@ -7,7 +7,7 @@ use crate::{
     bedrock_auth::BedrockAuth,
     construction::{HttpConstructionSpec, construct_http_provider},
     credentials::SecretLiteral,
-    http::{build_client, build_direct_client, validate_endpoint},
+    http::{AttemptPolicy, build_client, build_direct_client, validate_endpoint},
 };
 #[cfg(feature = "provider-bedrock")]
 use crate::{
@@ -25,6 +25,7 @@ pub const BEDROCK_FAMILY_UNAVAILABLE_MESSAGE: &str = "this build of qq-provider 
 pub struct ProviderCompiler {
     http: reqwest::Client,
     direct_http: reqwest::Client,
+    attempts: AttemptPolicy,
 }
 
 impl ProviderCompiler {
@@ -33,7 +34,21 @@ impl ProviderCompiler {
         Ok(Self {
             http: build_client()?,
             direct_http: build_direct_client()?,
+            attempts: AttemptPolicy::default(),
         })
+    }
+
+    /// The attempt policy every HTTP provider this compiler produces carries.
+    /// This is the only retry owner: nothing above the provider resends.
+    #[must_use]
+    pub fn with_attempt_policy(mut self, attempts: AttemptPolicy) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
+    #[must_use]
+    pub const fn attempt_policy(&self) -> AttemptPolicy {
+        self.attempts
     }
 
     /// Validates and compiles one immutable provider recipe.
@@ -99,7 +114,10 @@ impl ProviderCompiler {
     }
 
     fn compile_http(&self, recipe: HttpProviderRecipe) -> Result<Arc<dyn Provider>, ProviderError> {
-        Ok(Arc::new(self.construct_http(recipe)?))
+        Ok(Arc::new(
+            self.construct_http(recipe)?
+                .with_attempt_policy(self.attempts),
+        ))
     }
 
     fn compile_http_for_canary(

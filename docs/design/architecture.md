@@ -294,8 +294,8 @@ capability-scoped workspace with its instruction file already read, the
 compiled `ToolCatalog` (built-ins, the `spawn_agent`, `search_history`,
 `select_tools`, and `load_skill` declarations, and every admitted external tool
 with its serialized schema and digest), the compiled `SkillIndex`, the
-sub-agent routes, the external tool hosts, the selected agent pack, the
-context sources, and the retry policy. Durable session runs execute directly
+sub-agent routes, the external tool hosts, the selected agent pack, and the
+context sources. Durable session runs execute directly
 from the plan and perform no canonicalization, directory open, instruction
 read, or host catalog request before the first provider request; only an
 explicitly invoked command or skill document is still read per run. External
@@ -313,8 +313,9 @@ and static header *names*, the resolved model, workspace root, prompt version,
 instruction hash and source, the tool catalog (digest, exposure, admitted
 names, host generations, typed exclusions), the skill index, the selected pack
 (identifier, version, manifest digest, persona hash, tool policy), spawn
-routes, configuration grants, MCP server declarations, retry policy, and
-configuration source labels. `AgentPlanDigest` is the SHA-256 of a domain-tagged compact JSON
+routes, configuration grants, MCP server declarations, and configuration
+source labels. Retry is the provider's alone (`qq_provider::AttemptPolicy`)
+and is not part of the plan. `AgentPlanDigest` is the SHA-256 of a domain-tagged compact JSON
 encoding in declaration order (`DESCRIPTOR_VERSION` pins the encoding). Secret
 values, secret hashes, live handles, and the credential epoch never enter the
 descriptor or its digest.
