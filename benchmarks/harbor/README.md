@@ -122,6 +122,15 @@ run:
 An existing job directory is rejected rather than resumed implicitly. Use a
 fresh `--job-name` for each comparison run.
 
+Two deadlines apply to each trial: QQ's own `--timeout-seconds` and Harbor's
+per-task agent timeout (`timeout_sec` in `task.toml`, 900 s for most
+Terminal-Bench 2 tasks). QQ must settle first so the trace ends with an
+outcome record; `eval run` therefore passes `--agent-timeout-multiplier`
+(default 1.5) to Harbor, and `--timeout-seconds` should stay at or below the
+task's own limit. When the outer deadline fires first Harbor stops the
+container mid-run, the adapter records `qq_status: interrupted_externally`,
+and `eval report` counts the trial as a harness failure.
+
 The repository-local adapter smoke task is intentionally tiny and has no
 task-specific benchmark knowledge:
 

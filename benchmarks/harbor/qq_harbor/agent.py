@@ -351,7 +351,28 @@ class QQAgent(BaseInstalledAgent):
             (record for record in records if record.get("type") == "outcome"), None
         )
         if outcome is None:
-            raise RuntimeError("QQ trace has no terminal outcome record")
+            # qq writes the outcome last, so its absence means the process was
+            # torn down from outside (Harbor's agent timeout, a stopped
+            # container, a host signal) before it could settle. Record that as
+            # metadata instead of raising: Harbor calls this hook while it is
+            # already unwinding a cancelled trial, and an exception here
+            # escapes the trial and aborts every other trial in the job.
+            # `cargo xtask eval report` treats the missing outcome as a
+            # harness failure.
+            events = sum(1 for record in records if record.get("type") == "event")
+            self.logger.error(
+                "QQ trace has no terminal outcome record after %d events; "
+                "the run was interrupted externally (qq exit code %s)",
+                events,
+                self._exit_code,
+            )
+            context.metadata = {
+                **(context.metadata or {}),
+                "qq_status": "interrupted_externally",
+                "qq_exit_code": self._exit_code,
+                "qq_trace_events": events,
+            }
+            return
 
         usage = outcome.get("usage")
         if isinstance(usage, dict):

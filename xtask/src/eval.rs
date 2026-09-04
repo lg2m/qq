@@ -25,7 +25,7 @@ pub(crate) struct EvalArgs {
 #[derive(Debug, Subcommand)]
 enum EvalCommand {
     /// Build QQ and run a pinned Harbor evaluation.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Summarize one Harbor job and verify its identities and failure labels.
     Report(ReportArgs),
     /// Record one trajectory-grounded primary failure category.
@@ -62,9 +62,16 @@ struct RunArgs {
     /// Concurrent trials. Keep this explicit so machine pressure is reproducible.
     #[arg(short = 'n', long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     n_concurrent: u16,
-    /// QQ wall-clock limit passed to every trial.
+    /// QQ wall-clock limit passed to every trial. Harbor's own per-task
+    /// agent deadline is stretched by `--agent-timeout-multiplier` so QQ
+    /// settles first and the trace carries an outcome record.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     timeout_seconds: Option<u64>,
+    /// Multiplier applied to each task's Harbor agent timeout. Keep it above
+    /// 1.0: when the outer deadline fires first the container is stopped
+    /// mid-run and the trial is a harness failure, not a task result.
+    #[arg(long, default_value_t = 1.5)]
+    agent_timeout_multiplier: f64,
     /// QQ model-turn limit passed to every trial.
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     max_turns: Option<u16>,
@@ -217,7 +224,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<(), EvalError> {
 
 fn run_blocking(args: EvalArgs) -> Result<(), EvalError> {
     match args.command {
-        EvalCommand::Run(args) => run_harbor(args),
+        EvalCommand::Run(args) => run_harbor(*args),
         EvalCommand::Report(args) => {
             let report = report_job(&args.job)?;
             let rendered =
@@ -312,6 +319,11 @@ fn launch_plan(
             "--max-cost-usd must be a finite value greater than zero".to_owned(),
         ));
     }
+    if !args.agent_timeout_multiplier.is_finite() || args.agent_timeout_multiplier < 1.0 {
+        return Err(EvalError::Invalid(
+            "--agent-timeout-multiplier must be a finite value of at least 1.0".to_owned(),
+        ));
+    }
     let mut arguments = vec![
         "run".to_owned(),
         "--model".to_owned(),
@@ -330,6 +342,8 @@ fn launch_plan(
         args.n_attempts.to_string(),
         "--n-concurrent".to_owned(),
         args.n_concurrent.to_string(),
+        "--agent-timeout-multiplier".to_owned(),
+        args.agent_timeout_multiplier.to_string(),
     ];
     for argument in [
         args.timeout_seconds
@@ -826,12 +840,22 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
         let harness_failure = result.exception_info.is_some();
         harness_failures += u64::from(harness_failure);
         let trace_path = trial_dir.join("agent/qq-trace.jsonl");
+        // A trace whose outcome record is missing was cut off from outside
+        // (Harbor's agent timeout, a stopped container); Harbor records that
+        // as an exception, and the trial is a harness failure with partial
+        // metrics rather than an attempt with a settled identity.
+        let trace_settled = trace_path.is_file() && trace_has_outcome(&trace_path)?;
+        if trace_path.is_file() && !trace_settled && !harness_failure {
+            return Err(EvalError::Invalid(format!(
+                "trial {trial_name} has a QQ trace without an outcome record but no Harbor exception explaining the interruption"
+            )));
+        }
         let trace_metrics = if trace_path.is_file() {
             read_trace_metrics(&trace_path)?
         } else {
             TraceMetrics::default()
         };
-        let identity = if trace_path.is_file() {
+        let identity = if trace_settled {
             let identity = read_identity(&trace_path)?;
             if identity.qq_source_revision != manifest.qq_source_revision {
                 return Err(EvalError::Invalid(format!(
@@ -1602,6 +1626,12 @@ fn wilson_interval(passes: u64, attempts: u64) -> (f64, f64) {
     ((center - margin).max(0.0), (center + margin).min(1.0))
 }
 
+fn trace_has_outcome(trace: &Path) -> Result<bool, EvalError> {
+    Ok(read_jsonl(trace)?
+        .iter()
+        .any(|record| record.get("type").and_then(Value::as_str) == Some("outcome")))
+}
+
 fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
     let records = read_jsonl(trace)?;
     let trial = records
@@ -2197,6 +2227,12 @@ mod tests {
             "/repo/benchmarks/harbor/smoke-task"
         );
         assert_eq!(plan.environment["HARBOR_TELEMETRY"], "off");
+        let multiplier_index = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "--agent-timeout-multiplier")
+            .unwrap();
+        assert_eq!(plan.arguments[multiplier_index + 1], "1.5");
         assert_eq!(plan.environment["PYTHONPATH"], "/repo/benchmarks/harbor");
         assert!(!plan.environment.contains_key("QQ_EVAL_ARM"));
     }
@@ -2269,6 +2305,15 @@ mod tests {
             false,
         );
         assert!(matches!(budget, Err(EvalError::Invalid(_))));
+
+        let multiplier = launch_plan(
+            run_args(&["--path", "task", "--agent-timeout-multiplier", "0.5"]),
+            Path::new("/repo"),
+            Path::new("/repo/target"),
+            "rev1".to_owned(),
+            false,
+        );
+        assert!(matches!(multiplier, Err(EvalError::Invalid(_))));
     }
 
     #[test]
@@ -2570,6 +2615,61 @@ mod tests {
         assert_eq!(report.harness_failure_rate, 1.0);
         assert!(!report.trials[0].identity_observed);
         assert_eq!(report.trials[0].trajectory, None);
+    }
+
+    #[test]
+    fn externally_interrupted_trace_without_an_outcome_is_a_harness_failure() {
+        // Harbor's agent deadline fired before qq settled: the trace has a
+        // trial record and events but no outcome, and Harbor recorded an
+        // AgentTimeoutError. The report must not read identity from it, and
+        // must not accept the same trace when Harbor recorded no exception.
+        let interrupted_trace = |exception: bool| {
+            let directory = tempfile::tempdir().unwrap();
+            write_job_scaffold(directory.path());
+            write_trial(
+                directory.path(),
+                "cut",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                exception,
+                false,
+            );
+            fs::write(
+                directory.path().join("cut/agent/qq-trace.jsonl"),
+                format!(
+                    "{}\n{}\n",
+                    json!({"type": "trial", "qq_version": "0.1.0", "qq_source_revision": "abc123"}),
+                    json!({"type": "event", "envelope": {"event": {"type": "tool_call_started"}}}),
+                ),
+            )
+            .unwrap();
+            directory
+        };
+
+        let with_exception = interrupted_trace(true);
+        classify_trial(
+            with_exception.path(),
+            "cut",
+            "benchmark_infrastructure_or_invalid_task",
+            "result",
+            "cut-id",
+        );
+        let report = report_job(with_exception.path()).unwrap();
+        assert_eq!(report.identity, None);
+        assert_eq!(report.harness_failure_rate, 1.0);
+        assert!(!report.trials[0].identity_observed);
+
+        let without_exception = interrupted_trace(false);
+        let error = report_job(without_exception.path()).unwrap_err();
+        assert!(
+            matches!(&error, EvalError::Invalid(message) if message.contains("without an outcome record")),
+            "{error}"
+        );
     }
 
     #[test]

@@ -98,5 +98,32 @@ class RunEnvTests(unittest.TestCase):
             self.assertEqual(chosen, Path(override.name).resolve())
 
 
+class PostRunTests(unittest.TestCase):
+    def test_a_trace_cut_off_before_its_outcome_is_recorded_not_raised(self) -> None:
+        # Harbor calls populate_context_post_run while unwinding a trial its
+        # own deadline cancelled; raising here would abort every other trial
+        # in the job. The trace still converts to a trajectory.
+        from harbor.models.agent.context import AgentContext
+
+        logs_dir = Path(tempfile.mkdtemp())
+        fixture = Path(__file__).resolve().parent / "fixtures" / "tool_loop.trace.jsonl"
+        lines = [
+            line
+            for line in fixture.read_text(encoding="utf-8").splitlines()
+            if '"type":"outcome"' not in line and '"type": "outcome"' not in line
+        ]
+        (logs_dir / "qq-trace.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        agent = QQAgent(logs_dir)
+        agent._exit_code = None
+        context = AgentContext()
+        agent.populate_context_post_run(context)
+
+        self.assertTrue((logs_dir / "trajectory.json").is_file())
+        self.assertIsNone(context.cost_usd)
+        self.assertEqual(context.metadata["qq_status"], "interrupted_externally")
+        self.assertGreater(context.metadata["qq_trace_events"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
