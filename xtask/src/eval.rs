@@ -598,6 +598,10 @@ struct FailureClassification {
     note: String,
 }
 
+/// What every trial in one job must share. Two per-trial facts deliberately
+/// live elsewhere: `workspace_identity` hashes the task's working directory
+/// and `system_prompt_hash` covers a prompt that names that directory, so both
+/// vary across the tasks of a dataset and belong on [`TrialSummary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BaselineIdentity {
     qq_version: String,
@@ -612,16 +616,21 @@ struct BaselineIdentity {
     timeout_seconds: Option<u64>,
     max_turns: Option<u16>,
     max_cost_usd_nanos: Option<u64>,
-    workspace_identity: String,
     prompt_version: u16,
     instruction_hash: String,
-    system_prompt_hash: String,
     tool_schema_hash: String,
     selected_guidance: Option<Value>,
     /// Operator-declared arm label; the only identity field two compared
     /// jobs are expected to differ in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     arm: Option<String>,
+}
+
+/// The per-trial half of a trace's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrialIdentity {
+    workspace_identity: String,
+    system_prompt_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -638,6 +647,13 @@ struct TrialSummary {
     passed: bool,
     harness_failure: bool,
     identity_observed: bool,
+    /// SHA-256 of the task's canonical working directory; from the trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_identity: Option<String>,
+    /// Hash of the rendered system prompt, which names the working directory
+    /// and therefore differs task to task; from the trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -856,7 +872,7 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
             TraceMetrics::default()
         };
         let identity = if trace_settled {
-            let identity = read_identity(&trace_path)?;
+            let (identity, trial_identity) = read_identity(&trace_path)?;
             if identity.qq_source_revision != manifest.qq_source_revision {
                 return Err(EvalError::Invalid(format!(
                     "trial {trial_name} QQ revision does not match its launch manifest"
@@ -869,9 +885,9 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
                     )));
                 }
             } else {
-                fixed_identity = Some(identity.clone());
+                fixed_identity = Some(identity);
             }
-            Some(identity)
+            Some(trial_identity)
         } else if harness_failure {
             None
         } else {
@@ -961,6 +977,10 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
             passed,
             harness_failure,
             identity_observed: identity.is_some(),
+            workspace_identity: identity
+                .as_ref()
+                .map(|identity| identity.workspace_identity.clone()),
+            system_prompt_hash: identity.map(|identity| identity.system_prompt_hash),
             cost_usd: totals
                 .cost_usd
                 .filter(|cost| cost.is_finite() && *cost >= 0.0),
@@ -1139,7 +1159,7 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
 
     // Everything that shapes the task or the model must match; everything an
     // arm is allowed to change is reported rather than rejected.
-    let required: [(&str, Value, Value); 13] = [
+    let required: [(&str, Value, Value); 12] = [
         (
             "model",
             json!(baseline_identity.model),
@@ -1196,11 +1216,6 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
             json!(candidate_identity.instruction_hash),
         ),
         (
-            "workspace_identity",
-            json!(baseline_identity.workspace_identity),
-            json!(candidate_identity.workspace_identity),
-        ),
-        (
             "machine_class",
             json!(baseline.machine_class),
             json!(candidate.machine_class),
@@ -1234,11 +1249,6 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
             "qq_source_revision",
             json!(baseline_identity.qq_source_revision),
             json!(candidate_identity.qq_source_revision),
-        ),
-        (
-            "system_prompt_hash",
-            json!(baseline_identity.system_prompt_hash),
-            json!(candidate_identity.system_prompt_hash),
         ),
         (
             "tool_schema_hash",
@@ -1286,6 +1296,17 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
             if baseline.task_checksum != candidate.task_checksum {
                 return Err(EvalError::Invalid(format!(
                     "task {task} has different checksums across arms; the task changed"
+                )));
+            }
+            // The working directory is part of the task; two arms that saw
+            // different ones did not run the same task even if the checksum
+            // agrees.
+            if let (Some(left), Some(right)) =
+                (&baseline.workspace_identity, &candidate.workspace_identity)
+                && left != right
+            {
+                return Err(EvalError::Invalid(format!(
+                    "task {task} ran in different workspaces across arms"
                 )));
             }
             pairs.push(TrialPair {
@@ -1632,7 +1653,7 @@ fn trace_has_outcome(trace: &Path) -> Result<bool, EvalError> {
         .any(|record| record.get("type").and_then(Value::as_str) == Some("outcome")))
 }
 
-fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
+fn read_identity(trace: &Path) -> Result<(BaselineIdentity, TrialIdentity), EvalError> {
     let records = read_jsonl(trace)?;
     let trial = records
         .iter()
@@ -1658,7 +1679,11 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
             trace.display()
         )));
     }
-    Ok(BaselineIdentity {
+    let trial_identity = TrialIdentity {
+        workspace_identity: required_hash(trial, "workspace_identity", trace)?,
+        system_prompt_hash: required_hash_value(prompt, "system_prompt_hash", trace)?,
+    };
+    let baseline = BaselineIdentity {
         qq_version: required_string(trial, "qq_version", trace)?,
         qq_source_revision,
         protocol_version: required_u16(trial, "protocol_version", trace)?,
@@ -1699,7 +1724,6 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
         timeout_seconds: optional_u64(trial, "timeout_seconds", trace)?,
         max_turns: optional_u16(trial, "max_turns", trace)?,
         max_cost_usd_nanos: optional_u64(trial, "max_cost_usd_nanos", trace)?,
-        workspace_identity: required_hash(trial, "workspace_identity", trace)?,
         prompt_version: prompt
             .get("version")
             .and_then(Value::as_u64)
@@ -1711,7 +1735,6 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
                 ))
             })?,
         instruction_hash: required_hash_value(prompt, "instruction_hash", trace)?,
-        system_prompt_hash: required_hash_value(prompt, "system_prompt_hash", trace)?,
         tool_schema_hash: required_hash_value(prompt, "tool_schema_hash", trace)?,
         selected_guidance: prompt.get("selected_guidance").cloned(),
         arm: trial
@@ -1720,7 +1743,8 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
             .map(str::trim)
             .filter(|arm| !arm.is_empty())
             .map(str::to_owned),
-    })
+    };
+    Ok((baseline, trial_identity))
 }
 
 /// Per-trial facts only the durable QQ trace carries: Harbor's result has no
@@ -2454,7 +2478,7 @@ mod tests {
                         "timeout_seconds": 900,
                         "max_turns": 100,
                         "max_cost_usd_nanos": 2_000_000_000_u64,
-                        "workspace_identity": "e".repeat(64)
+                        "workspace_identity": content_hash(format!("/tasks/{trial}").as_bytes())
                     }),
                     json!({
                         "type": "outcome",
@@ -2463,7 +2487,7 @@ mod tests {
                         "prompt_identity": {
                             "version": 7,
                             "instruction_hash": "a".repeat(64),
-                            "system_prompt_hash": "b".repeat(64),
+                            "system_prompt_hash": content_hash(format!("prompt for /tasks/{trial}").as_bytes()),
                             "tool_schema_hash": "c".repeat(64)
                         }
                     })
@@ -2563,6 +2587,21 @@ mod tests {
         assert_eq!(identity.max_turns, Some(100));
         assert_eq!(identity.max_cost_usd_nanos, Some(2_000_000_000));
         assert_eq!(identity.prompt_version, 7);
+        // Two tasks with different working directories share one fixed
+        // identity; the directory-dependent hashes are reported per trial.
+        let pass = report
+            .trials
+            .iter()
+            .find(|trial| trial.trial_name == "pass")
+            .unwrap();
+        let fail = report
+            .trials
+            .iter()
+            .find(|trial| trial.trial_name == "fail")
+            .unwrap();
+        assert!(pass.workspace_identity.is_some());
+        assert_ne!(pass.workspace_identity, fail.workspace_identity);
+        assert_ne!(pass.system_prompt_hash, fail.system_prompt_hash);
 
         let classification = directory.path().join("fail/qq-failure.json");
         let mut ungrounded: Value = read_json(&classification).unwrap();
