@@ -103,10 +103,14 @@ The remaining gaps are material:
 
 Existing plans remain authoritative for their narrower scopes:
 
-- `docs/plans/compaction.md` owns transcript pruning, summary mechanics, and
-  the pending `search_history` work.
-- `docs/plans/subagents.md` owns the delegation policy, worker-model setting,
-  and child-cost roll-up.
+- `docs/plans/speed-first-extensible-agent-harness.md` owns the compiled plan,
+  protocol contract, extension lanes, and the 2026-09-04 hot-path redesign
+  (H13–H22).
+- `docs/plans/supervised-delegation.md` owns continuation on truncation, the
+  delegation roster, supervised write children, and the paired evaluation.
+- The shipped compaction and read-only sub-agent plans were removed on
+  2026-09-04; their contracts are recorded in `docs/design/` and in the
+  receipts below.
 - This plan supplies the cross-cutting sequencing, contracts, evaluation
   gates, and missing runtime work needed to make those plans effective.
 
@@ -846,7 +850,8 @@ storage/resource backstop, separate from model-window policy.
 
 ### Compaction Hardening
 
-Complete and extend `docs/plans/compaction.md`:
+Compaction contract (the standalone compaction plan shipped and was removed
+2026-09-04):
 
 - Implement `search_history` over the full durable transcript with bounded,
   cited excerpts.
@@ -1093,7 +1098,8 @@ tool implementation detail until its lifecycle must be displayed separately.
 
 Priority: P1 after Phase 2 and Phase 5.
 
-Complete the pending work in `docs/plans/subagents.md`:
+Complete the pending sub-agent work (the read-only sub-agent plan's Phases
+A–C shipped; that plan was removed 2026-09-04):
 
 - Add a configured worker-model selection with parent fallback.
 - Persist the child's resolved model independently.
@@ -1131,6 +1137,14 @@ sub-agents are permitted only as one serialized `Supervised` child per run
 ## Phase 8: Warm-Path Runtime And Request Efficiency
 
 Priority: P2. Start only after end-to-end measurements identify the cost.
+
+Hand-off recorded 2026-09-04: the retry-exposure, shared-message-storage, and
+request-encoding-benchmark candidates below are implemented by H14 (D3) and
+H18 (D5) in
+[`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md)
+after its audit confirmed nested provider/core retries (up to 24 sends per
+turn) and a full history clone per attempt. This phase keeps the remaining
+candidates.
 
 Candidate work:
 

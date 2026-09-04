@@ -214,7 +214,9 @@ fixed per-session cap (4 MiB), and a persist that would exceed it fails
 the run. That is the backstop against unbounded growth, not window
 management.
 
-Result pruning is the first shedding mechanism (`docs/plans/compaction.md`):
+Result pruning is the first shedding mechanism (shipped compaction design;
+bounds recorded under "Compaction Hardening" in
+`docs/plans/terminal-bench-readiness.md`):
 during assembly, read-only built-in results older than the last few model
 turns are replaced by one-line stubs naming the tool, arguments, and size,
 because the agent can re-derive them on demand. Mutating, shell, and MCP

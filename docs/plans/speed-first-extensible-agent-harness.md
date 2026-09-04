@@ -1,17 +1,11 @@
 # Speed-First Extensible Agent Harness Backend
 
-Status: Phase 0 complete 2026-09-01. Phase 1 complete 2026-09-02 (R4, R5, H1).
-Phase 2 complete 2026-09-02: H2 compiled agent plans, secret-free descriptors,
-credential epochs, and the bounded revalidating plan cache landed and measured.
-Phase 3 complete 2026-09-03 for H3 plus the H4 fixture suite: protocol 13
-(input parts, profiles, plan identity, steering, limits, capabilities,
-correlation), the Rust client path, and conformance fixtures landed and
-measured. The H4 external Python client is deferred to a consumer request.
-Phase 4 complete 2026-09-03 for H5–H9: protocol 14 (compiled tool catalog with
-progressive disclosure, external tool hosts with an embedded host beside MCP,
-agent packs, bounded context sources, and the post-commit observer contract)
-landed and measured. Implementation Phases 5–7 and tasks H10–H12 remain
-proposed.
+Status: Phases 0–4 (H0–H9) complete 2026-09-01 through 2026-09-03; compact
+receipts are under "Phases 0–4 — Complete". A workspace-wide design and
+performance audit on 2026-09-04 (see "Hot-Path Redesign Decisions") added
+tasks H13–H22 and two new implementation phases ahead of the sandbox,
+adapter, and qualification work. **Next slice: Phase 5 (H13–H17).** Phases
+5–9 and tasks H10–H22 remain proposed.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -61,26 +55,30 @@ part of the system before QQ has measured its baseline.
 
 ## Status And Authority
 
-This document is a proposed companion to the current architecture and plans.
-It does not silently override them.
+This document is the active backend plan and a companion to the architecture.
+It does not silently override the design documents.
 
 - [`docs/design/architecture.md`](../design/architecture.md) remains the system
   boundary and dependency-direction source of truth.
-- [`terminal-bench-readiness.md`](./terminal-bench-readiness.md) owns linear
-  streaming, reasoning batching, store fairness, resolved-model context
-  planning, tool-contract ablations, terminal qualification, sub-agent
-  economics, and warm-runtime work.
-- [`terminal-bench-baseline-repair.md`](./terminal-bench-baseline-repair.md)
-  owns the focused qualifying-baseline repair tranche.
-- [`compaction.md`](./compaction.md) owns transcript pruning, summary mechanics,
-  and the pending history-search work.
-- [`subagents.md`](./subagents.md) owns current read-only delegation, worker
-  model selection, child accounting, and child admission.
+- [`terminal-bench-readiness.md`](./terminal-bench-readiness.md) owns
+  tool-contract ablations, terminal qualification, sub-agent economics, the
+  remaining warm-runtime candidates, and the Terminal-Bench evaluation
+  program. Its shipped phases (linear streaming, store fairness, resolved
+  model, context admission, compaction, budgets) are recorded there as
+  receipts.
+- [`supervised-delegation.md`](./supervised-delegation.md) owns continuation
+  on truncation, the delegation roster, supervised write children, the
+  final-answer audit, and the pending paired evaluation.
 - [`run-snapshots.md`](./run-snapshots.md) owns reversible mutating-run state.
 - [`lsp-diagnostics.md`](./lsp-diagnostics.md) owns diagnostics integration and
   its MCP-first validation path.
-- [`core-runtime-rearchitecture.md`](./core-runtime-rearchitecture.md) owns the
-  physical `qq-core` extraction sequence and reasoning-effort contract.
+
+Shipped plans (TUI rearchitecture and refinement, compaction, model-reviewed
+approvals, read-only sub-agents, provider rearchitecture, client parity) were
+removed on 2026-09-04; their durable content lives in `docs/design/` and
+their receipts in Git history. The proposed `qq-core` physical extraction plan
+was retired in favor of D9 below, and the Terminal-Bench baseline-repair
+tranche folded into the readiness plan's Phase 6 gates.
 
 Where this plan depends on one of those contracts, implementation should land
 through the owning plan and this document should record the dependency rather
@@ -242,20 +240,22 @@ QQ currently provides:
   compilation benchmarks, a synthetic tool-loop benchmark, and manual TUI
   performance cases.
 
-The critical gaps already recorded in the active readiness plan are:
+The gaps recorded at the original 2026-08 audit, with their current status:
 
-| Area | Current behavior | Consequence |
+| Area | Original gap | Status (2026-09-04) |
 | --- | --- | --- |
-| Streaming persistence | Text batches reconstruct context and grow stored strings by concatenation | Structurally superlinear long-output work |
-| Reasoning persistence | Deltas commit independently | Transaction and queue pressure for reasoning-heavy models |
-| Store scheduling | Control work is always preferred and full output queues poll | Output can be delayed or starved |
-| Context planning | Fixed byte budget and trigger | Incorrect behavior across small and large context windows |
-| Resolved model state | Runtime loading drops effective limits/capabilities | Core cannot reproduce or budget the actual execution |
-| Run limits | Core-owned `RunLimits` and typed `budget_exhausted` outcome shipped in R5 | Clients other than `qq run` do not yet surface the limits they may impose |
-| Terminal | `shell` is one-shot without stdin or a durable handle | Interactive and long-running processes are awkward |
-| Search/edit | Literal scan and exact replacement | Additional model turns and I/O on large repositories |
-| Retry ownership | Provider and core retries can amplify | Duplicate spend and unclear delivery certainty |
-| Evaluation | No complete useful-result latency gate | Speed claims are not yet end-to-end |
+| Streaming persistence | Text batches reconstructed context and grew strings by concatenation | Resolved by R4 (linear chunks); one fsync per batch remains → D2 |
+| Reasoning persistence | Deltas committed independently | Resolved by R4 (bounded batches) |
+| Store scheduling | Control always preferred; full output queues polled | Resolved by R4 (wake-driven fairness); 14 `sleep(1 ms)` overload loops remain → D8 |
+| Context planning | Fixed byte budget and trigger | Resolved by R5 (provider-aware admission, occupancy reuse) |
+| Resolved model state | Runtime loading dropped effective limits | Resolved by R5 and H2 (`ResolvedModel` in the plan) |
+| Run limits | No core-owned outcome | Resolved by R5 and H3 (`RunLimits`, `budget_exhausted`, capabilities) |
+| Terminal | `shell` is one-shot without a durable handle | Open; owned by R6 |
+| Search/edit | Literal scan and exact replacement | Open; owned by R6 tournament |
+| Retry ownership | Provider and core retries can amplify | Confirmed at up to 24 sends per turn → D3 (H14) |
+| Approval identity | (found 2026-09-04) `ext__` tools classified `Unknown` and execute in every mode | P0 → D4 (H13) |
+| Event fan-out | (found 2026-09-04) each subscriber re-reads and re-serializes every event | → D1 (H15) |
+| Evaluation | No complete useful-result latency gate | Partially resolved by H0 gates; end-to-end quality gate remains H12 |
 
 One footprint issue mattered for embedders at the time of the audit:
 `qq-provider` depended unconditionally on the AWS SDK family. H1 resolved it by
@@ -745,6 +745,379 @@ are real, but the existing crate already centralizes shared HTTP, SSE,
 redaction, construction, and compilation behavior. Split only measured heavy
 dependencies, not cohesive protocol code.
 
+## Hot-Path Redesign Decisions
+
+On 2026-09-04 seven read-only audits covered every crate for design-pattern
+and performance opportunities, and one selection pass verified the
+highest-stakes claims against source and chose the designs below. The
+selection criteria, in order, were: measurable movement on a named gate,
+correctness, line reduction with no behavior change, and simplicity (enums,
+tables, newtypes, and const data over traits; one owner over layers; no
+dynamic dispatch on hot paths; no new crates). Each design names the
+pattern it applies honestly; several are "a struct" or "a table", which is
+the point.
+
+### Verified Findings
+
+| Finding | Evidence | Verdict |
+| --- | --- | --- |
+| One fsync per output batch | `sessions/store/worker.rs` runs one job per message with no outer transaction; `append_text`, `append_reasoning`, `append_tool_call_output`, and `append_run_activity` each open and commit their own transaction under `synchronous=FULL`; zero `prepare_cached` in `qq-core` | Confirmed |
+| Every subscriber re-reads SQLite per event | `sessions/runtime.rs` subscribers call `store.events_after` after every wakeup; `notify` publishes only a sequence; `read_events` parses each row; the server re-serializes each envelope per subscriber | Confirmed |
+| Two retry owners | `qq-provider/http.rs` retries three attempts within 15 s; `qq-core/runtime/retry.rs` retries eight attempts from 1 s to 60 s around it; worst case 24 sends per logical turn. The provider's `random_u32` fallback yields zero jitter | Confirmed |
+| `ext__` tools bypass approval | `approval.rs` classifies only `mcp__`; every other unknown name maps to `Unknown`, which executes in every mode including read-only; `hosts.rs` documents the opposite | Confirmed |
+| History cloned per attempt | `lib.rs` builds `ModelRequest::new(.., messages.clone(), ..)` inside the attempt loop; `ModelRequest.messages` is an owned `Vec<Message>`; adapters use only `&[Message]` | Confirmed |
+| `SessionEvent` size dominated by inline `SessionSummary` | Eight variants embed the 18-field summary by value; `TextAppended` carries one string | Structure confirmed; byte figures not measured |
+| Active-run summary scans events on the ack path | `load_session_summary` calls `load_run_activity`, which parses up to 512 envelopes inside the command transaction | Confirmed |
+| Config parsed three times per load | `load`, `selected_organization`, and `project_trusted` each discover, read, parse, and hash the same project files | Confirmed by audit |
+
+### D1 — Published-Event Outbox And Workspace Broadcast
+
+Pattern: Observer through `tokio::sync::broadcast`; the outbox is a value
+returned from the commit path.
+
+Problem: each committed event is re-read from SQLite and re-parsed by every
+subscriber and re-serialized by the server; `notify` is called from 31
+ad-hoc sites with only a cursor. Subscriber count multiplies control-lane
+store load and competes with command acknowledgement.
+
+Design, owned by `qq-core::sessions`:
+
+```rust
+pub struct PublishedEvent { pub envelope: SessionEventEnvelope, pub json: Arc<str> }
+pub(super) struct Committed<T> { pub value: T, pub events: Vec<Arc<PublishedEvent>> }
+struct WorkspaceFeed { tx: broadcast::Sender<Arc<PublishedEvent>> } // bounded, 1024
+```
+
+`append_event` already encodes the envelope before the insert; it returns the
+encoding instead of dropping it. Store wrappers return `Committed<T>`; the
+runtime publishes once per commit. `subscribe` catches up from SQLite through
+a raw `(sequence, String)` read until it reaches the first buffered sequence,
+then drains the broadcast; `Lagged` falls back to SQLite catch-up. The server
+writes `json` directly into the SSE frame; the TUI and headless adapter use
+`envelope`. The sequence `watch` remains only for shutdown and failure.
+
+Rejected: per-subscriber `mpsc` fan-out (per-client backpressure with no
+bounded catch-up story); caching parsed pages (still one store read per
+subscriber per event).
+
+Gates: durable delta to TUI p95, 100-session throughput, command
+acknowledgement tail. Expected: one serialization per event instead of one
+plus one per subscriber; zero store reads per event in steady state. No
+protocol or schema bump; wire bytes are identical.
+
+Tests: ordering and no-gap across the catch-up to live handoff; `Lagged`
+replay without duplication; eight subscribers perform exactly one catch-up
+read each. Benchmark before: subscriber fan-out at one, eight, and
+thirty-two subscribers on the existing SSE observation harness.
+
+### D2 — Output-Lane Group Commit And Statement Cache
+
+Pattern: unit of work in the store worker with deferred replies.
+
+Problem: every output job commits and fsyncs its own transaction, so eight
+streams cost eight fsyncs per service round and the 50 ms starvation budget
+sits at 49–50 ms. No statement is cached. `append_event` runs an `UPDATE`
+then a `SELECT`.
+
+Design, owned by `qq-core::sessions::store::worker`: when an output job is
+dequeued, the worker opens one transaction, runs that job and any already
+queued output jobs (bounded by `OUTPUT_GROUP_LIMIT = 16` and by control-lane
+emptiness) each inside a savepoint, commits once, and only then replies to
+every job with the shared commit outcome. A failing job rolls back its own
+savepoint and receives `Persistence`; a failing outer commit fails every job
+and publishes nothing. Control-lane jobs keep their own transaction so an
+acknowledgement never waits for a batch. The connection sets a prepared
+statement cache of 128 and hot statements use `prepare_cached`; `append_event`
+uses `UPDATE … RETURNING next_sequence`.
+
+Rejected: `synchronous=NORMAL` (a failed write could be presented as
+durable); a timer-based batch window (adds latency to a lone stream, while
+draining already-queued work adds none).
+
+Gates: eight-stream output service gap (expect ≤20 ms from ≤50 ms), semantic
+delta to durable commit p95 and p99, one MiB scaling. Persist-before-publish
+is preserved because replies, and therefore D1 publication, fire only after
+the outer commit.
+
+Tests: savepoint isolation; commit failure fails every job and publishes
+nothing; a control job is admitted between batches; a crash after savepoint
+and before commit leaves nothing durable. Benchmark before: a
+`store_output_batch` bench (eight streams, 64-byte deltas) plus the R4
+fairness matrix.
+
+### D3 — Single Retry Owner
+
+Pattern: remove a layer; one policy struct on the compiled provider.
+
+Problem: the core turn loop retries the provider's retries. Up to 24 sends
+per logical turn violate the amplification gate and the architecture rule
+that retry belongs to `qq-provider`. Core also re-sends when a stream ends
+without a terminal event, a decision the provider can make with better
+information.
+
+Design: `qq_provider::RetryPolicy` becomes a public, plan-compiled
+`AttemptPolicy` (default four attempts, 500 ms base, 8 s cap, 30 s budget)
+carried on the compiled provider. `Provider::stream` restarts the request
+when the SSE stream ends before any `ProviderEvent` has been yielded, where
+duplication is impossible, and counts it against the same policy.
+`ProviderError` records the attempt count. `qq-core/runtime/retry.rs`,
+`TurnRetryPolicy`, and the `'turn` attempt loop are deleted. The `random_u32`
+fallback becomes an atomic generator seeded from `SystemTime`.
+
+Rejected: keeping core as owner with provider retries disabled (core lacks
+`Retry-After` and pre-stream versus post-stream visibility); splitting
+ownership by error kind (two owners is the bug).
+
+Gates: provider retry amplification below 1.05; claim to provider send (no
+per-attempt request rebuild).
+
+Tests: fake provider failing before the stream and mid-stream before the
+first event; attempts never exceed the policy; zero duplicate deltas;
+`Retry-After` honored; attempts visible in the failure outcome. Add an
+amplification counter to the fake-provider benchmark.
+
+### D4 — Effect-Classified Approval
+
+Pattern: table lookup on data the catalog already holds.
+
+Problem: `approval::classify` keys on the tool name; embedded-host `ext__`
+tools fall to `Unknown` and execute in every mode. Effect is re-derived from
+name strings in four places.
+
+Design: `RuntimeToolCall` carries the catalog `EffectClass`, set at lookup.
+`classify(effect, name, args)` matches on the effect and consults arguments
+only for the shell and `spawn_agent` refinements it performs today. External
+tools map to the class MCP tools use now. `ToolClass::Unknown` is deleted; a
+name absent from the catalog is a tool error before approval. The name
+matches in `tools/specs.rs`, `plan.rs`, and `approval.rs` are removed. Host
+`read_only` hints stay advisory.
+
+Rejected: adding an `ext__` prefix arm (fixes the symptom and keeps four
+derivations); letting hosts declare effect (hints must not grant authority).
+
+Gates: none directly; removes one JSON parse and two string matches per tool
+call. This is a P0 correctness fix. No wire, schema, or descriptor change,
+because effect is derived from the already-digested catalog.
+
+Tests: `ext__` tool denied under read-only, held under ask and supervised;
+hints do not change decisions; MCP behavior unchanged.
+
+### D5 — Shared Transcript And Precompiled Prompt Prefix
+
+Pattern: shared immutable data with copy-on-write; memoization in the plan.
+
+Problem: the history is deep-cloned per turn; the system prompt (up to
+~128 KiB) is rebuilt and hashed per run; tool schemas are re-serialized per
+run although the catalog serialized them at compile; message bytes are
+measured twice per run.
+
+Design: `ModelRequest.messages: Arc<Vec<Message>>`; core appends with
+`Arc::make_mut`, which does not copy once the previous stream is dropped.
+`CompiledAgentPlan` gains `prompt_prefix: Arc<str>`, a cloned SHA-256 state
+for the prefix that is fed only the per-run suffix, and the
+`ToolSchemaMeasurement` for full and static exposure computed once.
+`ToolSpec.input_schema` becomes a precomputed `RawValue`; tool-call
+arguments in history are stored as their original string rather than
+re-stringified per request. Core keeps running byte counters updated on push.
+
+Rejected: `Arc<[Message]>` (cannot push; copies per turn); a persistent
+vector crate for one site.
+
+Gates: one MiB request heap ≤2x (from ~3x), encode ≤10 ms, claim to provider
+send (−100–300 µs prompt rebuild, −0.5–1 ms schema measurement).
+
+Tests: `Arc::strong_count == 1` after stream drop proves no copy; the
+prefix-plus-suffix digest equals the full digest, which guards the persisted
+`RunPromptIdentity`. Benchmark before: `provider_encode` (one MiB plus 32
+schemas with a counting allocator) in `qq-provider`; rerun
+`provider_compiler` and `plan_compile`.
+
+### D6 — Command-Acknowledgement Fast Path
+
+Pattern: denormalized column and a maintained counter.
+
+Problem: `load_session_summary` runs on every command that publishes a
+summary; for a session with an active run it parses up to 512 envelopes
+inside the command transaction (2–20 ms). Every command counts the
+`commands` table. Snapshots scan accounting per session.
+
+Design: schema 24 adds `runs.activity`, written by `append_run_activity` in
+the same transaction as its event and read by the summary query;
+`load_run_activity` is deleted. The command count becomes a maintained
+counter or an existence check where only presence matters. `load_snapshot`
+aggregates accounting in one grouped query. Migration backfills `activity`
+as null, which clients already tolerate.
+
+Rejected: an in-memory activity cache (a second source of truth that must
+survive restart).
+
+Gates: command acknowledgement ≤10 ms with an active run; snapshot and
+reconnect latency. Schema bump 23→24; no wire bump.
+
+### D7 — Two-Hop Claim To Send
+
+Pattern: query consolidation.
+
+Problem: a claim performs five serialized store round trips before the
+provider send; context assembly is N+1 per message and parses every
+tool-call argument; `canonicalize` runs inside a store closure on the worker
+thread.
+
+Design: one control job returns the claimed run, file state, pending
+steering, cancellation flag, and messages from a single transaction using
+one joined query over messages, chunks, and tool calls ordered by ordinal.
+Stale-result pruning uses stored kinds rather than re-parsed arguments.
+`start_reserved_run` remains the second hop because it publishes
+`RunStarted`. Path canonicalization moves ahead of the queue on the caller's
+blocking thread.
+
+Rejected: caching assembled context across turns in memory (invalidated by
+steering and compaction; adds an owner).
+
+Gates: warm claim to provider send ≤25 ms. Shares the schema 24 migration
+with D6.
+
+Tests: a context-equality fixture comparing the old assembly with the
+joined query on a store seeded with compaction, steering, and pruned
+results; the reload path uses the same function.
+
+### D8 — Wake-Driven Control Admission
+
+Pattern: bounded semaphore replaces polling.
+
+Problem: fourteen sites loop on `sleep(1 ms)` after `Overloaded` from the
+control lane, adding jitter on cancellation and settlement; sub-agent
+completion polls the store on every workspace event; MCP cancellation polls
+every 50 ms.
+
+Design: the store gains `control_slots`, a semaphore mirroring the existing
+`output_slots`; control calls await a permit so `try_send` cannot be full.
+`Overloaded` remains only for explicit admission rejection. The fourteen
+loops are deleted. Sub-agent completion subscribes to the existing
+`settlements` watch; MCP cancellation uses a watch.
+
+Gates: cancellation ≤100 ms under load; command acknowledgement tail.
+
+Tests: 256 concurrent control calls complete without spinning;
+cancellation latency under load.
+
+### D9 — Store Identity, Settlement, And Error Consolidation
+
+Pattern: `Copy` newtype, constructor functions, one settlement value, and
+`From` impls. No traits.
+
+Problem: `ClaimedRun` is cloned 23 times and fabricated six times;
+`EventContext` is written as a literal 46 times; three settlement paths
+carry divergent guards (`complete_run_in_transaction` lacks the
+`outcome_json IS NULL` guard, a latent double settle); 332
+`map_err(|_| Persistence)` sites erase every SQLite error.
+
+Design: `RunIdentity { workspace_id, session_id, run_id, command_id, kind,
+child }` is `Copy` and lives inside `ClaimedRun`; `EventContext::for_run`
+and `for_session` replace the literals; `RunSettlement { identity, outcome,
+audit }` feeds one `settle_run` with the null guard; `PersistenceFault
+{ Sqlite(code), Codec, Constraint }` rides in
+`SessionRuntimeError::Persistence` through `From<rusqlite::Error>`. After
+that lands, `sessions.rs` is split into `sessions/{codec, events, snapshots,
+transcript, claim, streaming, tool_calls, settlement, compaction,
+commands}.rs` with tests under `sessions/tests/`, as a separate mechanical
+commit.
+
+Gates: none directly (about five fewer allocations per persisted event).
+This is correctness plus roughly 700 fewer implementation lines. The HTTP
+mapping of `Persistence` is unchanged.
+
+Tests: settling an already-settled run through the previously unguarded
+path is a no-op; every `PersistenceFault` variant is reachable through fault
+injection.
+
+### D10 — Zero-Copy SSE Framing
+
+Pattern: slice scanning with a borrowed view.
+
+Problem: the provider SSE decoder pushes byte by byte, allocates name and
+data strings per event, Anthropic parses each event twice, and the ledger
+clones ids per argument delta; the client decoder mirrors the per-byte
+feed.
+
+Design: `SseFramer::push(&[u8])` scans for frame boundaries with a slice
+search and yields `SseEventRef<'a> { name, data, id }` over the framer's
+buffer; adapters parse `data` once; `ProviderEvent` tool ids become
+`Arc<str>`. The client reuses the same shape; the framer is duplicated
+rather than shared if sharing would add a dependency edge.
+
+Rejected: an event-source crate (a dependency for bounded behavior QQ owns);
+parsing to `RawValue` then re-parsing (still two passes).
+
+Gates: one MiB to 512 KiB scaling ratio; semantic delta to durable commit.
+
+Tests: property test splitting events at every byte boundary; CRLF;
+multi-line data; oversized rejection. Benchmark before: `sse_decode` at
+64 KiB, 512 KiB, and one MiB in `qq-provider`, which does not exist today.
+
+### Bundled Fixes (H22)
+
+Small enough to ship alongside the designs, grouped by crate:
+
+- `qq-core`: move `catalog_blocking` inside `spawn_blocking`; hoist
+  `sleep_until` out of three `select!` loops; take tool results by value;
+  parse tool arguments once into `RuntimeToolCall`; `TurnMode` and
+  `StreamEnd` enums; one bounded UTF-8 read for six copies; serialize the
+  descriptor once at compile; gate file-state eviction on a counter; borrow
+  when persisting model turns.
+- `qq-mcp`: share catalog `ToolSpec`s by `Arc`; release the call permit
+  before awaiting the connect mutex.
+- `qq-protocol`: box `SessionSummary` in the eight summary-carrying event
+  variants (wire-neutral); one hash newtype macro for the two identical
+  32-byte hash types; move client body limits into `limits.rs`.
+- `qq-provider`: one `StaticHttpAuth` with a per-protocol API-key header
+  constant, deleting three auth enums and four `build_headers`
+  (−240 lines); `RequestAuthorizer` as an enum; body encoding with a
+  capacity hint; skip redaction merge when empty; avoid the per-request
+  `HeaderMap` clone; stop `Debug`-formatting Bedrock events to count bytes.
+- `qq-server` and root: a `COMMAND_ROUTES` table keyed by
+  `SessionCommandKind` replacing twelve handlers, with the client table
+  asserted equal in a test; `decode_bounded` for the four decode preambles;
+  `PlanCache` borrows the key on lookup, evicts single-flight entries, and
+  stops cloning paths in fingerprint checks; the approval reviewer compiles
+  through `PlanCache`; headless output leaves the Tokio worker.
+- `qq-config` and `qq-auth`: explicit pack manifests enter `probed_paths`
+  (warm revalidation misses them today); pack MCP servers pass
+  `validate_mcp_servers`; parse each source once per load instead of three
+  times; memoize verified ancestor directories instead of re-stat'ing from
+  root; `LazyLock` builtin providers; shared lock for credential reads,
+  `chmod` only when the mode differs, and `resolve_with_epoch` to halve lock
+  cycles.
+- `qq-tui`: a `body_mut` that does not drop the session tree index on
+  streaming deltas; scan the streaming tail once per frame; compute sidebar
+  status only for visible rows; bound `tool_timing` and
+  `expanded_tool_calls`; parse key chords once.
+
+### Rejected Or Deferred
+
+- A `SseCodec` trait with a generic `SseProvider<C>` over four stable
+  adapters: trait-shaped, no gate, broad regression surface. Revisit when a
+  fifth SSE adapter forces it.
+- Bedrock and Google stream phase enums and the duplicate tool-call
+  tracker: correct but no gate; fold into the next adapter change.
+- Collapsing boxed `stream!` layers: one indirection per event, not per
+  byte; no measurement.
+- Template-method tool-call transitions and per-arm command functions in
+  `execute_command`: shortening for its own sake; reconsider only if the D9
+  split exposes real duplication.
+- Typed run and tool-call state strings, `RunShared`/`RunState` bundles,
+  table-driven budget checks, search/read/hex micro-optimizations: no gate
+  or owned by R6 evaluation.
+- A shared `AnswerProjection` across the TUI, headless, and `ask` reducers:
+  speculative unification; the TUI reducer is cached and correct.
+- Root canonicalize and credential-plan dedup, `Tracked<T>` provenance, a
+  `RefreshableCredential` trait across Codex and xAI: cold path, no gate.
+- TUI reducer and view dedups beyond H22: frame cost at 200 sessions is
+  30–60 µs.
+- File splits other than `sessions.rs`: structure without behavior; do
+  opportunistically, never as a dedicated task.
+- A `ValidatedInput` newtype: no bug reported.
+
 ## Backend Protocol Additions
 
 The native QQ protocol remains the authoritative interface. Additions are
@@ -956,6 +1329,11 @@ authentication, and stronger durability.
 | Embedding | No profile/plan plane (resolved by H2) | `AgentProfile` plus cached `CompiledAgentPlan` |
 | Protocol | Text-only and weak active control (resolved by H3) | Input parts, profile, plan digest, limits, steering, capabilities |
 | Observability | Incomplete end-to-end evidence | Admission, compile, send, TTFT, persist, deliver, tool, replay spans |
+| Event fan-out | Every subscriber re-reads SQLite and re-parses/re-serializes each event | Outbox returned from commit plus per-workspace broadcast; SQLite only for catch-up (D1) |
+| Output commit | One fsync per output batch; no statement cache | Output-lane group commit with savepoints and deferred replies (D2) |
+| Approval identity | Tool class derived from name strings; `ext__` falls to `Unknown` and executes | Classify from the catalog `EffectClass` (D4) |
+| Per-run copies | History cloned per attempt; prompt rebuilt and hashed per run; schemas re-serialized | Shared `Arc` transcript, precompiled prompt prefix, `RawValue` schemas (D5) |
+| Store identity | `ClaimedRun` cloned per event; three settlement paths; 332 source-erasing error maps | `Copy` `RunIdentity`, one `RunSettlement`, `PersistenceFault` (D9) |
 
 ### Reject
 
@@ -993,7 +1371,13 @@ this plan:
 | R8 | Phase 8, warm runtime and request efficiency | Retry ownership, stable-prefix caching, and warm-path work meet their owning gates |
 
 This document consumes completion evidence from those phases. It does not
-redefine their schemas, migrations, tool contracts, or tests.
+redefine their schemas, migrations, tool contracts, or tests. One exception
+is recorded explicitly: R8 lists retry exposure, shared immutable message
+storage, and request-encoding benchmarks as unstarted P2 candidates. H14 (D3)
+and H18 (D5) implement those three candidates here because the 2026-09-04
+audit confirmed a measured amplification defect and a per-attempt history
+copy on the default path. The readiness plan records the hand-off; R8 keeps
+credential-lease caching, MCP bounds, and provider prompt-cache determinism.
 
 ### Task Index
 
@@ -1009,756 +1393,178 @@ redefine their schemas, migrations, tool contracts, or tests.
 | H7 | Complete: embedded external-tool host and shared host conformance | H6 | Core, MCP, root |
 | H8 | Complete: bounded `ContextSource` and cache contract (in-tree consumers) | H2 | Core, root, protocol |
 | H9 | Complete: post-commit observer loop and replay conformance | H3 | Protocol, client, server |
+| H13 | Effect-classified approval: `ext__` tools obey every approval mode; MCP permit released before the connect wait (D4) | H6, H7 | `qq-core`, `qq-mcp` |
+| H14 | Single retry owner in `qq-provider` with a plan-compiled `AttemptPolicy`; core turn retry deleted; amplification measured (D3) | H2 | `qq-provider`, `qq-core` |
+| H15 | Published-event outbox and per-workspace broadcast; SQLite reads only for catch-up (D1) | H9 | `qq-core`, `qq-server` |
+| H16 | Output-lane group commit with savepoints, deferred replies, and cached statements (D2) | H15 | `qq-core` store |
+| H17 | Schema 24: `runs.activity`, command counter, joined context load; claim to send in two hops (D6, D7) | H16 | `qq-core` store |
+| H18 | Shared transcript `Arc`, precompiled prompt prefix, precomputed tool schemas (D5) | H14 | `qq-core`, `qq-provider` |
+| H19 | Zero-copy SSE framing in provider and client (D10) | None | `qq-provider`, `qq-client` |
+| H20 | Wake-driven control admission; polling loops removed (D8) | H16 | `qq-core` |
+| H21 | `RunIdentity`, `PersistenceFault`, one settlement path, `sessions.rs` split (D9) | H15–H17, H20 | `qq-core` |
+| H22 | Bundled cold-path and structural fixes: config/auth load, protocol boxing and limits, route tables, TUI index and tail | None | Per crate |
 | H10 | First real OS process-sandbox adapter | R6, platform threat model | Core tools, root |
 | H11 | Optional ACP/OpenAI compatibility facade | H4, real consumer | Adapter in existing surface owner |
 | H12 | Crash, load, security, quality, and performance qualification | All shipped tasks and required R milestones | Workspace-wide |
 
-### Phase 0 — Establish The Speed Constitution
+### Phases 0–4 — Complete
 
-Implement H0 before extension work.
-
-Deliverables:
-
-- reproducible benchmark commands and machine metadata;
-- the current default dependency tree;
-- current release binary and RSS measurements;
-- first and repeated fresh-process observations plus server/runtime startup
-  distributions;
-- admission, provider-send, durable-delta, client-delivery, cancellation,
-  replay, and tool-dispatch distributions;
-- one/ten/one-hundred session load profiles;
-- long-stream complexity evidence; and
-- benchmark output that is generated and remains untracked.
-
-Acceptance:
-
-- repeated runs report median, p95, and p99 where meaningful;
-- network/provider latency is separated from QQ runtime latency;
-- measurements describe the exact current feature set and revision;
-- a versioned comparator recomputes summaries and rejects incompatible reports,
-  failed fixture checks, excessive noise, p95 latency/size regressions,
-  throughput-median regressions, and configured p99 or absolute limits; and
-- no later phase can claim speed without naming the affected gate.
-
-#### Phase 0 Completion Receipt — 2026-09-01
-
-H0 is complete. `cargo xtask perf baseline` now pins the host target, builds the
-default locked release artifact, and re-executes an optimized worker. It
-snapshots the exact Git status, source content and file modes, and lockfile
-identity before the build; removes inherited Rust/Cargo codegen overrides;
-records hashed native-toolchain environment and Cargo-configuration identities;
-and rechecks both source and artifact identity after measurement. It writes one
-versioned JSON report and uniquely named dependency tree beneath ignored
-`target/qq-perf/`; existing symlink components cannot redirect `--output`
-outside that directory. The report records the source manifest, exact
-default-feature build, artifact, machine, requested workload, effective
-per-metric sample counts, raw samples, distribution summaries, metric
-direction, correctness checks, and unsupported boundaries. `cargo xtask perf
-check` recomputes every summary and compares compatible reports against
-[`benchmarks/perf/budgets-v1.json`](../../benchmarks/perf/budgets-v1.json) and
-exits nonzero on a regression.
-
-The deterministic fixture uses temporary SQLite stores/workspaces, the runtime
-default `WAL` plus `synchronous=FULL` durability, fake providers, authenticated
-QQ HTTP/SSE established before prompt submission, validated tool results,
-bounded provider timing signals, deadline-wrapped runtime/client cases, and
-always-run bounded runtime/server/process cleanup. Each 1/10/100-session load
-profile runs in an isolated optimized child with a sidecar RSS sampler. Linux
-recording fails rather than omitting any required idle or active RSS sample.
-One hundred sessions means one hundred admitted sessions contending through the
-current default cap, and the receipt requires observed provider concurrency to
-equal `min(session_count, configured_limit)`. Provider network time and model
-quality are excluded. The recorder currently refuses non-Linux hosts until safe
-native path isolation and RSS sampling exist.
-
-The clean 100-sample qualification ran from detached revision
-`638330550aa916d9540409a6497128a5ad9a61b9` with `source.dirty = false` on the
-`linux-x86_64-local` machine class: Linux 7.2.0, AMD Ryzen 9 9950X, 32 logical
-CPUs, 64.9 GB RAM, powersave governor, Rust/Cargo 1.97.1. The optimized default
-artifact was 62,599,288 bytes with a 2,761-line dependency tree. The report
-contained all 47 metrics and all 14 correctness receipts passed.
-
-| Selected clean metric | Median | p95 | p99 |
-| --- | ---: | ---: | ---: |
-| Fresh `qq --version` process | 1.722 ms | 2.419 ms | 2.770 ms |
-| Isolated server readiness | 75.442 ms | 79.080 ms | n/a (20 samples) |
-| Idle server RSS | 15.59 MiB | 16.06 MiB | n/a (20 samples) |
-| Durable direct command acknowledgement | 3.211 ms | 3.475 ms | 6.336 ms |
-| Provider delta to committed core event | 6.235 ms | 7.491 ms | 11.710 ms |
-| Cancellation to committed terminal event | 6.360 ms | 9.202 ms | 14.638 ms |
-| 100-session batch | 3.050 s | 7.768 s | n/a (10 batches) |
-| 100-session throughput | 29.710 runs/s | 38.216 runs/s | n/a (10 batches) |
-| 100-session worker peak RSS | 15.54 MiB | 15.75 MiB | n/a (10 batches) |
-| 100-session maximum active runs | 8 | 8 | n/a (10 batches) |
-
-The versioned Phase 0 self-comparison intentionally reported one existing red
-target: the measured 1 MiB/512 KiB durable-stream p95 ratio was `2.292x`
-against the checked-in `2.200x` ceiling. The budget was not weakened. R4 later
-turned the same gate green at `1.925x`; the historical Phase 0 report remains
-unchanged. No other Phase 0 budget failure was reported.
-
-Qualification commands:
-
-```sh
-cargo xtask perf baseline \
-  --machine-class linux-x86_64-local \
-  --samples 100 \
-  --warmups 10 \
-  --output target/qq-perf/phase0-full-r3.json
-cargo xtask perf check \
-  --baseline target/qq-perf/phase0-full-r3.json \
-  --candidate target/qq-perf/phase0-full-r3.json \
-  --budgets benchmarks/perf/budgets-v1.json
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo build --workspace
-```
-
-The isolated HTTP/SSE cases needed loopback permission outside the restricted
-execution sandbox; provider traffic remained the deterministic in-process fake
-and made no external network request. Raw machine samples remain untracked by
-design. The reproducible protocol and complete measurement inventory are in
+Phases 0–4 shipped between 2026-09-01 and 2026-09-03. Their full receipts
+(deliverables, acceptance evidence, test names, and measurement narrative)
+were compressed on 2026-09-04; the complete text is in Git history at the
+revisions below, and the reproducible measurement protocol is in
 [`benchmarks/perf/README.md`](../../benchmarks/perf/README.md).
 
-### Phase 1 — Complete Owned Prerequisites And Feature Profiles
+| Phase | Tasks | Completed | Revision | Landed |
+| --- | --- | --- | --- | --- |
+| 0 — Speed constitution | H0 | 2026-09-01 | `6383305` | `cargo xtask perf baseline/check`, versioned JSON reports, `benchmarks/perf/budgets-v1.json`, 47 metrics, 14 correctness receipts, deterministic fake-provider fixture with 1/10/100-session load and RSS sampling |
+| 1 — Prerequisites and profiles | R4, R5, H1 | 2026-09-02 | `8ccba84` | R4 linear/fair streaming and R5 resolved model, context admission, `RunLimits`, and compaction hardening imported from the readiness plan; `provider-bedrock` feature gates the seven AWS crates; full and minimal profiles both pass the shared interface fixtures |
+| 2 — Compiled plan | H2 | 2026-09-02 | `2375928` | `AgentProfile`, secret-free `AgentPlanDescriptor` with canonical digest (`DESCRIPTOR_VERSION = 1`), runtime-only `CompiledAgentPlan`, `SourceFingerprint` stat revalidation, opaque `CredentialEpoch`, root `PlanCache` (16 entries / 64 MiB, LRU, pinned active generations, single-flight); raw-secret hashing deleted |
+| 3 — Backend contract | H3, H4 fixtures | 2026-09-03 | `27afe89` | Protocol 13, schema 21, descriptor 2: `InputPart`, `Correlation`, `AgentProfileId`, `RunPlanIdentity`, `SteerRun` and steering events, `SetSessionProfile`, expanded `RunLimits`, `ServerCapabilities` (`CAPABILITIES_VERSION = 1`), config `profiles`, typed client calls, 24 golden fixtures. External Python client deferred to a real consumer |
+| 4 — Extensions | H5–H9 | 2026-09-03 | `5f48fd6` | Protocol 14, descriptor 3: immutable `ToolCatalog` with progressive exposure and `select_tools`; `ExternalToolHost` with an `EmbeddedToolHost` beside MCP and a shared conformance suite; `pack.ron` agent packs; bounded `ContextSource` with cache and fail policy; `qq-client::observer` post-commit loop; `ToolSpec` shared behind `Arc` |
 
-Complete R4 and R5 through their owning readiness phases, then implement H1.
-Do not copy their implementation contracts into this plan.
+Retained decisions from those receipts:
 
-Status: complete 2026-09-02. R4, R5, and H1 receipts follow.
+- Persist-before-publish, one terminal event per run, idempotent commands,
+  and cursor replay are the invariants every later phase must keep.
+- The warm plan path performs no filesystem discovery beyond the recorded
+  `stat` list; refresh failures never poison a valid generation; active runs
+  keep their admitted generation.
+- Secrets and secret hashes never enter descriptors, digests, events, traces,
+  snapshots, or cache diagnostics.
+- Static built-in tools are the zero-overhead path and never enter the
+  exclusion or pin paths.
+- Every external component (host, source, observer) has typed readiness,
+  error, capacity, and shutdown states.
+- The Phase 4 recording host was shared and noisy; two tail-only metrics
+  (`provider_delta_to_committed_core_event_ns` p95 and
+  `http_cursor_reconnect_replay_ns` p95) were recorded as noise, not accepted
+  regressions, after `main` failed the same budgets against itself.
 
-#### Imported R5 Completion Receipt — 2026-09-02
+Measurement trend at each phase boundary (clean detached 100-sample recorder
+except Phase 4, which used the best p95 across repeated runs on a loaded
+host). These are the pre-change baselines for Phase 5.
 
-The owning [Terminal-Bench readiness plan](./terminal-bench-readiness.md)
-records the Phase 5 receipt: immutable resolved-model identity, provider-aware
-context admission with exact cross-run occupancy reuse (schema 18), core-owned
-`RunLimits` with the typed `budget_exhausted` outcome (schema 19, protocol 10),
-and compaction hardening — validated summaries, three-row bounded history,
-`rollback_compaction`, and the `search_history` recall tool (protocol 11). The
-clean detached 100-sample recorder at exact revision
-`42f16c6168fef9b008e7427ed581511abb3b2760` reported 62 metrics with all 55
-budgets green: a `1.931x` one-MiB/512-KiB scaling ratio, 23.410 ms p95
-control response, 59.109 ms p95 cancellation, and a 49.000 ms p95 persisted
-output service gap under eight concurrent streams. A first attempt on a loaded
-host failed the service-gap budget by one 52 ms sample and was rerun without
-weakening the budget. The live provider cache-ratio check is deferred for
-credentials and is not counted as passed. Clean workspace test, format,
-Clippy, and build gates passed.
+| Metric | Phase 0 | Phase 1 | Phase 2 | Phase 3 | Phase 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Submit start to provider entry p95 | — | 16.4 ms | 16.5 ms | 17.0 ms | 13.5 ms |
+| Durable direct command acknowledgement p95 | 3.5 ms | 5.8 ms | 5.8 ms | 5.9 ms | 3.6 ms |
+| HTTP command acknowledgement p95 | — | — | 3.7 ms | 6.2 ms | 3.7 ms |
+| Provider delta to committed core event p95 | 7.5 ms | — | — | — | 9.1 ms (noise) |
+| Eight-stream output service gap p95 | — | 50.0 ms | 47.0 ms | 46.0 ms | 47.0 ms |
+| 1 MiB / 512 KiB scaling ratio | 2.292x (red) | 1.951x | 1.919x | 1.895x | 1.892x |
+| Cancellation to committed terminal event p95 | 9.2 ms | 59.1 ms (R5) | — | — | — |
+| 100-session batch p95 | 7.77 s | — | — | — | 2.42 s |
+| Release binary | 62.60 MB | 63.99 MB | 64.02 MB | 65.31 MB | 66.79 MB |
+| Minimal release binary | — | 51.88 MB | — | — | 54.72 MB |
+| Idle server RSS p95 | 16.06 MiB | 17.96 MB | 17.89 MB | 18.04 MB | 17.82 MB |
+| `plan_compile` (embedded profile) | — | — | 20.9 µs | 21.5 µs | 23.9 µs |
+| `plan_for` cold / warm | — | — | 180 / 6.1 µs | 180 / 6.2 µs | 202 / 7.7 µs |
+| Compiled plan estimated heap | — | — | 7.0 KiB | 8.2 KiB | 14.0 KiB |
+| `catalog_compile_512` | — | — | — | — | 1.21 ms |
+| `select_tools_rank` (512 tools) | — | — | — | — | 18 µs |
 
-#### H1 Completion Receipt — 2026-09-02
+Cold `plan_for` is dominated by configuration discovery and credential
+resolution rather than plan construction, which is why H22 targets the
+config and auth load paths. The eight-stream service gap has sat within 5 ms
+of its 50 ms budget since Phase 1, which is what D2 addresses.
 
-Dependency audit: of `qq-provider`'s dependencies only the seven AWS SDK crates
-(`aws-config`, `aws-credential-types`, `aws-sdk-bedrockruntime`, `aws-sigv4`,
-`aws-smithy-http-client`, `aws-smithy-runtime-api`, `aws-smithy-types`) are
-adapter-specific; they were used by `aws.rs`, `providers/bedrock.rs`, and
-`providers/mantle.rs` only. Everything else (reqwest, SSE framing, redaction,
-construction, compilation, the neutral request/model/pricing/event types) is
-shared by the HTTP families and stays unconditional. `aws-lc-rs` appears in
-both profiles as rustls's crypto backend, not as an SDK dependency.
+### Phase 5 — Correct The Hot Path
 
-Feature manifest (commit `8ccba84`): `qq-provider` gains `provider-bedrock`
-(default on) owning the seven optional AWS crates; the HTTP families need no
-feature because they add no dependency. `BedrockAuth` moved to a neutral
-module so `ProviderRecipe` is constructible and digestible in every profile;
-without the feature `ProviderCompiler` returns a configuration error
-(`BEDROCK_FAMILY_UNAVAILABLE_MESSAGE`) before any SDK or network work. The root
-`qq` package mirrors it: `default = ["provider-bedrock"]` is the full binary,
-`--no-default-features` is the minimal embedding profile. `xtask` pins the full
-profile for canaries. The provider self dev-dependency drops default features so
-the minimal profile is genuinely tested rather than re-unified by Cargo.
+Implement H13, H14, H15, H16, and H17, in that order. H13 ships first
+because it is a P0 approval bypass. H15, H16, and H17 touch the same store
+functions and land serially; H14 is independent and may run in a parallel
+worktree.
 
-Acceptance:
+Benchmarks to record before each change, per the Performance Constitution:
 
-- the readiness plan marks R4 and R5 complete (receipts above);
-- the shared interface fixtures (`crates/qq-provider/tests/interface`, nine
-  cases across OpenAI Responses, Chat Completions, Anthropic, Google, and the
-  canary path) pass under both `--features provider-bedrock` (186 lib tests)
-  and `--no-default-features` (142 lib tests; the 44 gated tests are AWS
-  configuration, Bedrock, and Mantle adapter tests);
-  `bedrock_recipes_compile_only_with_the_provider_bedrock_feature` asserts the
-  refusal path;
-- the minimal closure links none of the seven AWS crates, asserted by the
-  recorder's `minimal_profile_excludes_heavy_provider_dependencies` receipt
-  (272 distinct crates against 326 for the full profile);
-- no neutral type, request path, or event changed shape; the gate sits at
-  recipe compilation and in one `RequestAuthorizer` field;
-- budgets are enforced: `qq_release_binary_bytes` ≤ 70 MB,
-  `qq_minimal_release_binary_bytes` ≤ 56 MB, and
-  `qq_minimal_dependency_closure_crates` ≤ 300 are absolute ceilings, with
-  relative regression limits on both profiles' startup, readiness, and RSS
-  metrics (`benchmarks/perf/budgets-v1.json`, fixture 3); and
-- no provider-per-crate split or parallel provider interface was introduced.
-
-Measurements from the clean detached 100-sample recorder at exact revision
-`8ccba84d31fe5bc1ab37587268bc716dcada1a5f` (69 metrics, all 61 budgets green):
-
-| Boundary | Full | Minimal |
-| --- | ---: | ---: |
-| Release binary | 63.99 MB | 51.88 MB |
-| Distinct dependency-closure crates | 326 | 272 |
-| Repeated `qq --version` p95 | 2.274 ms | 2.124 ms |
-| Isolated `qq serve` readiness p95 | 111.988 ms | 120.846 ms |
-| Idle server RSS p95 | 17.96 MB | 15.98 MB |
-| Idle server peak RSS p95 | 17.97 MB | 15.98 MB |
-
-The minimal profile removes 12.1 MB (19%) of binary and 54 crates; idle RSS
-drops ~2 MB. Startup and readiness are within noise of each other, so the
-AWS closure was a size and build-time cost rather than a startup cost. The R4
-fairness metrics stayed green on this run (23.987 ms control upper bound,
-50.000 ms output service gap at its limit, 1.951x scaling ratio).
-
-Phase 1 is complete.
-
-#### Imported R4 Completion Receipt — 2026-09-01
-
-The owning [Terminal-Bench readiness plan](./terminal-bench-readiness.md)
-records the full schema, batching, fairness, capacity, recovery, and
-qualification receipt. Implementation commit `ecd42e5` plus diagnostic commit
-`b1cc118` passed the clean detached 100-sample recorder at exact revision
-`b1cc1189a32bc0361045472bc1a4e338c2e52d06`: 62 metrics, all 55 enforced
-budgets green, a `1.925x` one-MiB/512-KiB scaling ratio, 23.521 ms p95 control
-response, 40.819 ms p95 cancellation, and a 50.000 ms p95 persisted output
-service gap under eight concurrent streams. The three-sample isolated release
-diagnostic also passed exact 64 KiB through 4 MiB direct-store payloads, and
-the clean workspace test, format, Clippy, and build gates passed. Raw reports
-remain ignored and untracked.
+- H14: a fake-provider fault-injection run reporting attempts per logical
+  turn (the amplification counter);
+- H15: subscriber fan-out at one, eight, and thirty-two subscribers on the
+  existing SSE observation harness;
+- H16: a `store_output_batch` bench (eight streams, 64-byte deltas) plus a
+  rerun of the R4 fairness matrix; and
+- H17: the H0 direct and HTTP acknowledgement proxies and the submit-to-
+  provider-entry proxy, with a 512-event active session seeded.
 
 Deliverables:
 
-- completion receipts for R4 and R5 referencing their migrations, tests, and
-  benchmarks;
-- an audit of which dependencies belong to provider-neutral versus concrete
-  adapter code;
-- feature-gated heavy provider families inside `qq-provider`;
-- an explicit full binary feature manifest;
-- an explicit minimal embedding feature manifest; and
-- binary, dependency-closure, startup, and RSS measurements for both profiles.
+- `EffectClass`-driven approval with `ToolClass::Unknown` removed (D4);
+- one `AttemptPolicy` on the compiled provider and no core turn retry (D3);
+- `PublishedEvent`, `Committed<T>`, and a bounded per-workspace broadcast
+  with SQLite catch-up (D1);
+- output-lane group commit with savepoints, deferred replies, a prepared
+  statement cache, and `RETURNING` sequence allocation (D2);
+- schema 24 with `runs.activity`, a maintained command counter, grouped
+  snapshot accounting, and a single joined context load (D6, D7); and
+- migration and regression tests named in each design.
 
 Acceptance:
 
-- the owning readiness plan marks R4 and R5 complete with its own gates;
-- full and minimal profiles pass shared provider contract fixtures;
-- the minimal profile excludes unused AWS SDK dependencies;
-- disabling one adapter family cannot alter neutral request/event behavior;
-- full and minimal budgets are enforced rather than merely reported; and
-- no provider-per-crate or parallel provider interface is introduced.
+- an `ext__` tool is denied under read-only and held under ask and
+  supervised, and MCP decisions are unchanged;
+- attempts per logical turn never exceed the policy and measured
+  amplification is below 1.05;
+- in steady state each subscriber performs exactly one catch-up read and
+  no store read per event, and live and replayed streams are byte-identical;
+- a failed outer commit fails every batched job and publishes nothing; a
+  control job is admitted between batches;
+- command acknowledgement stays within its budget with an active run that
+  has 512 events;
+- the eight-stream output service gap is at most 20 ms;
+- claim to provider send uses two store hops and the joined context equals
+  the previous assembly on the seeded fixture; and
+- no protocol, capability, or descriptor version changes; schema moves
+  23→24 with a migration test.
 
-### Phase 2 — Compile The Execution Plan
+### Phase 6 — Shrink Per-Run Work And Consolidate The Store
 
-Implement H2 before protocol-visible plan identity or general addon packaging.
+Implement H18, H19, H20, H21, and H22. H18 and H19 are independent and may
+run in parallel worktrees; H20 then H21 follow Phase 5 serially because they
+edit the same store paths. H22 items may land whenever their crate is
+otherwise quiet.
 
-Status: complete 2026-09-02. Receipt follows.
+Benchmarks to record before each change:
 
-#### H2 Completion Receipt — 2026-09-02
-
-Before H2, every `SubmitPrompt` reloaded and re-parsed layered configuration,
-re-resolved every secret under the credential store's file lock, re-enumerated
-and re-authenticated every provider/model for spawn routes, hashed raw secret
-bytes into the runtime cache key, cloned the cached runtime to attach spawn
-routes, then canonicalized and reopened the workspace and re-read `AGENTS.md`
-inside the run loop. Only the prompt, guidance, and limits were per-run.
-
-Landed (squashed as one commit on `main`):
-
-- `qq-protocol`: `AgentPlanDigest` and opaque `CredentialEpoch` newtypes. No
-  wire type carries them yet; `PROTOCOL_VERSION` stays 11.
-- `qq-auth`: the credential index carries a `revision` advanced by every
-  durable write, including in-place rotation of an existing keyring entry,
-  which previously skipped the index write. `CredentialStore::epoch()` reads it
-  without touching secrets; pre-revision indexes load as epoch zero.
-- `qq-provider`: `BUILD_IDENTITY` names the crate version and compiled adapter
-  families for descriptors.
-- `qq-config`: the loader records every filesystem location it probed (files
-  present or absent, layer directories, VCS-root markers, trust and
-  organization state, the working directory) and exposes
-  `ConfigSnapshot::probed_paths()`.
-- `qq-core::plan`: typed `AgentProfile`; `AgentPlanDescriptor` with a
-  domain-tagged canonical compact-JSON encoding (`DESCRIPTOR_VERSION = 1`) and
-  golden digest fixture; runtime-only `CompiledAgentPlan` holding the runtime,
-  opened workspace, preloaded instructions, static tool catalog and schema
-  hash, resolved model, descriptor, digest, epoch, instruction-source
-  fingerprints, and a byte estimate; `SourceFingerprint` (`len`, `mtime`,
-  inode, presence) for stat revalidation. The run loop executes from the plan:
-  no canonicalize, `Workspace::open`, instruction read, or `spawn_agent`
-  schema rebuild per run. `Runtime::run_in_workspace` compiles an embedded plan
-  and delegates, so direct callers are unchanged. `LoadedRuntime` carries the
-  plan; the former runtime/resolved-model mismatch check moved to compile time.
-- Root: `PlanCache` keyed by canonical workspace, model selection, and
-  explicit configuration; `Hit`/`Revalidated`/`Compiled` outcomes; LRU eviction
-  of inactive generations; pinned active generations count toward the
-  16-entry/64 MiB bound and produce an explicit capacity error; single-flight
-  compile per key; shutdown wired to `RuntimeHandler::shutdown`. `RuntimeKey`
-  and all raw-secret hashing were deleted; the provider preparers return
-  `ProviderDescriptor`s; the MCP registry cache is keyed by declaration digest
-  plus epoch and yields `McpServerDescriptor`s. `qq ask` runs from the plan.
-
-Acceptance:
-
-- the same canonical descriptor produces the same digest (golden
-  `b04a4fbe…e069`; round trip through JSON preserves it);
-- 27 behavior-affecting descriptor fields each change the digest, and a
-  compiled plan's digest changes when `AGENTS.md` changes;
-- secrets and secret hashes never enter descriptors, digests, or diagnostics:
-  sentinel secrets (inline bearer, custom header value, stored key before and
-  after rotation) are asserted absent from canonical bytes and `Debug`, and
-  endpoints are reduced to scheme/host/port/path;
-- rotation of a stored credential changes the epoch and recompiles the
-  provider handle while the digest is unchanged
-  (`credential_rotation_changes_the_epoch_but_not_the_plan_digest`);
-- a warm lookup performs no filesystem discovery: it is the recorded `stat`
-  list only, asserted by counting compiles across repeated loads;
-- a config or instruction edit recompiles on the next prompt, an edit that
-  produces an identical digest keeps the live generation, a broken edit fails
-  the triggering run and leaves the valid generation cached, and reverting
-  hits again;
-- active runs retain their admitted generation across a refresh (pinned
-  entries survive LRU eviction and are never evicted);
-- refresh storms compile once per key (16 concurrent misses) and pinned entries
-  cannot grow the cache past its entry or byte bound; and
-- the default path stays within the regression gate (below).
-
-Measurements at exact revision `2375928` (clean detached recorder,
-100 samples, 69 metrics, all 61 budgets green):
-
-| Metric | Phase 1 (`8ccba84`) | Phase 2 (`2375928`) |
-| --- | ---: | ---: |
-| Submit start to provider entry p95 | 16.4 ms | 16.5 ms |
-| Durable direct command acknowledgement p95 | 5.8 ms | 5.8 ms |
-| Eight-stream output service gap p95 | 50.0 ms | 47.0 ms |
-| 1 MiB / 512 KiB scaling ratio | 1.951x | 1.919x |
-| Release binary | 63.99 MB | 64.02 MB |
-| Idle server RSS p95 | 17.96 MB | 17.89 MB |
-
-The fixture's `BenchmarkLoader` compiles a fresh plan on every load rather than
-caching, so `submit_start_to_provider_entry_ns` measures the uncached floor
-and stays comparable with earlier reports; it did not move. The saving H2
-targets is outside that fixture and is measured directly:
-
-| Benchmark | Result |
-| --- | ---: |
-| `plan_compile` (embedded profile, 1.5 KiB `AGENTS.md`) | 20.9 µs |
-| `plan_descriptor_digest` | 1.78 µs |
-| Compiled plan estimated heap | 7.0 KiB |
-| `RuntimeFactory::plan_for` cold compile (config + stored credential + provider) median / p95 | 180 µs / 205 µs |
-| `RuntimeFactory::plan_for` warm hit median / p95 | 6.1 µs / 6.2 µs |
-
-The warm path is ~30x cheaper than the per-prompt work every run paid before,
-and it no longer holds the credential store's file lock or parses RON. Cold
-compile is dominated by configuration discovery and credential resolution, not
-by plan construction.
-
-Not in scope, per the phase split: persisting the digest or epoch on runs,
-exposing them on the wire, an `AgentProfileId` or configuration-level profile
-key, freezing the MCP catalog into a generation (H6), or agent-pack manifests
-(H5). Deferred: the perf fixture could grow a cached-loader variant to record
-the warm admission path end to end.
-
-Phase 2 is complete.
-
+- H18: `provider_encode` (one MiB plus 32 schemas with a counting
+  allocator) in `qq-provider`, plus reruns of `provider_compiler`,
+  `plan_compile`, and the `plan_for` warm path;
+- H19: `sse_decode` at 64 KiB, 512 KiB, and one MiB in `qq-provider`;
+- H20: cancellation under 256 queued control jobs; and
+- H22: the H0 cold `plan_for` measurement and the TUI 200-session sidebar
+  case.
 
 Deliverables:
 
-- typed `AgentProfile` input and provenance without leaking config documents
-  into core;
-- a secret-free canonical `AgentPlanDescriptor` and digest fixtures;
-- a runtime-only immutable `CompiledAgentPlan`;
-- opaque credential epochs and rotation invalidation without secret hashes;
-- a bounded entry/byte cache with inactive LRU eviction and active-generation
-  pinning;
-- atomic generation swap after successful refresh;
-- explicit compile, capacity, readiness, and shutdown errors; and
-- plan compilation/cache benchmarks added before the implementation is
-  accepted.
+- `Arc<Vec<Message>>` transcripts, precompiled prompt prefix and digest
+  state, and precomputed schema measurement and `RawValue` schemas (D5);
+- slice-scanning SSE framers in provider and client with borrowed event
+  views and shared tool ids (D10);
+- `control_slots` admission and the removal of every `sleep(1 ms)` retry
+  loop and store poll (D8);
+- `RunIdentity`, `EventContext` constructors, `RunSettlement`,
+  `PersistenceFault`, and the `sessions.rs` split as a separate commit (D9);
+  and
+- the bundled fixes listed under H22.
 
 Acceptance:
 
-- the same canonical descriptor produces the same digest;
-- each behavior-affecting source or adapter change produces a new digest;
-- secrets and secret hashes never enter descriptors, digests, events, traces,
-  snapshots, or cache diagnostics;
-- credential rotation changes the opaque epoch and refreshes matching live
-  authorization without changing behavioral identity;
-- warm plan lookup performs no filesystem discovery;
-- active runs retain their admitted generation through refresh;
-- refresh failure does not break an existing valid generation;
-- refresh storms and pinned entries cannot grow the cache beyond its hard
-  admission bound; and
-- disabled plan support stays within the default-path regression gate.
+- one MiB request heap is at most 2x the payload and encode is at most
+  10 ms; the prefix-plus-suffix prompt digest equals the full digest;
+- the one MiB to 512 KiB scaling ratio stays at or below 2.2x and improves
+  against the Phase 4 receipt;
+- cancellation is at most 100 ms with 256 queued control jobs and no site
+  polls the store;
+- settling an already-settled run through any path is a no-op and every
+  `PersistenceFault` variant is reachable in tests;
+- the `sessions.rs` split changes no behavior and lands as its own commit;
+- explicit pack manifests are revalidated on warm hits and pack MCP names
+  are validated;
+- the H22 route-table equality test passes between client and server; and
+- the default path stays within the regression gate for every metric in the
+  Phase 4 receipt.
 
-### Phase 3 — Complete The Backend Contract
-
-Implement H3, then H4. H3 may expose plan identity because H2 already supplies
-the secret-free descriptor and digest.
-
-Status: complete 2026-09-03 for H3 and the H4 fixture suite. Receipt follows.
-
-#### H3 Completion Receipt — 2026-09-03
-
-Before H3 the wire contract was text-only: `submit_prompt.prompt` was one
-string, sessions had no profile concept, accepted runs recorded a resolved
-model but not the plan they ran under, the only live-run control was
-cancellation, `RunLimits` covered five families, nothing described a server
-beyond `protocol_version`, every struct rejected unknown fields in both
-directions, and a client could learn what the server supported only by
-trying.
-
-Landed as protocol version 13, schema version 21, descriptor version 2
-(squashed as one commit on `main`):
-
-- `qq-protocol`: `InputPart::{Text, WorkspaceFile}` with pure `validate_input`
-  and its bounds; `Correlation` (bounded opaque map); `AgentProfileId`
-  (validated slug, `default` implicit); `RunPlanIdentity`; `SteerRun`
-  (`interrupt` flag) with `SteeringQueued` and the `steering_queued` /
-  `steering_applied` / `steering_superseded` / `run_interrupted` events;
-  `SetSessionProfile` / `SessionProfileSet`; `RunLimits` gains
-  `max_input_tokens`, `max_output_tokens`, `max_tool_output_bytes`,
-  `max_children`, `max_concurrent_children` and `BudgetLimitKind` gains
-  `InputTokens`, `OutputTokens`, `TokensUnknown`, `ToolOutputBytes`;
-  `SessionSummary.{profile, correlation}`, `RunSnapshot.{plan, correlation}`,
-  `MessageSnapshot.steering`, `RunStarted.plan`; `ServerCapabilities`
-  (`CAPABILITIES_VERSION = 1`) and `CapabilitiesRequest`; `SessionCommandKind`
-  and `InputPartKind` vocabularies; `ServerInfo` and the capability document
-  tolerate unknown fields, everything inbound stays strict (`SessionCommand`
-  and `InputPart` now carry `deny_unknown_fields`). `PromptQueued.run` is
-  boxed to keep the event enum small.
-- `qq-core`: schema 21 adds `sessions.{profile, correlation_json}`,
-  `runs.{input_json, correlation_json, plan_identity_json,
-  plan_descriptor_json}`, `messages.{input_json, steering}`. Admission
-  validates parts without I/O; `input::resolve_blocking` reads file parts
-  through the plan's workspace at run start, records them in file state, and
-  fails the run (`invalid_command`) on any violation before provider work.
-  Plan identity and the canonical descriptor are written in the
-  `status = 'running'` statement. Steering: durable row, bounded per-run
-  channel in `SessionRuntimeInner.steering`, boundary injection after tool
-  results or in place of completion, interrupt observed in the provider
-  stream, approval wait, and tool `select!`s, interrupted calls settle with an
-  error result, applied steering persisted with its turn ordinal and replayed
-  in that position by context assembly, pending steering superseded at
-  settlement, replayed commands never re-queue. `BudgetMeter` charges the new
-  families with typed exhaustion; child bounds lower the spawner's ceiling
-  and refuse as tool errors. `RuntimeLoadRequest.profile`;
-  `LoadedRuntime::compile_blocking_for_profile`. `MAX_PENDING_STEERING = 4`,
-  `MAX_CHILD_DEPTH = 1`, and the child ceilings are public for capabilities.
-- `qq-config`: `profiles: { name: Profile(model, organization,
-  max_output_tokens, approval_mode) | Remove }` layered by name like `mcp`,
-  validated at merge (name shape, route on a configured provider, policy cap),
-  `default` undeclarable, `ConfigSnapshot::{profiles, profile}`,
-  `ConfigKey::{Profiles, Profile}`, provenance. No dependency on
-  `qq-protocol`.
-- Root: `RuntimeFactory::plan_for_profile`; `PlanKey.profile`; profile values
-  resolve beneath request overrides inside `compile_generation`; the
-  descriptor records the profile (v2 golden
-  `bc19398a…6267`); `RuntimeBuildError::UnknownProfile` →
-  `configuration`; `RuntimeFactory::profiles_for` and
-  `RuntimeHandler::profiles` for the capability document;
-  `SessionRuntime::workspace_path`.
-- `qq-server`: `POST /v1/capabilities`, `/v1/runs/steer`,
-  `/v1/sessions/profile`; input parts validated at the transport before the
-  handler; `ServerHandler::profiles`.
-- `qq-client`: routes for the new commands; typed `submit`, `steer`,
-  `interrupt`, `cancel`, `approve`, `set_profile`, `capabilities`.
-- TUI, headless, xtask, and Harbor fixtures adapt to the new shapes (the TUI
-  renders steering rows and states but offers no steering composer yet).
-
-Acceptance:
-
-- an external process can create (with profile and correlation), run
-  (structured input, limits), approve, steer, interrupt, cancel, disconnect,
-  reconnect, and resume through the documented routes; the Rust client
-  exposes each as a typed call
-  (`retried_commands_replay_receipts_and_conflicting_reuse_is_rejected`,
-  `steering_is_applied_at_the_next_boundary_and_replays_in_context`,
-  `interrupting_steer_withdraws_the_pending_approval_and_continues`);
-- retries cannot duplicate prompts, approvals, steering, or cancellation: a
-  reused `command_id` replays the stored receipt and a conflicting body is
-  refused, at the route and in the durable journal;
-- clients learn supported input parts, commands, steering, limit kinds,
-  bounds, approval vocabulary, and workspace profiles from
-  `/v1/capabilities`, and read a newer server's `ServerInfo`/capabilities
-  without a decode failure
-  (`capabilities_document_advertises_bounds_commands_and_workspace_profiles`,
-  `inbound_types_reject_unknown_fields_and_response_types_tolerate_them`);
-- malformed or oversized input fails at the transport (`400`) and at durable
-  admission before any row is written; a stale or escaping attachment fails
-  the run before provider work
-  (`malformed_and_oversized_input_fails_before_the_handler`,
-  `workspace_file_parts_attach_at_start_and_stale_hashes_fail_before_provider_work`);
-- accepted runs carry a fixed `RunPlanIdentity` that survives configuration
-  refresh and restart; the persisted descriptor re-digests to it
-  (`plan_identity_correlation_and_profile_persist_and_survive_refresh`);
-- profiles key the plan cache, resolve beneath explicit overrides, and an
-  undeclared profile is a typed configuration failure
-  (`profiles_select_defaults_key_the_plan_cache_and_reject_unknown_names`,
-  `agent_profiles_layer_by_name_validate_routes_and_never_declare_default`);
-- steering bounds and refusals are typed: queue of 4, blank input, unknown or
-  queued or finished runs, superseded on cancel
-  (`steering_bounds_and_refusals_are_typed`);
-- every new limit family settles with its own kind and lost usage under a
-  token bound is `tokens_unknown`
-  (`split_token_and_tool_output_bounds_settle_with_their_own_kinds`);
-- 24 golden wire fixtures under `crates/qq-protocol/tests/fixtures/v13/` are
-  checked byte-for-byte; and
-- no second execution implementation exists: the server, TUI, headless
-  adapter, and `qq ask` all run the same `CompiledAgentPlan::execute`.
-
-Measurements at exact revision `27afe89` (clean detached recorder, 100
-samples, 69 metrics, all 61 budgets green):
-
-| Metric | Phase 2 (`2375928`) | Phase 3 (`27afe89`) |
-| --- | ---: | ---: |
-| Submit start to provider entry p95 | 16.5 ms | 17.0 ms |
-| Durable direct command acknowledgement p95 | 5.8 ms | 5.9 ms |
-| HTTP command acknowledgement p95 | 3.7 ms | 6.2 ms |
-| Eight-stream output service gap p95 | 47.0 ms | 46.0 ms |
-| 1 MiB / 512 KiB scaling ratio | 1.919x | 1.895x |
-| Release binary | 64.02 MB | 65.31 MB |
-| Idle server RSS p95 | 17.89 MB | 18.04 MB |
-| `plan_compile` (embedded profile) | 20.9 µs | 21.5 µs |
-| `plan_descriptor_digest` | 1.78 µs | 1.72 µs |
-| Compiled plan estimated heap | 7.0 KiB | 8.2 KiB |
-| `plan_for` cold / warm | 180 µs / 6.1 µs | 180 µs / 6.2 µs |
-
-The submit path now serializes the input part list into the run and message
-rows and the plan identity plus descriptor JSON into the start statement; the
-p95 moved by 0.5 ms and stays inside its budget. The HTTP acknowledgement
-median is unchanged (3.4 ms); its p95 sits on the same ~6 ms durable-commit
-tail that the direct `command_ack_ns` path shows in both phases (about ten of
-one hundred samples), so the 100-sample p95 lands on either side of that
-cluster from run to run. The budget holds. The binary grew 1.3 MB for the new
-types, routes, and fixtures.
-
-Not in scope, per the phase split: image input parts (the capability document
-advertises the accepted kinds so they are additive), a steering composer in
-the TUI, freezing the MCP catalog into a generation (H6), agent-pack manifests
-(H5), and the external Python reference client, which waits for a real
-consumer so its shape is driven by use rather than guessed.
-
-Phase 3 is complete for the backend contract.
-
-
-Deliverables:
-
-- bounded versioned `InputPart` commands;
-- session/run profile selection and effective plan identity;
-- core limits and typed outcomes visible through HTTP/SSE;
-- active-run steering and interruption commands;
-- versioned capability discovery;
-- opaque bounded correlation metadata;
-- protocol fixtures for command idempotency, replay, approvals, steering,
-  limits, unknown fields, and version skew;
-- a complete Rust client path; and
-- one thin external reference client selected by a real consumer. For a
-  Python Hermes-style application, prefer a small async Python client over a
-  subprocess wrapper.
-
-Acceptance:
-
-- an external process can create, run, approve, steer, cancel, disconnect,
-  reconnect, and resume a session without reading QQ internals;
-- retries cannot duplicate prompts, approvals, steering, or cancellation;
-- clients learn supported features through capabilities rather than provider
-  name checks;
-- malformed/oversized input fails before durable run admission; and
-- the external client adds no second execution implementation.
-
-### Phase 4 — Add Declarative And Executable Extensions
-
-Implement H5-H9 only with concrete consumers. External tool hosts perform no
-implicit retry; a host-specific idempotent retry contract would require
-separate evidence and must not create a second provider/tool retry layer.
-
-Status: complete 2026-09-03. Receipt follows.
-
-#### Phase 4 Completion Receipt — 2026-09-03
-
-Before Phase 4 the plan carried a static tool list and MCP declarations joined
-every run from a live registry cache, so two runs under one plan could see
-different tools; every declared tool schema was sent on every request; skills
-were reachable only by explicit `/name`; agent customization stopped at the
-`profiles` map; nothing supplied context the runtime did not own; and the
-observer story was "subscribe and hope". Five commits landed on `main`, one
-per task, in dependency order H6, H7, H5, H8, H9, plus one `perf` commit.
-
-Landed as protocol version 14, descriptor version 3, prompt version 9, schema
-version 21 (unchanged):
-
-- H6 `qq-core::catalog`: `ToolCatalog::compile(static, hosts)` builds one
-  immutable sorted catalog per plan with a digest over names, descriptions,
-  serialized schemas, effect classes, and exposure. Bounds are constants and
-  advertised: 512 tools, 16 KiB schema, 4 KiB description, 1 MiB external
-  schema; every refusal is a typed `ExcludedTool` in the descriptor and the
-  capability document. `Exposure::Full` at or under 24 external tools and
-  32 KiB; otherwise `Progressive` with a prompt index and the `select_tools`
-  meta-tool (8 matches per call, 32 pins per run, deterministic token-overlap
-  ranking, recovery re-pins from prior results). `ExternalToolHost` replaces
-  `McpRegistry` in core (`Runtime::with_tool_host`); `qq-mcp` gains catalog
-  generations, `McpCallFailure`, hints, and terminal shutdown; the root's
-  `WiredMcpRegistry` implements the host and the plan cache revalidates
-  `hosts_are_current()` in memory. `SkillIndex` compiles native and pack roots
-  with front-matter descriptions, disclosed in the prompt and loadable through
-  `load_skill`; `.agents`/`.claude` stay explicit-only. Root and skill-root
-  fingerprints join the plan's stale check (seven by default).
-- H7 `qq-core::hosts::embedded`: `EmbeddedToolHost::builder(name)` with a
-  frozen registry, `max_concurrent_calls` permit (`Overloaded` on exhaustion),
-  per-call deadline, 64 KiB argument and 1 MiB result bounds, and
-  `ext__<host>__<tool>` names. `hosts::conformance::check` is the shared
-  suite; the embedded host passes it whole and the wired MCP adapter passes
-  the availability subset over a real stdio transport.
-- H5 `qq-config::pack`: `pack.ron` (`PACK_SCHEMA_VERSION = 1`) with id,
-  version, persona, skill and command roots, tool allow/deny, per-profile MCP
-  subsets, and `requires.protocol`. Discovery from `<global>/packs/<id>/` and
-  trust-gated `.qq/packs/<id>/` root-to-leaf plus explicit `packs:` entries,
-  32 at most, later layers win by id, pack profiles merge beneath config
-  profiles in one namespace with typed conflicts. The root translates a
-  selected pack into `PackSelection`; the plan prepends the bounded persona,
-  indexes pack skill roots as `pack:<id>/...`, filters the catalog by policy
-  before exposure is decided, and records `PackDescriptor`;
-  `AgentProfileSummary.pack` names it in capabilities.
-- H8 `qq-core::context_source`: `ContextSource` trait, clamped
-  `ContextBudget` (64 KiB, 64 items, 10 s), bounded LRU `ContextCache`,
-  `FailPolicy::{Open, Closed}`, eight sources per plan, fetched after guidance
-  and before provider work, blocks appended to the system prompt only.
-  `RunPromptIdentity.context_sources` records each `ContextSourceOutcome` and
-  content hash; a closed failure settles as `RunFailureKind::ContextSource`.
-- H9 `qq-client::observer`: `run(client, workspace, cursor, sink)` owns its
-  cursor, delivers in sequence order, reconnects with 50 ms–5 s backoff, and
-  exits typed (`Stopped`, `CursorRejected`, `EventTooLarge`).
-  `ServerCapabilities.events` advertises post-commit delivery, the 128-event
-  replay page, the 64-subscription cap, the event bound, and unbounded
-  retention.
-- Protocol: `ToolExposure`, `ContextSourceOutcome`, `ContextSourceRecord`,
-  `ToolCapabilities`, `WorkspaceToolCapabilities`, `ToolHostSummary`,
-  `SkillCapabilities`, `EventCapabilities`, `PackSummary`; 24 goldens under
-  `fixtures/v14/`; `ServerHandler::workspace_tools`.
-- `ToolSpec` now shares its payload behind an `Arc` (`perf(provider)`), so
-  compiling the catalog into every plan costs a reference count bump per spec
-  rather than a schema deep copy.
-
-Acceptance, against the Phase 4 list:
-
-- static built-in dispatch is unchanged: built-ins never enter the exclusion
-  or pin paths and `catalog_compile_static_only` is 6 µs;
-- warm runs do no filesystem addon discovery: pack manifests, personas, and
-  skill roots are fingerprinted at compile time and revalidated by `stat`;
-  hosts by an in-memory generation compare (`plan_for` warm hit 7.7 µs);
-- active runs retain their admitted catalog generation and a stale host
-  recompiles only the next load
-  (`progressive_exposure_pins_selected_tools_for_the_rest_of_the_run`,
-  `recovered_runs_re_pin_from_prior_select_tools_results`);
-- a failed refresh leaves the current generation available (unchanged H2
-  cache behavior; a pack requiring a newer protocol is a typed configuration
-  failure);
-- an external tool timeout, overload, invalid result, or shutdown settles as a
-  typed tool error without destabilizing the runtime
-  (`host_failures_are_typed_tool_errors_and_small_catalogs_expose_fully`,
-  `embedded_host_passes_the_shared_conformance_suite`,
-  `embedded_host_bounds_arguments_and_validates_registration`,
-  `wired_mcp_adapter_passes_the_availability_subset_over_the_real_transport`);
-- a context-source failure follows its fail policy and cannot alter transcript
-  history (`sources_are_budgeted_cached_and_fail_by_policy`,
-  `runs_append_source_context_to_the_prompt_and_fail_closed_before_provider_work`);
-- an observer can fall behind, restart, and replay from a cursor, and no
-  observer delays persistence or delivery
-  (`observers_fall_behind_restart_and_converge_without_delaying_commits`:
-  forty prompts through the real server with one observer stalled on its
-  first delivery, producer acknowledgements unaffected, live and replayed
-  streams byte-identical, foreign cursor → `CursorRejected`);
-- packs are discovered, validated, layered, and trust-gated
-  (`agent_packs_are_discovered_validated_layered_and_trust_gated`,
-  `agent_pack_manifests_fail_fast_on_every_documented_error`,
-  `pack_profiles_compile_persona_skills_tool_policy_and_mcp_subsets_into_plans`);
-- every external component has bounded readiness and shutdown
-  (`HostReadiness`, `HostCallError::ShutDown`, `McpManager::shutdown` refuses
-  later connects); and
-- no universal lifecycle hook or dynamic native-library ABI was introduced:
-  the embedded host is a closure registry behind the same host seam MCP uses.
-
-Measurements at `5f48fd6` (release recorder, 100 samples, 69 metrics, 20/20
-correctness receipts). The host was shared with other agents at 40%+ CPU
-during recording, so each side was recorded twice (`main` at `8abdced`) to
-four times (Phase 4) and compared per metric at the best p95 across runs;
-`main` against itself failed eleven p95 budgets on this host, which bounds
-the noise floor. On the merged reports 59 of 61 budgets hold; the two that
-do not are `provider_delta_to_committed_core_event_ns` p95 (6.5 → 9.1 ms
-against a +10% budget; medians 6.25 → 6.12 ms, minimum 5.9 → 5.6 ms) and
-`http_cursor_reconnect_replay_ns` p95 (329 → 398 µs; medians 164 → 146 µs).
-Both are tail-only with medians and minimums improved or equal, and both
-appeared in the `main`-versus-`main` comparison, so they are recorded as
-noise rather than accepted regressions. The default path carries one new
-`Arc<[ToolSpec]>` clone and no new I/O per run.
-
-| Metric | Phase 3 (`27afe89`) | `main` (`8abdced`) | Phase 4 (`5f48fd6`) |
-| --- | ---: | ---: | ---: |
-| Submit start to provider entry p95 | 17.0 ms | 13.7 ms | 13.5 ms |
-| Durable direct command acknowledgement p95 | 5.9 ms | 3.5 ms | 3.6 ms |
-| HTTP command acknowledgement p95 | 6.2 ms | 3.7 ms | 3.7 ms |
-| Direct run completion p95 | — | 29.8 ms | 30.1 ms |
-| Eight-stream output service gap p95 | 46.0 ms | 45.0 ms | 47.0 ms |
-| 1 MiB / 512 KiB scaling ratio | 1.895x | 1.889x | 1.892x |
-| 100-session batch p95 | — | 2.42 s | 2.42 s |
-| Release binary | 65.31 MB | 65.62 MB | 66.79 MB |
-| Minimal release binary | — | 53.49 MB | 54.72 MB |
-| Idle server RSS p95 | 18.04 MB | 17.96 MB | 17.82 MB |
-| `plan_compile` (embedded profile) | 21.5 µs | 21.5 µs | 23.9 µs |
-| `plan_descriptor_digest` | 1.72 µs | — | 2.3 µs |
-| Compiled plan estimated heap | 8.2 KiB | — | 14.0 KiB |
-| `plan_for` cold / warm | 180 µs / 6.2 µs | — | 202 µs / 7.7 µs |
-| `catalog_compile_512` (64 KiB index) | — | — | 1.21 ms |
-| `select_tools_rank` (512 tools) | — | — | 18 µs |
-| `plan_compile_with_host_64` | — | — | 101 µs |
-
-`plan_compile` grew 2.4 µs for the catalog, skill index, and seven
-fingerprints; before the `ToolSpec` sharing fix it was 42 µs. The compiled
-plan's estimated heap grew from 8.2 KiB to 14.0 KiB (the catalog entries,
-their search text, and the skill index) and the descriptor from 1107 to 1249
-canonical bytes on the embedded profile (the catalog and skill sections
-replace the old static list), 2907 bytes with a 64-tool host. The binary grew 1.2 MB for the catalog, hosts, packs, context
-sources, observer, and fixtures.
-
-Not in scope, per the phase split and the approved plan: H7 and H8 ship with
-in-tree consumers only (the conformance suite, the root MCP adapter, and the
-test sources); the first external embedder and memory product bind to the
-seams as they are. MCP effect hints are advisory and approval policy is
-unchanged. Retention remains unbounded (advertised). No pack registry,
-signing, or remote fetch; packs are local directories.
-
-Phase 4 is complete.
-
-Deliverables:
-
-- declarative addon/agent-pack manifests;
-- progressive skill and capability loading;
-- one embedded callback tool host beside MCP;
-- a shared external-tool contract only after both adapters work;
-- bounded catalog generation, cancellation, deadlines, effect classes,
-  ownership, concurrency, and output;
-- selected MCP schema loading for large catalogs;
-- typed `ContextSource` retrieval with caching, provenance, and fail policy;
-- durable post-commit event ingestion;
-- explicit extension readiness, error, capacity, and shutdown states;
-- conformance fixtures for MCP, embedded tools, context sources, and
-  observers; and
-- run traces containing profile, prompt, provider, model, tool, context, and
-  addon digests.
-
-Acceptance:
-
-- static built-in dispatch is unchanged;
-- warm runs do no filesystem addon discovery;
-- active runs retain their admitted addon/catalog generation;
-- failed addon refresh leaves the current valid generation available;
-- an external tool crash, timeout, overload, or invalid result settles
-  explicitly without destabilizing the runtime;
-- a context-source failure follows its declared fail policy and cannot alter
-  transcript history;
-- an observer can fall behind, restart, and replay from a cursor;
-- no observer delays persistence or delivery; and
-- every external component has bounded readiness and shutdown;
-- disabled addon support stays within the default-path regression gate; and
-- no universal lifecycle hook or dynamic native-library ABI is introduced.
-
-### Phase 5 — Upgrade Execution Quality And Isolation
+### Phase 7 — Upgrade Execution Quality And Isolation
 
 R6-R8 remain owned by the readiness roadmap. Implement H10 only after R6 has
 selected and shipped a real terminal/process contract and a platform threat
@@ -1777,7 +1583,7 @@ Acceptance:
 - the sandbox adapter remains optional and feature-gated where its platform
   dependencies are not needed.
 
-### Phase 6 — Add Product Adapters On Demand
+### Phase 8 — Add Product Adapters On Demand
 
 Implement H11 only for an actual client.
 
@@ -1800,9 +1606,12 @@ Acceptance:
 - product auth and tenancy remain outside `qq-core`; and
 - the adapter can be disabled without affecting the base binary's hot path.
 
-### Phase 7 — Qualification
+### Phase 9 — Qualification
 
-H12 qualifies the complete story, not only individual modules.
+H12 qualifies the complete story, not only individual modules. It re-runs
+every Phase 5 and Phase 6 pre-change baseline and enforces the recorded
+improvements as regression gates in `benchmarks/perf/budgets-v1.json` (or a
+successor budget file).
 
 Required scenarios:
 
@@ -1851,9 +1660,16 @@ Use fake providers, temporary SQLite stores, and temporary workspaces to prove:
 
 - Provider compiler benchmark.
 - Plan compilation and cache benchmark.
-- Model-request encoding benchmark.
-- Streaming append and reasoning batching benchmark.
-- Store fairness and replay benchmark.
+- Model-request encoding benchmark (`provider_encode`: one MiB plus 32
+  schemas with heap accounting; added by H18 before the change).
+- SSE framing and decode benchmark (`sse_decode` at 64 KiB, 512 KiB, and
+  one MiB; added by H19 before the change).
+- Streaming append and reasoning batching benchmark, plus the
+  `store_output_batch` group-commit bench (H16).
+- Store fairness and replay benchmark, plus subscriber fan-out at one,
+  eight, and thirty-two subscribers (H15).
+- Fake-provider attempt-amplification counter (H14).
+- Cancellation under 256 queued control jobs (H20).
 - Static versus MCP versus embedded tool-dispatch benchmark.
 - Context-source cold/warm benchmark.
 - Persistent terminal operation benchmark.
@@ -1911,6 +1727,11 @@ streaming, persistence, context, tool dispatch, or terminal execution changes.
 | Sandbox claims | Policy UX mistaken for isolation | Call it a sandbox only after adversarial platform tests pass |
 | Scope expansion | Backend absorbs Hermes product features | Keep product adapters above `qq-client` |
 | Benchmark gaming | Startup/size improves while outcomes regress | Measure useful-result latency, reliability, cost, and resource use together |
+| Group commit | A batched job is acknowledged before the outer commit, or one failing job fails its siblings | Deferred replies fire only after commit; savepoint per job; crash test before commit leaves nothing durable |
+| Broadcast handoff | A subscriber misses or duplicates an event between SQLite catch-up and the live feed | Catch up until the first buffered sequence, then drain; `Lagged` returns to catch-up; no-gap ordering tests |
+| Retry ownership move | Deleting the core loop drops a failure class the provider cannot see | Provider restarts only before the first yielded event; fake-provider fixtures cover pre-stream and mid-stream faults |
+| Prompt prefix memoization | Prefix plus suffix digest diverges from the full digest and changes persisted prompt identity | Digest-equality fixture is a Phase 6 acceptance gate |
+| Consolidation churn | Mechanical splits and error-type changes hide behavior changes | D9 lands the behavior change and the file split as separate commits |
 
 ## Architecture Review Questions
 
@@ -1950,7 +1771,11 @@ The speed-first extensible backend is complete when:
 - agent packs, MCP, one embedded tool host, one context source, and one
   post-commit observer pass conformance and failure tests;
 - every queue, task, process, retry, output, and concurrency dimension is
-  bounded;
+  bounded, and retry has exactly one owner;
+- event delivery serializes each committed event once and reads the store
+  only for catch-up, and output persistence commits in bounded groups;
+- every tool call is approval-classified from catalog effect data rather
+  than its name;
 - terminal and sandbox behavior, if shipped, passes cleanup and adversarial
   tests on supported platforms;
 - crash/restart never repeats uncertain side effects and every accepted run
@@ -1960,6 +1785,6 @@ The speed-first extensible backend is complete when:
 - product integrations remain clients of one durable QQ runtime.
 
 Until those conditions are met, the near-term implementation boundary is
-Phase 0 plus the active readiness plan's linear streaming, fair persistence,
-resolved model, context, and budget work. Plugin or marketplace work is not the
+Phase 5 (H13–H17): the approval fix, single retry owner, published-event
+outbox, group commit, and schema 24. Plugin or marketplace work is not the
 next slice.

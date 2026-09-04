@@ -51,12 +51,11 @@ Design constraints inherited from the harness plan and `AGENTS.md`:
 - [`docs/design/architecture.md`](../design/architecture.md) remains the
   boundary source of truth; §Amendments lists the two sentences this plan
   needs changed.
-- [`subagents.md`](./subagents.md) owns current read-only delegation. D2–D4
-  supersede its "mutating children are future work" and "depth one" items;
-  its accounting and admission contracts otherwise stand.
-- [`model-reviewed-approvals.md`](./model-reviewed-approvals.md) owns the
-  reviewer seam. D4 widens its request, honors `Deny` for supervised children,
-  and charges its spend.
+- The shipped read-only sub-agent and model-reviewed-approval plans were
+  removed on 2026-09-04. This plan now owns delegation depth, mutating
+  children, and the widened reviewer request; the shipped accounting,
+  admission, and reviewer-seam contracts are recorded in
+  `docs/design/architecture.md`, `tools.md`, and `protocol.md`.
 - [`terminal-bench-readiness.md`](./terminal-bench-readiness.md) owns R7
   sub-agent economics and the evaluation scorecard. D6 delivers the paired
   comparison it defines and consumes its gate.
@@ -529,10 +528,10 @@ These must be applied, with the reasoning recorded, before D4 or D5 lands.
    isolated Git worktree or sandbox" → scope to parallel editing subagents;
    a serialized supervised child shares the checkout because its parent is
    blocked and sibling writers serialize.
-5. `subagents.md` status, "What This Is Not", and sequencing step 6 → point
-   to this plan for mutating children and depth.
-6. `model-reviewed-approvals.md` → record the widened request, honored `Deny`
-   for `Supervised`, budgeted spend, and cached provider handle.
+5. Retired 2026-09-04: the sub-agent and model-reviewed-approval plans were
+   removed; this plan is the owner of mutating children, depth, and the
+   widened reviewer request.
+6. Retired with item 5.
 7. `docs/design/tools.md` and `protocol.md` still state `ask` is the default
    approval mode; code defaults to `auto`. Fix alongside D4.
 
