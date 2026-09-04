@@ -45,18 +45,21 @@ use crate::{
 mod approvals;
 pub(crate) mod context;
 mod execution;
+mod feed;
 mod runtime;
 mod scheduler;
 mod store;
 mod subagents;
 
+pub use feed::PublishedEvent;
 pub use runtime::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime,
-    MAX_REVIEW_ARGUMENT_BYTES, MAX_REVIEW_BRIEF_BYTES, MAX_REVIEW_RECENT_ACTIONS, RecentAction,
-    ReviewDecision, ReviewFuture, ReviewOrigin, ReviewRequest, ReviewSpend, ReviewVerdict,
-    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
-    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
-    WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    MAX_REVIEW_ARGUMENT_BYTES, MAX_REVIEW_BRIEF_BYTES, MAX_REVIEW_RECENT_ACTIONS,
+    PublishedEventStream, RecentAction, ReviewDecision, ReviewFuture, ReviewOrigin, ReviewRequest,
+    ReviewSpend, ReviewVerdict, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
+    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
+    SpawnModelValidationFuture, WorkerRuntimeLoadFuture, WorkspaceGrantAuthority,
+    WorkspaceGrantSeed,
 };
 
 use approvals::ConcludedApproval;
@@ -5779,15 +5782,32 @@ fn load_session_snapshot(
     })
 }
 
+#[cfg(test)]
 fn read_events(
     connection: &mut Connection,
     workspace_id: WorkspaceId,
     after: u64,
     limit: u16,
 ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
+    Ok(
+        read_published_events(connection, workspace_id, after, limit)?
+            .into_iter()
+            .map(feed::PublishedEvent::into_envelope)
+            .collect(),
+    )
+}
+
+/// `read_events` keeping the stored encoding beside the parsed envelope, for
+/// subscriber catch-up: the same bytes a live delivery would have carried.
+fn read_published_events(
+    connection: &mut Connection,
+    workspace_id: WorkspaceId,
+    after: u64,
+    limit: u16,
+) -> Result<Vec<Arc<feed::PublishedEvent>>, SessionRuntimeError> {
     ensure_workspace(connection, workspace_id)?;
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT envelope_json FROM events
              WHERE workspace_id = ?1 AND sequence > ?2
              ORDER BY sequence LIMIT ?3",
@@ -5800,7 +5820,12 @@ fn read_events(
         .map_err(|_| SessionRuntimeError::Persistence)?
         .map(|row| {
             let encoded = row.map_err(|_| SessionRuntimeError::Persistence)?;
-            serde_json::from_str(&encoded).map_err(|_| SessionRuntimeError::Persistence)
+            let envelope =
+                serde_json::from_str(&encoded).map_err(|_| SessionRuntimeError::Persistence)?;
+            Ok(Arc::new(feed::PublishedEvent {
+                envelope,
+                json: Arc::from(encoded),
+            }))
         })
         .collect()
 }
@@ -5846,9 +5871,15 @@ fn append_event(
     transaction
         .execute(
             "INSERT INTO events(workspace_id, sequence, envelope_json) VALUES (?1, ?2, ?3)",
-            params![context.workspace_id.to_string(), sequence, encoded],
+            params![context.workspace_id.to_string(), sequence, encoded.as_str()],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    // The encoding is kept, not dropped: after commit the worker publishes
+    // it to live subscribers and the server writes it to the wire as-is.
+    feed::stage(Arc::new(feed::PublishedEvent {
+        envelope: envelope.clone(),
+        json: Arc::from(encoded),
+    }));
     Ok(envelope)
 }
 
@@ -15032,6 +15063,149 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// D1: a subscriber that keeps up performs one catch-up read when it
+    /// attaches and no store read per event afterwards; the live and replayed
+    /// deliveries are byte-identical and the sequence is contiguous.
+    #[tokio::test]
+    async fn live_subscribers_read_the_store_once_and_receive_committed_bytes() {
+        let harness = scripted_runs_harness(ApprovalMode::Ask, vec![Vec::new()]).await;
+        // Attach eight subscribers, each catching up from the session cursor.
+        // Their catch-up reads happen when first polled, so poll each once
+        // before the run so the baseline includes them.
+        let mut subscribers: Vec<PublishedEventStream> = (0..8)
+            .map(|_| {
+                harness
+                    .runtime
+                    .subscribe_published(SubscribeRequest {
+                        workspace_id: harness.workspace_id,
+                        after: EventCursor {
+                            store_id: harness.runtime.inner.store.store_id(),
+                            workspace_id: harness.workspace_id,
+                            sequence: 0,
+                        },
+                    })
+                    .unwrap()
+            })
+            .collect();
+        let mut caught_up = Vec::new();
+        for subscriber in &mut subscribers {
+            // The SessionCreated event is already committed; catch-up
+            // delivers it. Two control reads: the page and the empty page.
+            caught_up.push(subscriber.next().await.unwrap().unwrap());
+        }
+        let reads_before = harness.runtime.inner.store.catch_up_reads();
+
+        let run_id = submit_prompt(&harness, "hello").await;
+        let mut streams = Vec::with_capacity(8);
+        for subscriber in &mut subscribers {
+            let mut observed = vec![];
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), subscriber.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let finished = matches!(event.envelope.event, SessionEvent::RunFinished { .. });
+                observed.push(event);
+                if finished {
+                    break;
+                }
+            }
+            streams.push(observed);
+        }
+        let events_per_subscriber = streams[0].len();
+        assert!(events_per_subscriber >= 4, "{events_per_subscriber} events");
+        // Every event reached every subscriber from the live feed: zero
+        // catch-up reads during the run.
+        assert_eq!(
+            harness.runtime.inner.store.catch_up_reads(),
+            reads_before,
+            "8 subscribers observing {events_per_subscriber} events must not read the store"
+        );
+        // Attaching cost each of the eight subscribers exactly one read; the
+        // harness's own stream is never polled here.
+        assert_eq!(reads_before, 8);
+
+        // Every subscriber saw the same contiguous sequence with the same
+        // bytes, and the bytes equal a fresh replay from the store.
+        let replay = harness
+            .runtime
+            .inner
+            .store
+            .published_events_after(
+                harness.workspace_id,
+                caught_up[0].envelope.cursor.sequence,
+                128,
+            )
+            .await
+            .unwrap();
+        for observed in &streams {
+            assert_eq!(observed.len(), replay.len());
+            let mut expected = caught_up[0].envelope.cursor.sequence;
+            for (live, replayed) in observed.iter().zip(&replay) {
+                expected += 1;
+                assert_eq!(live.envelope.cursor.sequence, expected, "contiguous");
+                assert_eq!(live.json, replayed.json, "live bytes equal stored bytes");
+                assert_eq!(live.envelope, replayed.envelope);
+            }
+        }
+        let _ = run_id;
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    /// D1: a subscriber that lags past the feed capacity is redirected to
+    /// SQLite catch-up and still observes every event exactly once, in order.
+    #[tokio::test]
+    async fn a_lagging_subscriber_catches_up_from_the_store_without_gaps_or_duplicates() {
+        // Each scripted read-only tool run commits a dozen or so events;
+        // enough runs overrun the feed while the slow subscriber sits unpolled.
+        let runs = feed::FEED_CAPACITY / 14;
+        let script = vec![("read_file", r#"{"path":"AGENTS.md"}"#.to_owned())];
+        let mut harness = scripted_runs_harness(ApprovalMode::Ask, vec![script; runs]).await;
+        let mut slow = harness
+            .runtime
+            .subscribe_published(SubscribeRequest {
+                workspace_id: harness.workspace_id,
+                after: EventCursor {
+                    store_id: harness.runtime.inner.store.store_id(),
+                    workspace_id: harness.workspace_id,
+                    sequence: 0,
+                },
+            })
+            .unwrap();
+        // Poll once so it is attached live, then leave it unpolled.
+        let first = slow.next().await.unwrap().unwrap();
+        let mut last = None;
+        for index in 0..runs {
+            submit_prompt(&harness, &format!("run {index}")).await;
+            let observed = collect_through_finished(&mut harness.events).await;
+            last = observed.last().map(|event| event.cursor.sequence);
+        }
+        let last = last.unwrap();
+        assert!(
+            last as usize > feed::FEED_CAPACITY,
+            "{last} events must exceed the feed capacity to lag"
+        );
+
+        let mut observed = vec![first];
+        while observed.last().unwrap().envelope.cursor.sequence < last {
+            let event = tokio::time::timeout(Duration::from_secs(10), slow.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            observed.push(event);
+        }
+        for (index, event) in observed.iter().enumerate() {
+            assert_eq!(
+                event.envelope.cursor.sequence,
+                index as u64 + 1,
+                "no gap, no duplicate"
+            );
+        }
+        harness.runtime.shutdown().await.unwrap();
     }
 
     /// Collects events until the compaction commits (`SessionCompacted`),

@@ -27,7 +27,7 @@ use axum::{
 };
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use qq_core::SessionEventStream;
+use qq_core::PublishedEventStream;
 use qq_protocol::{
     AgentProfileSummary, ApprovalMode, BudgetLimitKind, CAPABILITIES_VERSION, CapabilitiesRequest,
     CommandReceipt, CommandRequest, DelegationCapabilities, DelegationRoster, EventCapabilities,
@@ -117,10 +117,12 @@ pub trait ServerHandler: Send + Sync + 'static {
         Box::pin(async { Err(ServerHandlerError::Unavailable) })
     }
 
+    /// Committed events after the request cursor, each with the JSON the
+    /// store persisted. The server writes that JSON to the SSE frame as-is.
     fn subscribe(
         &self,
         _request: SubscribeRequest,
-    ) -> Result<SessionEventStream, ServerHandlerError> {
+    ) -> Result<PublishedEventStream, ServerHandlerError> {
         Err(ServerHandlerError::Unavailable)
     }
 }
@@ -1023,16 +1025,16 @@ async fn workspace_events(
                 Ok(event) => event,
                 Err(_) => return,
             };
-            let encoded = serde_json::to_string(&event)
-                .expect("SessionEventEnvelope serialization cannot fail");
-            if encoded.len() > MAX_EVENT_BYTES {
+            // The store already encoded this event once, on commit; the
+            // frame carries those bytes and never re-serializes.
+            if event.json.len() > MAX_EVENT_BYTES {
                 return;
             }
             yield Ok::<Event, Infallible>(
                 Event::default()
-                    .id(event.cursor.to_string())
+                    .id(event.envelope.cursor.to_string())
                     .event("session_event")
-                    .data(encoded),
+                    .data(event.json.as_ref()),
             );
         }
     };
@@ -1670,9 +1672,13 @@ mod tests {
         fn subscribe(
             &self,
             _request: SubscribeRequest,
-        ) -> Result<SessionEventStream, ServerHandlerError> {
-            let events =
-                futures_stream::iter([Ok(self.event.clone())]).chain(futures_stream::pending());
+        ) -> Result<PublishedEventStream, ServerHandlerError> {
+            let json = serde_json::to_string(&self.event).expect("test envelope encodes");
+            let published = Arc::new(qq_core::PublishedEvent {
+                envelope: self.event.clone(),
+                json: Arc::from(json),
+            });
+            let events = futures_stream::iter([Ok(published)]).chain(futures_stream::pending());
             Ok(Box::pin(events))
         }
     }

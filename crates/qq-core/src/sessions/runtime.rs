@@ -283,6 +283,11 @@ pub trait ApprovalReviewer: Send + Sync + 'static {
 pub type SessionEventStream =
     Pin<Box<dyn Stream<Item = Result<SessionEventEnvelope, SessionRuntimeError>> + Send + 'static>>;
 
+/// Committed events with their persisted encoding, for transports that
+/// forward bytes.
+pub type PublishedEventStream =
+    Pin<Box<dyn Stream<Item = Result<Arc<PublishedEvent>, SessionRuntimeError>> + Send + 'static>>;
+
 #[derive(Clone)]
 pub struct SessionRuntimeOptions {
     pub database_path: PathBuf,
@@ -651,10 +656,32 @@ impl SessionRuntime {
         self.inner.store.snapshot(request).await
     }
 
+    /// Committed events after `request.after`, as parsed envelopes.
     pub fn subscribe(
         &self,
         request: SubscribeRequest,
     ) -> Result<SessionEventStream, SessionRuntimeError> {
+        let published = self.subscribe_published(request)?;
+        Ok(Box::pin(
+            published.map(|item| item.map(PublishedEvent::into_envelope)),
+        ))
+    }
+
+    /// Committed events after `request.after`, each carrying the exact JSON
+    /// the store persisted so a transport can forward it without
+    /// re-serializing.
+    ///
+    /// Delivery has two phases. Catch-up reads pages from SQLite until it is
+    /// caught up to the live feed; then events arrive from the per-workspace
+    /// broadcast with no store access. A subscriber that falls more than the
+    /// feed capacity behind is redirected to catch-up from its last cursor,
+    /// so the sequence it observes is contiguous and complete whatever the
+    /// pace. SQLite is authoritative throughout: nothing is delivered live
+    /// that was not already committed.
+    pub fn subscribe_published(
+        &self,
+        request: SubscribeRequest,
+    ) -> Result<PublishedEventStream, SessionRuntimeError> {
         if *self.inner.failed.borrow() {
             return Err(SessionRuntimeError::Unavailable);
         }
@@ -667,41 +694,69 @@ impl SessionRuntime {
 
         let store = self.inner.store.clone();
         let mut failed = self.inner.failed.subscribe();
-        let mut wakeup = self
-            .inner
-            .subscribe(request.workspace_id, request.after.sequence)?;
+        let workspace_id = request.workspace_id;
         Ok(Box::pin(stream! {
             let mut after = request.after.sequence;
             loop {
-                let events = match store
-                    .events_after(request.workspace_id, after, MAX_REPLAY_EVENTS)
-                    .await
-                {
-                    Ok(events) => events,
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
+                // Attach to the live feed before catching up so no commit can
+                // land between the last catch-up page and the first live
+                // receive. Anything already at or below `after` when it
+                // arrives live is a duplicate of the catch-up and is skipped.
+                let Some(mut live) = store.feed(workspace_id) else {
+                    yield Err(SessionRuntimeError::Unavailable);
+                    return;
                 };
-                if !events.is_empty() {
-                    for event in events {
-                        after = event.cursor.sequence;
+                loop {
+                    let page = match store
+                        .published_events_after(workspace_id, after, MAX_REPLAY_EVENTS)
+                        .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
+                    // A short page is the end of the durable backlog: one read
+                    // suffices for a subscriber that is nearly caught up.
+                    let caught_up = page.len() < usize::from(MAX_REPLAY_EVENTS);
+                    for event in page {
+                        after = event.envelope.cursor.sequence;
                         yield Ok(event);
                     }
-                    continue;
-                }
-                tokio::select! {
-                    biased;
-                    changed = failed.changed() => {
-                        if changed.is_err() || *failed.borrow() {
-                            yield Err(SessionRuntimeError::Unavailable);
-                            return;
-                        }
+                    if caught_up {
+                        break;
                     }
-                    changed = wakeup.changed() => {
-                        if changed.is_err() {
-                            return;
+                }
+                loop {
+                    let received = tokio::select! {
+                        biased;
+                        changed = failed.changed() => {
+                            if changed.is_err() || *failed.borrow() {
+                                yield Err(SessionRuntimeError::Unavailable);
+                                return;
+                            }
+                            continue;
                         }
+                        received = live.recv() => received,
+                    };
+                    match received {
+                        Ok(event) => {
+                            let sequence = event.envelope.cursor.sequence;
+                            if sequence <= after {
+                                continue;
+                            }
+                            if sequence != after + 1 {
+                                // A gap means the feed was subscribed after
+                                // a commit the catch-up did not see; fall
+                                // back to the store for the missing range.
+                                break;
+                            }
+                            after = sequence;
+                            yield Ok(event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
                 }
             }

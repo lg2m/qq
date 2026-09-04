@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use super::*;
+use feed::WorkspaceFeed;
 use worker::WorkerMessage;
 
 mod schema;
@@ -225,6 +226,11 @@ struct StoreInner {
     control: Sender<WorkerMessage>,
     output: Sender<WorkerMessage>,
     output_slots: Arc<Semaphore>,
+    /// Live subscribers, fed by the worker after each committing job.
+    feed: Arc<WorkspaceFeed>,
+    /// Subscriber catch-up pages read, for tests that bound them.
+    #[cfg(test)]
+    catch_up_reads: std::sync::atomic::AtomicU64,
     shutdown: Sender<()>,
     closed: watch::Receiver<bool>,
     closing: AtomicBool,
@@ -258,6 +264,9 @@ impl Store {
                 control: started.control,
                 output: started.output,
                 output_slots: Arc::new(Semaphore::new(OUTPUT_QUEUE_CAPACITY)),
+                feed: Arc::new(WorkspaceFeed::default()),
+                #[cfg(test)]
+                catch_up_reads: std::sync::atomic::AtomicU64::new(0),
                 shutdown: started.shutdown,
                 closed: started.closed,
                 closing: AtomicBool::new(false),
@@ -270,6 +279,21 @@ impl Store {
 
     pub(super) const fn store_id(&self) -> StoreId {
         self.store_id
+    }
+
+    #[cfg(test)]
+    pub(super) fn catch_up_reads(&self) -> u64 {
+        self.inner.catch_up_reads.load(Ordering::Relaxed)
+    }
+
+    /// A live receiver for one workspace's committed events. Delivers only
+    /// events published after this call; the caller catches up from
+    /// `events_after` first.
+    pub(super) fn feed(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Option<tokio::sync::broadcast::Receiver<Arc<feed::PublishedEvent>>> {
+        self.inner.feed.subscribe(workspace_id)
     }
 
     pub(super) async fn call<T, F>(
@@ -294,9 +318,17 @@ impl Store {
             ),
         };
         let (reply, response) = oneshot::channel();
+        let feed = Arc::clone(&self.inner.feed);
         let message = WorkerMessage::Run {
             job: Box::new(move |connection| {
-                let _ = reply.send(operation(connection));
+                let result = operation(connection);
+                // Persist, then publish, then acknowledge. A failed operation
+                // rolled back, so what it staged never reaches a subscriber.
+                let staged = feed::take_staged();
+                if result.is_ok() {
+                    feed.publish(staged);
+                }
+                let _ = reply.send(result);
             }),
             _output_permit: output_permit,
         };
@@ -512,6 +544,7 @@ impl Store {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn events_after(
         &self,
         workspace_id: WorkspaceId,
@@ -520,6 +553,20 @@ impl Store {
     ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         self.call(Priority::Control, move |connection| {
             read_events(connection, workspace_id, sequence, limit)
+        })
+        .await
+    }
+
+    pub(super) async fn published_events_after(
+        &self,
+        workspace_id: WorkspaceId,
+        sequence: u64,
+        limit: u16,
+    ) -> Result<Vec<Arc<feed::PublishedEvent>>, SessionRuntimeError> {
+        #[cfg(test)]
+        self.inner.catch_up_reads.fetch_add(1, Ordering::Relaxed);
+        self.call(Priority::Control, move |connection| {
+            read_published_events(connection, workspace_id, sequence, limit)
         })
         .await
     }

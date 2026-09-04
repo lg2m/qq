@@ -22,8 +22,8 @@ use clap::{Args, Subcommand, ValueEnum};
 use futures_util::{StreamExt, future::join_all, stream};
 use qq_client::SessionClient;
 use qq_core::{
-    LoadedRuntime, Runtime, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader,
-    SessionEventStream, SessionRuntime, SessionRuntimeOptions,
+    LoadedRuntime, PublishedEventStream, Runtime, RuntimeLoadError, RuntimeLoadFuture,
+    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeOptions,
 };
 use qq_protocol::{
     ApprovalMode, CapabilitySupport, CommandId, CommandOutcome, CommandReceipt, CommandRequest,
@@ -2444,6 +2444,10 @@ async fn run_workloads(
     metrics.extend(amplification_metrics);
     checks.extend(amplification_checks);
 
+    let (fan_out_metrics, fan_out_checks) = subscriber_fan_out_workloads(samples).await?;
+    metrics.extend(fan_out_metrics);
+    checks.extend(fan_out_checks);
+
     let (stream_metrics, stream_checks) = long_stream_workloads(samples).await?;
     metrics.extend(stream_metrics);
     checks.extend(stream_checks);
@@ -3100,9 +3104,9 @@ impl ServerHandler for RuntimeServerHandler {
     fn subscribe(
         &self,
         request: SubscribeRequest,
-    ) -> Result<SessionEventStream, ServerHandlerError> {
+    ) -> Result<PublishedEventStream, ServerHandlerError> {
         self.runtime
-            .subscribe(request)
+            .subscribe_published(request)
             .map_err(|_| ServerHandlerError::Internal)
     }
 }
@@ -3640,6 +3644,125 @@ async fn retry_amplification_workloads(
     }
     .await;
     finish_runtime_fixture(&fixture, "shut down amplification runtime", operation).await
+}
+
+/// Subscriber fan-out: with 1, 8, and 32 subscribers attached to one
+/// workspace, the time from the provider's first delta to that event's
+/// committed observation by the slowest subscriber, and the command
+/// acknowledgement under the same load. Subscribers cost the store nothing
+/// per event once attached, so these should move little with the count.
+async fn subscriber_fan_out_workloads(
+    samples: u16,
+) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
+    let runs = samples.clamp(5, 20);
+    let mut metrics = Vec::new();
+    let mut checks = Vec::new();
+    for subscribers in [1_usize, 8, 32] {
+        let mut fixture = RuntimeFixture::open(ProviderMode::Text {
+            total_bytes: 4_096,
+            chunk_bytes: 4_096,
+            delay: Duration::ZERO,
+            chunk_delay: Duration::ZERO,
+        })
+        .await?;
+        let operation = async {
+            let mut deliveries = Vec::with_capacity(usize::from(runs));
+            let mut acknowledgements = Vec::with_capacity(usize::from(runs));
+            let mut identical = true;
+            for _ in 0..runs {
+                let (session_id, cursor) = fixture.create_session(ApprovalMode::ReadOnly).await?;
+                let mut streams = Vec::with_capacity(subscribers);
+                for _ in 0..subscribers {
+                    let mut stream = fixture.subscribe(cursor)?;
+                    // Drive the stream until its catch-up read finds the
+                    // backlog empty and it parks on the live feed. Nothing is
+                    // committed yet, so the poll times out without an item.
+                    match tokio::time::timeout(Duration::from_millis(20), stream.next()).await {
+                        Ok(Some(Err(error))) => {
+                            return Err(fixture_error("attach subscriber")(error));
+                        }
+                        Ok(Some(Ok(_))) => {
+                            return Err(PerfError::Fixture(
+                                "fan-out subscriber saw an event before the run".to_owned(),
+                            ));
+                        }
+                        Ok(None) | Err(_) => {}
+                    }
+                    streams.push(stream);
+                }
+                let started = Instant::now();
+                let receipt = session_command(
+                    "submit prompt",
+                    &fixture.runtime,
+                    generate_id("fan-out prompt command")?,
+                    SessionCommand::SubmitPrompt {
+                        session_id,
+                        input: vec![qq_protocol::InputPart::text(
+                            "respond with deterministic text".to_owned(),
+                        )],
+                        limits: qq_protocol::RunLimits::default(),
+                        correlation: qq_protocol::Correlation::default(),
+                    },
+                )
+                .await?;
+                acknowledgements.push(elapsed_ns(started));
+                let run_id = prompt_run_id(&receipt)?;
+                let _ = receive_mark(&mut fixture.marks, ProviderMarkKind::Entered).await?;
+                let delta = receive_mark(&mut fixture.marks, ProviderMarkKind::FirstDelta).await?;
+                let mut slowest: Option<Instant> = None;
+                let mut sequences = Vec::with_capacity(subscribers);
+                for stream in &mut streams {
+                    let (outcome, cursor, first_text) = wait_for_run(stream, run_id).await?;
+                    if !matches!(outcome, RunOutcome::Completed) {
+                        return Err(PerfError::Fixture(
+                            "fan-out text run did not complete".to_owned(),
+                        ));
+                    }
+                    let first_text = first_text.ok_or_else(|| {
+                        PerfError::Fixture("fan-out run produced no text event".to_owned())
+                    })?;
+                    slowest = Some(slowest.map_or(first_text, |seen| seen.max(first_text)));
+                    sequences.push(cursor.sequence);
+                }
+                identical &= sequences.iter().all(|sequence| *sequence == sequences[0]);
+                let slowest = slowest.expect("at least one subscriber");
+                deliveries.push(duration_ns(slowest.duration_since(delta)));
+            }
+            Ok((
+                vec![
+                    MetricResult::measured(
+                        format!("fan_out_{subscribers}_subscribers_delta_to_slowest_observer_ns"),
+                        "ns",
+                        format!(
+                            "fake provider first semantic delta to TextAppended observed by the slowest of {subscribers} live subscribers on one workspace"
+                        ),
+                        deliveries,
+                    )?,
+                    MetricResult::measured(
+                        format!("fan_out_{subscribers}_subscribers_command_ack_ns"),
+                        "ns",
+                        format!(
+                            "SubmitPrompt call to durable CommandReceipt with {subscribers} live subscribers attached"
+                        ),
+                        acknowledgements,
+                    )?,
+                ],
+                vec![CorrectnessCheck {
+                    name: format!("fan_out_{subscribers}_subscribers_converge"),
+                    passed: identical,
+                    detail: format!(
+                        "{subscribers} subscribers observed the same terminal cursor on every run"
+                    ),
+                }],
+            ))
+        }
+        .await;
+        let (subscriber_metrics, subscriber_checks) =
+            finish_runtime_fixture(&fixture, "shut down fan-out runtime", operation).await?;
+        metrics.extend(subscriber_metrics);
+        checks.extend(subscriber_checks);
+    }
+    Ok((metrics, checks))
 }
 
 async fn long_stream_workloads(
@@ -4911,6 +5034,18 @@ mod tests {
         assert_eq!(metrics[0].name, "provider_retry_amplification_milli");
         assert_eq!(metrics[0].summary.p95, 1_000, "{:?}", metrics[0].summary);
         assert!(checks[0].passed, "{}", checks[0].detail);
+    }
+
+    /// Every subscriber in the fan-out fixture must converge on the same
+    /// terminal cursor for each run.
+    #[tokio::test]
+    async fn subscriber_fan_out_fixture_converges_at_every_width() {
+        let (metrics, checks) = subscriber_fan_out_workloads(5).await.unwrap();
+        assert_eq!(metrics.len(), 6);
+        assert_eq!(checks.len(), 3);
+        for check in &checks {
+            assert!(check.passed, "{}", check.detail);
+        }
     }
 
     #[test]

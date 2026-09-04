@@ -13,9 +13,9 @@ use qq_config::{
     ProviderConfig, WorkspaceGrant,
 };
 use qq_core::{
-    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, ReviewDecision,
-    ReviewFuture, ReviewRequest, ReviewVerdict, RuntimeConfigError, RuntimeLoadError,
-    RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime,
+    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, PublishedEventStream,
+    ReviewDecision, ReviewFuture, ReviewRequest, ReviewVerdict, RuntimeConfigError,
+    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionRuntime,
     SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
     WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
     plan::{
@@ -1811,9 +1811,9 @@ impl ServerHandler for RuntimeHandler {
     fn subscribe(
         &self,
         request: SubscribeRequest,
-    ) -> Result<SessionEventStream, ServerHandlerError> {
+    ) -> Result<PublishedEventStream, ServerHandlerError> {
         self.durable
-            .subscribe(request)
+            .subscribe_published(request)
             .map_err(map_session_runtime_error)
     }
 }

@@ -459,9 +459,19 @@ the block and records the outcome; `Closed` fails the run with
 
 ### Observers
 
-Every event a client can observe is published after its durable commit, and
-the server pages committed rows from SQLite per subscriber, so an observer
-that falls behind slows only itself. `qq_client::observer::run` is the
+Every event a client can observe is published after its durable commit. The
+store encodes each envelope exactly once, inside the transaction that persists
+it, and keeps that encoding as a `PublishedEvent { envelope, json }`. After the
+transaction commits, the store worker publishes the batch to a bounded
+per-workspace `broadcast` feed (1024 events); a failed transaction publishes
+nothing. `SessionRuntime::subscribe_published` catches a subscriber up from
+SQLite in pages of `MAX_REPLAY_EVENTS`, then delivers from the feed with no
+store access per event; a subscriber that lags past the feed capacity is
+redirected to SQLite catch-up from its last cursor, so every subscriber
+observes a contiguous, complete sequence at its own pace and slows only
+itself. The HTTP server writes `json` into the SSE frame as-is, so a live
+delivery and a replay are byte-identical and no event is serialized more than
+once. `qq_client::observer::run` is the
 ingestion contract for products that consume events (memory, analytics,
 notifications): it owns its cursor, delivers each committed event in sequence
 order to one `EventSink`, reconnects with bounded backoff (50 ms to 5 s) from
