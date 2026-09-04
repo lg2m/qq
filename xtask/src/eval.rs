@@ -272,10 +272,13 @@ const fn default_plan_approval() -> EvalApproval {
 }
 
 /// The non-secret Harbor invocation for `args`, relative to `repository`.
-/// Pure so the launch contract can be tested without git, cargo, or Harbor.
+/// `target_dir` is Cargo's build output directory (`CARGO_TARGET_DIR` or the
+/// repository's `target/`). Pure so the launch contract can be tested without
+/// git, cargo, or Harbor.
 fn launch_plan(
     args: RunArgs,
     repository: &Path,
+    target_dir: &Path,
     revision: String,
     dirty: bool,
 ) -> Result<LaunchPlan, EvalError> {
@@ -295,8 +298,8 @@ fn launch_plan(
         )));
     }
     let binary = match &target {
-        Some(target) => repository.join("target").join(target).join("release/qq"),
-        None => repository.join("target/release/qq"),
+        Some(target) => target_dir.join(target).join("release/qq"),
+        None => target_dir.join("release/qq"),
     };
     let jobs_dir = absolute_from(repository, &args.jobs_dir);
     let adapter = repository.join("benchmarks/harbor");
@@ -406,7 +409,10 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
     let harbor = args.harbor.clone();
     let jobs_dir = absolute_from(&repository, &args.jobs_dir);
     let job_name = args.job_name.clone();
-    let plan = launch_plan(args, &repository, revision, dirty)?;
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .map(|dir| absolute_from(&repository, Path::new(&dir)))
+        .unwrap_or_else(|| repository.join("target"));
+    let plan = launch_plan(args, &repository, &target_dir, revision, dirty)?;
     if dry_run {
         println!(
             "{}",
@@ -2171,6 +2177,7 @@ mod tests {
         let plan = launch_plan(
             run_args(&["--path", "benchmarks/harbor/smoke-task"]),
             repository,
+            &repository.join("target"),
             "rev1".to_owned(),
             false,
         )
@@ -2214,6 +2221,7 @@ mod tests {
                 "5",
             ]),
             Path::new("/repo"),
+            Path::new("/ci/target"),
             "rev1".to_owned(),
             true,
         )
@@ -2228,7 +2236,7 @@ mod tests {
         assert_eq!(
             kwargs(&plan),
             vec![
-                "binary_path=/repo/target/x86_64-unknown-linux-musl/release/qq",
+                "binary_path=/ci/target/x86_64-unknown-linux-musl/release/qq",
                 "approval=auto",
                 "timeout_seconds=900",
                 "max_turns=200",
@@ -2247,6 +2255,7 @@ mod tests {
         let malformed = launch_plan(
             run_args(&["--path", "task", "--target", "../escape"]),
             Path::new("/repo"),
+            Path::new("/repo/target"),
             "rev1".to_owned(),
             false,
         );
@@ -2255,6 +2264,7 @@ mod tests {
         let budget = launch_plan(
             run_args(&["--path", "task", "--max-cost-usd", "0"]),
             Path::new("/repo"),
+            Path::new("/repo/target"),
             "rev1".to_owned(),
             false,
         );
