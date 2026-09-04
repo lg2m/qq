@@ -1,0 +1,74 @@
+// Terminal-Bench evaluation configuration for runs routed through a LiteLLM
+// gateway. This is the entire QQ configuration inside a task container: the
+// adapter delivers it via QQ_CONFIG_CONTENT, and the container has no other
+// project or user configuration.
+//
+// Secret-free by construction. The gateway key comes from LITELLM_API_KEY in
+// the Harbor host environment; the adapter forwards it to the container and
+// never logs it. Pricing mirrors the gateway's per-million-token rates as
+// nanos per token (USD 2.00 per million = 2_000 nanos per token) so
+// --max-cost-usd and dollars-per-pass reporting stay meaningful. Cache rates
+// are required: the gateway reports cached reads, and a usage report without
+// a matching rate makes the run's cost unknown, which aborts a budgeted run.
+// Anthropic cache rates follow the published 10% read / 125% write of input;
+// xAI's cached-input rate is 25% and writes are billed as ordinary input. The
+// `provenance` string records where each rate came from.
+//
+// Usage (see benchmarks/harbor/README.md):
+//
+//   export LITELLM_API_KEY=...
+//   export QQ_CONFIG_CONTENT="$(cat benchmarks/harbor/eval-config.ron)"
+//   cargo xtask eval run --model litellm/us.anthropic.claude-sonnet-5 ...
+(
+    version: 1,
+    providers: {
+        "litellm": LiteLlm(
+            connection: (
+                base_url: "https://litellm.example.invalid/v1",
+                api: OpenAiChatCompletions,
+                auth: ApiKey(Env("LITELLM_API_KEY")),
+            ),
+            models: {
+                "us.anthropic.claude-sonnet-5": (
+                    name: "Claude Sonnet 5",
+                    reasoning: true,
+                    context_window: 1000000,
+                    max_output_tokens: 128000,
+                    pricing: (
+                        input_usd_nanos_per_token: 2000,
+                        output_usd_nanos_per_token: 10000,
+                        cache_read_usd_nanos_per_token: 200,
+                        cache_write_usd_nanos_per_token: 2500,
+                        provenance: "litellm gateway model list, 2026-09-04",
+                    ),
+                ),
+                "us.anthropic.claude-opus-5": (
+                    name: "Claude Opus 5",
+                    reasoning: true,
+                    context_window: 1000000,
+                    max_output_tokens: 128000,
+                    pricing: (
+                        input_usd_nanos_per_token: 5000,
+                        output_usd_nanos_per_token: 25000,
+                        cache_read_usd_nanos_per_token: 500,
+                        cache_write_usd_nanos_per_token: 6250,
+                        provenance: "litellm gateway model list, 2026-09-04",
+                    ),
+                ),
+                "us.xai.grok-4.6": (
+                    name: "Grok 4.6",
+                    reasoning: true,
+                    context_window: 1000000,
+                    max_output_tokens: 128000,
+                    pricing: (
+                        input_usd_nanos_per_token: 2200,
+                        output_usd_nanos_per_token: 6600,
+                        cache_read_usd_nanos_per_token: 550,
+                        cache_write_usd_nanos_per_token: 2200,
+                        provenance: "litellm gateway model list, 2026-09-04",
+                    ),
+                ),
+            },
+        ),
+    },
+)

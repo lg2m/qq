@@ -71,6 +71,18 @@ struct RunArgs {
     /// QQ run-cost limit in USD passed to every trial.
     #[arg(long)]
     max_cost_usd: Option<f64>,
+    /// Unattended tool-approval policy for `qq run` inside each task
+    /// container. Task containers are disposable, and the reference harnesses
+    /// run unrestricted, so `full` is the comparable default; `auto` and
+    /// `read-only` exist for ablations.
+    #[arg(long, value_enum, default_value_t = EvalApproval::Full)]
+    approval: EvalApproval,
+    /// Rust target triple to build and upload. Set this to
+    /// `x86_64-unknown-linux-musl` for a static binary that runs on any task
+    /// image; the default host build requires the image's glibc to be at
+    /// least as new as the build host's.
+    #[arg(long, value_name = "TRIPLE")]
+    target: Option<String>,
     /// Stable operator-supplied machine or runner class recorded in the manifest.
     #[arg(long)]
     machine_class: Option<String>,
@@ -91,6 +103,26 @@ struct RunArgs {
     /// Print the complete non-secret launch plan without building or running.
     #[arg(long)]
     dry_run: bool,
+}
+
+/// Mirrors `qq run --approval`; `ask` is intentionally unrepresentable
+/// because nothing can answer a prompt inside a task container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum EvalApproval {
+    ReadOnly,
+    Auto,
+    Full,
+}
+
+impl EvalApproval {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -223,28 +255,50 @@ struct LaunchPlan {
     harbor_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     machine_class: Option<String>,
+    /// Rust target triple of the uploaded binary; absent for the host build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qq_build_target: Option<String>,
+    #[serde(default = "default_plan_approval")]
+    approval: EvalApproval,
     program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
 }
 
-fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
-    let repository = repository_root()?;
-    let revision = command_stdout(
-        ProcessCommand::new("git")
-            .current_dir(&repository)
-            .args(["rev-parse", "HEAD"]),
-        "git",
-    )?;
-    let dirty = !command_stdout(
-        ProcessCommand::new("git")
-            .current_dir(&repository)
-            .args(["status", "--porcelain"]),
-        "git",
-    )?
-    .is_empty();
-    let binary = repository.join("target/release/qq");
-    let jobs_dir = absolute_from(&repository, &args.jobs_dir);
+/// Manifests written before `--approval` existed were produced by an adapter
+/// that hard-coded `auto`.
+const fn default_plan_approval() -> EvalApproval {
+    EvalApproval::Auto
+}
+
+/// The non-secret Harbor invocation for `args`, relative to `repository`.
+/// Pure so the launch contract can be tested without git, cargo, or Harbor.
+fn launch_plan(
+    args: RunArgs,
+    repository: &Path,
+    revision: String,
+    dirty: bool,
+) -> Result<LaunchPlan, EvalError> {
+    let target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned);
+    if let Some(target) = &target
+        && !target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(EvalError::Invalid(format!(
+            "--target must be a Rust target triple such as x86_64-unknown-linux-musl; got {target:?}"
+        )));
+    }
+    let binary = match &target {
+        Some(target) => repository.join("target").join(target).join("release/qq"),
+        None => repository.join("target/release/qq"),
+    };
+    let jobs_dir = absolute_from(repository, &args.jobs_dir);
     let adapter = repository.join("benchmarks/harbor");
     validate_job_name(&args.job_name)?;
     if args
@@ -263,6 +317,8 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         QQ_AGENT_IMPORT.to_owned(),
         "--agent-kwarg".to_owned(),
         format!("binary_path={}", binary.display()),
+        "--agent-kwarg".to_owned(),
+        format!("approval={}", args.approval.as_str()),
         "--job-name".to_owned(),
         args.job_name.clone(),
         "--jobs-dir".to_owned(),
@@ -292,7 +348,7 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         }
         (None, Some(path)) => {
             arguments.push("--path".to_owned());
-            arguments.push(absolute_from(&repository, &path).display().to_string());
+            arguments.push(absolute_from(repository, &path).display().to_string());
         }
         _ => {
             return Err(EvalError::Invalid(
@@ -304,11 +360,13 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         arguments.push("--include-task-name".to_owned());
         arguments.push(task);
     }
-    let plan = LaunchPlan {
-        qq_source_revision: revision.clone(),
+    Ok(LaunchPlan {
+        qq_source_revision: revision,
         qq_source_dirty: dirty,
         harbor_version: HARBOR_VERSION.to_owned(),
         machine_class: args.machine_class,
+        qq_build_target: target,
+        approval: args.approval,
         program: args.harbor.display().to_string(),
         arguments,
         environment: {
@@ -326,8 +384,30 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
             }
             environment
         },
-    };
-    if args.dry_run {
+    })
+}
+
+fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
+    let repository = repository_root()?;
+    let revision = command_stdout(
+        ProcessCommand::new("git")
+            .current_dir(&repository)
+            .args(["rev-parse", "HEAD"]),
+        "git",
+    )?;
+    let dirty = !command_stdout(
+        ProcessCommand::new("git")
+            .current_dir(&repository)
+            .args(["status", "--porcelain"]),
+        "git",
+    )?
+    .is_empty();
+    let dry_run = args.dry_run;
+    let harbor = args.harbor.clone();
+    let jobs_dir = absolute_from(&repository, &args.jobs_dir);
+    let job_name = args.job_name.clone();
+    let plan = launch_plan(args, &repository, revision, dirty)?;
+    if dry_run {
         println!(
             "{}",
             serde_json::to_string_pretty(&plan).map_err(|source| EvalError::Json {
@@ -345,23 +425,26 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
     }
 
     let found = command_stdout(
-        ProcessCommand::new(&args.harbor).arg("--version"),
-        &args.harbor.display().to_string(),
+        ProcessCommand::new(&harbor).arg("--version"),
+        &harbor.display().to_string(),
     )?;
     if !found.split_whitespace().any(|part| part == HARBOR_VERSION) {
         return Err(EvalError::HarborVersion { found });
     }
 
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let build_status = ProcessCommand::new(&cargo)
+    let mut build = ProcessCommand::new(&cargo);
+    build
         .current_dir(&repository)
-        .env("QQ_SOURCE_REVISION", &revision)
-        .args(["build", "--release", "--bin", "qq"])
-        .status()
-        .map_err(|source| EvalError::Launch {
-            program: cargo.to_string_lossy().into_owned(),
-            source,
-        })?;
+        .env("QQ_SOURCE_REVISION", &plan.qq_source_revision)
+        .args(["build", "--release", "--bin", "qq"]);
+    if let Some(target) = &plan.qq_build_target {
+        build.args(["--target", target]);
+    }
+    let build_status = build.status().map_err(|source| EvalError::Launch {
+        program: cargo.to_string_lossy().into_owned(),
+        source,
+    })?;
     require_success(&cargo.to_string_lossy(), build_status)?;
 
     fs::create_dir_all(&jobs_dir).map_err(|source| EvalError::Io {
@@ -369,7 +452,7 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         path: jobs_dir.display().to_string(),
         source,
     })?;
-    let job_dir = jobs_dir.join(&args.job_name);
+    let job_dir = jobs_dir.join(&job_name);
     if job_dir.exists() {
         return Err(EvalError::Invalid(format!(
             "evaluation job directory {} already exists; choose a fresh --job-name so runs cannot be mixed",
@@ -388,16 +471,16 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
     })?;
     rendered.push(b'\n');
     write_file(&manifest, &rendered)?;
-    let status = ProcessCommand::new(&args.harbor)
+    let status = ProcessCommand::new(&harbor)
         .current_dir(&repository)
         .args(&plan.arguments)
         .envs(&plan.environment)
         .status()
         .map_err(|source| EvalError::Launch {
-            program: args.harbor.display().to_string(),
+            program: harbor.display().to_string(),
             source,
         })?;
-    require_success(&args.harbor.display().to_string(), status)?;
+    require_success(&harbor.display().to_string(), status)?;
     Ok(())
 }
 
@@ -720,7 +803,11 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
                 path: trial_config_path.display().to_string(),
                 source,
             })?;
-        if decoded_config != result.config {
+        // Harbor 0.20.0 writes the trial's config.json with pydantic's
+        // `exclude_defaults`, while result.json embeds the fully defaulted
+        // model, so identity means "every explicit field agrees", not
+        // byte-for-byte equality.
+        if !is_projection_of(&decoded_config, &result.config) {
             return Err(EvalError::Invalid(format!(
                 "trial {trial_name} result.json does not match its resolved config.json"
             )));
@@ -1999,6 +2086,19 @@ fn content_hash(bytes: &[u8]) -> String {
     hash
 }
 
+/// `true` when every key present in `partial` is present in `full` with an
+/// equal value, recursing through objects. Arrays and scalars must match
+/// exactly; `full` may carry additional keys.
+fn is_projection_of(partial: &Value, full: &Value) -> bool {
+    match (partial, full) {
+        (Value::Object(partial), Value::Object(full)) => partial.iter().all(|(key, value)| {
+            full.get(key)
+                .is_some_and(|other| is_projection_of(value, other))
+        }),
+        _ => partial == full,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2026,6 +2126,8 @@ mod tests {
             qq_source_dirty: false,
             harbor_version: HARBOR_VERSION.to_owned(),
             machine_class: Some("ci-small".to_owned()),
+            qq_build_target: None,
+            approval: EvalApproval::Full,
             program: "harbor".to_owned(),
             arguments: vec!["run".to_owned()],
             environment: BTreeMap::from([("HARBOR_TELEMETRY".to_owned(), "off".to_owned())]),
@@ -2034,6 +2136,181 @@ mod tests {
             &path.join("qq-eval-manifest.json"),
             &serde_json::to_value(manifest).unwrap(),
         );
+    }
+
+    fn run_args(extra: &[&str]) -> RunArgs {
+        #[derive(Debug, clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+        let mut argv = vec![
+            "eval-run",
+            "--model",
+            "litellm/us.anthropic.claude-sonnet-5",
+            "--job-name",
+            "pilot",
+        ];
+        argv.extend_from_slice(extra);
+        <Wrapper as clap::Parser>::try_parse_from(argv)
+            .expect("run arguments parse")
+            .run
+    }
+
+    fn kwargs(plan: &LaunchPlan) -> Vec<&str> {
+        plan.arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--agent-kwarg")
+            .map(|pair| pair[1].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn launch_plan_defaults_to_full_approval_and_the_host_release_binary() {
+        let repository = Path::new("/repo");
+        let plan = launch_plan(
+            run_args(&["--path", "benchmarks/harbor/smoke-task"]),
+            repository,
+            "rev1".to_owned(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.approval, EvalApproval::Full);
+        assert_eq!(plan.qq_build_target, None);
+        assert!(kwargs(&plan).contains(&"approval=full"));
+        assert!(kwargs(&plan).contains(&"binary_path=/repo/target/release/qq"));
+        let path_index = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "--path")
+            .unwrap();
+        assert_eq!(
+            plan.arguments[path_index + 1],
+            "/repo/benchmarks/harbor/smoke-task"
+        );
+        assert_eq!(plan.environment["HARBOR_TELEMETRY"], "off");
+        assert_eq!(plan.environment["PYTHONPATH"], "/repo/benchmarks/harbor");
+        assert!(!plan.environment.contains_key("QQ_EVAL_ARM"));
+    }
+
+    #[test]
+    fn launch_plan_forwards_approval_and_target_and_records_them() {
+        let plan = launch_plan(
+            run_args(&[
+                "--dataset",
+                "terminal-bench/terminal-bench-2",
+                "--approval",
+                "auto",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "--arm",
+                " A1 ",
+                "--timeout-seconds",
+                "900",
+                "--max-turns",
+                "200",
+                "--max-cost-usd",
+                "5",
+            ]),
+            Path::new("/repo"),
+            "rev1".to_owned(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.approval, EvalApproval::Auto);
+        assert_eq!(
+            plan.qq_build_target.as_deref(),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert!(plan.qq_source_dirty);
+        assert_eq!(
+            kwargs(&plan),
+            vec![
+                "binary_path=/repo/target/x86_64-unknown-linux-musl/release/qq",
+                "approval=auto",
+                "timeout_seconds=900",
+                "max_turns=200",
+                "max_cost_usd=5",
+            ]
+        );
+        assert_eq!(plan.environment["QQ_EVAL_ARM"], "A1");
+
+        let rendered = serde_json::to_value(&plan).unwrap();
+        assert_eq!(rendered["approval"], "auto");
+        assert_eq!(rendered["qq_build_target"], "x86_64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn launch_plan_rejects_a_malformed_target_and_a_nonpositive_budget() {
+        let malformed = launch_plan(
+            run_args(&["--path", "task", "--target", "../escape"]),
+            Path::new("/repo"),
+            "rev1".to_owned(),
+            false,
+        );
+        assert!(matches!(malformed, Err(EvalError::Invalid(_))));
+
+        let budget = launch_plan(
+            run_args(&["--path", "task", "--max-cost-usd", "0"]),
+            Path::new("/repo"),
+            "rev1".to_owned(),
+            false,
+        );
+        assert!(matches!(budget, Err(EvalError::Invalid(_))));
+    }
+
+    #[test]
+    fn trial_config_written_without_defaults_still_matches_its_result_config() {
+        // Harbor 0.20.0 writes config.json with exclude_defaults but embeds
+        // the fully defaulted config in result.json.
+        let written = json!({
+            "agent": {"name": "qq_harbor.agent:QQAgent", "kwargs": {"approval": "full"}},
+            "task": {"path": "/tasks/smoke"},
+            "trials_dir": "/jobs/smoke"
+        });
+        let embedded = json!({
+            "agent": {
+                "name": "qq_harbor.agent:QQAgent",
+                "kwargs": {"approval": "full"},
+                "n_concurrent": null,
+                "skills": []
+            },
+            "environment": {"type": "docker", "delete": true},
+            "task": {"path": "/tasks/smoke", "ref": null},
+            "trials_dir": "/jobs/smoke",
+            "timeout_multiplier": 1.0
+        });
+        assert!(is_projection_of(&written, &embedded));
+
+        let drifted = json!({
+            "agent": {"name": "qq_harbor.agent:QQAgent", "kwargs": {"approval": "auto"}},
+            "task": {"path": "/tasks/smoke"},
+            "trials_dir": "/jobs/smoke"
+        });
+        assert!(!is_projection_of(&drifted, &embedded));
+        let extra_key = json!({"task": {"path": "/tasks/smoke", "name": "smoke"}});
+        assert!(!is_projection_of(&extra_key, &embedded));
+        assert!(!is_projection_of(
+            &json!({"a": [1, 2]}),
+            &json!({"a": [1, 2, 3]})
+        ));
+    }
+
+    #[test]
+    fn manifests_written_before_the_approval_flag_read_back_as_auto() {
+        let legacy = json!({
+            "qq_source_revision": "abc123",
+            "qq_source_dirty": false,
+            "harbor_version": HARBOR_VERSION,
+            "program": "harbor",
+            "arguments": ["run"],
+            "environment": {}
+        });
+        let manifest: LaunchPlan = serde_json::from_value(legacy).unwrap();
+        assert_eq!(manifest.approval, EvalApproval::Auto);
+        assert_eq!(manifest.qq_build_target, None);
     }
 
     #[allow(clippy::too_many_arguments)]

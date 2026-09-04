@@ -5,8 +5,9 @@ Repository automation for QQ is available through `cargo xtask`.
 - `cargo xtask providers check offline` runs the deterministic provider gate.
 - `cargo xtask providers check live ...` runs explicitly enabled provider
   canaries.
-- `cargo xtask eval run ...` builds a revision-stamped QQ binary and launches
-  the pinned Harbor adapter.
+- `cargo xtask eval run ...` builds a revision-stamped QQ binary (optionally
+  for a static `--target`), selects the in-container `--approval` policy, and
+  launches the pinned Harbor adapter.
 - `cargo xtask eval classify ...` records one trajectory-grounded failure
   category.
 - `cargo xtask eval report ...` verifies fixed trial identity and emits the

@@ -72,6 +72,22 @@
         ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.llvmPackages.libclang ]
         ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
 
+      # Terminal-Bench evaluation: Harbor runs under uv, and the qq binary
+      # uploaded into task containers is a static x86_64 musl build so it
+      # runs on any task image regardless of its glibc.
+      evalTools = with pkgs; [
+        python313
+        uv
+      ];
+
+      muslCross = pkgs.pkgsCross.musl64.stdenv.cc;
+
+      evalShellHook = lib.optionalString (pkgs.stdenv.isLinux && pkgs.stdenv.isx86_64) ''
+        export CC_x86_64_unknown_linux_musl=${muslCross}/bin/${muslCross.targetPrefix}cc
+        export AR_x86_64_unknown_linux_musl=${muslCross}/bin/${muslCross.targetPrefix}ar
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=${muslCross}/bin/${muslCross.targetPrefix}cc
+      '';
+
       mkRustShell =
         {
           name,
@@ -79,8 +95,9 @@
         }:
         pkgs.mkShell {
           inherit name;
-          packages = commonTools ++ nixTools ++ rustTools ++ nativeTools ++ extraPackages;
+          packages = commonTools ++ nixTools ++ rustTools ++ nativeTools ++ evalTools ++ extraPackages;
           buildInputs = nativeLibraries;
+          shellHook = evalShellHook;
         };
     in
     {

@@ -8,3 +8,6 @@ components = [
   "rust-src",
   "rustfmt",
 ]
+# Static evaluation binary uploaded into Terminal-Bench task containers; see
+# benchmarks/harbor/README.md.
+targets = ["x86_64-unknown-linux-musl"]
