@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use qq_protocol::{DelegationRole, DelegationRoster};
+use qq_protocol::{ChildAuthority, DelegationRole, DelegationRoster};
 use qq_provider::ToolSpec;
 use serde::Deserialize;
 use serde_json::json;
@@ -197,6 +197,18 @@ pub(crate) fn spawn_agent_spec(model_routes: &[String], delegation: &DelegationR
             }),
         );
     }
+    // Write authority is advertised only when the roster permits it; a model
+    // never sees an option the spawner would refuse.
+    if delegation.write_children {
+        properties.insert(
+            "authority".to_owned(),
+            json!({
+                "type": "string",
+                "enum": ["read", "write"],
+                "description": "read (default): the sub-agent may only read the workspace. write: it may edit files and run commands, but every such action is held and adjudicated by the reviewer model before it runs, and only one write sub-agent runs at a time. Request write only when the task itself requires changing the workspace."
+            }),
+        );
+    }
     let override_routes: Vec<&str> = if has_roster {
         delegation
             .roster
@@ -262,6 +274,8 @@ pub(crate) struct SpawnAgentArgs {
     pub(crate) model: Option<String>,
     #[serde(default)]
     pub(crate) role: Option<DelegationRole>,
+    #[serde(default)]
+    pub(crate) authority: ChildAuthority,
 }
 
 pub(crate) fn specs() -> Vec<ToolSpec> {

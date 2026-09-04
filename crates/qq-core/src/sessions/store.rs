@@ -446,6 +446,7 @@ impl Store {
         model: ModelSelection,
         task: String,
         limits: RunLimits,
+        approval_mode: ApprovalMode,
     ) -> Result<CreatedChildRun, SessionRuntimeError> {
         let store_id = self.store_id;
         let parent = ChildRunParent {
@@ -455,7 +456,15 @@ impl Store {
             tool_call_id: Some(call_id),
         };
         self.call(Priority::Control, move |connection| {
-            create_child_run(connection, store_id, parent, model, task, limits)
+            create_child_run(
+                connection,
+                store_id,
+                parent,
+                model,
+                task,
+                limits,
+                approval_mode,
+            )
         })
         .await
     }
@@ -1067,6 +1076,33 @@ impl Store {
         let claimed = claimed.clone();
         self.call(Priority::Output, move |connection| {
             resolve_approval_by_reviewer(connection, store_id, &claimed, tool_call_id)
+        })
+        .await
+    }
+
+    /// Settles a held `Supervised` call as denied by the reviewer.
+    pub(super) async fn deny_approval_by_reviewer(
+        &self,
+        claimed: &ClaimedRun,
+        tool_call_id: ToolCallId,
+        message: String,
+    ) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
+        let store_id = self.store_id;
+        let claimed = claimed.clone();
+        self.call(Priority::Output, move |connection| {
+            deny_approval_by_reviewer(connection, store_id, &claimed, tool_call_id, &message)
+        })
+        .await
+    }
+
+    /// The bounded run context a review request carries.
+    pub(super) async fn review_context(
+        &self,
+        claimed: &ClaimedRun,
+    ) -> Result<(Option<String>, Vec<RecentAction>), SessionRuntimeError> {
+        let claimed = claimed.clone();
+        self.call(Priority::Control, move |connection| {
+            load_review_context(connection, &claimed)
         })
         .await
     }

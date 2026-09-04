@@ -1,7 +1,7 @@
 //! Application configuration to model-runtime composition.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -13,11 +13,11 @@ use qq_config::{
     ProviderConfig, WorkspaceGrant,
 };
 use qq_core::{
-    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, ReviewFuture,
-    ReviewRequest, ReviewVerdict, RuntimeConfigError, RuntimeLoadError, RuntimeLoadFuture,
-    RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError,
-    SessionRuntimeOptions, SpawnModelValidationFuture, WorkerRuntimeLoadFuture,
-    WorkspaceGrantAuthority, WorkspaceGrantSeed,
+    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, ReviewDecision,
+    ReviewFuture, ReviewRequest, ReviewVerdict, RuntimeConfigError, RuntimeLoadError,
+    RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime,
+    SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
+    WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
     plan::{
         AgentProfile, CompiledAgentPlan, CredentialReference, HostSnapshot, PackSelection,
         PlanCompileError, ProviderDescriptor, SourceFingerprint,
@@ -1249,66 +1249,127 @@ impl WorkspaceGrantAuthority for RuntimeFactory {
     }
 }
 
-/// One-shot reviewer verdict budget: a bounded, non-streaming-style read of
-/// a small model's single JSON line.
-const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 512;
+/// One-shot reviewer verdict budget: a bounded read of a small model's single
+/// JSON line. Raised from 512 when requests gained arguments and briefs.
+const REVIEWER_MAX_OUTPUT_TOKENS: u32 = 1_024;
 const REVIEWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bytes of one section (arguments, brief, diff) quoted to the reviewer.
+const REVIEWER_SECTION_BYTES: usize = 8 * 1024;
 
 /// Adjudicates held tool approvals with the workspace-configured
 /// `reviewer_model`, through the same provider compilation path as ordinary
 /// runs. Every failure — no reviewer configured, config or provider errors,
 /// timeout, unparseable verdict — resolves as `Escalate`, leaving the human
 /// approval path untouched.
+///
+/// The compiled provider is cached per workspace and revalidated by
+/// credential epoch, so a held call does not pay a configuration load.
 pub struct ModelApprovalReviewer {
     factory: RuntimeFactory,
+    cache: Arc<std::sync::Mutex<HashMap<PathBuf, CachedReviewer>>>,
+}
+
+#[derive(Clone)]
+struct CachedReviewer {
+    epoch: qq_protocol::CredentialEpoch,
+    route: qq_config::ModelRoute,
+    provider: Arc<dyn qq_provider::Provider>,
+    pricing: Option<qq_protocol::ModelPricing>,
 }
 
 impl ModelApprovalReviewer {
     pub fn new(factory: RuntimeFactory) -> Self {
-        Self { factory }
+        Self {
+            factory,
+            cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     fn escalate(reason: &str) -> ReviewVerdict {
-        ReviewVerdict::Escalate {
+        ReviewVerdict::free(ReviewDecision::Escalate {
             reason: reason.to_owned(),
+        })
+    }
+
+    /// Blocking: the cached reviewer for `workspace` when its credential epoch
+    /// still matches, else a fresh compile. A rotated credential or changed
+    /// reviewer route is observed on the next epoch.
+    fn prepare(&self, workspace: &Path) -> Result<CachedReviewer, String> {
+        let epoch = self
+            .factory
+            .inner
+            .credentials
+            .epoch()
+            .map_err(|error| error.to_string())?;
+        if let Ok(cache) = self.cache.lock()
+            && let Some(cached) = cache.get(workspace)
+            && cached.epoch == epoch
+        {
+            return Ok(cached.clone());
         }
+        let load =
+            LoadRequest::from_process_env(workspace, None).map_err(|error| error.to_string())?;
+        let snapshot = self
+            .factory
+            .load(&load)
+            .map_err(|error| error.to_string())?;
+        let Some(route) = snapshot.reviewer_model() else {
+            return Err("no reviewer model is configured".to_owned());
+        };
+        let provider_config = snapshot
+            .providers()
+            .get(route.provider())
+            .ok_or_else(|| format!("unknown reviewer provider {}", route.provider()))?;
+        let (recipe, _) = self
+            .factory
+            .prepare_provider(route.provider(), route.model(), provider_config)
+            .map_err(|error| error.to_string())?;
+        let provider = self
+            .factory
+            .inner
+            .providers
+            .compile(recipe)
+            .map_err(|error| error.to_string())?;
+        let pricing = provider_config
+            .models()
+            .get(route.model())
+            .and_then(qq_config::ModelMetadata::pricing)
+            .cloned()
+            .map(protocol_model_pricing);
+        let cached = CachedReviewer {
+            epoch,
+            route: route.clone(),
+            provider,
+            pricing,
+        };
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(workspace.to_owned(), cached.clone());
+        }
+        Ok(cached)
     }
 }
 
 impl ApprovalReviewer for ModelApprovalReviewer {
     fn review(&self, request: ReviewRequest) -> ReviewFuture {
-        let factory = self.factory.clone();
+        let reviewer = Self {
+            factory: self.factory.clone(),
+            cache: Arc::clone(&self.cache),
+        };
         Box::pin(async move {
             let workspace = PathBuf::from(&request.workspace);
-            let prepared = tokio::task::spawn_blocking(move || {
-                let load = LoadRequest::from_process_env(&workspace, None)
-                    .map_err(|error| error.to_string())?;
-                let snapshot = factory.load(&load).map_err(|error| error.to_string())?;
-                let Some(route) = snapshot.reviewer_model() else {
-                    return Err("no reviewer model is configured".to_owned());
-                };
-                let provider_config = snapshot
-                    .providers()
-                    .get(route.provider())
-                    .ok_or_else(|| format!("unknown reviewer provider {}", route.provider()))?;
-                let (recipe, _) = factory
-                    .prepare_provider(route.provider(), route.model(), provider_config)
-                    .map_err(|error| error.to_string())?;
-                let provider = factory
-                    .inner
-                    .providers
-                    .compile(recipe)
-                    .map_err(|error| error.to_string())?;
-                Ok::<_, String>((provider, route.model().to_owned()))
-            })
-            .await;
-            let (provider, model) = match prepared {
+            let prepared = tokio::task::spawn_blocking(move || reviewer.prepare(&workspace)).await;
+            let cached = match prepared {
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(_)) | Err(_) => return Self::escalate("reviewer unavailable"),
             };
             let verdict = tokio::time::timeout(
                 REVIEWER_TIMEOUT,
-                collect_reviewer_verdict(provider, &model, &request),
+                collect_reviewer_verdict(
+                    cached.provider,
+                    cached.route.model(),
+                    cached.pricing.as_ref(),
+                    &request,
+                ),
             )
             .await;
             match verdict {
@@ -1320,14 +1381,17 @@ impl ApprovalReviewer for ModelApprovalReviewer {
 }
 
 /// The reviewer's contract: one strict JSON line. Anything else escalates.
-const REVIEWER_SYSTEM_PROMPT: &str = "You are a tool-call safety reviewer for a coding agent. \
-The agent proposed one action that static policy flagged as potentially dangerous. \
-Judge only the action shown; you have no transcript and must not assume intent. \
-Approve only actions whose worst plausible outcome is recoverable within the workspace \
-(for example: deleting build artifacts, killing a process the workspace owns, \
-reinstalling dependencies). Escalate anything externally visible, credential-touching, \
-system-level, or ambiguous (for example: force-pushing shared branches, sudo, piped \
-installers, writes outside the workspace). \
+const REVIEWER_SYSTEM_PROMPT: &str = "You are a tool-call reviewer for a coding agent. \
+The agent proposed one action that policy held for review. Judge only the action shown; \
+you have no transcript and must not assume intent beyond the stated task. \
+Two criteria, both required to approve: (1) safety — the worst plausible outcome is \
+recoverable within the workspace (for example: deleting build artifacts, killing a process \
+the workspace owns, reinstalling dependencies, editing source files); escalate anything \
+externally visible, credential-touching, system-level, or ambiguous (force-pushing shared \
+branches, sudo, piped installers, writes outside the workspace). (2) necessity — when a task \
+brief is given, the action must be plausibly necessary for that task; deny actions clearly \
+outside it. For a supervised sub-agent your deny is final; for a root session it only \
+escalates to the human. \
 Reply with exactly one JSON object on one line and nothing else: \
 {\"verdict\":\"approve\"} or {\"verdict\":\"escalate\",\"reason\":\"...\"} \
 or {\"verdict\":\"deny\",\"reason\":\"...\"}.";
@@ -1335,15 +1399,32 @@ or {\"verdict\":\"deny\",\"reason\":\"...\"}.";
 async fn collect_reviewer_verdict(
     provider: Arc<dyn qq_provider::Provider>,
     model: &str,
+    pricing: Option<&qq_protocol::ModelPricing>,
     request: &ReviewRequest,
 ) -> ReviewVerdict {
     use futures_util::StreamExt as _;
     use qq_provider::{ContentBlock, Message, ModelRequest, ProviderEvent, Role};
 
     let mut description = format!(
-        "Tool: {}\nWorkspace: {}\n",
-        request.tool_name, request.workspace
+        "Tool: {}\nWorkspace: {}\nSession mode: {}\n",
+        request.tool_name,
+        request.workspace,
+        match request.mode {
+            qq_protocol::ApprovalMode::Supervised => "supervised sub-agent (your deny is final)",
+            _ => "root session (deny escalates to the human)",
+        }
     );
+    match request.origin {
+        qq_core::ReviewOrigin::Root => {}
+        qq_core::ReviewOrigin::Child { depth, .. } => {
+            description.push_str(&format!("Origin: sub-agent at depth {depth}\n"));
+        }
+    }
+    if let Some(brief) = &request.task_brief {
+        description.push_str("Task brief given to the sub-agent:\n");
+        description.push_str(&bounded(brief, REVIEWER_SECTION_BYTES));
+        description.push('\n');
+    }
     if let Some(shell) = &request.shell {
         description.push_str("Shell command: ");
         description.push_str(&shell.command);
@@ -1358,8 +1439,33 @@ async fn collect_reviewer_verdict(
         description.push_str("Edit path: ");
         description.push_str(&edit.path);
         description.push_str("\nDiff preview:\n");
-        description.push_str(&edit.diff);
+        description.push_str(&bounded(&edit.diff, REVIEWER_SECTION_BYTES));
         description.push('\n');
+    }
+    if request.shell.is_none() && request.edit.is_none() {
+        description.push_str("Arguments: ");
+        description.push_str(&bounded(&request.arguments, REVIEWER_SECTION_BYTES));
+        description.push('\n');
+    }
+    if !request.recent_actions.is_empty() {
+        description.push_str("Recent tool calls of this run (oldest first): ");
+        let listed = request
+            .recent_actions
+            .iter()
+            .map(|action| match &action.path {
+                Some(path) => format!("{}({})", action.tool, bounded(path, 120)),
+                None => action.tool.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        description.push_str(&listed);
+        description.push('\n');
+    }
+    if !request.granted_tools.is_empty() || !request.granted_shell_prefixes.is_empty() {
+        description.push_str(&format!(
+            "Session grants: tools {:?}; shell prefixes {:?}\n",
+            request.granted_tools, request.granted_shell_prefixes
+        ));
     }
     let model_request = ModelRequest::new(
         model.to_owned(),
@@ -1372,24 +1478,65 @@ async fn collect_reviewer_verdict(
     .with_system(REVIEWER_SYSTEM_PROMPT);
     let mut stream = provider.stream(model_request);
     let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(ProviderEvent::OutputTextDelta { text: delta }) => text.push_str(&delta),
-            Ok(ProviderEvent::Completed { .. }) => break,
-            Ok(_) => {}
-            Err(_) => {
-                return ReviewVerdict::Escalate {
-                    reason: "reviewer request failed".to_owned(),
+    let mut spend = qq_core::ReviewSpend::default();
+    loop {
+        match stream.next().await {
+            Some(Ok(ProviderEvent::OutputTextDelta { text: delta })) => text.push_str(&delta),
+            Some(Ok(
+                ProviderEvent::Completed { usage } | ProviderEvent::Incomplete { usage, .. },
+            )) => {
+                let usage = usage.map(|usage| qq_protocol::TokenUsage {
+                    input_tokens: usage.input_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_write_input_tokens: usage.cache_write_input_tokens,
+                    output_tokens: usage.output_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
+                });
+                spend = qq_core::ReviewSpend {
+                    usage,
+                    cost_usd_nanos: match (usage, pricing) {
+                        (Some(usage), Some(pricing)) => qq_core::run_cost(usage, pricing),
+                        _ => None,
+                    },
+                };
+                break;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(_)) => {
+                return ReviewVerdict {
+                    decision: ReviewDecision::Escalate {
+                        reason: "reviewer request failed".to_owned(),
+                    },
+                    // The request was sent; its spend is unknown, not zero.
+                    spend: qq_core::ReviewSpend {
+                        usage: None,
+                        cost_usd_nanos: None,
+                    },
                 };
             }
+            None => break,
         }
     }
-    parse_reviewer_verdict(&text)
+    ReviewVerdict {
+        decision: parse_reviewer_decision(&text),
+        spend,
+    }
+}
+
+fn bounded(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &text[..end])
 }
 
 /// Parses the reviewer's reply. The verdict must be the only JSON object in
 /// the reply and `approve` carries no qualifier; everything else escalates.
-fn parse_reviewer_verdict(text: &str) -> ReviewVerdict {
+fn parse_reviewer_decision(text: &str) -> ReviewDecision {
     #[derive(serde::Deserialize)]
     struct Reply {
         verdict: String,
@@ -1398,7 +1545,7 @@ fn parse_reviewer_verdict(text: &str) -> ReviewVerdict {
     }
     let trimmed = text.trim();
     let Ok(reply) = serde_json::from_str::<Reply>(trimmed) else {
-        return ReviewVerdict::Escalate {
+        return ReviewDecision::Escalate {
             reason: "reviewer reply was not a valid verdict".to_owned(),
         };
     };
@@ -1408,11 +1555,11 @@ fn parse_reviewer_verdict(text: &str) -> ReviewVerdict {
             .unwrap_or_else(|| "reviewer verdict".to_owned())
     };
     match reply.verdict.as_str() {
-        "approve" => ReviewVerdict::Approve,
-        "deny" => ReviewVerdict::Deny {
+        "approve" => ReviewDecision::Approve,
+        "deny" => ReviewDecision::Deny {
             reason: reason(reply),
         },
-        _ => ReviewVerdict::Escalate {
+        _ => ReviewDecision::Escalate {
             reason: reason(reply),
         },
     }
@@ -4961,38 +5108,38 @@ mod tests {
     #[test]
     fn reviewer_verdict_parses_strictly_and_escalates_everything_else() {
         assert!(matches!(
-            parse_reviewer_verdict(r#"{"verdict":"approve"}"#),
-            ReviewVerdict::Approve
+            parse_reviewer_decision(r#"{"verdict":"approve"}"#),
+            ReviewDecision::Approve
         ));
         assert!(matches!(
-            parse_reviewer_verdict("  {\"verdict\":\"approve\"}\n"),
-            ReviewVerdict::Approve
+            parse_reviewer_decision("  {\"verdict\":\"approve\"}\n"),
+            ReviewDecision::Approve
         ));
         assert!(matches!(
-            parse_reviewer_verdict(r#"{"verdict":"deny","reason":"wipes home"}"#),
-            ReviewVerdict::Deny { reason } if reason == "wipes home"
+            parse_reviewer_decision(r#"{"verdict":"deny","reason":"wipes home"}"#),
+            ReviewDecision::Deny { reason } if reason == "wipes home"
         ));
         assert!(matches!(
-            parse_reviewer_verdict(r#"{"verdict":"escalate","reason":"unsure"}"#),
-            ReviewVerdict::Escalate { reason } if reason == "unsure"
+            parse_reviewer_decision(r#"{"verdict":"escalate","reason":"unsure"}"#),
+            ReviewDecision::Escalate { reason } if reason == "unsure"
         ));
         // Unknown verdicts, prose-wrapped JSON, and non-JSON all escalate:
         // the reviewer can only ever expedite, never widen, an approval.
         assert!(matches!(
-            parse_reviewer_verdict(r#"{"verdict":"allow"}"#),
-            ReviewVerdict::Escalate { .. }
+            parse_reviewer_decision(r#"{"verdict":"allow"}"#),
+            ReviewDecision::Escalate { .. }
         ));
         assert!(matches!(
-            parse_reviewer_verdict(r#"Sure! {"verdict":"approve"}"#),
-            ReviewVerdict::Escalate { .. }
+            parse_reviewer_decision(r#"Sure! {"verdict":"approve"}"#),
+            ReviewDecision::Escalate { .. }
         ));
         assert!(matches!(
-            parse_reviewer_verdict("approve"),
-            ReviewVerdict::Escalate { .. }
+            parse_reviewer_decision("approve"),
+            ReviewDecision::Escalate { .. }
         ));
         assert!(matches!(
-            parse_reviewer_verdict(""),
-            ReviewVerdict::Escalate { .. }
+            parse_reviewer_decision(""),
+            ReviewDecision::Escalate { .. }
         ));
     }
 }

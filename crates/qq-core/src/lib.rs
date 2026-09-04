@@ -61,11 +61,12 @@ pub use runtime::MAX_PENDING_STEERING;
 pub use sessions::{
     ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, MAX_CHILD_DEPTH,
     MAX_CHILD_DEPTH_CEILING, MAX_CONCURRENT_CHILDREN_PER_RUN, MAX_DELEGATION_ROSTER,
-    MAX_PENDING_PROMPTS, MAX_REPLAY_EVENTS, MAX_SPAWNED_CHILDREN_PER_RUN, ReviewFuture,
-    ReviewRequest, ReviewVerdict, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
-    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
-    SpawnModelValidationFuture, WorkerRuntimeLoadFuture, WorkspaceGrantAuthority,
-    WorkspaceGrantSeed,
+    MAX_PENDING_PROMPTS, MAX_REPLAY_EVENTS, MAX_REVIEW_ARGUMENT_BYTES, MAX_REVIEW_BRIEF_BYTES,
+    MAX_REVIEW_RECENT_ACTIONS, MAX_SPAWNED_CHILDREN_PER_RUN, RecentAction, ReviewDecision,
+    ReviewFuture, ReviewOrigin, ReviewRequest, ReviewSpend, ReviewVerdict, RuntimeLoadError,
+    RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream, SessionRuntime,
+    SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
+    WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed, run_cost,
 };
 pub use workspace::skills::{MAX_INDEXED_SKILLS, MAX_SKILL_DESCRIPTION_BYTES};
 pub use workspace::{SkillEntry, SkillIndex, SkillKind};
@@ -1730,6 +1731,19 @@ impl plan::CompiledAgentPlan {
                         });
                         continue;
                     };
+                    // Reviewer spend is charged whatever the verdict; the
+                    // wrapped decision is then applied like any other.
+                    let decision = match decision {
+                        GateDecision::Reviewed { decision, spend } => {
+                            budget.charge_child(spend.usage, spend.cost_usd_nanos);
+                            yield RuntimeEvent::ReviewCharged {
+                                usage: spend.usage,
+                                cost_usd_nanos: spend.cost_usd_nanos,
+                            };
+                            *decision
+                        }
+                        decision => decision,
+                    };
                     match decision {
                         GateDecision::Execute => {}
                         GateDecision::Deny { message } => {
@@ -1743,6 +1757,9 @@ impl plan::CompiledAgentPlan {
                         GateDecision::Fail { kind, message } => {
                             yield RuntimeEvent::Failed { kind, message };
                             return;
+                        }
+                        GateDecision::Reviewed { .. } => {
+                            unreachable!("reviewed decisions are unwrapped once, never nested")
                         }
                     }
                 }
@@ -1872,6 +1889,7 @@ impl plan::CompiledAgentPlan {
                                                             call_id: call.id,
                                                             task: arguments.task,
                                                             model,
+                                                            authority: arguments.authority,
                                                             limits,
                                                         })
                                                         .await;
@@ -2212,6 +2230,8 @@ fn public_run_stream(mut events: RuntimeStream, context_window: Option<u32>) -> 
                 // Direct runs have no steering channel, so these never fire.
                 | RuntimeEvent::SteeringApplied { .. }
                 | RuntimeEvent::Interrupted { .. }
+                // Direct runs have no reviewer either.
+                | RuntimeEvent::ReviewCharged { .. }
                 // Continuation is transparent to the direct stream: the text
                 // keeps flowing and the typed failure names exhaustion.
                 | RuntimeEvent::OutputTruncated { .. } => {}

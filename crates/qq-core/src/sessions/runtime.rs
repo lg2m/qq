@@ -173,30 +173,97 @@ pub trait WorkspaceGrantAuthority: Send + Sync + 'static {
     fn promote_grant(&self, workspace: &Path, grant: &ApprovalGrant) -> GrantPromotionFuture;
 }
 
+/// Bounds on the context a review request carries. The reviewer sees only
+/// what it needs to judge one action; a poisoned transcript must not be able
+/// to argue its own call safe.
+pub const MAX_REVIEW_ARGUMENT_BYTES: usize = 16 * 1024;
+pub const MAX_REVIEW_BRIEF_BYTES: usize = 8 * 1024;
+pub const MAX_REVIEW_RECENT_ACTIONS: usize = 16;
+
+/// Where the reviewed call originates: a root session, or a child spawned by
+/// a parent run with the given nesting depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewOrigin {
+    Root,
+    Child { depth: u16, parent_run: RunId },
+}
+
+/// One earlier tool call of the same run, for the reviewer's sense of what
+/// the run has been doing. Names and paths only, never results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentAction {
+    pub tool: String,
+    pub path: Option<String>,
+}
+
 /// Everything an approval reviewer may see about one held tool call. The
-/// transcript is deliberately absent: a poisoned context must not be able to
-/// argue its own call safe.
+/// transcript is deliberately absent; for a child the task brief its parent
+/// wrote stands in, so the reviewer can judge whether the action is plausibly
+/// necessary for the stated task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewRequest {
     pub tool_name: String,
+    /// The call's arguments as JSON, truncated to `MAX_REVIEW_ARGUMENT_BYTES`.
+    pub arguments: String,
     pub shell: Option<ShellCommandPreview>,
     pub edit: Option<EditPreview>,
     pub workspace: String,
+    pub origin: ReviewOrigin,
+    /// The child's task brief (the prompt that created its run), truncated to
+    /// `MAX_REVIEW_BRIEF_BYTES`. `None` for root sessions.
+    pub task_brief: Option<String>,
+    /// The session's approval mode, so the reviewer knows whether its `Deny`
+    /// is final (`Supervised`) or advisory (`Auto`).
+    pub mode: ApprovalMode,
+    /// The last `MAX_REVIEW_RECENT_ACTIONS` finished tool calls of the run.
+    pub recent_actions: Vec<RecentAction>,
+    /// Tool names and shell prefixes the session has been granted.
+    pub granted_tools: Vec<String>,
+    pub granted_shell_prefixes: Vec<String>,
 }
 
-/// A reviewer's answer for one held tool call. Anything other than a clear
-/// `Approve` leaves the call waiting for a human; the reviewer can expedite
-/// approvals but can never widen a denial or bypass the client.
+/// What the reviewer's own provider call cost, charged to the reviewed run.
+/// `None` fields mean unknown, never zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReviewSpend {
+    pub usage: Option<TokenUsage>,
+    pub cost_usd_nanos: Option<u64>,
+}
+
+/// A reviewer's answer for one held tool call, with what answering cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewVerdict {
+pub struct ReviewVerdict {
+    pub decision: ReviewDecision,
+    pub spend: ReviewSpend,
+}
+
+impl ReviewVerdict {
+    /// A verdict that cost nothing: reviewer unavailable, not configured, or
+    /// answered from policy without a model call.
+    #[must_use]
+    pub const fn free(decision: ReviewDecision) -> Self {
+        Self {
+            decision,
+            spend: ReviewSpend {
+                usage: None,
+                cost_usd_nanos: Some(0),
+            },
+        }
+    }
+}
+
+/// The reviewer's judgement. For `Auto` sessions anything other than a clear
+/// `Approve` leaves the call waiting for a human: the reviewer can expedite
+/// approvals but never widens a denial. For `Supervised` sessions `Deny` is
+/// final and `Escalate` reaches the human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewDecision {
     Approve,
     /// The reviewer declines to decide; the human approval path continues.
     Escalate {
         reason: String,
     },
-    /// The reviewer judges the call unsafe. Treated exactly like `Escalate`
-    /// today (the human still decides); carried separately so the verdict
-    /// vocabulary does not need a wire change to harden later.
+    /// The reviewer judges the call unsafe or unnecessary for the task.
     Deny {
         reason: String,
     },

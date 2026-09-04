@@ -1,7 +1,7 @@
 # Supervised Delegation, Continuation, And Audit
 
-Status: proposed 2026-09-03. D1, D2, D3, and D6a implemented 2026-09-03; D4,
-D5, and D6b not started. This plan is a companion to
+Status: proposed 2026-09-03. D1, D2, D3, D4a, and D6a implemented 2026-09-03;
+D4b, D5, and D6b not started. This plan is a companion to
 [`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md)
 and requires the amendments listed in [Amendments](#amendments-to-existing-plans)
 before D4 or D5 may land.
@@ -473,7 +473,7 @@ gate beyond T1 showing no pass-rate loss.
 | D1 continuation | none | done; protocol 16, schema 22 |
 | D2 accounting and authority repair | none | done |
 | D3 roster | D2 | done; descriptor 4, prompt 10 |
-| D4a supervised write children at depth one | D2, D3, amendments | reviewer widening |
+| D4a supervised write children at depth one | D2, D3, amendments | done |
 | D4b configurable depth to three | D4a | per-depth pools, descendant cap |
 | D5 audit | D4a (audit child reuses supervised machinery) | amendment |
 | D6b paired runs and gate decisions | all | flips defaults |

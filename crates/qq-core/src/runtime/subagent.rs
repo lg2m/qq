@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use qq_protocol::{RunLimits, TokenUsage, ToolCallId};
+use qq_protocol::{ChildAuthority, RunLimits, TokenUsage, ToolCallId};
 
 /// The spend one spawned sub-agent reports back to its parent. Every field is
 /// `None` when unknown, never zero: the parent's meter turns an unknown into
@@ -52,6 +52,10 @@ pub(crate) struct SpawnRequest {
     pub(crate) call_id: ToolCallId,
     pub(crate) task: String,
     pub(crate) model: Option<String>,
+    /// The authority the parent asked for. `Write` is admitted only when the
+    /// roster allows write children and a reviewer is installed; the child
+    /// then runs `Supervised`, never above.
+    pub(crate) authority: ChildAuthority,
     /// The parent's remaining budget at spawn time. The child is admitted
     /// with these bounds, never with the parent's original caps.
     pub(crate) limits: RunLimits,

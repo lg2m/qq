@@ -272,6 +272,11 @@ pub struct ModelDescriptor {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
     ReadOnly,
+    /// Every mutating, shell, and external call is held and adjudicated by
+    /// the configured reviewer model regardless of grants; a reviewer denial
+    /// is final and an escalation reaches the human. Only spawned write
+    /// children run here; a client cannot select it for a root session.
+    Supervised,
     Ask,
     /// Default: edits and safe shell run without prompting; only dangerous
     /// shell commands (deletion, privilege escalation, force-push, piped
@@ -280,6 +285,27 @@ pub enum ApprovalMode {
     Auto,
     /// Zero restrictions: every tool call executes without prompting.
     Full,
+}
+
+/// The authority a parent grants a spawned child: `read` yields a `ReadOnly`
+/// child; `write` yields a `Supervised` one whose every held action is
+/// adjudicated before it runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildAuthority {
+    #[default]
+    Read,
+    Write,
+}
+
+impl ChildAuthority {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
 }
 
 /// A client's answer to one pending tool approval.
@@ -322,9 +348,9 @@ pub enum ApprovalResolution {
     ApprovedByReviewer,
     Denied,
     DeniedTimeout,
-    /// Denied by the configured approval reviewer model. Reserved: the
-    /// current reviewer escalates to a human instead of denying, but the
-    /// wire vocabulary is versioned with the feature.
+    /// Denied by the configured approval reviewer model. Live for `supervised`
+    /// sessions (write children), where a reviewer denial is final; for root
+    /// `auto` sessions the reviewer still escalates to a human instead.
     DeniedByReviewer,
 }
 

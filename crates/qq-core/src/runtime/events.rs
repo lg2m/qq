@@ -119,6 +119,13 @@ pub(crate) enum RuntimeEvent {
         /// a successful edit). Never enters model context.
         display: Option<ToolCallDisplay>,
     },
+    /// The approval reviewer answered for one of this run's held calls; its
+    /// provider spend is the run's to account for. Emitted before the call
+    /// executes or settles as denied.
+    ReviewCharged {
+        usage: Option<TokenUsage>,
+        cost_usd_nanos: Option<u64>,
+    },
     /// Queued steering entered model context: the message will be part of
     /// the request for `turn_ordinal`. Emitted at the boundary, before that
     /// turn is prepared.

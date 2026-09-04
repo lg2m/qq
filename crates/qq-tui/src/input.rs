@@ -336,6 +336,7 @@ pub(crate) fn command_rows() -> Vec<CommandRow> {
 pub(crate) const fn approval_mode_label(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::ReadOnly => "read_only",
+        ApprovalMode::Supervised => "supervised",
         ApprovalMode::Ask => "ask",
         ApprovalMode::Auto => "auto",
         ApprovalMode::Full => "full",
@@ -349,6 +350,12 @@ pub(crate) const fn approval_mode_row(mode: ApprovalMode) -> ApprovalModeRow {
         ApprovalMode::ReadOnly => (
             "read_only",
             "deny edits, shell, and external tools without asking",
+        ),
+        // Never offered by the server for root sessions; rendered for the
+        // write children that run under it.
+        ApprovalMode::Supervised => (
+            "supervised",
+            "every edit, shell, and external call is adjudicated by the reviewer model",
         ),
         ApprovalMode::Ask => ("ask", "ask before edits, shell, and external tools"),
         ApprovalMode::Auto => (

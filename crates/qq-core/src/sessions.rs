@@ -51,14 +51,17 @@ mod store;
 mod subagents;
 
 pub use runtime::{
-    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime, ReviewFuture,
-    ReviewRequest, ReviewVerdict, RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest,
-    RuntimeLoader, SessionEventStream, SessionRuntime, SessionRuntimeError, SessionRuntimeOptions,
-    SpawnModelValidationFuture, WorkerRuntimeLoadFuture, WorkspaceGrantAuthority,
-    WorkspaceGrantSeed,
+    ApprovalReviewer, GrantPromotionFuture, GrantSeedFuture, LoadedRuntime,
+    MAX_REVIEW_ARGUMENT_BYTES, MAX_REVIEW_BRIEF_BYTES, MAX_REVIEW_RECENT_ACTIONS, RecentAction,
+    ReviewDecision, ReviewFuture, ReviewOrigin, ReviewRequest, ReviewSpend, ReviewVerdict,
+    RuntimeLoadError, RuntimeLoadFuture, RuntimeLoadRequest, RuntimeLoader, SessionEventStream,
+    SessionRuntime, SessionRuntimeError, SessionRuntimeOptions, SpawnModelValidationFuture,
+    WorkerRuntimeLoadFuture, WorkspaceGrantAuthority, WorkspaceGrantSeed,
 };
 
 use approvals::ConcludedApproval;
+#[cfg(test)]
+use execution::RunAccountingAccumulator;
 use execution::{ModelTurnCommit, RunAccounting, add_usage};
 use store::Store;
 #[cfg(test)]
@@ -655,7 +658,16 @@ fn create_child_run(
     model: ModelSelection,
     task: String,
     limits: RunLimits,
+    approval_mode: ApprovalMode,
 ) -> Result<CreatedChildRun, SessionRuntimeError> {
+    // Children never hold more than Supervised authority; the spawner decides
+    // between ReadOnly and Supervised and nothing else may reach here.
+    if !matches!(
+        approval_mode,
+        ApprovalMode::ReadOnly | ApprovalMode::Supervised
+    ) {
+        return Err(SessionRuntimeError::ChildAuthorityEscalation);
+    }
     let ChildRunParent {
         workspace_id,
         session_id: parent_session_id,
@@ -722,7 +734,7 @@ fn create_child_run(
                 id, workspace_id, parent_id, owner_run_id, spawned_by_tool_call_id, title,
                 status, queued_prompts, model, max_output_tokens, organization, approval_mode,
                 created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?10, ?5, 'queued', 1, ?6, ?7, ?8, 'read_only', ?9, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?10, ?5, 'queued', 1, ?6, ?7, ?8, ?11, ?9, ?9)",
             params![
                 session_id.to_string(),
                 workspace_id.to_string(),
@@ -734,6 +746,7 @@ fn create_child_run(
                 model.organization,
                 now,
                 spawned_by_tool_call_id.map(|id| id.to_string()),
+                approval_mode_str(approval_mode),
             ],
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -3751,6 +3764,145 @@ fn resolve_approval_by_reviewer(
     Ok(Some(event))
 }
 
+/// A reviewer denial for a `Supervised` call: the call settles as denied with
+/// the reviewer's bounded reason in one transaction, exactly like a human
+/// denial. `Ok(None)` when a client resolution won the race.
+fn deny_approval_by_reviewer(
+    connection: &mut Connection,
+    store_id: StoreId,
+    claimed: &ClaimedRun,
+    tool_call_id: ToolCallId,
+    message: &str,
+) -> Result<Option<SessionEventEnvelope>, SessionRuntimeError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let now = now_ms();
+    let Some((state, resolution, provider_call_id, first_result_in_turn)) = transaction
+        .query_row(
+            "SELECT current.state, current.approval_resolution, current.provider_call_id,
+                    NOT EXISTS(
+                        SELECT 1 FROM tool_calls previous
+                        WHERE previous.run_id = current.run_id
+                          AND previous.turn_ordinal = current.turn_ordinal
+                          AND previous.result IS NOT NULL
+                    )
+             FROM tool_calls current WHERE current.id = ?1 AND current.run_id = ?2",
+            params![tool_call_id.to_string(), claimed.run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+    else {
+        return Err(SessionRuntimeError::ToolCallNotFound);
+    };
+    if state != "awaiting_approval" || resolution.is_some() {
+        return Ok(None);
+    }
+    reserve_tool_result_capacity(
+        &transaction,
+        claimed.run_id,
+        &provider_call_id,
+        message,
+        first_result_in_turn,
+    )?;
+    transaction
+        .execute(
+            "UPDATE tool_calls
+             SET state = 'denied', result = ?2, is_error = 1,
+                 approval_resolution = ?3, resolved_at_ms = ?4, finished_at_ms = ?4
+             WHERE id = ?1 AND state = 'awaiting_approval'",
+            params![
+                tool_call_id.to_string(),
+                message,
+                approval_resolution_str(ApprovalResolution::DeniedByReviewer),
+                now,
+            ],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let tool_call = load_tool_call(&transaction, tool_call_id)?;
+    let event = append_event(
+        &transaction,
+        EventContext {
+            store_id,
+            workspace_id: claimed.workspace_id,
+            session_id: claimed.session_id,
+            run_id: Some(claimed.run_id),
+            caused_by: Some(claimed.command_id),
+            occurred_at_ms: now,
+        },
+        SessionEvent::ToolApprovalResolved {
+            tool_call,
+            resolution: ApprovalResolution::DeniedByReviewer,
+        },
+    )?;
+    transaction
+        .commit()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(Some(event))
+}
+
+/// What a reviewer may know about the run beyond the held call: the brief
+/// that created a child run (its prompt) and the most recent finished tool
+/// calls by name and path. Bounded; never results or model text.
+fn load_review_context(
+    connection: &Connection,
+    claimed: &ClaimedRun,
+) -> Result<(Option<String>, Vec<RecentAction>), SessionRuntimeError> {
+    let task_brief = if claimed.child {
+        connection
+            .query_row(
+                "SELECT m.output FROM messages m JOIN runs r ON r.user_message_id = m.id
+                 WHERE r.id = ?1",
+                [claimed.run_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| SessionRuntimeError::Persistence)?
+            .map(|brief| truncate_utf8(brief, MAX_REVIEW_BRIEF_BYTES))
+    } else {
+        None
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT name, arguments_json FROM tool_calls
+             WHERE run_id = ?1 AND result IS NOT NULL
+             ORDER BY turn_ordinal DESC, call_ordinal DESC LIMIT ?2",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let mut recent = statement
+        .query_map(
+            params![claimed.run_id.to_string(), MAX_REVIEW_RECENT_ACTIONS as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .into_iter()
+        .map(|(tool, arguments)| RecentAction {
+            path: serde_json::from_str::<serde_json::Value>(&arguments)
+                .ok()
+                .and_then(|arguments| {
+                    arguments
+                        .get("path")
+                        .or_else(|| arguments.get("command"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }),
+            tool,
+        })
+        .collect::<Vec<_>>();
+    recent.reverse();
+    Ok((task_brief, recent))
+}
+
 fn conclude_tool_approval(
     connection: &mut Connection,
     store_id: StoreId,
@@ -6706,7 +6858,10 @@ fn load_run(connection: &Connection, run_id: RunId) -> Result<RunSnapshot, Sessi
         )
 }
 
-pub(crate) fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
+/// Estimated cost of one usage report under `pricing`, in USD nanos. `None`
+/// when the pricing table lacks a rate the usage needs (a cached read without
+/// a cache price) or the arithmetic overflows.
+pub fn run_cost(usage: TokenUsage, pricing: &ModelPricing) -> Option<u64> {
     let total_input = usage
         .input_tokens
         .checked_add(usage.cache_read_input_tokens)?
@@ -6969,6 +7124,7 @@ fn parse_message_state(value: &str) -> Result<MessageState, SessionRuntimeError>
 const fn approval_mode_str(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::ReadOnly => "read_only",
+        ApprovalMode::Supervised => "supervised",
         ApprovalMode::Ask => "ask",
         ApprovalMode::Auto => "auto",
         ApprovalMode::Full => "full",
@@ -6978,6 +7134,7 @@ const fn approval_mode_str(mode: ApprovalMode) -> &'static str {
 fn parse_approval_mode(value: &str) -> Result<ApprovalMode, SessionRuntimeError> {
     match value {
         "read_only" => Ok(ApprovalMode::ReadOnly),
+        "supervised" => Ok(ApprovalMode::Supervised),
         "ask" => Ok(ApprovalMode::Ask),
         "auto" => Ok(ApprovalMode::Auto),
         "full" => Ok(ApprovalMode::Full),
@@ -6990,9 +7147,12 @@ fn parse_approval_mode(value: &str) -> Result<ApprovalMode, SessionRuntimeError>
 const fn approval_rank(mode: ApprovalMode) -> u8 {
     match mode {
         ApprovalMode::ReadOnly => 0,
-        ApprovalMode::Ask => 1,
-        ApprovalMode::Auto => 2,
-        ApprovalMode::Full => 3,
+        // Supervised executes nothing non-read without adjudication; Ask lets
+        // grants through, so it ranks above.
+        ApprovalMode::Supervised => 1,
+        ApprovalMode::Ask => 2,
+        ApprovalMode::Auto => 3,
+        ApprovalMode::Full => 4,
     }
 }
 
@@ -23509,7 +23669,8 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_approval_executes_a_held_call_without_a_client() {
-        let (reviewer, consulted) = StubReviewer::immediate(ReviewVerdict::Approve);
+        let (reviewer, consulted) =
+            StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
         let mut harness = approval_harness_with_reviewer(
             ApprovalMode::Auto,
             "__test_shell",
@@ -23559,9 +23720,10 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_escalation_leaves_the_call_waiting_for_a_client() {
-        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::Escalate {
-            reason: "unsure".to_owned(),
-        });
+        let (reviewer, _) =
+            StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Escalate {
+                reason: "unsure".to_owned(),
+            }));
         let mut harness = approval_harness_with_reviewer(
             ApprovalMode::Auto,
             "__test_shell",
@@ -23594,9 +23756,9 @@ mod tests {
 
     #[tokio::test]
     async fn reviewer_denial_still_lets_the_client_decide() {
-        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::Deny {
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Deny {
             reason: "dangerous".to_owned(),
-        });
+        }));
         let mut harness = approval_harness_with_reviewer(
             ApprovalMode::Auto,
             "__test_shell",
@@ -23633,7 +23795,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_resolution_wins_over_a_late_reviewer_approval() {
-        let (reviewer, release) = StubReviewer::held(ReviewVerdict::Approve);
+        let (reviewer, release) = StubReviewer::held(ReviewVerdict::free(ReviewDecision::Approve));
         let mut harness = approval_harness_with_reviewer(
             ApprovalMode::Auto,
             "__test_shell",
@@ -23674,7 +23836,8 @@ mod tests {
 
     #[tokio::test]
     async fn ask_mode_never_consults_the_reviewer() {
-        let (reviewer, consulted) = StubReviewer::immediate(ReviewVerdict::Approve);
+        let (reviewer, consulted) =
+            StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
         let mut harness = approval_harness_with_reviewer(
             ApprovalMode::Ask,
             "__test_mutate",
@@ -24510,15 +24673,11 @@ mod tests {
         queue: StdMutex<Vec<Arc<dyn Provider>>>,
     }
 
-    impl RuntimeLoader for QueueLoader {
-        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
-            let spawn_model_routes = self
-                .routed
-                .iter()
-                .map(|(model, _)| (*model).to_owned())
-                .collect::<Vec<_>>();
-            let provider = self
-                .routed
+    impl QueueLoader {
+        /// The routed provider for the request's model, else the next queued
+        /// one, else static text.
+        fn next_provider(&self, request: &RuntimeLoadRequest) -> Arc<dyn Provider> {
+            self.routed
                 .iter()
                 .find(|(model, _)| request.model.model.as_deref() == Some(*model))
                 .map(|(_, provider)| Arc::clone(provider))
@@ -24530,7 +24689,18 @@ mod tests {
                         Some(queue.remove(0))
                     }
                 })
-                .unwrap_or_else(|| Arc::new(StaticTextProvider));
+                .unwrap_or_else(|| Arc::new(StaticTextProvider))
+        }
+    }
+
+    impl RuntimeLoader for QueueLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let spawn_model_routes = self
+                .routed
+                .iter()
+                .map(|(model, _)| (*model).to_owned())
+                .collect::<Vec<_>>();
+            let provider = self.next_provider(&request);
             Box::pin(async move {
                 Runtime::with_provider(provider, "test-model", 256)
                     .map(|runtime| {
@@ -25604,6 +25774,7 @@ mod tests {
                         },
                         "queued child task".to_owned(),
                         RunLimits::default(),
+                        ApprovalMode::ReadOnly,
                     );
                     let _ = created_tx.send(result.as_ref().ok().map(|created| {
                         (
@@ -25672,6 +25843,7 @@ mod tests {
                 },
                 "too late".to_owned(),
                 RunLimits::default(),
+                ApprovalMode::ReadOnly,
             )
             .await;
         assert!(matches!(rejected, Err(SessionRuntimeError::RunNotFound)));
@@ -25700,6 +25872,7 @@ mod tests {
                 },
                 "running child task".to_owned(),
                 RunLimits::default(),
+                ApprovalMode::ReadOnly,
             )
             .await
             .unwrap();
@@ -25745,6 +25918,7 @@ mod tests {
                 },
                 "queued child task".to_owned(),
                 RunLimits::default(),
+                ApprovalMode::ReadOnly,
             )
             .await
             .unwrap();
@@ -26814,6 +26988,8 @@ mod tests {
             parent,
             subagents::SpawnBudget {
                 slots: Arc::new(Semaphore::new(1)),
+                write_slot: Arc::new(Semaphore::new(1)),
+                write_children: false,
                 spawned: Arc::new(AtomicUsize::new(0)),
                 max_children: usize::from(MAX_SPAWNED_CHILDREN_PER_RUN),
             },
@@ -26821,6 +26997,7 @@ mod tests {
                 call_id: ToolCallId::from_bytes([0x5a; 16]),
                 task: "research".to_owned(),
                 model: None,
+                authority: qq_protocol::ChildAuthority::Read,
                 limits: RunLimits::default(),
             },
         ));
@@ -26853,6 +27030,529 @@ mod tests {
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].id, session_id);
         assert_eq!(snapshot.sessions[0].active_run_id, None);
+    }
+
+    /// `QueueLoader` whose plans permit write children.
+    struct WriteChildLoader {
+        inner: QueueLoader,
+    }
+
+    impl RuntimeLoader for WriteChildLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = self.inner.next_provider(&request);
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime
+                                .with_turn_retry_policy(crate::TurnRetryPolicy::disabled())
+                                .with_delegation(qq_protocol::DelegationRoster {
+                                    roster: Vec::new(),
+                                    default_role: qq_protocol::DelegationRole::Balanced,
+                                    max_depth: 1,
+                                    write_children: true,
+                                }),
+                            &request.workspace,
+                            None,
+                        )
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    async fn write_child_harness(
+        child: Arc<dyn Provider>,
+        parent_script: Vec<(&'static str, String)>,
+        reviewer: Option<Arc<dyn ApprovalReviewer>>,
+        parent_mode: ApprovalMode,
+    ) -> (SpawnHarness, Arc<StdMutex<Vec<ModelRequest>>>) {
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: parent_script,
+            turn: StdMutex::new(0),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"));
+        options.max_active_runs = 8;
+        options.approval_timeout = Duration::from_secs(2);
+        if let Some(reviewer) = reviewer {
+            options = options.with_approval_reviewer(reviewer);
+        }
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(WriteChildLoader {
+                inner: QueueLoader {
+                    routed: vec![("test/child", child)],
+                    queue: StdMutex::new(vec![parent]),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session_with_mode(&runtime, workspace_id, None, parent_mode).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        (
+            SpawnHarness {
+                _directory: directory,
+                runtime,
+                workspace_id,
+                session_id,
+                events,
+            },
+            parent_requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_write_child_runs_supervised_and_the_reviewer_adjudicates_each_action() {
+        let (reviewer, consulted) =
+            StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let child_requests = Arc::new(StdMutex::new(Vec::new()));
+        let child: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&child_requests),
+            script: vec![(
+                "write_file",
+                r#"{"path":"child.txt","content":"written by the child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let (mut harness, parent_requests) = write_child_harness(
+            child,
+            vec![(
+                "spawn_agent",
+                r#"{"task":"Create child.txt with a greeting","model":"test/child","authority":"write"}"#.to_owned(),
+            )],
+            Some(reviewer),
+            ApprovalMode::Auto,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        let child_session = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::SessionCreated { session }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+            .expect("the write spawn creates a child");
+        assert_eq!(child_session.approval_mode, ApprovalMode::Supervised);
+        // The child's write was held, adjudicated, and executed.
+        let resolutions = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::ToolApprovalResolved {
+                    tool_call,
+                    resolution,
+                } if tool_call.session_id == child_session.id => {
+                    Some((tool_call.name.clone(), *resolution))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resolutions,
+            vec![(
+                "write_file".to_owned(),
+                ApprovalResolution::ApprovedByReviewer
+            )]
+        );
+        assert_eq!(
+            std::fs::read_to_string(harness._directory.path().join("child.txt")).unwrap(),
+            "written by the child"
+        );
+        // The reviewer saw the child's brief, its arguments, and its origin.
+        let requests = consulted.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tool_name, "write_file");
+        assert_eq!(requests[0].mode, ApprovalMode::Supervised);
+        assert!(matches!(
+            requests[0].origin,
+            ReviewOrigin::Child { depth: 1, .. }
+        ));
+        assert_eq!(
+            requests[0].task_brief.as_deref(),
+            Some("Create child.txt with a greeting")
+        );
+        assert!(requests[0].arguments.contains("child.txt"));
+        drop(requests);
+        // The child kept the mutating schemas: supervised holds, it does not
+        // withhold.
+        let child_reqs = child_requests.lock().unwrap().clone();
+        assert!(
+            child_reqs[0]
+                .tools()
+                .iter()
+                .any(|spec| spec.name() == "write_file")
+        );
+        // The spawn itself was a mutating call under the parent's Auto policy
+        // and executed without a prompt.
+        assert!(!observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::ToolApprovalRequested { tool_call, .. } if tool_call.run_id == run_id
+        )));
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+        let parent_reqs = parent_requests.lock().unwrap().clone();
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: false, .. }] if content == "done"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reviewer_denial_is_final_for_a_supervised_child_and_is_durable() {
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict {
+            decision: ReviewDecision::Deny {
+                reason: "not needed for the brief".to_owned(),
+            },
+            spend: ReviewSpend {
+                usage: Some(TokenUsage {
+                    input_tokens: 40,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 8,
+                    reasoning_tokens: None,
+                }),
+                cost_usd_nanos: Some(0),
+            },
+        });
+        let child_requests = Arc::new(StdMutex::new(Vec::new()));
+        let child: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&child_requests),
+            script: vec![(
+                "write_file",
+                r#"{"path":"forbidden.txt","content":"x"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let (mut harness, _) = write_child_harness(
+            child,
+            vec![(
+                "spawn_agent",
+                r#"{"task":"Read the docs","model":"test/child","authority":"write"}"#.to_owned(),
+            )],
+            Some(reviewer),
+            ApprovalMode::Auto,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+
+        let denied = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::ToolApprovalResolved {
+                    tool_call,
+                    resolution: ApprovalResolution::DeniedByReviewer,
+                } => Some(tool_call.clone()),
+                _ => None,
+            })
+            .expect("the reviewer denial is published");
+        assert_eq!(denied.state, ToolCallState::Denied);
+        assert!(
+            denied
+                .result
+                .as_deref()
+                .unwrap()
+                .contains("not needed for the brief")
+        );
+        assert!(!harness._directory.path().join("forbidden.txt").exists());
+        // The child saw the denial as a tool error and finished; the parent
+        // received the child's answer.
+        let child_reqs = child_requests.lock().unwrap().clone();
+        assert!(matches!(
+            child_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("reviewer denied")
+        ));
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+        // The scripted child reports no usage of its own, so the reviewer's
+        // known spend cannot make the child's total known; the run settles
+        // with unknown usage rather than a partial number.
+        let child_run = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunFinished { session, usage, .. }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    Some(*usage)
+                }
+                _ => None,
+            })
+            .expect("the child run finished");
+        assert_eq!(child_run, None);
+    }
+
+    #[test]
+    fn reviewer_spend_joins_run_accounting_and_unknown_spend_poisons_it() {
+        let mut accounting = RunAccountingAccumulator::new(
+            Some(ModelPricing {
+                input_usd_nanos_per_token: 10,
+                output_usd_nanos_per_token: 20,
+                cache_read_usd_nanos_per_token: None,
+                cache_write_usd_nanos_per_token: None,
+                context_tier: None,
+                provenance: "test".to_owned(),
+            }),
+            ContextOccupancyBasis {
+                version: 1,
+                shape: ContentHash::from_bytes([0; 32]),
+                static_prefix: PreparedStaticPrefix::new(ContentHash::from_bytes([0; 32]), None),
+                request_bytes: 0,
+            },
+        );
+        accounting.record_turn(Some(usage(100, 10)));
+        accounting.record_review(Some(usage(40, 8)), Some(560));
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.usage, Some(usage(140, 18)));
+        assert_eq!(
+            snapshot.estimated_cost_usd_nanos,
+            Some(100 * 10 + 10 * 20 + 560)
+        );
+        // Occupancy is untouched: the reviewer's request is not this run's.
+        assert_eq!(snapshot.context_tokens, Some(100));
+        accounting.record_review(None, None);
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.usage, None);
+        assert_eq!(snapshot.estimated_cost_usd_nanos, None);
+    }
+
+    #[tokio::test]
+    async fn write_children_are_refused_without_the_roster_flag_or_a_reviewer() {
+        // Reviewer present but the roster forbids writers: QueueLoader plans
+        // carry the default roster.
+        let (reviewer, consulted) =
+            StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let child: Arc<dyn Provider> = Arc::new(StaticTextProvider);
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&parent_requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"t","model":"test/child","authority":"write"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"))
+            .with_approval_reviewer(reviewer);
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(QueueLoader {
+                routed: vec![("test/child", child)],
+                queue: StdMutex::new(vec![parent]),
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = submit_prompt_to(&runtime, session_id, "delegate").await;
+        let observed = collect_until_run_finished(&mut events, run_id).await;
+        assert!(!observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::SessionCreated { session } if session.parent_id.is_some()
+        )));
+        let parent_reqs = parent_requests.lock().unwrap().clone();
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("write sub-agents are not enabled")
+        ));
+        assert!(consulted.lock().unwrap().is_empty());
+        runtime.shutdown().await.unwrap();
+
+        // Roster permits writers but no reviewer is installed.
+        let child: Arc<dyn Provider> = Arc::new(StaticTextProvider);
+        let (mut harness, parent_requests) = write_child_harness(
+            child,
+            vec![(
+                "spawn_agent",
+                r#"{"task":"t","model":"test/child","authority":"write"}"#.to_owned(),
+            )],
+            None,
+            ApprovalMode::Auto,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        assert!(!observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::SessionCreated { session } if session.parent_id.is_some()
+        )));
+        let parent_reqs = parent_requests.lock().unwrap().clone();
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content.contains("require a configured reviewer_model")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_write_spawn_is_a_mutating_call_under_the_parents_policy() {
+        // Under ReadOnly the delegation itself is denied without a prompt.
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let child: Arc<dyn Provider> = Arc::new(StaticTextProvider);
+        let (mut harness, parent_requests) = write_child_harness(
+            child,
+            vec![(
+                "spawn_agent",
+                r#"{"task":"t","model":"test/child","authority":"write"}"#.to_owned(),
+            )],
+            Some(reviewer),
+            ApprovalMode::ReadOnly,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        assert!(!observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::SessionCreated { session } if session.parent_id.is_some()
+        )));
+        // A read-only root is not even offered spawn_agent's write authority
+        // ... but a guessed call is still denied by policy, never executed.
+        let parent_reqs = parent_requests.lock().unwrap().clone();
+        assert!(matches!(
+            parent_reqs[1].messages()[2].content(),
+            [ContentBlock::ToolResult { content, is_error: true, .. }]
+                if content == approval::POLICY_DENIED_RESULT
+        ));
+
+        // Under Ask the human approves the delegation itself.
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let child: Arc<dyn Provider> = Arc::new(StaticTextProvider);
+        let (mut harness, _) = write_child_harness(
+            child,
+            vec![(
+                "spawn_agent",
+                r#"{"task":"t","model":"test/child","authority":"write"}"#.to_owned(),
+            )],
+            Some(reviewer),
+            ApprovalMode::Ask,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let (_, held) = collect_until_approval_requested(&mut harness.events).await;
+        assert_eq!(held.name, "spawn_agent");
+        assert_eq!(held.run_id, run_id);
+        respond_approval(
+            &harness.runtime,
+            run_id,
+            held.id,
+            ApprovalDecision::ApproveOnce,
+        )
+        .await
+        .unwrap();
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        assert!(observed.iter().any(|event| matches!(
+            &event.event,
+            SessionEvent::SessionCreated { session }
+                if session.parent_id.is_some() && session.approval_mode == ApprovalMode::Supervised
+        )));
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_children_serialize_on_the_per_run_write_permit() {
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let child: Arc<dyn Provider> = Arc::new(GaugedTextProvider {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        });
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(MultiSpawnProvider {
+            requests: Arc::clone(&parent_requests),
+            spawns: 3,
+            arguments: |index| {
+                format!(r#"{{"task":"task {index}","model":"test/child","authority":"write"}}"#)
+            },
+            turn: StdMutex::new(0),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"))
+            .with_approval_reviewer(reviewer);
+        options.max_active_runs = 8;
+        let runtime = SessionRuntime::open(
+            options,
+            Arc::new(WriteChildLoader {
+                inner: QueueLoader {
+                    routed: vec![("test/child", child)],
+                    queue: StdMutex::new(vec![parent]),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created = create_session(&runtime, workspace_id, None).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("unexpected receipt")
+        };
+        let mut events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        let run_id = submit_prompt_to(&runtime, session_id, "fan out writers").await;
+        let observed = collect_until_run_finished(&mut events, run_id).await;
+
+        let children = observed
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, SessionEvent::SessionCreated { session }
+                    if session.parent_id.is_some() && session.approval_mode == ApprovalMode::Supervised)
+            })
+            .count();
+        assert_eq!(children, 3, "every writer eventually runs");
+        assert_eq!(
+            peak.load(Ordering::Acquire),
+            1,
+            "two writers never share the checkout"
+        );
+        assert!(matches!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        ));
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]

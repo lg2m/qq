@@ -9,6 +9,8 @@ pub(crate) const USER_DENIED_RESULT: &str = "The user denied this tool call.";
 pub(crate) const TIMEOUT_DENIED_RESULT: &str = "No client resolved this tool approval within the configured wait; the call was denied by timeout.";
 pub(crate) const UNATTENDED_DENIED_RESULT: &str =
     "Tool approval is unavailable for this run; the call was denied.";
+pub(crate) const REVIEWER_DENIED_RESULT: &str =
+    "The approval reviewer denied this tool call for the supervised sub-agent:";
 
 /// How one requested tool call relates to the workspace and the outside world.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,14 +158,14 @@ fn dangerous_shell_segment(segment: &str) -> bool {
 
 pub(crate) fn classify(name: &str, arguments: &str) -> ToolClass {
     match name {
-        // spawn_agent is read-only: its child session runs in read-only
-        // approval mode, so the call carries no mutation authority and never
-        // needs an approval prompt.
-        "read_file"
-        | "list_dir"
-        | "search"
-        | crate::tools::SPAWN_AGENT_TOOL
-        | crate::runtime::SEARCH_HISTORY_TOOL => ToolClass::ReadOnly,
+        "read_file" | "list_dir" | "search" | crate::runtime::SEARCH_HISTORY_TOOL => {
+            ToolClass::ReadOnly
+        }
+        // A read child carries no mutation authority and never needs a
+        // prompt. Asking for a write child is itself a mutating act under the
+        // parent's policy: `Ask` prompts for the delegation, `ReadOnly`
+        // denies it, `Auto` and `Full` proceed.
+        crate::tools::SPAWN_AGENT_TOOL => spawn_class(arguments),
         "edit_file" | "write_file" => ToolClass::Mutating,
         "shell" => shell_class(arguments),
         #[cfg(test)]
@@ -263,6 +265,20 @@ fn push_diff_lines(diff: &mut String, sign: char, content: &str, side_budget: us
     }
 }
 
+fn spawn_class(arguments: &str) -> ToolClass {
+    #[derive(Deserialize)]
+    struct SpawnArguments {
+        #[serde(default)]
+        authority: qq_protocol::ChildAuthority,
+    }
+    match serde_json::from_str::<SpawnArguments>(arguments) {
+        Ok(SpawnArguments {
+            authority: qq_protocol::ChildAuthority::Write,
+        }) => ToolClass::Mutating,
+        Ok(_) | Err(_) => ToolClass::ReadOnly,
+    }
+}
+
 fn shell_class(arguments: &str) -> ToolClass {
     #[derive(Deserialize)]
     struct ShellArguments {
@@ -295,6 +311,9 @@ pub(crate) fn evaluate(
         ToolClass::ReadOnly | ToolClass::Unknown => PolicyDecision::Execute,
         ToolClass::Mutating | ToolClass::Shell { .. } | ToolClass::Mcp => match mode {
             ApprovalMode::ReadOnly => PolicyDecision::Deny,
+            // Supervised holds everything, grants included: the whole point is
+            // that a reviewer sees every action a write child takes.
+            ApprovalMode::Supervised => PolicyDecision::RequireApproval,
             ApprovalMode::Ask => {
                 if grants.covers(name, class) {
                     PolicyDecision::Execute
@@ -357,6 +376,36 @@ mod tests {
                 PolicyDecision::Execute
             );
         }
+    }
+
+    #[test]
+    fn supervised_mode_holds_every_non_read_call_regardless_of_grants() {
+        for (name, class) in [
+            ("write_file", ToolClass::Mutating),
+            ("shell", shell("cargo test")),
+            ("shell", shell("rm -rf /")),
+            ("mcp__server__tool", ToolClass::Mcp),
+        ] {
+            assert_eq!(
+                evaluate(
+                    ApprovalMode::Supervised,
+                    name,
+                    &class,
+                    &grants(&[name], &["cargo", "rm"]),
+                ),
+                PolicyDecision::RequireApproval,
+                "supervised must hold {name} even when granted"
+            );
+        }
+        assert_eq!(
+            evaluate(
+                ApprovalMode::Supervised,
+                "read_file",
+                &ToolClass::ReadOnly,
+                &grants(&[], &[])
+            ),
+            PolicyDecision::Execute
+        );
     }
 
     #[test]
@@ -634,6 +683,16 @@ mod tests {
     fn classification_reads_shell_arguments_and_namespaces() {
         assert_eq!(classify("search", "{}"), ToolClass::ReadOnly);
         assert_eq!(classify("spawn_agent", "{}"), ToolClass::ReadOnly);
+        assert_eq!(
+            classify("spawn_agent", r#"{"task":"t","authority":"read"}"#),
+            ToolClass::ReadOnly
+        );
+        assert_eq!(
+            classify("spawn_agent", r#"{"task":"t","authority":"write"}"#),
+            ToolClass::Mutating,
+            "asking for a write child is a mutating act under the parent's policy"
+        );
+        assert_eq!(classify("spawn_agent", "not json"), ToolClass::ReadOnly);
         assert_eq!(classify("edit_file", "{}"), ToolClass::Mutating);
         assert_eq!(
             classify("shell", r#"{"command":"cargo test","cwd":"crates"}"#),

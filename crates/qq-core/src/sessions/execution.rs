@@ -198,16 +198,17 @@ async fn prepare_execution(
             let spawner = if claimed.child {
                 None
             } else {
-                Some(Arc::new(SessionSubagentSpawner::new(
-                    Arc::clone(inner),
-                    claimed.clone(),
-                )) as Arc<dyn SubagentSpawner>)
+                Some(Arc::new(
+                    SessionSubagentSpawner::new(Arc::clone(inner), claimed.clone())
+                        .with_write_children(loaded.plan.descriptor().delegation.write_children),
+                ) as Arc<dyn SubagentSpawner>)
             };
             RunCapabilities::user(spawner)
         };
-        // A read-only session (every model-spawned child today) never sees the
-        // schemas its policy denies; the catalog filter is part of the
-        // request, not a gate-time refusal.
+        // A read-only session (every read child) never sees the schemas its
+        // policy denies; the catalog filter is part of the request, not a
+        // gate-time refusal. A Supervised child keeps the full catalog: its
+        // mutating calls are held, not denied.
         let base = if claimed.approval_mode == ApprovalMode::ReadOnly {
             base.read_only()
         } else {
@@ -1575,6 +1576,14 @@ async fn execute_started_run(
             // Approval transitions (including denials) are persisted and
             // published by the tool gate before this event is emitted.
             RunInput::Event(Some(RuntimeEvent::ToolCallDenied { .. })) => {}
+            // Reviewer spend joins the run's accounting; the next persisted
+            // turn or the run's settlement carries the updated totals.
+            RunInput::Event(Some(RuntimeEvent::ReviewCharged {
+                usage,
+                cost_usd_nanos,
+            })) => {
+                accounting.record_review(usage, cost_usd_nanos);
+            }
             RunInput::Event(Some(RuntimeEvent::ToolCallStarted { id })) => {
                 if internal {
                     continue;
@@ -2183,7 +2192,7 @@ pub(super) struct RunAccounting {
     pub(super) request_basis: ContextOccupancyBasis,
 }
 
-struct RunAccountingAccumulator {
+pub(super) struct RunAccountingAccumulator {
     usage: Option<TokenUsage>,
     context_tokens: Option<u64>,
     estimated_cost_usd_nanos: Option<u64>,
@@ -2193,7 +2202,7 @@ struct RunAccountingAccumulator {
 }
 
 impl RunAccountingAccumulator {
-    fn new(pricing: Option<ModelPricing>, request_basis: ContextOccupancyBasis) -> Self {
+    pub(super) fn new(pricing: Option<ModelPricing>, request_basis: ContextOccupancyBasis) -> Self {
         Self {
             usage: Some(TokenUsage::default()),
             context_tokens: None,
@@ -2204,7 +2213,22 @@ impl RunAccountingAccumulator {
         }
     }
 
-    fn record_turn(&mut self, usage: Option<TokenUsage>) {
+    /// Adds a reviewer's provider spend to the run's totals. It is not a turn
+    /// of this run (context occupancy is untouched) but the run is
+    /// accountable for it; unknown spend makes the totals unknown.
+    pub(super) fn record_review(&mut self, usage: Option<TokenUsage>, cost_usd_nanos: Option<u64>) {
+        self.saw_turn = true;
+        match usage {
+            Some(usage) => self.usage = self.usage.and_then(|total| add_usage(total, usage)),
+            None => self.usage = None,
+        }
+        self.estimated_cost_usd_nanos = match (self.estimated_cost_usd_nanos, cost_usd_nanos) {
+            (Some(total), Some(cost)) => total.checked_add(cost),
+            _ => None,
+        };
+    }
+
+    pub(super) fn record_turn(&mut self, usage: Option<TokenUsage>) {
         self.saw_turn = true;
         let Some(usage) = usage else {
             self.usage = None;
@@ -2229,7 +2253,7 @@ impl RunAccountingAccumulator {
         });
     }
 
-    fn snapshot(&self) -> RunAccounting {
+    pub(super) fn snapshot(&self) -> RunAccounting {
         RunAccounting {
             usage: self.saw_turn.then_some(self.usage).flatten(),
             context_tokens: self.context_tokens,

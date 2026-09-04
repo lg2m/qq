@@ -1,5 +1,6 @@
 use super::runtime::SessionRuntimeInner;
 use super::*;
+use qq_protocol::ChildAuthority;
 
 /// Executes `spawn_agent` calls for one parent run: creates a read-only child
 /// session and queued task atomically (while preserving the ordinary durable
@@ -10,6 +11,11 @@ pub(super) struct SessionSubagentSpawner {
     /// Bounds this run's children in flight; excess spawn calls in one turn
     /// wait here rather than erroring.
     slots: Arc<Semaphore>,
+    /// One write child at a time per parent run: two writers must never
+    /// share the checkout. Held in addition to a `slots` permit.
+    write_slot: Arc<Semaphore>,
+    /// Whether the plan's roster permits write children at all.
+    write_children: bool,
     /// Children this run has spawned so far, capped at `max_children`.
     spawned: Arc<AtomicUsize>,
     /// The effective total-children bound: the caller's `max_children` when
@@ -33,9 +39,17 @@ impl SessionSubagentSpawner {
             inner,
             parent,
             slots: Arc::new(Semaphore::new(concurrent)),
+            write_slot: Arc::new(Semaphore::new(1)),
+            write_children: false,
             spawned: Arc::new(AtomicUsize::new(0)),
             max_children,
         }
+    }
+
+    /// Permits `authority: write` spawns. Set from the compiled plan's roster.
+    pub(super) fn with_write_children(mut self, write_children: bool) -> Self {
+        self.write_children = write_children;
+        self
     }
 }
 
@@ -46,6 +60,8 @@ impl SubagentSpawner for SessionSubagentSpawner {
         let slots = Arc::clone(&self.slots);
         let budget = SpawnBudget {
             slots,
+            write_slot: Arc::clone(&self.write_slot),
+            write_children: self.write_children,
             spawned: Arc::clone(&self.spawned),
             max_children: self.max_children,
         };
@@ -56,6 +72,8 @@ impl SubagentSpawner for SessionSubagentSpawner {
 /// The per-run child bookkeeping one spawn call draws from.
 pub(super) struct SpawnBudget {
     pub(super) slots: Arc<Semaphore>,
+    pub(super) write_slot: Arc<Semaphore>,
+    pub(super) write_children: bool,
     pub(super) spawned: Arc<AtomicUsize>,
     pub(super) max_children: usize,
 }
@@ -85,6 +103,8 @@ pub(super) async fn spawn_child_run(
 ) -> SpawnAgentOutcome {
     let SpawnBudget {
         slots,
+        write_slot,
+        write_children,
         spawned,
         max_children,
     } = budget;
@@ -92,8 +112,32 @@ pub(super) async fn spawn_child_run(
         call_id,
         task,
         model,
+        authority,
         limits: child_limits,
     } = request;
+    // Authority attenuates strictly: a read child is ReadOnly; a write child
+    // is Supervised and needs both the roster's permission and a reviewer to
+    // adjudicate its actions. Only depth one may write (children have no
+    // spawner at all, so this is structural). A ReadOnly parent cannot grant
+    // write: its own policy already denied the mutating spawn call.
+    let child_mode = match authority {
+        ChildAuthority::Read => ApprovalMode::ReadOnly,
+        ChildAuthority::Write => {
+            if !write_children {
+                return spawn_error(
+                    "write sub-agents are not enabled: set delegation.write_children = true in \
+                     the configuration, or spawn with authority read",
+                );
+            }
+            if inner.approval_reviewer.is_none() {
+                return spawn_error(
+                    "write sub-agents require a configured reviewer_model to adjudicate their \
+                     actions; spawn with authority read instead",
+                );
+            }
+            ApprovalMode::Supervised
+        }
+    };
     // The budget counts attempts, so a failing spawn also consumes it. A
     // refused spawn is a tool error the model can act on, never a terminal
     // outcome: ending the parent because it asked for one child too many
@@ -161,6 +205,16 @@ pub(super) async fn spawn_child_run(
     let Ok(_slot) = Arc::clone(&slots).acquire_owned().await else {
         return spawn_error("the sub-agent scheduler is unavailable");
     };
+    // Writers serialize behind the read slot too: a second write spawn in the
+    // same turn waits here until the first child settles.
+    let _write_slot = if child_mode == ApprovalMode::Supervised {
+        match Arc::clone(&write_slot).acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(_) => return spawn_error("the sub-agent scheduler is unavailable"),
+        }
+    } else {
+        None
+    };
     // Shutdown owns the write side of this gate. Hold the read side across
     // the durable child transaction so shutdown observes either no child run
     // or the fully queued run it must settle; child admission can never cross
@@ -171,7 +225,7 @@ pub(super) async fn spawn_child_run(
     }
     let created = match inner
         .store
-        .create_child_run(&parent, call_id, selection, task, child_limits)
+        .create_child_run(&parent, call_id, selection, task, child_limits, child_mode)
         .await
     {
         Ok(created) => created,

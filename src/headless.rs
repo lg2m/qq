@@ -720,8 +720,18 @@ async fn stream_run(
                         // deferred briefly, giving the reviewer its window.
                         // A late deny is harmless: resolution is idempotent,
                         // so a reviewer approval that landed first stands.
+                        // A child session's held calls belong to a supervised
+                        // write child: the reviewer adjudicates them, and the
+                        // headless root only supplies the unattended fallback
+                        // (a deferred deny), never a blanket approve. The
+                        // allowlist still applies: the human declared it.
                         let granted = allowlisted_grant(options, &tool_call.name, shell.as_ref());
-                        let decision = match (granted, options.approval) {
+                        let approval = if ours {
+                            options.approval
+                        } else {
+                            HeadlessApproval::Auto
+                        };
+                        let decision = match (granted, approval) {
                             (Some(grant), _) => {
                                 if text {
                                     let _ = writeln!(
@@ -733,7 +743,7 @@ async fn stream_run(
                                 Some(ApprovalDecision::ApproveForSession { grant })
                             }
                             (None, HeadlessApproval::Full) => Some(ApprovalDecision::ApproveOnce),
-                            (None, HeadlessApproval::Auto) if options.reviewer_configured => {
+                            (None, HeadlessApproval::Auto) if options.reviewer_configured || !ours => {
                                 if let Some(run_id) = envelope.run_id {
                                     let sessions = sessions.clone();
                                     let tool_call_id = tool_call.id;

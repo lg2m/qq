@@ -758,7 +758,19 @@ Outcome:
 ```
 
 Resolution values: `approved_once`, `approved_for_session`,
-`approved_for_workspace`, `denied`, `denied_timeout`.
+`approved_for_workspace`, `approved_by_reviewer`, `denied`, `denied_timeout`,
+`denied_by_reviewer`. The reviewer resolutions are written by the configured
+`reviewer_model` without a human: `approved_by_reviewer` for `auto` sessions'
+dangerous shell and for every held call of a `supervised` child;
+`denied_by_reviewer` only for `supervised` children, where the denial is final
+and the child receives it as a tool error. Reviewer spend is charged to the
+reviewed run.
+
+Approval modes are `read_only`, `supervised`, `ask`, `auto` (default), and
+`full`. `supervised` is never advertised for root sessions and cannot be set by
+`set_approval_mode`: it is the mode a `spawn_agent` call with
+`authority: "write"` gives its child, and a spawned child's mode may only be
+lowered by a client, never raised (`child_authority_escalation`).
 
 `approve_for_workspace` resolves the approval exactly like
 `approve_for_session` — the session grant is recorded in the same
