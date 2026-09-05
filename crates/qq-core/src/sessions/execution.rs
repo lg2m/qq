@@ -2,7 +2,7 @@ use super::*;
 use super::{
     approvals::SessionToolGate,
     runtime::SessionRuntimeInner,
-    subagents::{SessionAuditHook, SessionHistorySearcher, SessionSubagentSpawner},
+    subagents::{ChildTasks, SessionAuditHook, SessionHistorySearcher, SessionSubagentSpawner},
 };
 
 /// Denies every tool call. Compaction runs summarize existing context; a
@@ -73,11 +73,72 @@ struct PreparedExecution {
     tool_cancellation: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct RunResources {
+    tools: crate::tools::ToolTasks,
+    children: Arc<ChildTasks>,
+    #[cfg(test)]
+    run_id: Option<RunId>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ExecutionCleanupError {
+    #[error("local tool cleanup failed: {0}")]
+    Tools(#[source] crate::tools::ToolDrainError),
+    #[error("child cleanup failed: {0}")]
+    Children(#[source] crate::runtime::ChildCleanupError),
+}
+
+#[cfg(test)]
+static STOP_OBSERVERS: Mutex<Vec<(RunId, oneshot::Sender<()>)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn observe_execution_stop(run_id: RunId) -> oneshot::Receiver<()> {
+    let (sender, receiver) = oneshot::channel();
+    STOP_OBSERVERS.lock().unwrap().push((run_id, sender));
+    receiver
+}
+
+impl RunResources {
+    #[cfg(test)]
+    pub(super) fn for_test_run(mut self, run_id: RunId) -> Self {
+        self.run_id = Some(run_id);
+        self
+    }
+    pub(super) async fn drain(&self) -> Result<(), ExecutionCleanupError> {
+        let (tools, children) = tokio::join!(self.tools.drain(), self.children.drain());
+        match (tools, children) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (Err(error), _) => Err(ExecutionCleanupError::Tools(error)),
+            (_, Err(error)) => Err(ExecutionCleanupError::Children(error)),
+        }
+    }
+
+    async fn stop(&self, events: &mut crate::RuntimeStream) -> Result<(), ExecutionCleanupError> {
+        *events = Box::pin(futures_util::stream::empty());
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut observers = STOP_OBSERVERS.lock().unwrap();
+                observers
+                    .iter()
+                    .position(|(run, _)| Some(*run) == self.run_id)
+                    .map(|index| observers.remove(index))
+            };
+            if let Some((_, entered)) = hook {
+                let _ = entered.send(());
+            }
+        }
+        self.drain().await
+    }
+}
+
 async fn prepare_execution(
     inner: &Arc<SessionRuntimeInner>,
     claimed: &mut ClaimedRun,
     loaded: &LoadedRuntime,
     cancellation: &mut watch::Receiver<bool>,
+    resources: &RunResources,
 ) -> Result<PreparedExecution, RunOutcome> {
     let tool_cancellation = Arc::new(AtomicBool::new(false));
     let internal = claimed.kind == RunKind::Compaction;
@@ -191,8 +252,12 @@ async fn prepare_execution(
         let effective_depth = delegation.max_depth.min(MAX_CHILD_DEPTH);
         let spawner = if claimed.depth < effective_depth {
             Some(Arc::new(
-                SessionSubagentSpawner::new(Arc::clone(inner), claimed.clone())
-                    .with_write_children(delegation.write_children && claimed.depth == 0),
+                SessionSubagentSpawner::new(
+                    Arc::clone(inner),
+                    claimed.clone(),
+                    Arc::clone(&resources.children),
+                )
+                .with_write_children(delegation.write_children && claimed.depth == 0),
             ) as Arc<dyn SubagentSpawner>)
         } else {
             None
@@ -252,12 +317,14 @@ async fn prepare_execution(
                 Arc::clone(inner),
                 claimed.clone(),
                 loaded.plan.descriptor().delegation.clone(),
+                Arc::clone(&resources.children),
             )))
         } else {
             base
         }
     }
-    .with_literal_slash(claimed.literal_slash);
+    .with_literal_slash(claimed.literal_slash)
+    .with_tool_tasks(resources.tools.clone());
     // The claimed workspace is the plan's workspace: the loader compiled the
     // plan for exactly this session's canonical root, so no per-run
     // canonicalization or directory open happens here.
@@ -342,6 +409,7 @@ pub(super) async fn execute_run(
     inner: Arc<SessionRuntimeInner>,
     mut claimed: ClaimedRun,
     mut cancellation: watch::Receiver<bool>,
+    resources: RunResources,
 ) {
     if *cancellation.borrow() {
         finish_reserved_run(&inner, &claimed, RunOutcome::Cancelled).await;
@@ -367,9 +435,9 @@ pub(super) async fn execute_run(
         },
         changed = cancellation.changed() => {
             if changed.is_ok() && *cancellation.borrow() {
-                finish_reserved_run(&inner, &claimed, RunOutcome::Cancelled).await;
-                // Runtime construction may be blocking; retain the run permit until it exits.
+                // A terminal event releases the session, so construction must exit first.
                 let _ = load.await;
+                finish_reserved_run(&inner, &claimed, RunOutcome::Cancelled).await;
                 return;
             }
             return;
@@ -403,7 +471,9 @@ pub(super) async fn execute_run(
     }
     loop {
         let prepared =
-            match prepare_execution(&inner, &mut claimed, &loaded, &mut cancellation).await {
+            match prepare_execution(&inner, &mut claimed, &loaded, &mut cancellation, &resources)
+                .await
+            {
                 Ok(prepared) => prepared,
                 Err(outcome) => {
                     finish_reserved_run(&inner, &claimed, outcome).await;
@@ -454,7 +524,16 @@ pub(super) async fn execute_run(
             }
             let audit = prepared.audit.clone();
             drop(prepared);
-            if !run_auto_compaction(&inner, &mut claimed, &loaded, audit, &mut cancellation).await {
+            if !run_auto_compaction(
+                &inner,
+                &mut claimed,
+                &loaded,
+                audit,
+                &mut cancellation,
+                &resources,
+            )
+            .await
+            {
                 return;
             }
             continue;
@@ -544,6 +623,7 @@ pub(super) async fn execute_run(
                     prepared.events,
                     prepared.tool_cancellation,
                     &prepared.audit,
+                    &resources,
                 )
                 .await;
                 return;
@@ -551,8 +631,15 @@ pub(super) async fn execute_run(
             context::ContextPlan::Compact { .. } if claimed.kind == RunKind::Prompt => {
                 let audit = prepared.audit.clone();
                 drop(prepared);
-                if !run_auto_compaction(&inner, &mut claimed, &loaded, audit, &mut cancellation)
-                    .await
+                if !run_auto_compaction(
+                    &inner,
+                    &mut claimed,
+                    &loaded,
+                    audit,
+                    &mut cancellation,
+                    &resources,
+                )
+                .await
                 {
                     return;
                 }
@@ -577,6 +664,7 @@ async fn run_auto_compaction(
     loaded: &LoadedRuntime,
     original_audit: PreparedRunAudit,
     cancellation: &mut watch::Receiver<bool>,
+    resources: &RunResources,
 ) -> bool {
     let messages = loop {
         if *inner.failed.borrow() {
@@ -645,13 +733,14 @@ async fn run_auto_compaction(
     candidate.messages = messages;
     candidate.context_compaction_attempted = true;
     candidate.context_occupancy = None;
-    let prepared = match prepare_execution(inner, &mut candidate, loaded, cancellation).await {
-        Ok(prepared) => prepared,
-        Err(outcome) => {
-            finish_prepared_run(inner, original, &original_audit, outcome).await;
-            return false;
-        }
-    };
+    let prepared =
+        match prepare_execution(inner, &mut candidate, loaded, cancellation, resources).await {
+            Ok(prepared) => prepared,
+            Err(outcome) => {
+                finish_prepared_run(inner, original, &original_audit, outcome).await;
+                return false;
+            }
+        };
     let plan = context::plan(context::ContextInput {
         context_window: loaded.resolved_model().context_window,
         max_output_tokens: prepared.audit.weight.max_output_tokens,
@@ -760,6 +849,7 @@ async fn run_auto_compaction(
             prepared.events,
             prepared.tool_cancellation,
             &prepared.audit,
+            resources,
         )
         .await;
     }
@@ -933,6 +1023,7 @@ async fn execute_started_run(
     mut events: crate::RuntimeStream,
     tool_cancellation: Arc<AtomicBool>,
     audit: &PreparedRunAudit,
+    resources: &RunResources,
 ) {
     let resolved_model = Arc::clone(&audit.resolved_model);
     let context_shape = audit.context_shape;
@@ -944,6 +1035,10 @@ async fn execute_started_run(
     let mut runtime_failed = inner.failed.subscribe();
     if *runtime_failed.borrow() {
         tool_cancellation.store(true, Ordering::Release);
+        if resources.stop(&mut events).await.is_err() {
+            inner.failed.send_replace(true);
+            return;
+        }
         finish_run(
             &inner,
             &claimed,
@@ -1043,6 +1138,10 @@ async fn execute_started_run(
             )
             .await
         {
+            if resources.stop(&mut events).await.is_err() {
+                inner.failed.send_replace(true);
+                return;
+            }
             finish_run(
                 &inner,
                 &claimed,
@@ -1066,6 +1165,10 @@ async fn execute_started_run(
             )
             .await
         {
+            if resources.stop(&mut events).await.is_err() {
+                inner.failed.send_replace(true);
+                return;
+            }
             finish_run(
                 &inner,
                 &claimed,
@@ -1084,6 +1187,10 @@ async fn execute_started_run(
             )
             .await
         {
+            if resources.stop(&mut events).await.is_err() {
+                inner.failed.send_replace(true);
+                return;
+            }
             finish_run(
                 &inner,
                 &claimed,
@@ -1108,6 +1215,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1126,6 +1237,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1142,6 +1257,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1162,6 +1281,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1180,6 +1303,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1195,6 +1322,10 @@ async fn execute_started_run(
                 } else {
                     RunOutcome::Interrupted
                 };
+                if resources.stop(&mut events).await.is_err() {
+                    inner.failed.send_replace(true);
+                    return;
+                }
                 finish_run_accounted(&inner, &claimed, outcome, Some(accounting.snapshot())).await;
                 return;
             }
@@ -1208,6 +1339,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1226,12 +1361,20 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
                         persistence_failure("failed to persist model output", &error),
                     )
                     .await;
+                    return;
+                }
+                if resources.stop(&mut events).await.is_err() {
+                    inner.failed.send_replace(true);
                     return;
                 }
                 finish_run_accounted(
@@ -1253,6 +1396,10 @@ async fn execute_started_run(
                 if let Some(identity) = identity
                     && let Err(error) = inner.store.record_prompt_identity(&claimed, identity).await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1282,6 +1429,10 @@ async fn execute_started_run(
                 match plan {
                     context::ContextPlan::Send { .. } => {}
                     plan => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(&inner, &claimed, planned_context_failure(plan)).await;
                         return;
                     }
@@ -1301,6 +1452,10 @@ async fn execute_started_run(
                 match inner.store.append_run_activity(&claimed, activity).await {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1324,6 +1479,10 @@ async fn execute_started_run(
                 {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1350,6 +1509,10 @@ async fn execute_started_run(
                     {
                         Ok(event) => inner.notify(event.cursor),
                         Err(error) => {
+                            if resources.stop(&mut events).await.is_err() {
+                                inner.failed.send_replace(true);
+                                return;
+                            }
                             finish_run(
                                 &inner,
                                 &claimed,
@@ -1378,6 +1541,10 @@ async fn execute_started_run(
                     )
                     .await
                     {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1402,6 +1569,10 @@ async fn execute_started_run(
                 {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1467,6 +1638,10 @@ async fn execute_started_run(
                             }
                         }
                         Err(error) => {
+                            if resources.stop(&mut events).await.is_err() {
+                                inner.failed.send_replace(true);
+                                return;
+                            }
                             finish_run(
                                 &inner,
                                 &claimed,
@@ -1491,6 +1666,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1547,6 +1726,10 @@ async fn execute_started_run(
                         }
                     }
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1584,6 +1767,10 @@ async fn execute_started_run(
                 match inner.store.record_audit(&claimed, record).await {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1609,6 +1796,10 @@ async fn execute_started_run(
                 match inner.store.start_tool_call(&claimed, id).await {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1632,6 +1823,10 @@ async fn execute_started_run(
                     )
                     .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1658,6 +1853,10 @@ async fn execute_started_run(
                     )
                     .await
                     {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1689,6 +1888,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1704,6 +1907,10 @@ async fn execute_started_run(
                 {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1741,6 +1948,10 @@ async fn execute_started_run(
                     )
                     .await
                     {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1762,6 +1973,10 @@ async fn execute_started_run(
                     )
                     .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -1786,6 +2001,10 @@ async fn execute_started_run(
                     )
                     .await
                     {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1808,6 +2027,10 @@ async fn execute_started_run(
                 {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1831,6 +2054,10 @@ async fn execute_started_run(
                         }
                     }
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1855,6 +2082,10 @@ async fn execute_started_run(
                 {
                     Ok(event) => inner.notify(event.cursor),
                     Err(error) => {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run(
                             &inner,
                             &claimed,
@@ -1869,6 +2100,10 @@ async fn execute_started_run(
                 if internal {
                     let summary = std::mem::take(&mut summary_text);
                     if summary.trim().is_empty() {
+                        if resources.stop(&mut events).await.is_err() {
+                            inner.failed.send_replace(true);
+                            return;
+                        }
                         finish_run_accounted(
                             &inner,
                             &claimed,
@@ -1881,6 +2116,10 @@ async fn execute_started_run(
                             Some(accounting.snapshot()),
                         )
                         .await;
+                        return;
+                    }
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
                         return;
                     }
                     match inner
@@ -1913,12 +2152,20 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
                         persistence_failure("failed to persist model output", &error),
                     )
                     .await;
+                    return;
+                }
+                if resources.stop(&mut events).await.is_err() {
+                    inner.failed.send_replace(true);
                     return;
                 }
                 finish_run_accounted(
@@ -1941,12 +2188,20 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
                         persistence_failure("failed to persist model output", &error),
                     )
                     .await;
+                    return;
+                }
+                if resources.stop(&mut events).await.is_err() {
+                    inner.failed.send_replace(true);
                     return;
                 }
                 finish_run_accounted(
@@ -1971,12 +2226,20 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
                         persistence_failure("failed to persist model output", &error),
                     )
                     .await;
+                    return;
+                }
+                if resources.stop(&mut events).await.is_err() {
+                    inner.failed.send_replace(true);
                     return;
                 }
                 finish_run_accounted(
@@ -2002,6 +2265,10 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
@@ -2020,12 +2287,20 @@ async fn execute_started_run(
                 )
                 .await
                 {
+                    if resources.stop(&mut events).await.is_err() {
+                        inner.failed.send_replace(true);
+                        return;
+                    }
                     finish_run(
                         &inner,
                         &claimed,
                         persistence_failure("failed to persist model output", &error),
                     )
                     .await;
+                    return;
+                }
+                if resources.stop(&mut events).await.is_err() {
+                    inner.failed.send_replace(true);
                     return;
                 }
                 finish_run_accounted(

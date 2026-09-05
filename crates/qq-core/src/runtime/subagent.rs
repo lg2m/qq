@@ -69,6 +69,13 @@ pub(crate) struct SpawnRequest {
 pub(crate) type SpawnAgentFuture =
     Pin<Box<dyn Future<Output = SpawnAgentOutcome> + Send + 'static>>;
 
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("child execution cleanup is unavailable")]
+pub(crate) struct ChildCleanupError;
+
+pub(crate) type ChildDrainFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<SpawnAgentSpend>, ChildCleanupError>> + Send>>;
+
 /// Runs one sub-agent task to completion on behalf of a `spawn_agent` call.
 /// The session runtime installs a spawner for eligible runs only: child
 /// sessions (and session-less runs) get none, so the tool is neither declared
@@ -76,6 +83,11 @@ pub(crate) type SpawnAgentFuture =
 /// in-flight child work.
 pub(crate) trait SubagentSpawner: Send + Sync {
     fn spawn(&self, request: SpawnRequest) -> SpawnAgentFuture;
+    /// Called synchronously after the parent charges a returned child's spend.
+    fn acknowledge(&self, call_id: ToolCallId);
+    /// Stops outstanding children and returns all spend not yet acknowledged.
+    /// Dropping this future must preserve ownership and unconsumed receipts.
+    fn drain(&self) -> ChildDrainFuture;
 }
 
 /// The dispatcher's defensive answer when `spawn_agent` is called by a run

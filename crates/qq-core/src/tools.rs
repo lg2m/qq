@@ -42,6 +42,9 @@ use std::sync::{
 #[cfg(test)]
 use tokio::sync::mpsc;
 
+#[cfg(all(test, unix))]
+pub(crate) use shell::observe_shell_spawn;
+
 #[cfg(test)]
 mod tests {
     use std::fs;

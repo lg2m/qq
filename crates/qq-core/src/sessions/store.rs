@@ -36,6 +36,14 @@ static CANCELLATION_READ_FAILURES: Mutex<Vec<(RunId, SessionRuntimeError)>> =
     Mutex::new(Vec::new());
 
 #[cfg(test)]
+static CHILD_CANCELLATION_FAILURES: Mutex<Vec<RunId>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn fail_child_cancellation(run_id: RunId) {
+    CHILD_CANCELLATION_FAILURES.lock().unwrap().push(run_id);
+}
+
+#[cfg(test)]
 static RESERVED_SETTLEMENT_FAILURES: Mutex<Vec<(RunId, SessionRuntimeError)>> =
     Mutex::new(Vec::new());
 
@@ -69,6 +77,33 @@ struct OutcomeReadHook {
 
 #[cfg(test)]
 static OUTCOME_READ_HOOKS: Mutex<Vec<OutcomeReadHook>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct ChildCreationHook {
+    session_id: SessionId,
+    entered: oneshot::Sender<RunId>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static CHILD_CREATION_HOOKS: Mutex<Vec<ChildCreationHook>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn hold_child_creation(
+    session_id: SessionId,
+) -> (oneshot::Receiver<RunId>, oneshot::Sender<()>) {
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    CHILD_CREATION_HOOKS
+        .lock()
+        .unwrap()
+        .push(ChildCreationHook {
+            session_id,
+            entered,
+            release: release_rx,
+        });
+    (entered_rx, release)
+}
 
 #[cfg(test)]
 pub(super) fn hold_outcome_read(
@@ -565,6 +600,33 @@ impl Store {
         .await
     }
 
+    pub(super) async fn cancel_child_run(
+        &self,
+        run_id: RunId,
+    ) -> Result<AppliedCommand, SessionRuntimeError> {
+        #[cfg(test)]
+        {
+            let mut failures = CHILD_CANCELLATION_FAILURES.lock().unwrap();
+            if let Some(index) = failures.iter().position(|run| *run == run_id) {
+                failures.remove(index);
+                return Err(SessionRuntimeError::Persistence);
+            }
+        }
+        let store_id = self.store_id;
+        let command_id = CommandId::generate().map_err(|_| SessionRuntimeError::Unavailable)?;
+        self.call(Priority::AwaitControl, move |connection| {
+            execute_command(
+                connection,
+                store_id,
+                command_id,
+                SessionCommand::CancelRun { run_id },
+                None,
+                &WorkspaceGrantSeed::default(),
+            )
+        })
+        .await
+    }
+
     pub(super) async fn create_child_run(
         &self,
         parent: &ClaimedRun,
@@ -580,10 +642,28 @@ impl Store {
             depth: parent.depth,
             root_run_id: parent.root_run_id,
         };
-        self.call(Priority::Control, move |connection| {
-            create_child_run(connection, store_id, parent, admission)
-        })
-        .await
+        #[cfg(test)]
+        let parent_session = parent.session_id;
+        let created = self
+            .call(Priority::Control, move |connection| {
+                create_child_run(connection, store_id, parent, admission)
+            })
+            .await;
+        #[cfg(test)]
+        if let Ok(created) = &created {
+            let hook = {
+                let mut hooks = CHILD_CREATION_HOOKS.lock().unwrap();
+                hooks
+                    .iter()
+                    .position(|hook| hook.session_id == parent_session)
+                    .map(|index| hooks.remove(index))
+            };
+            if let Some(hook) = hook {
+                let _ = hook.entered.send(created.run_id);
+                let _ = hook.release.await;
+            }
+        }
+        created
     }
 
     pub(super) async fn workspace_path(

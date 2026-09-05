@@ -27942,6 +27942,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_waits_for_started_child_loader_work_without_creating_a_child() {
+        struct HeldChildLoader {
+            inner: QueueLoader,
+            entered: Arc<tokio::sync::Notify>,
+            release: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
+            completed: Arc<AtomicBool>,
+        }
+
+        impl RuntimeLoader for HeldChildLoader {
+            fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                if request.model.model.as_deref() != Some("test/child") {
+                    return self.inner.load(request);
+                }
+                let release = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("only one child load");
+                let entered = Arc::clone(&self.entered);
+                let completed = Arc::clone(&self.completed);
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || {
+                        entered.notify_one();
+                        release.recv().unwrap();
+                        completed.store(true, Ordering::Release);
+                    })
+                    .await
+                    .unwrap();
+                    Runtime::new(StaticTextProvider, "test-model", 256)
+                        .map(|runtime| loaded_runtime(runtime, &request.workspace, None))
+                        .map_err(|error| RuntimeLoadError {
+                            kind: RunFailureKind::Configuration,
+                            message: error.to_string(),
+                        })
+                })
+            }
+        }
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+            requests: Arc::clone(&requests),
+            script: vec![(
+                "spawn_agent",
+                r#"{"task":"prepare","model":"test/child"}"#.to_owned(),
+            )],
+            turn: StdMutex::new(0),
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let mut harness = spawn_harness_with_loader(
+            Arc::new(HeldChildLoader {
+                inner: QueueLoader {
+                    routed: vec![("test/child", Arc::new(StaticTextProvider))],
+                    queue: StdMutex::new(vec![parent]),
+                },
+                entered: Arc::clone(&entered),
+                release: StdMutex::new(Some(release_rx)),
+                completed: Arc::clone(&completed),
+            }),
+            1,
+        )
+        .await;
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let stopped = execution::observe_execution_stop(run_id);
+        let runtime = harness.runtime.clone();
+        let mut shutdown = tokio::spawn(async move { runtime.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(2), stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        let premature = tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_ok();
+        let completed_before_release = completed.load(Ordering::Acquire);
+        release.send(()).unwrap();
+        assert!(
+            !premature,
+            "shutdown cannot finish while admitted loader work is running"
+        );
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!completed_before_release);
+        assert!(completed.load(Ordering::Acquire));
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        assert!(!observed.iter().any(|event| matches!(&event.event,
+            SessionEvent::SessionCreated { session } if session.parent_id.is_some())));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Cancelled)
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_closes_child_admission_before_scanning_unfinished_runs() {
         struct PausedChildLoader {
             entered: Arc<tokio::sync::Notify>,
@@ -28030,6 +28132,7 @@ mod tests {
                 write_children: false,
                 spawned: Arc::new(AtomicUsize::new(0)),
                 max_children: usize::from(MAX_SPAWNED_CHILDREN_PER_RUN),
+                tasks: Arc::new(subagents::ChildTasks::default()),
             },
             SpawnRequest {
                 call_id: ToolCallId::from_bytes([0x5a; 16]),
@@ -28125,7 +28228,7 @@ mod tests {
             Arc::new(WriteChildLoader {
                 inner: QueueLoader {
                     routed: vec![("test/child", child)],
-                    queue: StdMutex::new(vec![parent]),
+                    queue: StdMutex::new(vec![Arc::clone(&parent), parent]),
                 },
             }),
         )
@@ -28526,6 +28629,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_charges_a_completed_but_unconsumed_child_exactly_once() {
+        struct MeteredScript {
+            inner: ScriptedRunProvider,
+            usage: Vec<TokenUsage>,
+            turn: AtomicUsize,
+        }
+        impl Provider for MeteredScript {
+            fn stream(&self, request: ModelRequest) -> ProviderStream {
+                let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+                let usage = provider_usage_of(self.usage[turn.min(self.usage.len() - 1)]);
+                Box::pin(self.inner.stream(request).map(move |event| match event {
+                    Ok(qq_provider::ProviderEvent::Completed { .. }) => {
+                        Ok(qq_provider::ProviderEvent::Completed { usage: Some(usage) })
+                    }
+                    event => event,
+                }))
+            }
+        }
+        let parent_requests = Arc::new(StdMutex::new(Vec::new()));
+        let parent = Arc::new(MeteredScript {
+            inner: ScriptedRunProvider {
+                requests: Arc::clone(&parent_requests),
+                script: vec![(
+                    "spawn_agent",
+                    r#"{"task":"research","model":"test/child"}"#.to_owned(),
+                )],
+                turn: StdMutex::new(0),
+            },
+            usage: vec![usage(2, 0), usage(10, 0)],
+            turn: AtomicUsize::new(0),
+        });
+        let child = Arc::new(MeteredScript {
+            inner: ScriptedRunProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                script: Vec::new(),
+                turn: StdMutex::new(0),
+            },
+            usage: vec![usage(30, 0)],
+            turn: AtomicUsize::new(0),
+        });
+        let mut harness = spawn_harness(vec![("test/child", child)], vec![parent], 8).await;
+        let (delivered, release) = subagents::hold_child_delivery(harness.session_id);
+        let receipt = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    input: vec![InputPart::text("delegate")],
+                    limits: RunLimits {
+                        max_total_tokens: Some(40),
+                        ..RunLimits::default()
+                    },
+                    correlation: Correlation::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = receipt.outcome else {
+            panic!("expected run");
+        };
+        tokio::time::timeout(Duration::from_secs(2), delivered)
+            .await
+            .unwrap()
+            .unwrap();
+        steer(
+            &harness.runtime,
+            run_id,
+            "continue with your own answer",
+            true,
+        )
+        .await
+        .unwrap();
+        // The interrupt wins the biased select even though the reply is ready.
+        let _ = release.send(());
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        let exhaustion = exhaustion_of(&observed, run_id);
+        assert_eq!(exhaustion.limit, BudgetLimitKind::TotalTokens);
+        assert!(
+            exhaustion.message.contains("42 total tokens"),
+            "{}",
+            exhaustion.message
+        );
+        assert_eq!(parent_requests.lock().unwrap().len(), 2);
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_mutation_drains_before_steering_or_a_replacement_run_can_write() {
+        for interruption in [0, 1, 2, 3] {
+            let shutting_down = interruption == 3;
+            let cancel_parent = interruption != 0;
+            let (reviewer, _) =
+                StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+            let child = Arc::new(ScriptedRunProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                script: vec![(
+                    "write_file",
+                    r#"{"path":"child.txt","content":"child"}"#.to_owned(),
+                )],
+                turn: StdMutex::new(0),
+            });
+            let (mut harness, parent_requests) = write_child_harness(
+                child,
+                vec![
+                    (
+                        "spawn_agent",
+                        r#"{"task":"write","model":"test/child","authority":"write"}"#.to_owned(),
+                    ),
+                    (
+                        "write_file",
+                        r#"{"path":"parent.txt","content":"parent"}"#.to_owned(),
+                    ),
+                ],
+                Some(reviewer),
+                ApprovalMode::Full,
+            )
+            .await;
+            let (applying, release) = crate::tools::hold_tool_apply(harness._directory.path());
+            let parent_run =
+                submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+            tokio::time::timeout(Duration::from_secs(2), applying)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut observed = Vec::new();
+            let child_run = loop {
+                let event = harness.events.next().await.unwrap().unwrap();
+                let child = event.run_id.filter(|run| {
+                    *run != parent_run && matches!(event.event, SessionEvent::RunStarted { .. })
+                });
+                observed.push(event);
+                if let Some(run) = child {
+                    break run;
+                }
+            };
+            let mut stopping = Some(execution::observe_execution_stop(child_run));
+            if interruption == 2 {
+                steer(&harness.runtime, parent_run, "stop the child", true)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), stopping.take().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            let shutdown = if shutting_down {
+                let runtime = harness.runtime.clone();
+                Some(tokio::spawn(async move { runtime.shutdown().await }))
+            } else {
+                None
+            };
+            let last_run = if shutting_down {
+                parent_run
+            } else if cancel_parent {
+                let queued =
+                    submit_prompt_to(&harness.runtime, harness.session_id, "continue").await;
+                harness
+                    .runtime
+                    .command(
+                        CommandId::generate().unwrap(),
+                        SessionCommand::CancelRun { run_id: parent_run },
+                    )
+                    .await
+                    .unwrap();
+                queued
+            } else {
+                steer(
+                    &harness.runtime,
+                    parent_run,
+                    "stop the child and continue",
+                    true,
+                )
+                .await
+                .unwrap();
+                parent_run
+            };
+            if interruption != 2 {
+                tokio::time::timeout(Duration::from_secs(2), stopping.take().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            // The real write is past its cancellation check and holds the
+            // apply lock. Completion must remain unavailable until it exits.
+            let premature = tokio::time::timeout(Duration::from_millis(50), async {
+                loop {
+                    let event = harness.events.next().await.unwrap().unwrap();
+                    let stopped = event.run_id == Some(child_run)
+                        && matches!(event.event, SessionEvent::RunFinished { .. });
+                    observed.push(event);
+                    if stopped {
+                        break;
+                    }
+                }
+            })
+            .await
+            .is_ok();
+            let requests_before_release = parent_requests.lock().unwrap().len();
+            let shutdown_pending = shutdown
+                .as_ref()
+                .is_none_or(|shutdown| !shutdown.is_finished());
+            release.send(()).unwrap();
+            observed.extend(collect_until_run_finished(&mut harness.events, last_run).await);
+            if let Some(shutdown) = shutdown {
+                tokio::time::timeout(Duration::from_secs(2), shutdown)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            } else {
+                harness.runtime.shutdown().await.unwrap();
+            }
+            assert!(
+                shutdown_pending,
+                "shutdown cannot succeed before native cleanup exits"
+            );
+            assert!(
+                !premature,
+                "a child terminal event must not precede its native mutation teardown"
+            );
+            assert_eq!(
+                requests_before_release, 1,
+                "no parent or queued replacement may resume during child teardown"
+            );
+            let child_finished = observed
+                .iter()
+                .position(|event| {
+                    event.run_id == Some(child_run)
+                        && matches!(event.event, SessionEvent::RunFinished { .. })
+                })
+                .unwrap();
+            let parent_finished = observed
+                .iter()
+                .position(|event| {
+                    event.run_id == Some(parent_run)
+                        && matches!(event.event, SessionEvent::RunFinished { .. })
+                })
+                .unwrap();
+            assert!(child_finished < parent_finished);
+            assert_eq!(
+                std::fs::read_to_string(harness._directory.path().join("child.txt")).unwrap(),
+                "child"
+            );
+            if shutting_down {
+                assert!(!harness._directory.path().join("parent.txt").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(harness._directory.path().join("parent.txt")).unwrap(),
+                    "parent"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupting_steering_owns_a_child_whose_creation_reply_is_pending() {
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let (mut harness, _) = write_child_harness(
+            Arc::new(HangingProvider),
+            vec![
+                (
+                    "spawn_agent",
+                    r#"{"task":"wait","model":"test/child","authority":"write"}"#.to_owned(),
+                ),
+                (
+                    "write_file",
+                    r#"{"path":"parent.txt","content":"resumed"}"#.to_owned(),
+                ),
+            ],
+            Some(reviewer),
+            ApprovalMode::Full,
+        )
+        .await;
+        let (created, release) = store::hold_child_creation(harness.session_id);
+        let parent_run = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let child_run = tokio::time::timeout(Duration::from_secs(2), created)
+            .await
+            .unwrap()
+            .unwrap();
+        steer(
+            &harness.runtime,
+            parent_run,
+            "stop the child and continue",
+            true,
+        )
+        .await
+        .unwrap();
+        let _ = release.send(());
+        let mut observed = collect_until_run_finished(&mut harness.events, parent_run).await;
+        harness.runtime.shutdown().await.unwrap();
+        if finished_outcome(&observed, child_run).is_none() {
+            observed.extend(collect_until_run_finished(&mut harness.events, child_run).await);
+        }
+        let finished_at = |run| {
+            observed
+                .iter()
+                .position(|event| {
+                    event.run_id == Some(run)
+                        && matches!(event.event, SessionEvent::RunFinished { .. })
+                })
+                .unwrap()
+        };
+        assert!(
+            finished_at(child_run) < finished_at(parent_run),
+            "steering must own and stop an admitted child before the parent resumes"
+        );
+        assert_eq!(
+            finished_outcome(&observed, child_run),
+            Some(RunOutcome::Cancelled)
+        );
+        assert_eq!(
+            std::fs::read_to_string(harness._directory.path().join("parent.txt")).unwrap(),
+            "resumed"
+        );
+    }
+
+    #[tokio::test]
     async fn store_saturation_does_not_release_a_running_write_child() {
         struct HeldChild {
             entered: Arc<tokio::sync::Notify>,
@@ -28665,6 +29086,127 @@ mod tests {
             std::fs::read_to_string(harness._directory.path().join("parent.txt")).unwrap(),
             "parent resumed"
         );
+    }
+
+    #[tokio::test]
+    async fn child_cancellation_persistence_failure_prevents_parent_continuation() {
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let (mut harness, requests) = write_child_harness(
+            Arc::new(HangingProvider),
+            vec![(
+                "spawn_agent",
+                r#"{"task":"wait","model":"test/child","authority":"write"}"#.to_owned(),
+            )],
+            Some(reviewer),
+            ApprovalMode::Full,
+        )
+        .await;
+        let parent_run = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let child_run = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = harness.events.next().await.unwrap().unwrap();
+                if event.run_id != Some(parent_run)
+                    && matches!(event.event, SessionEvent::RunStarted { .. })
+                {
+                    break event.run_id.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        store::fail_child_cancellation(child_run);
+        let child_cancel = harness
+            .runtime
+            .inner
+            .cancellations
+            .lock()
+            .unwrap()
+            .get(&child_run)
+            .unwrap()
+            .subscribe();
+        steer(&harness.runtime, parent_run, "continue", true)
+            .await
+            .unwrap();
+        let unavailable = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = harness.events.next().await {
+                match event {
+                    Err(SessionRuntimeError::Unavailable) => return true,
+                    Ok(event)
+                        if event.run_id == Some(parent_run)
+                            && matches!(event.event, SessionEvent::RunFinished { .. }) =>
+                    {
+                        return false;
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("unexpected event error: {error}"),
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        assert!(
+            unavailable,
+            "failed cancellation cannot become a resumable tool result"
+        );
+        assert!(
+            *child_cancel.borrow(),
+            "live execution is cancelled before persistence is attempted"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            steer(&harness.runtime, parent_run, "retry", true).await,
+            Err(SessionRuntimeError::Unavailable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unconfirmed_shell_exit_prevents_session_continuation() {
+        let (mut harness, requests) = write_child_harness(
+            Arc::new(StaticTextProvider),
+            vec![("shell", r#"{"command":"sleep 300"}"#.to_owned())],
+            None,
+            ApprovalMode::Full,
+        )
+        .await;
+        let spawned = crate::tools::observe_shell_spawn(harness._directory.path(), true);
+        let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "run a command").await;
+        let pid = tokio::time::timeout(Duration::from_secs(2), spawned)
+            .await
+            .unwrap()
+            .unwrap();
+        let unavailable = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = harness.events.next().await {
+                match event {
+                    Err(SessionRuntimeError::Unavailable) => return true,
+                    Ok(event)
+                        if event.run_id == Some(run_id)
+                            && matches!(event.event, SessionEvent::RunFinished { .. }) =>
+                    {
+                        return false;
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("unexpected event error: {error}"),
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        assert!(
+            unavailable,
+            "an unconfirmed reap must fail the session runtime closed"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rustix::process::test_kill_process(pid).is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the process guard must still send termination on panic");
     }
 
     #[tokio::test]
@@ -29619,6 +30161,99 @@ mod tests {
             })
             .collect();
         (started, completed)
+    }
+
+    #[tokio::test]
+    async fn steering_during_an_audit_reaches_the_next_parent_request() {
+        use tokio::sync::Notify;
+        struct HeldFirstAuditor {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+            calls: AtomicUsize,
+        }
+
+        impl Provider for HeldFirstAuditor {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async_stream::stream! {
+                    if first {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    yield Ok(qq_provider::ProviderEvent::OutputTextDelta {
+                        text: r#"{"verdict":"pass"}"#.to_owned(),
+                    });
+                    yield Ok(qq_provider::ProviderEvent::Completed { usage: None });
+                })
+            }
+        }
+
+        for interrupt in [true, false] {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let parent: Arc<dyn Provider> = Arc::new(ScriptedRunProvider {
+                requests: Arc::clone(&requests),
+                script: Vec::new(),
+                turn: StdMutex::new(0),
+            });
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let auditor: Arc<dyn Provider> = Arc::new(HeldFirstAuditor {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                calls: AtomicUsize::new(0),
+            });
+            let mut harness =
+                audit_harness(parent, auditor, crate::runtime::AuditMode::Always, 1).await;
+            let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "answer").await;
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+            let receipt = steer(&harness.runtime, run_id, "use the new direction", interrupt)
+                .await
+                .unwrap();
+            let CommandOutcome::SteeringQueued { message_id, .. } = receipt.outcome else {
+                panic!("steering must be queued");
+            };
+            if !interrupt {
+                release.notify_one();
+            }
+            let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+            harness.runtime.shutdown().await.unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "interrupt={interrupt}");
+            assert!(
+                request_texts(&requests[1])
+                    .iter()
+                    .any(|text| text.contains("use the new direction"))
+            );
+            assert!(observed.iter().any(|event| matches!(&event.event,
+                SessionEvent::SteeringApplied { message_id: applied, .. } if *applied == message_id)));
+            let child_outcomes: Vec<_> = observed
+                .iter()
+                .filter_map(|event| match &event.event {
+                    SessionEvent::RunFinished {
+                        session, outcome, ..
+                    } if session.parent_id == Some(harness.session_id) => Some(outcome),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(child_outcomes.len(), 2);
+            assert_eq!(
+                *child_outcomes[0],
+                if interrupt {
+                    RunOutcome::Cancelled
+                } else {
+                    RunOutcome::Completed
+                }
+            );
+            assert_eq!(*child_outcomes[1], RunOutcome::Completed);
+            assert_eq!(
+                finished_outcome(&observed, run_id),
+                Some(RunOutcome::Completed)
+            );
+        }
     }
 
     #[tokio::test]

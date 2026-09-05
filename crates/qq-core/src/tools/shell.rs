@@ -22,7 +22,7 @@ struct SpawnHook {
 static SPAWN_HOOKS: std::sync::Mutex<Vec<SpawnHook>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-pub(super) fn observe_shell_spawn(
+pub(crate) fn observe_shell_spawn(
     workspace: &std::path::Path,
     panic: bool,
 ) -> tokio::sync::oneshot::Receiver<u32> {

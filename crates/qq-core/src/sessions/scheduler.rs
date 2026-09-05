@@ -1,6 +1,6 @@
 use super::*;
 use super::{
-    execution::{execute_run, internal_failure, persistence_failure},
+    execution::{RunResources, execute_run, internal_failure, persistence_failure},
     runtime::SessionRuntimeInner,
 };
 
@@ -67,12 +67,22 @@ pub(super) async fn schedule_runs(
                 let task_inner = Arc::clone(&inner);
                 let panic_claimed = claimed.panic_settlement_claim();
                 tokio::spawn(async move {
-                    let execution =
-                        AssertUnwindSafe(supervise_reserved_run(Arc::clone(&task_inner), claimed))
-                            .catch_unwind()
-                            .await;
+                    let resources = RunResources::default();
+                    #[cfg(test)]
+                    let resources = resources.for_test_run(claimed.run_id);
+                    let execution = AssertUnwindSafe(supervise_reserved_run(
+                        Arc::clone(&task_inner),
+                        claimed,
+                        resources.clone(),
+                    ))
+                    .catch_unwind()
+                    .await;
                     if execution.is_err() {
-                        settle_panicked_execution_with_retry(&task_inner, &panic_claimed).await;
+                        if resources.drain().await.is_err() {
+                            task_inner.failed.send_replace(true);
+                        } else {
+                            settle_panicked_execution_with_retry(&task_inner, &panic_claimed).await;
+                        }
                     }
                     drop(permit);
                     task_inner
@@ -87,7 +97,11 @@ pub(super) async fn schedule_runs(
     }
 }
 
-async fn supervise_reserved_run(inner: Arc<SessionRuntimeInner>, claimed: ClaimedRun) {
+async fn supervise_reserved_run(
+    inner: Arc<SessionRuntimeInner>,
+    claimed: ClaimedRun,
+    resources: RunResources,
+) {
     let (cancel, cancel_receiver) = watch::channel(false);
     let registered = match inner.cancellations.lock() {
         Ok(mut cancellations) => {
@@ -149,7 +163,7 @@ async fn supervise_reserved_run(inner: Arc<SessionRuntimeInner>, claimed: Claime
         .await;
         return;
     }
-    execute_run(inner, claimed, cancel_receiver).await;
+    execute_run(inner, claimed, cancel_receiver, resources).await;
 }
 
 async fn settle_unstartable_reservation_with_retry(

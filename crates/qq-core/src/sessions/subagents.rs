@@ -1,8 +1,108 @@
 use super::runtime::SessionRuntimeInner;
 use super::*;
+use crate::runtime::{ChildCleanupError, ChildDrainFuture};
 use qq_protocol::ChildAuthority;
 
-/// Executes `spawn_agent` calls for one parent run: creates a read-only child
+type ChildReceipt = Result<SpawnAgentSpend, ChildCleanupError>;
+
+#[cfg(test)]
+struct ChildDeliveryHook {
+    session_id: SessionId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static CHILD_DELIVERY_HOOKS: Mutex<Vec<ChildDeliveryHook>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn hold_child_delivery(
+    session_id: SessionId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    CHILD_DELIVERY_HOOKS
+        .lock()
+        .unwrap()
+        .push(ChildDeliveryHook {
+            session_id,
+            entered,
+            release: release_rx,
+        });
+    (entered_rx, release)
+}
+
+struct ChildTask {
+    cancel: watch::Sender<bool>,
+    completed: watch::Receiver<Option<ChildReceipt>>,
+}
+
+/// Owners and unconsumed receipts stay here even if a tool or a cleanup await
+/// is interrupted. Only a charged receipt or a fully drained batch is removed.
+#[derive(Default)]
+pub(super) struct ChildTasks {
+    tasks: Mutex<HashMap<ToolCallId, ChildTask>>,
+}
+
+impl ChildTasks {
+    fn acknowledge(&self, call_id: ToolCallId) {
+        self.tasks
+            .lock()
+            .expect("child owner registry poisoned")
+            .remove(&call_id);
+    }
+
+    pub(super) async fn drain(&self) -> Result<Vec<SpawnAgentSpend>, ChildCleanupError> {
+        let pending = {
+            let tasks = self.tasks.lock().map_err(|_| ChildCleanupError)?;
+            tasks
+                .values()
+                .map(|task| {
+                    task.cancel.send_replace(true);
+                    task.completed.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        for mut completed in pending {
+            while completed.borrow().is_none() {
+                if completed.changed().await.is_err() {
+                    return Err(ChildCleanupError);
+                }
+            }
+        }
+        // Nothing is removed before the last await: a cancelled drain can be
+        // resumed by the session owner without losing any child's accounting.
+        let mut tasks = self.tasks.lock().map_err(|_| ChildCleanupError)?;
+        let mut spend = Vec::with_capacity(tasks.len());
+        for task in tasks.values() {
+            match *task.completed.borrow() {
+                Some(Ok(receipt)) => spend.push(receipt),
+                Some(Err(error)) => return Err(error),
+                None => return Err(ChildCleanupError),
+            }
+        }
+        tasks.clear();
+        Ok(spend)
+    }
+}
+
+struct CancelChildWaiter(watch::Sender<bool>);
+
+impl Drop for CancelChildWaiter {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+async fn child_cancelled(cancel: &mut watch::Receiver<bool>) {
+    while !*cancel.borrow() {
+        if cancel.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Executes `spawn_agent` calls for one parent run: creates an authority-limited child
 /// session and queued task atomically (while preserving the ordinary durable
 /// event stream), then resolves with the child run's final assistant text.
 pub(super) struct SessionSubagentSpawner {
@@ -21,10 +121,15 @@ pub(super) struct SessionSubagentSpawner {
     /// The effective total-children bound: the caller's `max_children` when
     /// imposed (admission already capped it), else the runtime ceiling.
     max_children: usize,
+    tasks: Arc<ChildTasks>,
 }
 
 impl SessionSubagentSpawner {
-    pub(super) fn new(inner: Arc<SessionRuntimeInner>, parent: ClaimedRun) -> Self {
+    pub(super) fn new(
+        inner: Arc<SessionRuntimeInner>,
+        parent: ClaimedRun,
+        tasks: Arc<ChildTasks>,
+    ) -> Self {
         let concurrent = parent
             .limits
             .max_concurrent_children
@@ -43,6 +148,7 @@ impl SessionSubagentSpawner {
             write_children: false,
             spawned: Arc::new(AtomicUsize::new(0)),
             max_children,
+            tasks,
         }
     }
 
@@ -64,8 +170,18 @@ impl SubagentSpawner for SessionSubagentSpawner {
             write_children: self.write_children,
             spawned: Arc::clone(&self.spawned),
             max_children: self.max_children,
+            tasks: Arc::clone(&self.tasks),
         };
         Box::pin(async move { spawn_child_run(inner, parent, budget, request).await })
+    }
+
+    fn acknowledge(&self, call_id: ToolCallId) {
+        self.tasks.acknowledge(call_id);
+    }
+
+    fn drain(&self) -> ChildDrainFuture {
+        let tasks = Arc::clone(&self.tasks);
+        Box::pin(async move { tasks.drain().await })
     }
 }
 
@@ -76,6 +192,7 @@ pub(super) struct SpawnBudget {
     pub(super) write_children: bool,
     pub(super) spawned: Arc<AtomicUsize>,
     pub(super) max_children: usize,
+    pub(super) tasks: Arc<ChildTasks>,
 }
 
 /// A child that never ran spent nothing. Failed children report their real
@@ -93,14 +210,102 @@ fn spawn_error_with_spend(content: impl Into<String>, spend: SpawnAgentSpend) ->
     }
 }
 
-/// One `spawn_agent` execution. Every child failure mode — command errors, a
-/// failed, cancelled, or empty child run — resolves to an error *tool result*
-/// for the parent's model, never a parent run failure.
+/// One owned `spawn_agent` execution. Ordinary admission errors and settled
+/// child failures become tool results. Uncertain ownership or teardown fails
+/// the session runtime closed.
 pub(super) async fn spawn_child_run(
     inner: Arc<SessionRuntimeInner>,
     parent: ClaimedRun,
     budget: SpawnBudget,
     request: SpawnRequest,
+) -> SpawnAgentOutcome {
+    let (cancel, cancellation) = watch::channel(false);
+    let (completed, completion) = watch::channel(None);
+    let (reply, response) = oneshot::channel();
+    {
+        let mut tasks = match budget.tasks.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(_) => {
+                inner.failed.send_replace(true);
+                return spawn_error_with_spend(
+                    "child owner registry is unavailable",
+                    SpawnAgentSpend::UNKNOWN,
+                );
+            }
+        };
+        if tasks.len() > usize::from(MAX_SPAWNED_CHILDREN_PER_RUN)
+            || tasks.contains_key(&request.call_id)
+        {
+            return spawn_error("the child owner capacity was exhausted");
+        }
+        tasks.insert(
+            request.call_id,
+            ChildTask {
+                cancel: cancel.clone(),
+                completed: completion,
+            },
+        );
+    }
+    let _waiter = CancelChildWaiter(cancel);
+    #[cfg(test)]
+    let parent_session = parent.session_id;
+    let owner_inner = Arc::clone(&inner);
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(run_owned_child(
+            Arc::clone(&owner_inner),
+            parent,
+            budget,
+            request,
+            cancellation,
+        ))
+        .catch_unwind()
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                owner_inner.failed.send_replace(true);
+                spawn_error_with_spend("child owner task panicked", SpawnAgentSpend::UNKNOWN)
+            }
+        };
+        let receipt = if *owner_inner.failed.borrow() {
+            Err(ChildCleanupError)
+        } else {
+            Ok(outcome.spend)
+        };
+        completed.send_replace(Some(receipt));
+        let _ = reply.send(outcome);
+    });
+    match response.await {
+        Ok(outcome) => {
+            #[cfg(test)]
+            {
+                let hook = {
+                    let mut hooks = CHILD_DELIVERY_HOOKS.lock().unwrap();
+                    hooks
+                        .iter()
+                        .position(|hook| hook.session_id == parent_session)
+                        .map(|index| hooks.remove(index))
+                };
+                if let Some(hook) = hook {
+                    let _ = hook.entered.send(());
+                    let _ = hook.release.await;
+                }
+            }
+            outcome
+        }
+        Err(_) => {
+            inner.failed.send_replace(true);
+            spawn_error_with_spend("child owner task disappeared", SpawnAgentSpend::UNKNOWN)
+        }
+    }
+}
+
+async fn run_owned_child(
+    inner: Arc<SessionRuntimeInner>,
+    parent: ClaimedRun,
+    budget: SpawnBudget,
+    request: SpawnRequest,
+    mut cancellation: watch::Receiver<bool>,
 ) -> SpawnAgentOutcome {
     let SpawnBudget {
         slots,
@@ -108,6 +313,7 @@ pub(super) async fn spawn_child_run(
         write_children,
         spawned,
         max_children,
+        tasks: _,
     } = budget;
     let SpawnRequest {
         call_id,
@@ -150,78 +356,120 @@ pub(super) async fn spawn_child_run(
              continue with what they returned"
         ));
     }
-    let mut selection = parent.model.clone();
-    if let Some(model) = model.and_then(|model| {
-        let model = model.trim().to_owned();
-        (!model.is_empty()).then_some(model)
-    }) {
-        selection.model = Some(model);
-    } else {
-        selection = match inner
+    // Preparation and execution share the same child bounds. A started loader
+    // may own blocking work, so cancellation retains its permit until it exits.
+    let acquire = async {
+        // Wait for a child slot before creating anything: spawn calls queued
+        // behind the concurrency cap must not pile up sessions they cannot run.
+        let Ok(_slot) = Arc::clone(&slots).acquire_owned().await else {
+            return Err(spawn_error("the sub-agent scheduler is unavailable"));
+        };
+        // Writers serialize behind the read slot too: a second write spawn in the
+        // same turn waits here until the first child settles.
+        let _write_slot = if child_mode == ApprovalMode::Supervised {
+            match Arc::clone(&write_slot).acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(_) => return Err(spawn_error("the sub-agent scheduler is unavailable")),
+            }
+        } else {
+            None
+        };
+        Ok((_slot, _write_slot))
+    };
+    let (_slot, _write_slot) = tokio::select! {
+        biased;
+        () = child_cancelled(&mut cancellation) => return spawn_error("the sub-agent admission was cancelled"),
+        acquired = acquire => match acquired {
+            Ok(acquired) => acquired,
+            Err(outcome) => return outcome,
+        },
+    };
+    let prepare_cancel = cancellation.clone();
+    let prepared = async {
+        if *prepare_cancel.borrow() {
+            return Err(spawn_error("the sub-agent admission was cancelled"));
+        }
+        let mut selection = parent.model.clone();
+        if let Some(model) = model.and_then(|model| {
+            let model = model.trim().to_owned();
+            (!model.is_empty()).then_some(model)
+        }) {
+            selection.model = Some(model);
+        } else {
+            selection = match inner
+                .loader
+                .resolve_worker_model(parent.workspace.clone(), selection)
+                .await
+            {
+                Ok(selection) => selection,
+                Err(error) => {
+                    return Err(spawn_error(format!(
+                        "the sub-agent model could not be resolved: {}",
+                        truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
+                    )));
+                }
+            };
+        }
+        if *prepare_cancel.borrow() {
+            return Err(spawn_error("the sub-agent admission was cancelled"));
+        }
+        // The spawn-time choke point: every resolved route — explicit argument,
+        // configured worker, or parent fallback — must be authenticated and in
+        // the served model list right now, before any durable child state exists.
+        if let Err(error) = inner
             .loader
-            .resolve_worker_model(parent.workspace.clone(), selection)
+            .validate_spawn_model(parent.workspace.clone(), selection.clone())
             .await
         {
-            Ok(selection) => selection,
-            Err(error) => {
-                return spawn_error(format!(
-                    "the sub-agent model could not be resolved: {}",
-                    truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
-                ));
-            }
-        };
-    }
-    // The spawn-time choke point: every resolved route — explicit argument,
-    // configured worker, or parent fallback — must be authenticated and in
-    // the served model list right now, before any durable child state exists.
-    if let Err(error) = inner
-        .loader
-        .validate_spawn_model(parent.workspace.clone(), selection.clone())
-        .await
-    {
-        return spawn_error(format!(
-            "the sub-agent model was rejected: {}",
-            truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
-        ));
-    }
-    // Validate and construct the selected runtime before creating durable
-    // child state. A bad explicit/configured route must leave no orphan
-    // session (and this runtime will be reused from the loader cache when the
-    // queued child is claimed).
-    if let Err(error) = inner
-        .loader
-        .load(RuntimeLoadRequest {
-            workspace: parent.workspace.clone(),
-            model: selection.clone(),
-            profile: parent.profile.clone(),
-        })
-        .await
-    {
-        return spawn_error(format!(
-            "the sub-agent model could not be loaded: {}",
-            truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
-        ));
-    }
-    // Wait for a child slot before creating anything: spawn calls queued
-    // behind the concurrency cap must not pile up sessions they cannot run.
-    let Ok(_slot) = Arc::clone(&slots).acquire_owned().await else {
-        return spawn_error("the sub-agent scheduler is unavailable");
-    };
-    // Writers serialize behind the read slot too: a second write spawn in the
-    // same turn waits here until the first child settles.
-    let _write_slot = if child_mode == ApprovalMode::Supervised {
-        match Arc::clone(&write_slot).acquire_owned().await {
-            Ok(permit) => Some(permit),
-            Err(_) => return spawn_error("the sub-agent scheduler is unavailable"),
+            return Err(spawn_error(format!(
+                "the sub-agent model was rejected: {}",
+                truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
+            )));
         }
-    } else {
-        None
+        if *prepare_cancel.borrow() {
+            return Err(spawn_error("the sub-agent admission was cancelled"));
+        }
+        // Validate and construct the selected runtime before creating durable
+        // child state. A bad explicit/configured route must leave no orphan
+        // session (and this runtime will be reused from the loader cache when the
+        // queued child is claimed).
+        if let Err(error) = inner
+            .loader
+            .load(RuntimeLoadRequest {
+                workspace: parent.workspace.clone(),
+                model: selection.clone(),
+                profile: parent.profile.clone(),
+            })
+            .await
+        {
+            return Err(spawn_error(format!(
+                "the sub-agent model could not be loaded: {}",
+                truncate_utf8(error.message, MAX_FAILURE_MESSAGE_BYTES)
+            )));
+        }
+        Ok(selection)
+    };
+    let mut prepared = std::pin::pin!(prepared);
+    let selection = tokio::select! {
+        biased;
+        () = child_cancelled(&mut cancellation) => {
+            let _ = prepared.await;
+            return spawn_error("the sub-agent admission was cancelled");
+        },
+        prepared = &mut prepared => match prepared {
+            Ok(selection) => selection,
+            Err(outcome) => return outcome,
+        },
     };
     // Shutdown owns the write side of this gate. Hold the read side across
     // the durable child transaction so shutdown observes either no child run
     // or the fully queued run it must settle; child admission can never cross
     // the shutdown scan.
-    let lifecycle = inner.lifecycle.read().await;
+    let lifecycle = tokio::select! {
+        biased;
+        () = child_cancelled(&mut cancellation) => return spawn_error("the sub-agent admission was cancelled"),
+        lifecycle = inner.lifecycle.read() => lifecycle,
+    };
     if *inner.shutdown.borrow() || *inner.failed.borrow() {
         return spawn_error("the session runtime is shutting down");
     }
@@ -264,10 +512,29 @@ pub(super) async fn spawn_child_run(
     };
     drop(lifecycle);
     let _ = inner.schedule.try_send(());
-    // Parent cancellation reaches the child by drop: the cancelled parent's
-    // tool loop is dropped wholesale, dropping this future mid-await, and the
-    // guard then cancels the still-running child run.
+    let mut cancelled = false;
     let (outcome, spend) = loop {
+        if !cancelled && *cancellation.borrow() {
+            inner.cancel(run_id);
+            match inner.store.cancel_child_run(run_id).await {
+                Ok(applied) => {
+                    inner.notify(applied.receipt.committed_through);
+                    for run in applied.cascade_cancels {
+                        inner.cancel(run);
+                    }
+                    let _ = inner.schedule.try_send(());
+                }
+                Err(_) => {
+                    inner.failed.send_replace(true);
+                    guard.disarm();
+                    return spawn_error_with_spend(
+                        "child cancellation could not be persisted",
+                        SpawnAgentSpend::UNKNOWN,
+                    );
+                }
+            }
+            cancelled = true;
+        }
         match inner.store.run_outcome(run_id).await {
             Ok(Some(settled)) => break settled,
             Ok(None) => {}
@@ -284,12 +551,15 @@ pub(super) async fn spawn_child_run(
                 );
             }
         }
-        if wakeup.changed().await.is_err() {
-            guard.disarm();
-            return spawn_error_with_spend(
-                "the session runtime shut down while the sub-agent was running",
-                SpawnAgentSpend::UNKNOWN,
-            );
+        tokio::select! {
+            biased;
+            () = child_cancelled(&mut cancellation), if !cancelled => {},
+            changed = wakeup.changed() => if changed.is_err() {
+                inner.failed.send_replace(true);
+                inner.cancel(run_id);
+                guard.disarm();
+                return spawn_error_with_spend("child completion became unavailable", SpawnAgentSpend::UNKNOWN);
+            },
         }
     };
     guard.disarm();
@@ -347,37 +617,12 @@ impl CancelChildOnDrop {
 
 impl Drop for CancelChildOnDrop {
     fn drop(&mut self) {
-        let Some(run_id) = self.run_id.take() else {
-            return;
-        };
-        let inner = Arc::clone(&self.inner);
-        // Drop cannot await; outside a runtime (process teardown) there is
-        // nothing left to cancel for.
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
-            let Ok(command_id) = CommandId::generate() else {
-                return;
-            };
-            let Ok(applied) = inner
-                .store
-                .command_with_seed(
-                    command_id,
-                    SessionCommand::CancelRun { run_id },
-                    WorkspaceGrantSeed::default(),
-                    None,
-                )
-                .await
-            else {
-                return;
-            };
-            inner.notify(applied.receipt.committed_through);
-            inner.cancel(run_id);
-            if applied.schedule {
-                let _ = inner.schedule.try_send(());
-            }
-        });
+        if let Some(run_id) = self.run_id.take() {
+            // The owned task only abandons an admitted child on a panic.
+            // Stop the runtime rather than permit further parent mutation.
+            self.inner.failed.send_replace(true);
+            self.inner.cancel(run_id);
+        }
     }
 }
 
@@ -442,6 +687,8 @@ pub(super) struct SessionAuditHook {
     /// Audits are one at a time per run and never count against the
     /// parent's ordinary child slots.
     slots: Arc<Semaphore>,
+    tasks: Arc<ChildTasks>,
+    pending: Arc<Mutex<Option<ToolCallId>>>,
 }
 
 impl SessionAuditHook {
@@ -449,12 +696,15 @@ impl SessionAuditHook {
         inner: Arc<SessionRuntimeInner>,
         parent: ClaimedRun,
         delegation: qq_protocol::DelegationRoster,
+        tasks: Arc<ChildTasks>,
     ) -> Self {
         Self {
             inner,
             parent,
             delegation,
             slots: Arc::new(Semaphore::new(1)),
+            tasks,
+            pending: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -471,10 +721,23 @@ with exactly one JSON object on one line and nothing else: \
 (at most 8, one sentence each). Escalate nothing; if you cannot verify, say so as a finding.";
 
 impl crate::runtime::AuditHook for SessionAuditHook {
+    fn acknowledge(&self) {
+        if let Some(call_id) = self.pending.lock().expect("audit owner poisoned").take() {
+            self.tasks.acknowledge(call_id);
+        }
+    }
+
+    fn drain(&self) -> ChildDrainFuture {
+        let tasks = Arc::clone(&self.tasks);
+        Box::pin(async move { tasks.drain().await })
+    }
+
     fn audit(&self, request: crate::runtime::AuditRequest) -> crate::runtime::AuditFuture {
         let inner = Arc::clone(&self.inner);
         let parent = self.parent.clone();
         let slots = Arc::clone(&self.slots);
+        let tasks = Arc::clone(&self.tasks);
+        let pending = Arc::clone(&self.pending);
         let model = self
             .delegation
             .route_for_role(request.role)
@@ -509,6 +772,14 @@ impl crate::runtime::AuditHook for SessionAuditHook {
             // like any child; the parent's meter already accounts for this
             // spend when the verdict returns.
             let limits = RunLimits::default();
+            let call_id = match ToolCallId::generate() {
+                Ok(call_id) => call_id,
+                Err(_) => {
+                    inner.failed.send_replace(true);
+                    return crate::runtime::AuditVerdict::unavailable();
+                }
+            };
+            *pending.lock().expect("audit owner poisoned") = Some(call_id);
             let outcome = spawn_child_run(
                 inner,
                 parent,
@@ -518,9 +789,10 @@ impl crate::runtime::AuditHook for SessionAuditHook {
                     write_children: false,
                     spawned: Arc::new(AtomicUsize::new(0)),
                     max_children: 1,
+                    tasks,
                 },
                 SpawnRequest {
-                    call_id: ToolCallId::from_bytes([0xAD; 16]),
+                    call_id,
                     task: brief,
                     model,
                     authority: ChildAuthority::Read,

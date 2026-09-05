@@ -129,6 +129,8 @@ pub type AuditFuture = Pin<Box<dyn Future<Output = AuditVerdict> + Send + 'stati
 /// `max_revisions` times, then complete.
 pub(crate) trait AuditHook: Send + Sync {
     fn audit(&self, request: AuditRequest) -> AuditFuture;
+    fn acknowledge(&self);
+    fn drain(&self) -> super::ChildDrainFuture;
 }
 
 /// Sent to the model when the auditor asked for a revision.

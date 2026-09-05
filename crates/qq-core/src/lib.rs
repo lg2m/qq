@@ -388,6 +388,7 @@ pub(crate) struct RunCapabilities {
     /// Audits the candidate final answer of a root run. Session roots install
     /// one; children, internal runs, and direct runs have none.
     audit_hook: Option<Arc<dyn runtime::AuditHook>>,
+    tool_tasks: Option<tools::ToolTasks>,
 }
 
 impl RunCapabilities {
@@ -404,6 +405,7 @@ impl RunCapabilities {
             history: None,
             steering: None,
             audit_hook: None,
+            tool_tasks: None,
         }
     }
 
@@ -447,6 +449,11 @@ impl RunCapabilities {
         self
     }
 
+    pub(crate) fn with_tool_tasks(mut self, tasks: tools::ToolTasks) -> Self {
+        self.tool_tasks = Some(tasks);
+        self
+    }
+
     pub(crate) fn with_audit_hook(mut self, hook: Arc<dyn runtime::AuditHook>) -> Self {
         self.audit_hook = Some(hook);
         self
@@ -483,6 +490,7 @@ impl RunCapabilities {
             history: None,
             steering: None,
             audit_hook: None,
+            tool_tasks: None,
         }
     }
 }
@@ -891,7 +899,9 @@ impl plan::CompiledAgentPlan {
                 history,
                 steering,
                 audit_hook,
+                tool_tasks,
             } = capabilities;
+            let tool_tasks = tool_tasks.unwrap_or_default();
             let mut steering = steering;
             let mut handled_interrupt = steering
                 .as_ref()
@@ -1791,16 +1801,47 @@ impl plan::CompiledAgentPlan {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        let verdict = hook
+                        let mut auditing = hook
                             .audit(runtime::AuditRequest {
                                 prompt: audit_prompt.clone(),
                                 answer: bounded_text(&answer, runtime::MAX_AUDIT_ANSWER_BYTES),
                                 actions: audit_actions.clone(),
                                 role: plan.runtime.audit.role,
                                 revision: audit_revisions,
-                            })
-                            .await;
+                            });
+                        let verdict = tokio::select! {
+                            biased;
+                            () = interrupt_requested(&mut steering, handled_interrupt) => None,
+                            verdict = &mut auditing => Some(verdict),
+                        };
+                        drop(auditing);
+                        let audit_interrupted = verdict.is_none();
+                        let verdict = match verdict {
+                            Some(verdict) => verdict,
+                            None => {
+                                let spends = match hook.drain().await {
+                                    Ok(spends) => spends,
+                                    Err(error) => {
+                                        yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: error.to_string() };
+                                        return;
+                                    }
+                                };
+                                let spend = match spends.as_slice() {
+                                    [] => SpawnAgentSpend::NONE,
+                                    [spend] => *spend,
+                                    _ => {
+                                        yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: "audit cleanup found multiple uncharged children".to_owned() };
+                                        return;
+                                    }
+                                };
+                                runtime::AuditVerdict {
+                                    usage: spend.usage, cost_usd_nanos: spend.cost_usd_nanos,
+                                    ..runtime::AuditVerdict::unavailable()
+                                }
+                            }
+                        };
                         budget.charge_child(verdict.usage, verdict.cost_usd_nanos);
+                        hook.acknowledge();
                         let revise = verdict.outcome == qq_protocol::AuditOutcome::Revised
                             && audit_revisions < plan.runtime.audit.max_revisions;
                         yield RuntimeEvent::Audited {
@@ -1811,6 +1852,18 @@ impl plan::CompiledAgentPlan {
                             cost_usd_nanos: verdict.cost_usd_nanos,
                             audit_session: verdict.audit_session,
                         };
+                        if audit_interrupted {
+                            handled_interrupt = steering.as_ref().map_or(handled_interrupt, |steering| *steering.interrupts.borrow());
+                            irreducible_message_bytes = irreducible_message_bytes.saturating_add(measure_message(&assistant));
+                            messages.push(assistant);
+                            yield RuntimeEvent::Interrupted { turn_ordinal };
+                            if let Some(applied) = apply_steering(&mut steering, &mut messages, &mut irreducible_message_bytes, turn_ordinal.saturating_add(1)) {
+                                for message_id in applied {
+                                    yield RuntimeEvent::SteeringApplied { message_id, turn_ordinal: turn_ordinal.saturating_add(1) };
+                                }
+                            }
+                            continue;
+                        }
                         if revise {
                             audit_revisions += 1;
                             irreducible_message_bytes = irreducible_message_bytes
@@ -1826,6 +1879,15 @@ impl plan::CompiledAgentPlan {
                                 .saturating_add(measure_message(messages.last().expect("just pushed")));
                             continue;
                         }
+                    }
+                    // Steering accepted while an audit ran still owns the next boundary.
+                    if let Some(applied) = apply_steering(&mut steering, &mut messages, &mut irreducible_message_bytes, turn_ordinal.saturating_add(1)) {
+                        irreducible_message_bytes = irreducible_message_bytes.saturating_add(measure_message(&assistant));
+                        let queued = messages.split_off(messages.len() - applied.len());
+                        messages.push(assistant);
+                        messages.extend(queued);
+                        for message_id in applied { yield RuntimeEvent::SteeringApplied { message_id, turn_ordinal: turn_ordinal.saturating_add(1) }; }
+                        continue;
                     }
                     yield RuntimeEvent::Completed;
                     return;
@@ -1967,6 +2029,7 @@ impl plan::CompiledAgentPlan {
                     let pack_roots = Arc::clone(&pack_roots);
                     let hosts = Arc::clone(&hosts);
                     let spawner = spawner.clone();
+                    let tool_tasks = tool_tasks.clone();
                     let history = history.clone();
                     let delegation = Arc::clone(&delegation);
                     // Under progressive exposure only pinned externals were
@@ -2139,6 +2202,7 @@ impl plan::CompiledAgentPlan {
                                     call.arguments.clone(),
                                     cancelled,
                                     output,
+                                    tool_tasks,
                                 )
                                 .await
                             }
@@ -2167,33 +2231,48 @@ impl plan::CompiledAgentPlan {
                         let (delta_sender, mut deltas) =
                             tokio::sync::mpsc::channel::<String>(SHELL_OUTPUT_QUEUE_CAPACITY);
                         let mut execution = Box::pin(execute_one(call, Some(delta_sender)));
+                        let mut output_closed = false;
                         let (call, result, child_spend) = loop {
                             let interrupt = interrupt_requested(&mut steering, handled_interrupt);
                             tokio::select! {
                                 biased;
                                 () = interrupt => {
-                                    // Dropping the execution kills a shell
-                                    // process group and abandons MCP/child
-                                    // awaits; bounded blocking reads finish on
-                                    // their thread and are discarded.
+                                    // Stop dispatch, then await owned local work
+                                    // and children before applying steering.
                                     drop(execution);
+                                    if let Err(error) = tool_tasks.drain().await {
+                                        yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: error.to_string() };
+                                        return;
+                                    }
+                                    if let Some(spawner) = &spawner {
+                                        match spawner.drain().await {
+                                            Ok(spends) => for spend in spends { budget.charge_child(spend.usage, spend.cost_usd_nanos); },
+                                            Err(error) => {
+                                                yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: error.to_string() };
+                                                return;
+                                            }
+                                        }
+                                    }
                                     break (call_id_holder.take().expect("call retained"), tools::ToolExecutionResult {
                                         content: INTERRUPTED_TOOL_RESULT.to_owned(),
                                         is_error: true,
                                         file_state: None,
                                     }, None);
                                 }
-                                chunk = deltas.recv() => match chunk {
+                                chunk = deltas.recv(), if !output_closed => match chunk {
                                     Some(chunk) => {
                                         yield RuntimeEvent::ToolCallOutputDelta { id: call_id, chunk };
                                     }
-                                    // The execution dropped its sender early;
-                                    // nothing more can stream, so just finish.
-                                    None => break execution.await,
+                                    // Keep selecting interruption after output closes.
+                                    None => output_closed = true,
                                 },
                                 completed = &mut execution => break completed,
                             }
                         };
+                        if let Err(error) = tool_tasks.check() {
+                            yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: error.to_string() };
+                            return;
+                        }
                         let interrupted_here = result.content == INTERRUPTED_TOOL_RESULT && result.is_error && result.file_state.is_none() && steering.as_ref().is_some_and(|steering| *steering.interrupts.borrow() > handled_interrupt);
                         // Chunks sent in the execution's final poll may still
                         // be buffered; drain them before the terminal event.
@@ -2202,6 +2281,7 @@ impl plan::CompiledAgentPlan {
                         }
                         if let Some(spend) = child_spend {
                             budget.charge_child(spend.usage, spend.cost_usd_nanos);
+                            if let Some(spawner) = &spawner { spawner.acknowledge(call.id); }
                         }
                         note_audited_action(
                             &mut audit_triggers,
@@ -2244,8 +2324,13 @@ impl plan::CompiledAgentPlan {
                         let Some((call, result, child_spend)) = next else {
                             break;
                         };
+                        if let Err(error) = tool_tasks.check() {
+                            yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: error.to_string() };
+                            return;
+                        }
                         if let Some(spend) = child_spend {
                             budget.charge_child(spend.usage, spend.cost_usd_nanos);
+                            if let Some(spawner) = &spawner { spawner.acknowledge(call.id); }
                         }
                         note_audited_action(
                             &mut audit_triggers,
@@ -2266,6 +2351,19 @@ impl plan::CompiledAgentPlan {
                     }
                 }
                 if turn_interrupted_in_tools {
+                    if let Err(error) = tool_tasks.drain().await {
+                                        yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: error.to_string() };
+                                        return;
+                                    }
+                    if let Some(spawner) = &spawner {
+                        match spawner.drain().await {
+                            Ok(spends) => for spend in spends { budget.charge_child(spend.usage, spend.cost_usd_nanos); },
+                            Err(error) => {
+                                yield RuntimeEvent::Failed { kind: RunFailureKind::Server, message: error.to_string() };
+                                return;
+                            }
+                        }
+                    }
                     handled_interrupt = steering
                         .as_ref()
                         .map_or(handled_interrupt, |steering| *steering.interrupts.borrow());
@@ -3736,6 +3834,7 @@ mod tests {
             r#"{"delay_ms":500,"result":"late"}"#.to_owned(),
             Arc::clone(&cancelled),
             None,
+            tools::ToolTasks::default(),
         ));
         while tools::test_executions_started() == started {
             tokio::task::yield_now().await;
@@ -5481,6 +5580,10 @@ mod tests {
     }
 
     impl SubagentSpawner for StubSpawner {
+        fn acknowledge(&self, _: ToolCallId) {}
+        fn drain(&self) -> runtime::ChildDrainFuture {
+            Box::pin(async { Ok(Vec::new()) })
+        }
         fn spawn(&self, request: SpawnRequest) -> SpawnAgentFuture {
             self.tasks
                 .lock()
