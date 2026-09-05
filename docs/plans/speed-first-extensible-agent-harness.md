@@ -4,8 +4,9 @@ Status: Phases 0–4 (H0–H9) complete 2026-09-01 through 2026-09-03; compact
 receipts are under "Phases 0–4 — Complete". A workspace-wide design and
 performance audit on 2026-09-04 (see "Hot-Path Redesign Decisions") added
 tasks H13–H22 and two new implementation phases ahead of the sandbox,
-adapter, and qualification work. **Next slice: Phase 5 (H13–H17).** Phases
-5–9 and tasks H10–H22 remain proposed.
+adapter, and qualification work. Phase 5 (H13–H17) complete 2026-09-04;
+receipt under "Phase 5 — Correct The Hot Path". **Next slice: Phase 6
+(H18–H22).** Phases 6–9 and tasks H10–H12, H18–H22 remain proposed.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -952,7 +953,7 @@ Rejected: an in-memory activity cache (a second source of truth that must
 survive restart).
 
 Gates: command acknowledgement ≤10 ms with an active run; snapshot and
-reconnect latency. Schema bump 23→24; no wire bump.
+reconnect latency. Schema bump (shipped as 24→25: the audit columns took 24 first); no wire bump.
 
 ### D7 — Two-Hop Claim To Send
 
@@ -1422,6 +1423,7 @@ revisions below, and the reproducible measurement protocol is in
 | 2 — Compiled plan | H2 | 2026-09-02 | `2375928` | `AgentProfile`, secret-free `AgentPlanDescriptor` with canonical digest (`DESCRIPTOR_VERSION = 1`), runtime-only `CompiledAgentPlan`, `SourceFingerprint` stat revalidation, opaque `CredentialEpoch`, root `PlanCache` (16 entries / 64 MiB, LRU, pinned active generations, single-flight); raw-secret hashing deleted |
 | 3 — Backend contract | H3, H4 fixtures | 2026-09-03 | `27afe89` | Protocol 13, schema 21, descriptor 2: `InputPart`, `Correlation`, `AgentProfileId`, `RunPlanIdentity`, `SteerRun` and steering events, `SetSessionProfile`, expanded `RunLimits`, `ServerCapabilities` (`CAPABILITIES_VERSION = 1`), config `profiles`, typed client calls, 24 golden fixtures. External Python client deferred to a real consumer |
 | 4 — Extensions | H5–H9 | 2026-09-03 | `5f48fd6` | Protocol 14, descriptor 3: immutable `ToolCatalog` with progressive exposure and `select_tools`; `ExternalToolHost` with an `EmbeddedToolHost` beside MCP and a shared conformance suite; `pack.ron` agent packs; bounded `ContextSource` with cache and fail policy; `qq-client::observer` post-commit loop; `ToolSpec` shared behind `Arc` |
+| 5 — Correct the hot path | H13–H17 | 2026-09-04 | `70166bd` | Effect-classified approval (`ToolClass::Unknown` deleted, `ext__` tools gated); provider is the single retry owner (`AttemptPolicy`, core `'turn` loop and `TurnRetryPolicy` deleted, descriptor 5); published-event outbox and per-workspace broadcast; output-lane group commit with savepoints and a 128-statement cache; schema 25 (`runs.activity`, command counter, grouped snapshot accounting, two-hop claim, joined context assembly) |
 
 Retained decisions from those receipts:
 
@@ -1470,6 +1472,67 @@ config and auth load paths. The eight-stream service gap has sat within 5 ms
 of its 50 ms budget since Phase 1, which is what D2 addresses.
 
 ### Phase 5 — Correct The Hot Path
+
+Status: complete 2026-09-04. Receipt follows; the original task text is kept
+below it for the acceptance list.
+
+#### Phase 5 Completion Receipt — 2026-09-04
+
+Commits, in order: `ea5a6af` (H13), `d02a619` (H14), `e040cab` (H15),
+`7ced6ca` (H16), `70166bd` (H17). Every commit passed `cargo fmt --check`,
+`cargo clippy --workspace --all-targets --all-features -D warnings`, and
+`cargo test --workspace`; H14 also passed the minimal
+`--no-default-features --features test-support` profile.
+
+Two deviations from the designs as written:
+
+- D3 removed the retry field from the plan descriptor, which changes the
+  canonical encoding; `DESCRIPTOR_VERSION` moved 4→5 and the golden digest
+  was re-pinned. The plan had said "no descriptor bump"; the field was a
+  constant default in every real plan, so no behavior changed.
+- The audit columns landed as schema 24 after the audit was written, so D6/D7
+  shipped as schema **25**, not 24.
+
+Acceptance, item by item:
+
+| Acceptance | Result |
+| --- | --- |
+| `ext__` denied under read-only, held under ask and supervised; MCP unchanged | Five-mode matrix with and without `read_only` hints, plus MCP decision tests, all green; hints never change a decision |
+| Attempts per turn never exceed policy; amplification below 1.05 | `provider_retry_amplification_milli` = 1000 (exactly one send per turn above the provider); `AttemptPolicy` tests cover pre-stream, pre-first-event, post-event, non-transient, `Retry-After`, and exhaustion |
+| One catch-up read per subscriber, none per event; live and replayed streams byte-identical | Eight subscribers: 8 catch-up reads total, 0 during the run; `live.json == stored.json` for every event; lagged subscriber recovers via SQLite with no gap or duplicate |
+| Failed outer commit fails every job and publishes nothing; control admitted between batches | Deferred-FK commit failure settles every job `Persistence` and the feed stays empty; a waiting control job runs within one group |
+| Command ack within budget with a 512-event active session | `busy_workspace_command_ack_ns` median 3.02 ms / p95 5.9 ms with 560 events and an active run (gate 10 ms) |
+| Eight-stream output service gap ≤20 ms | **Not met**: 29–45 ms (was 42–45). Completion dropped 0.91→0.29 s and the batch bench 236→138 ms, so the fsync amplification is gone; the remaining gap is scheduler wake latency and is carried to D8 (H20) |
+| Claim to send uses two store hops; joined context equals previous assembly | Cancellation, file state, and steering ride the claim; the pre-change assembly is kept as a test oracle and matches on compaction, steering, and pruned-result stores |
+| No protocol/capability bump; schema migration tested | `PROTOCOL_VERSION` 16 and `CAPABILITIES_VERSION` 1 unchanged; descriptor 4→5 (above); schema 24→25 with a backfill test |
+
+Measurements (this host, release, medians unless stated):
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Retry amplification (sends per logical turn) | up to 24 | 1.000 |
+| Fan-out, delta to slowest of 8 subscribers | 13.7 ms | 12.1 ms |
+| Fan-out, delta to slowest of 32 subscribers p95 | 26.4 ms | 14.9 ms |
+| Command ack with 32 subscribers attached | 17.6 ms | 6.2 ms |
+| R4 eight-stream completion | 0.91 s | 0.29 s |
+| R4 eight-stream output service gap | 42–45 ms | 29–45 ms |
+| R4 eight-stream cancellation to finished | 50–66 ms | 34–48 ms |
+| `store_output_batch` (8×256×64 B) | 236 ms | 138 ms |
+| Workspace snapshot | 899 µs | 465 µs |
+| Submit start to provider entry | 9.8 ms | 9.3 ms |
+| `provider_recipe_compile` | 537 ns | 549 ns |
+
+New instruments: `provider_retry_amplification_milli`, six `fan_out_*`
+metrics, `busy_workspace_command_ack_ns` (all budgeted), and the
+`store_output_batch` bench in `qq-core`.
+
+Deferred from this phase, now owned by Phase 6: deleting the 35 `notify`
+call sites (the watch remains as a wake for `subagents.rs`; H22), the
+`sleep(1 ms)` overload loops and the service-gap remainder (D8, H20), and
+stale-result pruning by a stored tool kind rather than by name (H22).
+
+#### Original Task Text
+
 
 Implement H13, H14, H15, H16, and H17, in that order. H13 ships first
 because it is a P0 approval bypass. H15, H16, and H17 touch the same store
@@ -1785,6 +1848,6 @@ The speed-first extensible backend is complete when:
 - product integrations remain clients of one durable QQ runtime.
 
 Until those conditions are met, the near-term implementation boundary is
-Phase 5 (H13–H17): the approval fix, single retry owner, published-event
-outbox, group commit, and schema 24. Plugin or marketplace work is not the
-next slice.
+Phase 6 (H18–H22): per-run copy elimination, SSE framing, control-lane
+admission, store consolidation, and the bundled fixes. Phase 5 shipped on
+2026-09-04. Plugin or marketplace work is not the next slice.

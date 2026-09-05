@@ -9,12 +9,11 @@ system boundaries.
 
 | # | Next slice | Plan | Why now |
 | ---: | --- | --- | --- |
-| 1 | Phase 5 — H13 approval fix, H14 single retry owner, H15 event outbox, H16 group commit, H17 schema 24 | [`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md) | P0 approval bypass for `ext__` tools; confirmed 24x retry amplification; the two largest verified hot-path costs |
-| 2 | Phase 6 — H18–H22 per-run copies, SSE framing, control admission, store consolidation, bundled fixes | same | Moves the 1 MiB heap, scaling, cancellation, and cold `plan_for` gates; −1,500 LOC |
-| 3 | D6b paired evaluation (paid runs) and the default decisions it feeds | [`supervised-delegation.md`](./supervised-delegation.md) | Decides delegation depth and worker-model defaults with evidence |
-| 4 | Phase 6 tool tournament and terminal; Phase 7 sub-agent economics; Phase 8 remaining warm-path candidates | [`terminal-bench-readiness.md`](./terminal-bench-readiness.md) | Evaluation-gated; feeds H10 |
-| 5 | Phase 7 — H10 process sandbox | `speed-first-…` | Gated on R6 and a platform threat model |
-| 6 | Phase 8 — H11 product adapters; Phase 9 — H12 qualification | `speed-first-…` | H11 needs a real consumer; H12 closes the story |
+| 1 | Phase 6 — H18–H22 per-run copies, SSE framing, control admission, store consolidation, bundled fixes | [`speed-first-extensible-agent-harness.md`](./speed-first-extensible-agent-harness.md) | Moves the 1 MiB heap, scaling, cancellation, and cold `plan_for` gates; carries the eight-stream service-gap remainder (29–45 ms vs the 20 ms target) and the `notify` cleanup from Phase 5; −1,500 LOC |
+| 2 | D6b paired evaluation (paid runs) and the default decisions it feeds | [`supervised-delegation.md`](./supervised-delegation.md) | Decides delegation depth and worker-model defaults with evidence |
+| 3 | Phase 6 tool tournament and terminal; Phase 7 sub-agent economics; Phase 8 remaining warm-path candidates | [`terminal-bench-readiness.md`](./terminal-bench-readiness.md) | Evaluation-gated; feeds H10 |
+| 4 | Phase 7 — H10 process sandbox | `speed-first-…` | Gated on R6 and a platform threat model |
+| 5 | Phase 8 — H11 product adapters; Phase 9 — H12 qualification | `speed-first-…` | H11 needs a real consumer; H12 closes the story |
 | — | Run snapshots | [`run-snapshots.md`](./run-snapshots.md) | Proposed; no scheduled slice |
 | — | LSP diagnostics | [`lsp-diagnostics.md`](./lsp-diagnostics.md) | Proposed; MCP-first validation before native work |
 
