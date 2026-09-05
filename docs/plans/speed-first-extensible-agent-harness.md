@@ -8,9 +8,10 @@ adapter, and qualification work. Phase 5 (H13–H17) complete 2026-09-04;
 receipt under "Phase 5 — Correct The Hot Path", including the unmet output
 service-gap gate. A follow-up source audit and peer review on 2026-09-04
 identified correctness gaps in shipped child, cache, feed, and context-source
-behavior. H23's first slice (outcome-read saturation and hard failure) is
-implemented and locally validated; receipt under Phase 5a. **Next slice: H23
-owned admission, interrupting steering, and execution teardown.**
+behavior. Both H23 ownership slices are implemented and locally validated on
+Linux, with focused latency/resource receipts under Phase 5a; native Windows
+teardown remains unqualified. **Next implementation slice: H24 remaining child
+budgets at each admission.**
 H23–H26 precede Phase 6; H27–H28 join its early correctness work. Phases 6–9
 remain proposed, with H20 moved ahead of H18 and H19 conditional on decoder
 measurements.
@@ -1010,10 +1011,10 @@ Design: the store gains `control_slots`, a semaphore mirroring the existing
 loops are deleted. Sub-agent completion subscribes to the existing
 `settlements` watch; MCP cancellation uses a watch.
 
-H23 slice 1 introduces the shared `control_slots` capacity bound and uses
-waiting admission only for child outcome reads. H20 extends that mechanism
-to the remaining lifecycle callers and removes the existing polling loops;
-the first H23 slice does not qualify those broader changes or the fairness gate.
+H23 introduces the shared `control_slots` capacity bound and uses waiting
+admission for child outcome reads and owned-child cancellation. H20 extends
+that mechanism to the remaining lifecycle callers and removes the existing
+polling loops; H23 does not qualify those broader changes or the fairness gate.
 
 Gates: cancellation ≤100 ms under load; command acknowledgement tail; the
 carried eight-stream output service gap ≤20 ms. Queue admission, dequeue,
@@ -1043,7 +1044,10 @@ audit }` feeds one `settle_run` with the null guard; `PersistenceFault
 that lands, `sessions.rs` is split into `sessions/{codec, events, snapshots,
 transcript, claim, streaming, tool_calls, settlement, compaction,
 commands}.rs` with tests under `sessions/tests/`, as a separate mechanical
-commit.
+commit. The settlement interface must also make successful execution teardown
+a prerequisite for publishing a terminal event or releasing session ownership.
+H23 fixes the existing branches explicitly; H21 makes that ordering structural
+so a new branch cannot silently bypass child and local-tool drain.
 
 Gates: none directly (about five fewer allocations per persisted event).
 This is correctness plus roughly 700 fewer implementation lines. The HTTP
@@ -1453,7 +1457,7 @@ credential-lease caching, MCP bounds, and provider prompt-cache determinism.
 | H20 | Wake-driven control admission; polling loops removed; carried ≤20 ms output-fairness gate (D8) | H16, H23–H26 | `qq-core` |
 | H21 | `RunIdentity`, `PersistenceFault`, one settlement path, `sessions.rs` split (D9) | H15–H17, H20 | `qq-core` |
 | H22 | Bundled cold-path and structural fixes: config/auth load, protocol boxing and limits, route tables, TUI index and tail | None | Per crate |
-| H23 | Supervised-child ownership across admission, overload, steering, and cleanup; first active repair | Supervised-delegation D4 | `qq-core` |
+| H23 | Supervised-child ownership across admission, overload, steering, and cleanup; implemented and validated on Linux, Windows qualification open | Supervised-delegation D4 | `qq-core` |
 | H24 | Recompute remaining child budgets at sequential admission; define parallel fanout semantics | Supervised-delegation D2 | `qq-core` |
 | H25 | Live provider/MCP credential binding invalidation without secret-bearing durable identities | H2, H7 | Root, auth, MCP wiring |
 | H26 | Bounded workspace-feed admission and lifecycle | H15 | `qq-core`, server fixtures |
@@ -1650,8 +1654,9 @@ is still live.
 The second establishes owned admission and cleanup across interrupting steering
 and parent termination, including locally owned mutation/process quiescence.
 A durable terminal event is not by itself proof of execution teardown. H23
-stays open until both slices are qualified; this split does not defer its
-cleanup acceptance to H12.
+requires both slices' failure and cleanup fixtures; this split does not defer
+that acceptance to H12. Both slices now pass on Linux. Native Windows cleanup
+qualification remains open and must not be inferred from Linux tests.
 
 Each repair carries the acceptance fixtures in the follow-up audit table,
 workspace checks, and its relevant latency/resource measurements. Do not
@@ -1699,9 +1704,68 @@ the full H0 regression gate or the carried H20 ≤20 ms service-gap target.
 Repeat the controlled tail comparison before closing H23; the existing
 absolute control/cancellation/gap budgets were not exceeded in these samples.
 
-Interrupting steering, creation whose awaiter disappears, cancellation admission
-failure, and execution teardown remain the next required H23 slice. This receipt
-does not establish mutation/process quiescence or complete H20 qualification.
+This first-slice receipt does not establish mutation/process quiescence.
+Owned admission, steering, and teardown are covered by the second slice below.
+
+#### H23 Slice 2 Receipt — 2026-09-04
+
+Implemented and locally validated on Linux. Child admission now has a bounded
+owner that survives dropped result waiters, retains started loader work and
+permits, and awaits accepted creation through its reply. Interrupting steering
+cancels and drains owned children before continuation. Child spend remains
+keyed by tool-call identity until charged and synchronously acknowledged, so a
+completed-but-unconsumed result is neither lost nor charged twice. Audit children
+use the same ownership boundary; both interrupting and queued steering received
+during an audit reach the next parent request.
+
+Started runs drop dispatch and drain children, blocking file operations, and
+owned shell tasks before terminal settlement can release the session. A native
+write already inside atomic apply may finish; parent and queued replacement
+writers wait for its exit. Shell tasks retain ownership through kill and reap;
+a panic or failed termination/reap makes cleanup unconfirmed and fails the
+runtime closed. Windows explicitly kills the owned child before waiting.
+External MCP effects and detached or escaped processes remain uncertain;
+interruption never implies rollback or authorizes an automatic retry.
+
+Public-session regressions cover held creation replies, exact interrupted-child
+spend, audit steering, failed cancellation persistence, unconfirmed process
+exit, native writes held across steering/cancellation/reentrant cleanup/shutdown,
+and shutdown during real blocking loader work. Tool regressions cover dropped
+waiters, full shell-output queues, and panic cleanup. Independent Standards and
+Spec reviewers challenged the ownership and failure cases; neither found a
+remaining implementation blocker. H21 now explicitly owns making successful
+teardown a structural prerequisite of the settlement interface.
+
+Validation after integration with the concurrent provider/configuration commits:
+workspace tests (1158 passed, 3 ignored), formatting, strict
+all-target/all-feature workspace Clippy, and workspace build pass. Tests used
+local loopback access with this host's NO_COLOR unset. No protocol, descriptor,
+schema, or dependency changes. Native Windows tests were added but were not
+executed on Windows.
+
+Focused performance qualification: 30 alternating baseline/candidate pairs
+per case, release workers on the same host/filesystem without concurrent builds
+or tests. Baseline is 036329a; candidate includes both H23 slices. Values are
+nearest-rank median / p95, matching the xtask convention, in milliseconds
+except RSS in MiB.
+
+| Metric | Baseline | H23 slices 1 + 2 |
+| --- | ---: | ---: |
+| Eight-stream completion | 286.81 / 320.69 | 285.16 / 311.12 |
+| Control call latency upper bound | 19.51 / 25.37 | 19.06 / 24.51 |
+| Cancellation to finished | 28.12 / 33.31 | 26.08 / 32.06 |
+| Maximum output service gap | 24.00 / 32.00 | 23.00 / 29.00 |
+| Eight-stream peak temporary RSS | 8.52 / 9.36 | 8.86 / 9.85 |
+| One-MiB shell-output completion | 92.22 / 115.41 | 94.31 / 101.14 |
+| Shell peak temporary RSS | 3.86 / 4.04 | 4.05 / 4.31 |
+
+These cases stay within their existing relative and absolute p95 budgets.
+The earlier sample's elevated candidate tails did not recur; RSS p95 increased
+5.2% for streams and 6.6% for shell, within the 25% budget. This qualifies the
+focused comparison, not the complete H0 suite. The carried H20 output-gap
+target of at most 20 ms is still unmet (candidate p95 29 ms). Native Windows
+teardown remains an explicit platform qualification gap. H24–H26 still precede
+Phase 6; H24 is the next implementation slice.
 
 ### Phase 6 — Finish Fairness, Shrink Per-Run Work, And Consolidate
 
@@ -1988,7 +2052,8 @@ The speed-first extensible backend is complete when:
 - product integrations remain clients of one durable QQ runtime.
 
 Until those conditions are met, the immediate implementation boundary is
-Phase 5a (H23–H26), beginning with H23 supervised-child ownership. Phase 6
+Phase 5a: H24 child budgets next, then H25–H26, with H23 native Windows
+qualification still open. Phase 6
 then starts with H20 and the early correctness repairs (behavioral H21,
 H27–H28, correctness H22), followed by H18, measured H19, and mechanical
 consolidation. Phase 5 shipped on 2026-09-04 with its output-service-gap gate

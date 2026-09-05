@@ -360,7 +360,7 @@ H23 follow-up acceptance:
   for control-lane capacity; no polling interval is added. A hard store error
   fails the runtime and signals the child instead of returning a resumable
   tool error that lets the parent resume while its child is live.
-- The next ownership slice covers interrupting steering before the creation
+- Owned admission and cleanup cover interrupting steering before the creation
   reply, cancellation admission failure, and parent continuation or a queued
   replacement run. A durable terminal event alone is not an execution-stopped
   acknowledgement: the child stream and locally owned mutators/processes must
@@ -370,7 +370,15 @@ H23 follow-up acceptance:
   Preserve uncertainty for external effects; stopping QQ dispatch cannot prove
   a remote MCP effect was undone, and must never trigger an implicit retry.
 
-H23 remains open until both slices pass their failure and cleanup fixtures.
+Both H23 slices now pass their failure and cleanup fixtures on Linux. Owned
+children retain creation, loader work, and permits across waiter cancellation;
+spend is charged and acknowledged exactly once. Parent continuation and terminal
+settlement await child and local-tool drain. Audit steering uses the same
+boundary. Native Windows teardown tests are added but remain unqualified on
+Windows; remote MCP effects and detached processes remain uncertain. See the
+[H23 slice 2 receipt](speed-first-extensible-agent-harness.md#h23-slice-2-receipt--2026-09-04)
+for validation and latency/resource results. H24 remaining-budget admission is
+the next implementation slice; it is not repaired by H23.
 
 Reviewer widening. `ReviewRequest` gains bounded `arguments` (16 KiB),
 `task_brief` (the child's brief, 8 KiB), `origin: Root | Child { depth,

@@ -640,13 +640,16 @@ remain the only user-level terminal conditions; provider adapters do not
 participate in slice rollover.
 
 Once prompt submission commits, the runtime owns that accepted run until it
-persists exactly one terminal `RunFinished` event. A run-task panic becomes a
-durable server failure. A headless output or trace failure requests ordinary
+persists exactly one terminal `RunFinished` event. Before settling started
+execution, it drops dispatch and drains owned child tasks and local tool work.
+A run-task panic becomes a durable server failure only after that cleanup
+succeeds; unconfirmed cleanup makes the runtime unavailable instead. A headless output or trace failure requests ordinary
 durable cancellation and waits for the matching terminal event; dropping the
 headless owner starts the same bounded cleanup in the background. Explicit
 runtime shutdown first closes command and child-run admission and stops run
 claiming, then cancels every queued or running run and waits for the store to
-report no unfinished work. Snapshots and subscriptions remain readable while
+report no unfinished work and for admitted preparation and execution to exit.
+Snapshots and subscriptions remain readable while
 and after shutdown so callers can observe the settled state. An embedded HTTP
 owner first stops accepting connections, settles the runtime, and only then
 waits for a bounded response drain; a long-lived SSE subscriber cannot prevent
@@ -658,7 +661,7 @@ in-flight tool calls interrupted before scheduling resumes. Committed turns
 remain authoritative, interrupted side effects are never re-executed, and
 queued work that never started may still be claimed normally.
 
-`spawn_agent` creates a read-only child session, its queued prompt run, and the
+`spawn_agent` creates an authority-limited child session, its queued prompt run, and the
 parent-run ownership link in one store transaction. The ordered
 `SessionCreated` and `PromptQueued` events are published only after that fully
 initialized state commits. The child is therefore either absent or durably
@@ -668,6 +671,22 @@ child when it interrupts the owning parent. Parent cancellation uses the same
 durable ownership link for in-process children. Once a child completes, only
 its final committed model turn's text or refusal is returned to the parent;
 earlier turns remain visible in the child's authoritative transcript.
+
+An owned child task retains admission, loader work, and the writer permit even
+if an interrupting parent drops its result waiter. Accepted creation is awaited
+through its transaction reply. Child outcome reads and cancellation wait for
+bounded control-lane capacity; a hard failure preserves uncertain ownership and
+fails the runtime. Child spend remains available until the parent charges and
+acknowledges it, including when steering interrupts a completed result. Audits
+use the same child ownership and accounting boundary.
+
+Local tool ownership extends through blocking file work and shell termination
+and reap. A parent, or a replacement run in its session, cannot start another
+write while a supervised child is draining. Cancellation does not undo a native
+write already inside its atomic apply step. Unix shell process groups are killed
+on interruption; Windows explicitly terminates the owned child process. Detached
+or escaped processes and remote MCP effects are not proven undone by stopping
+QQ dispatch, and uncertain effects are never implicitly retried.
 
 Which model a child runs is decided at one choke point from the delegation
 roster. The root translates the configured `delegation` section (or, as sugar,
@@ -827,7 +846,8 @@ modify the same checkout concurrently. When *parallel* editing subagents are
 introduced, each receives an isolated Git worktree or sandbox and returns a
 patch for central review and integration. A single serialized `Supervised`
 write child shares its parent's checkout: the parent is blocked while it runs,
-sibling writers serialize on a per-run permit, and every mutating call it makes
+sibling writers serialize on a per-run permit retained through local execution
+teardown, and every mutating call it makes
 is adjudicated before it executes. Read-only research agents may be
 parallelized earlier.
 
