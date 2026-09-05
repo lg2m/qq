@@ -385,7 +385,7 @@ pub(in crate::sessions) fn open_database(
         }
         Some(
             "10" | "11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21"
-            | "22" | "23" | "24",
+            | "22" | "23" | "24" | "25",
         ) => {}
         Some(_) => return Err(SessionRuntimeError::Persistence),
     }
@@ -405,6 +405,7 @@ pub(in crate::sessions) fn open_database(
                 | "22"
                 | "23"
                 | "24"
+                | "25"
         )
     ) {
         let transaction = connection
@@ -436,6 +437,7 @@ pub(in crate::sessions) fn open_database(
                 | "22"
                 | "23"
                 | "24"
+                | "25"
         )
     ) {
         let transaction = connection
@@ -454,7 +456,20 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24")
+        Some(
+            "13" | "14"
+                | "15"
+                | "16"
+                | "17"
+                | "18"
+                | "19"
+                | "20"
+                | "21"
+                | "22"
+                | "23"
+                | "24"
+                | "25"
+        )
     ) {
         let transaction = connection
             .transaction()
@@ -472,7 +487,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24")
+        Some("14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24" | "25")
     ) {
         let transaction = connection
             .transaction()
@@ -491,7 +506,7 @@ pub(in crate::sessions) fn open_database(
     validate_model_turn_audit_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24")
+        Some("15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24" | "25")
     ) {
         let transaction = connection
             .transaction()
@@ -524,7 +539,7 @@ pub(in crate::sessions) fn open_database(
     validate_linear_streaming_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24")
+        Some("16" | "17" | "18" | "19" | "20" | "21" | "22" | "23" | "24" | "25")
     ) {
         let transaction = connection
             .transaction()
@@ -545,7 +560,7 @@ pub(in crate::sessions) fn open_database(
     }
     if !matches!(
         schema_version.as_deref(),
-        Some("17" | "18" | "19" | "20" | "21" | "22" | "23" | "24")
+        Some("17" | "18" | "19" | "20" | "21" | "22" | "23" | "24" | "25")
     ) {
         let transaction = connection
             .transaction()
@@ -565,7 +580,7 @@ pub(in crate::sessions) fn open_database(
     validate_preparing_run_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("18" | "19" | "20" | "21" | "22" | "23" | "24")
+        Some("18" | "19" | "20" | "21" | "22" | "23" | "24" | "25")
     ) {
         let transaction = connection
             .transaction()
@@ -585,7 +600,7 @@ pub(in crate::sessions) fn open_database(
     validate_context_occupancy_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("19" | "20" | "21" | "22" | "23" | "24")
+        Some("19" | "20" | "21" | "22" | "23" | "24" | "25")
     ) {
         let transaction = connection
             .transaction()
@@ -605,7 +620,7 @@ pub(in crate::sessions) fn open_database(
     validate_run_limits_schema(&connection)?;
     if !matches!(
         schema_version.as_deref(),
-        Some("20" | "21" | "22" | "23" | "24")
+        Some("20" | "21" | "22" | "23" | "24" | "25")
     ) {
         let transaction = connection
             .transaction()
@@ -621,7 +636,10 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("21" | "22" | "23" | "24")) {
+    if !matches!(
+        schema_version.as_deref(),
+        Some("21" | "22" | "23" | "24" | "25")
+    ) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -636,7 +654,7 @@ pub(in crate::sessions) fn open_database(
             .commit()
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
-    if !matches!(schema_version.as_deref(), Some("22" | "23" | "24")) {
+    if !matches!(schema_version.as_deref(), Some("22" | "23" | "24" | "25")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -652,7 +670,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_output_truncation_schema(&connection)?;
-    if !matches!(schema_version.as_deref(), Some("23" | "24")) {
+    if !matches!(schema_version.as_deref(), Some("23" | "24" | "25")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -668,7 +686,7 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_session_depth_schema(&connection)?;
-    if schema_version.as_deref() != Some("24") {
+    if !matches!(schema_version.as_deref(), Some("24" | "25")) {
         let transaction = connection
             .transaction()
             .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -684,6 +702,22 @@ pub(in crate::sessions) fn open_database(
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
     validate_audit_schema(&connection)?;
+    if schema_version.as_deref() != Some("25") {
+        let transaction = connection
+            .transaction()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        add_fast_path_columns(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET value = '25' WHERE key = 'schema_version'",
+                [],
+            )
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+        transaction
+            .commit()
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    validate_fast_path_schema(&connection)?;
     let stored = connection
         .query_row(
             "SELECT value FROM metadata WHERE key = 'store_id'",
@@ -1562,6 +1596,48 @@ fn validate_audit_schema(connection: &Connection) -> Result<(), SessionRuntimeEr
         return Err(SessionRuntimeError::Persistence);
     }
     if column_shape(connection, "runs", "audit_json")? != ("TEXT".to_owned(), false, None, 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    Ok(())
+}
+
+/// Schema 25: the command-acknowledgement fast path.
+///
+/// `runs.activity` is the run's latest `RunActivityChanged` value, written in
+/// the same transaction as the event so the session summary reads a column
+/// instead of scanning the event log. It is null for runs recorded before
+/// this version and for runs that have not reported activity, which clients
+/// already tolerate. `metadata.command_count` replaces the per-command
+/// `COUNT(*)` over `commands`; it is backfilled from the table once.
+fn add_fast_path_columns(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if !has_column(connection, "runs", "activity")? {
+        connection
+            .execute("ALTER TABLE runs ADD COLUMN activity TEXT", [])
+            .map_err(|_| SessionRuntimeError::Persistence)?;
+    }
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO metadata(key, value)
+             VALUES ('command_count', (SELECT COUNT(*) FROM commands))",
+            [],
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    Ok(())
+}
+
+fn validate_fast_path_schema(connection: &Connection) -> Result<(), SessionRuntimeError> {
+    if column_shape(connection, "runs", "activity")? != ("TEXT".to_owned(), false, None, 0) {
+        return Err(SessionRuntimeError::Persistence);
+    }
+    let counted: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'command_count'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    if counted.is_none() {
         return Err(SessionRuntimeError::Persistence);
     }
     Ok(())

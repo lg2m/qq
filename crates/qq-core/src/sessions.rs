@@ -359,6 +359,13 @@ struct ClaimedRun {
     input: Vec<InputPart>,
     /// Agent profile the session selected at claim time.
     profile: AgentProfileId,
+    /// State the executor needs before its first provider request, read in
+    /// the claim transaction so it needs no further store round trips: the
+    /// cancellation flag as of the claim, the session's known file hashes,
+    /// and steering queued before the run started.
+    cancel_requested: bool,
+    file_state: Vec<(String, String)>,
+    pending_steering: Vec<crate::runtime::SteeringMessage>,
 }
 
 impl ClaimedRun {
@@ -385,6 +392,9 @@ impl ClaimedRun {
             limits: RunLimits::default(),
             input: Vec::new(),
             profile: self.profile.clone(),
+            cancel_requested: false,
+            file_state: Vec::new(),
+            pending_steering: Vec::new(),
             approval_mode: self.approval_mode,
             depth: self.depth,
             root_run_id: self.root_run_id,
@@ -903,11 +913,15 @@ fn create_child_run(
     })
 }
 
+/// `canonical_workspace` is the resolved path for `ResolveWorkspace`, computed
+/// by the caller on a blocking thread; the command itself is journaled as
+/// submitted so idempotency compares what the client sent.
 fn execute_command(
     connection: &mut Connection,
     store_id: StoreId,
     command_id: CommandId,
     command: SessionCommand,
+    canonical_workspace: Option<Result<String, SessionRuntimeError>>,
     seed: &WorkspaceGrantSeed,
 ) -> Result<AppliedCommand, SessionRuntimeError> {
     let request_json =
@@ -948,8 +962,13 @@ fn execute_command(
                 .map_err(|_| SessionRuntimeError::Persistence)?,
         });
     }
+    // The counter is maintained beside every insert (schema 25) so the bound
+    // costs one row read instead of a table scan per command.
     let command_count: u32 = connection
-        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .prepare_cached("SELECT value FROM metadata WHERE key = 'command_count'")
+        .and_then(|mut statement| statement.query_row([], |row| row.get::<_, String>(0)))
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .parse()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     if command_count >= MAX_COMMANDS {
         return Err(SessionRuntimeError::CommandLimitReached);
@@ -960,19 +979,9 @@ fn execute_command(
     let mut grant_promotion_pending = false;
     let mut cascade_cancels = Vec::new();
     let (receipt, schedule) = match command {
-        SessionCommand::ResolveWorkspace { path } => {
-            let path = path.trim();
-            if path.is_empty() {
-                return Err(SessionRuntimeError::EmptyWorkspace);
-            }
-            let canonical =
-                std::fs::canonicalize(path).map_err(|_| SessionRuntimeError::InvalidWorkspace)?;
-            if !canonical.is_dir() {
-                return Err(SessionRuntimeError::InvalidWorkspace);
-            }
-            let path = canonical
-                .to_str()
-                .ok_or(SessionRuntimeError::InvalidWorkspace)?;
+        SessionCommand::ResolveWorkspace { .. } => {
+            let canonical = canonical_workspace.ok_or(SessionRuntimeError::InvalidWorkspace)??;
+            let path = canonical.as_str();
             let existing = transaction
                 .query_row(
                     "SELECT id, next_sequence FROM workspaces WHERE path = ?1",
@@ -2102,6 +2111,13 @@ fn execute_command(
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
     transaction
+        .prepare_cached(
+            "UPDATE metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+             WHERE key = 'command_count'",
+        )
+        .and_then(|mut statement| statement.execute([]))
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
     Ok(AppliedCommand {
@@ -2361,6 +2377,12 @@ fn reserve_next_run_recoverable(
             )
             .map_err(|_| SessionRuntimeError::Persistence)?;
     }
+    // Everything the executor reads before its first provider request rides
+    // the claim transaction, so claim-to-send is two store hops: this one and
+    // the `RunStarted` publication.
+    let cancel_requested = run_cancel_requested(&transaction, run_id)?;
+    let file_state = session_file_state_rows(&transaction, session_id)?;
+    let pending_steering = pending_steering_rows(&transaction, run_id)?;
     transaction
         .commit()
         .map_err(|_| SessionRuntimeError::Persistence)?;
@@ -2386,6 +2408,9 @@ fn reserve_next_run_recoverable(
         approval_mode,
         depth,
         root_run_id,
+        cancel_requested,
+        file_state,
+        pending_steering,
         purpose,
     }))
 }
@@ -2620,6 +2645,11 @@ fn start_auto_compaction(
             depth: original.depth,
             root_run_id: original.root_run_id,
             purpose: original.purpose,
+            // A compaction run starts inside this transaction: nothing can have
+            // cancelled it yet, and it steers and edits no files.
+            cancel_requested: false,
+            file_state: Vec::new(),
+            pending_steering: Vec::new(),
         },
         started,
     )))
@@ -3397,15 +3427,22 @@ fn append_run_activity(
     activity: RunActivity,
 ) -> Result<SessionEventEnvelope, SessionRuntimeError> {
     let transaction = store::begin_unit(connection)?;
+    // The column and the event commit together, so the summary query reads
+    // the same value a replaying client would reconstruct.
     let running = transaction
-        .query_row(
-            "SELECT 1 FROM runs WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
-            params![claimed.run_id.to_string(), claimed.session_id.to_string()],
-            |_| Ok(()),
+        .prepare_cached(
+            "UPDATE runs SET activity = ?3
+             WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
         )
-        .optional()
+        .and_then(|mut statement| {
+            statement.execute(params![
+                claimed.run_id.to_string(),
+                claimed.session_id.to_string(),
+                run_activity_column(activity),
+            ])
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    if running.is_none() {
+    if running != 1 {
         return Err(SessionRuntimeError::Unavailable);
     }
     let event = append_event(
@@ -4996,6 +5033,9 @@ fn settle_panicked_execution(
                 approval_mode: original.approval_mode,
                 depth: original.depth,
                 root_run_id: original.root_run_id,
+                cancel_requested: false,
+                file_state: Vec::new(),
+                pending_steering: Vec::new(),
                 purpose: original.purpose,
             };
             events.push(complete_run_in_transaction(
@@ -5378,6 +5418,9 @@ fn recover_interrupted_runs(
             approval_mode: ApprovalMode::default(),
             depth: 0,
             root_run_id: run_id,
+            cancel_requested: false,
+            file_state: Vec::new(),
+            pending_steering: Vec::new(),
             purpose: SessionPurpose::Task,
         };
         let event =
@@ -5579,9 +5622,17 @@ fn load_snapshot(
         .map_err(|_| SessionRuntimeError::Persistence)?;
     drop(statement);
     let has_older_sessions = ids.len() > usize::from(request.session_limit);
+    // One grouped pass over the workspace's runs supplies every summary's
+    // accounting instead of a subtree query per session.
+    let mut folds = load_accounting_folds(&transaction, None, request.workspace_id)?;
     let mut sessions = Vec::with_capacity(ids.len().min(usize::from(request.session_limit)));
     for id in ids.into_iter().take(usize::from(request.session_limit)) {
-        sessions.push(load_session_summary(&transaction, parse_id(&id)?)?);
+        let accounting = folds.remove(&id).unwrap_or_default().total();
+        sessions.push(load_session_summary_with_accounting(
+            &transaction,
+            parse_id(&id)?,
+            accounting,
+        )?);
     }
     let focused = request
         .focused_session_id
@@ -5768,6 +5819,64 @@ fn read_published_events(
         .collect()
 }
 
+fn run_cancel_requested(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<bool, SessionRuntimeError> {
+    connection
+        .prepare_cached("SELECT cancel_requested FROM runs WHERE id = ?1")
+        .and_then(|mut statement| {
+            statement
+                .query_row([run_id.to_string()], |row| row.get(0))
+                .optional()
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .ok_or(SessionRuntimeError::RunNotFound)
+}
+
+fn session_file_state_rows(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Vec<(String, String)>, SessionRuntimeError> {
+    let mut statement = connection
+        .prepare_cached("SELECT path, content_hash FROM session_files WHERE session_id = ?1")
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    statement
+        .query_map([session_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)
+}
+
+fn pending_steering_rows(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Vec<crate::runtime::SteeringMessage>, SessionRuntimeError> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT id, output FROM messages
+             WHERE run_id = ?1 AND steering = 1 AND state = 'queued' ORDER BY ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let rows = statement
+        .query_map([run_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    rows.into_iter()
+        .map(|(id, text)| {
+            Ok(crate::runtime::SteeringMessage {
+                message_id: parse_id(&id)?,
+                text,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct EventContext {
     store_id: StoreId,
@@ -5893,50 +6002,105 @@ impl AccountingAggregate {
     }
 }
 
+/// Per-session direct and inclusive aggregates, folded from run rows. The
+/// default is known-zero: a session with no runs has spent nothing.
+struct SessionAccountingFold {
+    direct: AccountingAggregate,
+    inclusive: AccountingAggregate,
+}
+
+impl Default for SessionAccountingFold {
+    fn default() -> Self {
+        Self {
+            direct: AccountingAggregate::known_zero(),
+            inclusive: AccountingAggregate::known_zero(),
+        }
+    }
+}
+
+impl SessionAccountingFold {
+    fn total(self) -> SessionAccounting {
+        SessionAccounting {
+            direct: self.direct.total(),
+            inclusive: self.inclusive.total(),
+        }
+    }
+}
+
+/// The accounting query for one root or for every session in a workspace:
+/// each row is one run in the bounded subtree of `root`, tagged with that
+/// root so one pass can fold every session at once.
+const ACCOUNTING_ROWS_SQL: &str = "WITH RECURSIVE subtree(root, id, depth) AS (
+         SELECT id, id, 0 FROM sessions WHERE (?1 IS NULL AND workspace_id = ?2) OR id = ?1
+         UNION ALL
+         SELECT subtree.root, child.id, subtree.depth + 1
+         FROM sessions child JOIN subtree ON child.parent_id = subtree.id
+         WHERE subtree.depth < ?3
+     )
+     SELECT subtree.root, r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos,
+            EXISTS(SELECT 1 FROM model_turns turn WHERE turn.run_id = r.id),
+            r.started_at_ms
+     FROM runs r
+     JOIN subtree ON subtree.id = r.session_id
+     ORDER BY r.rowid";
+
 fn load_session_accounting(
     connection: &Connection,
     session_id: SessionId,
 ) -> Result<SessionAccounting, SessionRuntimeError> {
+    let mut folds = load_accounting_folds(
+        connection,
+        Some(session_id),
+        WorkspaceId::from_bytes([0; 16]),
+    )?;
+    Ok(folds
+        .remove(&session_id.to_string())
+        .unwrap_or_default()
+        .total())
+}
+
+/// Folds run rows into per-root accounting. `Some(root)` scopes to one
+/// session's subtree; `None` covers every session in `workspace_id` in one
+/// grouped pass, which is what a snapshot needs.
+fn load_accounting_folds(
+    connection: &Connection,
+    root: Option<SessionId>,
+    workspace_id: WorkspaceId,
+) -> Result<HashMap<String, SessionAccountingFold>, SessionRuntimeError> {
     // Inclusive totals are the bounded subtree, computed from run rows every
     // time: never a sum of cached child inclusives, which could double count
     // or go stale. The depth bound is the runtime's, so a store touched by a
     // deeper future build still reads back the same tree this build runs.
     let mut statement = connection
-        .prepare(
-            "WITH RECURSIVE subtree(id, depth) AS (
-                 SELECT ?1, 0
-                 UNION ALL
-                 SELECT child.id, subtree.depth + 1
-                 FROM sessions child JOIN subtree ON child.parent_id = subtree.id
-                 WHERE subtree.depth < ?2
-             )
-             SELECT r.session_id, r.status, r.usage_json, r.estimated_cost_usd_nanos,
-                    EXISTS(SELECT 1 FROM model_turns turn WHERE turn.run_id = r.id),
-                    r.started_at_ms
-             FROM runs r
-             JOIN subtree ON subtree.id = r.session_id
-             ORDER BY r.rowid",
-        )
+        .prepare_cached(ACCOUNTING_ROWS_SQL)
         .map_err(|_| SessionRuntimeError::Persistence)?;
     let rows = statement
-        .query_map(params![session_id.to_string(), MAX_CHILD_DEPTH], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<u64>>(3)?,
-                row.get::<_, bool>(4)?,
-                row.get::<_, Option<u64>>(5)?,
-            ))
-        })
+        .query_map(
+            params![
+                root.map(|root| root.to_string()),
+                workspace_id.to_string(),
+                MAX_CHILD_DEPTH
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<u64>>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<u64>>(6)?,
+                ))
+            },
+        )
         .map_err(|_| SessionRuntimeError::Persistence)?;
 
-    let session_id = session_id.to_string();
-    let mut direct = AccountingAggregate::known_zero();
-    let mut inclusive = AccountingAggregate::known_zero();
+    let mut folds: HashMap<String, SessionAccountingFold> = HashMap::new();
     for row in rows {
-        let (owner_id, status, encoded_usage, cost, saw_turn, started_at_ms) =
+        let (session_id, owner_id, status, encoded_usage, cost, saw_turn, started_at_ms) =
             row.map_err(|_| SessionRuntimeError::Persistence)?;
+        let fold = folds.entry(session_id.clone()).or_default();
+        let SessionAccountingFold { direct, inclusive } = fold;
         let Some(encoded_usage) = encoded_usage else {
             let terminal = matches!(
                 status.as_str(),
@@ -5969,10 +6133,7 @@ fn load_session_accounting(
             direct.add(usage, cost)?;
         }
     }
-    Ok(SessionAccounting {
-        direct: direct.total(),
-        inclusive: inclusive.total(),
-    })
+    Ok(folds)
 }
 
 fn load_session_summary(
@@ -5980,6 +6141,14 @@ fn load_session_summary(
     session_id: SessionId,
 ) -> Result<SessionSummary, SessionRuntimeError> {
     let accounting = load_session_accounting(connection, session_id)?;
+    load_session_summary_with_accounting(connection, session_id, accounting)
+}
+
+fn load_session_summary_with_accounting(
+    connection: &Connection,
+    session_id: SessionId,
+    accounting: SessionAccounting,
+) -> Result<SessionSummary, SessionRuntimeError> {
     connection
         .query_row(
             "SELECT s.workspace_id, s.parent_id, s.title, s.status, s.active_run_id,
@@ -5988,7 +6157,8 @@ fn load_session_summary(
                       WHERE session_id = s.id AND outcome_json IS NOT NULL
                       ORDER BY finished_at_ms DESC, rowid DESC LIMIT 1),
                      s.owner_run_id, s.spawned_by_tool_call_id, s.profile, s.correlation_json,
-                     s.approval_mode, s.depth, s.purpose
+                     s.approval_mode, s.depth, s.purpose,
+                     (SELECT activity FROM runs WHERE id = s.active_run_id)
               FROM sessions s WHERE s.id = ?1",
             [session_id.to_string()],
             |row| {
@@ -6010,6 +6180,7 @@ fn load_session_summary(
                     row.get::<_, String>(14)?,
                     row.get::<_, u16>(15)?,
                     row.get::<_, String>(16)?,
+                    row.get::<_, Option<String>>(17)?,
                 ))
             },
         )
@@ -6035,11 +6206,12 @@ fn load_session_summary(
                 approval_mode,
                 depth,
                 purpose,
+                activity,
             )| {
                 let direct_cost = accounting.direct.estimated_cost_usd_nanos;
                 let active_run_id: Option<RunId> = active.as_deref().map(parse_id).transpose()?;
                 let activity = match active_run_id {
-                    Some(run_id) => load_run_activity(connection, session_id, run_id)?,
+                    Some(_) => activity.as_deref().map(parse_run_activity).transpose()?,
                     None => None,
                 };
                 let spawned_by = match owner_run {
@@ -6082,44 +6254,23 @@ fn load_session_summary(
             },
         )
 }
-
-/// The latest `RunActivityChanged` recorded for `run_id`, if any. Activity is
-/// only ever persisted as an event, so this scans the session's recent events
-/// newest-first and stops at the first activity or terminal run event.
-fn load_run_activity(
-    connection: &Connection,
-    session_id: SessionId,
-    run_id: RunId,
-) -> Result<Option<RunActivity>, SessionRuntimeError> {
-    // Bounded: one running turn emits a handful of activity changes between
-    // text deltas, so the answer is within the newest few hundred events.
-    const SCAN_LIMIT: usize = 512;
-    let mut statement = connection
-        .prepare(
-            "SELECT envelope_json FROM events
-             WHERE workspace_id = (SELECT workspace_id FROM sessions WHERE id = ?1)
-             ORDER BY sequence DESC LIMIT ?2",
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let rows = statement
-        .query_map(params![session_id.to_string(), SCAN_LIMIT as i64], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    for envelope in rows {
-        let envelope = envelope.map_err(|_| SessionRuntimeError::Persistence)?;
-        let envelope: SessionEventEnvelope =
-            serde_json::from_str(&envelope).map_err(|_| SessionRuntimeError::Persistence)?;
-        if envelope.session_id != session_id || envelope.run_id != Some(run_id) {
-            continue;
-        }
-        match envelope.event {
-            SessionEvent::RunActivityChanged { activity, .. } => return Ok(Some(activity)),
-            SessionEvent::RunStarted { .. } | SessionEvent::RunFinished { .. } => return Ok(None),
-            _ => {}
-        }
+const fn run_activity_column(activity: RunActivity) -> &'static str {
+    match activity {
+        RunActivity::WaitingForProvider => "waiting_for_provider",
+        RunActivity::Reasoning => "reasoning",
+        RunActivity::GeneratingResponse => "generating_response",
+        RunActivity::PreparingToolCall => "preparing_tool_call",
     }
-    Ok(None)
+}
+
+fn parse_run_activity(column: &str) -> Result<RunActivity, SessionRuntimeError> {
+    match column {
+        "waiting_for_provider" => Ok(RunActivity::WaitingForProvider),
+        "reasoning" => Ok(RunActivity::Reasoning),
+        "generating_response" => Ok(RunActivity::GeneratingResponse),
+        "preparing_tool_call" => Ok(RunActivity::PreparingToolCall),
+        _ => Err(SessionRuntimeError::Persistence),
+    }
 }
 
 fn load_message(
@@ -6291,6 +6442,13 @@ fn load_model_context(
         .map(|(context, _)| context)
 }
 
+/// Assembles model context with a fixed number of session-scoped queries:
+/// the prompts (with their run's status and outcome and their assembled
+/// text), every committed model turn for those runs, every recorded tool
+/// result, every applied steering message, and — only for stores that
+/// predate `model_turns` — the legacy assistant rows. Assembly then runs in
+/// memory in prompt order, so the cost is proportional to the context and not
+/// to the number of messages times the number of tables.
 fn load_model_context_with_rewrite_status(
     transaction: &Connection,
     session_id: SessionId,
@@ -6302,23 +6460,134 @@ fn load_model_context_with_rewrite_status(
         .map_or(0, |compaction| compaction.cutoff_ordinal);
     // SQLite integers are i64; `u64::MAX` means "everything".
     let through_ordinal = through_ordinal.min(u64::try_from(i64::MAX).unwrap_or(u64::MAX));
+    let session = session_id.to_string();
+
+    // Prompts in ordinal order, each with its run's status and outcome and its
+    // full text: the base `output` plus every streamed chunk in chunk order.
+    struct Prompt {
+        run_id: String,
+        text: String,
+        status: String,
+        outcome_json: Option<String>,
+    }
     let mut statement = transaction
-        .prepare(
-            "SELECT id FROM messages
-             WHERE session_id = ?1 AND ordinal <= ?2 AND ordinal > ?3
-               AND role = 'user' AND steering = 0
-               AND state IN ('complete', 'cancelled', 'failed', 'interrupted')
-             ORDER BY ordinal",
+        .prepare_cached(
+            "SELECT m.run_id, m.output, r.status, r.outcome_json,
+                    (SELECT group_concat(c.text, '') FROM (
+                         SELECT text FROM message_chunks
+                         WHERE message_id = m.id AND channel = 'output'
+                         ORDER BY chunk_ordinal
+                     ) c)
+             FROM messages m JOIN runs r ON r.id = m.run_id
+             WHERE m.session_id = ?1 AND m.ordinal <= ?2 AND m.ordinal > ?3
+               AND m.role = 'user' AND m.steering = 0
+               AND m.state IN ('complete', 'cancelled', 'failed', 'interrupted')
+             ORDER BY m.ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let message_ids = statement
-        .query_map(
-            params![session_id.to_string(), through_ordinal, cutoff_ordinal],
-            |row| row.get::<_, String>(0),
-        )
+    let prompts = statement
+        .query_map(params![session, through_ordinal, cutoff_ordinal], |row| {
+            let mut text = row.get::<_, String>(1)?;
+            if let Some(chunks) = row.get::<_, Option<String>>(4)? {
+                text.push_str(&chunks);
+            }
+            Ok(Prompt {
+                run_id: row.get(0)?,
+                text,
+                status: row.get(2)?,
+                outcome_json: row.get(3)?,
+            })
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SessionRuntimeError::Persistence)?;
+    drop(statement);
+
+    // Every committed turn for the session's runs, grouped by run.
+    let mut turns: HashMap<String, Vec<(u16, String, bool)>> = HashMap::new();
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT t.run_id, t.turn_ordinal, t.assistant_content_json, t.truncated
+             FROM model_turns t JOIN runs r ON r.id = t.run_id
+             WHERE r.session_id = ?1
+             ORDER BY t.run_id, t.turn_ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let rows = statement
+        .query_map([&session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u16>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    for row in rows {
+        let (run_id, ordinal, content, truncated) =
+            row.map_err(|_| SessionRuntimeError::Persistence)?;
+        turns
+            .entry(run_id)
+            .or_default()
+            .push((ordinal, content, truncated));
+    }
+    drop(statement);
+
+    // Every recorded tool result, keyed by run and provider call id.
+    let mut results: HashMap<String, HashMap<String, (String, bool)>> = HashMap::new();
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT c.run_id, c.provider_call_id, c.result, c.is_error
+             FROM tool_calls c JOIN runs r ON r.id = c.run_id
+             WHERE r.session_id = ?1 AND c.result IS NOT NULL",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let rows = statement
+        .query_map([&session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    for row in rows {
+        let (run_id, call_id, content, is_error) =
+            row.map_err(|_| SessionRuntimeError::Persistence)?;
+        results
+            .entry(run_id)
+            .or_default()
+            .insert(call_id, (content, is_error));
+    }
+    drop(statement);
+
+    // Applied steering, per run, in the order it was applied. Each carries
+    // the ordinal of the turn whose request first included it.
+    let mut steering: HashMap<String, std::collections::VecDeque<(u16, String)>> = HashMap::new();
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT run_id, turn_ordinal, output FROM messages
+             WHERE session_id = ?1 AND steering = 1 AND state = 'complete'
+             ORDER BY run_id, turn_ordinal, ordinal",
+        )
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    let rows = statement
+        .query_map([&session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u16>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| SessionRuntimeError::Persistence)?;
+    for row in rows {
+        let (run_id, ordinal, text) = row.map_err(|_| SessionRuntimeError::Persistence)?;
+        steering
+            .entry(run_id)
+            .or_default()
+            .push_back((ordinal, text));
+    }
     drop(statement);
 
     let mut context = Vec::new();
@@ -6328,48 +6597,37 @@ fn load_model_context_with_rewrite_status(
             compaction.summary
         )));
     }
-    for id in message_ids {
-        let snapshot = load_message(transaction, parse_id(&id)?)?;
-        if snapshot.role != MessageRole::User {
-            return Err(SessionRuntimeError::Persistence);
-        }
-        context.push(Message::user(snapshot.output));
+    for prompt in prompts {
+        context.push(Message::user(prompt.text));
         // Reconstruct each run immediately after its prompt rather than
         // following message-row ordinals. Follow-up prompts can be queued
         // while the prior run is active, so its later committed output still
         // belongs before the follow-up in model context.
-        let status: String = transaction
-            .query_row(
-                "SELECT status FROM runs WHERE id = ?1",
-                [snapshot.run_id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|_| SessionRuntimeError::Persistence)?;
         if matches!(
-            status.as_str(),
+            prompt.status.as_str(),
             "completed" | "cancelled" | "failed" | "interrupted" | "running"
         ) {
-            let has_turns: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM model_turns WHERE run_id = ?1)",
-                    [snapshot.run_id.to_string()],
-                    |row| row.get(0),
-                )
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            if has_turns {
-                append_run_turns(transaction, snapshot.run_id, &mut context)?;
-            } else {
-                append_legacy_run_messages(transaction, snapshot.run_id, &mut context)?;
+            match turns.remove(&prompt.run_id) {
+                Some(run_turns) => append_run_turns(
+                    run_turns,
+                    results.remove(&prompt.run_id).unwrap_or_default(),
+                    steering.remove(&prompt.run_id).unwrap_or_default(),
+                    &mut context,
+                )?,
+                None => append_legacy_run_messages(
+                    transaction,
+                    parse_id(&prompt.run_id)?,
+                    &mut context,
+                )?,
             }
         }
-        if matches!(status.as_str(), "cancelled" | "failed" | "interrupted") {
-            let outcome_json: String = transaction
-                .query_row(
-                    "SELECT outcome_json FROM runs WHERE id = ?1",
-                    [snapshot.run_id.to_string()],
-                    |row| row.get(0),
-                )
-                .map_err(|_| SessionRuntimeError::Persistence)?;
+        if matches!(
+            prompt.status.as_str(),
+            "cancelled" | "failed" | "interrupted"
+        ) {
+            let outcome_json = prompt
+                .outcome_json
+                .ok_or(SessionRuntimeError::Persistence)?;
             let outcome: RunOutcome = serde_json::from_str(&outcome_json)
                 .map_err(|_| SessionRuntimeError::Persistence)?;
             if let Some(notice) = runtime_notice(&outcome) {
@@ -6381,31 +6639,47 @@ fn load_model_context_with_rewrite_status(
     Ok((context, context_rewritten))
 }
 
+/// Assistant rows from stores that predate `model_turns`: one query per such
+/// run, which only legacy sessions ever pay.
 fn append_legacy_run_messages(
     connection: &Connection,
     run_id: RunId,
     context: &mut Vec<Message>,
 ) -> Result<(), SessionRuntimeError> {
     let mut statement = connection
-        .prepare(
-            "SELECT id FROM messages
-             WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
-             ORDER BY turn_ordinal, ordinal",
+        .prepare_cached(
+            "SELECT m.output, m.refusal,
+                    (SELECT group_concat(c.text, '') FROM (
+                         SELECT text FROM message_chunks
+                         WHERE message_id = m.id AND channel = 'output'
+                         ORDER BY chunk_ordinal
+                     ) c),
+                    (SELECT group_concat(c.text, '') FROM (
+                         SELECT text FROM message_chunks
+                         WHERE message_id = m.id AND channel = 'refusal'
+                         ORDER BY chunk_ordinal
+                     ) c)
+             FROM messages m
+             WHERE m.run_id = ?1 AND m.role = 'assistant' AND m.state = 'complete'
+             ORDER BY m.turn_ordinal, m.ordinal",
         )
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    let message_ids = statement
-        .query_map([run_id.to_string()], |row| row.get::<_, String>(0))
-        .map_err(|_| SessionRuntimeError::Persistence)?
-        .collect::<Result<Vec<_>, _>>()
+    let rows = statement
+        .query_map([run_id.to_string()], |row| {
+            let mut output = row.get::<_, String>(0)?;
+            let mut refusal = row.get::<_, String>(1)?;
+            if let Some(chunks) = row.get::<_, Option<String>>(2)? {
+                output.push_str(&chunks);
+            }
+            if let Some(chunks) = row.get::<_, Option<String>>(3)? {
+                refusal.push_str(&chunks);
+            }
+            Ok((output, refusal))
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?;
-    drop(statement);
-    for message_id in message_ids {
-        let message = load_message(connection, parse_id(&message_id)?)?;
-        let content = if message.output.is_empty() {
-            message.refusal
-        } else {
-            message.output
-        };
+    for row in rows {
+        let (output, refusal) = row.map_err(|_| SessionRuntimeError::Persistence)?;
+        let content = if output.is_empty() { refusal } else { output };
         if !content.trim().is_empty() {
             context.push(Message::assistant(content));
         }
@@ -6772,47 +7046,16 @@ fn compaction_instruction(
 
 /// Replays one run's persisted model turns (assistant content and tool
 /// results) into `context`, in turn order.
+/// Replays one run's committed turns into `context`: each assistant turn,
+/// then exactly one result per `ToolCall` block in block order, with applied
+/// steering placed immediately before the turn whose request first carried it
+/// and the continuation notice after a truncated turn.
 fn append_run_turns(
-    transaction: &Connection,
-    run_id: RunId,
+    turns: Vec<(u16, String, bool)>,
+    mut recorded: HashMap<String, (String, bool)>,
+    mut steering: std::collections::VecDeque<(u16, String)>,
     context: &mut Vec<Message>,
 ) -> Result<(), SessionRuntimeError> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT turn_ordinal, assistant_content_json, truncated FROM model_turns
-             WHERE run_id = ?1 ORDER BY turn_ordinal",
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let turns = statement
-        .query_map([run_id.to_string()], |row| {
-            Ok((
-                row.get::<_, u16>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })
-        .map_err(|_| SessionRuntimeError::Persistence)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    drop(statement);
-    // Applied steering carries the ordinal of the turn whose request first
-    // included it; it is replayed as a user message immediately before that
-    // turn, after the preceding turn's tool results.
-    let mut statement = transaction
-        .prepare(
-            "SELECT turn_ordinal, output FROM messages
-             WHERE run_id = ?1 AND steering = 1 AND state = 'complete'
-             ORDER BY turn_ordinal, ordinal",
-        )
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    let mut steering = statement
-        .query_map([run_id.to_string()], |row| {
-            Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|_| SessionRuntimeError::Persistence)?
-        .collect::<Result<std::collections::VecDeque<_>, _>>()
-        .map_err(|_| SessionRuntimeError::Persistence)?;
-    drop(statement);
     for (turn_ordinal, content_json, truncated) in turns {
         while steering
             .front()
@@ -6827,30 +7070,10 @@ fn append_run_turns(
                 .into_iter()
                 .map(ContentBlock::from)
                 .collect();
-
-        let mut statement = transaction
-            .prepare(
-                "SELECT provider_call_id, result, is_error FROM tool_calls
-                 WHERE run_id = ?1 AND turn_ordinal = ?2 AND result IS NOT NULL
-                 ORDER BY call_ordinal",
-            )
-            .map_err(|_| SessionRuntimeError::Persistence)?;
-        let mut recorded = statement
-            .query_map(params![run_id.to_string(), turn_ordinal], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, String>(1)?, row.get::<_, bool>(2)?),
-                ))
-            })
-            .map_err(|_| SessionRuntimeError::Persistence)?
-            .collect::<Result<HashMap<String, (String, bool)>, _>>()
-            .map_err(|_| SessionRuntimeError::Persistence)?;
-        drop(statement);
-        // Emit exactly one result per ToolCall block, in block order.
-        // A block without a recorded result (a crash between the
-        // turn commit and its tool_calls rows in an older store)
-        // gets an explicit interrupted result so replayed context
-        // stays provider-valid instead of poisoning the session.
+        // A block without a recorded result (a crash between the turn commit
+        // and its tool_calls rows in an older store) gets an explicit
+        // interrupted result so replayed context stays provider-valid
+        // instead of poisoning the session.
         let results = content
             .iter()
             .filter_map(|block| match block {
@@ -9434,6 +9657,11 @@ mod tests {
         ));
         assert_eq!(context[steering_index + 1].role(), Role::Assistant);
         harness.runtime.shutdown().await.unwrap();
+        drop(store);
+        assert_assembly_matches_reference(
+            &harness._directory.path().join("sessions.sqlite3"),
+            harness.session_id,
+        );
     }
 
     #[tokio::test]
@@ -11443,7 +11671,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(
             !connection
@@ -11570,7 +11798,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "tool_calls", "display_json").unwrap());
         let (turn_ordinal, output, state) = connection
@@ -11638,7 +11866,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         let (display_json, result) = connection
             .query_row(
@@ -11697,7 +11925,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "runs", "kind").unwrap());
         assert_eq!(
@@ -11762,7 +11990,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "sessions", "context_tokens").unwrap());
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
@@ -11850,7 +12078,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "sessions", "owner_run_id").unwrap());
         assert_eq!(
@@ -11906,7 +12134,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "runs", "prompt_identity_json").unwrap());
         assert_eq!(
@@ -11950,7 +12178,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         for column in [
             "model_json",
@@ -12017,7 +12245,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "message_chunks", "chunk_ordinal").unwrap());
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
@@ -12091,7 +12319,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         let command_id_not_null: bool = connection
             .query_row(
@@ -12130,7 +12358,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "message_chunks", "text").unwrap());
         assert!(has_column(&connection, "runs", "context_base_bytes").unwrap());
@@ -12200,7 +12428,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         assert!(has_column(&connection, "runs", "resolved_model_json").unwrap());
         assert_eq!(
@@ -12292,7 +12520,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         let preparing_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12415,7 +12643,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         let occupancy_shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12521,7 +12749,7 @@ mod tests {
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap(),
-                "24"
+                "25"
             );
         }
     }
@@ -12642,7 +12870,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         // A historical child keeps its parent run but has no recorded call:
         // the summary says so explicitly instead of inventing one.
@@ -12658,6 +12886,159 @@ mod tests {
         let parent = load_session_summary(&connection, parent_id).unwrap();
         assert_eq!(parent.spawned_by, None);
         assert_eq!(parent.activity, None);
+    }
+
+    /// Schema 25: `runs.activity` is added null and the command counter is
+    /// backfilled from the journal, so a schema-24 store reopens with its
+    /// summaries intact and its command bound still enforced.
+    #[test]
+    fn version_twenty_five_migration_adds_activity_and_backfills_the_command_counter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let workspace_id = WorkspaceId::generate().unwrap();
+        let session_id = SessionId::generate().unwrap();
+        let run_id = RunId::generate().unwrap();
+        let (connection, _) = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, path) VALUES (?1, '/v24-fast-path')",
+                [workspace_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, title, status, active_run_id,
+                                      created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'Old', 'running', ?3, 1, 1)",
+                params![
+                    session_id.to_string(),
+                    workspace_id.to_string(),
+                    run_id.to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(
+                     id, session_id, command_id, user_message_id, assistant_message_id,
+                     status, created_at_ms
+                 ) VALUES (?1, ?2, 'cmd', 'u', 'a', 'running', 1)",
+                params![run_id.to_string(), session_id.to_string()],
+            )
+            .unwrap();
+        for index in 0..3 {
+            connection
+                .execute(
+                    "INSERT INTO commands(id, request_json, receipt_json) VALUES (?1, '{}', '{}')",
+                    [format!("cmd-{index}")],
+                )
+                .unwrap();
+        }
+        for statement in [
+            "UPDATE metadata SET value = '24' WHERE key = 'schema_version'",
+            "DELETE FROM metadata WHERE key = 'command_count'",
+            "ALTER TABLE runs DROP COLUMN activity",
+        ] {
+            connection.execute(statement, []).unwrap();
+        }
+        drop(connection);
+
+        let (connection, _) = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "25"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'command_count'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "3",
+            "the counter is backfilled from the journal"
+        );
+        let activity: Option<String> = connection
+            .query_row(
+                "SELECT activity FROM runs WHERE id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(activity, None);
+        // A historical running run reports no activity, which is what the
+        // event-log scan reported for a run with no activity events.
+        let summary = load_session_summary(&connection, session_id).unwrap();
+        assert_eq!(summary.active_run_id, Some(run_id));
+        assert_eq!(summary.activity, None);
+    }
+
+    /// D6: activity is a column written with its event, and the summary reads
+    /// D6: activity is a column written with its event and the summary reads
+    /// the column; the command counter tracks the journal exactly.
+    #[tokio::test]
+    async fn run_activity_is_read_from_the_column_and_the_command_counter_tracks_the_journal() {
+        let mut harness = approval_harness(
+            ApprovalMode::Ask,
+            "__test_mutate",
+            "{}",
+            1,
+            DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
+        let (observed, _) = collect_until_approval_requested(&mut harness.events).await;
+        // The run is parked at an approval. The last RunActivityChanged the
+        // subscriber saw, the column, and the summary published by the next
+        // command must all agree.
+        let last_activity = observed
+            .iter()
+            .rev()
+            .find_map(|event| match &event.event {
+                SessionEvent::RunActivityChanged { activity, .. } => Some(*activity),
+                _ => None,
+            })
+            .expect("a tool turn reports activity before the approval");
+        let run_id = harness.run_id;
+        let session_id = harness.session_id;
+        let (column, summary, counted, journaled) = harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                let column: Option<String> = connection
+                    .query_row(
+                        "SELECT activity FROM runs WHERE id = ?1",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let summary = load_session_summary(connection, session_id)?;
+                let counted: String = connection
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key = 'command_count'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let journaled: u32 = connection
+                    .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok((column, summary, counted, journaled))
+            })
+            .await
+            .unwrap();
+        assert_eq!(column.as_deref(), Some(run_activity_column(last_activity)));
+        assert_eq!(summary.activity, Some(last_activity));
+        assert!(journaled >= 3, "resolve, create, submit");
+        assert_eq!(counted, journaled.to_string());
+        harness.runtime.shutdown().await.unwrap();
     }
 
     #[test]
@@ -12729,7 +13110,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         let message = load_message(&connection, message_id).unwrap();
         assert!(!message.truncated);
@@ -12745,10 +13126,22 @@ mod tests {
         assert!(!truncated);
         assert_eq!(continuations, 0);
         // Historical context replays without a continuation notice.
-        let mut connection = connection;
-        let transaction = connection.transaction().unwrap();
+        let (ordinal, content_json, truncated): (u16, String, bool) = connection
+            .query_row(
+                "SELECT turn_ordinal, assistant_content_json, truncated FROM model_turns
+                 WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
         let mut context = Vec::new();
-        append_run_turns(&transaction, run_id, &mut context).unwrap();
+        append_run_turns(
+            vec![(ordinal, content_json, truncated)],
+            HashMap::new(),
+            std::collections::VecDeque::new(),
+            &mut context,
+        )
+        .unwrap();
         assert_eq!(context.len(), 1);
         assert_eq!(context[0].role(), Role::Assistant);
     }
@@ -12804,7 +13197,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
         let shape: (String, bool, Option<String>) = connection
             .query_row(
@@ -12886,7 +13279,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "24"
+            "25"
         );
     }
 
@@ -13806,6 +14199,7 @@ mod tests {
                 limits: qq_protocol::RunLimits::default(),
                 correlation: Correlation::default(),
             },
+            None,
             &WorkspaceGrantSeed::default(),
         )
         .unwrap();
@@ -13923,6 +14317,9 @@ mod tests {
             depth: 0,
             root_run_id: run_id,
             purpose: SessionPurpose::Task,
+            cancel_requested: false,
+            file_state: Vec::new(),
+            pending_steering: Vec::new(),
         };
         (
             directory,
@@ -13959,6 +14356,7 @@ mod tests {
                     tool_call_id,
                     decision: ApprovalDecision::Deny,
                 },
+                None,
                 &WorkspaceGrantSeed::default(),
             )
             .map(|_| ()),
@@ -14883,6 +15281,7 @@ mod tests {
             store_id,
             CommandId::from_bytes([9; 16]),
             SessionCommand::CompactSession { session_id },
+            None,
             &WorkspaceGrantSeed::default(),
         )
         .unwrap();
@@ -14988,6 +15387,279 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// The pre-D7 assembly, one query per message and per turn, kept as the
+    /// oracle for the joined loader. Any divergence between the two on a
+    /// seeded store is a regression in the joined query.
+    mod reference_assembly {
+        use super::*;
+
+        pub(super) fn reference_load_model_context(
+            transaction: &Connection,
+            session_id: SessionId,
+            through_ordinal: u64,
+        ) -> Result<(Vec<Message>, bool), SessionRuntimeError> {
+            let compaction = latest_compaction(transaction, session_id)?;
+            let cutoff_ordinal = compaction
+                .as_ref()
+                .map_or(0, |compaction| compaction.cutoff_ordinal);
+            // SQLite integers are i64; `u64::MAX` means "everything".
+            let through_ordinal = through_ordinal.min(u64::try_from(i64::MAX).unwrap_or(u64::MAX));
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM messages
+                     WHERE session_id = ?1 AND ordinal <= ?2 AND ordinal > ?3
+                       AND role = 'user' AND steering = 0
+                       AND state IN ('complete', 'cancelled', 'failed', 'interrupted')
+                     ORDER BY ordinal",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let message_ids = statement
+                .query_map(
+                    params![session_id.to_string(), through_ordinal, cutoff_ordinal],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            drop(statement);
+
+            let mut context = Vec::new();
+            if let Some(compaction) = compaction {
+                context.push(Message::user(format!(
+                    "{COMPACTION_SUMMARY_PREAMBLE}\n\n{}",
+                    compaction.summary
+                )));
+            }
+            for id in message_ids {
+                let snapshot = load_message(transaction, parse_id(&id)?)?;
+                if snapshot.role != MessageRole::User {
+                    return Err(SessionRuntimeError::Persistence);
+                }
+                context.push(Message::user(snapshot.output));
+                // Reconstruct each run immediately after its prompt rather than
+                // following message-row ordinals. Follow-up prompts can be queued
+                // while the prior run is active, so its later committed output still
+                // belongs before the follow-up in model context.
+                let status: String = transaction
+                    .query_row(
+                        "SELECT status FROM runs WHERE id = ?1",
+                        [snapshot.run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                if matches!(
+                    status.as_str(),
+                    "completed" | "cancelled" | "failed" | "interrupted" | "running"
+                ) {
+                    let has_turns: bool = transaction
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM model_turns WHERE run_id = ?1)",
+                            [snapshot.run_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    if has_turns {
+                        reference_append_run_turns(transaction, snapshot.run_id, &mut context)?;
+                    } else {
+                        reference_append_legacy_run_messages(
+                            transaction,
+                            snapshot.run_id,
+                            &mut context,
+                        )?;
+                    }
+                }
+                if matches!(status.as_str(), "cancelled" | "failed" | "interrupted") {
+                    let outcome_json: String = transaction
+                        .query_row(
+                            "SELECT outcome_json FROM runs WHERE id = ?1",
+                            [snapshot.run_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    let outcome: RunOutcome = serde_json::from_str(&outcome_json)
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                    if let Some(notice) = runtime_notice(&outcome) {
+                        context.push(Message::user(notice));
+                    }
+                }
+            }
+            let context_rewritten = prune_stale_tool_results(&mut context);
+            Ok((context, context_rewritten))
+        }
+        fn reference_append_legacy_run_messages(
+            connection: &Connection,
+            run_id: RunId,
+            context: &mut Vec<Message>,
+        ) -> Result<(), SessionRuntimeError> {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id FROM messages
+                     WHERE run_id = ?1 AND role = 'assistant' AND state = 'complete'
+                     ORDER BY turn_ordinal, ordinal",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let message_ids = statement
+                .query_map([run_id.to_string()], |row| row.get::<_, String>(0))
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            drop(statement);
+            for message_id in message_ids {
+                let message = load_message(connection, parse_id(&message_id)?)?;
+                let content = if message.output.is_empty() {
+                    message.refusal
+                } else {
+                    message.output
+                };
+                if !content.trim().is_empty() {
+                    context.push(Message::assistant(content));
+                }
+            }
+            Ok(())
+        }
+        fn reference_append_run_turns(
+            transaction: &Connection,
+            run_id: RunId,
+            context: &mut Vec<Message>,
+        ) -> Result<(), SessionRuntimeError> {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT turn_ordinal, assistant_content_json, truncated FROM model_turns
+                     WHERE run_id = ?1 ORDER BY turn_ordinal",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let turns = statement
+                .query_map([run_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, u16>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                })
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            drop(statement);
+            // Applied steering carries the ordinal of the turn whose request first
+            // included it; it is replayed as a user message immediately before that
+            // turn, after the preceding turn's tool results.
+            let mut statement = transaction
+                .prepare(
+                    "SELECT turn_ordinal, output FROM messages
+                     WHERE run_id = ?1 AND steering = 1 AND state = 'complete'
+                     ORDER BY turn_ordinal, ordinal",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let mut steering = statement
+                .query_map([run_id.to_string()], |row| {
+                    Ok((row.get::<_, u16>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| SessionRuntimeError::Persistence)?
+                .collect::<Result<std::collections::VecDeque<_>, _>>()
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            drop(statement);
+            for (turn_ordinal, content_json, truncated) in turns {
+                while steering
+                    .front()
+                    .is_some_and(|(applied_before, _)| *applied_before <= turn_ordinal)
+                {
+                    let (_, text) = steering.pop_front().expect("front was just checked");
+                    context.push(Message::user(text));
+                }
+                let content: Vec<ContentBlock> =
+                    serde_json::from_str::<Vec<PersistedContentBlock>>(&content_json)
+                        .map_err(|_| SessionRuntimeError::Persistence)?
+                        .into_iter()
+                        .map(ContentBlock::from)
+                        .collect();
+
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT provider_call_id, result, is_error FROM tool_calls
+                         WHERE run_id = ?1 AND turn_ordinal = ?2 AND result IS NOT NULL
+                         ORDER BY call_ordinal",
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                let mut recorded = statement
+                    .query_map(params![run_id.to_string(), turn_ordinal], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            (row.get::<_, String>(1)?, row.get::<_, bool>(2)?),
+                        ))
+                    })
+                    .map_err(|_| SessionRuntimeError::Persistence)?
+                    .collect::<Result<HashMap<String, (String, bool)>, _>>()
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                drop(statement);
+                // Emit exactly one result per ToolCall block, in block order.
+                // A block without a recorded result (a crash between the
+                // turn commit and its tool_calls rows in an older store)
+                // gets an explicit interrupted result so replayed context
+                // stays provider-valid instead of poisoning the session.
+                let results = content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolCall { id, .. } => Some(match recorded.remove(id) {
+                            Some((content, is_error)) => ContentBlock::ToolResult {
+                                call_id: id.clone(),
+                                content,
+                                is_error,
+                            },
+                            None => ContentBlock::ToolResult {
+                                call_id: id.clone(),
+                                content: INTERRUPTED_TOOL_RESULT.to_owned(),
+                                is_error: true,
+                            },
+                        }),
+                        ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                context.push(Message::new(Role::Assistant, content));
+                if !results.is_empty() {
+                    context.push(Message::tool_results(results));
+                }
+                // A truncated turn was followed in the live run by the continuation
+                // notice; replaying it keeps the assembled context identical to the
+                // request the model actually saw (and preserves role alternation).
+                if truncated {
+                    context.push(Message::user(crate::OUTPUT_TRUNCATED_CONTINUE_NOTICE));
+                }
+            }
+            // Steering applied for a turn that never committed (the run settled
+            // first) still reached the model's request; keep it so the transcript
+            // the user saw is the transcript the next run continues from.
+            for (_, text) in steering {
+                context.push(Message::user(text));
+            }
+            Ok(())
+        }
+    }
+
+    /// Asserts the joined context loader assembles exactly what the reference
+    /// (per-message, per-turn) loader assembles for `session_id`.
+    fn assert_assembly_matches_reference(database: &std::path::Path, session_id: SessionId) {
+        let mut connection = Connection::open(database).unwrap();
+        let transaction = connection.transaction().unwrap();
+        let (joined, joined_rewritten) =
+            load_model_context_with_rewrite_status(&transaction, session_id, u64::MAX).unwrap();
+        let (reference, reference_rewritten) =
+            reference_assembly::reference_load_model_context(&transaction, session_id, u64::MAX)
+                .unwrap();
+        assert_eq!(joined_rewritten, reference_rewritten);
+        assert_eq!(joined.len(), reference.len(), "message count");
+        for (index, (joined, reference)) in joined.iter().zip(&reference).enumerate() {
+            assert_eq!(joined.role(), reference.role(), "role at {index}");
+            assert_eq!(joined.content(), reference.content(), "content at {index}");
+        }
+        // A bounded prefix must agree too: `through_ordinal` scoping is part
+        // of the contract the reload path depends on.
+        let (joined, _) =
+            load_model_context_with_rewrite_status(&transaction, session_id, 1).unwrap();
+        let (reference, _) =
+            reference_assembly::reference_load_model_context(&transaction, session_id, 1).unwrap();
+        assert_eq!(joined.len(), reference.len(), "bounded message count");
     }
 
     async fn collect_through_finished(
@@ -15544,6 +16216,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(compactions, 2);
+        drop(connection);
+        harness.runtime.shutdown().await.unwrap();
+        assert_assembly_matches_reference(
+            &harness.workspace_path.join("sessions.sqlite3"),
+            harness.session_id,
+        );
     }
 
     /// One scripted model load for the auto-compaction tests: what the
@@ -17040,17 +17718,18 @@ mod tests {
             collect_through_finished(&mut harness.events).await;
         }
 
-        let requests = harness.requests.lock().unwrap();
-        let last = requests.last().unwrap();
-        let results = last
-            .messages()
-            .iter()
-            .flat_map(Message::content)
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let results: Vec<String> = {
+            let requests = harness.requests.lock().unwrap();
+            let last = requests.last().unwrap();
+            last.messages()
+                .iter()
+                .flat_map(Message::content)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
         assert_eq!(results.len(), 3);
         // The old read is a stub naming the tool, arguments, and size.
         assert!(
@@ -17070,6 +17749,11 @@ mod tests {
             results[2].contains("nnnn"),
             "recent results must stay verbatim, got {:?}",
             results[2]
+        );
+        harness.runtime.shutdown().await.unwrap();
+        assert_assembly_matches_reference(
+            &harness.workspace_path.join("sessions.sqlite3"),
+            harness.session_id,
         );
     }
 
@@ -27333,6 +28017,9 @@ mod tests {
             depth: 0,
             root_run_id: parent_run,
             purpose: SessionPurpose::Task,
+            cancel_requested: false,
+            file_state: Vec::new(),
+            pending_steering: Vec::new(),
         };
         let child = tokio::spawn(spawn_child_run(
             Arc::clone(&runtime.inner),

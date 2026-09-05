@@ -114,6 +114,7 @@ source control.
 | Cancellation | cancel call through committed terminal event | Hanging deterministic provider, bounded by the runtime timeout |
 | Retry amplification | provider stream entries per logical turn (`provider_retry_amplification_milli`) | Every fake-provider stream fails before its first event; the provider is the single retry owner, so the runtime must add no sends (gate below 1.05) |
 | Subscriber fan-out | delta to the slowest of 1, 8, and 32 live subscribers; command ack under each | Committed events reach subscribers from a per-workspace broadcast of the store's own encoding; no store read per event once attached |
+| Busy-workspace ack | `SetSessionModel` acknowledgement with an active run and 500+ committed events | The published summary reads `runs.activity` instead of scanning the event log |
 | Stream scaling | 64 KiB, 512 KiB, 1 MiB and 1 MiB/512 KiB ratio | 1 KiB fake-provider deltas through durable completion |
 | Long reasoning | completion, durable payload transactions, temporary RSS | One MiB of provider-exposed reasoning with exact lifecycle order and replay digest |
 | Long shell | completion, live-output transactions, temporary RSS | One MiB workspace file through bounded shell streaming, terminal result, and exact replay digest |

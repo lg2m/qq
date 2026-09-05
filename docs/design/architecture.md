@@ -599,6 +599,19 @@ one fsync per service round instead of eight, at `synchronous=FULL`
 throughout. Operation code is identical in both modes: every mutation begins a
 `Unit` that is a transaction when alone and a savepoint inside a group.
 
+Command acknowledgement is bounded work independent of history. The active
+run's activity is a `runs.activity` column written in the same transaction as
+its `RunActivityChanged` event, so the session summary a command publishes
+reads one row instead of scanning the event log; the command bound is a
+maintained `metadata.command_count` counter rather than a `COUNT(*)` per
+command; and a workspace snapshot aggregates every session's accounting in one
+grouped query. A claimed run carries the cancellation flag, session file
+hashes, and pending steering out of the claim transaction, so claim to first
+provider request is two store hops (claim, then `RunStarted`), and context
+assembly runs a fixed number of session-scoped queries rather than one per
+message and per turn. Workspace path canonicalization runs on a blocking
+thread before the command reaches the store worker.
+
 Caller budgets are core-owned. `submit_prompt.limits` carries a versioned
 `RunLimits` (wall clock, model turns, tool calls, total tokens, cost) that is
 validated at admission, persisted with the run row, and metered by the runtime

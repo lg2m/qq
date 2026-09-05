@@ -1872,6 +1872,14 @@ enum ProviderMode {
         name: &'static str,
         arguments: &'static str,
     },
+    /// The first stream emits `total_bytes` and completes; every later stream
+    /// emits one delta and then hangs, so a workspace can carry both a long
+    /// committed history and an active run.
+    TextThenHang {
+        total_bytes: usize,
+        chunk_bytes: usize,
+        streams: Arc<std::sync::atomic::AtomicUsize>,
+    },
     /// Every stream fails before its first event. The runtime above the
     /// provider must not resend, so the attempts-per-turn ratio it produces
     /// is the retry amplification above the single provider retry owner.
@@ -2080,6 +2088,36 @@ impl Provider for BenchmarkProvider {
                 })
             }
             ProviderMode::Hanging => Box::pin(stream::pending()),
+            ProviderMode::TextThenHang {
+                total_bytes,
+                chunk_bytes,
+                streams,
+            } => {
+                let first = streams.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                let total_bytes = *total_bytes;
+                let chunk_bytes = *chunk_bytes;
+                let marks = self.marks.clone();
+                Box::pin(async_stream::stream! {
+                    if let Err(error) = send_provider_mark(&marks, ProviderMarkKind::FirstDelta) {
+                        yield Err(error);
+                        return;
+                    }
+                    if !first {
+                        yield Ok(ProviderEvent::OutputTextDelta { text: "x".to_owned() });
+                        std::future::pending::<()>().await;
+                    }
+                    let mut remaining = total_bytes;
+                    while remaining > 0 {
+                        let bytes = remaining.min(chunk_bytes);
+                        remaining -= bytes;
+                        yield Ok(ProviderEvent::OutputTextDelta { text: "x".repeat(bytes) });
+                        // Outrun the store's 8 ms batch window so each delta
+                        // commits as its own event.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    yield Ok(ProviderEvent::Completed { usage: None });
+                })
+            }
             ProviderMode::Faulting => Box::pin(stream::once(async {
                 Err(ProviderError::Api {
                     status: 503,
@@ -2447,6 +2485,10 @@ async fn run_workloads(
     let (fan_out_metrics, fan_out_checks) = subscriber_fan_out_workloads(samples).await?;
     metrics.extend(fan_out_metrics);
     checks.extend(fan_out_checks);
+
+    let (busy_metrics, busy_checks) = busy_workspace_ack_workloads(samples).await?;
+    metrics.extend(busy_metrics);
+    checks.extend(busy_checks);
 
     let (stream_metrics, stream_checks) = long_stream_workloads(samples).await?;
     metrics.extend(stream_metrics);
@@ -3765,6 +3807,100 @@ async fn subscriber_fan_out_workloads(
     Ok((metrics, checks))
 }
 
+/// Command acknowledgement against a workspace whose active session has a
+/// long event history: with a hanging run parked after more than 512
+/// committed events, `SetSessionModel` on a second idle session publishes a
+/// summary. The summary once scanned the newest 512 envelopes for the
+/// active run's activity; it now reads a column, so this must not scale with
+/// history.
+async fn busy_workspace_ack_workloads(
+    samples: u16,
+) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
+    const HISTORY_BYTES: usize = 560 * 1024;
+    let acks = samples.clamp(10, 50);
+    let mut fixture = RuntimeFixture::open(ProviderMode::TextThenHang {
+        total_bytes: HISTORY_BYTES,
+        chunk_bytes: 1024,
+        streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+    .await?;
+    let operation = async {
+        // Seed one completed run so the workspace's event log is long.
+        let (busy_session, cursor) = fixture.create_session(ApprovalMode::ReadOnly).await?;
+        let mut events = fixture.subscribe(cursor)?;
+        let seeded = session_command(
+            "seed busy history",
+            &fixture.runtime,
+            generate_id("busy history command")?,
+            SessionCommand::SubmitPrompt {
+                session_id: busy_session,
+                input: vec![qq_protocol::InputPart::text("stream history".to_owned())],
+                limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
+            },
+        )
+        .await?;
+        let seeded_run = prompt_run_id(&seeded)?;
+        let (outcome, cursor, _) = wait_for_run(&mut events, seeded_run).await?;
+        if !matches!(outcome, RunOutcome::Completed) {
+            return Err(PerfError::Fixture("history run did not complete".to_owned()));
+        }
+        let history_events = cursor.sequence;
+        // Park a second run on the same session so it has an active run whose
+        // summary every later command on the workspace publishes.
+        session_command(
+            "park active run",
+            &fixture.runtime,
+            generate_id("park active run command")?,
+            SessionCommand::SubmitPrompt {
+                session_id: busy_session,
+                input: vec![qq_protocol::InputPart::text("hang".to_owned())],
+                limits: qq_protocol::RunLimits::default(),
+                correlation: qq_protocol::Correlation::default(),
+            },
+        )
+        .await?;
+        let _ = receive_mark(&mut fixture.marks, ProviderMarkKind::FirstDelta).await?;
+        let idle_session = busy_session;
+        let mut measured = Vec::with_capacity(usize::from(acks));
+        for index in 0..acks {
+            let started = Instant::now();
+            session_command(
+                "set session model on busy workspace",
+                &fixture.runtime,
+                generate_id("busy ack command")?,
+                SessionCommand::SetSessionModel {
+                    session_id: idle_session,
+                    model: ModelSelection {
+                        model: Some(format!("benchmark/model-{index}")),
+                        max_output_tokens: Some(256),
+                        organization: None,
+                    },
+                },
+            )
+            .await?;
+            measured.push(elapsed_ns(started));
+        }
+        Ok((
+            vec![MetricResult::measured(
+                "busy_workspace_command_ack_ns",
+                "ns",
+                format!(
+                    "SetSessionModel acknowledgement on a workspace with {history_events} committed events; the published summary reads the active run's activity column"
+                ),
+                measured,
+            )?],
+            vec![CorrectnessCheck {
+                name: "busy_workspace_history_seeded".to_owned(),
+                passed: history_events >= 512,
+                detail: format!("{history_events} events committed before measuring; gate is 512"),
+            }],
+        ))
+    }
+    .await;
+    finish_runtime_fixture(&fixture, "shut down busy-workspace runtime", operation).await
+}
+
 async fn long_stream_workloads(
     samples: u16,
 ) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
@@ -5038,6 +5174,15 @@ mod tests {
 
     /// Every subscriber in the fan-out fixture must converge on the same
     /// terminal cursor for each run.
+    /// The busy-workspace fixture must seed at least 512 committed events before
+    /// its acknowledgements are measured.
+    #[tokio::test]
+    async fn busy_workspace_fixture_seeds_a_long_history() {
+        let (metrics, checks) = busy_workspace_ack_workloads(10).await.unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!(checks[0].passed, "{}", checks[0].detail);
+    }
+
     #[tokio::test]
     async fn subscriber_fan_out_fixture_converges_at_every_width() {
         let (metrics, checks) = subscriber_fan_out_workloads(5).await.unwrap();

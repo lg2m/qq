@@ -95,25 +95,15 @@ async fn prepare_execution(
             cancellation.clone(),
         ))
     };
-    let file_state = tokio::select! {
-        result = session_file_state_with_retry(inner, claimed.session_id) => match result {
-            Ok(entries) => Arc::new(FileState::with_entries(entries)),
-            Err(error) => {
-                return Err(persistence_failure(
-                    "failed to load the session file state",
-                    &error,
-                ));
-            }
-        },
-        changed = cancellation.changed() => {
-            tool_cancellation.store(true, Ordering::Release);
-            return if changed.is_ok() && *cancellation.borrow() {
-                Err(RunOutcome::Cancelled)
-            } else {
-                Err(RunOutcome::Interrupted)
-            };
-        }
-    };
+    // The claim carried the session's file hashes, so nothing here waits on
+    // the store; a cancel already recorded settles before any preparation.
+    if *cancellation.borrow() {
+        tool_cancellation.store(true, Ordering::Release);
+        return Err(RunOutcome::Cancelled);
+    }
+    let file_state = Arc::new(FileState::with_entries(std::mem::take(
+        &mut claimed.file_state,
+    )));
     // Structured input resolves here, before the first provider request:
     // file parts are read through the plan's workspace capability and
     // recorded in the session file state. The assembled context already ends
@@ -225,25 +215,16 @@ async fn prepare_execution(
             base
         };
         let (sender, receiver) = crate::runtime::steering_channel();
-        // Steering recorded between claim and start (the run was already
-        // `running` for admission purposes) is queued into the channel now
-        // so the first boundary applies it.
-        match inner.store.pending_steering(claimed.run_id).await {
-            Ok(pending) => {
-                for message in pending {
-                    match sender.messages.try_send(message) {
-                        Ok(()) => {}
-                        // The channel and the durable bound are the same size.
-                        Err(_) => break,
-                    }
-                }
-            }
-            Err(error) => {
-                tool_cancellation.store(true, Ordering::Release);
-                return Err(persistence_failure(
-                    "failed to load pending steering",
-                    &error,
-                ));
+        // Steering recorded up to the claim (the run was already `running`
+        // for admission purposes) rode the claim and is queued into the
+        // channel now so the first boundary applies it. Steering recorded
+        // after the claim reaches the channel through `steer`, which the
+        // registration below makes possible.
+        for message in std::mem::take(&mut claimed.pending_steering) {
+            match sender.messages.try_send(message) {
+                Ok(()) => {}
+                // The channel and the durable bound are the same size.
+                Err(_) => break,
             }
         }
         match inner.steering.lock() {
@@ -857,23 +838,6 @@ async fn cancellation_requested_with_retry(
             return Err(SessionRuntimeError::Unavailable);
         }
         match result {
-            Err(SessionRuntimeError::Overloaded) => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            result => return result,
-        }
-    }
-}
-
-async fn session_file_state_with_retry(
-    inner: &SessionRuntimeInner,
-    session_id: SessionId,
-) -> Result<Vec<(String, String)>, SessionRuntimeError> {
-    loop {
-        if *inner.failed.borrow() {
-            return Err(SessionRuntimeError::Unavailable);
-        }
-        match inner.store.session_file_state(session_id).await {
             Err(SessionRuntimeError::Overloaded) => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }

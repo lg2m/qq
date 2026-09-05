@@ -106,25 +106,36 @@ async fn supervise_reserved_run(inner: Arc<SessionRuntimeInner>, claimed: Claime
         .await;
         return;
     }
-    loop {
-        match inner.store.cancellation_requested(claimed.run_id).await {
-            Ok(true) => {
-                cancel.send_replace(true);
-                break;
-            }
-            Ok(false) => break,
-            Err(SessionRuntimeError::Overloaded) => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            Err(error) => {
-                settle_unstartable_reservation_with_retry(
-                    &inner,
-                    &claimed,
-                    persistence_failure("failed to read reserved-run cancellation state", &error),
-                    false,
-                )
-                .await;
-                return;
+    // A cancel recorded before the claim rides the claim. One recorded
+    // between the claim and the registration above would have found no
+    // watch to signal, so the flag is re-read once now that the watch
+    // exists; every later cancel reaches it through `cancel`.
+    if claimed.cancel_requested {
+        cancel.send_replace(true);
+    } else {
+        loop {
+            match inner.store.cancellation_requested(claimed.run_id).await {
+                Ok(true) => {
+                    cancel.send_replace(true);
+                    break;
+                }
+                Ok(false) => break,
+                Err(SessionRuntimeError::Overloaded) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => {
+                    settle_unstartable_reservation_with_retry(
+                        &inner,
+                        &claimed,
+                        persistence_failure(
+                            "failed to read reserved-run cancellation state",
+                            &error,
+                        ),
+                        false,
+                    )
+                    .await;
+                    return;
+                }
             }
         }
     }

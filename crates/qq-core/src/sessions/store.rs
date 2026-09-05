@@ -455,8 +455,46 @@ impl Store {
         promotion_wakeup: Option<mpsc::Sender<()>>,
     ) -> Result<AppliedCommand, SessionRuntimeError> {
         let store_id = self.store_id;
+        // Workspace canonicalization is filesystem I/O; it runs on a blocking
+        // thread before the command reaches the single store worker, which
+        // must never block on the disk outside SQLite itself.
+        // A path that does not resolve is carried as its error rather than
+        // returned here: the worker checks the command journal first, so a
+        // replayed or conflicting command id is answered as such even when
+        // the directory has since disappeared.
+        let canonical_workspace = match &command {
+            SessionCommand::ResolveWorkspace { path } => {
+                let trimmed = path.trim().to_owned();
+                if trimmed.is_empty() {
+                    return Err(SessionRuntimeError::EmptyWorkspace);
+                }
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let canonical = std::fs::canonicalize(&trimmed)
+                            .map_err(|_| SessionRuntimeError::InvalidWorkspace)?;
+                        if !canonical.is_dir() {
+                            return Err(SessionRuntimeError::InvalidWorkspace);
+                        }
+                        canonical
+                            .to_str()
+                            .map(str::to_owned)
+                            .ok_or(SessionRuntimeError::InvalidWorkspace)
+                    })
+                    .await
+                    .map_err(|_| SessionRuntimeError::Unavailable)?,
+                )
+            }
+            _ => None,
+        };
         self.call(Priority::Control, move |connection| {
-            let applied = execute_command(connection, store_id, command_id, command, &seed)?;
+            let applied = execute_command(
+                connection,
+                store_id,
+                command_id,
+                command,
+                canonical_workspace,
+                &seed,
+            )?;
             if applied.grant_promotion_pending
                 && let Some(wakeup) = promotion_wakeup
             {
@@ -945,36 +983,6 @@ impl Store {
     /// with their provider-visible text, in order. Used once when the run
     /// loop starts so steering that arrived between claim and start is not
     /// stranded.
-    pub(super) async fn pending_steering(
-        &self,
-        run_id: RunId,
-    ) -> Result<Vec<crate::runtime::SteeringMessage>, SessionRuntimeError> {
-        self.call(Priority::Control, move |connection| {
-            let mut statement = connection
-                .prepare(
-                    "SELECT id, output FROM messages
-                     WHERE run_id = ?1 AND steering = 1 AND state = 'queued' ORDER BY ordinal",
-                )
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            let rows = statement
-                .query_map([run_id.to_string()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|_| SessionRuntimeError::Persistence)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            rows.into_iter()
-                .map(|(id, text)| {
-                    Ok(crate::runtime::SteeringMessage {
-                        message_id: parse_id(&id)?,
-                        text,
-                    })
-                })
-                .collect()
-        })
-        .await
-    }
-
     pub(super) async fn append_reasoning(
         &self,
         claimed: &ClaimedRun,
@@ -1040,25 +1048,6 @@ impl Store {
                 file_state,
                 display,
             )
-        })
-        .await
-    }
-
-    pub(super) async fn session_file_state(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<(String, String)>, SessionRuntimeError> {
-        self.call(Priority::Control, move |connection| {
-            let mut statement = connection
-                .prepare("SELECT path, content_hash FROM session_files WHERE session_id = ?1")
-                .map_err(|_| SessionRuntimeError::Persistence)?;
-            statement
-                .query_map([session_id.to_string()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|_| SessionRuntimeError::Persistence)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| SessionRuntimeError::Persistence)
         })
         .await
     }
