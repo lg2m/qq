@@ -995,7 +995,7 @@ pub enum SessionRuntimeError {
     WorkspaceLimitReached,
     #[error("session was not found")]
     SessionNotFound,
-    #[error("session has an active run")]
+    #[error("session or an owning run is active")]
     SessionActive,
     #[error("workspace session limit reached")]
     SessionLimitReached,

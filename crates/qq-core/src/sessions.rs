@@ -29228,14 +29228,7 @@ mod tests {
             "an unconfirmed reap must fail the session runtime closed"
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
-        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while rustix::process::test_kill_process(pid).is_ok() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the process guard must still send termination on panic");
+        crate::tools::assert_panicked_process_exits(pid).await;
     }
 
     #[tokio::test]

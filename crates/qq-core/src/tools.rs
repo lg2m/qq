@@ -45,6 +45,31 @@ use tokio::sync::mpsc;
 #[cfg(all(test, unix))]
 pub(crate) use shell::observe_shell_spawn;
 
+#[cfg(all(test, unix))]
+pub(crate) async fn assert_panicked_process_exits(pid: u32) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // Panic deliberately leaves production cleanup unconfirmed. Reap only
+        // this fixture's child, without mistaking a dead zombie for a live process.
+        match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG) {
+            Ok(Some((reaped, status))) => {
+                assert_eq!(reaped, pid);
+                assert!(status.exited() || status.signaled());
+                return;
+            }
+            Err(rustix::io::Errno::CHILD) => return, // Tokio already reaped it.
+            Ok(None) | Err(rustix::io::Errno::INTR) => {}
+            Err(error) => panic!("cannot wait for the panicked fixture's child: {error}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the process guard must still send termination on panic"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -836,7 +861,7 @@ mod tests {
             Err(ToolDrainError::UnconfirmedProcessExit)
         );
         assert_eq!(tasks.check(), Err(ToolDrainError::UnconfirmedProcessExit));
-        assert_process_exits(spawned.await.unwrap()).await;
+        assert_panicked_process_exits(spawned.await.unwrap()).await;
     }
 
     #[cfg(windows)]
