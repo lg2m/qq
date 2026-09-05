@@ -5,8 +5,15 @@ receipts are under "Phases 0–4 — Complete". A workspace-wide design and
 performance audit on 2026-09-04 (see "Hot-Path Redesign Decisions") added
 tasks H13–H22 and two new implementation phases ahead of the sandbox,
 adapter, and qualification work. Phase 5 (H13–H17) complete 2026-09-04;
-receipt under "Phase 5 — Correct The Hot Path". **Next slice: Phase 6
-(H18–H22).** Phases 6–9 and tasks H10–H12, H18–H22 remain proposed.
+receipt under "Phase 5 — Correct The Hot Path", including the unmet output
+service-gap gate. A follow-up source audit and peer review on 2026-09-04
+identified correctness gaps in shipped child, cache, feed, and context-source
+behavior. H23's first slice (outcome-read saturation and hard failure) is
+implemented and locally validated; receipt under Phase 5a. **Next slice: H23
+owned admission, interrupting steering, and execution teardown.**
+H23–H26 precede Phase 6; H27–H28 join its early correctness work. Phases 6–9
+remain proposed, with H20 moved ahead of H18 and H19 conditional on decoder
+measurements.
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -38,13 +45,16 @@ projects:
 - MCP-based external tools; and
 - durable, bounded read-only sub-agent sessions.
 
-The next priorities, in order, are:
+The compiled plan, backend protocol, and initial extension lanes have shipped.
+The remaining priorities, in order, are:
 
-1. Measure and repair the persistence, context, and scheduling hot paths.
-2. Introduce one immutable, content-addressed `CompiledAgentPlan`.
-3. Complete the backend protocol needed by external agent products.
-4. Add narrow extension lanes for agent packs, providers, tools, context, and
-   observers.
+1. Repair supervised-child ownership and budget admission, live credential
+   binding, and workspace-feed retention (H23–H26).
+2. Finish control admission and the carried output-fairness gate (H20).
+3. Repair settlement, active-plan accounting, context-source admission and
+   identity, and pack revalidation (behavioral H21, H27–H28, correctness H22).
+4. Reduce per-turn copying (H18), then optimize SSE only if decoder-specific
+   measurements justify it (H19); leave mechanical consolidation last.
 5. Add durable terminal control and a real process-sandbox adapter when
    evaluation justifies them.
 6. Add optional product-facing protocol adapters only in response to real
@@ -758,7 +768,10 @@ dynamic dispatch on hot paths; no new crates). Each design names the
 pattern it applies honestly; several are "a struct" or "a table", which is
 the point.
 
-### Verified Findings
+### Findings At The Start Of Phase 5
+
+This table records the pre-change audit, not the current implementation.
+H13–H17 receipts below identify repairs and the remaining acceptance gap.
 
 | Finding | Evidence | Verdict |
 | --- | --- | --- |
@@ -997,7 +1010,15 @@ Design: the store gains `control_slots`, a semaphore mirroring the existing
 loops are deleted. Sub-agent completion subscribes to the existing
 `settlements` watch; MCP cancellation uses a watch.
 
-Gates: cancellation ≤100 ms under load; command acknowledgement tail.
+H23 slice 1 introduces the shared `control_slots` capacity bound and uses
+waiting admission only for child outcome reads. H20 extends that mechanism
+to the remaining lifecycle callers and removes the existing polling loops;
+the first H23 slice does not qualify those broader changes or the fairness gate.
+
+Gates: cancellation ≤100 ms under load; command acknowledgement tail; the
+carried eight-stream output service gap ≤20 ms. Queue admission, dequeue,
+and commit timing in a focused fixture must establish the remaining cause;
+persisted event timestamps alone do not identify scheduler wake latency.
 
 Tests: 256 concurrent control calls complete without spinning;
 cancellation latency under load.
@@ -1050,7 +1071,12 @@ rather than shared if sharing would add a dependency edge.
 Rejected: an event-source crate (a dependency for bounded behavior QQ owns);
 parsing to `RawValue` then re-parsing (still two passes).
 
-Gates: one MiB to 512 KiB scaling ratio; semantic delta to durable commit.
+Gates: decoder time and allocations on a deterministic local HTTP/SSE
+pipeline, plus semantic delta to durable commit. The existing one MiB to
+512 KiB ratio remains a regression gate, but its fake provider emits semantic
+events directly and does not exercise either SSE decoder. Record the parser
+baseline before committing to the borrowed-view design and retain it only if
+the measured benefit justifies the interface change.
 
 Tests: property test splitting events at every byte boundary; CRLF;
 multi-line data; oversized rejection. Benchmark before: `sse_decode` at
@@ -1080,7 +1106,8 @@ Small enough to ship alongside the designs, grouped by crate:
   `SessionCommandKind` replacing twelve handlers, with the client table
   asserted equal in a test; `decode_bounded` for the four decode preambles;
   `PlanCache` borrows the key on lookup, evicts single-flight entries, and
-  stops cloning paths in fingerprint checks; the approval reviewer compiles
+  stops cloning paths in fingerprint checks (active-generation accounting and
+  atomic refresh admission are separately tracked by H27); the approval reviewer compiles
   through `PlanCache`; headless output leaves the Tokio worker.
 - `qq-config` and `qq-auth`: explicit pack manifests enter `probed_paths`
   (warm revalidation misses them today); pack MCP servers pass
@@ -1118,6 +1145,28 @@ Small enough to ship alongside the designs, grouped by crate:
 - File splits other than `sessions.rs`: structure without behavior; do
   opportunistically, never as a dedicated task.
 - A `ValidatedInput` newtype: no bug reported.
+
+### Follow-Up Correctness Audit — 2026-09-04
+
+Three independent read-only reviews of `036329a` covered performance,
+architecture, and correctness, then challenged each other's recommendations.
+The resulting work repairs existing contracts before further optimization:
+
+| Task | Current discrepancy | Required repair and acceptance |
+| --- | --- | --- |
+| H23 | A child outcome-read error disarms cleanup and releases its writer permit while the child may still execute. Interrupting steering can drop admission before a child id is returned or abandon asynchronous cancellation while the parent continues. | Preserve ownership across admission, overload, interruption, and cleanup. A parent or replacement writer cannot mutate until the previous supervised child has stopped. Test held creation, control saturation, interrupting steering, failed cleanup, and durable terminal ordering through `SessionRuntime`. Ordinary parent cancellation already has a creation-race regression; steering needs its own. Owned by supervised-delegation D4. |
+| H24 | Remaining child limits are captured once per tool turn and reused after earlier sequential children consume them. | Compute remaining cost, tokens, and duration at each sequential admission; reject an exhausted remainder. Test two children in one turn, including unknown spend. Record parallel-child reservation or permitted overshoot semantics explicitly without introducing a general scheduler. Owned by supervised-delegation D2. |
+| H25 | Same-file inline provider-secret changes can be discarded as equivalent plans. MCP registry keys also collapse differing inline bearer values before secrets are resolved. | Separate secret-free durable identity from live binding invalidation in both caches. Test same-path provider key/header rotation and two workspaces with differing inline MCP bearers; preserve active-run handles. Stored-credential rotation already works. Never hash or persist secrets to repair the key. |
+| H26 | Subscription allocates a retained workspace feed before validating workspace existence; rejected/disconnected arbitrary ids leave entries behind. | Validate before retaining feed state and bound or reclaim inactive entries, preserving attach-before-catch-up ordering. Test unknown-id churn, disconnect, and replay/live handoff. A standalone probe of unchanged `feed.rs` retained about 129 MiB after 4096 distinct subscribe/drop pairs with no surviving receivers; authenticated HTTP reachability was source-traced, not benchmarked. |
+| H27 | Same-key refresh removes the old generation before admission; active holders disappear from estimated-byte accounting, and a rejected replacement loses the old cache entry. | Account for superseded live generations and admit atomically. A probe with one entry and a 17682-byte budget retained two generations totaling 23651 estimated bytes. Test pinned same-key refresh, release/reclamation, and failed replacement preserving the prior generation. Runtime concurrency supplies an independent bound; this is a violated cache budget, not proof of unlimited runtime memory. |
+| H28 | A ninth context source, including a fail-closed source, is silently ignored. Source identity, version, budget, and failure policy are absent from the plan descriptor. | Reject excess registration with a typed capacity error before provider work; include immutable source descriptors in canonical plan identity with the required descriptor-version fixture update. Public-API probes reproduced both a skipped required source and equal digests for differing source identities/policies. |
+
+The review retained the single runtime, provider-owned retries, immutable plans,
+and persist-before-publish ordering. It ranked child ownership ahead of feed
+retention, classified cache accounting as P2 because other runtime limits
+exist, and made H19 conditional on measurements that actually decode SSE.
+Fault, cancellation, and recovery fixtures land with each repair; H12 later
+requalifies the combined system rather than being the first failure test.
 
 ## Backend Protocol Additions
 
@@ -1271,7 +1320,7 @@ Carry forward the active readiness targets:
 | Context overflow sent to a provider | Zero |
 | Compaction reduction when required | At least `8x` |
 | Stable-prefix provider cache use | At least `80%` where supported |
-| Provider retry amplification | `< 1.05` attempts per logical turn |
+| Core retry amplification | `< 1.05` provider stream entries per logical turn; transport attempts separately obey `AttemptPolicy` |
 | Harness-attributable evaluation failures | `< 0.5%` |
 
 Phase 0 establishes honest binary-size, startup, and RSS baselines. Its first
@@ -1386,24 +1435,30 @@ credential-lease caching, MCP bounds, and provider prompt-cache determinism.
 | --- | --- | --- | --- |
 | H0 | Complete: current-runtime speed, size, RSS, replay, and concurrency baseline | None | `xtask`, existing benches |
 | H1 | Cargo feature/dependency profiles, full/minimal baselines, and budget gates | H0 | Root, `qq-provider` |
-| H2 | Complete: immutable live `CompiledAgentPlan`, secret-free descriptor, and bounded cache | H1, R5 | Root, config, core, provider |
+| H2 | Shipped: immutable live `CompiledAgentPlan` and secret-free descriptor; cache repairs H25, H27 | H1, R5 | Root, config, core, provider |
 | H3 | Complete: input parts, profiles, plan identity, limits, steering, capabilities, and correlation | H2 | `qq-protocol`, server, client |
 | H4 | Fixtures complete; first external SDK deferred to a real consumer | H3 | `qq-client`, external adapter |
 | H5 | Complete: declarative agent-pack manifests compiled into plans | H2 | Root, config, core |
 | H6 | Complete: immutable tool catalog, progressive disclosure, skill index | H2 | Root, core, MCP, protocol |
 | H7 | Complete: embedded external-tool host and shared host conformance | H6 | Core, MCP, root |
-| H8 | Complete: bounded `ContextSource` and cache contract (in-tree consumers) | H2 | Core, root, protocol |
+| H8 | Shipped: `ContextSource` and cache (in-tree consumers); admission/identity repair H28 | H2 | Core, root, protocol |
 | H9 | Complete: post-commit observer loop and replay conformance | H3 | Protocol, client, server |
 | H13 | Effect-classified approval: `ext__` tools obey every approval mode; MCP permit released before the connect wait (D4) | H6, H7 | `qq-core`, `qq-mcp` |
 | H14 | Single retry owner in `qq-provider` with a plan-compiled `AttemptPolicy`; core turn retry deleted; amplification measured (D3) | H2 | `qq-provider`, `qq-core` |
 | H15 | Published-event outbox and per-workspace broadcast; SQLite reads only for catch-up (D1) | H9 | `qq-core`, `qq-server` |
 | H16 | Output-lane group commit with savepoints, deferred replies, and cached statements (D2) | H15 | `qq-core` store |
-| H17 | Schema 24: `runs.activity`, command counter, joined context load; claim to send in two hops (D6, D7) | H16 | `qq-core` store |
+| H17 | Shipped schema 25: `runs.activity`, command counter, joined context load; claim to send in two hops (D6, D7) | H16 | `qq-core` store |
 | H18 | Shared transcript `Arc`, precompiled prompt prefix, precomputed tool schemas (D5) | H14 | `qq-core`, `qq-provider` |
-| H19 | Zero-copy SSE framing in provider and client (D10) | None | `qq-provider`, `qq-client` |
-| H20 | Wake-driven control admission; polling loops removed (D8) | H16 | `qq-core` |
+| H19 | Measured SSE framing optimization in provider and client (D10); borrowed views conditional on decoder-specific benefit | H18, decoder baseline | `qq-provider`, `qq-client` |
+| H20 | Wake-driven control admission; polling loops removed; carried ≤20 ms output-fairness gate (D8) | H16, H23–H26 | `qq-core` |
 | H21 | `RunIdentity`, `PersistenceFault`, one settlement path, `sessions.rs` split (D9) | H15–H17, H20 | `qq-core` |
 | H22 | Bundled cold-path and structural fixes: config/auth load, protocol boxing and limits, route tables, TUI index and tail | None | Per crate |
+| H23 | Supervised-child ownership across admission, overload, steering, and cleanup; first active repair | Supervised-delegation D4 | `qq-core` |
+| H24 | Recompute remaining child budgets at sequential admission; define parallel fanout semantics | Supervised-delegation D2 | `qq-core` |
+| H25 | Live provider/MCP credential binding invalidation without secret-bearing durable identities | H2, H7 | Root, auth, MCP wiring |
+| H26 | Bounded workspace-feed admission and lifecycle | H15 | `qq-core`, server fixtures |
+| H27 | Active-generation accounting and atomic cache refresh admission | H2 | Root |
+| H28 | Explicit context-source capacity rejection and immutable source identity | H8 | Core, protocol |
 | H10 | First real OS process-sandbox adapter | R6, platform threat model | Core tools, root |
 | H11 | Optional ACP/OpenAI compatibility facade | H4, real consumer | Adapter in existing surface owner |
 | H12 | Crash, load, security, quality, and performance qualification | All shipped tasks and required R milestones | Workspace-wide |
@@ -1436,8 +1491,10 @@ Retained decisions from those receipts:
   snapshots, or cache diagnostics.
 - Static built-in tools are the zero-overhead path and never enter the
   exclusion or pin paths.
-- Every external component (host, source, observer) has typed readiness,
-  error, capacity, and shutdown states.
+- External hosts expose readiness and shutdown contracts; context sources
+  expose budgets and failure policy; observers consume committed events.
+  These are distinct interfaces. Source registration capacity and identity
+  remain subject to the H28 repair.
 - The Phase 4 recording host was shared and noisy; two tail-only metrics
   (`provider_delta_to_committed_core_event_ns` p95 and
   `http_cursor_reconnect_replay_ns` p95) were recorded as noise, not accepted
@@ -1498,11 +1555,11 @@ Acceptance, item by item:
 | Acceptance | Result |
 | --- | --- |
 | `ext__` denied under read-only, held under ask and supervised; MCP unchanged | Five-mode matrix with and without `read_only` hints, plus MCP decision tests, all green; hints never change a decision |
-| Attempts per turn never exceed policy; amplification below 1.05 | `provider_retry_amplification_milli` = 1000 (exactly one send per turn above the provider); `AttemptPolicy` tests cover pre-stream, pre-first-event, post-event, non-transient, `Retry-After`, and exhaustion |
+| Attempts per turn never exceed policy; amplification below 1.05 | `provider_retry_amplification_milli` = 1000 counts one core entry into a fake provider per logical turn, not transport sends. Separate `AttemptPolicy` tests cover pre-stream, pre-first-event, post-event, non-transient, `Retry-After`, and exhaustion |
 | One catch-up read per subscriber, none per event; live and replayed streams byte-identical | Eight subscribers: 8 catch-up reads total, 0 during the run; `live.json == stored.json` for every event; lagged subscriber recovers via SQLite with no gap or duplicate |
 | Failed outer commit fails every job and publishes nothing; control admitted between batches | Deferred-FK commit failure settles every job `Persistence` and the feed stays empty; a waiting control job runs within one group |
 | Command ack within budget with a 512-event active session | `busy_workspace_command_ack_ns` median 3.02 ms / p95 5.9 ms with 560 events and an active run (gate 10 ms) |
-| Eight-stream output service gap ≤20 ms | **Not met**: 29–45 ms (was 42–45). Completion dropped 0.91→0.29 s and the batch bench 236→138 ms, so the fsync amplification is gone; the remaining gap is scheduler wake latency and is carried to D8 (H20) |
+| Eight-stream output service gap ≤20 ms | **Not met**: 29–45 ms (was 42–45). Completion dropped 0.91→0.29 s and the batch bench 236→138 ms. The remaining cause is unverified: persisted event timestamps do not distinguish queue, scheduler, and commit delay. The ≤20 ms gate is carried explicitly to D8 (H20); the existing executable budget remains 50 ms until the tighter target is achieved and qualified. |
 | Claim to send uses two store hops; joined context equals previous assembly | Cancellation, file state, and steering ride the claim; the pre-change assembly is kept as a test oracle and matches on compaction, steering, and pruned-result stores |
 | No protocol/capability bump; schema migration tested | `PROTOCOL_VERSION` 16 and `CAPABILITIES_VERSION` 1 unchanged; descriptor 4→5 (above); schema 24→25 with a backfill test |
 
@@ -1510,7 +1567,7 @@ Measurements (this host, release, medians unless stated):
 
 | Metric | Before | After |
 | --- | ---: | ---: |
-| Retry amplification (sends per logical turn) | up to 24 | 1.000 |
+| Retry ownership | Static worst case of up to 24 transport sends from nested retry owners | Measured 1.000 core entries into a fake provider per logical turn; actual transport attempts remain bounded by `AttemptPolicy` |
 | Fan-out, delta to slowest of 8 subscribers | 13.7 ms | 12.1 ms |
 | Fan-out, delta to slowest of 32 subscribers p95 | 26.4 ms | 14.9 ms |
 | Command ack with 32 subscribers attached | 17.6 ms | 6.2 ms |
@@ -1580,20 +1637,90 @@ Acceptance:
 - no protocol, capability, or descriptor version changes; schema moves
   23→24 with a migration test.
 
-### Phase 6 — Shrink Per-Run Work And Consolidate The Store
+### Phase 5a — Repair Shipped Correctness Contracts
 
-Implement H18, H19, H20, H21, and H22. H18 and H19 are independent and may
-run in parallel worktrees; H20 then H21 follow Phase 5 serially because they
-edit the same store paths. H22 items may land whenever their crate is
-otherwise quiet.
+Implement H23, H24, H25, and H26 before Phase 6. H23 starts with the
+supervised-child ownership invariant and its failure tests; H24 follows in
+the owning delegation contract. H25 and H26 may be independently investigated,
+but concurrent writing uses isolated worktrees and reviewed integration.
+
+H23 is delivered in two bounded slices. The first prevents outcome-read
+saturation or hard failure from allowing the parent to resume while its child
+is still live.
+The second establishes owned admission and cleanup across interrupting steering
+and parent termination, including locally owned mutation/process quiescence.
+A durable terminal event is not by itself proof of execution teardown. H23
+stays open until both slices are qualified; this split does not defer its
+cleanup acceptance to H12.
+
+Each repair carries the acceptance fixtures in the follow-up audit table,
+workspace checks, and its relevant latency/resource measurements. Do not
+mark the tranche complete while a repair or its qualification remains open.
+No broad refactor, new plugin surface, or global scheduling framework is part
+of this tranche.
+
+#### H23 Slice 1 Receipt — 2026-09-04
+
+Implemented and locally validated; H23 and Phase 5a remain open. Child outcome
+reads wait for a capacity wake on the bounded control lane while retaining
+their child guard and writer permit. Ordinary command admission retains its
+immediate overload response. Hard outcome-read failures fail the runtime and
+signal child cancellation before the parent can continue normal tool execution.
+
+Four regressions cover a live write child under actual control saturation,
+unreadable child accounting, cancellation of a capacity waiter, and store close
+waking waiters while draining accepted jobs. The runtime regressions failed
+before their fixes. The saturation fixture acknowledges an actual admission
+attempt while all 256 slots are occupied and checks the child's successful
+result and durable completion before the parent's tool completion.
+
+Validation: `cargo test --workspace` (1146 passed, 3 ignored),
+`cargo fmt --all -- --check`, strict all-target/all-feature workspace Clippy,
+and `cargo build --workspace` pass. The workspace tests require local loopback
+access; this host's `NO_COLOR=1` was unset for existing color-output tests.
+No protocol, descriptor, schema, or dependency changes.
+
+Performance smoke: ten alternating baseline/candidate pairs of release
+`xtask perf r4-worker --case eight-streams`, built from `036329a` and this
+slice, on the same host/filesystem with no concurrent build or test run.
+Values are median [min, max]; milliseconds except RSS in MiB.
+
+| Metric | Baseline | H23 slice 1 |
+| --- | ---: | ---: |
+| Eight-stream completion | 278.7 [250.2, 341.7] | 274.1 [255.9, 309.4] |
+| Control call latency upper bound | 20.09 [19.54, 24.07] | 20.92 [18.70, 30.98] |
+| Cancellation to finished | 27.40 [25.86, 31.36] | 27.81 [23.44, 41.11] |
+| Maximum output service gap | 24.0 [23, 28] | 24.5 [22, 35] |
+| Peak temporary RSS | 9.02 [8.18, 9.87] | 9.12 [8.33, 9.80] |
+
+Medians are close, but candidate control/cancellation/output maxima are higher;
+the tail impact remains unresolved. This small comparison does not qualify
+the full H0 regression gate or the carried H20 ≤20 ms service-gap target.
+Repeat the controlled tail comparison before closing H23; the existing
+absolute control/cancellation/gap budgets were not exceeded in these samples.
+
+Interrupting steering, creation whose awaiter disappears, cancellation admission
+failure, and execution teardown remain the next required H23 slice. This receipt
+does not establish mutation/process quiescence or complete H20 qualification.
+
+### Phase 6 — Finish Fairness, Shrink Per-Run Work, And Consolidate
+
+After Phase 5a, implement H20 first. Then land the behavioral settlement
+portion of H21, H27–H28, and H22's explicit-pack revalidation and MCP-name
+validation fixes. H18 follows those correctness repairs. H19 follows its
+decoder baseline and only ships the design justified by that evidence. The
+mechanical H21 file split and remaining structural H22 items land last,
+separately from behavior changes.
 
 Benchmarks to record before each change:
 
 - H18: `provider_encode` (one MiB plus 32 schemas with a counting
   allocator) in `qq-provider`, plus reruns of `provider_compiler`,
   `plan_compile`, and the `plan_for` warm path;
-- H19: `sse_decode` at 64 KiB, 512 KiB, and one MiB in `qq-provider`;
-- H20: cancellation under 256 queued control jobs; and
+- H19: `sse_decode` at 64 KiB, 512 KiB, and one MiB in `qq-provider`, plus
+  allocations and latency through a deterministic local HTTP/SSE pipeline;
+- H20: cancellation under 256 queued control jobs and the eight-stream mixed
+  control/output fixture, with queue admission/dequeue/commit timing; and
 - H22: the H0 cold `plan_for` measurement and the TUI 200-session sidebar
   case.
 
@@ -1601,8 +1728,9 @@ Deliverables:
 
 - `Arc<Vec<Message>>` transcripts, precompiled prompt prefix and digest
   state, and precomputed schema measurement and `RawValue` schemas (D5);
-- slice-scanning SSE framers in provider and client with borrowed event
-  views and shared tool ids (D10);
+- if H19 ships, measured SSE framing improvements in provider and client;
+  borrowed event views and shared tool ids only when the decoder baseline
+  supports D10;
 - `control_slots` admission and the removal of every `sleep(1 ms)` retry
   loop and store poll (D8);
 - `RunIdentity`, `EventContext` constructors, `RunSettlement`,
@@ -1618,6 +1746,16 @@ Acceptance:
   against the Phase 4 receipt;
 - cancellation is at most 100 ms with 256 queued control jobs and no site
   polls the store;
+- the carried eight-stream output service gap is at most 20 ms under mixed
+  control/output load, with no relaxation of cancellation or durability;
+  once qualified, tighten its executable budget from 50 ms to 20 ms;
+- if H19 ships, it improves decoder-specific allocation/latency measurements;
+  the fake-provider stream-scaling ratio alone cannot qualify it. A documented
+  no-change decision is acceptable when measurements show insufficient benefit;
+- active and superseded plan generations obey entry/byte limits; rejected
+  refresh leaves the previous cached generation intact;
+- excess required context sources fail compilation explicitly, and changing
+  source identity, version, budget, or fail policy changes the plan digest;
 - settling an already-settled run through any path is a no-op and every
   `PersistenceFault` variant is reachable in tests;
 - the `sessions.rs` split changes no behavior and lands as its own commit;
@@ -1671,7 +1809,9 @@ Acceptance:
 
 ### Phase 9 — Qualification
 
-H12 qualifies the complete story, not only individual modules. It re-runs
+H12 qualifies the complete story, not only individual modules. Each preceding
+repair already includes its own fault, cancellation, and recovery fixtures;
+H12 is the combined-system qualification, not their first execution. It re-runs
 every Phase 5 and Phase 6 pre-change baseline and enforces the recorded
 improvements as regression gates in `benchmarks/perf/budgets-v1.json` (or a
 successor budget file).
@@ -1847,7 +1987,9 @@ The speed-first extensible backend is complete when:
   improve verified work per dollar and minute; and
 - product integrations remain clients of one durable QQ runtime.
 
-Until those conditions are met, the near-term implementation boundary is
-Phase 6 (H18–H22): per-run copy elimination, SSE framing, control-lane
-admission, store consolidation, and the bundled fixes. Phase 5 shipped on
-2026-09-04. Plugin or marketplace work is not the next slice.
+Until those conditions are met, the immediate implementation boundary is
+Phase 5a (H23–H26), beginning with H23 supervised-child ownership. Phase 6
+then starts with H20 and the early correctness repairs (behavioral H21,
+H27–H28, correctness H22), followed by H18, measured H19, and mechanical
+consolidation. Phase 5 shipped on 2026-09-04 with its output-service-gap gate
+still open. Plugin or marketplace work is not the next slice.

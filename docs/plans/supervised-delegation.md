@@ -7,6 +7,13 @@ the default decisions they feed have not been made. This plan is a companion to
 and requires the amendments listed in [Amendments](#amendments-to-existing-plans)
 before D4 or D5 may land.
 
+The 2026-09-04 follow-up review reopened D4 ownership (H23) and D2 remaining
+budget admission (H24), scheduled by the backend plan's Phase 5a. H23's first
+slice, outcome-read saturation and hard-failure handling, is implemented and
+locally validated; see its receipt in the backend plan. Interrupting steering
+and execution teardown remain the next required slice. The prior shipped
+receipts do not qualify those newly identified failure windows.
+
 This plan covers four related runtime behaviors:
 
 1. runs that stop half-finished on provider output truncation must continue,
@@ -236,6 +243,12 @@ partial turn visible to the next prompt; content filter still fails as
 
 Owner: `qq-core`, `qq-protocol`. Prerequisite for any depth above one.
 
+H24 follow-up: recompute the remaining budget at each sequential child
+admission, after charging earlier children in the same turn. Test cost,
+tokens, elapsed duration, unknown spend, and zero remainder. Specify parallel
+fanout reservation or permitted overshoot explicitly; giving each child the
+same stale allowance does not establish an aggregate bound.
+
 - Child limits are the parent's remaining budget: remaining cost, remaining
   wall clock, and remaining tokens where the parent carries token limits;
   `None` where the parent has none. A child cannot be admitted with a zero or
@@ -340,6 +353,24 @@ one, separate from the read-child semaphore). Write spawns are never batched
 into the read-only parallel group. The parent is blocked awaiting the spawn
 result, so no two writers share the checkout within one delegation tree.
 Read-before-write hashes already guard cross-session edits.
+
+H23 follow-up acceptance:
+
+- Outcome reads retain child ownership and the writer permit while waiting
+  for control-lane capacity; no polling interval is added. A hard store error
+  fails the runtime and signals the child instead of returning a resumable
+  tool error that lets the parent resume while its child is live.
+- The next ownership slice covers interrupting steering before the creation
+  reply, cancellation admission failure, and parent continuation or a queued
+  replacement run. A durable terminal event alone is not an execution-stopped
+  acknowledgement: the child stream and locally owned mutators/processes must
+  be quiescent before another writer is released.
+- Track accepted child creation even if its awaiter disappears, account for
+  interrupted child spend exactly once, and test shutdown during cleanup.
+  Preserve uncertainty for external effects; stopping QQ dispatch cannot prove
+  a remote MCP effect was undone, and must never trigger an implicit retry.
+
+H23 remains open until both slices pass their failure and cleanup fixtures.
 
 Reviewer widening. `ReviewRequest` gains bounded `arguments` (16 KiB),
 `task_brief` (the child's brief, 8 KiB), `origin: Root | Child { depth,
