@@ -1,13 +1,12 @@
-use std::{
-    io::Read,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::io::Read;
 
 use serde::Deserialize;
 
 use crate::workspace::Workspace;
 
-use super::dispatch::{MAX_TOOL_RESULT_BYTES, TRUNCATION_MARKER, ToolExecutionResult};
+use super::dispatch::{
+    MAX_TOOL_RESULT_BYTES, TRUNCATION_MARKER, ToolCancellation, ToolExecutionResult,
+};
 
 const MAX_SEARCH_ENTRIES: usize = 20_000;
 const MAX_SEARCH_RESULTS: usize = 200;
@@ -29,7 +28,7 @@ fn default_search_path() -> String {
 pub(super) fn search(
     workspace: &Workspace,
     arguments: SearchArgs,
-    cancelled: &AtomicBool,
+    cancelled: &ToolCancellation,
 ) -> ToolExecutionResult {
     if arguments.query.is_empty() || arguments.query.len() > 1_024 {
         return ToolExecutionResult::error("query must contain between 1 and 1024 bytes");
@@ -47,7 +46,7 @@ pub(super) fn search(
     let mut bounded = false;
 
     while let Some(path) = pending.pop() {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.is_cancelled() {
             return ToolExecutionResult::error("tool execution was cancelled");
         }
         // `bounded` also stops the walk: once the result buffer is full no
@@ -86,7 +85,7 @@ pub(super) fn search(
             };
             let mut children = Vec::new();
             for entry in entries {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.is_cancelled() {
                     return ToolExecutionResult::error("tool execution was cancelled");
                 }
                 if visited_entries
@@ -155,7 +154,7 @@ pub(super) fn search(
         let mut file = file.take(remaining.min(metadata.len()));
         let mut chunk = [0_u8; 64 * 1024];
         loop {
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.is_cancelled() {
                 return ToolExecutionResult::error("tool execution was cancelled");
             }
             let read = match file.read(&mut chunk) {

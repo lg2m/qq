@@ -1,15 +1,13 @@
 #[cfg(test)]
 use std::sync::OnceLock;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 #[cfg(test)]
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::workspace::{FileState, FileStateUpdate, Workspace, blocking_permits};
 
@@ -31,6 +29,91 @@ static TEST_EXECUTIONS_STARTED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static TEST_EXECUTION_BARRIER: OnceLock<std::sync::Barrier> = OnceLock::new();
 
+/// Tracks actual local execution, including work whose result waiter was
+/// dropped. Stop dispatching into the scope before awaiting its drain.
+#[derive(Clone, Default)]
+pub(crate) struct ToolTasks(Arc<ToolTaskState>);
+
+#[derive(Default)]
+struct ToolTaskState {
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+impl ToolTasks {
+    pub(crate) async fn drain(&self) {
+        loop {
+            let idle = self.0.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.0.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+
+    fn enter(&self) -> ToolTaskLease {
+        self.0.active.fetch_add(1, Ordering::AcqRel);
+        ToolTaskLease(Arc::clone(&self.0))
+    }
+}
+
+struct ToolTaskLease(Arc<ToolTaskState>);
+
+impl Drop for ToolTaskLease {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+pub(super) struct ToolCancellation {
+    run: Arc<AtomicBool>,
+    call: Arc<CallCancellation>,
+}
+
+#[derive(Default)]
+struct CallCancellation {
+    cancelled: AtomicBool,
+    wake: Notify,
+}
+
+impl ToolCancellation {
+    pub(super) fn new(run: Arc<AtomicBool>) -> Self {
+        Self {
+            run,
+            call: Arc::new(CallCancellation::default()),
+        }
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.run.load(Ordering::Acquire) || self.call.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn caller_dropped(&self) {
+        loop {
+            let wake = self.call.wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            if self.call.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            wake.await;
+        }
+    }
+}
+
+struct CancelCallOnDrop(Arc<CallCancellation>);
+
+impl Drop for CancelCallOnDrop {
+    fn drop(&mut self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.wake.notify_waiters();
+    }
+}
+
 pub(crate) async fn execute(
     workspace: Workspace,
     file_state: Arc<FileState>,
@@ -38,10 +121,13 @@ pub(crate) async fn execute(
     arguments: String,
     cancelled: Arc<AtomicBool>,
     output: Option<mpsc::Sender<String>>,
+    tasks: ToolTasks,
 ) -> ToolExecutionResult {
     if arguments.len() > MAX_ARGUMENT_BYTES {
         return ToolExecutionResult::error("tool arguments exceed the 64 KiB limit");
     }
+    let cancelled = ToolCancellation::new(cancelled);
+    let _cancel_on_drop = CancelCallOnDrop(Arc::clone(&cancelled.call));
     // Shell executes on the async runtime directly: it awaits a child process
     // rather than doing blocking filesystem work, so it must neither occupy a
     // blocking permit for its full (possibly 120 s) lifetime nor block a
@@ -53,14 +139,25 @@ pub(crate) async fn execute(
                 return ToolExecutionResult::error(format!("invalid arguments: {error}"));
             }
         };
-        return run_shell(&workspace, &arguments, &cancelled, output.as_ref()).await;
+        let lease = tasks.enter();
+        return match tokio::spawn(async move {
+            let _lease = lease;
+            run_shell(&workspace, &arguments, &cancelled, output.as_ref()).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => ToolExecutionResult::error("tool execution stopped unexpectedly"),
+        };
     }
     let permit = match blocking_permits().acquire_owned().await {
         Ok(permit) => permit,
         Err(_) => return ToolExecutionResult::error("tool executor is unavailable"),
     };
+    let lease = tasks.enter();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _lease = lease;
         execute_blocking(&workspace, &file_state, &name, &arguments, &cancelled)
     })
     .await
@@ -138,9 +235,9 @@ pub(super) fn execute_blocking(
     file_state: &FileState,
     name: &str,
     arguments: &str,
-    cancelled: &AtomicBool,
+    cancelled: &ToolCancellation,
 ) -> ToolExecutionResult {
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.is_cancelled() {
         return ToolExecutionResult::error("tool execution was cancelled");
     }
     match BuiltInTool::from_name(name) {
@@ -158,11 +255,11 @@ pub(super) fn execute_blocking(
             }),
         Some(BuiltInTool::EditFile) => deserialize(arguments)
             .map_or_else(ToolExecutionResult::error, |args| {
-                edit_file(workspace, file_state, &args)
+                edit_file(workspace, file_state, &args, cancelled)
             }),
         Some(BuiltInTool::WriteFile) => deserialize(arguments)
             .map_or_else(ToolExecutionResult::error, |args| {
-                write_file(workspace, file_state, &args)
+                write_file(workspace, file_state, &args, cancelled)
             }),
         Some(BuiltInTool::Shell) => {
             ToolExecutionResult::error("shell commands must execute asynchronously")
@@ -180,7 +277,7 @@ pub(super) fn execute_blocking(
                     .wait();
             }
             for _ in 0..arguments.delay_ms {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.is_cancelled() {
                     return ToolExecutionResult::error("tool execution was cancelled");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -195,7 +292,7 @@ pub(super) fn execute_blocking(
             };
             TEST_EXECUTIONS_STARTED.fetch_add(1, Ordering::Release);
             for _ in 0..arguments.delay_ms {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.is_cancelled() {
                     return ToolExecutionResult::error("tool execution was cancelled");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));

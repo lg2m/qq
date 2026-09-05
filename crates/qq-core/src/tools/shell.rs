@@ -1,11 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use serde::Deserialize;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 
 use crate::workspace::Workspace;
 
-use super::dispatch::ToolExecutionResult;
+use super::dispatch::{ToolCancellation, ToolExecutionResult};
 
 pub(super) const MAX_SHELL_OUTPUT_BYTES: usize = 128 * 1024;
 const SHELL_READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -34,14 +32,15 @@ enum ShellOutcome {
 /// process group with the workspace (or a contained subdirectory) as its
 /// working directory, combined stdout+stderr captured head+tail within the
 /// output budget, live chunks forwarded to `output`, and the whole process
-/// group killed on timeout, cancellation, or drop of the in-flight future.
+/// group killed on timeout or cancellation. The dispatch task owns this
+/// future through kill and reap even when its result waiter disappears.
 pub(super) async fn run_shell(
     workspace: &Workspace,
     arguments: &ShellArgs,
-    cancelled: &AtomicBool,
+    cancelled: &ToolCancellation,
     output: Option<&mpsc::Sender<String>>,
 ) -> ToolExecutionResult {
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.is_cancelled() {
         return ToolExecutionResult::error("tool execution was cancelled");
     }
     if arguments.command.trim().is_empty() {
@@ -101,9 +100,10 @@ pub(super) async fn run_shell(
     let outcome = loop {
         tokio::select! {
             biased;
+            () = cancelled.caller_dropped() => break ShellOutcome::Cancelled,
             () = tokio::time::sleep_until(deadline) => break ShellOutcome::TimedOut,
             _ = cancel_poll.tick() => {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.is_cancelled() {
                     break ShellOutcome::Cancelled;
                 }
             }
@@ -245,10 +245,9 @@ fn shell_result(capture: BoundedCapture, status: std::process::ExitStatus) -> To
     }
 }
 
-/// Kills a spawned command's whole process group when dropped, unless
-/// disarmed after a normal exit. Kill-on-drop is what guarantees run
-/// cancellation leaves no orphaned children even though cancellation drops
-/// the in-flight execution future without polling it further.
+/// Kills the process group on task destruction, unless disarmed after a
+/// normal exit. Ordinary cancellation keeps the owning task alive to reap
+/// the child; this guard also covers unwinding of that task.
 struct ProcessGroupGuard {
     #[cfg(unix)]
     pgid: Option<rustix::process::Pid>,

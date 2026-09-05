@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::workspace::{FileState, FileStateUpdate, Workspace, content_hash, stale_file_error};
 
 use super::{
-    dispatch::ToolExecutionResult,
+    dispatch::{ToolCancellation, ToolExecutionResult},
     edit::{MAX_EDIT_FILE_BYTES, apply_atomically, read_editable},
 };
 
@@ -23,6 +23,7 @@ pub(super) fn write_file(
     workspace: &Workspace,
     file_state: &FileState,
     arguments: &WriteFileArgs,
+    cancelled: &ToolCancellation,
 ) -> ToolExecutionResult {
     if arguments.content.len() as u64 > MAX_EDIT_FILE_BYTES {
         return ToolExecutionResult::error(format!(
@@ -40,6 +41,9 @@ pub(super) fn write_file(
         .apply_lock()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    if cancelled.is_cancelled() {
+        return ToolExecutionResult::error("tool execution was cancelled");
+    }
     let created = match workspace.root().symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => {
             // Overwrites follow the same read-before-write and staleness

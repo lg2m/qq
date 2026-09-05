@@ -1,13 +1,12 @@
-use std::{
-    io::{BufRead, BufReader, Cursor, Read, Take},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::io::{BufRead, BufReader, Cursor, Read, Take};
 
 use serde::Deserialize;
 
 use crate::workspace::{FileState, FileStateUpdate, Workspace, content_hash};
 
-use super::dispatch::{MAX_TOOL_RESULT_BYTES, TRUNCATION_MARKER, ToolExecutionResult};
+use super::dispatch::{
+    MAX_TOOL_RESULT_BYTES, TRUNCATION_MARKER, ToolCancellation, ToolExecutionResult,
+};
 
 pub(super) const MAX_READ_LINES: usize = 2_000;
 const MAX_READ_OFFSET: usize = 100_000;
@@ -35,7 +34,7 @@ pub(super) fn read_file(
     workspace: &Workspace,
     file_state: &FileState,
     arguments: ReadFileArgs,
-    cancelled: &AtomicBool,
+    cancelled: &ToolCancellation,
 ) -> ToolExecutionResult {
     if arguments.offset == 0 || arguments.offset > MAX_READ_OFFSET {
         return ToolExecutionResult::error(format!(
@@ -82,13 +81,13 @@ fn window_lines<R: Read>(
     mut reader: Take<BufReader<R>>,
     offset: usize,
     limit: usize,
-    cancelled: &AtomicBool,
+    cancelled: &ToolCancellation,
 ) -> ToolExecutionResult {
     let mut output = String::new();
     let mut line = Vec::new();
     let end = offset.saturating_add(limit);
     for line_number in 1..end {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.is_cancelled() {
             return ToolExecutionResult::error("tool execution was cancelled");
         }
         line.clear();

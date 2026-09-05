@@ -9,7 +9,9 @@ mod write;
 
 #[cfg(test)]
 pub(crate) use dispatch::{MAX_TOOL_RESULT_BYTES, test_executions_started};
-pub(crate) use dispatch::{ToolExecutionResult, bounded_result, execute};
+pub(crate) use dispatch::{ToolExecutionResult, ToolTasks, bounded_result, execute};
+#[cfg(test)]
+pub(crate) use edit::hold_tool_apply;
 pub(crate) use specs::{
     MAX_SPAWN_AGENT_SCHEMA_BYTES, SPAWN_AGENT_TOOL, SpawnAgentArgs, spawn_agent_spec, static_tools,
 };
@@ -19,7 +21,7 @@ pub(crate) use specs::{specs, test_tool_effect};
 #[cfg(test)]
 use crate::workspace::{FileState, Workspace, content_hash};
 #[cfg(test)]
-use dispatch::{TRUNCATION_MARKER, escaped_len, execute_blocking};
+use dispatch::{TRUNCATION_MARKER, ToolCancellation, escaped_len, execute_blocking};
 #[cfg(test)]
 use list::MAX_DIRECTORY_ENTRIES;
 #[cfg(test)]
@@ -50,7 +52,13 @@ mod tests {
         name: &str,
         arguments: &str,
     ) -> ToolExecutionResult {
-        execute_blocking(workspace, state, name, arguments, &AtomicBool::new(false))
+        execute_blocking(
+            workspace,
+            state,
+            name,
+            arguments,
+            &ToolCancellation::new(Arc::new(AtomicBool::new(false))),
+        )
     }
 
     #[test]
@@ -242,7 +250,7 @@ mod tests {
             &FileState::default(),
             "read_file",
             r#"{"path":"note.txt"}"#,
-            &AtomicBool::new(true),
+            &ToolCancellation::new(Arc::new(AtomicBool::new(true))),
         );
         assert!(result.is_error);
         assert!(result.content.contains("cancelled"));
@@ -713,8 +721,88 @@ mod tests {
             arguments.to_owned(),
             cancelled,
             output,
+            ToolTasks::default(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn dropped_write_waiter_drains_the_actual_atomic_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let tasks = ToolTasks::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (entered, release) = hold_tool_apply(workspace.path());
+        let mut execution = Box::pin(execute(
+            workspace,
+            Arc::new(FileState::default()),
+            "write_file".to_owned(),
+            r#"{"path":"result.txt","content":"committed locally"}"#.to_owned(),
+            Arc::clone(&cancelled),
+            None,
+            tasks.clone(),
+        ));
+        assert!(futures_util::poll!(execution.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(execution);
+
+        let mut abandoned_drain = Box::pin(tasks.drain());
+        assert!(futures_util::poll!(abandoned_drain.as_mut()).is_pending());
+        let mut drain = Box::pin(tasks.drain());
+        assert!(futures_util::poll!(drain.as_mut()).is_pending());
+        drop(abandoned_drain);
+        assert!(!directory.path().join("result.txt").exists());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("result.txt")).unwrap(),
+            "committed locally"
+        );
+        assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_shell_waiter_is_reaped_before_drain_with_full_live_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let tasks = ToolTasks::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (output, mut chunks) = mpsc::channel::<String>(1);
+        let mut execution = Box::pin(execute(
+            workspace,
+            Arc::new(FileState::default()),
+            "shell".to_owned(),
+            r#"{"command":"echo pid:$$; while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done"}"#.to_owned(),
+            Arc::clone(&cancelled),
+            Some(output),
+            tasks.clone(),
+        ));
+        assert!(futures_util::poll!(execution.as_mut()).is_pending());
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), chunks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let pid = parse_marked_pid(&first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while chunks.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(execution);
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.drain())
+            .await
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        assert!(rustix::process::test_kill_process(pid).is_err());
+        assert!(!cancelled.load(Ordering::Acquire));
     }
 
     /// Polls until the process is gone, failing the test after a generous

@@ -1,10 +1,8 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use serde::Deserialize;
 
 use crate::workspace::Workspace;
 
-use super::dispatch::{TRUNCATION_MARKER, ToolExecutionResult};
+use super::dispatch::{TRUNCATION_MARKER, ToolCancellation, ToolExecutionResult};
 
 pub(super) const MAX_DIRECTORY_ENTRIES: usize = 1_000;
 
@@ -23,7 +21,7 @@ const fn default_directory_limit() -> usize {
 pub(super) fn list_dir(
     workspace: &Workspace,
     arguments: ListDirArgs,
-    cancelled: &AtomicBool,
+    cancelled: &ToolCancellation,
 ) -> ToolExecutionResult {
     if arguments.limit == 0 || arguments.limit > MAX_DIRECTORY_ENTRIES {
         return ToolExecutionResult::error(format!(
@@ -45,7 +43,7 @@ pub(super) fn list_dir(
     };
     let mut entries = Vec::with_capacity(arguments.limit.min(MAX_DIRECTORY_ENTRIES));
     for entry in read_dir.take(MAX_DIRECTORY_ENTRIES + 1) {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.is_cancelled() {
             return ToolExecutionResult::error("tool execution was cancelled");
         }
         let entry = match entry {

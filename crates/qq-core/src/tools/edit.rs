@@ -11,10 +11,40 @@ use serde::Deserialize;
 
 use crate::workspace::{FileState, FileStateUpdate, Workspace, content_hash, stale_file_error};
 
-use super::{dispatch::ToolExecutionResult, read::MAX_READ_SCAN_BYTES};
+use super::{
+    dispatch::{ToolCancellation, ToolExecutionResult},
+    read::MAX_READ_SCAN_BYTES,
+};
 
 pub(super) const MAX_EDIT_FILE_BYTES: u64 = MAX_READ_SCAN_BYTES;
 static TEMP_FILE_ORDINAL: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+struct ApplyHook {
+    workspace: PathBuf,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static APPLY_HOOKS: std::sync::Mutex<Vec<ApplyHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn hold_tool_apply(
+    workspace: &Path,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    APPLY_HOOKS.lock().unwrap().push(ApplyHook {
+        workspace: workspace.to_owned(),
+        entered,
+        release: release_rx,
+    });
+    (entered_rx, release)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +60,7 @@ pub(super) fn edit_file(
     workspace: &Workspace,
     file_state: &FileState,
     arguments: &EditFileArgs,
+    cancelled: &ToolCancellation,
 ) -> ToolExecutionResult {
     if arguments.old_string.is_empty() {
         return ToolExecutionResult::error("old_string must not be empty");
@@ -60,6 +91,9 @@ pub(super) fn edit_file(
         .apply_lock()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    if cancelled.is_cancelled() {
+        return ToolExecutionResult::error("tool execution was cancelled");
+    }
     let current = match read_editable(workspace, &path) {
         Ok(current) => current,
         Err(error) => return ToolExecutionResult::error(error),
@@ -183,6 +217,20 @@ pub(super) fn apply_atomically(
         .and_then(|()| temp.sync_all())
         .map_err(|error| format!("could not write the temporary file: {error}"));
     drop(temp);
+    #[cfg(test)]
+    {
+        let hook = {
+            let mut hooks = APPLY_HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .position(|hook| hook.workspace == workspace.path())
+                .map(|index| hooks.remove(index))
+        };
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(());
+            let _ = hook.release.recv();
+        }
+    }
     let applied = written
         .and_then(|()| match permissions {
             Some(permissions) => workspace
