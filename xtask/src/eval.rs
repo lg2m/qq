@@ -25,7 +25,7 @@ pub(crate) struct EvalArgs {
 #[derive(Debug, Subcommand)]
 enum EvalCommand {
     /// Build QQ and run a pinned Harbor evaluation.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Summarize one Harbor job and verify its identities and failure labels.
     Report(ReportArgs),
     /// Record one trajectory-grounded primary failure category.
@@ -62,15 +62,34 @@ struct RunArgs {
     /// Concurrent trials. Keep this explicit so machine pressure is reproducible.
     #[arg(short = 'n', long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     n_concurrent: u16,
-    /// QQ wall-clock limit passed to every trial.
+    /// QQ wall-clock limit passed to every trial. Harbor's own per-task
+    /// agent deadline is stretched by `--agent-timeout-multiplier` so QQ
+    /// settles first and the trace carries an outcome record.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     timeout_seconds: Option<u64>,
+    /// Multiplier applied to each task's Harbor agent timeout. Keep it above
+    /// 1.0: when the outer deadline fires first the container is stopped
+    /// mid-run and the trial is a harness failure, not a task result.
+    #[arg(long, default_value_t = 1.5)]
+    agent_timeout_multiplier: f64,
     /// QQ model-turn limit passed to every trial.
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     max_turns: Option<u16>,
     /// QQ run-cost limit in USD passed to every trial.
     #[arg(long)]
     max_cost_usd: Option<f64>,
+    /// Unattended tool-approval policy for `qq run` inside each task
+    /// container. Task containers are disposable, and the reference harnesses
+    /// run unrestricted, so `full` is the comparable default; `auto` and
+    /// `read-only` exist for ablations.
+    #[arg(long, value_enum, default_value_t = EvalApproval::Full)]
+    approval: EvalApproval,
+    /// Rust target triple to build and upload. Set this to
+    /// `x86_64-unknown-linux-musl` for a static binary that runs on any task
+    /// image; the default host build requires the image's glibc to be at
+    /// least as new as the build host's.
+    #[arg(long, value_name = "TRIPLE")]
+    target: Option<String>,
     /// Stable operator-supplied machine or runner class recorded in the manifest.
     #[arg(long)]
     machine_class: Option<String>,
@@ -91,6 +110,26 @@ struct RunArgs {
     /// Print the complete non-secret launch plan without building or running.
     #[arg(long)]
     dry_run: bool,
+}
+
+/// Mirrors `qq run --approval`; `ask` is intentionally unrepresentable
+/// because nothing can answer a prompt inside a task container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum EvalApproval {
+    ReadOnly,
+    Auto,
+    Full,
+}
+
+impl EvalApproval {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -185,7 +224,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<(), EvalError> {
 
 fn run_blocking(args: EvalArgs) -> Result<(), EvalError> {
     match args.command {
-        EvalCommand::Run(args) => run_harbor(args),
+        EvalCommand::Run(args) => run_harbor(*args),
         EvalCommand::Report(args) => {
             let report = report_job(&args.job)?;
             let rendered =
@@ -223,28 +262,53 @@ struct LaunchPlan {
     harbor_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     machine_class: Option<String>,
+    /// Rust target triple of the uploaded binary; absent for the host build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qq_build_target: Option<String>,
+    #[serde(default = "default_plan_approval")]
+    approval: EvalApproval,
     program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
 }
 
-fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
-    let repository = repository_root()?;
-    let revision = command_stdout(
-        ProcessCommand::new("git")
-            .current_dir(&repository)
-            .args(["rev-parse", "HEAD"]),
-        "git",
-    )?;
-    let dirty = !command_stdout(
-        ProcessCommand::new("git")
-            .current_dir(&repository)
-            .args(["status", "--porcelain"]),
-        "git",
-    )?
-    .is_empty();
-    let binary = repository.join("target/release/qq");
-    let jobs_dir = absolute_from(&repository, &args.jobs_dir);
+/// Manifests written before `--approval` existed were produced by an adapter
+/// that hard-coded `auto`.
+const fn default_plan_approval() -> EvalApproval {
+    EvalApproval::Auto
+}
+
+/// The non-secret Harbor invocation for `args`, relative to `repository`.
+/// `target_dir` is Cargo's build output directory (`CARGO_TARGET_DIR` or the
+/// repository's `target/`). Pure so the launch contract can be tested without
+/// git, cargo, or Harbor.
+fn launch_plan(
+    args: RunArgs,
+    repository: &Path,
+    target_dir: &Path,
+    revision: String,
+    dirty: bool,
+) -> Result<LaunchPlan, EvalError> {
+    let target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned);
+    if let Some(target) = &target
+        && !target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(EvalError::Invalid(format!(
+            "--target must be a Rust target triple such as x86_64-unknown-linux-musl; got {target:?}"
+        )));
+    }
+    let binary = match &target {
+        Some(target) => target_dir.join(target).join("release/qq"),
+        None => target_dir.join("release/qq"),
+    };
+    let jobs_dir = absolute_from(repository, &args.jobs_dir);
     let adapter = repository.join("benchmarks/harbor");
     validate_job_name(&args.job_name)?;
     if args
@@ -255,6 +319,11 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
             "--max-cost-usd must be a finite value greater than zero".to_owned(),
         ));
     }
+    if !args.agent_timeout_multiplier.is_finite() || args.agent_timeout_multiplier < 1.0 {
+        return Err(EvalError::Invalid(
+            "--agent-timeout-multiplier must be a finite value of at least 1.0".to_owned(),
+        ));
+    }
     let mut arguments = vec![
         "run".to_owned(),
         "--model".to_owned(),
@@ -263,6 +332,8 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         QQ_AGENT_IMPORT.to_owned(),
         "--agent-kwarg".to_owned(),
         format!("binary_path={}", binary.display()),
+        "--agent-kwarg".to_owned(),
+        format!("approval={}", args.approval.as_str()),
         "--job-name".to_owned(),
         args.job_name.clone(),
         "--jobs-dir".to_owned(),
@@ -271,6 +342,8 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         args.n_attempts.to_string(),
         "--n-concurrent".to_owned(),
         args.n_concurrent.to_string(),
+        "--agent-timeout-multiplier".to_owned(),
+        args.agent_timeout_multiplier.to_string(),
     ];
     for argument in [
         args.timeout_seconds
@@ -292,7 +365,7 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         }
         (None, Some(path)) => {
             arguments.push("--path".to_owned());
-            arguments.push(absolute_from(&repository, &path).display().to_string());
+            arguments.push(absolute_from(repository, &path).display().to_string());
         }
         _ => {
             return Err(EvalError::Invalid(
@@ -304,11 +377,13 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         arguments.push("--include-task-name".to_owned());
         arguments.push(task);
     }
-    let plan = LaunchPlan {
-        qq_source_revision: revision.clone(),
+    Ok(LaunchPlan {
+        qq_source_revision: revision,
         qq_source_dirty: dirty,
         harbor_version: HARBOR_VERSION.to_owned(),
         machine_class: args.machine_class,
+        qq_build_target: target,
+        approval: args.approval,
         program: args.harbor.display().to_string(),
         arguments,
         environment: {
@@ -326,8 +401,33 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
             }
             environment
         },
-    };
-    if args.dry_run {
+    })
+}
+
+fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
+    let repository = repository_root()?;
+    let revision = command_stdout(
+        ProcessCommand::new("git")
+            .current_dir(&repository)
+            .args(["rev-parse", "HEAD"]),
+        "git",
+    )?;
+    let dirty = !command_stdout(
+        ProcessCommand::new("git")
+            .current_dir(&repository)
+            .args(["status", "--porcelain"]),
+        "git",
+    )?
+    .is_empty();
+    let dry_run = args.dry_run;
+    let harbor = args.harbor.clone();
+    let jobs_dir = absolute_from(&repository, &args.jobs_dir);
+    let job_name = args.job_name.clone();
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .map(|dir| absolute_from(&repository, Path::new(&dir)))
+        .unwrap_or_else(|| repository.join("target"));
+    let plan = launch_plan(args, &repository, &target_dir, revision, dirty)?;
+    if dry_run {
         println!(
             "{}",
             serde_json::to_string_pretty(&plan).map_err(|source| EvalError::Json {
@@ -345,23 +445,26 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
     }
 
     let found = command_stdout(
-        ProcessCommand::new(&args.harbor).arg("--version"),
-        &args.harbor.display().to_string(),
+        ProcessCommand::new(&harbor).arg("--version"),
+        &harbor.display().to_string(),
     )?;
     if !found.split_whitespace().any(|part| part == HARBOR_VERSION) {
         return Err(EvalError::HarborVersion { found });
     }
 
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let build_status = ProcessCommand::new(&cargo)
+    let mut build = ProcessCommand::new(&cargo);
+    build
         .current_dir(&repository)
-        .env("QQ_SOURCE_REVISION", &revision)
-        .args(["build", "--release", "--bin", "qq"])
-        .status()
-        .map_err(|source| EvalError::Launch {
-            program: cargo.to_string_lossy().into_owned(),
-            source,
-        })?;
+        .env("QQ_SOURCE_REVISION", &plan.qq_source_revision)
+        .args(["build", "--release", "--bin", "qq"]);
+    if let Some(target) = &plan.qq_build_target {
+        build.args(["--target", target]);
+    }
+    let build_status = build.status().map_err(|source| EvalError::Launch {
+        program: cargo.to_string_lossy().into_owned(),
+        source,
+    })?;
     require_success(&cargo.to_string_lossy(), build_status)?;
 
     fs::create_dir_all(&jobs_dir).map_err(|source| EvalError::Io {
@@ -369,7 +472,7 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
         path: jobs_dir.display().to_string(),
         source,
     })?;
-    let job_dir = jobs_dir.join(&args.job_name);
+    let job_dir = jobs_dir.join(&job_name);
     if job_dir.exists() {
         return Err(EvalError::Invalid(format!(
             "evaluation job directory {} already exists; choose a fresh --job-name so runs cannot be mixed",
@@ -388,16 +491,16 @@ fn run_harbor(args: RunArgs) -> Result<(), EvalError> {
     })?;
     rendered.push(b'\n');
     write_file(&manifest, &rendered)?;
-    let status = ProcessCommand::new(&args.harbor)
+    let status = ProcessCommand::new(&harbor)
         .current_dir(&repository)
         .args(&plan.arguments)
         .envs(&plan.environment)
         .status()
         .map_err(|source| EvalError::Launch {
-            program: args.harbor.display().to_string(),
+            program: harbor.display().to_string(),
             source,
         })?;
-    require_success(&args.harbor.display().to_string(), status)?;
+    require_success(&harbor.display().to_string(), status)?;
     Ok(())
 }
 
@@ -495,6 +598,10 @@ struct FailureClassification {
     note: String,
 }
 
+/// What every trial in one job must share. Two per-trial facts deliberately
+/// live elsewhere: `workspace_identity` hashes the task's working directory
+/// and `system_prompt_hash` covers a prompt that names that directory, so both
+/// vary across the tasks of a dataset and belong on [`TrialSummary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BaselineIdentity {
     qq_version: String,
@@ -509,16 +616,21 @@ struct BaselineIdentity {
     timeout_seconds: Option<u64>,
     max_turns: Option<u16>,
     max_cost_usd_nanos: Option<u64>,
-    workspace_identity: String,
     prompt_version: u16,
     instruction_hash: String,
-    system_prompt_hash: String,
     tool_schema_hash: String,
     selected_guidance: Option<Value>,
     /// Operator-declared arm label; the only identity field two compared
     /// jobs are expected to differ in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     arm: Option<String>,
+}
+
+/// The per-trial half of a trace's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrialIdentity {
+    workspace_identity: String,
+    system_prompt_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -535,6 +647,13 @@ struct TrialSummary {
     passed: bool,
     harness_failure: bool,
     identity_observed: bool,
+    /// SHA-256 of the task's canonical working directory; from the trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_identity: Option<String>,
+    /// Hash of the rendered system prompt, which names the working directory
+    /// and therefore differs task to task; from the trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -720,7 +839,11 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
                 path: trial_config_path.display().to_string(),
                 source,
             })?;
-        if decoded_config != result.config {
+        // Harbor 0.20.0 writes the trial's config.json with pydantic's
+        // `exclude_defaults`, while result.json embeds the fully defaulted
+        // model, so identity means "every explicit field agrees", not
+        // byte-for-byte equality.
+        if !is_projection_of(&decoded_config, &result.config) {
             return Err(EvalError::Invalid(format!(
                 "trial {trial_name} result.json does not match its resolved config.json"
             )));
@@ -733,13 +856,23 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
         let harness_failure = result.exception_info.is_some();
         harness_failures += u64::from(harness_failure);
         let trace_path = trial_dir.join("agent/qq-trace.jsonl");
+        // A trace whose outcome record is missing was cut off from outside
+        // (Harbor's agent timeout, a stopped container); Harbor records that
+        // as an exception, and the trial is a harness failure with partial
+        // metrics rather than an attempt with a settled identity.
+        let trace_settled = trace_path.is_file() && trace_has_outcome(&trace_path)?;
+        if trace_path.is_file() && !trace_settled && !harness_failure {
+            return Err(EvalError::Invalid(format!(
+                "trial {trial_name} has a QQ trace without an outcome record but no Harbor exception explaining the interruption"
+            )));
+        }
         let trace_metrics = if trace_path.is_file() {
             read_trace_metrics(&trace_path)?
         } else {
             TraceMetrics::default()
         };
-        let identity = if trace_path.is_file() {
-            let identity = read_identity(&trace_path)?;
+        let identity = if trace_settled {
+            let (identity, trial_identity) = read_identity(&trace_path)?;
             if identity.qq_source_revision != manifest.qq_source_revision {
                 return Err(EvalError::Invalid(format!(
                     "trial {trial_name} QQ revision does not match its launch manifest"
@@ -752,9 +885,9 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
                     )));
                 }
             } else {
-                fixed_identity = Some(identity.clone());
+                fixed_identity = Some(identity);
             }
-            Some(identity)
+            Some(trial_identity)
         } else if harness_failure {
             None
         } else {
@@ -844,6 +977,10 @@ fn report_job(job: &Path) -> Result<EvalReport, EvalError> {
             passed,
             harness_failure,
             identity_observed: identity.is_some(),
+            workspace_identity: identity
+                .as_ref()
+                .map(|identity| identity.workspace_identity.clone()),
+            system_prompt_hash: identity.map(|identity| identity.system_prompt_hash),
             cost_usd: totals
                 .cost_usd
                 .filter(|cost| cost.is_finite() && *cost >= 0.0),
@@ -1022,7 +1159,7 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
 
     // Everything that shapes the task or the model must match; everything an
     // arm is allowed to change is reported rather than rejected.
-    let required: [(&str, Value, Value); 13] = [
+    let required: [(&str, Value, Value); 12] = [
         (
             "model",
             json!(baseline_identity.model),
@@ -1079,11 +1216,6 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
             json!(candidate_identity.instruction_hash),
         ),
         (
-            "workspace_identity",
-            json!(baseline_identity.workspace_identity),
-            json!(candidate_identity.workspace_identity),
-        ),
-        (
             "machine_class",
             json!(baseline.machine_class),
             json!(candidate.machine_class),
@@ -1117,11 +1249,6 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
             "qq_source_revision",
             json!(baseline_identity.qq_source_revision),
             json!(candidate_identity.qq_source_revision),
-        ),
-        (
-            "system_prompt_hash",
-            json!(baseline_identity.system_prompt_hash),
-            json!(candidate_identity.system_prompt_hash),
         ),
         (
             "tool_schema_hash",
@@ -1169,6 +1296,17 @@ fn compare_jobs(args: &CompareArgs) -> Result<EvalComparison, EvalError> {
             if baseline.task_checksum != candidate.task_checksum {
                 return Err(EvalError::Invalid(format!(
                     "task {task} has different checksums across arms; the task changed"
+                )));
+            }
+            // The working directory is part of the task; two arms that saw
+            // different ones did not run the same task even if the checksum
+            // agrees.
+            if let (Some(left), Some(right)) =
+                (&baseline.workspace_identity, &candidate.workspace_identity)
+                && left != right
+            {
+                return Err(EvalError::Invalid(format!(
+                    "task {task} ran in different workspaces across arms"
                 )));
             }
             pairs.push(TrialPair {
@@ -1509,7 +1647,13 @@ fn wilson_interval(passes: u64, attempts: u64) -> (f64, f64) {
     ((center - margin).max(0.0), (center + margin).min(1.0))
 }
 
-fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
+fn trace_has_outcome(trace: &Path) -> Result<bool, EvalError> {
+    Ok(read_jsonl(trace)?
+        .iter()
+        .any(|record| record.get("type").and_then(Value::as_str) == Some("outcome")))
+}
+
+fn read_identity(trace: &Path) -> Result<(BaselineIdentity, TrialIdentity), EvalError> {
     let records = read_jsonl(trace)?;
     let trial = records
         .iter()
@@ -1535,7 +1679,11 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
             trace.display()
         )));
     }
-    Ok(BaselineIdentity {
+    let trial_identity = TrialIdentity {
+        workspace_identity: required_hash(trial, "workspace_identity", trace)?,
+        system_prompt_hash: required_hash_value(prompt, "system_prompt_hash", trace)?,
+    };
+    let baseline = BaselineIdentity {
         qq_version: required_string(trial, "qq_version", trace)?,
         qq_source_revision,
         protocol_version: required_u16(trial, "protocol_version", trace)?,
@@ -1576,7 +1724,6 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
         timeout_seconds: optional_u64(trial, "timeout_seconds", trace)?,
         max_turns: optional_u16(trial, "max_turns", trace)?,
         max_cost_usd_nanos: optional_u64(trial, "max_cost_usd_nanos", trace)?,
-        workspace_identity: required_hash(trial, "workspace_identity", trace)?,
         prompt_version: prompt
             .get("version")
             .and_then(Value::as_u64)
@@ -1588,7 +1735,6 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
                 ))
             })?,
         instruction_hash: required_hash_value(prompt, "instruction_hash", trace)?,
-        system_prompt_hash: required_hash_value(prompt, "system_prompt_hash", trace)?,
         tool_schema_hash: required_hash_value(prompt, "tool_schema_hash", trace)?,
         selected_guidance: prompt.get("selected_guidance").cloned(),
         arm: trial
@@ -1597,7 +1743,8 @@ fn read_identity(trace: &Path) -> Result<BaselineIdentity, EvalError> {
             .map(str::trim)
             .filter(|arm| !arm.is_empty())
             .map(str::to_owned),
-    })
+    };
+    Ok((baseline, trial_identity))
 }
 
 /// Per-trial facts only the durable QQ trace carries: Harbor's result has no
@@ -1999,6 +2146,19 @@ fn content_hash(bytes: &[u8]) -> String {
     hash
 }
 
+/// `true` when every key present in `partial` is present in `full` with an
+/// equal value, recursing through objects. Arrays and scalars must match
+/// exactly; `full` may carry additional keys.
+fn is_projection_of(partial: &Value, full: &Value) -> bool {
+    match (partial, full) {
+        (Value::Object(partial), Value::Object(full)) => partial.iter().all(|(key, value)| {
+            full.get(key)
+                .is_some_and(|other| is_projection_of(value, other))
+        }),
+        _ => partial == full,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2026,6 +2186,8 @@ mod tests {
             qq_source_dirty: false,
             harbor_version: HARBOR_VERSION.to_owned(),
             machine_class: Some("ci-small".to_owned()),
+            qq_build_target: None,
+            approval: EvalApproval::Full,
             program: "harbor".to_owned(),
             arguments: vec!["run".to_owned()],
             environment: BTreeMap::from([("HARBOR_TELEMETRY".to_owned(), "off".to_owned())]),
@@ -2034,6 +2196,200 @@ mod tests {
             &path.join("qq-eval-manifest.json"),
             &serde_json::to_value(manifest).unwrap(),
         );
+    }
+
+    fn run_args(extra: &[&str]) -> RunArgs {
+        #[derive(Debug, clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+        let mut argv = vec![
+            "eval-run",
+            "--model",
+            "litellm/us.anthropic.claude-sonnet-5",
+            "--job-name",
+            "pilot",
+        ];
+        argv.extend_from_slice(extra);
+        <Wrapper as clap::Parser>::try_parse_from(argv)
+            .expect("run arguments parse")
+            .run
+    }
+
+    fn kwargs(plan: &LaunchPlan) -> Vec<&str> {
+        plan.arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--agent-kwarg")
+            .map(|pair| pair[1].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn launch_plan_defaults_to_full_approval_and_the_host_release_binary() {
+        let repository = Path::new("/repo");
+        let plan = launch_plan(
+            run_args(&["--path", "benchmarks/harbor/smoke-task"]),
+            repository,
+            &repository.join("target"),
+            "rev1".to_owned(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.approval, EvalApproval::Full);
+        assert_eq!(plan.qq_build_target, None);
+        assert!(kwargs(&plan).contains(&"approval=full"));
+        assert!(kwargs(&plan).contains(&"binary_path=/repo/target/release/qq"));
+        let path_index = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "--path")
+            .unwrap();
+        assert_eq!(
+            plan.arguments[path_index + 1],
+            "/repo/benchmarks/harbor/smoke-task"
+        );
+        assert_eq!(plan.environment["HARBOR_TELEMETRY"], "off");
+        let multiplier_index = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "--agent-timeout-multiplier")
+            .unwrap();
+        assert_eq!(plan.arguments[multiplier_index + 1], "1.5");
+        assert_eq!(plan.environment["PYTHONPATH"], "/repo/benchmarks/harbor");
+        assert!(!plan.environment.contains_key("QQ_EVAL_ARM"));
+    }
+
+    #[test]
+    fn launch_plan_forwards_approval_and_target_and_records_them() {
+        let plan = launch_plan(
+            run_args(&[
+                "--dataset",
+                "terminal-bench/terminal-bench-2",
+                "--approval",
+                "auto",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "--arm",
+                " A1 ",
+                "--timeout-seconds",
+                "900",
+                "--max-turns",
+                "200",
+                "--max-cost-usd",
+                "5",
+            ]),
+            Path::new("/repo"),
+            Path::new("/ci/target"),
+            "rev1".to_owned(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.approval, EvalApproval::Auto);
+        assert_eq!(
+            plan.qq_build_target.as_deref(),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert!(plan.qq_source_dirty);
+        assert_eq!(
+            kwargs(&plan),
+            vec![
+                "binary_path=/ci/target/x86_64-unknown-linux-musl/release/qq",
+                "approval=auto",
+                "timeout_seconds=900",
+                "max_turns=200",
+                "max_cost_usd=5",
+            ]
+        );
+        assert_eq!(plan.environment["QQ_EVAL_ARM"], "A1");
+
+        let rendered = serde_json::to_value(&plan).unwrap();
+        assert_eq!(rendered["approval"], "auto");
+        assert_eq!(rendered["qq_build_target"], "x86_64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn launch_plan_rejects_a_malformed_target_and_a_nonpositive_budget() {
+        let malformed = launch_plan(
+            run_args(&["--path", "task", "--target", "../escape"]),
+            Path::new("/repo"),
+            Path::new("/repo/target"),
+            "rev1".to_owned(),
+            false,
+        );
+        assert!(matches!(malformed, Err(EvalError::Invalid(_))));
+
+        let budget = launch_plan(
+            run_args(&["--path", "task", "--max-cost-usd", "0"]),
+            Path::new("/repo"),
+            Path::new("/repo/target"),
+            "rev1".to_owned(),
+            false,
+        );
+        assert!(matches!(budget, Err(EvalError::Invalid(_))));
+
+        let multiplier = launch_plan(
+            run_args(&["--path", "task", "--agent-timeout-multiplier", "0.5"]),
+            Path::new("/repo"),
+            Path::new("/repo/target"),
+            "rev1".to_owned(),
+            false,
+        );
+        assert!(matches!(multiplier, Err(EvalError::Invalid(_))));
+    }
+
+    #[test]
+    fn trial_config_written_without_defaults_still_matches_its_result_config() {
+        // Harbor 0.20.0 writes config.json with exclude_defaults but embeds
+        // the fully defaulted config in result.json.
+        let written = json!({
+            "agent": {"name": "qq_harbor.agent:QQAgent", "kwargs": {"approval": "full"}},
+            "task": {"path": "/tasks/smoke"},
+            "trials_dir": "/jobs/smoke"
+        });
+        let embedded = json!({
+            "agent": {
+                "name": "qq_harbor.agent:QQAgent",
+                "kwargs": {"approval": "full"},
+                "n_concurrent": null,
+                "skills": []
+            },
+            "environment": {"type": "docker", "delete": true},
+            "task": {"path": "/tasks/smoke", "ref": null},
+            "trials_dir": "/jobs/smoke",
+            "timeout_multiplier": 1.0
+        });
+        assert!(is_projection_of(&written, &embedded));
+
+        let drifted = json!({
+            "agent": {"name": "qq_harbor.agent:QQAgent", "kwargs": {"approval": "auto"}},
+            "task": {"path": "/tasks/smoke"},
+            "trials_dir": "/jobs/smoke"
+        });
+        assert!(!is_projection_of(&drifted, &embedded));
+        let extra_key = json!({"task": {"path": "/tasks/smoke", "name": "smoke"}});
+        assert!(!is_projection_of(&extra_key, &embedded));
+        assert!(!is_projection_of(
+            &json!({"a": [1, 2]}),
+            &json!({"a": [1, 2, 3]})
+        ));
+    }
+
+    #[test]
+    fn manifests_written_before_the_approval_flag_read_back_as_auto() {
+        let legacy = json!({
+            "qq_source_revision": "abc123",
+            "qq_source_dirty": false,
+            "harbor_version": HARBOR_VERSION,
+            "program": "harbor",
+            "arguments": ["run"],
+            "environment": {}
+        });
+        let manifest: LaunchPlan = serde_json::from_value(legacy).unwrap();
+        assert_eq!(manifest.approval, EvalApproval::Auto);
+        assert_eq!(manifest.qq_build_target, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2122,7 +2478,7 @@ mod tests {
                         "timeout_seconds": 900,
                         "max_turns": 100,
                         "max_cost_usd_nanos": 2_000_000_000_u64,
-                        "workspace_identity": "e".repeat(64)
+                        "workspace_identity": content_hash(format!("/tasks/{trial}").as_bytes())
                     }),
                     json!({
                         "type": "outcome",
@@ -2131,7 +2487,7 @@ mod tests {
                         "prompt_identity": {
                             "version": 7,
                             "instruction_hash": "a".repeat(64),
-                            "system_prompt_hash": "b".repeat(64),
+                            "system_prompt_hash": content_hash(format!("prompt for /tasks/{trial}").as_bytes()),
                             "tool_schema_hash": "c".repeat(64)
                         }
                     })
@@ -2231,6 +2587,21 @@ mod tests {
         assert_eq!(identity.max_turns, Some(100));
         assert_eq!(identity.max_cost_usd_nanos, Some(2_000_000_000));
         assert_eq!(identity.prompt_version, 7);
+        // Two tasks with different working directories share one fixed
+        // identity; the directory-dependent hashes are reported per trial.
+        let pass = report
+            .trials
+            .iter()
+            .find(|trial| trial.trial_name == "pass")
+            .unwrap();
+        let fail = report
+            .trials
+            .iter()
+            .find(|trial| trial.trial_name == "fail")
+            .unwrap();
+        assert!(pass.workspace_identity.is_some());
+        assert_ne!(pass.workspace_identity, fail.workspace_identity);
+        assert_ne!(pass.system_prompt_hash, fail.system_prompt_hash);
 
         let classification = directory.path().join("fail/qq-failure.json");
         let mut ungrounded: Value = read_json(&classification).unwrap();
@@ -2283,6 +2654,61 @@ mod tests {
         assert_eq!(report.harness_failure_rate, 1.0);
         assert!(!report.trials[0].identity_observed);
         assert_eq!(report.trials[0].trajectory, None);
+    }
+
+    #[test]
+    fn externally_interrupted_trace_without_an_outcome_is_a_harness_failure() {
+        // Harbor's agent deadline fired before qq settled: the trace has a
+        // trial record and events but no outcome, and Harbor recorded an
+        // AgentTimeoutError. The report must not read identity from it, and
+        // must not accept the same trace when Harbor recorded no exception.
+        let interrupted_trace = |exception: bool| {
+            let directory = tempfile::tempdir().unwrap();
+            write_job_scaffold(directory.path());
+            write_trial(
+                directory.path(),
+                "cut",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                exception,
+                false,
+            );
+            fs::write(
+                directory.path().join("cut/agent/qq-trace.jsonl"),
+                format!(
+                    "{}\n{}\n",
+                    json!({"type": "trial", "qq_version": "0.1.0", "qq_source_revision": "abc123"}),
+                    json!({"type": "event", "envelope": {"event": {"type": "tool_call_started"}}}),
+                ),
+            )
+            .unwrap();
+            directory
+        };
+
+        let with_exception = interrupted_trace(true);
+        classify_trial(
+            with_exception.path(),
+            "cut",
+            "benchmark_infrastructure_or_invalid_task",
+            "result",
+            "cut-id",
+        );
+        let report = report_job(with_exception.path()).unwrap();
+        assert_eq!(report.identity, None);
+        assert_eq!(report.harness_failure_rate, 1.0);
+        assert!(!report.trials[0].identity_observed);
+
+        let without_exception = interrupted_trace(false);
+        let error = report_job(without_exception.path()).unwrap_err();
+        assert!(
+            matches!(&error, EvalError::Invalid(message) if message.contains("without an outcome record")),
+            "{error}"
+        );
     }
 
     #[test]

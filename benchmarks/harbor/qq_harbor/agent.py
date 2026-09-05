@@ -4,9 +4,13 @@ The adapter:
 
 1. Uploads a prebuilt ``qq`` binary into the container (``QQ_BINARY_PATH`` or
    the repository's release build), or — explicitly opted into — builds from
-   source inside the container via ``install-from-source.sh``.
-2. Runs ``qq run`` in the task workspace with the explicit unattended policy
-   (``--approval auto``), JSONL output, and a durable trace file under
+   source inside the container via ``install-from-source.sh``. A CA bundle is
+   uploaded alongside it because many task images ship without one and qq
+   verifies provider TLS against the platform trust store.
+2. Runs ``qq run`` in the task workspace with an explicit unattended policy
+   (``--approval full`` by default: task containers are disposable, and the
+   reference harnesses run unrestricted; ``auto`` and ``read-only`` remain
+   selectable for ablations), JSONL output, and a durable trace file under
    Harbor's agent-log mount. Provider credentials pass through the
    environment and are never logged.
 3. Converts the JSONL trace to an ATIF-v1.7 ``trajectory.json`` after the
@@ -41,6 +45,7 @@ _CREDENTIAL_ENV_VARS = (
     "OPENAI_BASE_URL",
     "GEMINI_API_KEY",
     "XAI_API_KEY",
+    "LITELLM_API_KEY",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -48,11 +53,17 @@ _CREDENTIAL_ENV_VARS = (
     "AWS_DEFAULT_REGION",
 )
 
+# Values accepted by `qq run --approval`; `ask` is deliberately absent because
+# nothing can answer a prompt inside a task container.
+_APPROVAL_MODES = ("read-only", "auto", "full")
+_DEFAULT_APPROVAL = "full"
+
 # QQ_-prefixed configuration passed through verbatim, except the adapter's own
 # host-side install knobs.
-_ADAPTER_ONLY_ENV_VARS = {"QQ_BINARY_PATH", "QQ_BUILD_FROM_SOURCE"}
+_ADAPTER_ONLY_ENV_VARS = {"QQ_BINARY_PATH", "QQ_BUILD_FROM_SOURCE", "QQ_CA_BUNDLE_PATH"}
 
 _BINARY_DEST = "/installed-agent/qq"
+_CA_BUNDLE_DEST = "/installed-agent/ca-certificates.crt"
 _SOURCE_TAR_DEST = "/installed-agent/qq-src.tar.gz"
 _INSTALL_SCRIPT_DEST = "/installed-agent/install-from-source.sh"
 
@@ -88,13 +99,19 @@ class QQAgent(BaseInstalledAgent):
         self,
         *args: Any,
         binary_path: str | None = None,
+        approval: str = _DEFAULT_APPROVAL,
         timeout_seconds: int | None = None,
         max_turns: int | None = None,
         max_cost_usd: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        if approval not in _APPROVAL_MODES:
+            raise ValueError(
+                f"approval must be one of {', '.join(_APPROVAL_MODES)}; got {approval!r}"
+            )
         self._binary_path = binary_path
+        self._approval = approval
         self._timeout_seconds = timeout_seconds
         self._max_turns = max_turns
         self._max_cost_usd = max_cost_usd
@@ -139,8 +156,40 @@ class QQAgent(BaseInstalledAgent):
                 return candidate
         return None
 
+    def _resolve_host_ca_bundle(self) -> Path:
+        """Locate a PEM CA bundle to upload for provider TLS verification.
+
+        Task images frequently lack ``ca-certificates``; the trust store from
+        the Harbor host (or, failing that, certifi's bundle, which Harbor's own
+        dependencies guarantee is present) is uploaded so the static qq binary
+        can verify the provider endpoint.
+        """
+        override = self._get_env("QQ_CA_BUNDLE_PATH")
+        candidates: list[Path] = [Path(override)] if override else []
+        env_bundle = os.environ.get("SSL_CERT_FILE")
+        if env_bundle:
+            candidates.append(Path(env_bundle))
+        candidates.extend(
+            Path(path)
+            for path in (
+                "/etc/ssl/certs/ca-certificates.crt",
+                "/etc/ssl/certs/ca-bundle.crt",
+                "/etc/pki/tls/certs/ca-bundle.crt",
+                "/etc/ssl/cert.pem",
+            )
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        import certifi
+
+        return Path(certifi.where())
+
     @override
     async def install(self, environment: BaseEnvironment) -> None:
+        bundle = self._resolve_host_ca_bundle()
+        await environment.upload_file(bundle, _CA_BUNDLE_DEST)
+        await self.exec_as_root(environment, f"chmod 644 {_CA_BUNDLE_DEST}")
         binary = self._resolve_host_binary()
         if binary is not None:
             self.logger.info(f"Uploading qq binary from {binary}")
@@ -188,7 +237,9 @@ class QQAgent(BaseInstalledAgent):
     # ------------------------------------------------------------------
 
     def _run_env(self) -> dict[str, str]:
-        env: dict[str, str] = {}
+        # rustls-platform-verifier honours SSL_CERT_FILE on Linux; point it at
+        # the uploaded bundle so provider TLS works on images without one.
+        env: dict[str, str] = {"SSL_CERT_FILE": _CA_BUNDLE_DEST}
         for key in _CREDENTIAL_ENV_VARS:
             value = self._get_env(key)
             if value is not None:
@@ -206,7 +257,7 @@ class QQAgent(BaseInstalledAgent):
             [
                 "run",
                 "--approval",
-                "auto",
+                self._approval,
                 "--format",
                 "jsonl",
                 "--trace",
@@ -245,10 +296,9 @@ class QQAgent(BaseInstalledAgent):
             else int(self._timeout_seconds) + 120,
         )
         self._exit_code = result.return_code
-        context.metadata = {
-            **(context.metadata or {}),
-            "qq_exit_code": result.return_code,
-        }
+        # Harbor 0.20.0 only invokes populate_context_post_run when the
+        # context is still entirely empty after run(); recording anything here
+        # would silently skip trajectory conversion and cost accounting.
 
         if result.return_code in _TASK_LEVEL_EXIT_CODES:
             self.logger.info(
@@ -301,7 +351,28 @@ class QQAgent(BaseInstalledAgent):
             (record for record in records if record.get("type") == "outcome"), None
         )
         if outcome is None:
-            raise RuntimeError("QQ trace has no terminal outcome record")
+            # qq writes the outcome last, so its absence means the process was
+            # torn down from outside (Harbor's agent timeout, a stopped
+            # container, a host signal) before it could settle. Record that as
+            # metadata instead of raising: Harbor calls this hook while it is
+            # already unwinding a cancelled trial, and an exception here
+            # escapes the trial and aborts every other trial in the job.
+            # `cargo xtask eval report` treats the missing outcome as a
+            # harness failure.
+            events = sum(1 for record in records if record.get("type") == "event")
+            self.logger.error(
+                "QQ trace has no terminal outcome record after %d events; "
+                "the run was interrupted externally (qq exit code %s)",
+                events,
+                self._exit_code,
+            )
+            context.metadata = {
+                **(context.metadata or {}),
+                "qq_status": "interrupted_externally",
+                "qq_exit_code": self._exit_code,
+                "qq_trace_events": events,
+            }
+            return
 
         usage = outcome.get("usage")
         if isinstance(usage, dict):

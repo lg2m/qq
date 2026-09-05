@@ -5,8 +5,9 @@ Configuration overlays for the paired evaluation in
 document applied through `QQ_CONFIG_CONTENT` on top of the operator's normal
 layers, so every arm shares the same providers, credentials, primary model,
 and policy and differs only in the section it names. Routes below are
-placeholders: replace `PROVIDER/...` with authenticated routes from
-`qq models` before running, keeping the *same* primary `--model` for every arm
+placeholders: replace `PROVIDER/...` with authenticated routes (see
+`qq config show`, or `benchmarks/harbor/eval-config.ron` for the gateway
+routes) before running, keeping the *same* primary `--model` for every arm
 (`eval compare` refuses arms whose model differs).
 
 | Arm | File | Question |
