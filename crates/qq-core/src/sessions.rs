@@ -28139,7 +28139,7 @@ mod tests {
                 task: "research".to_owned(),
                 model: None,
                 authority: qq_protocol::ChildAuthority::Read,
-                limits: RunLimits::default(),
+                budget: crate::runtime::ChildBudget::default(),
                 purpose: SessionPurpose::Task,
             },
         ));
@@ -30590,6 +30590,555 @@ mod tests {
                         message: error.to_string(),
                     })
             })
+        }
+    }
+
+    struct ChildBudgetLoader {
+        inner: QueueLoader,
+        write_children: bool,
+        audit: crate::runtime::AuditMode,
+    }
+
+    impl RuntimeLoader for ChildBudgetLoader {
+        fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+            let provider = self.inner.next_provider(&request);
+            let write_children = self.write_children;
+            let audit = self.audit;
+            let mut pricing = budget_pricing();
+            if request.model.model.as_deref() == Some("test/child") {
+                pricing.input_usd_nanos_per_token = 2_000;
+                pricing.output_usd_nanos_per_token = 3_000;
+            }
+            Box::pin(async move {
+                Runtime::with_provider(provider, "test-model", 256)
+                    .map(|runtime| {
+                        loaded_runtime(
+                            runtime
+                                .with_delegation(qq_protocol::DelegationRoster {
+                                    roster: vec![qq_protocol::DelegationRosterEntry {
+                                        route: "test/child".to_owned(),
+                                        role: qq_protocol::DelegationRole::Balanced,
+                                        note: None,
+                                        context_window: None,
+                                        max_output_tokens: None,
+                                        relative_cost_permille: None,
+                                    }],
+                                    default_role: qq_protocol::DelegationRole::Balanced,
+                                    max_depth: 1,
+                                    write_children,
+                                })
+                                .with_audit(crate::runtime::AuditPolicy {
+                                    mode: audit,
+                                    max_revisions: 1,
+                                    role: qq_protocol::DelegationRole::Balanced,
+                                }),
+                            &request.workspace,
+                            Some(pricing),
+                        )
+                    })
+                    .map_err(|error| RuntimeLoadError {
+                        kind: RunFailureKind::Configuration,
+                        message: error.to_string(),
+                    })
+            })
+        }
+    }
+
+    struct UsageProvider {
+        inner: Arc<dyn Provider>,
+        usage: Option<TokenUsage>,
+    }
+
+    impl Provider for UsageProvider {
+        fn stream(&self, request: ModelRequest) -> ProviderStream {
+            let usage = self.usage.map(provider_usage_of);
+            Box::pin(self.inner.stream(request).map(move |event| match event {
+                Ok(qq_provider::ProviderEvent::Completed { .. }) => {
+                    Ok(qq_provider::ProviderEvent::Completed { usage })
+                }
+                event => event,
+            }))
+        }
+    }
+
+    async fn child_budget_harness(
+        parent: Arc<dyn Provider>,
+        child: Arc<dyn Provider>,
+        write_children: bool,
+        audit: crate::runtime::AuditMode,
+    ) -> SpawnHarness {
+        let directory = tempfile::tempdir().unwrap();
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let runtime = SessionRuntime::open(
+            SessionRuntimeOptions::new(directory.path().join("sessions.sqlite3"))
+                .with_approval_reviewer(reviewer),
+            Arc::new(ChildBudgetLoader {
+                inner: QueueLoader {
+                    routed: vec![("test/child", child)],
+                    queue: StdMutex::new(vec![parent]),
+                },
+                write_children,
+                audit,
+            }),
+        )
+        .await
+        .unwrap();
+        let (workspace_id, _) = resolve_workspace(&runtime, directory.path()).await;
+        let created =
+            create_session_with_mode(&runtime, workspace_id, None, ApprovalMode::Full).await;
+        let CommandOutcome::SessionCreated { session_id } = created.outcome else {
+            panic!("expected session")
+        };
+        let events = runtime
+            .subscribe(SubscribeRequest {
+                workspace_id,
+                after: created.committed_through,
+            })
+            .unwrap();
+        SpawnHarness {
+            _directory: directory,
+            runtime,
+            workspace_id,
+            session_id,
+            events,
+        }
+    }
+
+    async fn submit_child_budget_prompt(harness: &SpawnHarness, limits: RunLimits) -> RunId {
+        let receipt = harness
+            .runtime
+            .command(
+                CommandId::generate().unwrap(),
+                SessionCommand::SubmitPrompt {
+                    session_id: harness.session_id,
+                    input: vec![InputPart::text("delegate")],
+                    limits,
+                    correlation: Correlation::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let CommandOutcome::PromptQueued { run_id, .. } = receipt.outcome else {
+            panic!("expected run")
+        };
+        run_id
+    }
+
+    #[tokio::test]
+    async fn sequential_children_receive_the_remaining_budget_after_prior_spend() {
+        let parent: Arc<dyn Provider> = Arc::new(UsageProvider {
+            inner: Arc::new(MultiSpawnProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                spawns: 2,
+                arguments: |_| {
+                    r#"{"task":"research","model":"test/child","authority":"write"}"#.to_owned()
+                },
+                turn: StdMutex::new(0),
+            }),
+            usage: Some(usage(10, 5)),
+        });
+        let child: Arc<dyn Provider> = Arc::new(UsageProvider {
+            inner: Arc::new(StaticTextProvider),
+            usage: Some(usage(30, 10)),
+        });
+        let mut harness =
+            child_budget_harness(parent, child, true, crate::runtime::AuditMode::Off).await;
+        let run_id = submit_child_budget_prompt(
+            &harness,
+            RunLimits {
+                max_total_tokens: Some(200),
+                max_input_tokens: Some(150),
+                max_output_tokens: Some(100),
+                max_cost_usd_nanos: Some(300_000),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        harness.runtime.shutdown().await.unwrap();
+        let admitted: Vec<_> = observed
+            .iter()
+            .filter_map(|event| match &event.event {
+                SessionEvent::PromptQueued { session, run, .. }
+                    if session.parent_id == Some(harness.session_id) =>
+                {
+                    run.limits.as_deref()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0].max_total_tokens, Some(185));
+        assert_eq!(admitted[0].max_cost_usd_nanos, Some(280_000));
+        assert_eq!(admitted[1].max_total_tokens, Some(145));
+        assert_eq!(admitted[1].max_input_tokens, Some(110));
+        assert_eq!(admitted[1].max_output_tokens, Some(85));
+        assert_eq!(admitted[1].max_cost_usd_nanos, Some(190_000));
+        assert_eq!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn budgeted_read_children_refuse_exhausted_or_unknown_remainders() {
+        for (limits, child_usage, family) in [
+            (
+                RunLimits {
+                    max_total_tokens: Some(40),
+                    ..RunLimits::default()
+                },
+                Some(usage(30, 10)),
+                "total_tokens",
+            ),
+            (
+                RunLimits {
+                    max_input_tokens: Some(30),
+                    ..RunLimits::default()
+                },
+                Some(usage(30, 10)),
+                "input_tokens",
+            ),
+            (
+                RunLimits {
+                    max_output_tokens: Some(10),
+                    ..RunLimits::default()
+                },
+                Some(usage(30, 10)),
+                "output_tokens",
+            ),
+            (
+                RunLimits {
+                    max_cost_usd_nanos: Some(90_000),
+                    ..RunLimits::default()
+                },
+                Some(usage(30, 10)),
+                "cost",
+            ),
+            (
+                RunLimits {
+                    max_total_tokens: Some(100),
+                    ..RunLimits::default()
+                },
+                None,
+                "tokens_unknown",
+            ),
+            (
+                RunLimits {
+                    max_cost_usd_nanos: Some(100_000),
+                    ..RunLimits::default()
+                },
+                None,
+                "cost_unknown",
+            ),
+        ] {
+            for concurrency in [1, MAX_CONCURRENT_CHILDREN_PER_RUN] {
+                let parent: Arc<dyn Provider> = Arc::new(UsageProvider {
+                    inner: Arc::new(MultiSpawnProvider {
+                        requests: Arc::new(StdMutex::new(Vec::new())),
+                        spawns: 2,
+                        arguments: |_| r#"{"task":"research","model":"test/child"}"#.to_owned(),
+                        turn: StdMutex::new(0),
+                    }),
+                    usage: Some(usage(0, 0)),
+                });
+                let child: Arc<dyn Provider> = Arc::new(UsageProvider {
+                    inner: Arc::new(StaticTextProvider),
+                    usage: child_usage,
+                });
+                let mut harness =
+                    child_budget_harness(parent, child, false, crate::runtime::AuditMode::Off)
+                        .await;
+                let run_id = submit_child_budget_prompt(
+                    &harness,
+                    RunLimits {
+                        max_concurrent_children: Some(concurrency),
+                        ..limits
+                    },
+                )
+                .await;
+                let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+                harness.runtime.shutdown().await.unwrap();
+                let children = observed.iter().filter(|event| matches!(&event.event,
+                    SessionEvent::SessionCreated { session } if session.parent_id == Some(harness.session_id))).count();
+                assert_eq!(children, 1, "{family}, concurrency={concurrency}");
+                assert!(observed.iter().any(|event| matches!(&event.event,
+                    SessionEvent::ToolCallFinished { tool_call, .. } if tool_call.run_id == run_id && tool_call.is_error
+                        && tool_call.result.as_deref().is_some_and(|result| result.contains("cannot afford a sub-agent") && result.contains(family)))));
+                if child_usage.is_none() {
+                    assert_eq!(exhaustion_of(&observed, run_id).limit.as_str(), family);
+                } else {
+                    assert_eq!(
+                        finished_outcome(&observed, run_id),
+                        Some(RunOutcome::Completed),
+                        "exact spend leaves no allowance for another child but may complete"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn audits_inherit_remaining_limits_and_charge_inclusive_spend_once() {
+        let parent: Arc<dyn Provider> = Arc::new(UsageProvider {
+            inner: Arc::new(StaticTextProvider),
+            usage: Some(usage(10, 0)),
+        });
+        let auditor: Arc<dyn Provider> = Arc::new(UsageProvider {
+            inner: Arc::new(VerdictProvider {
+                reply: r#"{"verdict":"pass"}"#,
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            usage: Some(usage(5, 0)),
+        });
+        let mut harness =
+            child_budget_harness(parent, auditor, false, crate::runtime::AuditMode::Always).await;
+        let run_id = submit_child_budget_prompt(
+            &harness,
+            RunLimits {
+                max_total_tokens: Some(100),
+                max_cost_usd_nanos: Some(100_000),
+                ..RunLimits::default()
+            },
+        )
+        .await;
+        let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+        harness.runtime.shutdown().await.unwrap();
+        let admitted = observed
+            .iter()
+            .find_map(|event| match &event.event {
+                SessionEvent::PromptQueued { session, run, .. }
+                    if session.purpose == SessionPurpose::Audit =>
+                {
+                    Some(run)
+                }
+                _ => None,
+            })
+            .expect("auditor was admitted");
+        let limits = admitted
+            .limits
+            .as_deref()
+            .expect("auditor must inherit a budget");
+        assert_eq!(limits.max_total_tokens, Some(90));
+        assert_eq!(limits.max_cost_usd_nanos, Some(90_000));
+        let snapshot = harness
+            .runtime
+            .snapshot(SnapshotRequest {
+                workspace_id: harness.workspace_id,
+                focused_session_id: Some(harness.session_id),
+                include_sessions: Vec::new(),
+                session_limit: 8,
+                message_limit: 8,
+            })
+            .await
+            .unwrap();
+        let totals = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == harness.session_id)
+            .unwrap()
+            .accounting
+            .unwrap();
+        assert_eq!(totals.direct.usage, Some(usage(10, 0)));
+        assert_eq!(totals.direct.estimated_cost_usd_nanos, Some(10_000));
+        assert_eq!(totals.inclusive.usage, Some(usage(15, 0)));
+        assert_eq!(totals.inclusive.estimated_cost_usd_nanos, Some(20_000));
+        assert_eq!(
+            finished_outcome(&observed, run_id),
+            Some(RunOutcome::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_overspend_and_unknown_spend_exhaust_the_parent() {
+        for (limits, auditor_usage, expected) in [
+            (
+                RunLimits {
+                    max_total_tokens: Some(100),
+                    ..RunLimits::default()
+                },
+                Some(usage(95, 0)),
+                BudgetLimitKind::TotalTokens,
+            ),
+            (
+                RunLimits {
+                    max_input_tokens: Some(100),
+                    ..RunLimits::default()
+                },
+                Some(usage(95, 0)),
+                BudgetLimitKind::InputTokens,
+            ),
+            (
+                RunLimits {
+                    max_output_tokens: Some(100),
+                    ..RunLimits::default()
+                },
+                Some(usage(0, 96)),
+                BudgetLimitKind::OutputTokens,
+            ),
+            (
+                RunLimits {
+                    max_cost_usd_nanos: Some(100_000),
+                    ..RunLimits::default()
+                },
+                Some(usage(45, 0)),
+                BudgetLimitKind::Cost,
+            ),
+            (
+                RunLimits {
+                    max_total_tokens: Some(100),
+                    ..RunLimits::default()
+                },
+                None,
+                BudgetLimitKind::TokensUnknown,
+            ),
+            (
+                RunLimits {
+                    max_cost_usd_nanos: Some(100_000),
+                    ..RunLimits::default()
+                },
+                None,
+                BudgetLimitKind::CostUnknown,
+            ),
+        ] {
+            let parent: Arc<dyn Provider> = Arc::new(UsageProvider {
+                inner: Arc::new(StaticTextProvider),
+                usage: Some(usage(10, 5)),
+            });
+            let auditor: Arc<dyn Provider> = Arc::new(UsageProvider {
+                inner: Arc::new(VerdictProvider {
+                    reply: r#"{"verdict":"pass"}"#,
+                    requests: Arc::new(StdMutex::new(Vec::new())),
+                }),
+                usage: auditor_usage,
+            });
+            let mut harness =
+                child_budget_harness(parent, auditor, false, crate::runtime::AuditMode::Always)
+                    .await;
+            let run_id = submit_child_budget_prompt(&harness, limits).await;
+            let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+            harness.runtime.shutdown().await.unwrap();
+            assert_eq!(exhaustion_of(&observed, run_id).limit, expected);
+            let (_, audits) = audit_events(&observed, run_id);
+            assert_eq!(
+                audits.len(),
+                1,
+                "the audit receipt is durable before exhaustion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn child_duration_is_reduced_by_preflight_and_prior_children() {
+        struct HeldPreflight {
+            inner: ChildBudgetLoader,
+            first: AtomicBool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        impl RuntimeLoader for HeldPreflight {
+            fn load(&self, request: RuntimeLoadRequest) -> RuntimeLoadFuture {
+                let hold = request.model.model.as_deref() == Some("test/child")
+                    && !self.first.swap(true, Ordering::SeqCst);
+                let loaded = self.inner.load(request);
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    if hold {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    loaded.await
+                })
+            }
+        }
+        for expires_during_preflight in [false, true] {
+            let parent: Arc<dyn Provider> = Arc::new(UsageProvider {
+                inner: Arc::new(MultiSpawnProvider {
+                    requests: Arc::new(StdMutex::new(Vec::new())),
+                    spawns: 2,
+                    arguments: |_| r#"{"task":"research","model":"test/child"}"#.to_owned(),
+                    turn: StdMutex::new(0),
+                }),
+                usage: Some(usage(0, 0)),
+            });
+            let child: Arc<dyn Provider> = Arc::new(UsageProvider {
+                inner: Arc::new(StaticTextProvider),
+                usage: Some(usage(0, 0)),
+            });
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut harness = spawn_harness_with_loader(
+                Arc::new(HeldPreflight {
+                    inner: ChildBudgetLoader {
+                        inner: QueueLoader {
+                            routed: vec![("test/child", child)],
+                            queue: StdMutex::new(vec![parent]),
+                        },
+                        write_children: false,
+                        audit: crate::runtime::AuditMode::Off,
+                    },
+                    first: AtomicBool::new(false),
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+                8,
+            )
+            .await;
+            let run_id = submit_child_budget_prompt(
+                &harness,
+                RunLimits {
+                    max_total_tokens: Some(1000),
+                    max_duration_ms: Some(if expires_during_preflight { 500 } else { 5000 }),
+                    ..RunLimits::default()
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(if expires_during_preflight {
+                600
+            } else {
+                200
+            }))
+            .await;
+            release.notify_one();
+            let observed = collect_until_run_finished(&mut harness.events, run_id).await;
+            harness.runtime.shutdown().await.unwrap();
+            let durations: Vec<_> = observed
+                .iter()
+                .filter_map(|event| match &event.event {
+                    SessionEvent::PromptQueued { session, run, .. }
+                        if session.parent_id == Some(harness.session_id) =>
+                    {
+                        run.limits
+                            .as_ref()
+                            .and_then(|limits| limits.max_duration_ms)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if expires_during_preflight {
+                assert!(
+                    durations.is_empty(),
+                    "expired preparation must not create a child"
+                );
+                assert_eq!(
+                    exhaustion_of(&observed, run_id).limit,
+                    BudgetLimitKind::Duration
+                );
+                continue;
+            }
+            assert_eq!(durations.len(), 2);
+            assert!(
+                durations[0] <= 4800,
+                "preflight time cannot restart the child's duration: {durations:?}"
+            );
+            assert!(
+                durations[1] < durations[0],
+                "later children inherit the remaining clock: {durations:?}"
+            );
         }
     }
 
