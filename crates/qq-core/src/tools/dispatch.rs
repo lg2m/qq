@@ -38,16 +38,31 @@ pub(crate) struct ToolTasks(Arc<ToolTaskState>);
 struct ToolTaskState {
     active: AtomicUsize,
     idle: Notify,
+    unconfirmed_process_exit: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ToolDrainError {
+    #[error("local shell process termination could not be confirmed")]
+    UnconfirmedProcessExit,
 }
 
 impl ToolTasks {
-    pub(crate) async fn drain(&self) {
+    pub(crate) fn check(&self) -> Result<(), ToolDrainError> {
+        if self.0.unconfirmed_process_exit.load(Ordering::Acquire) {
+            Err(ToolDrainError::UnconfirmedProcessExit)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn drain(&self) -> Result<(), ToolDrainError> {
         loop {
             let idle = self.0.idle.notified();
             tokio::pin!(idle);
             idle.as_mut().enable();
             if self.0.active.load(Ordering::Acquire) == 0 {
-                return;
+                return self.check();
             }
             idle.await;
         }
@@ -55,16 +70,27 @@ impl ToolTasks {
 
     fn enter(&self) -> ToolTaskLease {
         self.0.active.fetch_add(1, Ordering::AcqRel);
-        ToolTaskLease(Arc::clone(&self.0))
+        ToolTaskLease {
+            tasks: Arc::clone(&self.0),
+            process_pending: false,
+        }
     }
 }
 
-struct ToolTaskLease(Arc<ToolTaskState>);
+struct ToolTaskLease {
+    tasks: Arc<ToolTaskState>,
+    process_pending: bool,
+}
 
 impl Drop for ToolTaskLease {
     fn drop(&mut self) {
-        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.idle.notify_waiters();
+        if self.process_pending {
+            self.tasks
+                .unconfirmed_process_exit
+                .store(true, Ordering::Release);
+        }
+        if self.tasks.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tasks.idle.notify_waiters();
         }
     }
 }
@@ -141,8 +167,15 @@ pub(crate) async fn execute(
         };
         let lease = tasks.enter();
         return match tokio::spawn(async move {
-            let _lease = lease;
-            run_shell(&workspace, &arguments, &cancelled, output.as_ref()).await
+            let mut lease = lease;
+            run_shell(
+                &workspace,
+                &arguments,
+                &cancelled,
+                output.as_ref(),
+                &mut lease.process_pending,
+            )
+            .await
         })
         .await
         {

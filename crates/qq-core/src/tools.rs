@@ -9,7 +9,9 @@ mod write;
 
 #[cfg(test)]
 pub(crate) use dispatch::{MAX_TOOL_RESULT_BYTES, test_executions_started};
-pub(crate) use dispatch::{ToolExecutionResult, ToolTasks, bounded_result, execute};
+pub(crate) use dispatch::{
+    ToolDrainError, ToolExecutionResult, ToolTasks, bounded_result, execute,
+};
 #[cfg(test)]
 pub(crate) use edit::hold_tool_apply;
 pub(crate) use specs::{
@@ -758,6 +760,7 @@ mod tests {
         release.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), drain)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join("result.txt")).unwrap(),
@@ -799,10 +802,91 @@ mod tests {
         drop(execution);
         tokio::time::timeout(std::time::Duration::from_secs(5), tasks.drain())
             .await
+            .unwrap()
             .unwrap();
         let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
         assert!(rustix::process::test_kill_process(pid).is_err());
         assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn panicked_shell_task_never_reports_confirmed_quiescence() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let spawned = shell::observe_shell_spawn(workspace.path(), true);
+        let tasks = ToolTasks::default();
+        let result = execute(
+            workspace,
+            Arc::new(FileState::default()),
+            "shell".to_owned(),
+            r#"{"command":"sleep 300"}"#.to_owned(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            tasks.clone(),
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(tasks.check(), Err(ToolDrainError::UnconfirmedProcessExit));
+        assert_eq!(
+            tasks.drain().await,
+            Err(ToolDrainError::UnconfirmedProcessExit)
+        );
+        assert_eq!(tasks.check(), Err(ToolDrainError::UnconfirmedProcessExit));
+        assert_process_exits(spawned.await.unwrap()).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dropped_windows_shell_waiter_kills_the_owned_process_before_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let spawned = shell::observe_shell_spawn(workspace.path(), false);
+        let tasks = ToolTasks::default();
+        let mut execution = Box::pin(execute(
+            workspace,
+            Arc::new(FileState::default()),
+            "shell".to_owned(),
+            r#"{"command":"for /L %i in (1,1,2147483647) do @echo waiting"}"#.to_owned(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            tasks.clone(),
+        ));
+        assert!(futures_util::poll!(execution.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), spawned)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(execution);
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.drain())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_timeout_kills_the_owned_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(directory.path()).unwrap();
+        let tasks = ToolTasks::default();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execute(
+                workspace,
+                Arc::new(FileState::default()),
+                "shell".to_owned(),
+                r#"{"command":"for /L %i in (1,1,2147483647) do @echo waiting","timeout_seconds":1}"#.to_owned(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                tasks.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out"));
+        tasks.drain().await.unwrap();
     }
 
     /// Polls until the process is gone, failing the test after a generous

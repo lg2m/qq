@@ -11,6 +11,30 @@ const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
 pub(super) const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
 const SHELL_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[cfg(test)]
+struct SpawnHook {
+    workspace: std::path::PathBuf,
+    entered: tokio::sync::oneshot::Sender<u32>,
+    panic: bool,
+}
+
+#[cfg(test)]
+static SPAWN_HOOKS: std::sync::Mutex<Vec<SpawnHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn observe_shell_spawn(
+    workspace: &std::path::Path,
+    panic: bool,
+) -> tokio::sync::oneshot::Receiver<u32> {
+    let (entered, receiver) = tokio::sync::oneshot::channel();
+    SPAWN_HOOKS.lock().unwrap().push(SpawnHook {
+        workspace: workspace.to_owned(),
+        entered,
+        panic,
+    });
+    receiver
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ShellArgs {
@@ -39,6 +63,7 @@ pub(super) async fn run_shell(
     arguments: &ShellArgs,
     cancelled: &ToolCancellation,
     output: Option<&mpsc::Sender<String>>,
+    process_pending: &mut bool,
 ) -> ToolExecutionResult {
     if cancelled.is_cancelled() {
         return ToolExecutionResult::error("tool execution was cancelled");
@@ -83,10 +108,25 @@ pub(super) async fn run_shell(
             return ToolExecutionResult::error(format!("could not start the command: {error}"));
         }
     };
+    *process_pending = true;
     // The child leads its own process group (pgid == pid); the guard kills the
     // entire group on every abnormal exit path — timeout, cancellation, and
     // this future being dropped mid-flight — so no descendant is orphaned.
     let mut guard = ProcessGroupGuard::new(child.id());
+    #[cfg(test)]
+    {
+        let hook = {
+            let mut hooks = SPAWN_HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .position(|hook| hook.workspace == workspace.path())
+                .map(|index| hooks.remove(index))
+        };
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(child.id().unwrap());
+            assert!(!hook.panic, "injected shell task panic after process spawn");
+        }
+    }
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
@@ -133,7 +173,10 @@ pub(super) async fn run_shell(
                 // recycled: killing the group now could hit an innocent
                 // process. Surviving descendants closed their pipes, which is
                 // as detached as the timeout policy requires.
-                guard.disarm();
+                if status.is_ok() {
+                    guard.disarm();
+                    *process_pending = false;
+                }
                 break ShellOutcome::Exited(status);
             }
         }
@@ -145,9 +188,9 @@ pub(super) async fn run_shell(
             ToolExecutionResult::error(format!("could not observe the command exit: {error}"))
         }
         ShellOutcome::TimedOut => {
-            guard.kill();
-            // SIGKILL cannot be caught, so the reap completes promptly.
-            let _ = child.wait().await;
+            if let Err(message) = stop_shell(&mut child, &mut guard, process_pending).await {
+                return ToolExecutionResult::error(message);
+            }
             let mut content = capture.into_output();
             if !content.is_empty() && !content.ends_with('\n') {
                 content.push('\n');
@@ -158,10 +201,34 @@ pub(super) async fn run_shell(
             ToolExecutionResult::error(content)
         }
         ShellOutcome::Cancelled => {
-            guard.kill();
-            let _ = child.wait().await;
+            if let Err(message) = stop_shell(&mut child, &mut guard, process_pending).await {
+                return ToolExecutionResult::error(message);
+            }
             ToolExecutionResult::error("tool execution was cancelled")
         }
+    }
+}
+
+async fn stop_shell(
+    child: &mut tokio::process::Child,
+    guard: &mut ProcessGroupGuard,
+    process_pending: &mut bool,
+) -> Result<(), String> {
+    if let Err(error) = guard.kill() {
+        return Err(format!(
+            "could not terminate the command process group: {error}"
+        ));
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = child.start_kill() {
+        return Err(format!("could not terminate the command: {error}"));
+    }
+    match child.wait().await {
+        Ok(_) => {
+            *process_pending = false;
+            Ok(())
+        }
+        Err(error) => Err(format!("could not confirm the command exit: {error}")),
     }
 }
 
@@ -279,17 +346,23 @@ impl ProcessGroupGuard {
         }
     }
 
-    fn kill(&mut self) {
+    fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid.take() {
-            let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+            match rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(())
     }
 }
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        self.kill();
+        // Destruction is a best-effort fallback. The task lease still records
+        // an unconfirmed exit unless the owned Child was successfully reaped.
+        let _ = self.kill();
     }
 }
 
