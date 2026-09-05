@@ -4046,6 +4046,7 @@ mod tests {
         assert!(!options.is_empty());
         assert!(options.iter().all(|option| option.provider == "openai"));
         assert!(options.iter().any(|option| option.model == "gpt-5.6"));
+        assert!(options.iter().any(|option| option.model == "gpt-6-astra"));
         assert!(
             options
                 .iter()
@@ -4167,7 +4168,7 @@ mod tests {
         let fixture = RuntimeFixture::new();
         let factory = fixture.factory();
 
-        for model in ["grok-4.5", "grok-4.3"] {
+        for model in ["grok-4.6", "grok-4.5", "grok-4.3"] {
             let request = fixture.request(format!(
                 r#"(
                     version: 1,

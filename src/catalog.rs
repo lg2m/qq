@@ -26,7 +26,7 @@ const FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
 // Codex gates `/models` on a supported Codex client version, not QQ's package
 // version. Keep this at least as high as the newest listed model's
 // `minimal_client_version`.
-const CODEX_MODELS_CLIENT_VERSION: &str = "0.144.0";
+const CODEX_MODELS_CLIENT_VERSION: &str = "0.153.0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiscoveredModel {
@@ -488,6 +488,59 @@ mod tests {
     use qq_config::{ProviderAccess, SecretRef};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn codex_discovery_sends_supported_client_version_and_returns_astra() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..length]).unwrap();
+            assert!(request.starts_with("GET /v1/models?client_version=0.153.0 HTTP/1.1\r\n"));
+            let headers = request.to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer test-token\r\n"));
+            assert!(headers.contains("chatgpt-account-id: test-account\r\n"));
+            assert!(headers.contains("originator: qq\r\n"));
+            let body = r#"{"models":[{"slug":"gpt-6-astra","display_name":"GPT-6 Astra"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let access = HttpAccess::new(
+            format!("http://{address}/v1/responses"),
+            EndpointMode::Exact,
+            ProviderApi::OpenAiResponses,
+            HttpCredential::OpenAiCodex { profile: None },
+            BTreeMap::new(),
+        );
+        let discovery = ModelDiscovery::new().unwrap();
+
+        let models = discovery
+            .fetch(
+                ProviderKind::OpenAiCodex,
+                &access,
+                &DiscoveryAuth::Codex {
+                    access_token: Secret::from_secret_bytes("test-token"),
+                    account_id: "test-account".to_owned(),
+                    is_fedramp: false,
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            models,
+            [DiscoveredModel {
+                id: "gpt-6-astra".to_owned(),
+                name: Some("GPT-6 Astra".to_owned()),
+            }]
+        );
+    }
 
     #[test]
     fn discovers_authenticated_models_from_validated_loopback_endpoints() {

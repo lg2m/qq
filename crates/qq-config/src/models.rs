@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{ModelMetadata, ModelPricing, ModelPricingTier, ProviderApi};
 
-const PROVENANCE: &str = "models.dev/api.json@2026-07-22";
+const PROVENANCE: &str = "models.dev/api.json@2026-09-05";
 const OPENAI_API: u16 = 1 << 0;
 const OPENAI_CODEX: u16 = 1 << 1;
 const ANTHROPIC_API: u16 = 1 << 2;
@@ -209,6 +209,18 @@ const MODELS: &[ModelDefinition] = &[
     },
     model! {
         catalogs: OPENAI_API,
+        wire: "gpt-6-astra",
+        canonical: "openai/gpt-6-astra",
+        name: "GPT-6 Astra",
+        reasoning: true,
+        limits: 1_050_000 / 128_000,
+        pricing: tiered(10_000, 50_000, 1_000, 12_500, PricingTierDefinition {
+            above_input_tokens: 272_000, input: 20_000, output: 75_000,
+            cache_read: Some(2_000), cache_write: Some(25_000),
+        })
+    },
+    model! {
+        catalogs: OPENAI_API,
         wire: "gpt-5.6",
         canonical: "openai/gpt-5.6",
         name: "GPT-5.6",
@@ -265,6 +277,7 @@ const MODELS: &[ModelDefinition] = &[
     model! { catalogs: OPENAI_API, wire: "gpt-4.1-nano", canonical: "openai/gpt-4.1-nano", name: "GPT-4.1 nano", reasoning: false, limits: 1_047_576 / 32_768, pricing: metered(100, 400, 25, 0) },
     model! { catalogs: OPENAI_API, wire: "gpt-4o", canonical: "openai/gpt-4o", name: "GPT-4o", reasoning: false, limits: 128_000 / 16_384, pricing: metered(2_500, 10_000, 1_250, 0) },
     model! { catalogs: OPENAI_API, wire: "gpt-4o-mini", canonical: "openai/gpt-4o-mini", name: "GPT-4o mini", reasoning: false, limits: 128_000 / 16_384, pricing: metered(150, 600, 75, 0) },
+    model! { catalogs: OPENAI_CODEX, wire: "gpt-6-astra", canonical: "openai/gpt-6-astra", name: "GPT-6 Astra", reasoning: true, limits: 272_000 / 128_000, pricing: None },
     model! { catalogs: OPENAI_CODEX, wire: "gpt-5.6-sol", canonical: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol", reasoning: true, limits: 272_000 / 128_000, pricing: None },
     model! { catalogs: OPENAI_CODEX, wire: "gpt-5.6-terra", canonical: "openai/gpt-5.6-terra", name: "GPT-5.6 Terra", reasoning: true, limits: 272_000 / 128_000, pricing: None },
     model! { catalogs: OPENAI_CODEX, wire: "gpt-5.6-luna", canonical: "openai/gpt-5.6-luna", name: "GPT-5.6 Luna", reasoning: true, limits: 272_000 / 128_000, pricing: None },
@@ -318,6 +331,7 @@ const MODELS: &[ModelDefinition] = &[
     model! { catalogs: BEDROCK_MANTLE, wire: "openai.gpt-5.6-sol", canonical: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol", reasoning: true, limits: 272_000 / 128_000, pricing: metered(5_500, 33_000, 0, 0), api: ProviderApi::OpenAiResponses },
     model! { catalogs: BEDROCK_MANTLE, wire: "openai.gpt-5.6-luna", canonical: "openai/gpt-5.6-luna", name: "GPT-5.6 Luna", reasoning: true, limits: 272_000 / 128_000, pricing: metered(1_100, 6_600, 0, 0), api: ProviderApi::OpenAiResponses },
     model! { catalogs: BEDROCK_MANTLE, wire: "openai.gpt-5.6-terra", canonical: "openai/gpt-5.6-terra", name: "GPT-5.6 Terra", reasoning: true, limits: 272_000 / 128_000, pricing: metered(2_200, 13_200, 0, 0), api: ProviderApi::OpenAiResponses },
+    model! { catalogs: XAI_API, wire: "grok-4.6", canonical: "xai/grok-4.6", name: "Grok 4.6", reasoning: true, limits: 500_000 / 500_000, pricing: tiered(2_000, 6_000, 500, 0, PricingTierDefinition { above_input_tokens: 200_000, input: 4_000, output: 12_000, cache_read: Some(1_000), cache_write: None }), api: ProviderApi::OpenAiResponses },
     model! { catalogs: XAI_API, wire: "grok-4.5", canonical: "xai/grok-4.5", name: "Grok 4.5", reasoning: true, limits: 256_000 / 128_000, pricing: None, api: ProviderApi::OpenAiResponses },
     model! { catalogs: XAI_API, wire: "grok-4.3", canonical: "xai/grok-4.3", name: "Grok 4.3", reasoning: true, limits: 131_072 / 32_768, pricing: None, api: ProviderApi::OpenAiChatCompletions },
 ];
@@ -377,8 +391,27 @@ mod tests {
     }
 
     #[test]
+    fn current_frontier_models_are_available_through_direct_and_codex_routes() {
+        let openai = builtin_models(BuiltinCatalog::OpenAiApi);
+        let codex = builtin_models(BuiltinCatalog::OpenAiCodex);
+        let xai = builtin_models(BuiltinCatalog::XAiApi);
+
+        assert_eq!(
+            openai["gpt-6-astra"].canonical_id(),
+            Some("openai/gpt-6-astra")
+        );
+        assert_eq!(
+            codex["gpt-6-astra"].canonical_id(),
+            Some("openai/gpt-6-astra")
+        );
+        assert_eq!(xai["grok-4.6"].canonical_id(), Some("xai/grok-4.6"));
+        assert_eq!(xai["grok-4.6"].api(), Some(ProviderApi::OpenAiResponses));
+    }
+
+    #[test]
     fn xai_models_select_protocol_per_deployment() {
         let xai = builtin_models(BuiltinCatalog::XAiApi);
+        assert_eq!(xai["grok-4.6"].api(), Some(ProviderApi::OpenAiResponses));
         assert_eq!(xai["grok-4.5"].api(), Some(ProviderApi::OpenAiResponses));
         assert_eq!(
             xai["grok-4.3"].api(),
