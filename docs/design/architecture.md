@@ -622,9 +622,22 @@ spent the last permitted turn becomes a tool-free final status response; an
 elapsed wall clock or a provider turn that omits usage under a cost cap settles
 immediately. Every bound produces the typed `budget_exhausted` outcome, never a
 provider failure, so the TUI, server, and headless adapter observe one
-contract. Sub-agents are admitted with the parent's remaining wall clock, cost,
-and token bounds (`BudgetMeter::remaining`), never its original caps, and
-charge their settled (or unknown) usage and cost back to the parent's meter.
+contract. Each sequential child admission, including an auditor, derives fresh
+remaining cost and token bounds after charging earlier children. A turn containing
+children executes sequentially when the parent has any finite cost or token
+bound; unbounded and duration-only read fanout keep their existing concurrency.
+These are observed-spend limits: a provider turn or reserved final response can
+still overshoot; there is no prepaid reservation or estimated audit minimum.
+
+Children share the parent's absolute deadline. Preflight and queueing consume
+that clock; expiry cancels the owned work and waits for cleanup, which can finish
+after the deadline. Creation accepted by the store may commit after expiry and
+is then cancelled under the same retained owner. Settled child receipts charge
+that run and its exact owned descendants, excluding later user prompts in child
+sessions. Unknown usage or cost stays unknown and refuses a new child when the
+corresponding bound is imposed. Descendant history cannot be deleted until every
+owning ancestor run settles. Auditors store their direct spend on their own run;
+the parent meter and inclusive accounting each include that spend once.
 A read-only session is not offered the mutating, shell, or non-read external
 schemas its policy would deny, and a spawned child's approval mode can be
 lowered but never raised by a client command.
@@ -720,10 +733,15 @@ transcript. The child verifies the claims against the workspace with its own
 tools and answers one JSON verdict. `pass` completes the run; `revise` pushes
 the answer plus the findings as a runtime notice and continues once (bounded by
 `max_revisions`); an auditor that fails, is refused, or answers prose is
-`unavailable` and the answer stands. The record is durable on the run
+`unavailable` and the answer stands, provided the parent's budget still permits
+completion after charging audit spend. Otherwise the run settles as
+`budget_exhausted`, even when the auditor passed. The record is durable on the run
 (`runs.audit_json`, published as `run_audit_completed`) before the run settles,
 and the child's spend is charged to the audited run. Children, internal runs,
-budget-final turns, and runs that cannot fund an auditor are never audited. At dispatch `resolve_delegation_route` applies explicit
+budget-final turns, and runs without a positive, known remainder for each imposed
+cost/token bound or with an expired deadline are never audited. Unbounded
+families do not require an affordability estimate. At dispatch
+`resolve_delegation_route` applies explicit
 model, then role, then the roster's default role; without a roster the legacy
 worker/parent fallback and full authenticated route list remain, and the
 session spawner still validates every resolved route against the authenticated

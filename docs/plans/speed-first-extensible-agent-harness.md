@@ -10,8 +10,10 @@ service-gap gate. A follow-up source audit and peer review on 2026-09-04
 identified correctness gaps in shipped child, cache, feed, and context-source
 behavior. Both H23 ownership slices are implemented and locally validated on
 Linux, with focused latency/resource receipts under Phase 5a; native Windows
-teardown remains unqualified. **Next implementation slice: H24 remaining child
-budgets at each admission.**
+teardown remains unqualified. H24 remaining child budgets and owned-descendant
+accounting are implemented 2026-09-05; receipt under Phase 5a. The shell latency
+comparison remains unqualified because its host-noise gate failed.
+**Next implementation slice: H25 live provider/MCP credential binding.**
 H23–H26 precede Phase 6; H27–H28 join its early correctness work. Phases 6–9
 remain proposed, with H20 moved ahead of H18 and H19 conditional on decoder
 measurements.
@@ -49,8 +51,8 @@ projects:
 The compiled plan, backend protocol, and initial extension lanes have shipped.
 The remaining priorities, in order, are:
 
-1. Repair supervised-child ownership and budget admission, live credential
-   binding, and workspace-feed retention (H23–H26).
+1. Repair live credential binding and workspace-feed retention (H25–H26),
+   and retain H23's native Windows qualification gap.
 2. Finish control admission and the carried output-fairness gate (H20).
 3. Repair settlement, active-plan accounting, context-source admission and
    identity, and pack revalidation (behavioral H21, H27–H28, correctness H22).
@@ -1458,7 +1460,7 @@ credential-lease caching, MCP bounds, and provider prompt-cache determinism.
 | H21 | `RunIdentity`, `PersistenceFault`, one settlement path, `sessions.rs` split (D9) | H15–H17, H20 | `qq-core` |
 | H22 | Bundled cold-path and structural fixes: config/auth load, protocol boxing and limits, route tables, TUI index and tail | None | Per crate |
 | H23 | Supervised-child ownership across admission, overload, steering, and cleanup; implemented and validated on Linux, Windows qualification open | Supervised-delegation D4 | `qq-core` |
-| H24 | Recompute remaining child budgets at sequential admission; define parallel fanout semantics | Supervised-delegation D2 | `qq-core` |
+| H24 | Implemented: fresh child/audit admission, finite-spend serialization, owned-descendant receipts | Supervised-delegation D2 | `qq-core` |
 | H25 | Live provider/MCP credential binding invalidation without secret-bearing durable identities | H2, H7 | Root, auth, MCP wiring |
 | H26 | Bounded workspace-feed admission and lifecycle | H15 | `qq-core`, server fixtures |
 | H27 | Active-generation accounting and atomic cache refresh admission | H2 | Root |
@@ -1765,7 +1767,99 @@ The earlier sample's elevated candidate tails did not recur; RSS p95 increased
 focused comparison, not the complete H0 suite. The carried H20 output-gap
 target of at most 20 ms is still unmet (candidate p95 29 ms). Native Windows
 teardown remains an explicit platform qualification gap. H24–H26 still precede
-Phase 6; H24 is the next implementation slice.
+Phase 6; the following receipt records H24's subsequent repair.
+
+#### H24 Receipt — 2026-09-05
+
+Implemented in `qq-core`, with the owning D2 contract and architecture updated:
+
+- Recompute cost and total/input/output-token allowance after each settled child.
+  A finite spend bound serializes a child-containing turn; unbounded and
+  duration-only read fanout keep their existing concurrency. Exhausted or unknown
+  remainders refuse the next child by the affected family. Observed provider
+  turns and reserved final responses may still overshoot their allowance.
+- Carry the parent's absolute deadline through preparation, admission queues,
+  and execution. Expired preflight creates no child; store creation already
+  accepted may commit after expiry and is then cancelled under its retained
+  owner. Cleanup may finish after the deadline.
+- Include exact owned descendant runs in child spend receipts, excluding later
+  user prompts in child sessions. Propagate unknown usage/cost independently;
+  fail closed on missing, incomplete, malformed, or overflowing accounting.
+  Preserve owned session history until every owning ancestor run settles.
+- Give auditors the same remaining allowance, recheck budget exhaustion before
+  parent completion, and record audit spend once in inclusive accounting.
+  Positive known remainders are required only for imposed families; no minimum
+  audit-cost prediction or general reservation scheduler was added.
+
+Regression coverage includes two same-turn children, finite read fanout at one
+and three configured child slots, all spend families, unknown/zero allowance,
+preflight duration expiry, nested descendant spend, follow-up exclusion,
+accounting corruption/overflow, owner-held deletion, and audit inheritance and
+charge-once exhaustion. The two H23 injected-panic fixtures now distinguish a
+terminated unreaped child from a live process using nonblocking wait on their
+exact owned PID, after asserting production reports unconfirmed cleanup. Normal
+successful-drain assertions are unchanged.
+
+Local Linux validation: workspace tests (1170 passed, 3 ignored), formatting,
+strict all-target/all-feature workspace Clippy, and workspace build pass. Tests
+used local loopback access with this host's NO_COLOR unset. Independent Spec and
+Standards reviews found no remaining implementation blocker. No wire protocol,
+descriptor, persistence schema, or dependency changes; one benchmark target was
+added using existing dependencies.
+
+Focused measurement: 30 alternating baseline/candidate pairs for each latency
+case, plus three pairs of a barrier-controlled read-overlap case. Baseline is
+`f0a1c2e`; candidate code is `79d3211`. Both use the same new
+`cargo bench -p qq-core --bench child_admission` fixture. Compiled plans and
+store setup are outside its timer; providers add no artificial latency. Release
+workers ran on the same Linux host/filesystem without concurrent review builds
+or tests. Values are nearest-rank median / p95 in milliseconds, except RSS in MiB.
+
+| Durable delegation case | Baseline | H24 |
+| --- | ---: | ---: |
+| Four unbounded read children | 145.60 / 154.51 | 147.05 / 171.95 |
+| Four read children with finite cost/token caps | 145.22 / 260.90 | 150.96 / 294.95 |
+| Child plus grandchild | 98.23 / 124.88 | 99.03 / 109.31 |
+
+Finite-spend fanout has one active child at a time, versus three at baseline;
+its median is 4.0% higher in this fixture. Real provider latency can increase
+the serialization cost. Ordinary unbounded read fanout retains three active
+children, and the barrier case confirms three overlapping descendant provider
+streams in both versions. Every sample verifies expected child count, depth,
+and inclusive spend. These new latency cases are descriptive measurements,
+not an established numerical regression gate or proof of speed improvement.
+
+| Existing default-path metric | Baseline | H24 |
+| --- | ---: | ---: |
+| Eight-stream completion | 272.80 / 292.07 | 269.95 / 298.37 |
+| Control call latency upper bound | 19.00 / 22.46 | 18.86 / 21.57 |
+| Cancellation to finished | 26.00 / 29.28 | 25.72 / 28.73 |
+| Maximum output service gap | 23.00 / 26.00 | 23.00 / 26.00 |
+| Eight-stream peak temporary RSS | 8.41 / 9.30 | 8.65 / 10.09 |
+| One-MiB shell-output completion | 222.65 / 509.77 | 219.79 / 469.56 |
+| Shell peak temporary RSS | 3.74 / 3.88 | 4.03 / 4.21 |
+
+The eight-stream comparison passes existing relative, absolute, and noise
+gates. All shell relative/absolute p95 checks pass, but the shell latency
+noise check fails: median absolute deviation is 50.49% / 57.08% of the baseline /
+candidate median, above the 50% gate. Both arms rose together from about 90 ms
+to 200–500 ms during measurement; subsequent host I/O pressure was high. This
+supports an interference hypothesis, not a code-regression conclusion. The
+original noisy series is retained and does not qualify shell latency.
+
+A bounded 60-second follow-up recorded 13 I/O-pressure snapshots and found no
+stable low-pressure interval (at most 5% stall); final some/full 10-second
+pressure was 29.21% / 27.46%. No repeat was run and no samples were discarded.
+Shell latency qualification remains open for a stable host; code, correctness,
+and streaming checks above are complete. Raw paired reports, binary hashes,
+pressure observations, and verification logs are retained locally under
+`target/qq-perf/h24-2026-09-05/` (untracked generated evidence).
+
+This is not complete H0 qualification. H20's at-most-20-ms output service-gap
+target remains unmet (candidate p95 26 ms), and H23 native Windows teardown
+remains unqualified. H25 live credential binding is the next implementation
+slice, followed by H26 before Phase 6.
+
 
 ### Phase 6 — Finish Fairness, Shrink Per-Run Work, And Consolidate
 
@@ -2052,8 +2146,8 @@ The speed-first extensible backend is complete when:
 - product integrations remain clients of one durable QQ runtime.
 
 Until those conditions are met, the immediate implementation boundary is
-Phase 5a: H24 child budgets next, then H25–H26, with H23 native Windows
-qualification still open. Phase 6
+Phase 5a: H25 live credential binding next, then H26 workspace-feed retention,
+with H23 native Windows qualification still open. Phase 6
 then starts with H20 and the early correctness repairs (behavioral H21,
 H27–H28, correctness H22), followed by H18, measured H19, and mechanical
 consolidation. Phase 5 shipped on 2026-09-04 with its output-service-gap gate
