@@ -1323,12 +1323,9 @@ impl Store {
         .await
     }
 
-    /// The terminal outcome of one run, if it has reached one. Polled by
-    /// spawn futures awaiting their child run.
-    /// A settled run's outcome and estimated cost. The cost is `None` until
-    /// the run settles and stays `None` when spend was unmeasurable.
-    /// A settled run's outcome with the spend it is accountable for. Usage
-    /// and cost are `None` when unknown, never zero.
+    /// A settled run's outcome and its exact owned descendants' spend.
+    /// Later user prompts in a child session are separate runs and do not
+    /// enter this receipt. Missing usage or cost remains unknown.
     pub(super) async fn run_outcome(
         &self,
         run_id: RunId,
@@ -1351,42 +1348,136 @@ impl Store {
             }
         };
         let read = self.call(Priority::AwaitControl, move |connection| {
-            let (outcome, usage, cost) = connection
+            let (outcome, usage, _cost, session_id) = connection
                 .query_row(
-                    "SELECT outcome_json, usage_json, estimated_cost_usd_nanos FROM runs WHERE id = ?1",
+                    "SELECT outcome_json, usage_json, estimated_cost_usd_nanos, session_id
+                     FROM runs WHERE id = ?1",
                     [run_id.to_string()],
                     |row| {
                         Ok((
                             row.get::<_, Option<String>>(0)?,
                             row.get::<_, Option<String>>(1)?,
                             row.get::<_, Option<u64>>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|_| SessionRuntimeError::Persistence)?
                 .ok_or(SessionRuntimeError::RunNotFound)?;
-            let usage = usage
-                .as_deref()
-                .map(serde_json::from_str::<TokenUsage>)
-                .transpose()
+            let Some(encoded) = outcome else {
+                // A malformed live accounting row is already a hard read
+                // failure; do not wait for a hanging child to settle first.
+                if let Some(encoded) = usage {
+                    serde_json::from_str::<TokenUsage>(&encoded)
+                        .map_err(|_| SessionRuntimeError::Persistence)?;
+                }
+                return Ok(None);
+            };
+            let outcome = serde_json::from_str::<RunOutcome>(&encoded)
                 .map_err(|_| SessionRuntimeError::Persistence)?;
-            outcome
-                .as_deref()
-                .map(|encoded| {
-                    serde_json::from_str(encoded)
-                        .map(|outcome| {
-                            (
-                                outcome,
-                                SpawnAgentSpend {
-                                    cost_usd_nanos: cost,
-                                    usage,
-                                },
+            let workspace_id: String = connection
+                .query_row(
+                    "SELECT workspace_id FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            // Child creation atomically stores its original user message at
+            // ordinal one; compaction retains that row. Follow owner run ids
+            // and this message's exact run, not all runs in a child session.
+            // Left joins keep missing identities visible as hard failures.
+            // Materialize the bounded workspace candidates once so recursion
+            // does not rescan every session for each owned run.
+            let mut statement = connection
+                .prepare_cached(
+                    "WITH RECURSIVE candidates AS MATERIALIZED (
+                         SELECT id, owner_run_id FROM sessions
+                         WHERE workspace_id = ?2 AND owner_run_id IS NOT NULL
+                     ), owned(run_id, depth) AS (
+                         VALUES (?1, 0)
+                         UNION ALL
+                         SELECT initial.id, owned.depth + 1
+                         FROM owned
+                         JOIN candidates child ON child.owner_run_id = owned.run_id
+                         LEFT JOIN messages first ON first.session_id = child.id
+                             AND first.ordinal = 1 AND first.role = 'user'
+                         LEFT JOIN runs initial ON initial.id = first.run_id
+                             AND initial.session_id = child.id
+                             AND initial.user_message_id = first.id
+                         WHERE owned.depth < ?3
+                         LIMIT ?4
+                     )
+                     SELECT r.id,
+                            r.outcome_json IS NOT NULL AND r.status IN
+                                ('completed', 'cancelled', 'failed', 'interrupted', 'budget_exhausted'),
+                            r.usage_json, r.estimated_cost_usd_nanos,
+                            r.status = 'cancelled' AND r.started_at_ms IS NULL
+                                AND NOT EXISTS(SELECT 1 FROM model_turns t WHERE t.run_id = r.id),
+                            owned.depth = ?3 AND EXISTS(
+                                SELECT 1 FROM candidates child
+                                WHERE child.owner_run_id = owned.run_id
                             )
-                        })
-                        .map_err(|_| SessionRuntimeError::Persistence)
-                })
-                .transpose()
+                     FROM owned LEFT JOIN runs r ON r.id = owned.run_id",
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        run_id.to_string(),
+                        workspace_id,
+                        MAX_CHILD_DEPTH,
+                        usize::from(MAX_DESCENDANTS_PER_ROOT) + 2,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<u64>>(3)?,
+                            row.get::<_, Option<bool>>(4)?.unwrap_or(false),
+                            row.get::<_, bool>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|_| SessionRuntimeError::Persistence)?;
+            let mut spend = SpawnAgentSpend::NONE;
+            for (index, row) in rows.enumerate() {
+                let (id, settled, encoded_usage, cost, never_started, too_deep) =
+                    row.map_err(|_| SessionRuntimeError::Persistence)?;
+                if id.is_none()
+                    || !settled
+                    || too_deep
+                    || index > usize::from(MAX_DESCENDANTS_PER_ROOT)
+                {
+                    return Err(SessionRuntimeError::AccountingUnavailable);
+                }
+                let usage = match encoded_usage {
+                    Some(encoded) => Some(
+                        serde_json::from_str::<TokenUsage>(&encoded)
+                            .map_err(|_| SessionRuntimeError::Persistence)?,
+                    ),
+                    None if never_started => SpawnAgentSpend::NONE.usage,
+                    None => None,
+                };
+                spend.usage = match (spend.usage, usage) {
+                    (Some(total), Some(usage)) => Some(
+                        add_usage(total, usage)
+                            .ok_or(SessionRuntimeError::AccountingUnavailable)?,
+                    ),
+                    _ => None,
+                };
+                let cost = cost.or(never_started.then_some(0));
+                spend.cost_usd_nanos = match (spend.cost_usd_nanos, cost) {
+                    (Some(total), Some(cost)) => Some(
+                        total
+                            .checked_add(cost)
+                            .ok_or(SessionRuntimeError::AccountingUnavailable)?,
+                    ),
+                    _ => None,
+                };
+            }
+            Ok(Some((outcome, spend)))
         });
         #[cfg(test)]
         let read = async move {
