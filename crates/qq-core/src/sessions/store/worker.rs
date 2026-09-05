@@ -31,7 +31,7 @@ pub(super) type DatabaseJob = Box<dyn FnOnce(&mut Connection) -> JobOutcome + Se
 pub(super) enum WorkerMessage {
     Run {
         job: DatabaseJob,
-        _output_permit: Option<OwnedSemaphorePermit>,
+        capacity_permit: Option<OwnedSemaphorePermit>,
     },
 }
 
@@ -163,7 +163,12 @@ fn run_control_message(
     feed: &feed::WorkspaceFeed,
     message: WorkerMessage,
 ) {
-    let WorkerMessage::Run { job, .. } = message;
+    let WorkerMessage::Run {
+        job,
+        capacity_permit,
+    } = message;
+    // Capacity counts queued jobs, not the operation currently executing.
+    drop(capacity_permit);
     let outcome = job(connection);
     let staged = feed::take_staged();
     debug_assert!(

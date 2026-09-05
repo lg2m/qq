@@ -28526,6 +28526,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_saturation_does_not_release_a_running_write_child() {
+        struct HeldChild {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        impl Provider for HeldChild {
+            fn stream(&self, _: ModelRequest) -> ProviderStream {
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async_stream! {
+                    entered.notify_one();
+                    release.notified().await;
+                    yield Ok(qq_provider::ProviderEvent::OutputTextDelta { text: "child done".to_owned() });
+                    yield Ok(qq_provider::ProviderEvent::Completed { usage: None });
+                })
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release_child = Arc::new(tokio::sync::Notify::new());
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let (mut harness, parent_requests) = write_child_harness(
+            Arc::new(HeldChild {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release_child),
+            }),
+            vec![
+                (
+                    "spawn_agent",
+                    r#"{"task":"hold the checkout","model":"test/child","authority":"write"}"#
+                        .to_owned(),
+                ),
+                (
+                    "write_file",
+                    r#"{"path":"parent.txt","content":"parent resumed"}"#.to_owned(),
+                ),
+            ],
+            Some(reviewer),
+            ApprovalMode::Full,
+        )
+        .await;
+        let parent_run =
+            submit_prompt_to(&harness.runtime, harness.session_id, "delegate then write").await;
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let mut observed = Vec::new();
+        let (child_run, cursor) = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), harness.events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let child = matches!(event.event, SessionEvent::RunStarted { .. })
+                && event.run_id != Some(parent_run);
+            let run = event.run_id;
+            let cursor = event.cursor;
+            observed.push(event);
+            if child {
+                break (run.unwrap(), cursor);
+            }
+        };
+        let (read_entered, release_read, read_attempted) = store::hold_outcome_read(child_run);
+        harness.runtime.inner.notify(cursor);
+        tokio::time::timeout(Duration::from_secs(2), read_entered)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Hold the real worker and fill its control lane. The child is live;
+        // only the parent's outcome read is released into this saturation.
+        let blocked_store = harness.runtime.inner.store.clone();
+        let (worker_entered, worker_started) = oneshot::channel();
+        let (release_worker, worker_release) = std::sync::mpsc::channel();
+        let worker = tokio::spawn(async move {
+            blocked_store
+                .call(Priority::Output, move |_| {
+                    let _ = worker_entered.send(());
+                    worker_release
+                        .recv()
+                        .map_err(|_| SessionRuntimeError::Unavailable)
+                })
+                .await
+        });
+        worker_started.await.unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..256 {
+            let store = harness.runtime.inner.store.clone();
+            let mut job = Box::pin(async move { store.call(Priority::Control, |_| Ok(())).await });
+            assert!(futures_util::poll!(job.as_mut()).is_pending());
+            queued.push(job);
+        }
+        release_read.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), read_attempted)
+            .await
+            .unwrap()
+            .unwrap();
+        release_worker.send(()).unwrap();
+        worker.await.unwrap().unwrap();
+        for job in queued {
+            job.await.unwrap();
+        }
+        release_child.notify_one();
+        observed.extend(collect_until_run_finished(&mut harness.events, parent_run).await);
+        harness.runtime.shutdown().await.unwrap();
+        let parent_reqs = parent_requests.lock().unwrap();
+        assert!(
+            matches!(
+                parent_reqs[1].messages()[2].content(),
+                [ContentBlock::ToolResult { content, is_error: false, .. }] if content == "child done"
+            ),
+            "store overload must not replace the live child's result with an admission error"
+        );
+        let child_finished = observed
+            .iter()
+            .position(|event| {
+                event.run_id == Some(child_run)
+                    && matches!(event.event, SessionEvent::RunFinished { .. })
+            })
+            .unwrap();
+        let parent_resumed = observed
+            .iter()
+            .position(|event| {
+                event.run_id == Some(parent_run)
+                    && matches!(event.event, SessionEvent::ToolCallFinished { .. })
+            })
+            .unwrap();
+        assert!(child_finished < parent_resumed);
+        assert_eq!(
+            finished_outcome(&observed, child_run),
+            Some(RunOutcome::Completed)
+        );
+        assert!(matches!(
+            finished_outcome(&observed, parent_run),
+            Some(RunOutcome::Completed)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(harness._directory.path().join("parent.txt")).unwrap(),
+            "parent resumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_child_outcome_fails_the_runtime_before_parent_continuation() {
+        let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
+        let (mut harness, parent_requests) = write_child_harness(
+            Arc::new(HangingProvider),
+            vec![(
+                "spawn_agent",
+                r#"{"task":"hold the checkout","model":"test/child","authority":"write"}"#
+                    .to_owned(),
+            )],
+            Some(reviewer),
+            ApprovalMode::Full,
+        )
+        .await;
+        let parent_run = submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
+        let (child_run, cursor) = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), harness.events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if matches!(event.event, SessionEvent::RunStarted { .. })
+                && event.run_id != Some(parent_run)
+            {
+                break (event.run_id.unwrap(), event.cursor);
+            }
+        };
+        let (read_entered, release_read, _read_attempted) = store::hold_outcome_read(child_run);
+        harness.runtime.inner.notify(cursor);
+        tokio::time::timeout(Duration::from_secs(2), read_entered)
+            .await
+            .unwrap()
+            .unwrap();
+        // Corrupt just the child accounting payload: the database still
+        // accepts parent events, so an ordinary error result would resume it.
+        harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, move |connection| {
+                connection
+                    .execute(
+                        "UPDATE runs SET usage_json = 'invalid-json' WHERE id = ?1",
+                        [child_run.to_string()],
+                    )
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let child_cancel = harness
+            .runtime
+            .inner
+            .cancellations
+            .lock()
+            .unwrap()
+            .get(&child_run)
+            .unwrap()
+            .subscribe();
+        release_read.send(()).unwrap();
+        let unavailable = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = harness.events.next().await {
+                match event {
+                    Err(SessionRuntimeError::Unavailable) => return true,
+                    Ok(event)
+                        if matches!(event.event, SessionEvent::RunFinished { .. })
+                            && event.run_id == Some(parent_run) =>
+                    {
+                        return false;
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("unexpected event failure: {error}"),
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        if !unavailable {
+            // Clean up the still-running child on the failing implementation.
+            harness.runtime.inner.cancel(child_run);
+        }
+        assert!(
+            unavailable,
+            "unreadable child ownership must fail closed, not return a resumable tool error"
+        );
+        assert!(
+            *child_cancel.borrow(),
+            "the live child receives cancellation"
+        );
+        assert_eq!(
+            parent_requests.lock().unwrap().len(),
+            1,
+            "the parent makes no further provider request"
+        );
+        assert_eq!(
+            harness
+                .runtime
+                .command(
+                    CommandId::generate().unwrap(),
+                    SessionCommand::CancelRun { run_id: parent_run }
+                )
+                .await,
+            Err(SessionRuntimeError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
     async fn write_children_serialize_on_the_per_run_write_permit() {
         let (reviewer, _) = StubReviewer::immediate(ReviewVerdict::free(ReviewDecision::Approve));
         let active = Arc::new(AtomicUsize::new(0));

@@ -272,6 +272,11 @@ pub(super) async fn spawn_child_run(
             Ok(Some(settled)) => break settled,
             Ok(None) => {}
             Err(error) => {
+                // Outcome admission waits for capacity. A remaining error
+                // means ownership can no longer be established durably;
+                // the parent must not resume ordinary tool execution.
+                inner.failed.send_replace(true);
+                inner.cancel(run_id);
                 guard.disarm();
                 return spawn_error_with_spend(
                     format!("the sub-agent outcome could not be read: {error}"),

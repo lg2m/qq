@@ -60,6 +60,37 @@ struct CancellationReadHook {
 static CANCELLATION_READ_HOOKS: Mutex<Vec<CancellationReadHook>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
+struct OutcomeReadHook {
+    run_id: RunId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+    attempted: oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+static OUTCOME_READ_HOOKS: Mutex<Vec<OutcomeReadHook>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn hold_outcome_read(
+    run_id: RunId,
+) -> (
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+) {
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    let (attempted, attempted_rx) = oneshot::channel();
+    OUTCOME_READ_HOOKS.lock().unwrap().push(OutcomeReadHook {
+        run_id,
+        entered,
+        release: release_rx,
+        attempted,
+    });
+    (entered_rx, release, attempted_rx)
+}
+
+#[cfg(test)]
 struct ReservedStartOverloadHook {
     run_id: RunId,
     entered: oneshot::Sender<()>,
@@ -224,6 +255,7 @@ pub(super) struct Store {
 
 struct StoreInner {
     control: Sender<WorkerMessage>,
+    control_slots: Arc<Semaphore>,
     output: Sender<WorkerMessage>,
     output_slots: Arc<Semaphore>,
     /// Live subscribers, fed by the worker after each committing job.
@@ -241,12 +273,15 @@ struct StoreInner {
 #[derive(Clone, Copy)]
 pub(super) enum Priority {
     Control,
+    /// An already-owned child must survive transient admission pressure.
+    AwaitControl,
     Output,
 }
 
 impl Drop for StoreInner {
     fn drop(&mut self) {
         self.closing.store(true, Ordering::Release);
+        self.control_slots.close();
         self.output_slots.close();
         let _ = self.shutdown.try_send(());
     }
@@ -263,6 +298,7 @@ impl Store {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 control: started.control,
+                control_slots: Arc::new(Semaphore::new(CONTROL_QUEUE_CAPACITY)),
                 output: started.output,
                 output_slots: Arc::new(Semaphore::new(OUTPUT_QUEUE_CAPACITY)),
                 feed,
@@ -309,8 +345,24 @@ impl Store {
         if self.inner.closing.load(Ordering::Acquire) {
             return Err(SessionRuntimeError::Unavailable);
         }
-        let output_permit = match priority {
-            Priority::Control => None,
+        let capacity_permit = match priority {
+            Priority::Control => Some(
+                match Arc::clone(&self.inner.control_slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        return Err(SessionRuntimeError::Overloaded);
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => {
+                        return Err(SessionRuntimeError::Unavailable);
+                    }
+                },
+            ),
+            Priority::AwaitControl => Some(
+                Arc::clone(&self.inner.control_slots)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| SessionRuntimeError::Unavailable)?,
+            ),
             Priority::Output => Some(
                 Arc::clone(&self.inner.output_slots)
                     .acquire_owned()
@@ -333,10 +385,10 @@ impl Store {
                     }),
                 }
             }),
-            _output_permit: output_permit,
+            capacity_permit,
         };
         let sender = match priority {
-            Priority::Control => &self.inner.control,
+            Priority::Control | Priority::AwaitControl => &self.inner.control,
             Priority::Output => &self.inner.output,
         };
         // Enqueue and close share this short, synchronous admission boundary.
@@ -375,6 +427,7 @@ impl Store {
                 .map_err(|_| SessionRuntimeError::Unavailable)?;
             self.inner.closing.store(true, Ordering::Release);
             self.inner.output_slots.close();
+            self.inner.control_slots.close();
             let _ = self.inner.shutdown.try_send(());
         }
         let mut closed = self.inner.closed.clone();
@@ -1200,7 +1253,24 @@ impl Store {
         &self,
         run_id: RunId,
     ) -> Result<Option<(RunOutcome, SpawnAgentSpend)>, SessionRuntimeError> {
-        self.call(Priority::Control, move |connection| {
+        #[cfg(test)]
+        let mut attempted = {
+            let hook = {
+                let mut hooks = OUTCOME_READ_HOOKS.lock().unwrap();
+                hooks
+                    .iter()
+                    .position(|hook| hook.run_id == run_id)
+                    .map(|index| hooks.remove(index))
+            };
+            if let Some(hook) = hook {
+                let _ = hook.entered.send(());
+                let _ = hook.release.await;
+                Some(hook.attempted)
+            } else {
+                None
+            }
+        };
+        let read = self.call(Priority::AwaitControl, move |connection| {
             let (outcome, usage, cost) = connection
                 .query_row(
                     "SELECT outcome_json, usage_json, estimated_cost_usd_nanos FROM runs WHERE id = ?1",
@@ -1237,8 +1307,20 @@ impl Store {
                         .map_err(|_| SessionRuntimeError::Persistence)
                 })
                 .transpose()
-        })
-        .await
+        });
+        #[cfg(test)]
+        let read = async move {
+            let mut read = std::pin::pin!(read);
+            std::future::poll_fn(|cx| {
+                let result = read.as_mut().poll(cx);
+                if let Some(signal) = attempted.take() {
+                    let _ = signal.send(());
+                }
+                result
+            })
+            .await
+        };
+        read.await
     }
 
     /// The final committed model turn's text/refusal. Earlier assistant turns
@@ -1300,6 +1382,7 @@ impl Store {
     pub(super) fn stop_worker_for_test(&self) -> Option<std::thread::JoinHandle<()>> {
         self.inner.closing.store(true, Ordering::Release);
         self.inner.output_slots.close();
+        self.inner.control_slots.close();
         let _ = self.inner.shutdown.try_send(());
         self.inner.worker.lock().ok()?.take()
     }
@@ -1395,7 +1478,7 @@ mod tests {
     fn control_message(job: impl FnOnce(&mut Connection) + Send + 'static) -> WorkerMessage {
         WorkerMessage::Run {
             job: raw_job(job),
-            _output_permit: None,
+            capacity_permit: None,
         }
     }
 
@@ -1681,6 +1764,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_control_waiters_do_not_block_later_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (release, blocked) = hold_worker(&store).await;
+        let mut queued = Vec::new();
+        for _ in 0..CONTROL_QUEUE_CAPACITY {
+            let mut call = Box::pin(store.call(Priority::Control, |_| Ok(())));
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            queued.push(call);
+        }
+        let mut cancelled = Box::pin(store.call::<(), _>(Priority::AwaitControl, |_| {
+            panic!("cancelled waiter must not execute")
+        }));
+        assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        let mut following = Box::pin(store.call(Priority::AwaitControl, |_| Ok(7)));
+        assert!(futures_util::poll!(following.as_mut()).is_pending());
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), following)
+                .await
+                .unwrap()
+                .unwrap(),
+            7
+        );
+        for call in queued {
+            call.await.unwrap();
+        }
+        blocked.await.unwrap().unwrap();
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_the_store_wakes_control_admission_waiters_and_drains_accepted_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (release, blocked) = hold_worker(&store).await;
+        let mut queued = Vec::new();
+        for _ in 0..CONTROL_QUEUE_CAPACITY {
+            let mut call = Box::pin(store.call(Priority::Control, |_| Ok(())));
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            queued.push(call);
+        }
+        let mut waiting = Box::pin(store.call(Priority::AwaitControl, |_| Ok(())));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        let mut closing = Box::pin(store.close());
+        assert!(futures_util::poll!(closing.as_mut()).is_pending());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap(),
+            Err(SessionRuntimeError::Unavailable)
+        );
+        release.send(()).unwrap();
+        for call in queued {
+            call.await.unwrap();
+        }
+        blocked.await.unwrap().unwrap();
+        closing.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn saturated_output_submission_waits_for_a_capacity_wake() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("sessions.sqlite3"))
@@ -1710,7 +1859,7 @@ mod tests {
                 .output
                 .try_send(WorkerMessage::Run {
                     job: raw_job(|_| {}),
-                    _output_permit: Some(permit),
+                    capacity_permit: Some(permit),
                 })
                 .unwrap();
         }
@@ -1770,7 +1919,7 @@ mod tests {
                 job: raw_job(move |_| {
                     let _ = observed_tx.send(output_controls.load(Ordering::SeqCst));
                 }),
-                _output_permit: Some(permit),
+                capacity_permit: Some(permit),
             })
             .unwrap();
 
