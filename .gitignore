@@ -22,6 +22,8 @@ target
 
 /.direnv/
 
+.source/
+
 # Local environment and secret files
 .env
 .env.*
@@ -33,6 +35,7 @@ target
 /result-*
 
 .opencode
+opencode.json
 .claude
 
 # Harbor adapter environments and generated evaluation artifacts
