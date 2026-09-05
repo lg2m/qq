@@ -884,6 +884,33 @@ The same HTTP/SSE protocol serves local TUI clients, remote TUI clients, and
 future browser or mobile clients. Protocol replay means moving between devices
 does not require transferring in-memory client state.
 
+## Hosting Boundary
+
+QQ is designed to be run by a **supervisor**: a batch runner, CI job,
+evaluation harness, or hosted service that launches `qq run` inside an
+environment it controls and consumes the JSONL record stream and exit code.
+[`headless-contract.md`](./headless-contract.md) fixes that contract and the
+division of responsibility.
+
+The division is: QQ owns everything that must work on one machine for one
+user with no network other than the model endpoint — the agent loop,
+providers, tools, approvals, run limits, the durable session store, events,
+and the typed outcome. The supervisor owns everything that needs more than one
+tenant, more than one worker, or an authoritative record of money — isolation,
+repository checkout, patch extraction, spend authority, attempts and leases,
+independent verification, artifacts, identity, and billing.
+
+Three rules follow:
+
+- A supervisor consumes QQ as a binary through argv, environment, inline
+  configuration, and stdout. It never links `qq-core` into a process that
+  also executes untrusted repository code.
+- QQ has no supervisor-only mode and no product vocabulary. A capability a
+  supervisor needs is added only in a form a local user, a CI job, and an
+  evaluation harness could also use, and it stays off the run hot path.
+- The headless contract is public and pinned by fixtures in this repository so
+  a supervisor can test against it without reading QQ source.
+
 ## Performance Discipline
 
 Optimize end-to-end time to a useful result, not isolated microbenchmarks.
@@ -904,9 +931,10 @@ following yet:
 - Native or cross-platform mobile application.
 - JavaScript/TypeScript packages or package workspace.
 - Separate server executable.
-- Distributed workers or cloud control plane.
+- Distributed workers or cloud control plane. These belong to a supervisor
+  above the headless contract; see "Hosting Boundary".
 - Plugin marketplace or public extension interface.
-- Multi-user tenancy.
+- Multi-user tenancy. Same boundary.
 - Multi-agent editing orchestration.
 
 The HTTP/SSE server and client crates are designed to permit future surfaces,

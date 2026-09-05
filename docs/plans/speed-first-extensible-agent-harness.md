@@ -16,7 +16,10 @@ comparison remains unqualified because its host-noise gate failed.
 **Next implementation slice: H25 live provider/MCP credential binding.**
 H23–H26 precede Phase 6; H27–H28 join its early correctness work. Phases 6–9
 remain proposed, with H20 moved ahead of H18 and H19 conditional on decoder
-measurements.
+measurements. A hosting-boundary review on 2026-09-05 added the
+headless-contract tranche HC1–HC4 (Phase 5b), a cold-path set that may run in
+a parallel worktree alongside Phase 6; its design authority is
+[`docs/design/headless-contract.md`](../design/headless-contract.md).
 
 This plan defines how QQ becomes an extremely fast, lightweight, customizable
 agent harness that can serve as the backend for products such as a
@@ -86,6 +89,9 @@ It does not silently override the design documents.
 - [`run-snapshots.md`](./run-snapshots.md) owns reversible mutating-run state.
 - [`lsp-diagnostics.md`](./lsp-diagnostics.md) owns diagnostics integration and
   its MCP-first validation path.
+- [`docs/design/headless-contract.md`](../design/headless-contract.md) owns
+  the `qq run` JSONL/exit contract, the supervisor boundary, and the HC1–HC4
+  gap list implemented as Phase 5b here.
 
 Shipped plans (TUI rearchitecture and refinement, compaction, model-reviewed
 approvals, read-only sub-agents, provider rearchitecture, client parity) were
@@ -291,7 +297,7 @@ first-class capability.
 | Streaming text, reasoning, and tools | Yes | Yes | Yes | Yes | Yes |
 | Cancellation | Yes | Yes | Yes | Yes | Yes |
 | Active-run steering | Partial: queue or cancel | Yes | Partial | Yes | Queued at model boundary |
-| Structured output | No first-class contract | Yes | Yes | Provider-dependent | Yes |
+| Structured output | No first-class contract (HC3 proposed) | Yes | Yes | Provider-dependent | Yes |
 | Multimodal input | Text-only protocol | Images and media | Files and images | Images and vision | Native vision; SDK lacks images |
 | Bounded provider retries | Pre-stream only | Yes | Yes | Yes | Yes, with delivery certainty |
 | Durable sessions | SQLite authority | JSONL plus SQLite projection | SQLite; stronger V2 event store | Shipped synchronous JSONL | Checksummed framed event log |
@@ -1465,6 +1471,10 @@ credential-lease caching, MCP bounds, and provider prompt-cache determinism.
 | H26 | Bounded workspace-feed admission and lifecycle | H15 | `qq-core`, server fixtures |
 | H27 | Active-generation accounting and atomic cache refresh admission | H2 | Root |
 | H28 | Explicit context-source capacity rejection and immutable source identity | H8 | Core, protocol |
+| HC1 | Headless plumbing: `--correlation`, `--session` resume, `u32 --max-turns`, model-less `config check` | H3, H26 | Root `headless.rs`, `cli.rs`, config |
+| HC2 | Positive tool exposure: `policy.allow_tools` intersecting the catalog; profile exposure reachable from `qq run` | H6, H13 | Config, core plan |
+| HC3 | Typed final output: `--output-schema`, bounded repair turns, `final_output` on `outcome` and `RunFinished` | H3, HC1 | Protocol, core, root |
+| HC4 | Headless golden fixtures per `PROTOCOL_VERSION` and compatibility statement | HC1–HC3 | Protocol tests, docs |
 | H10 | First real OS process-sandbox adapter | R6, platform threat model | Core tools, root |
 | H11 | Optional ACP/OpenAI compatibility facade | H4, real consumer | Adapter in existing surface owner |
 | H12 | Crash, load, security, quality, and performance qualification | All shipped tasks and required R milestones | Workspace-wide |
@@ -1860,6 +1870,177 @@ target remains unmet (candidate p95 26 ms), and H23 native Windows teardown
 remains unqualified. H25 live credential binding is the next implementation
 slice, followed by H26 before Phase 6.
 
+### Phase 5b — Headless Contract For Supervisors
+
+Status: proposed 2026-09-05. Design authority is
+[`docs/design/headless-contract.md`](../design/headless-contract.md), which
+records the current contract, the supervisor/QQ boundary, and the gaps this
+tranche closes. Every item is cold-path CLI, configuration, or protocol
+plumbing; none touches the turn loop, the store worker, or the feed. HC1–HC4
+may therefore proceed in an isolated worktree concurrently with Phase 6 and
+integrate through review. HC1 and HC2 are independent; HC3 depends on HC1 for
+the `outcome` field placement; HC4 lands last and pins the whole.
+
+Motivation. A supervisor (batch runner, CI, evaluation harness, or hosted
+service) consumes `qq run` through argv, `QQ_CONFIG_CONTENT`, JSONL stdout,
+and the exit code. Today it must clamp `--max-turns` to `u16`, cannot stamp
+its own identifiers into QQ events, cannot resume a persisted session from
+the CLI, cannot narrow the tool catalog without editing configuration,
+receives the final answer as prose, and re-reads QQ source at every bump to
+confirm the record shapes. Each fix is generic: the same flags serve a
+developer scripting `qq run` locally and the Harbor evaluation adapter.
+
+Boundary rules for this tranche, restated from the design document:
+
+- no supervisor-only mode, no product vocabulary (tenant, release, ledger,
+  broker, billing) in flags, fields, or docs;
+- QQ acquires no new authority: no money, no isolation claims, no tenancy;
+- every addition is additive to the JSONL contract; a changed meaning needs a
+  `PROTOCOL_VERSION` bump and new fixtures; and
+- the default `qq run` path with none of the new flags produces byte-identical
+  records to today's, checked by the HC4 fixtures.
+
+#### HC1 — Headless Plumbing
+
+Deliverables:
+
+- `--correlation KEY=VALUE` (repeatable) on `qq run`, validated through the
+  existing `Correlation::new` bounds (8 entries, 64/256-byte key/value,
+  2 KiB total), passed on `CreateSession`, and echoed as `correlation` in the
+  `trial` record. Duplicate keys and bound violations exit `2` before a
+  session exists.
+- `--session <SESSION_ID>` on `qq run`: resolve the workspace, verify the
+  session belongs to it and is idle, and `SubmitPrompt` into it instead of
+  `CreateSession`. `--correlation` with `--session` is an argument error. A
+  running or missing session exits `2`. The `trial` record gains
+  `resumed: true`. Interrupted prior runs are already marked by recovery;
+  resume never replays an uncertain side effect. Combining `--session` with
+  `--profile` follows the same rule as the server's `SetSessionProfile`.
+- `--max-turns` widens to `u32`, matching `RunLimits.max_model_turns`; the
+  `trial` record's `max_turns` type follows.
+- `qq config check` accepts a document with no effective model. Model
+  selection is validated where it is consumed (`ask`, `run`, `serve`, TUI),
+  which already report `invalid_configuration`. `config show` prints `model:
+  <unset>`.
+
+Acceptance:
+
+- `qq run --correlation job=abc --correlation attempt=2` produces a `trial`
+  record and a workspace snapshot containing exactly those entries;
+  `--correlation` violating any bound exits `2` with no session row written.
+- `qq run --session <id>` against an idle persisted session appends a second
+  run to the same `session_id`, `trial.resumed == true`, and replay from
+  cursor 0 shows both runs in order; against a running session it exits `2`
+  and the running session is unaffected; against a foreign workspace's
+  session it exits `2`.
+- `--max-turns 70000` is accepted and enforced (fake provider, 70000 turns
+  not reached; a cap of 3 still settles `budget_exhausted` at turn 3).
+- `QQ_CONFIG_CONTENT='(version: 1)' qq config check` exits `0`;
+  `qq ask` under the same environment exits `2` with the existing "model must
+  be configured" message.
+- No protocol, descriptor, or schema bump; `trial` additions are optional
+  fields.
+
+#### HC2 — Positive Tool Exposure
+
+Deliverables:
+
+- `policy.allow_tools: [..]` in configuration. When present, the effective
+  catalog is the intersection of the compiled catalog and this list, applied
+  after `deny_tools`. MCP names use the existing `mcp__<server>__<tool>`
+  form; static built-ins are named as today. A name absent from the catalog
+  is a configuration error, not a silent no-op. Layers intersect (a narrower
+  layer cannot widen), matching `allowed_providers` composition.
+- `qq run --profile <name>` is documented as the primary way a supervisor
+  selects a pre-compiled exposure; `--allow-tool` and `--allow-shell` keep
+  their existing grant semantics and are re-documented as *widening held
+  calls*, never as an allowlist.
+- The plan descriptor already digests the catalog; a differing `allow_tools`
+  therefore yields a differing digest with no descriptor version change.
+
+Acceptance:
+
+- `allow_tools: ["read_file", "search"]` under `--approval full` exposes
+  exactly two tools in the model request (fake provider asserts the schema
+  list); a call to `edit_file` returned by the fake provider is a tool error
+  ("unknown tool"), never an approval hold.
+- A global `allow_tools` of five tools and a project `allow_tools` of two
+  yield two; the project cannot re-add a globally excluded tool.
+- `allow_tools: ["nonexistent"]` fails `config check` naming the entry.
+- Approval matrix from H13 is unchanged for every exposed tool.
+
+#### HC3 — Typed Final Output
+
+Deliverables:
+
+- `--output-schema <PATH>` on `qq run` (JSON Schema draft 2020-12 subset:
+  object/array/string/number/integer/boolean/null, `required`, `enum`,
+  `properties`, `items`, `additionalProperties: false`; anything else is
+  `invalid_configuration`). The schema is digested into the plan descriptor
+  (`DESCRIPTOR_VERSION` bump with fixture re-pin) and its text becomes part
+  of the system-prompt suffix so `RunPromptIdentity` reflects it.
+- When present, the run's final assistant message must be a JSON document
+  satisfying the schema. On failure QQ appends a validation-error user turn
+  and retries up to `--output-repair-turns N` (default 2, counted against
+  `max_model_turns`). Exhaustion settles `task_failed` with a typed
+  `final_output: { status: "invalid", errors: [..] }`.
+- `RunFinished` and the JSONL `outcome` gain an optional `final_output`
+  field: `{ status: "valid", value: <json> }`, `{ status: "invalid",
+  errors }`, or absent when no schema was given. Protocol bump; the server
+  and client surface it without interpretation.
+- Providers with native structured-output support (OpenAI `response_format`,
+  Google `responseSchema`, Anthropic tool-forced JSON) may use it behind the
+  existing provider-neutral request; validation still runs in core because
+  provider guarantees are not uniform. No provider-name branch enters the
+  hot path; the capability is a compiled-plan field.
+
+Acceptance:
+
+- Fake provider returns valid JSON first try: `outcome.final_output.status
+  == "valid"`, exactly one model turn.
+- Fake provider returns prose then valid JSON: two turns, valid.
+- Fake provider returns prose three times with `--output-repair-turns 2`:
+  `task_failed`, `final_output.status == "invalid"`, three turns, exit `1`.
+- Repair turns count against `--max-turns`; `--max-turns 2` with two
+  failures settles `budget_exhausted`, not `task_failed`.
+- An unsupported schema keyword exits `2` before a session exists.
+- Same prompt with and without a schema yields different
+  `AgentPlanDigest` and different `RunPromptIdentity`.
+- Golden `provider_encode` and `plan_compile` benches show no change on the
+  default (schema-less) path.
+
+#### HC4 — Golden Fixtures And Compatibility Statement
+
+Deliverables:
+
+- `crates/qq-protocol/tests/fixtures/headless/v<PROTOCOL_VERSION>/`
+  containing one `trial`, a representative `event` sequence (text, tool
+  call, child event, steering), and one `outcome` per status, generated by a
+  deterministic fake-provider run and checked in.
+- A test in the root package that runs `qq run --format jsonl` against the
+  fake provider and asserts byte equality with the fixtures after
+  normalizing ids, timestamps, `workspace_identity`, digests, and
+  `qq_version`/`qq_source_revision`.
+- A test that decodes every fixture with `serde_json::Value` and asserts the
+  required-field set from `headless-contract.md` is present, so a supervisor
+  can copy the assertion.
+- The compatibility policy section of `headless-contract.md` is referenced
+  from `protocol.md` and `README.md`; `PROTOCOL_VERSION` bumps require a new
+  fixture directory and retain the previous one.
+
+Acceptance:
+
+- The fixture test fails when any record shape, field name, or `status`
+  string changes without a fixture update.
+- The default-path fixture (no HC1–HC3 flags) is identical before and after
+  HC1–HC3 land, proving the additions are optional.
+
+Phase 5b is complete when HC1–HC4 have their acceptance fixtures green,
+`headless-contract.md` has moved each gap row from "Intended" to "Shipped"
+with the commit, and the workspace gates pass. It adds no perf budget of its
+own; the default-path H0 regression gate is the only performance acceptance,
+because none of this work is meant to be measurable there.
+
 
 ### Phase 6 — Finish Fairness, Shrink Per-Run Work, And Consolidate
 
@@ -2150,5 +2331,7 @@ Phase 5a: H25 live credential binding next, then H26 workspace-feed retention,
 with H23 native Windows qualification still open. Phase 6
 then starts with H20 and the early correctness repairs (behavioral H21,
 H27–H28, correctness H22), followed by H18, measured H19, and mechanical
-consolidation. Phase 5 shipped on 2026-09-04 with its output-service-gap gate
-still open. Plugin or marketplace work is not the next slice.
+consolidation. Phase 5b (HC1–HC4) is cold-path work that may run in a
+parallel worktree from H26 onward. Phase 5 shipped on 2026-09-04 with its
+output-service-gap gate still open. Plugin or marketplace work is not the
+next slice.
