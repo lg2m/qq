@@ -163,9 +163,12 @@ Approval classification uses the catalog effect class (`crates/qq-core/src/appro
 - `full`: everything executes; grants are redundant.
 
 `--allow-tool` and `--allow-shell` therefore **widen** what a held call may
-do; they are not an allowlist that narrows the catalog. Narrowing comes only
-from configuration `policy.deny_tools` and `policy.deny_shell_prefixes`, which
-remove tools from the catalog before the model sees them. Built-in tools are
+do; they are not an allowlist that narrows the catalog. Configuration
+`policy.allow_tools` and `policy.allow_shell_prefixes` also declare grants.
+Managed `policy.deny_tools` and `policy.deny_shell_prefixes` filter those
+grants; they do not remove tools from the catalog or prohibit an otherwise
+approved call (`crates/qq-config/src/document.rs`, `resolve_policy_grants`).
+Profile exposure controls the catalog separately. Built-in file tools are
 contained to the workspace through capability-scoped file handles; the `shell`
 tool is **not** contained. Isolation is the supervisor's job.
 
@@ -174,9 +177,13 @@ tool is **not** contained. Isolation is the supervisor's job.
 `RunLimits` (`crates/qq-protocol/src/sessions.rs`) supports `max_duration_ms`,
 `max_model_turns`, `max_tool_calls`, `max_total_tokens`, `max_cost_usd_nanos`,
 `max_input_tokens`, `max_output_tokens`, `max_tool_output_bytes`,
-`max_children`, `max_concurrent_children`. All are enforced by the core budget
-meter and produce a typed `budget_exhausted` outcome. `qq run` exposes only
-duration, turns, and cost on the command line. Cost and token caps settle as
+`max_children`, `max_concurrent_children`. The core budget meter enforces the
+duration, turn, tool-call, token, cost, and output bounds with typed
+`budget_exhausted` outcomes. Child admission enforces the other two limits:
+exceeding `max_children` returns a tool error that lets the parent continue,
+and `max_concurrent_children` limits concurrent admission through a semaphore
+(`crates/qq-core/src/sessions/subagents.rs`). `qq run` exposes only duration,
+turns, and cost on the command line. Cost and token caps settle as
 `cost_unknown` / `tokens_unknown` when the provider does not report usage; a
 supervisor must not assume a limit held when the signal was absent.
 
@@ -220,19 +227,35 @@ Each of these is a generic QQ improvement that local, CI, and evaluation
 users also benefit from. They are tracked as the headless-contract tranche
 (HC1–HC4) in
 [`../plans/speed-first-extensible-agent-harness.md`](../plans/speed-first-extensible-agent-harness.md).
-None touch the run hot path.
+CLI parsing and schema compilation stay off the run hot path. HC1 also
+changes shared limit types and startup ownership; HC3 adds opt-in core
+validation and repair turns, with bounded work and measured performance.
 
 | Gap | Today | Intended | Task |
 | --- | --- | --- | --- |
 | Correlation from the CLI | `qq run` passes `Correlation::default()`; the protocol already supports up to 8 bounded entries and returns them in snapshots | `--correlation KEY=VALUE` (repeatable) stamped on the session and echoed in `trial` and every envelope's session snapshot | HC1 |
-| Resume into an existing session | `qq run` always creates a session; `SubmitPrompt` on an existing session exists only through the server | `qq run --session ID` submits into a persisted session in the same store, with the same idempotent command admission; recovery marks interrupted runs and never replays uncertain side effects | HC1 |
-| `--max-turns` width | `u16`, clamped by supervisors | `u32`, matching `RunLimits.max_model_turns` | HC1 |
+| Resume into an existing session | `qq run` always creates a session; `SubmitPrompt` on an existing session exists only through the server | `qq run --session ID` establishes exclusive store ownership before opening the runtime or running recovery, rejects a busy store without mutation, then submits into an idle session in the same workspace; recovery never replays uncertain side effects | HC1 |
+| `--max-turns` width | CLI, `RunLimits.max_model_turns`, and the core turn counter are `u16` | Widen the shared types and CLI to `u32`, with a protocol-version bump, historical decoding fixtures, and boundary tests | HC1 |
 | Minimal configuration check | `config check` with `(version: 1)` fails with "model must be configured" | A document with no model validates; model selection is checked at run time, where it already is | HC1 |
-| Narrowing tool exposure without editing config | Only `policy.deny_*` narrows; `--allow-*` widens | `--profile` exposure filters (already compiled into the plan) plus a positive `policy.allow_tools` that intersects with the catalog, so a supervisor can grant exactly a tool set. Grants remain grants; exposure remains exposure | HC2 |
-| Typed final output | The final answer is free text; a supervisor that wants a structured report parses prose or asks the model to write a file | `--output-schema PATH` (JSON Schema) validated at run end with bounded repair turns; a `final_output` field on `outcome` carrying the validated value or a typed validation failure. Valid JSON is not a correct answer; the supervisor still verifies | HC3 |
+| Narrowing tool exposure | Profiles already filter exposure; `policy.allow_tools` and `--allow-*` grant held calls, while managed denies filter grants | A positive catalog filter composed by intersection. Naming is pending: adding `policy.exposed_tools` preserves grant compatibility; reusing `policy.allow_tools` requires an explicit breaking configuration migration. Do not implement either interpretation until that decision is recorded | HC2 |
+| Typed final output | The final answer is free text; a supervisor that wants a structured report parses prose or asks the model to write a file | Compile `--output-schema PATH` off the run hot path; core validates the final answer and performs bounded repair turns. Optional `final_output` on `RunFinished` and `outcome` carries the validated value or a typed validation failure, persisted before publication. Valid JSON is not a correct answer; the supervisor still verifies | HC3 |
 | Pinning the contract | Supervisors re-read QQ source at each bump | Golden JSONL fixtures for `trial`/`event`/`outcome` per `PROTOCOL_VERSION` under `crates/qq-protocol/tests/fixtures/headless/`, with a compatibility statement in this document | HC4 |
 | Exit code `3` ambiguity | Shared by `timed_out` and `budget_exhausted` | Keep the codes; the status field is authoritative and the fixtures pin that. Splitting the code is a breaking change with no consumer asking for it. Revisit only with a real request | none |
 | Static binary | musl build fails in Cargo build scripts | Packaging, not contract. Tracked outside this document | none |
+
+HC3 accepts at most 64 KiB of schema JSON, 32 nesting levels, and 4096 JSON
+values, including enum values. It rejects unsupported keywords and all
+references before session creation; compilation and validation perform no
+network discovery or external-reference fetches. `--output-repair-turns` is
+bounded to 0–8 (default 2) for the entire run. Each validation-error payload,
+including its rendered feedback or durable result, is at most 8 KiB; the
+repair bound limits repeated feedback. Repairs consume ordinary
+run budgets, support cancellation and steering, and do not reset their
+allowance after an audit revision or steering. The final answer, including
+any bounded audit revision, must pass validation before a valid result can
+be published. HC3 retains the audit's existing revision bound. Its acceptance
+tests cover these interactions and replay; enabled validation and repair
+cost is measured separately from the schema-less default path.
 
 ## Compatibility Policy
 
@@ -241,6 +264,14 @@ None touch the run hot path.
   contract from HC4 onward and bump with it.
 - New fields are additive and optional; a supervisor must ignore unknown
   fields and must fail closed on unknown `type` or `status` values.
+- Widening the shared model-turn limit to `u32` changes the accepted wire
+  range and requires a protocol-version bump. Existing `u16`-range records
+  remain decodable; tests cover values above that range without executing
+  tens of thousands of turns.
+- Each fixture version pins its exact `protocol_version`. Cross-version
+  default-path comparisons permit declared version-field changes after
+  normalizing run identity, timestamps, and build metadata; they require
+  unchanged application payload and no new opt-in fields without flags.
 - Exit codes are stable. A new terminal status reuses an existing code and is
   distinguished by `status`.
 - `estimated_cost_usd_nanos`, `usage`, and `prompt_identity` are diagnostic.
@@ -261,5 +292,7 @@ Before adding a headless flag, record, or field, answer:
 4. Is it additive to the JSONL contract, or does it change an existing
    field's meaning? The latter needs a `PROTOCOL_VERSION` bump and new
    fixtures.
-5. Does it touch the run hot path? It should not; headless plumbing is cold
-   path.
+5. Does it touch the run hot path? Keep CLI plumbing and compilation off it.
+   An opt-in runtime feature such as typed-output validation needs explicit
+   bounds, cancellation and budget tests, and measurements of both its
+   enabled cost and the unchanged default path.

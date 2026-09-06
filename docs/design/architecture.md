@@ -907,7 +907,10 @@ Three rules follow:
   also executes untrusted repository code.
 - QQ has no supervisor-only mode and no product vocabulary. A capability a
   supervisor needs is added only in a form a local user, a CI job, and an
-  evaluation harness could also use, and it stays off the run hot path.
+  evaluation harness could also use. CLI plumbing and compilation stay off
+  the run hot path; generic opt-in completion validation and bounded repair
+  belong in core, preserve default behavior when disabled, and require
+  cancellation, budget, and performance acceptance.
 - The headless contract is public and pinned by fixtures in this repository so
   a supervisor can test against it without reading QQ source.
 
