@@ -43,7 +43,10 @@ use thiserror::Error;
 
 use crate::{
     catalog::{DiscoveredModel, ModelDiscovery},
-    plan::{CompiledGeneration, PlanCache, PlanCacheError, PlanCacheLimits, PlanKey, PlanLookup},
+    plan::{
+        CompiledGeneration, LiveBindings, PlanCache, PlanCacheError, PlanCacheLimits, PlanKey,
+        PlanLookup,
+    },
 };
 
 const MAX_MODEL_OPTIONS: usize = 4_096;
@@ -575,11 +578,12 @@ impl RuntimeFactory {
             SourceFingerprint::capture(self.inner.credentials.paths().index_file());
         let epoch = self.inner.credentials.epoch()?;
         let snapshot = self.load(request)?;
+        let mut configuration_sources = vec![snapshot.sources().clone()];
         // A named profile supplies defaults beneath the request's explicit
         // overrides. Resolving it needs the merged configuration, so the load
         // repeats with the profile's values applied where the request left a
-        // gap; the second load probes the same paths, so revalidation is
-        // unchanged.
+        // gap. Both loads retain their pre-read observations because the
+        // first selected the profile and the second supplied runtime values.
         let selected_profile = snapshot.profile(profile_id.as_str());
         // A pack-declared profile brings its pack's resources and, when it
         // names MCP servers, restricts which declared servers join this plan.
@@ -642,7 +646,11 @@ impl RuntimeFactory {
                 {
                     overrides = overrides.with_max_output_tokens(cap);
                 }
-                self.load(&request.clone().with_overrides(overrides))?
+                let snapshot = self.load(&request.clone().with_overrides(overrides))?;
+                if !configuration_sources.contains(snapshot.sources()) {
+                    configuration_sources.push(snapshot.sources().clone());
+                }
+                snapshot
             }
         };
         let resolved_model = self.resolved_model_for_snapshot(&snapshot)?;
@@ -681,6 +689,10 @@ impl RuntimeFactory {
             }
             None => None,
         };
+        let mut bindings = LiveBindings {
+            provider: provider_config.access().cloned(),
+            mcp: None,
+        };
         if let Some(wired) = self.inner.mcp.registry_for_snapshot(
             &self.inner.credentials,
             epoch,
@@ -690,21 +702,21 @@ impl RuntimeFactory {
             // The catalog is snapshotted here, on the blocking compile
             // thread, so the plan holds an immutable tool list and the cache
             // can revalidate it against the manager's generation.
+            bindings.mcp = Some(Arc::clone(&wired.registry));
             profile = profile
                 .with_host(HostSnapshot::capture_blocking(wired.registry))
                 .with_mcp_servers(wired.servers);
         }
         let plan = CompiledAgentPlan::compile_blocking(profile)?;
-        let mut sources = Vec::with_capacity(snapshot.probed_paths().len() + 3);
+        let mut sources = Vec::with_capacity(plan.instruction_sources().len() + 1);
         sources.push(credential_index);
-        sources.extend(
-            snapshot
-                .probed_paths()
-                .iter()
-                .map(SourceFingerprint::capture),
-        );
         sources.extend(plan.instruction_sources().iter().cloned());
-        Ok(CompiledGeneration { plan, sources })
+        Ok(CompiledGeneration {
+            plan,
+            sources,
+            configuration_sources,
+            bindings,
+        })
     }
 
     fn resolved_model_for_snapshot(
@@ -4665,6 +4677,192 @@ mod tests {
             let debug = format!("{plan:?}");
             assert!(!debug.contains("sk-first-secret"));
             assert!(!debug.contains("sk-second-secret"));
+        }
+    }
+
+    #[test]
+    fn source_changes_during_plan_admission_do_not_certify_stale_configuration() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        let config = fixture.path("global/config.ron");
+        let document = |cap: u32| {
+            format!(
+                r#"(version: 1, model: "custom/test-model", max_output_tokens: {cap}, providers: {{
+            "custom": Custom(connection: (base_url: "http://localhost/v1", api: OpenAiChatCompletions, auth: NoAuth),
+            models: {{"test-model": (name: "Test model")}})
+        }})"#
+            )
+        };
+        fs::write(&config, document(128)).unwrap();
+        let request = LoadRequest::new(fixture.path("work"));
+        let workspace = qq_config::canonical_working_directory(request.cwd()).unwrap();
+        let profile = AgentProfileId::default();
+        let key = PlanKey {
+            workspace: workspace.clone(),
+            model: ModelSelection::default(),
+            profile: profile.clone(),
+            explicit_config_path: None,
+            explicit_config_content: None,
+        };
+        let (first, _) = factory
+            .inner
+            .plans
+            .load::<RuntimeBuildError, _>(key, || {
+                let generation = factory.compile_generation(&request, &profile, &workspace)?;
+                fs::write(&config, document(1024)).unwrap();
+                Ok(generation)
+            })
+            .unwrap();
+        let (next, lookup) = factory.plan_with_lookup(&request, &profile).unwrap();
+        assert_eq!(lookup, PlanLookup::Compiled);
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_ne!(first.digest(), next.digest());
+        assert_eq!(
+            factory.plan_with_lookup(&request, &profile).unwrap().1,
+            PlanLookup::Hit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_backed_provider_rotation_rebinds_new_runs_and_preserves_held_plans() {
+        use futures_util::StreamExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    assert!(bytes.len() < 256 * 1024);
+                    let Some(end) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        requests.push(headers.to_ascii_lowercase());
+                        break;
+                    }
+                }
+                let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        for kind in ["api-key", "auth-header", "static-header"] {
+            let (fixture, first, rotated) = tokio::task::spawn_blocking(move || {
+                let fixture = RuntimeFixture::new();
+                let factory = fixture.factory();
+                let config = fixture.path("global/config.ron");
+                let request = LoadRequest::new(fixture.path("work"));
+                let document = |value: &str| {
+                    let access = match kind {
+                        "api-key" => format!(r#"auth: ApiKey(Value("{value}"))"#),
+                        "auth-header" => {
+                            format!(r#"auth: Header("x-test-token", Value("{value}"))"#)
+                        }
+                        "static-header" => {
+                            format!(r#"auth: NoAuth, headers: {{"x-test-token": "{value}"}}"#)
+                        }
+                        _ => unreachable!(),
+                    };
+                    format!(
+                        r#"(version: 1, model: "custom/test-model", providers: {{
+                        "custom": Custom(connection: (base_url: "http://{address}/v1",
+                            api: OpenAiChatCompletions, {access}),
+                            models: {{"test-model": (name: "Test model")}})
+                    }})"#
+                    )
+                };
+                fs::write(&config, document("first-inline-value")).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                let first = factory.plan_for(&request).unwrap();
+                fs::write(&config, document("second-longer-inline-value")).unwrap();
+                let (rotated, lookup) = factory
+                    .plan_with_lookup(&request, &AgentProfileId::default())
+                    .unwrap();
+                assert_eq!(
+                    lookup,
+                    PlanLookup::Compiled,
+                    "{kind} must refresh its live binding"
+                );
+                assert!(!Arc::ptr_eq(&first, &rotated));
+                assert_eq!(first.digest(), rotated.digest());
+                assert_eq!(first.credential_epoch(), rotated.credential_epoch());
+                for plan in [&first, &rotated] {
+                    let descriptor =
+                        String::from_utf8(plan.descriptor().canonical_bytes().unwrap()).unwrap();
+                    let debug = format!("{plan:?}");
+                    for secret in ["first-inline-value", "second-longer-inline-value"] {
+                        assert!(!descriptor.contains(secret));
+                        assert!(!debug.contains(secret));
+                    }
+                }
+                fs::write(
+                    &config,
+                    format!(
+                        "{}\n// unchanged live configuration\n",
+                        document("second-longer-inline-value")
+                    ),
+                )
+                .unwrap();
+                let (revalidated, lookup) = factory
+                    .plan_with_lookup(&request, &AgentProfileId::default())
+                    .unwrap();
+                assert_eq!(lookup, PlanLookup::Revalidated);
+                assert!(Arc::ptr_eq(&rotated, &revalidated));
+                (fixture, first, rotated)
+            })
+            .await
+            .unwrap();
+            for plan in [first, rotated] {
+                let events = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    plan.run(qq_protocol::RunCommand::new("reply pong"))
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(events.last(), Some(qq_protocol::RunEvent::Completed)),
+                    "{events:?}"
+                );
+            }
+            drop(fixture);
+        }
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        for (index, header) in ["authorization: bearer", "x-test-token:", "x-test-token:"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(requests[index * 2].contains(&format!("{header} first-inline-value")));
+            assert!(
+                requests[index * 2 + 1].contains(&format!("{header} second-longer-inline-value"))
+            );
         }
     }
 

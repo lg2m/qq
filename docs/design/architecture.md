@@ -323,20 +323,21 @@ descriptor or its digest.
 Credential rotation is tracked separately by an opaque `CredentialEpoch` owned
 by `qq-auth`: every durable credential write advances the store's index
 revision, including in-place rotation of an existing entry. The root records
-the epoch beside a compiled plan and rekeys its MCP registry cache by
-declaration digest plus epoch, so a rotated secret rebuilds live authorization
-without changing behavioral identity. No cache key in the process hashes raw
-secret bytes.
+the epoch beside a compiled plan. Live provider access and admitted MCP
+declarations also retain exact in-memory equality, including inline credentials,
+header values, and full endpoints. These live bindings are never hashed or
+serialized into durable identity. An epoch or binding change rebuilds live
+authorization while active runs retain their original handles.
 
 The root's `PlanCache` holds one generation per (canonical workspace, model
 selection, explicit configuration) key and revalidates it on every load with a
 fixed list of `stat` calls: every path the configuration loader probed
-(`ConfigSnapshot::probed_paths`), the credential index file, the workspace's
+(`ConfigSnapshot::sources`, captured before discovery and reads), the credential index file, the workspace's
 `AGENTS.md`/`CLAUDE.md`, the skill roots the index was compiled from, and the
 selected pack's manifest and persona, plus one in-memory generation compare
 per external tool host. A warm lookup performs no configuration parsing,
 credential I/O, directory listing, or host round trip. Any observable change recompiles; an
-identical digest and epoch keeps the live generation, otherwise the new
+identical digest, epoch, and live bindings keep the live generation, otherwise the new
 generation is published atomically for later runs while active runs keep the
 `Arc` they were admitted with. A failed recompile returns the configuration
 error to the triggering run and leaves the previous generation cached. The
