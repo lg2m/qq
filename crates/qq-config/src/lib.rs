@@ -976,6 +976,7 @@ impl ModelRoute {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectivePolicy {
     allowed_providers: Option<Vec<String>>,
+    exposed_tools: Option<Vec<String>>,
     denied_providers: Vec<String>,
     max_output_tokens: Option<u32>,
     require_https: bool,
@@ -991,6 +992,7 @@ impl Default for EffectivePolicy {
     fn default() -> Self {
         Self {
             allowed_providers: None,
+            exposed_tools: None,
             denied_providers: Vec::new(),
             max_output_tokens: None,
             require_https: false,
@@ -1005,6 +1007,14 @@ impl Default for EffectivePolicy {
 }
 
 impl EffectivePolicy {
+    /// Exact catalog exposure, intersected across layers. Absence preserves
+    /// the existing catalog; an empty list exposes nothing. This grants no
+    /// execution authority.
+    #[must_use]
+    pub fn exposed_tools(&self) -> Option<&[String]> {
+        self.exposed_tools.as_deref()
+    }
+
     #[must_use]
     pub fn allowed_providers(&self) -> Option<&[String]> {
         self.allowed_providers.as_deref()

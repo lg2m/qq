@@ -6430,6 +6430,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_exposure_rejects_hidden_tools_before_full_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "before").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![
+                    vec![(
+                        "edit_file",
+                        r#"{"path":"note.txt","old_string":"before","new_string":"after"}"#
+                            .to_owned(),
+                    )],
+                    Vec::new(),
+                ],
+                requests: Arc::clone(&requests),
+            },
+            "test-model",
+            256,
+        )
+        .unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let plan = tokio::task::spawn_blocking(move || {
+            plan::CompiledAgentPlan::compile_blocking(
+                plan::AgentProfile::embedded(&runtime, workspace)
+                    .with_exposed_tools(vec!["read_file".to_owned(), "search".to_owned()]),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        let events = plan
+            .execute(
+                vec![Message::user("edit the note")],
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(StaticPolicyGate {
+                    mode: ApprovalMode::Full,
+                    grants: approval::SessionGrants {
+                        tools: ["edit_file".to_owned()].into_iter().collect(),
+                        shell_prefixes: Vec::new(),
+                    },
+                }),
+                Arc::new(workspace::FileState::default()),
+                RunCapabilities::user(None),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(events.last(), Some(RuntimeEvent::Completed)),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ToolCallDenied { .. }))
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(tool_names(request), ["read_file", "search"]);
+        }
+        assert!(requests[1].messages().last().unwrap().content().iter().any(|block| matches!(block,
+            ContentBlock::ToolResult { content, is_error: true, .. } if content.contains("unknown tool")
+        )));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("note.txt")).unwrap(),
+            "before"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_external_exposure_without_a_selector_is_fully_callable() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let host = WideHost::new(40);
+        let calls = Arc::clone(&host.calls);
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![vec![("ext__wide__tool07", "{}".to_owned())], Vec::new()],
+                requests: Arc::clone(&requests),
+            },
+            "test-model",
+            256,
+        )
+        .unwrap()
+        .with_tool_host(Arc::new(host));
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let plan = tokio::task::spawn_blocking(move || {
+            plan::CompiledAgentPlan::compile_blocking(
+                plan::AgentProfile::embedded(&runtime, workspace).with_exposed_tools(
+                    (0..40).map(|i| format!("ext__wide__tool{i:02}")).collect(),
+                ),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        let events = plan
+            .run(RunCommand::new("use tool seven"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(events.last(), Some(RunEvent::Completed)),
+            "{events:?}"
+        );
+        assert_eq!(plan.catalog().exposure(), catalog::Exposure::Full);
+        assert_eq!(calls.lock().unwrap().as_slice(), ["ext__wide__tool07"]);
+        for request in requests.lock().unwrap().iter() {
+            let names = tool_names(request);
+            assert_eq!(names.len(), 40);
+            assert!(names.iter().all(|name| name.starts_with("ext__wide__")));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_exposure_preserves_catalog_schema_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let host = WideHost::new(2);
+        let calls = Arc::clone(&host.calls);
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![
+                    vec![
+                        ("ext__wide__tool01", "{}".to_owned()),
+                        ("ext__wide__tool00", "{}".to_owned()),
+                    ],
+                    Vec::new(),
+                ],
+                requests: Arc::clone(&requests),
+            },
+            "test-model",
+            256,
+        )
+        .unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let plan = tokio::task::spawn_blocking(move || {
+            let mut snapshot = plan::HostSnapshot::capture_blocking(Arc::new(host));
+            snapshot.catalog.tools[1].spec = qq_provider::ToolSpec::new(
+                "ext__wide__tool01",
+                "Oversized tool",
+                serde_json::json!({"description": "x".repeat(16 * 1024)}),
+            );
+            plan::CompiledAgentPlan::compile_blocking(
+                plan::AgentProfile::embedded(&runtime, workspace)
+                    .with_host(snapshot)
+                    .with_exposed_tools(vec![
+                        "ext__wide__tool00".to_owned(),
+                        "ext__wide__tool01".to_owned(),
+                    ]),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            plan.catalog().names().collect::<Vec<_>>(),
+            ["ext__wide__tool00"]
+        );
+        assert_eq!(plan.catalog().excluded().len(), 1);
+        assert!(matches!(
+            plan.catalog().excluded()[0].reason,
+            catalog::ExclusionReason::SchemaTooLarge { bytes } if bytes > 16 * 1024
+        ));
+        let events = plan
+            .run(RunCommand::new("use both tools"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(events.last(), Some(RunEvent::Completed)),
+            "{events:?}"
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["ext__wide__tool00"]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(tool_names(&requests[0]), ["ext__wide__tool00"]);
+        assert!(requests[1].messages().last().unwrap().content().iter().any(|block| matches!(block,
+            ContentBlock::ToolResult { content, is_error: true, .. } if content.contains("unknown tool")
+        )));
+    }
+
+    #[tokio::test]
+    async fn explicit_external_exposure_with_a_selector_remains_progressive() {
+        let directory = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let host = WideHost::new(40);
+        let calls = Arc::clone(&host.calls);
+        let runtime = Runtime::new(
+            TurnScript {
+                turns: vec![
+                    vec![
+                        (
+                            catalog::SELECT_TOOLS_TOOL,
+                            r#"{"query":"deploy service","limit":1}"#.to_owned(),
+                        ),
+                        ("ext__wide__tool07", "{}".to_owned()),
+                    ],
+                    Vec::new(),
+                ],
+                requests: Arc::clone(&requests),
+            },
+            "test-model",
+            256,
+        )
+        .unwrap()
+        .with_tool_host(Arc::new(host));
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let plan = tokio::task::spawn_blocking(move || {
+            let mut names: Vec<_> = (0..40).map(|i| format!("ext__wide__tool{i:02}")).collect();
+            names.push(catalog::SELECT_TOOLS_TOOL.to_owned());
+            plan::CompiledAgentPlan::compile_blocking(
+                plan::AgentProfile::embedded(&runtime, workspace).with_exposed_tools(names),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        let events = plan
+            .run(RunCommand::new("use tool seven"))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(events.last(), Some(RunEvent::Completed)),
+            "{events:?}"
+        );
+        assert_eq!(plan.catalog().exposure(), catalog::Exposure::Progressive);
+        assert_eq!(calls.lock().unwrap().as_slice(), ["ext__wide__tool07"]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(tool_names(&requests[0]), [catalog::SELECT_TOOLS_TOOL]);
+        assert_eq!(
+            tool_names(&requests[1]),
+            [catalog::SELECT_TOOLS_TOOL, "ext__wide__tool07"]
+        );
+    }
+
+    #[tokio::test]
     async fn progressive_exposure_pins_selected_tools_for_the_rest_of_the_run() {
         let directory = tempfile::tempdir().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));

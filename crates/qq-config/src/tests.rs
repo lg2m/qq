@@ -1645,6 +1645,153 @@ fn rejects_invalid_mcp_declarations() {
 }
 
 #[test]
+fn tool_exposure_is_accepted_without_changing_approval_grants() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, policy: (
+        exposed_tools: ["read_file", "search", "list_dir", "shell", "spawn_agent"], allow_tools: ["edit_file"]
+    ))"#,
+    );
+    tree.write(
+        "work/.qq/config.ron",
+        r#"(version: 1, policy: (
+        exposed_tools: ["read_file", "search", "write_file"]
+    ))"#,
+    );
+    let snapshot = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(
+        snapshot.policy().exposed_tools().unwrap(),
+        ["read_file", "search"]
+    );
+    assert!(
+        snapshot
+            .grants()
+            .tools()
+            .iter()
+            .any(|name| name == "edit_file")
+    );
+}
+
+#[test]
+fn tool_exposure_rejects_unknown_static_and_malformed_mcp_names() {
+    let tree = TempTree::new();
+    for name in [
+        "nonexistent",
+        "read_file*",
+        "mcp__missing",
+        "mcp____tool",
+        "mcp__server__",
+    ] {
+        let request = tree.request().with_explicit_content(format!(
+            r#"(version: 1, policy: (exposed_tools: ["{name}"]))"#
+        ));
+        let error = tree.loader().load(&request).unwrap_err().to_string();
+        assert!(error.contains(name), "{name}: {error}");
+        assert!(error.contains("exposed_tools"), "{error}");
+    }
+}
+
+#[test]
+fn tool_exposure_bounds_and_duplicates_are_validated_per_layer() {
+    let tree = TempTree::new();
+    let names: Vec<_> = (0..1025).map(|i| format!("mcp__server__tool{i}")).collect();
+    let document = |names: &[String]| {
+        format!(
+            "(version: 1, policy: (exposed_tools: {}))",
+            serde_json::to_string(names).unwrap()
+        )
+    };
+    let snapshot = tree
+        .loader()
+        .load(
+            &tree
+                .request()
+                .with_explicit_content(document(&names[..1024])),
+        )
+        .unwrap();
+    assert_eq!(snapshot.policy().exposed_tools().unwrap().len(), 1024);
+    for invalid in [
+        document(&names),
+        document(&["read_file".to_owned(), "read_file".to_owned()]),
+    ] {
+        let error = tree
+            .loader()
+            .load(&tree.request().with_explicit_content(invalid))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exposed_tools"), "{error}");
+    }
+}
+
+#[test]
+fn exposure_only_edits_preserve_trust_without_widening_the_catalog() {
+    let tree = TempTree::new();
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, policy: (exposed_tools: ["read_file", "search"]))"#,
+    );
+    let project = |names: &str| {
+        format!(r#"(version: 1, policy: (exposed_tools: [{names}], allow_tools: ["edit_file"]))"#)
+    };
+    tree.write("work/.qq/config.ron", &project(r#""read_file""#));
+    let request = tree.request();
+    assert!(matches!(
+        tree.loader().load(&request),
+        Err(ConfigError::TrustRequired { .. })
+    ));
+    tree.loader().grant_pending_trust(&request).unwrap();
+    let snapshot = tree.loader().load(&request).unwrap();
+    assert_eq!(snapshot.policy().exposed_tools().unwrap(), ["read_file"]);
+    assert_eq!(snapshot.grants().tools(), ["edit_file"]);
+    tree.write(
+        "work/.qq/config.ron",
+        &project(r#""read_file", "search", "edit_file""#),
+    );
+    let snapshot = tree.loader().load(&request).unwrap();
+    assert_eq!(
+        snapshot.policy().exposed_tools().unwrap(),
+        ["read_file", "search"]
+    );
+    assert_eq!(snapshot.grants().tools(), ["edit_file"]);
+}
+
+#[test]
+fn absent_empty_and_external_tool_exposure_remain_distinct() {
+    let tree = TempTree::new();
+    assert!(
+        tree.loader()
+            .load(&tree.request())
+            .unwrap()
+            .policy()
+            .exposed_tools()
+            .is_none()
+    );
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, policy: (exposed_tools: []))"#,
+    );
+    let snapshot = tree
+        .loader()
+        .load(&tree.request().with_explicit_content(
+            r#"(version: 1, policy: (exposed_tools: ["mcp__server__tool", "read_file"]))"#,
+        ))
+        .unwrap();
+    assert!(snapshot.policy().exposed_tools().unwrap().is_empty());
+    let tree = TempTree::new();
+    let snapshot = tree
+        .loader()
+        .load(&tree.request().with_explicit_content(
+            r#"(version: 1, policy: (exposed_tools: ["mcp__server__tool"]))"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        snapshot.policy().exposed_tools().unwrap(),
+        ["mcp__server__tool"]
+    );
+}
+
+#[test]
 fn policy_grants_layer_extend_remove_deny_and_fold_mcp_allowlists() {
     let tree = TempTree::new();
     tree.write(

@@ -2069,9 +2069,12 @@ Deliverables:
 - MCP names use the existing `mcp__<server>__<tool>` form; static built-ins
   are named as today. `config check` validates exact static names and MCP
   name syntax without requiring a model or discovering MCP tools. Plan
-  compilation validates discovered MCP-name membership before applying the
-  exposure filter; an unknown name is a configuration error before provider
-  work, not a silent no-op.
+  compilation validates discovered MCP-name membership among profile-admitted
+  servers before applying the exposure filter. Configured servers excluded
+  by the profile's MCP subset remain excluded without discovery. An unknown
+  namespace or missing member on an admitted server is a configuration error
+  before provider work. Known tools still pass ordinary schema/catalog bounds;
+  their existing typed exclusions remain visible and valid peers stay usable.
 - `qq run --profile <name>` is documented as the primary way a supervisor
   selects a pre-compiled exposure; `--allow-tool` and `--allow-shell` keep
   their existing grant semantics and are re-documented as *widening held

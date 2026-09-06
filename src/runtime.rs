@@ -689,6 +689,27 @@ impl RuntimeFactory {
             }
             None => None,
         };
+        if let Some(names) = snapshot.policy().exposed_tools() {
+            // A profile-excluded configured server is outside discovery.
+            // Unknown namespaces stay in the list and fail core validation.
+            let names = names
+                .iter()
+                .filter(|name| {
+                    let server = name
+                        .strip_prefix("mcp__")
+                        .and_then(|rest| rest.split_once("__"))
+                        .map(|(server, _)| server);
+                    !server.is_some_and(|server| {
+                        snapshot.mcp_servers().contains_key(server)
+                            && mcp_subset
+                                .as_ref()
+                                .is_some_and(|subset| !subset.iter().any(|name| name == server))
+                    })
+                })
+                .cloned()
+                .collect();
+            profile = profile.with_exposed_tools(names);
+        }
         let mut bindings = LiveBindings {
             provider: provider_config.access().cloned(),
             mcp: None,
@@ -4677,6 +4698,108 @@ mod tests {
             let debug = format!("{plan:?}");
             assert!(!debug.contains("sk-first-secret"));
             assert!(!debug.contains("sk-second-secret"));
+        }
+    }
+
+    #[test]
+    fn configured_static_exposure_names_match_the_compiled_catalog() {
+        let fixture = RuntimeFixture::new();
+        let skill = fixture.path("work/.qq/skills/example/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(
+            skill,
+            "---\ndescription: Example guidance\n---\nBe brief.\n",
+        )
+        .unwrap();
+        let document = |policy: &str| {
+            format!(
+                r#"(version: 1, model: "custom/test-model", providers: {{
+            "custom": Custom(connection: (base_url: "http://localhost/v1", api: OpenAiChatCompletions, auth: NoAuth),
+            models: {{"test-model": (name: "Test model")}})
+        }}, policy: ({policy}))"#
+            )
+        };
+        let factory = fixture.factory();
+        let default = factory.plan_for(&fixture.request(document(""))).unwrap();
+        let names: Vec<_> = default.catalog().names().map(str::to_owned).collect();
+        assert!(names.iter().any(|name| name == "load_skill"));
+        for name in &names {
+            let request = fixture.request(document(&format!("exposed_tools: [{name:?}]")));
+            let snapshot = factory.load(&request).unwrap();
+            assert_eq!(
+                snapshot.policy().exposed_tools().unwrap(),
+                std::slice::from_ref(name)
+            );
+        }
+        let list = serde_json::to_string(&names).unwrap();
+        let all = factory
+            .plan_for(&fixture.request(document(&format!("exposed_tools: {list}"))))
+            .unwrap();
+        assert_eq!(default.digest(), all.digest());
+        let narrow = factory
+            .plan_for(&fixture.request(document(r#"exposed_tools: ["read_file", "search"]"#)))
+            .unwrap();
+        assert_eq!(
+            narrow.catalog().names().collect::<Vec<_>>(),
+            ["read_file", "search"]
+        );
+        let missing =
+            factory.plan_for(&fixture.request(document(r#"exposed_tools: ["mcp__absent__tool"]"#)));
+        assert!(matches!(
+            missing,
+            Err(RuntimeBuildError::Plan(
+                PlanCompileError::UnknownExposedTool { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn exposure_intersects_profile_mcp_admission_before_member_validation() {
+        let fixture = RuntimeFixture::new();
+        let factory = fixture.factory();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(fixture.path("data"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let manifest = fixture.path("work/.qq/packs/review/pack.ron");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(
+            manifest,
+            r#"(schema: 1, id: "review", version: "1.0.0", profiles: {
+            "local": Profile(mcp: []),
+            "remote": Profile(mcp: ["notes"]),
+        })"#,
+        )
+        .unwrap();
+        let document = |exposure: &str| {
+            format!(
+                r#"(version: 1, model: "custom/test-model", providers: {{
+            "custom": Custom(connection: (base_url: "http://localhost/v1", api: OpenAiChatCompletions, auth: NoAuth),
+                models: {{"test-model": (name: "Test")}})
+        }}, mcp: {{"notes": Stdio(command: "qq-test-must-not-start")}},
+            policy: (exposed_tools: ["read_file", "{exposure}"]))"#
+            )
+        };
+        let request = fixture.request(document("mcp__notes__missing"));
+        factory.inner.config.grant_pending_trust(&request).unwrap();
+        let local = AgentProfileId::new("local").unwrap();
+        let plan = factory.plan_for_profile(&request, &local).unwrap();
+        assert_eq!(plan.catalog().names().collect::<Vec<_>>(), ["read_file"]);
+        assert!(plan.descriptor().mcp_servers.is_empty());
+        let remote = AgentProfileId::new("remote").unwrap();
+        for (request, profile, expected) in [
+            (request, remote, "mcp__notes__missing"),
+            (
+                fixture.request(document("mcp__typo__missing")),
+                local,
+                "mcp__typo__missing",
+            ),
+        ] {
+            let error = factory.plan_for_profile(&request, &profile).unwrap_err();
+            assert!(
+                matches!(error, RuntimeBuildError::Plan(PlanCompileError::UnknownExposedTool { name }) if name == expected)
+            );
         }
     }
 

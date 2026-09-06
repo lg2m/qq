@@ -168,7 +168,27 @@ do; they are not an allowlist that narrows the catalog. Configuration
 Managed `policy.deny_tools` and `policy.deny_shell_prefixes` filter those
 grants; they do not remove tools from the catalog or prohibit an otherwise
 approved call (`crates/qq-config/src/document.rs`, `resolve_policy_grants`).
-Profile exposure controls the catalog separately. Built-in file tools are
+Choose `qq run --profile <name>` to select a pre-compiled profile/pack catalog.
+Optional `policy.exposed_tools` narrows that catalog further: absent means no
+additional restriction, `[]` exposes no tools, and lists intersect across
+configuration layers. For example, `exposed_tools: ["read_file", "search"]`
+exposes only those tools even under `--approval full`. A grant cannot restore
+a hidden tool. Restricting exposure requires no workspace trust; grants in
+the same document still require their ordinary trust approval.
+
+`config check` validates exact built-in names and MCP name syntax without
+discovering tools. Compilation checks MCP membership among the servers
+admitted by the profile. Configured servers excluded by a profile's MCP
+subset remain excluded without discovery; an unknown server or a missing
+tool on an admitted server fails compilation. `load_skill` is a known name
+but appears only when workspace or pack skills are available. Large external
+catalogs stay progressive when `select_tools` is exposed; omitting the
+selector sends the permitted schemas directly, within the existing catalog
+bounds. A discovered name still passes ordinary schema and catalog admission;
+an oversized tool is excluded with its existing typed reason while valid
+peers remain available.
+
+Built-in file tools are
 contained to the workspace through capability-scoped file handles; the `shell`
 tool is **not** contained. Isolation is the supervisor's job.
 

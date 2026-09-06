@@ -372,7 +372,9 @@ declares. `qq-config` does not depend on `qq-protocol`; the root translates.
 
 The catalog is compiled once per plan by `qq-core::catalog` from the static
 built-ins and every `ExternalToolHost` the root attached. Static tools are
-trusted and never excluded. External tools are validated by name shape
+trusted; profile/pack policy and optional `policy.exposed_tools` may remove
+them before catalog construction. Exposure lists intersect across config
+layers, and grant no execution authority. External tools are validated by name shape
 (`mcp__<server>__<tool>`, `ext__<host>__<tool>`), deduplicated against the
 static names and each other, bounded per tool (16 KiB schema, 4 KiB
 description) and per catalog (512 tools, 1 MiB of external schema), and every
@@ -383,7 +385,7 @@ descriptions, serialized schemas, effect classes, and the exposure mode.
 
 Exposure is a compile-time decision. A catalog with at most 24 external tools
 and 32 KiB of external schema is sent whole on every request (`Full`). A larger
-catalog is `Progressive`: requests carry the static tools plus one
+catalog with an admitted selector is `Progressive`: requests carry the static tools plus one
 `select_tools` meta-tool, and the system prompt carries a compact index of
 external names, descriptions, and host readiness. The model pins tools by
 keyword (`select_tools` ranks by deterministic token overlap, at most 8 matches
@@ -392,6 +394,9 @@ run, and a recovered run re-pins from the `select_tools` results already in its
 transcript, so the request the provider sees after a restart matches the one
 before it. Calling an unpinned external tool is a typed tool error that names
 `select_tools`, never a silent lookup miss.
+If explicit exposure omits `select_tools`, all permitted external schemas
+are sent directly under the same catalog bounds, so every admitted tool
+remains callable.
 
 `ExternalToolHost` is the single seam for anything that is not a built-in:
 `catalog_blocking` returns a generation-stamped `HostCatalog` with readiness;
