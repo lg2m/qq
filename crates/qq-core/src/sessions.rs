@@ -29363,12 +29363,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn unconfirmed_shell_exit_prevents_session_continuation() {
         let (mut harness, requests) = write_child_harness(
             Arc::new(StaticTextProvider),
-            vec![("shell", r#"{"command":"sleep 300"}"#.to_owned())],
+            vec![("shell", crate::tools::PANIC_SHELL_ARGUMENTS.to_owned())],
             None,
             ApprovalMode::Full,
         )
