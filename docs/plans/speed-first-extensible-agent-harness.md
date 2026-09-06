@@ -11,9 +11,13 @@ identified correctness gaps in shipped child, cache, feed, and context-source
 behavior. Both H23 ownership slices are implemented and locally validated on
 Linux, with focused latency/resource receipts under Phase 5a; native Windows
 teardown remains unqualified. H24 remaining child budgets and owned-descendant
-accounting are implemented 2026-09-05; receipt under Phase 5a. The shell latency
-comparison remains unqualified because its host-noise gate failed.
-**Next implementation slice: H25 live provider/MCP credential binding.**
+accounting are implemented 2026-09-05; receipt under Phase 5a. H25 and H26 are
+implemented and correctness-validated on Linux on 2026-09-06; their receipt
+below retains the pending performance qualification. A fresh focused shell
+comparison passes its noise and regression gates. The fan-out fixture needed
+correction, so its version-4 paired comparison is still pending.
+**Active work: qualify H25–H26; implement independent headless HC1–HC2 and
+record H20 diagnostics before changing fairness behavior.**
 H23–H26 precede Phase 6; H27–H28 join its early correctness work. Phases 6–9
 remain proposed, with H20 moved ahead of H18 and H19 conditional on decoder
 measurements. A hosting-boundary review on 2026-09-05 added the
@@ -1868,8 +1872,64 @@ pressure observations, and verification logs are retained locally under
 
 This is not complete H0 qualification. H20's at-most-20-ms output service-gap
 target remains unmet (candidate p95 26 ms), and H23 native Windows teardown
-remains unqualified. H25 live credential binding is the next implementation
-slice, followed by H26 before Phase 6.
+remains unqualified. The subsequent H25–H26 receipt follows.
+
+#### H25–H26 Implementation And Qualification Receipt — 2026-09-06
+
+Production changes through `6d31ba0` implement both repairs. H25 separates
+secret-free durable identity from exact, redacted live provider/MCP bindings;
+old active plans keep their handles while same-path key/header/bearer changes
+compile new bindings. MCP eager connections start only after the second cache
+admission check. Configuration source evidence is captured before probes and
+reads, including permissions, explicit packs, and profile reloads, so a
+concurrent edit cannot certify an old snapshot as current. H27 still owns
+atomic replacement, retained-generation accounting, and key reclamation.
+
+H26 validates and attaches a workspace feed in one store job before catch-up.
+The receiver lease reclaims the feed after the final subscriber, including
+cancelled admission and failed reply delivery. Replay/lag transitions retain
+the lease and sequence deduplication; publishing into an inactive workspace
+does not allocate a feed.
+
+Independent architecture, correctness, and performance reviews found no
+remaining implementation blocker. Regression tests reproduce stale provider
+headers, duplicate eager MCP startup, pre-read source races, arbitrary-id
+feed retention, cancellation, and replay/live ordering. On the integrated
+production tree, the workspace suite passed **1194 tests, 3 ignored**;
+formatting, strict all-target/all-feature Clippy, and workspace build passed.
+These are local Linux checks, with no native Windows qualification claim.
+
+The focused release comparison used clean baseline production `b0a8ce2` and
+candidate `6d31ba0`, with exact copied worker hashes and source manifests.
+All 310 workers completed their correctness checks. Five cache-process pairs
+used 200 samples each; the remaining cases used 30 alternating process pairs.
+
+| Observation | Baseline | Candidate |
+| --- | ---: | ---: |
+| Cold `plan_for`, median of process medians | 208.192 µs | 203.533 µs |
+| Warm `plan_for`, median of process medians | 8.015 µs | 7.534 µs |
+| 4096 rejected subscriptions, median / p95 | 44.594 / 61.727 ms | 19.341 / 38.316 ms |
+| Retained RSS after churn, median | 135,016,448 B | 0 B (maximum 4096 B) |
+| Fresh attach/replay, 900 raw samples, median / p95 | 16.220 / 58.130 µs | 21.500 / 72.617 µs |
+| R4 eight-stream service gap, p95 | 35 ms | 28 ms |
+| Shell completion, median / p95 | 90.617 / 112.192 ms | 89.364 / 113.413 ms |
+
+Fresh attach/replay trades 14.487 µs at p95 for reclaimable ownership and has
+no separate numeric budget. All focused R4 relative, absolute, and noise
+gates passed, including shell latency; H20's stricter **≤20 ms** output-gap
+target remains unmet. This is not the full H0 qualification.
+
+The original fan-out comparison failed four relative gates: delivery p95 at
+1/8/32 subscribers increased 39.1%/29.7%/25.0%, and 8-subscriber acknowledgment
+increased 30.2%. Both arms also exceeded the 15 ms acknowledgment budget at
+32 subscribers. Those failures remain recorded; host variability does not
+waive them. Review found timed attachment assumptions and sequential terminal
+observation in the fixture. Commit `5b77fee` replaces them with a FIFO
+attachment barrier and concurrent observation, with two regression tests
+and all 47 xtask tests passing. H0 fixture version **4** and focused feed
+version **2** declare the measurement change. Both arms must be re-recorded
+with identical corrected fixtures; the paired A/B and baseline A/A comparison
+is pending. H25–H26 performance qualification remains open until it is assessed.
 
 ### Phase 5b — Headless Contract For Supervisors
 
@@ -2405,8 +2465,8 @@ The speed-first extensible backend is complete when:
 - product integrations remain clients of one durable QQ runtime.
 
 Until those conditions are met, the immediate implementation boundary is
-Phase 5a: H25 live credential binding next, then H26 workspace-feed retention,
-with H23 native Windows qualification still open. Phase 6
+Phase 5a: qualify the implemented H25 live credential binding and H26
+workspace-feed lifecycle, with H23 native Windows qualification still open. Phase 6
 then starts with H20 and the early correctness repairs (behavioral H21,
 H27–H28, correctness H22), followed by H18, measured H19, and mechanical
 consolidation. Independent Phase 5b (HC1–HC4) work may run in parallel
