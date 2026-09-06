@@ -2051,6 +2051,22 @@ Acceptance:
 
 #### HC2 — Positive Tool Exposure
 
+Implementation receipt, 2026-09-06: `93ef6b8` adds the optional restriction
+without changing approval grants or the descriptor version. Configuration
+validates names and the 1024-name/duplicate bounds, intersects layers before
+trust-sensitive grants, and compilation intersects the result with the
+profile/pack catalog. An omitted selector makes admitted external tools
+directly callable under existing schema/catalog bounds.
+
+Genuine regression failures preceded the implementation. The local workspace
+suite passed 1207 tests (3 ignored), strict workspace Clippy, formatting, and
+workspace build. A subsequent independently requested oversized-tool
+execution regression passed separately, followed by strict core Clippy.
+Architecture and correctness reviewers reconciled namespace admission and
+typed catalog exclusions and closed their findings. The branch then rebased
+onto the Phase 5a fixture-version correction without production conflicts;
+combined integration and default-path H0 qualification remain pending.
+
 Compatibility interpretation: add `policy.exposed_tools` for catalog
 narrowing. Existing `policy.allow_tools` keeps its grant semantics and layer
 composition; managed `deny_tools` and `deny_shell_prefixes` keep filtering
