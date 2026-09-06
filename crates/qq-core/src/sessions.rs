@@ -28949,7 +28949,8 @@ mod tests {
                 ApprovalMode::Full,
             )
             .await;
-            let (applying, release) = crate::tools::hold_tool_apply(harness._directory.path());
+            let workspace = std::fs::canonicalize(harness._directory.path()).unwrap();
+            let (applying, release) = crate::tools::hold_tool_apply(&workspace);
             let parent_run =
                 submit_prompt_to(&harness.runtime, harness.session_id, "delegate").await;
             tokio::time::timeout(Duration::from_secs(2), applying)
@@ -29372,7 +29373,8 @@ mod tests {
             ApprovalMode::Full,
         )
         .await;
-        let spawned = crate::tools::observe_shell_spawn(harness._directory.path(), true);
+        let workspace = std::fs::canonicalize(harness._directory.path()).unwrap();
+        let spawned = crate::tools::observe_shell_spawn(&workspace, true);
         let run_id = submit_prompt_to(&harness.runtime, harness.session_id, "run a command").await;
         let pid = tokio::time::timeout(Duration::from_secs(2), spawned)
             .await
