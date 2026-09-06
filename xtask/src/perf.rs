@@ -5358,6 +5358,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn feed_lifecycle_fixtures_reject_unknown_ids_and_replay_committed_bytes() {
         let (churn, checks) = feed_churn_workload(8).await.unwrap();
