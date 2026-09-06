@@ -5795,6 +5795,17 @@ fn read_published_events(
     limit: u16,
 ) -> Result<Vec<Arc<feed::PublishedEvent>>, SessionRuntimeError> {
     ensure_workspace(connection, workspace_id)?;
+    read_published_event_page(connection, workspace_id, after, limit)
+}
+
+/// Reads a page after workspace validation, including when attachment and
+/// catch-up share a store job.
+fn read_published_event_page(
+    connection: &mut Connection,
+    workspace_id: WorkspaceId,
+    after: u64,
+    limit: u16,
+) -> Result<Vec<Arc<feed::PublishedEvent>>, SessionRuntimeError> {
     let mut statement = connection
         .prepare_cached(
             "SELECT envelope_json FROM events
@@ -15710,6 +15721,169 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unknown_workspace_subscription_churn_retains_no_feeds() {
+        let harness = scripted_runs_harness(ApprovalMode::ReadOnly, Vec::new()).await;
+        let before = harness.runtime.inner.store.retained_feeds();
+        for _ in 0..256 {
+            let workspace_id = WorkspaceId::generate().unwrap();
+            let mut events = harness
+                .runtime
+                .subscribe_published(SubscribeRequest {
+                    workspace_id,
+                    after: EventCursor {
+                        store_id: harness.runtime.inner.store.store_id(),
+                        workspace_id,
+                        sequence: 0,
+                    },
+                })
+                .unwrap();
+            assert_eq!(harness.runtime.inner.store.retained_feeds(), before);
+            assert_eq!(
+                events.next().await.unwrap().unwrap_err(),
+                SessionRuntimeError::WorkspaceNotFound
+            );
+            drop(events);
+            assert_eq!(harness.runtime.inner.store.retained_feeds(), before);
+        }
+        harness.runtime.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_subscribers_release_the_feed_and_replay_missed_commits() {
+        let harness = scripted_runs_harness(ApprovalMode::ReadOnly, Vec::new()).await;
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+        let request = SubscribeRequest {
+            workspace_id: harness.workspace_id,
+            after: EventCursor {
+                store_id: harness.runtime.inner.store.store_id(),
+                workspace_id: harness.workspace_id,
+                sequence: 0,
+            },
+        };
+        let mut first = harness.runtime.subscribe_published(request).unwrap();
+        let mut second = harness.runtime.subscribe_published(request).unwrap();
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+        let initial = first.next().await.unwrap().unwrap();
+        assert_eq!(second.next().await.unwrap().unwrap().json, initial.json);
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 1);
+        drop(first);
+        let created = create_session(&harness.runtime, harness.workspace_id, None).await;
+        let live = second.next().await.unwrap().unwrap();
+        assert_eq!(live.envelope.cursor, created.committed_through);
+        drop(second);
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+
+        let missed = create_session(&harness.runtime, harness.workspace_id, None).await;
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+        let mut restarted = harness.runtime.subscribe_published(request).unwrap();
+        assert_eq!(restarted.next().await.unwrap().unwrap().json, initial.json);
+        let newest = create_session(&harness.runtime, harness.workspace_id, None).await;
+        for cursor in [
+            created.committed_through,
+            missed.committed_through,
+            newest.committed_through,
+        ] {
+            assert_eq!(
+                restarted.next().await.unwrap().unwrap().envelope.cursor,
+                cursor
+            );
+        }
+        drop(restarted);
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+        harness.runtime.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_feed_attachment_releases_queued_and_unreceived_replies() {
+        for cancel_before_reply in [true, false] {
+            let harness = scripted_runs_harness(ApprovalMode::ReadOnly, Vec::new()).await;
+            let (entered, waiting) = oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let store = harness.runtime.inner.store.clone();
+            let hold = tokio::spawn(async move {
+                store
+                    .call(Priority::Control, move |_| {
+                        let _ = entered.send(());
+                        blocked
+                            .recv_timeout(Duration::from_secs(5))
+                            .map_err(|_| SessionRuntimeError::Unavailable)
+                    })
+                    .await
+            });
+            waiting.await.unwrap();
+            let mut events = Some(
+                harness
+                    .runtime
+                    .subscribe_published(SubscribeRequest {
+                        workspace_id: harness.workspace_id,
+                        after: EventCursor {
+                            store_id: harness.runtime.inner.store.store_id(),
+                            workspace_id: harness.workspace_id,
+                            sequence: 0,
+                        },
+                    })
+                    .unwrap(),
+            );
+            assert!(events.as_mut().unwrap().next().now_or_never().is_none());
+            assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+            if cancel_before_reply {
+                drop(events.take());
+            }
+            release.send(()).unwrap();
+            hold.await.unwrap().unwrap();
+            // The FIFO control barrier also waits for the attachment reply.
+            harness
+                .runtime
+                .inner
+                .store
+                .call(Priority::Control, |_| Ok(()))
+                .await
+                .unwrap();
+            assert_eq!(
+                harness.runtime.inner.store.retained_feeds(),
+                usize::from(!cancel_before_reply)
+            );
+            drop(events);
+            assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+            harness.runtime.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_replay_releases_its_feed() {
+        let harness = scripted_runs_harness(ApprovalMode::ReadOnly, Vec::new()).await;
+        harness
+            .runtime
+            .inner
+            .store
+            .call(Priority::Control, |connection| {
+                connection
+                    .execute("UPDATE events SET envelope_json = 'invalid'", [])
+                    .map_err(|_| SessionRuntimeError::Persistence)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut events = harness
+            .runtime
+            .subscribe_published(SubscribeRequest {
+                workspace_id: harness.workspace_id,
+                after: EventCursor {
+                    store_id: harness.runtime.inner.store.store_id(),
+                    workspace_id: harness.workspace_id,
+                    sequence: 0,
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err(),
+            SessionRuntimeError::Persistence
+        );
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+        harness.runtime.close().await.unwrap();
     }
 
     /// D1: a subscriber that keeps up performs one catch-up read when it

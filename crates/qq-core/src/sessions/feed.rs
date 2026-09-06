@@ -68,7 +68,65 @@ pub(super) struct WorkspaceFeed {
     senders: Mutex<HashMap<WorkspaceId, broadcast::Sender<Arc<PublishedEvent>>>>,
 }
 
+/// Owns one subscription and releases the workspace ring with its last receiver.
+pub(super) struct FeedReceiver {
+    feed: Arc<WorkspaceFeed>,
+    workspace_id: WorkspaceId,
+    receiver: Option<broadcast::Receiver<Arc<PublishedEvent>>>,
+}
+
+impl FeedReceiver {
+    pub(super) async fn recv(
+        &mut self,
+    ) -> Result<Arc<PublishedEvent>, broadcast::error::RecvError> {
+        self.receiver
+            .as_mut()
+            .expect("the receiver is removed only on drop")
+            .recv()
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_recv(
+        &mut self,
+    ) -> Result<Arc<PublishedEvent>, broadcast::error::TryRecvError> {
+        self.receiver
+            .as_mut()
+            .expect("the receiver is removed only on drop")
+            .try_recv()
+    }
+}
+
+impl Drop for FeedReceiver {
+    fn drop(&mut self) {
+        // A receiver can destroy its unread payloads; do that outside the
+        // registry lock so disconnecting cannot block another workspace.
+        drop(self.receiver.take());
+        let removed = {
+            let Ok(mut senders) = self.feed.senders.lock() else {
+                return;
+            };
+            // Subscribe creates its receiver under this lock. Check the
+            // current sender so even an older drop preserves a new receiver.
+            if senders
+                .get(&self.workspace_id)
+                .is_some_and(|sender| sender.receiver_count() == 0)
+            {
+                senders.remove(&self.workspace_id)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
+}
+
 impl WorkspaceFeed {
+    #[cfg(test)]
+    pub(super) fn retained_workspaces(&self) -> usize {
+        self.senders.lock().unwrap().len()
+    }
+
     /// Publishes one committed batch in sequence order. Publishing with no
     /// live receivers is not an error: the events are already durable and a
     /// later subscriber catches up from SQLite.
@@ -76,30 +134,29 @@ impl WorkspaceFeed {
         if events.is_empty() {
             return;
         }
-        let Ok(mut senders) = self.senders.lock() else {
+        let Ok(senders) = self.senders.lock() else {
             return;
         };
         for event in events {
-            let sender = senders
-                .entry(event.envelope.cursor.workspace_id)
-                .or_insert_with(|| broadcast::channel(FEED_CAPACITY).0);
-            let _ = sender.send(event);
+            if let Some(sender) = senders.get(&event.envelope.cursor.workspace_id) {
+                let _ = sender.send(event);
+            }
         }
     }
 
     /// A live receiver for `workspace_id`. Events published before this call
     /// are not delivered; the subscriber reads them from SQLite.
-    pub(super) fn subscribe(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> Option<broadcast::Receiver<Arc<PublishedEvent>>> {
+    pub(super) fn subscribe(self: &Arc<Self>, workspace_id: WorkspaceId) -> Option<FeedReceiver> {
         let mut senders = self.senders.lock().ok()?;
-        Some(
-            senders
-                .entry(workspace_id)
-                .or_insert_with(|| broadcast::channel(FEED_CAPACITY).0)
-                .subscribe(),
-        )
+        let receiver = senders
+            .entry(workspace_id)
+            .or_insert_with(|| broadcast::channel(FEED_CAPACITY).0)
+            .subscribe();
+        Some(FeedReceiver {
+            feed: Arc::clone(self),
+            workspace_id,
+            receiver: Some(receiver),
+        })
     }
 }
 
@@ -139,9 +196,61 @@ mod tests {
         assert!(take_staged().is_empty());
     }
 
+    #[test]
+    fn publishing_without_subscribers_retains_no_feed() {
+        let feed = WorkspaceFeed::default();
+        feed.publish(vec![published(1), published(2)]);
+        assert_eq!(feed.retained_workspaces(), 0);
+    }
+
+    #[test]
+    fn the_last_subscriber_releases_its_feed_and_buffered_events() {
+        let feed = Arc::new(WorkspaceFeed::default());
+        let event = published(1);
+        let workspace_id = event.envelope.cursor.workspace_id;
+        let first = feed.subscribe(workspace_id).unwrap();
+        let mut second = feed.subscribe(workspace_id).unwrap();
+        feed.publish(vec![event]);
+        drop(first);
+        assert_eq!(feed.retained_workspaces(), 1);
+        assert_eq!(second.try_recv().unwrap().envelope.cursor.sequence, 1);
+        let unread = published(2);
+        let buffered = Arc::downgrade(&unread);
+        feed.publish(vec![unread]);
+        assert!(buffered.upgrade().is_some());
+        drop(second);
+        assert_eq!(feed.retained_workspaces(), 0);
+        assert!(buffered.upgrade().is_none());
+    }
+
+    #[test]
+    fn final_drop_racing_a_new_subscriber_preserves_the_new_feed() {
+        let feed = Arc::new(WorkspaceFeed::default());
+        let workspace_id = published(1).envelope.cursor.workspace_id;
+        for sequence in 1..=64 {
+            let previous = feed.subscribe(workspace_id).unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    drop(previous);
+                });
+                barrier.wait();
+                let mut current = feed.subscribe(workspace_id).unwrap();
+                feed.publish(vec![published(sequence)]);
+                assert_eq!(
+                    current.try_recv().unwrap().envelope.cursor.sequence,
+                    sequence
+                );
+                drop(current);
+            });
+            assert_eq!(feed.retained_workspaces(), 0);
+        }
+    }
+
     #[tokio::test]
     async fn the_feed_delivers_in_order_and_a_late_subscriber_sees_nothing_earlier() {
-        let feed = WorkspaceFeed::default();
+        let feed = Arc::new(WorkspaceFeed::default());
         let workspace_id = published(1).envelope.cursor.workspace_id;
         feed.publish(vec![published(1)]);
         let mut receiver = feed.subscribe(workspace_id).expect("lock");

@@ -697,25 +697,29 @@ impl SessionRuntime {
         let workspace_id = request.workspace_id;
         Ok(Box::pin(stream! {
             let mut after = request.after.sequence;
-            loop {
-                // Attach to the live feed before catching up so no commit can
-                // land between the last catch-up page and the first live
-                // receive. Anything already at or below `after` when it
-                // arrives live is a duplicate of the catch-up and is skipped.
-                let Some(mut live) = store.feed(workspace_id) else {
-                    yield Err(SessionRuntimeError::Unavailable);
+            let attachment = match store.attach_feed(workspace_id, after, MAX_REPLAY_EVENTS).await {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    yield Err(error);
                     return;
-                };
+                }
+            };
+            let mut live = attachment.live;
+            let mut first_page = Some(attachment.page);
+            loop {
                 loop {
-                    let page = match store
-                        .published_events_after(workspace_id, after, MAX_REPLAY_EVENTS)
-                        .await
-                    {
-                        Ok(page) => page,
-                        Err(error) => {
-                            yield Err(error);
-                            return;
-                        }
+                    let page = match first_page.take() {
+                        Some(page) => page,
+                        None => match store
+                            .published_events_after(workspace_id, after, MAX_REPLAY_EVENTS)
+                            .await
+                        {
+                            Ok(page) => page,
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        },
                     };
                     // A short page is the end of the durable backlog: one read
                     // suffices for a subscriber that is nearly caught up.
@@ -744,12 +748,13 @@ impl SessionRuntime {
                         Ok(event) => {
                             let sequence = event.envelope.cursor.sequence;
                             if sequence <= after {
+                                // Attachment precedes catch-up, including
+                                // after lag: buffered events can overlap it.
                                 continue;
                             }
                             if sequence != after + 1 {
-                                // A gap means the feed was subscribed after
-                                // a commit the catch-up did not see; fall
-                                // back to the store for the missing range.
+                                // Recover any missing range from the
+                                // authoritative log.
                                 break;
                             }
                             after = sequence;

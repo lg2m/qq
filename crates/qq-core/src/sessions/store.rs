@@ -288,6 +288,11 @@ pub(super) struct Store {
     store_id: StoreId,
 }
 
+pub(super) struct FeedAttachment {
+    pub(super) live: feed::FeedReceiver,
+    pub(super) page: Vec<Arc<feed::PublishedEvent>>,
+}
+
 struct StoreInner {
     control: Sender<WorkerMessage>,
     control_slots: Arc<Semaphore>,
@@ -358,14 +363,32 @@ impl Store {
         self.inner.catch_up_reads.load(Ordering::Relaxed)
     }
 
-    /// A live receiver for one workspace's committed events. Delivers only
-    /// events published after this call; the caller catches up from
-    /// `events_after` first.
-    pub(super) fn feed(
+    #[cfg(test)]
+    pub(super) fn retained_feeds(&self) -> usize {
+        self.inner.feed.retained_workspaces()
+    }
+
+    /// Validates and attaches before the first catch-up page, in one job.
+    /// Only registered workspaces retain rings, and dropping the reply also
+    /// releases the receiver if the subscribing caller has gone away.
+    pub(super) async fn attach_feed(
         &self,
         workspace_id: WorkspaceId,
-    ) -> Option<tokio::sync::broadcast::Receiver<Arc<feed::PublishedEvent>>> {
-        self.inner.feed.subscribe(workspace_id)
+        sequence: u64,
+        limit: u16,
+    ) -> Result<FeedAttachment, SessionRuntimeError> {
+        let feed = Arc::clone(&self.inner.feed);
+        #[cfg(test)]
+        self.inner.catch_up_reads.fetch_add(1, Ordering::Relaxed);
+        self.call(Priority::Control, move |connection| {
+            ensure_workspace(connection, workspace_id)?;
+            let live = feed
+                .subscribe(workspace_id)
+                .ok_or(SessionRuntimeError::Unavailable)?;
+            let page = read_published_event_page(connection, workspace_id, sequence, limit)?;
+            Ok(FeedAttachment { live, page })
+        })
+        .await
     }
 
     pub(super) async fn call<T, F>(
@@ -1793,7 +1816,7 @@ mod tests {
             .await
             .unwrap();
         let (release, blocked) = hold_worker(&store).await;
-        let mut live = store.feed(workspace_id).unwrap();
+        let mut live = store.inner.feed.subscribe(workspace_id).unwrap();
 
         let mut jobs = Vec::new();
         for n in 0..3_u64 {
