@@ -31,6 +31,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Record active toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-teardown
