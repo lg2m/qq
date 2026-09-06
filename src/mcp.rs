@@ -164,12 +164,16 @@ struct RegistryKey {
 /// Process-wide cache of wired registries with exact live binding equality.
 pub(crate) struct McpRegistryCache {
     cache: Mutex<VecDeque<(RegistryKey, Arc<WiredMcpRegistry>)>>,
+    #[cfg(test)]
+    eager_publish_barrier: Option<Arc<std::sync::Barrier>>,
 }
 
 impl McpRegistryCache {
     pub(crate) fn new() -> Self {
         Self {
             cache: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            eager_publish_barrier: None,
         }
     }
 
@@ -229,16 +233,16 @@ impl McpRegistryCache {
         for (name, server) in &admitted {
             settings.push(resolve_server(name, server, credentials)?);
         }
-        let registry = Arc::new(WiredMcpRegistry {
-            manager: Arc::new(McpManager::new(settings)?),
-        });
+        #[cfg(test)]
+        if let Some(barrier) = &self.eager_publish_barrier {
+            barrier.wait();
+        }
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| RuntimeBuildError::CacheUnavailable)?;
-        // Another compile may have resolved the same declarations while
-        // this one was outside the lock. This unpublished manager has not
-        // connected yet; retain the published identity and connection.
+        // Resolve outside the lock, but construct only after this recheck:
+        // manager construction can spawn eager background connections.
         if let Some(index) = cache.iter().position(|(cached, _)| *cached == key) {
             let (cached_key, registry) = cache
                 .remove(index)
@@ -248,6 +252,15 @@ impl McpRegistryCache {
                 registry,
                 servers: descriptors,
             }));
+        }
+        let registry = Arc::new(WiredMcpRegistry {
+            manager: Arc::new(McpManager::new(settings)?),
+        });
+        #[cfg(test)]
+        if self.eager_publish_barrier.is_some() {
+            // Finish eager startup before the fixture counts HTTP initializes.
+            let catalog = registry.catalog_blocking();
+            assert!(matches!(catalog.readiness, HostReadiness::Ready));
         }
         cache.push_back((key, Arc::clone(&registry)));
         while cache.len() > MAX_CACHED_REGISTRIES {
@@ -335,7 +348,10 @@ fn resolve_server(
 mod tests {
     use std::{
         fs,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -352,6 +368,7 @@ mod tests {
 
     struct HttpFixture {
         url: String,
+        initializations: Arc<AtomicUsize>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -359,6 +376,8 @@ mod tests {
         async fn new() -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let initializations = Arc::new(AtomicUsize::new(0));
+            let initialized = Arc::clone(&initializations);
             let task = tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -398,11 +417,14 @@ mod tests {
                             "notifications/initialized" => (202, String::new()),
                             method => {
                                 let result = match method {
-                                    "initialize" => json!({
+                                    "initialize" => {
+                                        initialized.fetch_add(1, Ordering::SeqCst);
+                                        json!({
                                         "protocolVersion": message["params"]["protocolVersion"],
                                         "capabilities": {"tools": {}},
                                         "serverInfo": {"name": "authorization-fixture", "version": "1"},
-                                    }),
+                                        })
+                                    }
                                     "tools/list" => json!({"tools": [{
                                         "name": "echo", "inputSchema": {"type": "object"},
                                     }]}),
@@ -425,7 +447,11 @@ mod tests {
                     socket.write_all(response.as_bytes()).await.unwrap();
                 }
             });
-            Self { url, task }
+            Self {
+                url,
+                initializations,
+                task,
+            }
         }
     }
 
@@ -459,11 +485,21 @@ mod tests {
         }
 
         fn snapshot(&self, workspace: &str, url: &str, bearer: &str) -> ConfigSnapshot {
+            self.snapshot_with_eager(workspace, url, bearer, false)
+        }
+
+        fn snapshot_with_eager(
+            &self,
+            workspace: &str,
+            url: &str,
+            bearer: &str,
+            eager: bool,
+        ) -> ConfigSnapshot {
             let workspace = self.root.path().join(workspace);
             fs::create_dir_all(&workspace).unwrap();
             let path = workspace.join("config.ron");
             fs::write(&path, format!(
-                r#"(version: 1, model: "openai/gpt-5.6", mcp: {{"srv": Http(url: "{url}", bearer: Value("{bearer}"), allow: ["echo"], call_timeout_seconds: 5)}})"#,
+                r#"(version: 1, model: "openai/gpt-5.6", mcp: {{"srv": Http(url: "{url}", bearer: Value("{bearer}"), eager: {eager}, allow: ["echo"], call_timeout_seconds: 5)}})"#,
             )).unwrap();
             #[cfg(unix)]
             {
@@ -656,6 +692,47 @@ mod tests {
                 .iter()
                 .all(|registry| Arc::ptr_eq(&registries[0], registry))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_equal_eager_declarations_initialize_one_connection() {
+        let server = HttpFixture::new().await;
+        let fixture = ConfigFixture::new();
+        let mut cache = McpRegistryCache::new();
+        cache.eager_publish_barrier = Some(Arc::new(std::sync::Barrier::new(8)));
+        let cache = Arc::new(cache);
+        let snapshot = Arc::new(fixture.snapshot_with_eager("first", &server.url, "secret", true));
+        let tasks = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let snapshot = Arc::clone(&snapshot);
+                let credentials = fixture.credentials.clone();
+                tokio::task::spawn_blocking(move || {
+                    cache
+                        .registry_for_snapshot(&credentials, CredentialEpoch::NONE, &snapshot, None)
+                        .unwrap()
+                        .unwrap()
+                        .registry
+                })
+            })
+            .collect::<Vec<_>>();
+        let registries = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::join_all(tasks),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+        assert_eq!(server.initializations.load(Ordering::SeqCst), 1);
+        assert!(
+            registries
+                .iter()
+                .all(|registry| Arc::ptr_eq(&registries[0], registry))
+        );
+        assert!(echo(&registries[0]).await.starts_with("Bearer secret "));
+        registries[0].shutdown().await;
     }
 
     /// The adapter runs the shared host suite against a real manager whose
