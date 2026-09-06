@@ -33,7 +33,9 @@ use search::MAX_SEARCH_BYTES;
 #[cfg(test)]
 use serde_json::json;
 #[cfg(test)]
-use shell::{BoundedCapture, MAX_SHELL_OUTPUT_BYTES};
+use shell::BoundedCapture;
+#[cfg(all(test, unix))]
+use shell::MAX_SHELL_OUTPUT_BYTES;
 #[cfg(test)]
 use std::sync::{
     Arc,

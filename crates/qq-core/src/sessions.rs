@@ -25097,7 +25097,6 @@ mod tests {
 
     /// Like `collect_through_finished`, with a deadline generous enough for
     /// tests that spawn real child processes.
-    #[cfg(unix)]
     async fn collect_through_finished_generously(
         events: &mut SessionEventStream,
     ) -> Vec<SessionEventEnvelope> {
