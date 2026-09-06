@@ -632,6 +632,176 @@ fn applies_every_layer_in_documented_order() {
 }
 
 #[test]
+fn source_evidence_is_stale_when_config_changes_after_its_last_read() {
+    let tree = TempTree::new();
+    let path = tree.write("global/config.ron", "(version: 1, max_output_tokens: 17)");
+    loader::rewrite_after_read(
+        fs::canonicalize(path).unwrap(),
+        2,
+        "(version: 1, max_output_tokens: 12345)".to_owned(),
+    );
+
+    let snapshot = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(snapshot.max_output_tokens(), 17);
+    assert!(
+        !snapshot.sources().is_current(),
+        "a replacement after reading must not certify the older snapshot as current"
+    );
+    let reloaded = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(reloaded.max_output_tokens(), 12345);
+    assert!(reloaded.sources().is_current());
+}
+
+#[test]
+fn source_evidence_includes_explicit_pack_manifests() {
+    let tree = TempTree::new();
+    let manifest = tree.write(
+        "external/review-kit/pack.ron",
+        r#"(schema: 1, id: "review-kit", version: "1.0.0")"#,
+    );
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, packs: {"review-kit": Pack(path: "../external/review-kit")})"#,
+    );
+    let snapshot = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(snapshot.packs()["review-kit"].version(), "1.0.0");
+    assert!(snapshot.sources().is_current());
+    fs::write(
+        manifest,
+        r#"(schema: 1, id: "review-kit", version: "20.0.0")"#,
+    )
+    .unwrap();
+    assert!(
+        !snapshot.sources().is_current(),
+        "an explicit pack is configuration evidence even outside discovered pack roots"
+    );
+    let reloaded = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(reloaded.packs()["review-kit"].version(), "20.0.0");
+    assert!(reloaded.sources().is_current());
+}
+
+#[test]
+#[cfg(unix)]
+fn source_evidence_tracks_symlinked_vcs_marker_targets() {
+    use std::os::unix::fs::symlink;
+
+    let tree = TempTree::new();
+    fs::remove_dir(tree.path("work/.git")).unwrap();
+    let marker = tree.write("external/git-marker", "first target");
+    symlink(&marker, tree.path("work/.git")).unwrap();
+    let snapshot = tree.loader().load(&tree.request()).unwrap();
+    assert!(snapshot.sources().is_current());
+    fs::write(&marker, "a changed target behind the same link").unwrap();
+    assert!(
+        !snapshot.sources().is_current(),
+        "VCS marker discovery follows symlinks, so target evidence must follow too"
+    );
+    let reloaded = tree.loader().load(&tree.request()).unwrap();
+    assert!(reloaded.sources().is_current());
+    fs::remove_file(marker).unwrap();
+    assert!(!reloaded.sources().is_current());
+}
+
+#[test]
+fn source_evidence_tracks_creation_and_deletion_without_retaining_the_snapshot() {
+    for relative in [
+        "global/config.ron",
+        "global/config.d/10-added.ron",
+        "work/.qq/config.ron",
+        "work/qq.ron",
+    ] {
+        let tree = TempTree::new();
+        let snapshot = tree.loader().load(&tree.request()).unwrap();
+        let sources = snapshot.sources().clone();
+        drop(snapshot);
+        assert!(sources.is_current());
+        let path = tree.write(relative, "(version: 1, max_output_tokens: 123)");
+        assert!(
+            !sources.is_current(),
+            "new source {relative} must invalidate"
+        );
+        let reloaded = tree.loader().load(&tree.request()).unwrap();
+        assert_eq!(reloaded.max_output_tokens(), 123);
+        assert!(reloaded.sources().is_current());
+        fs::remove_file(path).unwrap();
+        assert!(
+            !reloaded.sources().is_current(),
+            "deleted source {relative}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn source_evidence_detects_atomic_replacement_with_equal_size_and_timestamp() {
+    let tree = TempTree::new();
+    let path = tree.write("global/config.ron", "(version: 1, max_output_tokens: 123)");
+    let source_modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let parent = tree.path("global");
+    let parent_modified = fs::metadata(&parent).unwrap().modified().unwrap();
+    let snapshot = tree.loader().load(&tree.request()).unwrap();
+    let replacement = tree.write("replacement.ron", "(version: 1, max_output_tokens: 456)");
+    fs::File::open(&replacement)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(source_modified))
+        .unwrap();
+    fs::rename(replacement, path).unwrap();
+    fs::File::open(parent)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(parent_modified))
+        .unwrap();
+    assert!(!snapshot.sources().is_current());
+    let reloaded = tree.loader().load(&tree.request()).unwrap();
+    assert_eq!(reloaded.max_output_tokens(), 456);
+    assert!(reloaded.sources().is_current());
+}
+
+#[test]
+#[cfg(unix)]
+fn source_evidence_tracks_the_requested_workspace_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tree = TempTree::new();
+    fs::create_dir_all(tree.path("work-two/.git")).unwrap();
+    tree.write("work-two/qq.ron", "(version: 1, max_output_tokens: 123)");
+    let alias = tree.path("alias");
+    symlink(tree.path("work"), &alias).unwrap();
+    let request = LoadRequest::new(&alias)
+        .with_overrides(RuntimeOverrides::new().with_model("openai/test-model"));
+    let snapshot = tree.loader().load(&request).unwrap();
+    assert!(snapshot.sources().is_current());
+    fs::remove_file(&alias).unwrap();
+    symlink(tree.path("work-two"), &alias).unwrap();
+    assert!(!snapshot.sources().is_current());
+    let reloaded = tree.loader().load(&request).unwrap();
+    assert_eq!(reloaded.max_output_tokens(), 123);
+    assert!(reloaded.sources().is_current());
+}
+
+#[test]
+#[cfg(unix)]
+fn source_evidence_distinguishes_missing_symlink_targets_from_metadata_errors() {
+    use std::os::unix::fs::symlink;
+
+    let tree = TempTree::new();
+    fs::remove_dir(tree.path("work/.git")).unwrap();
+    fs::create_dir(tree.path("work/.hg")).unwrap();
+    symlink(".git", tree.path("work/.git")).unwrap();
+    let unreadable = tree.loader().load(&tree.request()).unwrap();
+    assert!(
+        !unreadable.sources().is_current(),
+        "a repeated metadata failure is not evidence of unchanged sources"
+    );
+    fs::remove_file(tree.path("work/.git")).unwrap();
+    let target = tree.path("external/git-marker");
+    symlink(&target, tree.path("work/.git")).unwrap();
+    let absent = tree.loader().load(&tree.request()).unwrap();
+    assert!(absent.sources().is_current());
+    tree.write("external/git-marker", "new root marker");
+    assert!(!absent.sources().is_current());
+}
+
+#[test]
 fn probed_paths_cover_every_present_and_absent_source_location() {
     let tree = TempTree::new();
     fs::create_dir_all(tree.path("work/child")).unwrap();
@@ -2211,7 +2381,7 @@ fn agent_profiles_layer_by_name_validate_routes_and_never_declare_default() {
         )
         .unwrap();
         state.apply_document(&document, &origin, true);
-        state.finish(Vec::new(), Vec::new())
+        state.finish(Vec::new(), ConfigSources::default())
     };
     assert!(matches!(
         parse(r#""default": Profile(model: "openai/gpt-5.6")"#),

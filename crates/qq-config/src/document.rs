@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     marker::PhantomData,
-    path::PathBuf,
 };
 
 use ron::{Options, extensions::Extensions};
@@ -14,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AgentProfileConfig, AuditConfig, AuditMode, AwsAuth, BedrockAuth, ConfigError, ConfigKey,
-    ConfigProvenance, ConfigSnapshot, Connection, DEFAULT_MAX_OUTPUT_TOKENS,
+    ConfigProvenance, ConfigSnapshot, ConfigSources, Connection, DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MCP_CALL_TIMEOUT_SECONDS, DEFAULT_MCP_MAX_CONCURRENT_CALLS, DelegationConfig,
     DelegationEntry, DelegationRole, EffectivePolicy, HttpAccess, HttpCredential, InputModality,
     MAX_AUDIT_REVISIONS, MAX_DELEGATION_DEPTH, MAX_DELEGATION_NOTE_BYTES, MAX_DELEGATION_ROSTER,
@@ -1662,7 +1661,7 @@ impl MergeState {
     pub(super) fn finish(
         mut self,
         reports: Vec<SourceReport>,
-        probed_paths: Vec<PathBuf>,
+        sources: ConfigSources,
     ) -> Result<ConfigSnapshot, ConfigError> {
         // Packs contribute beneath the configuration: their MCP servers join
         // where the configuration declared none of that name, and their
@@ -1895,7 +1894,7 @@ impl MergeState {
             grants,
             reports,
             provenance: self.provenance,
-            probed_paths,
+            sources,
         })
     }
 }
