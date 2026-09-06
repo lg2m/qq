@@ -682,6 +682,73 @@ fn source_evidence_includes_explicit_pack_manifests() {
 
 #[test]
 #[cfg(unix)]
+fn source_evidence_tracks_explicit_pack_directory_resolution() {
+    use std::os::unix::fs::symlink;
+
+    let tree = TempTree::new();
+    let manifest = tree.write(
+        "external/first/pack.ron",
+        r#"(schema: 1, id: "review-kit", version: "1.0.0")"#,
+    );
+    fs::create_dir_all(tree.path("external/other")).unwrap();
+    fs::hard_link(manifest, tree.path("external/other/pack.ron")).unwrap();
+    let alias = tree.path("external/selected");
+    symlink("first", &alias).unwrap();
+    tree.write(
+        "global/config.ron",
+        r#"(version: 1, packs: {"review-kit": Pack(path: "../external/selected")})"#,
+    );
+    let loader = tree.loader();
+    let snapshot = loader.load(&tree.request()).unwrap();
+    assert!(snapshot.sources().is_current());
+    assert_eq!(
+        snapshot.packs()["review-kit"].directory(),
+        fs::canonicalize(tree.path("external/first")).unwrap()
+    );
+    fs::remove_file(&alias).unwrap();
+    symlink("other", &alias).unwrap();
+    let reloaded = loader.load(&tree.request()).unwrap();
+    assert_eq!(
+        reloaded.packs()["review-kit"].directory(),
+        fs::canonicalize(tree.path("external/other")).unwrap()
+    );
+    assert!(
+        !snapshot.sources().is_current(),
+        "a hard-linked manifest cannot certify the old resolved pack directory"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn source_evidence_invalidates_when_inline_secret_permissions_become_insecure() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let tree = TempTree::new();
+    let path = tree.write(
+        "global/config.ron",
+        r#"(version: 1, providers: {"openai": OpenAi(api_key: Value("test-inline-secret"))})"#,
+    );
+    let loader = tree.loader();
+    let snapshot = loader.load(&tree.request()).unwrap();
+    assert!(snapshot.sources().is_current());
+    let before = fs::metadata(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    assert_eq!(before.ino(), after.ino());
+    assert!(matches!(
+        loader.load(&tree.request()),
+        Err(ConfigError::InsecureSecretFile { .. })
+    ));
+    assert!(
+        !snapshot.sources().is_current(),
+        "a cached snapshot must notice permissions that make a fresh load fail"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn source_evidence_tracks_symlinked_vcs_marker_targets() {
     use std::os::unix::fs::symlink;
 

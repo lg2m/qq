@@ -215,6 +215,7 @@ pub(super) fn load(
     }
 
     // Administrator-owned files and native MDM values intentionally run last.
+    probes.record(&loader.paths.managed_dir);
     if loader.paths.enforce_managed_ownership {
         validate_managed_directory_if_present(&loader.paths.managed_dir)?;
     }
@@ -319,6 +320,7 @@ fn selected_organization(
         organization = Some(selected.to_owned());
     }
 
+    probes.record(&loader.paths.managed_dir);
     if loader.paths.enforce_managed_ownership {
         validate_managed_directory_if_present(&loader.paths.managed_dir)?;
     }
@@ -529,7 +531,14 @@ enum MetadataState {
     Present {
         len: u64,
         modified: Option<SystemTime>,
-        identity: Option<u64>,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(unix)]
+        uid: u32,
         is_dir: bool,
     },
     Unreadable(std::io::ErrorKind),
@@ -540,16 +549,18 @@ impl MetadataState {
         match metadata {
             Ok(metadata) => {
                 #[cfg(unix)]
-                let identity = {
-                    use std::os::unix::fs::MetadataExt;
-                    Some(metadata.ino())
-                };
-                #[cfg(not(unix))]
-                let identity = None;
+                use std::os::unix::fs::MetadataExt;
                 Self::Present {
                     len: metadata.len(),
                     modified: metadata.modified().ok(),
-                    identity,
+                    #[cfg(unix)]
+                    device: metadata.dev(),
+                    #[cfg(unix)]
+                    inode: metadata.ino(),
+                    #[cfg(unix)]
+                    mode: metadata.mode(),
+                    #[cfg(unix)]
+                    uid: metadata.uid(),
                     is_dir: metadata.is_dir(),
                 }
             }
