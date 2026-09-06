@@ -1473,7 +1473,7 @@ credential-lease caching, MCP bounds, and provider prompt-cache determinism.
 | H27 | Active-generation accounting and atomic cache refresh admission | H2 | Root |
 | H28 | Explicit context-source capacity rejection and immutable source identity | H8 | Core, protocol |
 | HC1 | Headless admission and plumbing: `--correlation`, exclusive `--session` resume, shared `u32` turn limits, model-less `config check` | H3, H26 | Root, config, core, protocol |
-| HC2 | Positive tool exposure; field compatibility decision pending before implementation | H6, H13 | Config, core plan |
+| HC2 | Positive tool exposure through optional `policy.exposed_tools`; existing grants unchanged | H6, H13 | Config, core plan |
 | HC3 | Typed final output: `--output-schema`, bounded repair turns, `final_output` on `outcome` and `RunFinished` | H3, HC1 | Protocol, core, root |
 | HC4 | Headless golden fixtures per `PROTOCOL_VERSION` and compatibility statement | HC1–HC3 | Protocol tests, docs |
 | H10 | First real OS process-sandbox adapter | R6, platform threat model | Core tools, root |
@@ -1880,10 +1880,9 @@ tranche closes. CLI parsing and schema compilation are cold-path work. HC1
 also changes startup ownership and shared limit types; HC3 adds opt-in core
 validation, repair turns, and durable output. Independent work may proceed in
 isolated worktrees alongside Phase 6, with coordinated integration through
-review. HC1 and HC2 are independent once HC2's compatibility decision is
-recorded. HC3 follows HC1 and coordinates settlement and prompt identity with
-behavioral H21, H18, and H28; its behavioral changes land before the mechanical
-`sessions.rs` split. HC4 lands last and pins the whole.
+review. HC1 and HC2 are independent. HC3 follows HC1 and coordinates settlement
+and prompt identity with behavioral H21, H18, and H28; its behavioral changes
+land before the mechanical `sessions.rs` split. HC4 lands last and pins the whole.
 
 Motivation. A supervisor (batch runner, CI, evaluation harness, or hosted
 service) consumes `qq run` through argv, `QQ_CONFIG_CONTENT`, JSONL stdout,
@@ -1963,42 +1962,54 @@ Acceptance:
 
 #### HC2 — Positive Tool Exposure
 
-Compatibility decision pending: `policy.allow_tools` already grants held
-calls and composes through grant merging; managed `deny_tools` filters those
-grants rather than the catalog. The original proposal below reuses that name
-for incompatible exposure semantics. Choose between a compatible new
-`policy.exposed_tools` field and an explicit breaking configuration migration
-before implementation, then update the proposal and fixtures to that choice.
-The name in the original proposal is not authorization to change existing
-grant semantics silently. Exact dynamic MCP-name validation also requires
-the discovered catalog; reconcile that acceptance with HC1's model-less
-configuration check without adding implicit network discovery to the check.
+Compatibility interpretation: add `policy.exposed_tools` for catalog
+narrowing. Existing `policy.allow_tools` keeps its grant semantics and layer
+composition; managed `deny_tools` and `deny_shell_prefixes` keep filtering
+grants. Exposure does not grant execution authority, and grants cannot
+restore a tool excluded from the catalog.
 
 Deliverables:
 
-- `policy.allow_tools: [..]` in configuration. When present, the effective
-  catalog is the intersection of the compiled catalog and this list, applied
-  after `deny_tools`. MCP names use the existing `mcp__<server>__<tool>`
-  form; static built-ins are named as today. A name absent from the catalog
-  is a configuration error, not a silent no-op. Layers intersect (a narrower
-  layer cannot widen), matching `allowed_providers` composition.
+- Optional `policy.exposed_tools: [..]` in configuration. When present, the
+  effective catalog is the intersection of this list and the existing
+  profile/pack exposure. An absent field adds no restriction; an empty list
+  exposes no tools. Layers intersect (a narrower layer cannot widen),
+  matching `allowed_providers` composition. Existing managed grant denies
+  do not become catalog filters; profile/pack tool policy and the new explicit
+  exposure field own that behavior.
+- MCP names use the existing `mcp__<server>__<tool>` form; static built-ins
+  are named as today. `config check` validates exact static names and MCP
+  name syntax without requiring a model or discovering MCP tools. Plan
+  compilation validates discovered MCP-name membership before applying the
+  exposure filter; an unknown name is a configuration error before provider
+  work, not a silent no-op.
 - `qq run --profile <name>` is documented as the primary way a supervisor
   selects a pre-compiled exposure; `--allow-tool` and `--allow-shell` keep
   their existing grant semantics and are re-documented as *widening held
   calls*, never as an allowlist.
-- The plan descriptor already digests the catalog; a differing `allow_tools`
-  therefore yields a differing digest with no descriptor version change.
+- The plan descriptor already digests the catalog; a change to the effective
+  exposure therefore changes its digest with no descriptor version change.
+  Different declarations that produce the same effective catalog need not
+  have different digests.
 
 Acceptance:
 
-- `allow_tools: ["read_file", "search"]` under `--approval full` exposes
+- `exposed_tools: ["read_file", "search"]` under `--approval full` exposes
   exactly two tools in the model request (fake provider asserts the schema
   list); a call to `edit_file` returned by the fake provider is a tool error
   ("unknown tool"), never an approval hold.
-- A global `allow_tools` of five tools and a project `allow_tools` of two
+- A global `exposed_tools` of five tools and a project `exposed_tools` of two
   yield two; the project cannot re-add a globally excluded tool.
-- `allow_tools: ["nonexistent"]` fails `config check` naming the entry.
-- Approval matrix from H13 is unchanged for every exposed tool.
+- `exposed_tools: ["nonexistent"]` or malformed MCP names fail `config
+  check` naming the entry. A syntactically valid MCP name can pass model-less
+  `config check`; a name absent from the discovered catalog fails plan
+  compilation before provider work.
+- An absent `exposed_tools` preserves existing catalogs and grant behavior;
+  an empty list exposes no tools. Neither a grant nor a broader layer can
+  restore a tool excluded by profile/pack policy or an exposure intersection.
+- Approval matrix from H13 is unchanged for every exposed tool, including
+  existing `policy.allow_tools`, `policy.allow_shell_prefixes`, and managed
+  grant-deny fixtures.
 
 #### HC3 — Typed Final Output
 
