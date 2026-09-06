@@ -14,10 +14,11 @@ teardown remains unqualified. H24 remaining child budgets and owned-descendant
 accounting are implemented 2026-09-05; receipt under Phase 5a. H25 and H26 are
 implemented and correctness-validated on Linux on 2026-09-06; their receipt
 below retains the pending performance qualification. A fresh focused shell
-comparison passes its noise and regression gates. The fan-out fixture needed
-correction, so its version-4 paired comparison is still pending.
-**Active work: qualify H25–H26; implement independent headless HC1–HC2 and
-record H20 diagnostics before changing fairness behavior.**
+comparison passes its noise and regression gates. The corrected fan-out
+comparison and same-binary control both fail tail gates; full version-4 H0
+and native Windows validation remain pending.
+**Active boundary: close Phase 5a qualification. Later-phase work is saved
+in isolated branches and paused until this phase is assessed.**
 H23–H26 precede Phase 6; H27–H28 join its early correctness work. Phases 6–9
 remain proposed, with H20 moved ahead of H18 and H19 conditional on decoder
 measurements. A hosting-boundary review on 2026-09-05 added the
@@ -1928,8 +1929,36 @@ observation in the fixture. Commit `5b77fee` replaces them with a FIFO
 attachment barrier and concurrent observation, with two regression tests
 and all 47 xtask tests passing. H0 fixture version **4** and focused feed
 version **2** declare the measurement change. Both arms must be re-recorded
-with identical corrected fixtures; the paired A/B and baseline A/A comparison
-is pending. H25–H26 performance qualification remains open until it is assessed.
+with identical corrected fixtures. That comparison is now complete: 30
+interleaved A/B pairs and 30 same-binary A/A pairs, each worker contributing
+five raw samples per metric. All 120 workers passed correctness checks.
+
+| Corrected fan-out metric | Baseline p95 | Candidate p95 | A/B change | Same-binary A/A change |
+| --- | ---: | ---: | ---: | ---: |
+| Delivery, 1 subscriber | 6.904 ms | 6.975 ms | +1.02% | −27.39% |
+| Acknowledgment, 1 subscriber | 3.526 ms | 3.863 ms | +9.54% | −40.97% |
+| Delivery, 8 subscribers | 7.025 ms | 6.946 ms | −1.13% | −10.14% |
+| Acknowledgment, 8 subscribers | 3.801 ms | 4.859 ms | **+27.85%** | **+68.83%** |
+| Delivery, 32 subscribers | 6.478 ms | 8.177 ms | **+26.23%** | **+15.95%** |
+| Acknowledgment, 32 subscribers | 3.516 ms | 3.541 ms | +0.72% | **+35.33%** |
+
+The relative budget is 15%; bold values fail it. The corrected 32-subscriber
+acknowledgment passes its 15 ms absolute budget. A/B medians differ by
+−0.21% to +0.78%, and all MAD gates pass. The same-binary control failing
+both candidate tail failures establishes non-repeatable tail qualification
+in this recording; it neither waives the failures nor proves a production
+regression. No samples were removed. Full version-4 H0 baseline/candidate
+qualification and the native Windows teardown job remain required.
+
+H20's pre-change diagnostic baseline is captured separately (`91c32ca`,
+30 eight-stream and 30 controlled-saturation workers). Actual per-run output
+commit gap p95 is 37.624 ms. For each worker's largest gap, queued service
+has p95 31.171 ms; time between occupied store jobs has p95 0.045 ms and
+output reply-to-caller-resume p95 is 0.085 ms. Repeated preceding output
+commits dominate queue occupancy. These are instrumented attribution
+measurements, not shipping-build gates; their separately ranked percentiles
+must not be summed. They support H20 investigating bounded group formation
+under control pressure. The stricter ≤20 ms target remains owned by H20.
 
 ### Phase 5b — Headless Contract For Supervisors
 
