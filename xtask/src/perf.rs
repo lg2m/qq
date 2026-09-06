@@ -83,6 +83,26 @@ enum PerfCommand {
     /// Internal isolated R4 qualification worker.
     #[command(hide = true)]
     R4Worker(R4WorkerArgs),
+    /// Internal isolated workspace-feed lifecycle worker.
+    #[command(hide = true)]
+    FeedWorker(FeedWorkerArgs),
+}
+
+#[derive(Debug, Args)]
+struct FeedWorkerArgs {
+    #[arg(long, value_enum)]
+    case: FeedCase,
+    /// Replay samples; fan-out retains its existing five-to-twenty sample cap.
+    #[arg(long, default_value_t = 30)]
+    samples: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum FeedCase {
+    Churn,
+    AttachReplay,
+    FanOut,
 }
 
 #[derive(Debug, Args)]
@@ -418,6 +438,7 @@ pub async fn run(args: PerfArgs) -> Result<(), PerfError> {
         PerfCommand::Check(args) => check_reports(args),
         PerfCommand::LoadWorker(args) => run_load_worker(args).await,
         PerfCommand::R4Worker(args) => run_r4_worker(args).await,
+        PerfCommand::FeedWorker(args) => run_feed_worker(args).await,
     }
 }
 
@@ -3688,6 +3709,150 @@ async fn retry_amplification_workloads(
     finish_runtime_fixture(&fixture, "shut down amplification runtime", operation).await
 }
 
+async fn feed_churn_workload(
+    subscriptions: u16,
+) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
+    let fixture = RuntimeFixture::open(ProviderMode::Hanging).await?;
+    let operation = async {
+        let requests = (0..subscriptions)
+            .map(|_| {
+                let workspace_id = WorkspaceId::generate()
+                    .map_err(fixture_error("generate unknown workspace"))?;
+                Ok(SubscribeRequest {
+                    workspace_id,
+                    after: EventCursor {
+                        workspace_id,
+                        ..fixture.initial_cursor
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, PerfError>>()?;
+        let rss_before = current_rss()?;
+        let started = Instant::now();
+        with_timeout("unknown workspace subscription churn", async {
+            for request in requests {
+                let mut events = fixture
+                    .runtime
+                    .subscribe_published(request)
+                    .map_err(fixture_error("create unknown-workspace stream"))?;
+                if !matches!(
+                    events.next().await,
+                    Some(Err(qq_core::SessionRuntimeError::WorkspaceNotFound))
+                ) {
+                    return Err(PerfError::Fixture(
+                        "unknown workspace was not rejected".to_owned(),
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .await??;
+        let elapsed = elapsed_ns(started);
+        let rss_after = current_rss()?;
+        Ok((
+            vec![
+                MetricResult::scalar(
+                    format!("feed_unknown_{subscriptions}_subscriptions_ns"),
+                    "ns",
+                    "public subscribe_published through WorkspaceNotFound and stream drop for every distinct unknown id; request generation excluded",
+                    elapsed,
+                )?,
+                MetricResult::scalar(
+                    format!("feed_unknown_{subscriptions}_retained_rss_bytes"),
+                    "bytes",
+                    "VmRSS after every rejected stream is dropped minus VmRSS before churn, with the same runtime still open; allocator retention included",
+                    rss_after.saturating_sub(rss_before),
+                )?,
+            ],
+            vec![CorrectnessCheck {
+                name: "unknown_workspace_subscriptions_rejected".to_owned(),
+                passed: true,
+                detail: format!("all {subscriptions} unknown ids returned WorkspaceNotFound"),
+            }],
+        ))
+    }
+    .await;
+    finish_runtime_fixture(&fixture, "shut down subscription churn runtime", operation).await
+}
+
+async fn feed_attach_replay_workload(
+    samples: u16,
+) -> Result<(Vec<MetricResult>, Vec<CorrectnessCheck>), PerfError> {
+    let fixture = RuntimeFixture::open(ProviderMode::Hanging).await?;
+    let operation = async {
+        let (_, target) = fixture.create_session(ApprovalMode::ReadOnly).await?;
+        let mut latencies = Vec::with_capacity(usize::from(samples));
+        let mut expected = None;
+        for _ in 0..samples {
+            let started = Instant::now();
+            let mut events = fixture
+                .runtime
+                .subscribe_published(SubscribeRequest {
+                    workspace_id: fixture.workspace_id,
+                    after: fixture.initial_cursor,
+                })
+                .map_err(fixture_error("attach replay subscriber"))?;
+            let event = with_timeout("read attachment replay", events.next())
+                .await?
+                .ok_or_else(|| PerfError::Fixture("attachment replay ended early".to_owned()))?
+                .map_err(fixture_error("read attachment replay"))?;
+            if event.envelope.cursor != target
+                || !matches!(event.envelope.event, SessionEvent::SessionCreated { .. })
+                || expected.as_ref().is_some_and(|json| *json != event.json)
+            {
+                return Err(PerfError::Fixture("attachment replay changed".to_owned()));
+            }
+            expected = Some(Arc::clone(&event.json));
+            drop(events);
+            latencies.push(elapsed_ns(started));
+        }
+        Ok((
+            vec![MetricResult::measured(
+                "feed_attach_replay_and_drop_ns",
+                "ns",
+                "public subscribe_published through one committed SessionCreated replay and stream drop, with no other active subscription",
+                latencies,
+            )?],
+            vec![CorrectnessCheck {
+                name: "feed_attachment_replay_identical".to_owned(),
+                passed: true,
+                detail: format!("all {samples} attachments returned the same committed cursor and JSON"),
+            }],
+        ))
+    }
+    .await;
+    finish_runtime_fixture(&fixture, "shut down attachment replay runtime", operation).await
+}
+
+async fn run_feed_worker(args: FeedWorkerArgs) -> Result<(), PerfError> {
+    if cfg!(debug_assertions) {
+        return Err(PerfError::DebugWorker);
+    }
+    if env::consts::OS != "linux" {
+        return Err(PerfError::UnsupportedHost(env::consts::OS));
+    }
+    if args.samples == 0 || args.samples > 1_000 {
+        return Err(PerfError::Fixture(
+            "feed samples must be 1..=1000".to_owned(),
+        ));
+    }
+    let (metrics, checks) = match args.case {
+        FeedCase::Churn => feed_churn_workload(4_096).await?,
+        FeedCase::AttachReplay => feed_attach_replay_workload(args.samples).await?,
+        FeedCase::FanOut => subscriber_fan_out_workloads(args.samples).await?,
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "feed_fixture_version": 1,
+            "case": args.case,
+            "metrics": metrics,
+            "checks": checks,
+        })
+    );
+    Ok(())
+}
+
 /// Subscriber fan-out: with 1, 8, and 32 subscribers attached to one
 /// workspace, the time from the provider's first delta to that event's
 /// committed observation by the slowest subscriber, and the command
@@ -5191,6 +5356,16 @@ mod tests {
         for check in &checks {
             assert!(check.passed, "{}", check.detail);
         }
+    }
+
+    #[tokio::test]
+    async fn feed_lifecycle_fixtures_reject_unknown_ids_and_replay_committed_bytes() {
+        let (churn, checks) = feed_churn_workload(8).await.unwrap();
+        assert_eq!(churn.len(), 2);
+        assert!(checks.iter().all(|check| check.passed));
+        let (replay, checks) = feed_attach_replay_workload(3).await.unwrap();
+        assert_eq!(replay[0].samples.len(), 3);
+        assert!(checks.iter().all(|check| check.passed));
     }
 
     #[test]
