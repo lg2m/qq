@@ -468,11 +468,16 @@ the block and records the outcome; `Closed` fails the run with
 Every event a client can observe is published after its durable commit. The
 store encodes each envelope exactly once, inside the transaction that persists
 it, and keeps that encoding as a `PublishedEvent { envelope, json }`. After the
-transaction commits, the store worker publishes the batch to a bounded
-per-workspace `broadcast` feed (1024 events); a failed transaction publishes
-nothing. `SessionRuntime::subscribe_published` catches a subscriber up from
-SQLite in pages of `MAX_REPLAY_EVENTS`, then delivers from the feed with no
-store access per event; a subscriber that lags past the feed capacity is
+transaction commits, the store worker appends the batch to a bounded,
+sequence-indexed per-workspace ring (1024 events) that exists only while the
+workspace has a subscriber; a failed transaction publishes nothing.
+`SessionRuntime::subscribe_published` reads by cursor. A cursor the ring covers
+attaches and catches up from memory with no store job, so reconnecting
+observers and fan-out attachments do not queue behind the store worker; any
+other cursor is validated and paged from SQLite in pages of
+`MAX_REPLAY_EVENTS` inside one control job that also joins the ring, so no
+commit can land between the page and the first live read. Live delivery is
+then a ring lookup per event; a subscriber that lags past the ring capacity is
 redirected to SQLite catch-up from its last cursor, so every subscriber
 observes a contiguous, complete sequence at its own pace and slows only
 itself. The HTTP server writes `json` into the SSE frame as-is, so a live

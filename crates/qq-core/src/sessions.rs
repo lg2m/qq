@@ -7483,12 +7483,12 @@ fn ensure_workspace(
     workspace_id: WorkspaceId,
 ) -> Result<(), SessionRuntimeError> {
     let found = connection
-        .query_row(
-            "SELECT 1 FROM workspaces WHERE id = ?1",
-            [workspace_id.to_string()],
-            |_| Ok(()),
-        )
-        .optional()
+        .prepare_cached("SELECT 1 FROM workspaces WHERE id = ?1")
+        .and_then(|mut statement| {
+            statement
+                .query_row([workspace_id.to_string()], |_| Ok(()))
+                .optional()
+        })
         .map_err(|_| SessionRuntimeError::Persistence)?;
     found.ok_or(SessionRuntimeError::WorkspaceNotFound)
 }
@@ -15973,6 +15973,113 @@ mod tests {
             }
         }
         let _ = run_id;
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    /// A reconnecting subscriber whose cursor is still inside the workspace
+    /// ring attaches and catches up from memory: no store job, byte-identical
+    /// events, contiguous sequence. A cursor the ring does not cover, or a
+    /// workspace with no ring, still reads SQLite.
+    #[tokio::test]
+    async fn a_warm_reconnect_replays_from_the_ring_without_a_store_read() {
+        let harness = scripted_runs_harness(ApprovalMode::Ask, vec![Vec::new()]).await;
+        let request = SubscribeRequest {
+            workspace_id: harness.workspace_id,
+            after: EventCursor {
+                store_id: harness.runtime.inner.store.store_id(),
+                workspace_id: harness.workspace_id,
+                sequence: 0,
+            },
+        };
+        // Cold attach: one store read validates the workspace and pages.
+        let mut anchor = harness.runtime.subscribe_published(request).unwrap();
+        let created = anchor.next().await.unwrap().unwrap();
+        assert_eq!(harness.runtime.inner.store.catch_up_reads(), 1);
+
+        // Sequence 0 predates the ring, so a second cold subscriber at the
+        // same cursor still goes to SQLite even though a ring now exists.
+        let mut cold = harness.runtime.subscribe_published(request).unwrap();
+        assert_eq!(cold.next().await.unwrap().unwrap().json, created.json);
+        assert_eq!(harness.runtime.inner.store.catch_up_reads(), 2);
+        drop(cold);
+
+        // The anchor's short page seeded the tail: a subscriber exactly at
+        // the tail attaches warm and observes the run entirely from memory.
+        let mut warm_at_tail = harness
+            .runtime
+            .subscribe_published(SubscribeRequest {
+                after: created.envelope.cursor,
+                ..request
+            })
+            .unwrap();
+        assert!(warm_at_tail.next().now_or_never().is_none());
+        assert_eq!(harness.runtime.inner.store.catch_up_reads(), 2);
+
+        submit_prompt(&harness, "hello").await;
+        let mut live = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), anchor.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let finished = matches!(event.envelope.event, SessionEvent::RunFinished { .. });
+            live.push(event);
+            if finished {
+                break;
+            }
+        }
+        assert!(live.len() >= 4, "{} events", live.len());
+        for expected in &live {
+            let observed = warm_at_tail.next().await.unwrap().unwrap();
+            assert_eq!(observed.json, expected.json);
+        }
+        assert_eq!(harness.runtime.inner.store.catch_up_reads(), 2);
+
+        // Reconnect from the middle of the run: the page comes from the ring.
+        let midpoint = live[1].envelope.cursor;
+        let mut reconnect = harness
+            .runtime
+            .subscribe_published(SubscribeRequest {
+                after: midpoint,
+                ..request
+            })
+            .unwrap();
+        for expected in &live[2..] {
+            let observed = reconnect.next().await.unwrap().unwrap();
+            assert_eq!(observed.envelope.cursor, expected.envelope.cursor);
+            assert_eq!(
+                observed.json, expected.json,
+                "ring bytes equal stored bytes"
+            );
+        }
+        assert!(reconnect.next().now_or_never().is_none());
+        assert_eq!(
+            harness.runtime.inner.store.catch_up_reads(),
+            2,
+            "warm reconnects must not read the store"
+        );
+
+        // The ring vouches only for cursors it covers.
+        let mut cold_again = harness.runtime.subscribe_published(request).unwrap();
+        assert_eq!(cold_again.next().await.unwrap().unwrap().json, created.json);
+        assert_eq!(harness.runtime.inner.store.catch_up_reads(), 3);
+
+        drop((anchor, warm_at_tail, reconnect, cold_again));
+        assert_eq!(harness.runtime.inner.store.retained_feeds(), 0);
+        // With no ring, the same cursor is cold once more.
+        let mut after_release = harness
+            .runtime
+            .subscribe_published(SubscribeRequest {
+                after: midpoint,
+                ..request
+            })
+            .unwrap();
+        assert_eq!(
+            after_release.next().await.unwrap().unwrap().envelope.cursor,
+            live[2].envelope.cursor
+        );
+        assert_eq!(harness.runtime.inner.store.catch_up_reads(), 4);
         harness.runtime.shutdown().await.unwrap();
     }
 
