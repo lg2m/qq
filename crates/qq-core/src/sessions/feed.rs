@@ -25,6 +25,12 @@ use tokio::sync::Notify;
 /// to SQLite catch-up, so the bound never drops an event; it only bounds memory.
 pub(super) const FEED_CAPACITY: usize = 1024;
 
+/// Encoded bytes retained per workspace ring. Large streams would otherwise
+/// pin roughly two copies of their recent payload (JSON plus the decoded
+/// envelope) for warm replay; past this bound the oldest events are released
+/// and a subscriber that needs them catches up from SQLite.
+pub(super) const FEED_RETAINED_BYTES: usize = 256 * 1024;
+
 /// One committed event with its canonical JSON encoding.
 ///
 /// `json` is the exact string persisted in `events.envelope_json`, so a live
@@ -91,6 +97,8 @@ struct Ring {
     /// Newest sequence known committed for the workspace, kept even while
     /// `events` is empty so a subscriber at that cursor attaches warm.
     tail: Option<u64>,
+    /// Sum of `json.len()` over `events`.
+    retained_bytes: usize,
     subscribers: usize,
     notify: Arc<Notify>,
 }
@@ -100,6 +108,7 @@ impl Ring {
         Self {
             events: VecDeque::new(),
             tail: None,
+            retained_bytes: 0,
             subscribers: 0,
             notify: Arc::new(Notify::new()),
         }
@@ -166,11 +175,17 @@ impl Ring {
             .is_some_and(|last| last.sequence() + 1 != sequence)
         {
             self.events.clear();
+            self.retained_bytes = 0;
         }
-        if self.events.len() >= FEED_CAPACITY {
-            self.events.pop_front();
-        }
+        self.retained_bytes += event.json.len();
         self.events.push_back(event);
+        while self.events.len() > FEED_CAPACITY
+            || (self.retained_bytes > FEED_RETAINED_BYTES && self.events.len() > 1)
+        {
+            if let Some(evicted) = self.events.pop_front() {
+                self.retained_bytes -= evicted.json.len();
+            }
+        }
         self.tail = Some(sequence);
     }
 }
@@ -194,6 +209,14 @@ impl FeedReceiver {
     /// subscriber is caught up. Cancel-safe: nothing is consumed until the
     /// event is returned.
     pub(super) async fn recv(&self, after: u64) -> Result<Arc<PublishedEvent>, RecvError> {
+        // Fast path: the event is usually already in the ring, so avoid
+        // constructing and registering a waiter for it.
+        match self.feed.lookup(self.workspace_id, after) {
+            Some(Lookup::Ready(event)) => return Ok(event),
+            Some(Lookup::Behind) => return Err(RecvError::Behind),
+            Some(Lookup::CaughtUp) => {}
+            None => return Err(RecvError::Closed),
+        }
         loop {
             let mut notified = pin!(self.notify.notified());
             // Register before reading the ring so a publish between the read
@@ -538,22 +561,58 @@ mod tests {
         let feed = Arc::new(WorkspaceFeed::default());
         let workspace_id = workspace();
         let receiver = feed.subscribe(workspace_id).unwrap();
-        feed.publish((1..=(FEED_CAPACITY as u64 + 8)).map(published).collect());
+        let newest = FEED_CAPACITY as u64 + 8;
+        feed.publish((1..=newest).map(published).collect());
+        let (oldest, len) = {
+            let rings = feed.rings.lock().unwrap();
+            let ring = rings.get(&workspace_id).unwrap();
+            (ring.events.front().unwrap().sequence(), ring.events.len())
+        };
+        assert!(len <= FEED_CAPACITY, "{len} retained");
+        assert!(oldest > 8, "the first events were evicted");
         assert_eq!(receiver.try_recv(0).unwrap_err(), RecvError::Behind);
-        assert_eq!(receiver.try_recv(7).unwrap_err(), RecvError::Behind);
-        assert_eq!(receiver.try_recv(8).unwrap().sequence(), 9);
         assert_eq!(
-            receiver
-                .try_recv(FEED_CAPACITY as u64 + 7)
-                .unwrap()
-                .sequence(),
-            FEED_CAPACITY as u64 + 8
+            receiver.try_recv(oldest - 2).unwrap_err(),
+            RecvError::Behind
         );
+        assert_eq!(receiver.try_recv(oldest - 1).unwrap().sequence(), oldest);
+        assert_eq!(receiver.try_recv(newest - 1).unwrap().sequence(), newest);
         assert!(feed.warm_page(workspace_id, 0, 128).is_none());
         assert_eq!(
-            sequences(&feed.warm_page(workspace_id, 8, 4).unwrap()),
-            [9, 10, 11, 12]
+            sequences(&feed.warm_page(workspace_id, oldest - 1, 4).unwrap()),
+            [oldest, oldest + 1, oldest + 2, oldest + 3]
         );
+    }
+
+    #[test]
+    fn large_payloads_are_bounded_by_bytes_not_only_by_count() {
+        let feed = Arc::new(WorkspaceFeed::default());
+        let workspace_id = workspace();
+        let receiver = feed.subscribe(workspace_id).unwrap();
+        // ~64 KiB per event: far fewer than FEED_CAPACITY fit in the byte bound.
+        let big = |sequence: u64| {
+            let template = published(sequence);
+            let padding = "x".repeat(64 * 1024);
+            Arc::new(PublishedEvent {
+                envelope: template.envelope.clone(),
+                json: Arc::from(format!("{}{padding}", template.json)),
+            })
+        };
+        feed.publish((1..=16).map(big).collect());
+        let retained = feed.warm_page(workspace_id, 0, 128);
+        assert!(retained.is_none(), "the oldest events were evicted");
+        let (first_retained, _) = {
+            let rings = feed.rings.lock().unwrap();
+            let ring = rings.get(&workspace_id).unwrap();
+            assert!(ring.retained_bytes <= FEED_RETAINED_BYTES + 64 * 1024 + 512);
+            assert!(ring.events.len() < 16 && !ring.events.is_empty());
+            (ring.events.front().unwrap().sequence(), ())
+        };
+        assert_eq!(
+            receiver.try_recv(first_retained - 2).unwrap_err(),
+            RecvError::Behind
+        );
+        assert_eq!(receiver.try_recv(15).unwrap().sequence(), 16);
     }
 
     #[test]
