@@ -15,8 +15,11 @@ accounting are implemented 2026-09-05; receipt under Phase 5a. H25 and H26 are
 implemented and correctness-validated on Linux on 2026-09-06; their receipt
 below retains the pending performance qualification. A fresh focused shell
 comparison passes its noise and regression gates. The corrected fan-out
-comparison and same-binary control both fail tail gates; full version-4 H0
-and native Windows validation remain pending.
+comparison and same-binary control both fail tail gates. The full version-4
+H0 comparison ran on 2026-09-07 and its four original failures are resolved
+by the feed hot-path redesign and release profile (receipt under Phase 5a);
+remaining tail-gate failures reproduce in the same-binary control and require
+a quiet-host acceptance run. Native Windows teardown passed in CI.
 **Active boundary: close Phase 5a qualification. Later-phase work is saved
 in isolated branches and paused until this phase is assessed.**
 H23–H26 precede Phase 6; H27–H28 join its early correctness work. Phases 6–9
@@ -1959,6 +1962,60 @@ commits dominate queue occupancy. These are instrumented attribution
 measurements, not shipping-build gates; their separately ranked percentiles
 must not be summed. They support H20 investigating bounded group formation
 under control pressure. The stricter ≤20 ms target remains owned by H20.
+
+#### Phase 5a Full H0 Comparison And Feed Hot-Path Receipt — 2026-09-07
+
+The full version-4 H0 comparison ran against pre-H23 baseline `cebd13b` with
+Phase 5a candidate `b5d94df` and failed four gates: minimal binary size
+56,091,752 B against the 56,000,000 B absolute limit; `cursor_replay_ns`
+p95 175.350 µs against 78.808 µs; fan-out delivery p95 at 1 and 32
+subscribers +26.6% and +43.9%. A bounded replay probe found no additional
+SQL, decoding, clones, or polls in the candidate, and both arms showed
+two-speed behavior within a single process, so the tail failures could not be
+attributed to H26. Symbol comparison of the two artifacts attributed most of
+the size growth to H23/H24 closures already on `main`, and found the shipped
+binary carried 12 MB of unstripped symbols with no release profile.
+
+Rather than widen budgets, the feed hot path was redesigned. The
+per-workspace `broadcast` channel is replaced by a bounded, sequence-indexed
+ring retained only while subscribed. A cursor the ring covers attaches and
+pages from memory with no store job; cold cursors validate and page from
+SQLite in one control job that joins the ring before any later commit. Live
+reads are cursor lookups, removing duplicate and gap handling. The ring is
+bounded by 1024 events and 256 KiB of retained encoding; a non-contiguous
+publish discards it rather than serve a hole. `Store::call` runs admission
+and settlement in one non-generic body behind a thin generic shim, and
+`ensure_workspace` uses the statement cache. The release profile now strips
+symbols and builds with one codegen unit and thin LTO. Fifteen feed and
+runtime regression tests cover warm and cold attach, tail seeding, lag
+redirection, byte and count eviction, contiguity, wake registration,
+last-subscriber release, and the drop/subscribe race.
+
+Deterministic results: minimal artifact 55,770,448 → 38,734,176 B (−30.5%),
+default artifact 67,845,536 → 45,479,728 B (−33.0%). The size budgets are
+tightened to 41,000,000 and 48,000,000 B so the reclaimed headroom cannot be
+spent silently. An in-process release probe of the exact `cursor_replay`
+shape (nine events, 2000 iterations) measured median 22.6 → 0.87 µs, p95
+38.2 → 1.7 µs, and 2001 → 1 store reads. In-process ring capacity change
+raised R4 peak temporary RSS by 2–4 MB before the byte bound; after it, all
+R4 RSS metrics are within +1%.
+
+Three full H0 recordings on the shared host (baseline, candidate, baseline)
+all produced fixture-version-4 reports with every correctness check passing.
+The `perf check` exit remains non-zero: the same-binary A/A pair failed five
+tail gates (all three fan-out acknowledgment tails, `long_stream`, and R4
+restart reconstruction) and each A/B pair failed two to four, with the set
+changing between runs and every failing metric showing identical medians and
+a 3.2/6.2 ms bimodal acknowledgment tail. Host I/O pressure `some avg10` was
+21–55% throughout. Candidate medians and p95 for `cursor_replay_ns`, all six
+fan-out metrics, and both original R4 RSS gates are at or below both
+baseline recordings. Tail qualification is therefore not repeatable on this
+host in this window, consistent with the earlier A/A finding; the failures
+are retained, not waived. The acceptance run must be repeated on a quiet
+host before the tranche is marked complete. The focused
+`feed_attach_replay` fixture subscribes from the workspace's initial cursor,
+which the ring never covers, so it measures the cold path on both arms and
+cannot gate the warm path; correcting that fixture is follow-up work.
 
 ### Phase 5b — Headless Contract For Supervisors
 
