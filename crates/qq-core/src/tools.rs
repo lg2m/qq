@@ -33,7 +33,9 @@ use search::MAX_SEARCH_BYTES;
 #[cfg(test)]
 use serde_json::json;
 #[cfg(test)]
-use shell::{BoundedCapture, MAX_SHELL_OUTPUT_BYTES};
+use shell::BoundedCapture;
+#[cfg(all(test, unix))]
+use shell::MAX_SHELL_OUTPUT_BYTES;
 #[cfg(test)]
 use std::sync::{
     Arc,
@@ -42,8 +44,14 @@ use std::sync::{
 #[cfg(test)]
 use tokio::sync::mpsc;
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) use shell::observe_shell_spawn;
+
+#[cfg(all(test, unix))]
+pub(crate) const PANIC_SHELL_ARGUMENTS: &str = r#"{"command":"sleep 300"}"#;
+#[cfg(all(test, windows))]
+pub(crate) const PANIC_SHELL_ARGUMENTS: &str =
+    r#"{"command":"for /L %i in (1,1,2147483647) do @rem waiting"}"#;
 
 #[cfg(all(test, unix))]
 pub(crate) async fn assert_panicked_process_exits(pid: u32) {
@@ -68,6 +76,34 @@ pub(crate) async fn assert_panicked_process_exits(pid: u32) {
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) async fn assert_panicked_process_exits(pid: u32) {
+    // This observes only the fixture's numeric PID. It cannot turn an
+    // unconfirmed production cleanup result into confirmed quiescence.
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $observedProcess = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+         if ($null -eq $observedProcess) {{ exit 0 }}; \
+         if ($observedProcess.WaitForExit(10000)) {{ exit 0 }}; \
+         [Console]::Error.WriteLine('the owned shell did not exit after panic'); exit 1"
+    );
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("the Windows process-exit observer must finish")
+    .expect("PowerShell must observe the panicked fixture's process");
+    assert!(
+        observed.status.success(),
+        "the owned process must still exit after panic: {}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
 }
 
 #[cfg(test)]
@@ -837,7 +873,7 @@ mod tests {
         assert!(!cancelled.load(Ordering::Acquire));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn panicked_shell_task_never_reports_confirmed_quiescence() {
         let directory = tempfile::tempdir().unwrap();
@@ -848,7 +884,7 @@ mod tests {
             workspace,
             Arc::new(FileState::default()),
             "shell".to_owned(),
-            r#"{"command":"sleep 300"}"#.to_owned(),
+            PANIC_SHELL_ARGUMENTS.to_owned(),
             Arc::new(AtomicBool::new(false)),
             None,
             tasks.clone(),
@@ -871,13 +907,14 @@ mod tests {
         let workspace = Workspace::open(directory.path()).unwrap();
         let spawned = shell::observe_shell_spawn(workspace.path(), false);
         let tasks = ToolTasks::default();
+        let (output, chunks) = mpsc::channel::<String>(1);
         let mut execution = Box::pin(execute(
             workspace,
             Arc::new(FileState::default()),
             "shell".to_owned(),
             r#"{"command":"for /L %i in (1,1,2147483647) do @echo waiting"}"#.to_owned(),
             Arc::new(AtomicBool::new(false)),
-            None,
+            Some(output),
             tasks.clone(),
         ));
         assert!(futures_util::poll!(execution.as_mut()).is_pending());
@@ -885,11 +922,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while chunks.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         drop(execution);
         tokio::time::timeout(std::time::Duration::from_secs(5), tasks.drain())
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            chunks.capacity(),
+            0,
+            "the output remained unread during drain"
+        );
     }
 
     #[cfg(windows)]

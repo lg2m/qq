@@ -323,20 +323,21 @@ descriptor or its digest.
 Credential rotation is tracked separately by an opaque `CredentialEpoch` owned
 by `qq-auth`: every durable credential write advances the store's index
 revision, including in-place rotation of an existing entry. The root records
-the epoch beside a compiled plan and rekeys its MCP registry cache by
-declaration digest plus epoch, so a rotated secret rebuilds live authorization
-without changing behavioral identity. No cache key in the process hashes raw
-secret bytes.
+the epoch beside a compiled plan. Live provider access and admitted MCP
+declarations also retain exact in-memory equality, including inline credentials,
+header values, and full endpoints. These live bindings are never hashed or
+serialized into durable identity. An epoch or binding change rebuilds live
+authorization while active runs retain their original handles.
 
 The root's `PlanCache` holds one generation per (canonical workspace, model
 selection, explicit configuration) key and revalidates it on every load with a
 fixed list of `stat` calls: every path the configuration loader probed
-(`ConfigSnapshot::probed_paths`), the credential index file, the workspace's
+(`ConfigSnapshot::sources`, captured before discovery and reads), the credential index file, the workspace's
 `AGENTS.md`/`CLAUDE.md`, the skill roots the index was compiled from, and the
 selected pack's manifest and persona, plus one in-memory generation compare
 per external tool host. A warm lookup performs no configuration parsing,
 credential I/O, directory listing, or host round trip. Any observable change recompiles; an
-identical digest and epoch keeps the live generation, otherwise the new
+identical digest, epoch, and live bindings keep the live generation, otherwise the new
 generation is published atomically for later runs while active runs keep the
 `Arc` they were admitted with. A failed recompile returns the configuration
 error to the triggering run and leaves the previous generation cached. The
@@ -371,7 +372,9 @@ declares. `qq-config` does not depend on `qq-protocol`; the root translates.
 
 The catalog is compiled once per plan by `qq-core::catalog` from the static
 built-ins and every `ExternalToolHost` the root attached. Static tools are
-trusted and never excluded. External tools are validated by name shape
+trusted; profile/pack policy and optional `policy.exposed_tools` may remove
+them before catalog construction. Exposure lists intersect across config
+layers, and grant no execution authority. External tools are validated by name shape
 (`mcp__<server>__<tool>`, `ext__<host>__<tool>`), deduplicated against the
 static names and each other, bounded per tool (16 KiB schema, 4 KiB
 description) and per catalog (512 tools, 1 MiB of external schema), and every
@@ -382,7 +385,7 @@ descriptions, serialized schemas, effect classes, and the exposure mode.
 
 Exposure is a compile-time decision. A catalog with at most 24 external tools
 and 32 KiB of external schema is sent whole on every request (`Full`). A larger
-catalog is `Progressive`: requests carry the static tools plus one
+catalog with an admitted selector is `Progressive`: requests carry the static tools plus one
 `select_tools` meta-tool, and the system prompt carries a compact index of
 external names, descriptions, and host readiness. The model pins tools by
 keyword (`select_tools` ranks by deterministic token overlap, at most 8 matches
@@ -391,6 +394,9 @@ run, and a recovered run re-pins from the `select_tools` results already in its
 transcript, so the request the provider sees after a restart matches the one
 before it. Calling an unpinned external tool is a typed tool error that names
 `select_tools`, never a silent lookup miss.
+If explicit exposure omits `select_tools`, all permitted external schemas
+are sent directly under the same catalog bounds, so every admitted tool
+remains callable.
 
 `ExternalToolHost` is the single seam for anything that is not a built-in:
 `catalog_blocking` returns a generation-stamped `HostCatalog` with readiness;
@@ -462,11 +468,16 @@ the block and records the outcome; `Closed` fails the run with
 Every event a client can observe is published after its durable commit. The
 store encodes each envelope exactly once, inside the transaction that persists
 it, and keeps that encoding as a `PublishedEvent { envelope, json }`. After the
-transaction commits, the store worker publishes the batch to a bounded
-per-workspace `broadcast` feed (1024 events); a failed transaction publishes
-nothing. `SessionRuntime::subscribe_published` catches a subscriber up from
-SQLite in pages of `MAX_REPLAY_EVENTS`, then delivers from the feed with no
-store access per event; a subscriber that lags past the feed capacity is
+transaction commits, the store worker appends the batch to a bounded,
+sequence-indexed per-workspace ring (1024 events) that exists only while the
+workspace has a subscriber; a failed transaction publishes nothing.
+`SessionRuntime::subscribe_published` reads by cursor. A cursor the ring covers
+attaches and catches up from memory with no store job, so reconnecting
+observers and fan-out attachments do not queue behind the store worker; any
+other cursor is validated and paged from SQLite in pages of
+`MAX_REPLAY_EVENTS` inside one control job that also joins the ring, so no
+commit can land between the page and the first live read. Live delivery is
+then a ring lookup per event; a subscriber that lags past the ring capacity is
 redirected to SQLite catch-up from its last cursor, so every subscriber
 observes a contiguous, complete sequence at its own pace and slows only
 itself. The HTTP server writes `json` into the SSE frame as-is, so a live
@@ -907,7 +918,10 @@ Three rules follow:
   also executes untrusted repository code.
 - QQ has no supervisor-only mode and no product vocabulary. A capability a
   supervisor needs is added only in a form a local user, a CI job, and an
-  evaluation harness could also use, and it stays off the run hot path.
+  evaluation harness could also use. CLI plumbing and compilation stay off
+  the run hot path; generic opt-in completion validation and bounded repair
+  belong in core, preserve default behavior when disabled, and require
+  cancellation, budget, and performance acceptance.
 - The headless contract is public and pinned by fixtures in this repository so
   a supervisor can test against it without reading QQ source.
 

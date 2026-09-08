@@ -288,6 +288,11 @@ pub(super) struct Store {
     store_id: StoreId,
 }
 
+pub(super) struct FeedAttachment {
+    pub(super) live: feed::FeedReceiver,
+    pub(super) page: Vec<Arc<feed::PublishedEvent>>,
+}
+
 struct StoreInner {
     control: Sender<WorkerMessage>,
     control_slots: Arc<Semaphore>,
@@ -358,14 +363,60 @@ impl Store {
         self.inner.catch_up_reads.load(Ordering::Relaxed)
     }
 
-    /// A live receiver for one workspace's committed events. Delivers only
-    /// events published after this call; the caller catches up from
-    /// `events_after` first.
-    pub(super) fn feed(
+    #[cfg(test)]
+    pub(super) fn retained_feeds(&self) -> usize {
+        self.inner.feed.retained_workspaces()
+    }
+
+    /// Attaches a subscriber at `sequence` with its first catch-up page.
+    ///
+    /// Warm path: when the workspace ring already covers the cursor, both come
+    /// from memory and no store job runs; a ring exists only for a workspace
+    /// the store validated for an earlier subscriber. Cold path: one control
+    /// job validates the workspace, reads the page, and joins the ring before
+    /// any later commit can publish, so nothing is missed between the two.
+    /// Dropping the reply also releases the receiver if the caller has gone.
+    pub(super) async fn attach_feed(
         &self,
         workspace_id: WorkspaceId,
-    ) -> Option<tokio::sync::broadcast::Receiver<Arc<feed::PublishedEvent>>> {
-        self.inner.feed.subscribe(workspace_id)
+        sequence: u64,
+        limit: u16,
+    ) -> Result<FeedAttachment, SessionRuntimeError> {
+        if let Some((live, page)) = self.inner.feed.attach_warm(workspace_id, sequence, limit) {
+            return Ok(FeedAttachment { live, page });
+        }
+        let feed = Arc::clone(&self.inner.feed);
+        #[cfg(test)]
+        self.inner.catch_up_reads.fetch_add(1, Ordering::Relaxed);
+        self.call(Priority::Control, move |connection| {
+            ensure_workspace(connection, workspace_id)?;
+            let page = read_published_event_page(connection, workspace_id, sequence, limit)?;
+            let short = page.len() < usize::from(limit);
+            let live = feed
+                .attach_cold(workspace_id, &page, short)
+                .ok_or(SessionRuntimeError::Unavailable)?;
+            Ok(FeedAttachment { live, page })
+        })
+        .await
+    }
+
+    /// A catch-up page, from the ring when it covers `sequence` and from
+    /// SQLite otherwise.
+    pub(super) async fn published_events_after(
+        &self,
+        workspace_id: WorkspaceId,
+        sequence: u64,
+        limit: u16,
+    ) -> Result<Vec<Arc<feed::PublishedEvent>>, SessionRuntimeError> {
+        if let Some(page) = self.inner.feed.warm_page(workspace_id, sequence, limit) {
+            return Ok(page);
+        }
+        #[cfg(test)]
+        self.inner.catch_up_reads.fetch_add(1, Ordering::Relaxed);
+        self.call(Priority::Control, move |connection| {
+            read_published_events(connection, workspace_id, sequence, limit)
+        })
+        .await
     }
 
     pub(super) async fn call<T, F>(
@@ -377,6 +428,34 @@ impl Store {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, SessionRuntimeError> + Send + 'static,
     {
+        // Only the reply type is generic. Admission, queueing, and settlement
+        // run in one shared body so ~60 call sites do not each carry a copy
+        // of the hot path.
+        let (reply, response) = oneshot::channel();
+        let job: worker::DatabaseJob = Box::new(move |connection| {
+            let result = operation(connection);
+            // The worker settles this after the enclosing commit: the
+            // reply and the staged events wait for durability. A commit
+            // failure replaces the result so no caller is told a write
+            // landed when it did not.
+            worker::JobOutcome {
+                ok: result.is_ok(),
+                settle: Box::new(move |commit| {
+                    let _ = reply.send(commit.and(result));
+                }),
+            }
+        });
+        self.enqueue(priority, job).await?;
+        response
+            .await
+            .map_err(|_| SessionRuntimeError::Unavailable)?
+    }
+
+    async fn enqueue(
+        &self,
+        priority: Priority,
+        job: worker::DatabaseJob,
+    ) -> Result<(), SessionRuntimeError> {
         if self.inner.closing.load(Ordering::Acquire) {
             return Err(SessionRuntimeError::Unavailable);
         }
@@ -405,21 +484,8 @@ impl Store {
                     .map_err(|_| SessionRuntimeError::Unavailable)?,
             ),
         };
-        let (reply, response) = oneshot::channel();
         let message = WorkerMessage::Run {
-            job: Box::new(move |connection| {
-                let result = operation(connection);
-                // The worker settles this after the enclosing commit: the
-                // reply and the staged events wait for durability. A commit
-                // failure replaces the result so no caller is told a write
-                // landed when it did not.
-                worker::JobOutcome {
-                    ok: result.is_ok(),
-                    settle: Box::new(move |commit| {
-                        let _ = reply.send(commit.and(result));
-                    }),
-                }
-            }),
+            job,
             capacity_permit,
         };
         let sender = match priority {
@@ -445,9 +511,7 @@ impl Store {
             }
         }
         drop(admission);
-        response
-            .await
-            .map_err(|_| SessionRuntimeError::Unavailable)?
+        Ok(())
     }
 
     /// Stops the database worker without synchronously joining it from an
@@ -727,20 +791,6 @@ impl Store {
     ) -> Result<Vec<SessionEventEnvelope>, SessionRuntimeError> {
         self.call(Priority::Control, move |connection| {
             read_events(connection, workspace_id, sequence, limit)
-        })
-        .await
-    }
-
-    pub(super) async fn published_events_after(
-        &self,
-        workspace_id: WorkspaceId,
-        sequence: u64,
-        limit: u16,
-    ) -> Result<Vec<Arc<feed::PublishedEvent>>, SessionRuntimeError> {
-        #[cfg(test)]
-        self.inner.catch_up_reads.fetch_add(1, Ordering::Relaxed);
-        self.call(Priority::Control, move |connection| {
-            read_published_events(connection, workspace_id, sequence, limit)
         })
         .await
     }
@@ -1793,7 +1843,7 @@ mod tests {
             .await
             .unwrap();
         let (release, blocked) = hold_worker(&store).await;
-        let mut live = store.feed(workspace_id).unwrap();
+        let live = store.inner.feed.subscribe(workspace_id).unwrap();
 
         let mut jobs = Vec::new();
         for n in 0..3_u64 {
@@ -1840,7 +1890,7 @@ mod tests {
             assert_eq!(job.await.unwrap(), Err(SessionRuntimeError::Persistence));
         }
         assert!(
-            live.try_recv().is_err(),
+            live.try_recv(0).is_err(),
             "nothing from a failed group is published"
         );
     }
